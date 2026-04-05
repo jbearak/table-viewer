@@ -29,11 +29,12 @@ export function Table({
                     {sheet.rows.map((row, r) => (
                         <tr
                             key={r}
-                            style={
-                                row_heights[r]
+                            style={{
+                                position: 'relative',
+                                ...(row_heights[r]
                                     ? { height: `${row_heights[r]}px` }
-                                    : undefined
-                            }
+                                    : undefined),
+                            }}
                         >
                             {row.map((cell, c) => {
                                 const key = `${r}:${c}`;
@@ -78,7 +79,7 @@ export function Table({
                                     </td>
                                 );
                             })}
-                            <RowResizeIndicator
+                            <RowResizeHandle
                                 row={r}
                                 on_resize={on_row_resize}
                             />
@@ -170,15 +171,15 @@ function ColumnResizeHandle({
     );
 }
 
-interface RowResizeIndicatorProps {
+interface RowResizeHandleProps {
     row: number;
     on_resize: (row: number, height: number) => void;
 }
 
-function RowResizeIndicator({
+function RowResizeHandle({
     row,
     on_resize,
-}: RowResizeIndicatorProps): React.JSX.Element {
+}: RowResizeHandleProps): React.JSX.Element {
     const handle_mouse_down = useCallback(
         (e: React.MouseEvent) => {
             e.preventDefault();
@@ -211,12 +212,10 @@ function RowResizeIndicator({
     );
 
     return (
-        <td style={{ padding: 0, width: 0, border: 'none', position: 'relative' }}>
-            <div
-                className="row-resize-handle"
-                onMouseDown={handle_mouse_down}
-            />
-        </td>
+        <div
+            className="row-resize-handle"
+            onMouseDown={handle_mouse_down}
+        />
     );
 }
 

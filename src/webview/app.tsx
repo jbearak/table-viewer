@@ -67,19 +67,56 @@ export function App(): React.JSX.Element {
             if (msg.type === 'reload') {
                 set_workbook(msg.data);
 
+                const new_names = new Set(
+                    msg.data.sheets.map((s) => s.name)
+                );
+
+                // Clear persisted state for removed sheets
+                const clean_record = <T,>(
+                    rec: Record<string, T>
+                ): Record<string, T> => {
+                    const result: Record<string, T> = {};
+                    for (const key of Object.keys(rec)) {
+                        if (new_names.has(key)) result[key] = rec[key];
+                    }
+                    return result;
+                };
+
+                set_column_widths((prev) => clean_record(prev));
+                set_row_heights((prev) => clean_record(prev));
+                scroll_positions_ref.current = clean_record(
+                    scroll_positions_ref.current
+                );
+
                 set_active_sheet((prev) => {
-                    const names = msg.data.sheets.map(
-                        (s) => s.name
-                    );
-                    if (names.includes(prev)) return prev;
-                    return names[0] ?? '';
+                    if (new_names.has(prev)) return prev;
+                    return msg.data.sheets[0]?.name ?? '';
                 });
+
+                state_ref.current = {
+                    ...state_ref.current,
+                    columnWidths: clean_record(
+                        state_ref.current.columnWidths ?? {}
+                    ),
+                    rowHeights: clean_record(
+                        state_ref.current.rowHeights ?? {}
+                    ),
+                    scrollPosition: clean_record(
+                        state_ref.current.scrollPosition ?? {}
+                    ),
+                    activeSheet: new_names.has(
+                        state_ref.current.activeSheet ?? ''
+                    )
+                        ? state_ref.current.activeSheet
+                        : msg.data.sheets[0]?.name,
+                };
+                persist_immediate();
             }
         };
 
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, []);
+    }, [persist_immediate]);
 
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
