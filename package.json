@@ -6,10 +6,16 @@
   "publisher": "jbearak",
   "license": "GPL-3.0",
   "author": "Jonathan Marc Bearak",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jbearak/table-viewer.git"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
@@ -18,10 +24,18 @@
         "viewType": "tableViewer.editor",
         "displayName": "Table Viewer",
         "selector": [
-          { "filenamePattern": "*.xlsx" },
-          { "filenamePattern": "*.XLSX" },
-          { "filenamePattern": "*.xls" },
-          { "filenamePattern": "*.XLS" }
+          {
+            "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.XLSX"
+          },
+          {
+            "filenamePattern": "*.xls"
+          },
+          {
+            "filenamePattern": "*.XLS"
+          }
         ],
         "priority": "default"
       }
@@ -31,7 +45,10 @@
       "properties": {
         "tableViewer.tabOrientation": {
           "type": "string",
-          "enum": ["horizontal", "vertical"],
+          "enum": [
+            "horizontal",
+            "vertical"
+          ],
           "default": "horizontal",
           "description": "Default worksheet tab orientation. Can be overridden per file."
         }
@@ -47,17 +64,17 @@
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "xlsx": "^0.18.5",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@types/vscode": "^1.75.0",
-    "esbuild": "^0.21.0",
-    "typescript": "^5.4.0",
-    "@vscode/vsce": "^2.26.0"
+    "@vscode/vsce": "^2.26.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.4.0"
   }
 }
