@@ -3,12 +3,14 @@ import type { WorkbookData, PerFileState, HostMessage } from '../types';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
 import { Table } from './table';
+import { ContextMenu, type MenuItem } from './context-menu';
 import {
     clamp_sheet_index,
     normalize_per_file_state,
     trim_sheet_state_array,
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
+import { use_selection } from './use-selection';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -246,7 +248,7 @@ export function App(): React.JSX.Element {
                         on_select={handle_sheet_select}
                         vertical={true}
                     />
-                    <Table
+                    <TableWithSelection
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={
@@ -268,7 +270,7 @@ export function App(): React.JSX.Element {
                         on_select={handle_sheet_select}
                         vertical={false}
                     />
-                    <Table
+                    <TableWithSelection
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={
@@ -284,5 +286,82 @@ export function App(): React.JSX.Element {
                 </>
             )}
         </div>
+    );
+}
+
+interface TableWithSelectionProps {
+    sheet: import('../types').SheetData;
+    show_formatting: boolean;
+    column_widths: Record<number, number>;
+    row_heights: Record<number, number>;
+    on_column_resize: (col: number, width: number) => void;
+    on_row_resize: (row: number, height: number) => void;
+    scroll_ref: React.RefObject<HTMLDivElement | null>;
+}
+
+function TableWithSelection({
+    sheet,
+    show_formatting,
+    column_widths,
+    row_heights,
+    on_column_resize,
+    on_row_resize,
+    scroll_ref,
+}: TableWithSelectionProps): React.JSX.Element {
+    const sel = use_selection(sheet, show_formatting);
+
+    const menu_items: MenuItem[] = [];
+    if (sel.context_menu) {
+        menu_items.push({
+            label: 'Copy cell',
+            on_click: () =>
+                sel.copy_cell(sel.context_menu!.row, sel.context_menu!.col),
+        });
+        if (sel.is_multi_cell) {
+            menu_items.push({
+                label: 'Copy selection',
+                on_click: () => sel.copy_selection(),
+            });
+        }
+        menu_items.push({
+            label: 'Select row',
+            on_click: () => sel.select_row(sel.context_menu!.row),
+        });
+        menu_items.push({
+            label: 'Select column',
+            on_click: () => sel.select_column(sel.context_menu!.col),
+        });
+        menu_items.push({
+            label: 'Select all',
+            on_click: () => sel.select_all(),
+        });
+    }
+
+    return (
+        <>
+            <Table
+                sheet={sheet}
+                show_formatting={show_formatting}
+                column_widths={column_widths}
+                row_heights={row_heights}
+                on_column_resize={on_column_resize}
+                on_row_resize={on_row_resize}
+                scroll_ref={scroll_ref}
+                selection={sel.selection}
+                on_cell_mouse_down={sel.on_cell_mouse_down}
+                on_cell_mouse_move={sel.on_cell_mouse_move}
+                on_cell_mouse_up={sel.on_cell_mouse_up}
+                on_context_menu={sel.on_context_menu}
+                on_key_down={sel.on_key_down}
+            />
+            {sel.context_menu && (
+                <ContextMenu
+                    x={sel.context_menu.x}
+                    y={sel.context_menu.y}
+                    items={menu_items}
+                    on_dismiss={sel.dismiss_context_menu}
+                />
+            )}
+        </>
     );
 }
