@@ -2,7 +2,7 @@ import type { ExtensionContext } from 'vscode';
 import type { PerFileState } from './types';
 
 const STATE_KEY = 'tableViewer.fileState';
-const MAX_STORED_FILES = 10_000;
+export const DEFAULT_MAX_STORED_FILES = 10_000;
 
 type StoredStateMap = Record<string, PerFileState>;
 
@@ -31,8 +31,11 @@ function evict_excess(
 }
 
 export function create_file_state_store(
-    context: ExtensionContext
+    context: ExtensionContext,
+    get_max_stored?: () => number
 ): FileStateStore {
+    const get_max = get_max_stored
+        ?? (() => DEFAULT_MAX_STORED_FILES);
     let pending_write: Promise<void> = Promise.resolve();
 
     return {
@@ -51,7 +54,7 @@ export function create_file_state_store(
                     const all = get_all_state(context);
                     delete all[file_path];
                     all[file_path] = state;
-                    evict_excess(all, MAX_STORED_FILES);
+                    evict_excess(all, get_max());
                     await context.globalState.update(
                         STATE_KEY,
                         all

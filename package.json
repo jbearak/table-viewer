@@ -52,6 +52,13 @@
           ],
           "default": "horizontal",
           "description": "Default worksheet tab orientation. Can be overridden per file."
+        },
+        "tableViewer.maxStoredFiles": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 1,
+          "scope": "application",
+          "description": "Maximum number of files whose layout settings (column widths, row heights, scroll positions) are remembered. When the limit is reached, the least recently used entries are removed first."
         }
       }
     }
