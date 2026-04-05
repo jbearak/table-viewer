@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import XLSX from 'xlsx';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
@@ -95,13 +96,25 @@ function normalize_value(value: ExcelJS.CellValue): string | number | boolean | 
 }
 
 function format_cell_value(cell: ExcelJS.Cell): string {
+    const raw = normalize_value(cell.value);
+    if (raw === null) return '';
+
+    // Apply Excel number format via SheetJS SSF
+    const num_fmt = cell.numFmt;
+    if (num_fmt && typeof raw === 'number') {
+        try {
+            return XLSX.SSF.format(num_fmt, raw);
+        } catch {
+            // Fall through to default
+        }
+    }
+
+    // For non-numeric or unformatted cells, use ExcelJS text
     const text = cell.text;
     if (text !== undefined && text !== null && text !== '') {
         return text;
     }
 
-    const raw = normalize_value(cell.value);
-    if (raw === null) return '';
     return String(raw);
 }
 
