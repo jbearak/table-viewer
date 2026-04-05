@@ -1,3 +1,4 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { parse_xlsx } from './parse-xlsx';
 import { parse_xls } from './parse-xls';
@@ -76,18 +77,18 @@ class ViewerPanel implements vscode.Disposable {
             )
         );
 
-        // Live reload: watch for file changes on this specific file
+        // Live reload: watch the parent directory for changes to this file
+        const dir = path.dirname(this.file_path);
+        const basename = path.basename(this.file_path);
         this.watcher = vscode.workspace.createFileSystemWatcher(
             new vscode.RelativePattern(
-                vscode.Uri.file(this.file_path),
-                '*'
+                vscode.Uri.file(dir),
+                basename
             )
         );
 
-        const on_file_change = async (changed_uri: vscode.Uri) => {
-            if (changed_uri.fsPath === this.file_path) {
-                await this.send_reload();
-            }
+        const on_file_change = async () => {
+            await this.send_reload();
         };
 
         this.disposables.push(

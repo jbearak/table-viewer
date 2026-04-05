@@ -22,6 +22,19 @@ export function Table({
 }: TableProps): React.JSX.Element {
     const merge_map = build_merge_map(sheet.merges);
 
+    // For each column, find the first row where it has a visible
+    // (non-hidden) cell — that's where we render the resize handle.
+    const resize_handle_row = new Map<number, number>();
+    for (let c = 0; c < sheet.columnCount; c++) {
+        for (let r = 0; r < sheet.rows.length; r++) {
+            const entry = merge_map.get(`${r}:${c}`);
+            if (entry !== 'hidden') {
+                resize_handle_row.set(c, r);
+                break;
+            }
+        }
+    }
+
     return (
         <div className="table-container" ref={scroll_ref as React.LegacyRef<HTMLDivElement>}>
             <table className="data-table">
@@ -53,20 +66,26 @@ export function Table({
                                         merge_info.colSpan;
                                 }
 
+                                const show_resize_handle =
+                                    resize_handle_row.get(c) === r;
+
                                 return (
                                     <td
                                         key={c}
                                         {...span_props}
-                                        style={
-                                            column_widths[c]
+                                        style={{
+                                            ...(column_widths[c]
                                                 ? {
                                                       width: `${column_widths[c]}px`,
                                                       minWidth: `${column_widths[c]}px`,
                                                   }
-                                                : undefined
-                                        }
+                                                : undefined),
+                                            ...(show_resize_handle
+                                                ? { position: 'relative' }
+                                                : undefined),
+                                        }}
                                     >
-                                        {r === 0 && (
+                                        {show_resize_handle && (
                                             <ColumnResizeHandle
                                                 col={c}
                                                 on_resize={on_column_resize}

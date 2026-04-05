@@ -135,10 +135,6 @@ body {
     min-width: 40px;
 }
 
-.data-table tr:first-child td {
-    position: relative;
-}
-
 .col-resize-handle {
     position: absolute;
     top: 0;

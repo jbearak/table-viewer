@@ -28,18 +28,19 @@ export function parse_xls(buffer: Buffer): WorkbookData {
         }
 
         const range = XLSX.utils.decode_range(ref);
-        const row_count = range.e.r - range.s.r + 1;
-        const col_count = range.e.c - range.s.c + 1;
+        // Always render from A1 to preserve cell positions
+        const row_count = range.e.r + 1;
+        const col_count = range.e.c + 1;
 
         const merges: MergeRange[] = [];
         const merged_cells = new Set<string>();
 
         for (const merge of worksheet['!merges'] ?? []) {
             const m: MergeRange = {
-                startRow: merge.s.r - range.s.r,
-                startCol: merge.s.c - range.s.c,
-                endRow: merge.e.r - range.s.r,
-                endCol: merge.e.c - range.s.c,
+                startRow: merge.s.r,
+                startCol: merge.s.c,
+                endRow: merge.e.r,
+                endCol: merge.e.c,
             };
             merges.push(m);
             for (let r = m.startRow; r <= m.endRow; r++) {
@@ -60,10 +61,7 @@ export function parse_xls(buffer: Buffer): WorkbookData {
                     continue;
                 }
 
-                const cell_addr = XLSX.utils.encode_cell({
-                    r: r + range.s.r,
-                    c: c + range.s.c,
-                });
+                const cell_addr = XLSX.utils.encode_cell({ r, c });
                 const cell = worksheet[cell_addr];
                 row_data.push(extract_cell_data(cell));
             }
