@@ -730,6 +730,9 @@ export interface StringReadResult {
 
 export function read_biff8_string(buf: Buffer, offset: number, char_count: number): StringReadResult {
     let pos = offset;
+    if (pos >= buf.length) {
+        return { value: '', bytesRead: 0 };
+    }
     const flags = buf[pos];
     pos += 1;
 
@@ -741,31 +744,41 @@ export function read_biff8_string(buf: Buffer, offset: number, char_count: numbe
     let ext_string_size = 0;
 
     if (has_rich_text) {
+        if (pos + 2 > buf.length) {
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
         rich_text_runs = buf.readUInt16LE(pos);
         pos += 2;
     }
     if (has_ext_string) {
-        ext_string_size = buf.readInt32LE(pos);
+        if (pos + 4 > buf.length) {
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
+        ext_string_size = buf.readUInt32LE(pos);
         pos += 4;
     }
 
     let value: string;
     if (is_utf16) {
-        value = buf.toString('utf16le', pos, pos + char_count * 2);
-        pos += char_count * 2;
+        const bytes_available = Math.max(0, buf.length - pos);
+        const chars_available = Math.floor(bytes_available / 2);
+        const chars_to_read = Math.min(char_count, chars_available);
+        value = buf.toString('utf16le', pos, pos + chars_to_read * 2);
+        pos += chars_to_read * 2;
     } else {
         // Compressed Latin-1: each byte is a code point
         value = '';
-        for (let i = 0; i < char_count; i++) {
+        const chars_to_read = Math.min(char_count, Math.max(0, buf.length - pos));
+        for (let i = 0; i < chars_to_read; i++) {
             value += String.fromCharCode(buf[pos + i]);
         }
-        pos += char_count;
+        pos += chars_to_read;
     }
 
     // Skip rich text run data (4 bytes per run)
-    pos += rich_text_runs * 4;
+    pos = Math.min(buf.length, pos + rich_text_runs * 4);
     // Skip extended string data
-    pos += ext_string_size;
+    pos = Math.min(buf.length, pos + ext_string_size);
 
     return { value, bytesRead: pos - offset };
 }
