@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import type { SheetData, MergeRange } from '../types';
+import type { SheetData } from '../types';
 import {
     type SelectionRange,
     type SelectionState,
