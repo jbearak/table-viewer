@@ -1,0 +1,179 @@
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html, body, #root {
+    height: 100%;
+    overflow: hidden;
+    color-scheme: light dark;
+}
+
+body {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 13px;
+    color: var(--vscode-editor-foreground, #ccc);
+    background: var(--vscode-editor-background, #1e1e1e);
+}
+
+.viewer {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.viewer.vertical-tabs .content-area {
+    display: flex;
+    flex-direction: row;
+    flex: 1;
+    overflow: hidden;
+}
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+    flex-shrink: 0;
+}
+
+.toggle {
+    padding: 3px 10px;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--vscode-foreground, #ccc);
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+}
+
+.toggle:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+}
+
+.toggle.active {
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    border-color: var(--vscode-button-background, #0e639c);
+}
+
+.sheet-tabs-horizontal {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+    flex-shrink: 0;
+    overflow-x: auto;
+}
+
+.sheet-tab {
+    padding: 6px 14px;
+    border-right: 1px solid var(--vscode-panel-border, #444);
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    color: var(--vscode-foreground, #ccc);
+    opacity: 0.6;
+    background: transparent;
+    border-top: none;
+    border-bottom: none;
+    border-left: none;
+    font-family: inherit;
+}
+
+.sheet-tab:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+    opacity: 1;
+}
+
+.sheet-tab.active {
+    opacity: 1;
+    background: var(--vscode-editor-background, #1e1e1e);
+    font-weight: bold;
+}
+
+.sheet-tabs-vertical {
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+    overflow-y: auto;
+    flex-shrink: 0;
+    min-width: 100px;
+    max-width: 200px;
+}
+
+.sheet-tabs-vertical .sheet-tab {
+    border-right: none;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    text-align: left;
+}
+
+.table-container {
+    flex: 1;
+    overflow: auto;
+}
+
+.data-table {
+    border-collapse: collapse;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 13px;
+}
+
+.data-table td {
+    border: 1px solid var(--vscode-panel-border, #444);
+    padding: 3px 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    vertical-align: top;
+    min-width: 40px;
+}
+
+.data-table tr:first-child td {
+    position: relative;
+}
+
+.col-resize-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 5px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 1;
+}
+
+.col-resize-handle:hover,
+.col-resize-handle.dragging {
+    background: var(--vscode-focusBorder, #007acc);
+}
+
+.row-resize-handle {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 5px;
+    cursor: row-resize;
+    z-index: 1;
+}
+
+.row-resize-handle:hover,
+.row-resize-handle.dragging {
+    background: var(--vscode-focusBorder, #007acc);
+}
+
+.loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--vscode-foreground, #ccc);
+    opacity: 0.6;
+}
