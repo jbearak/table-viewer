@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { parse_xlsx } from './parse-xlsx';
 import { parse_xls } from './parse-xls';
+import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WorkbookData, WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
@@ -121,6 +122,8 @@ class ViewerPanel implements vscode.Disposable {
     }
 
     private async parse_file(): Promise<{ data: WorkbookData; warnings: string[] }> {
+        const stat = await vscode.workspace.fs.stat(this.uri);
+        assert_safe_file_size(stat.size);
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {

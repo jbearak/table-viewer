@@ -3,26 +3,31 @@ import type { WorkbookData, PerFileState, HostMessage } from '../types';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
 import { Table } from './table';
+import {
+    clamp_sheet_index,
+    normalize_per_file_state,
+    trim_sheet_state_array,
+} from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import './styles.css';
 
 export function App(): React.JSX.Element {
     const [workbook, set_workbook] = useState<WorkbookData | null>(null);
-    const [active_sheet, set_active_sheet] = useState<string>('');
+    const [active_sheet_index, set_active_sheet_index] = useState(0);
     const [show_formatting, set_show_formatting] = useState(true);
     const [vertical_tabs, set_vertical_tabs] = useState(false);
     const [column_widths, set_column_widths] = useState<
-        Record<string, Record<number, number>>
-    >({});
+        (Record<number, number> | undefined)[]
+    >([]);
     const [row_heights, set_row_heights] = useState<
-        Record<string, Record<number, number>>
-    >({});
+        (Record<number, number> | undefined)[]
+    >([]);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const state_ref = useRef<PerFileState>({});
     const scroll_positions_ref = useRef<
-        Record<string, { top: number; left: number }>
-    >({});
+        ({ top: number; left: number } | undefined)[]
+    >([]);
 
     const { persist_debounced, persist_immediate } =
         use_state_sync(state_ref);
@@ -33,16 +38,14 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'workbookData') {
                 set_workbook(msg.data);
-
-                const s = msg.state;
-                const first_sheet =
-                    msg.data.sheets[0]?.name ?? '';
-                const sheet_name = s.activeSheet ?? first_sheet;
-                set_active_sheet(sheet_name);
-                set_column_widths(s.columnWidths ?? {});
-                set_row_heights(s.rowHeights ?? {});
-                scroll_positions_ref.current =
-                    s.scrollPosition ?? {};
+                const s = normalize_per_file_state(
+                    msg.state,
+                    msg.data.sheets.map((sheet) => sheet.name)
+                );
+                set_active_sheet_index(s.activeSheetIndex ?? 0);
+                set_column_widths(s.columnWidths ?? []);
+                set_row_heights(s.rowHeights ?? []);
+                scroll_positions_ref.current = s.scrollPosition ?? [];
 
                 const tab_orient =
                     s.tabOrientation ?? null;
@@ -51,12 +54,11 @@ export function App(): React.JSX.Element {
                         ? tab_orient === 'vertical'
                         : msg.defaultTabOrientation === 'vertical'
                 );
-
                 state_ref.current = s;
 
                 requestAnimationFrame(() => {
                     const pos =
-                        scroll_positions_ref.current[sheet_name];
+                        scroll_positions_ref.current[s.activeSheetIndex ?? 0];
                     if (pos && scroll_ref.current) {
                         scroll_ref.current.scrollTop = pos.top;
                         scroll_ref.current.scrollLeft = pos.left;
@@ -66,49 +68,40 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'reload') {
                 set_workbook(msg.data);
+                const sheet_count = msg.data.sheets.length;
 
-                const new_names = new Set(
-                    msg.data.sheets.map((s) => s.name)
+                set_column_widths((prev) =>
+                    trim_sheet_state_array(prev, sheet_count)
+                );
+                set_row_heights((prev) =>
+                    trim_sheet_state_array(prev, sheet_count)
+                );
+                scroll_positions_ref.current = trim_sheet_state_array(
+                    scroll_positions_ref.current,
+                    sheet_count
                 );
 
-                // Clear persisted state for removed sheets
-                const clean_record = <T,>(
-                    rec: Record<string, T>
-                ): Record<string, T> => {
-                    const result: Record<string, T> = {};
-                    for (const key of Object.keys(rec)) {
-                        if (new_names.has(key)) result[key] = rec[key];
-                    }
-                    return result;
-                };
-
-                set_column_widths((prev) => clean_record(prev));
-                set_row_heights((prev) => clean_record(prev));
-                scroll_positions_ref.current = clean_record(
-                    scroll_positions_ref.current
+                const next_active_sheet_index = clamp_sheet_index(
+                    active_sheet_index,
+                    sheet_count
                 );
-
-                set_active_sheet((prev) => {
-                    if (new_names.has(prev)) return prev;
-                    return msg.data.sheets[0]?.name ?? '';
-                });
+                set_active_sheet_index(next_active_sheet_index);
 
                 state_ref.current = {
                     ...state_ref.current,
-                    columnWidths: clean_record(
-                        state_ref.current.columnWidths ?? {}
+                    columnWidths: trim_sheet_state_array(
+                        state_ref.current.columnWidths,
+                        sheet_count
                     ),
-                    rowHeights: clean_record(
-                        state_ref.current.rowHeights ?? {}
+                    rowHeights: trim_sheet_state_array(
+                        state_ref.current.rowHeights,
+                        sheet_count
                     ),
-                    scrollPosition: clean_record(
-                        state_ref.current.scrollPosition ?? {}
+                    scrollPosition: trim_sheet_state_array(
+                        state_ref.current.scrollPosition,
+                        sheet_count
                     ),
-                    activeSheet: new_names.has(
-                        state_ref.current.activeSheet ?? ''
-                    )
-                        ? state_ref.current.activeSheet
-                        : msg.data.sheets[0]?.name,
+                    activeSheetIndex: next_active_sheet_index,
                 };
                 persist_immediate();
             }
@@ -116,7 +109,7 @@ export function App(): React.JSX.Element {
 
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [persist_immediate]);
+    }, [active_sheet_index, persist_immediate]);
 
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
@@ -127,40 +120,39 @@ export function App(): React.JSX.Element {
         if (!el) return;
 
         const on_scroll = () => {
-            scroll_positions_ref.current[active_sheet] = {
+            scroll_positions_ref.current[active_sheet_index] = {
                 top: el.scrollTop,
                 left: el.scrollLeft,
             };
             state_ref.current = {
                 ...state_ref.current,
-                scrollPosition: { ...scroll_positions_ref.current },
+                scrollPosition: [...scroll_positions_ref.current],
             };
             persist_debounced();
         };
 
         el.addEventListener('scroll', on_scroll, { passive: true });
         return () => el.removeEventListener('scroll', on_scroll);
-    }, [active_sheet, persist_debounced]);
+    }, [active_sheet_index, persist_debounced]);
 
     const handle_sheet_select = useCallback(
-        (name: string) => {
+        (sheet_index: number) => {
             if (scroll_ref.current) {
-                scroll_positions_ref.current[active_sheet] = {
+                scroll_positions_ref.current[active_sheet_index] = {
                     top: scroll_ref.current.scrollTop,
                     left: scroll_ref.current.scrollLeft,
                 };
             }
-
-            set_active_sheet(name);
+            set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
-                activeSheet: name,
-                scrollPosition: { ...scroll_positions_ref.current },
+                activeSheetIndex: sheet_index,
+                scrollPosition: [...scroll_positions_ref.current],
             };
             persist_immediate();
 
             requestAnimationFrame(() => {
-                const pos = scroll_positions_ref.current[name];
+                const pos = scroll_positions_ref.current[sheet_index];
                 if (pos && scroll_ref.current) {
                     scroll_ref.current.scrollTop = pos.top;
                     scroll_ref.current.scrollLeft = pos.left;
@@ -170,7 +162,7 @@ export function App(): React.JSX.Element {
                 }
             });
         },
-        [active_sheet, persist_immediate]
+        [active_sheet_index, persist_immediate]
     );
 
     const handle_toggle_formatting = useCallback(() => {
@@ -192,44 +184,43 @@ export function App(): React.JSX.Element {
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
             set_column_widths((prev) => {
-                const sheet_widths = { ...(prev[active_sheet] ?? {}) };
+                const next = [...prev];
+                const sheet_widths = { ...(next[active_sheet_index] ?? {}) };
                 sheet_widths[col] = width;
-                const next = { ...prev, [active_sheet]: sheet_widths };
+                next[active_sheet_index] = sheet_widths;
                 state_ref.current = {
                     ...state_ref.current,
-                    columnWidths: next,
+                    columnWidths: [...next],
                 };
                 persist_immediate();
                 return next;
             });
         },
-        [active_sheet, persist_immediate]
+        [active_sheet_index, persist_immediate]
     );
 
     const handle_row_resize = useCallback(
         (row: number, height: number) => {
             set_row_heights((prev) => {
-                const sheet_heights = { ...(prev[active_sheet] ?? {}) };
+                const next = [...prev];
+                const sheet_heights = { ...(next[active_sheet_index] ?? {}) };
                 sheet_heights[row] = height;
-                const next = { ...prev, [active_sheet]: sheet_heights };
+                next[active_sheet_index] = sheet_heights;
                 state_ref.current = {
                     ...state_ref.current,
-                    rowHeights: next,
+                    rowHeights: [...next],
                 };
                 persist_immediate();
                 return next;
             });
         },
-        [active_sheet, persist_immediate]
+        [active_sheet_index, persist_immediate]
     );
 
     if (!workbook) {
         return <div className="loading">Loading...</div>;
     }
-
-    const current_sheet = workbook.sheets.find(
-        (s) => s.name === active_sheet
-    );
+    const current_sheet = workbook.sheets[active_sheet_index];
 
     if (!current_sheet) {
         return <div className="loading">No sheets found</div>;
@@ -251,7 +242,7 @@ export function App(): React.JSX.Element {
                 <div className="content-area">
                     <SheetTabs
                         sheets={sheet_names}
-                        active_sheet={active_sheet}
+                        active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         vertical={true}
                     />
@@ -259,10 +250,10 @@ export function App(): React.JSX.Element {
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={
-                            column_widths[active_sheet] ?? {}
+                            column_widths[active_sheet_index] ?? {}
                         }
                         row_heights={
-                            row_heights[active_sheet] ?? {}
+                            row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
                         on_row_resize={handle_row_resize}
@@ -273,7 +264,7 @@ export function App(): React.JSX.Element {
                 <>
                     <SheetTabs
                         sheets={sheet_names}
-                        active_sheet={active_sheet}
+                        active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         vertical={false}
                     />
@@ -281,10 +272,10 @@ export function App(): React.JSX.Element {
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={
-                            column_widths[active_sheet] ?? {}
+                            column_widths[active_sheet_index] ?? {}
                         }
                         row_heights={
-                            row_heights[active_sheet] ?? {}
+                            row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
                         on_row_resize={handle_row_resize}

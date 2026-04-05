@@ -1,5 +1,11 @@
 import CFB from 'cfb';
 import SSF from 'ssf';
+import {
+    assert_safe_sheet_count,
+    assert_safe_sheet_shape,
+    create_workbook_budget,
+    type WorkbookBudget,
+} from './spreadsheet-safety';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 // --- Constants ---
@@ -393,6 +399,7 @@ function parse_sheet_records(
     xfs: XfEntry[],
     fonts: FontEntry[],
     format_map: Map<number, string>,
+    budget: WorkbookBudget,
 ): SheetData {
     let row_count = 0;
     let col_count = 0;
@@ -616,6 +623,8 @@ function parse_sheet_records(
         }
     }
 
+    assert_safe_sheet_shape(budget, row_count, col_count, merges.length);
+
     // Build merged cells set
     const merged_cells = new Set<string>();
     for (const m of merges) {
@@ -702,6 +711,8 @@ export function parse_xls(buffer: Buffer): ParseResult {
     const xfs = read_xfs(records);
     const format_map = read_formats(records);
     const sheet_entries = read_bound_sheets(records);
+    assert_safe_sheet_count(sheet_entries.length);
+    const budget = create_workbook_budget();
 
     // Parse each sheet
     const sheets: SheetData[] = [];
@@ -728,7 +739,14 @@ export function parse_xls(buffer: Buffer): ParseResult {
         }
 
         const sheet_records = records.slice(start_idx, end_idx);
-        const sheet_data = parse_sheet_records(sheet_records, sst, xfs, fonts, format_map);
+        const sheet_data = parse_sheet_records(
+            sheet_records,
+            sst,
+            xfs,
+            fonts,
+            format_map,
+            budget
+        );
         sheet_data.name = entry.name;
         sheets.push(sheet_data);
     }

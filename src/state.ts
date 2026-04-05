@@ -1,13 +1,13 @@
 import type { ExtensionContext } from 'vscode';
-import type { PerFileState } from './types';
+import type { PerFileState, StoredPerFileState } from './types';
 
 const STATE_KEY = 'tableViewer.fileState';
 export const DEFAULT_MAX_STORED_FILES = 10_000;
 
-type StoredStateMap = Record<string, PerFileState>;
+type StoredStateMap = Record<string, StoredPerFileState>;
 
 export interface FileStateStore {
-    get(file_path: string): PerFileState;
+    get(file_path: string): StoredPerFileState;
     set(file_path: string, state: PerFileState): Promise<void>;
 }
 
@@ -39,7 +39,7 @@ export function create_file_state_store(
     let pending_write: Promise<void> = Promise.resolve();
 
     return {
-        get(file_path: string): PerFileState {
+        get(file_path: string): StoredPerFileState {
             const all = get_all_state(context);
             return all[file_path] ?? {};
         },

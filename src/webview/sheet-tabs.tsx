@@ -2,14 +2,14 @@ import React from 'react';
 
 interface SheetTabsProps {
     sheets: string[];
-    active_sheet: string;
-    on_select: (name: string) => void;
+    active_sheet_index: number;
+    on_select: (sheet_index: number) => void;
     vertical: boolean;
 }
 
 export function SheetTabs({
     sheets,
-    active_sheet,
+    active_sheet_index,
     on_select,
     vertical,
 }: SheetTabsProps): React.JSX.Element {
@@ -21,11 +21,11 @@ export function SheetTabs({
 
     return (
         <div className={class_name}>
-            {sheets.map((name) => (
+            {sheets.map((name, index) => (
                 <button
-                    key={name}
-                    className={`sheet-tab ${name === active_sheet ? 'active' : ''}`}
-                    onClick={() => on_select(name)}
+                    key={`${index}:${name}`}
+                    className={`sheet-tab ${index === active_sheet_index ? 'active' : ''}`}
+                    onClick={() => on_select(index)}
                 >
                     {name}
                 </button>
