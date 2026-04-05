@@ -23,7 +23,7 @@ export function Table({
     const merge_map = build_merge_map(sheet.merges);
 
     return (
-        <div className="table-container" ref={scroll_ref as React.RefObject<HTMLDivElement>}>
+        <div className="table-container" ref={scroll_ref as React.LegacyRef<HTMLDivElement>}>
             <table className="data-table">
                 <tbody>
                     {sheet.rows.map((row, r) => (
