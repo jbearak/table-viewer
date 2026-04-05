@@ -130,7 +130,7 @@ body {
     border: 1px solid var(--vscode-panel-border, #444);
     padding: 3px 6px;
     white-space: pre-wrap;
-    word-break: break-word;
+    overflow-wrap: break-word;
     vertical-align: top;
     min-width: 40px;
 }

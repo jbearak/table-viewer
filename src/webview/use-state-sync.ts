@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useEffect } from 'react';
 import type { PerFileState } from '../types';
 
 declare function acquireVsCodeApi(): {
@@ -15,6 +15,14 @@ export function use_state_sync(
     current_state: React.MutableRefObject<PerFileState>
 ) {
     const timer_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    useEffect(() => {
+        return () => {
+            if (timer_ref.current) {
+                clearTimeout(timer_ref.current);
+            }
+        };
+    }, []);
 
     const persist = useCallback(() => {
         vscode_api.postMessage({
