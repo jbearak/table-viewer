@@ -51,6 +51,16 @@ describe('expand_range_for_merges', () => {
         const range: SelectionRange = { start_row: 3, start_col: 3, end_row: 4, end_col: 4 };
         expect(expand_range_for_merges(range, merges)).toEqual(range);
     });
+    it('cascades expansion when merges are adjacent', () => {
+        const adjacent_merges: MergeRange[] = [
+            { startRow: 1, startCol: 1, endRow: 2, endCol: 2 },
+            { startRow: 2, startCol: 2, endRow: 3, endCol: 3 },
+        ];
+        const range: SelectionRange = { start_row: 1, start_col: 1, end_row: 1, end_col: 1 };
+        expect(expand_range_for_merges(range, adjacent_merges)).toEqual({
+            start_row: 1, start_col: 1, end_row: 3, end_col: 3,
+        });
+    });
     it('handles range already fully containing a merge', () => {
         const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 3, end_col: 3 };
         expect(expand_range_for_merges(range, merges)).toEqual(range);

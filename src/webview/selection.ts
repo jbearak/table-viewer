@@ -68,6 +68,8 @@ export function format_selection_for_clipboard(rows: (CellData | null)[][], rang
 
 export type Direction = 'up' | 'down' | 'left' | 'right';
 
+// Invariant: row/col must be a merge anchor or a non-merged cell (never an interior merged cell).
+// The use_selection hook enforces this by always resolving to anchors on click/navigate.
 export function move_active_cell(row: number, col: number, direction: Direction, row_count: number, col_count: number, merges: MergeRange[]): { row: number; col: number } {
     const current_merge = merges.find((m) => m.startRow === row && m.startCol === col);
     let next_row = row;
