@@ -22,6 +22,8 @@ const RT_BLANK = 0x0201;
 const RT_MERGECELLS = 0x00E5;
 const RT_LABEL = 0x0204;
 const RT_FILEPASS = 0x002F;
+const RT_FORMULA = 0x0006;
+const RT_STRING = 0x0207;
 
 const BIFF8_VERSION = 0x0600;
 
@@ -96,11 +98,17 @@ export function scan_records(buf: Buffer): ScanResult {
         }
     }
 
-    // Finalize any records that accumulated Continue chunks (single concat, not quadratic)
+    // Finalize Continue chunks: for most records, flatten into single buffer.
+    // For SST records, preserve chunk boundaries (needed for string decoding).
     for (const rec of records) {
         if (rec._chunks) {
-            rec.data = Buffer.concat(rec._chunks);
-            delete rec._chunks;
+            if (rec.type === 0x00FC) {
+                // SST: keep chunks for read_sst_chunked
+                // rec.data stays as the first chunk, _chunks has all chunks including first
+            } else {
+                rec.data = Buffer.concat(rec._chunks);
+                delete rec._chunks;
+            }
         }
     }
 
@@ -172,23 +180,120 @@ export function read_biff8_string(buf: Buffer, offset: number, char_count: numbe
 
 // --- Layer 2: Record Readers ---
 
+/**
+ * Read SST with proper CONTINUE boundary handling.
+ *
+ * When an SST spans CONTINUE records, a string can be split mid-character.
+ * Each CONTINUE chunk starts with a fresh compression flag byte that may
+ * differ from the original string's flag. We must decode strings chunk-aware.
+ */
 function read_sst(records: BiffRecord[]): string[] {
     const strings: string[] = [];
 
     for (const rec of records) {
         if (rec.type !== RT_SST) continue;
 
-        const buf = rec.data;
-        const unique_count = buf.readUInt32LE(4);
-        let pos = 8;
+        const chunks = rec._chunks ?? [rec.data];
 
-        for (let i = 0; i < unique_count && pos < buf.length; i++) {
-            const char_count = buf.readUInt16LE(pos);
-            pos += 2;
-            const result = read_biff8_string(buf, pos, char_count);
-            strings.push(result.value);
-            pos += result.bytesRead;
+        // Build a reader that tracks position across chunks
+        const total_buf = Buffer.concat(chunks);
+
+        // Absolute position in the concatenated buffer
+        // But we also track chunk boundaries for flag-byte re-reads
+        const chunk_offsets: number[] = [];
+        let running = 0;
+        for (const c of chunks) {
+            chunk_offsets.push(running);
+            running += c.length;
         }
+
+        const unique_count = total_buf.readUInt32LE(4);
+        let abs_pos = 8;
+
+        for (let i = 0; i < unique_count && abs_pos < total_buf.length; i++) {
+            if (abs_pos + 2 > total_buf.length) break;
+            const char_count = total_buf.readUInt16LE(abs_pos);
+            abs_pos += 2;
+
+            // Read flags
+            if (abs_pos >= total_buf.length) break;
+            const flags = total_buf[abs_pos];
+            abs_pos += 1;
+
+            const has_rich_text = (flags & 0x08) !== 0;
+            const has_ext_string = (flags & 0x04) !== 0;
+
+            let rich_text_runs = 0;
+            let ext_string_size = 0;
+
+            if (has_rich_text) {
+                if (abs_pos + 2 > total_buf.length) break;
+                rich_text_runs = total_buf.readUInt16LE(abs_pos);
+                abs_pos += 2;
+            }
+            if (has_ext_string) {
+                if (abs_pos + 4 > total_buf.length) break;
+                ext_string_size = total_buf.readUInt32LE(abs_pos);
+                abs_pos += 4;
+            }
+
+            // Now read char_count characters, handling CONTINUE boundaries
+            let is_utf16 = (flags & 0x01) !== 0;
+            let value = '';
+            let chars_remaining = char_count;
+
+            while (chars_remaining > 0 && abs_pos < total_buf.length) {
+                // Find which chunk we're in
+                let current_chunk = 0;
+                for (let ci = chunk_offsets.length - 1; ci >= 0; ci--) {
+                    if (abs_pos >= chunk_offsets[ci]) {
+                        current_chunk = ci;
+                        break;
+                    }
+                }
+
+                // How many bytes until the next chunk boundary?
+                const chunk_end = current_chunk + 1 < chunk_offsets.length
+                    ? chunk_offsets[current_chunk + 1]
+                    : total_buf.length;
+                const bytes_left_in_chunk = chunk_end - abs_pos;
+
+                // How many characters can we read from this chunk?
+                const char_size = is_utf16 ? 2 : 1;
+                const chars_in_chunk = Math.min(
+                    chars_remaining,
+                    Math.floor(bytes_left_in_chunk / char_size)
+                );
+
+                if (chars_in_chunk > 0) {
+                    if (is_utf16) {
+                        value += total_buf.toString('utf16le', abs_pos, abs_pos + chars_in_chunk * 2);
+                        abs_pos += chars_in_chunk * 2;
+                    } else {
+                        for (let j = 0; j < chars_in_chunk; j++) {
+                            value += String.fromCharCode(total_buf[abs_pos + j]);
+                        }
+                        abs_pos += chars_in_chunk;
+                    }
+                    chars_remaining -= chars_in_chunk;
+                }
+
+                // If we hit a chunk boundary mid-string, read the new compression flag
+                if (chars_remaining > 0 && abs_pos >= chunk_end && abs_pos < total_buf.length) {
+                    const new_flags = total_buf[abs_pos];
+                    abs_pos += 1;
+                    is_utf16 = (new_flags & 0x01) !== 0;
+                }
+            }
+
+            // Skip rich text run data and extended string data
+            abs_pos += rich_text_runs * 4;
+            abs_pos += ext_string_size;
+
+            strings.push(value);
+        }
+
+        delete rec._chunks;
         break;
     }
 
@@ -202,7 +307,8 @@ function read_fonts(records: BiffRecord[]): FontEntry[] {
         if (rec.type !== RT_FONT) continue;
         const buf = rec.data;
         const grbit = buf.readUInt16LE(2);
-        const weight = buf.readUInt16LE(4);
+        // BIFF8 FONT: 0-1 height, 2-3 grbit, 4-5 color index, 6-7 bold weight
+        const weight = buf.readUInt16LE(6);
         const italic = (grbit & 0x02) !== 0;
         const bold = weight >= 700;
         fonts.push({ bold, italic });
@@ -258,10 +364,14 @@ function read_bound_sheets(records: BiffRecord[]): SheetEntry[] {
 function format_value(raw: number, xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): string {
     if (xf_index >= xfs.length) return String(raw);
     const xf = xfs[xf_index];
-    const fmt = format_map.get(xf.format_index);
-    if (!fmt) return String(raw);
+    const fmt_index = xf.format_index;
+    const fmt = format_map.get(fmt_index);
     try {
-        return SSF.format(fmt, raw);
+        if (fmt) {
+            return SSF.format(fmt, raw);
+        }
+        // SSF handles built-in format indices (0-49) natively
+        return SSF.format(fmt_index, raw);
     } catch {
         return String(raw);
     }
@@ -288,6 +398,9 @@ function parse_sheet_records(
     let col_count = 0;
     const cells = new Map<string, CellData>();
     const merges: MergeRange[] = [];
+    // Track last FORMULA cell so a following STRING record can fill its value
+    let pending_formula_key: string | null = null;
+    let pending_formula_style: { bold: boolean; italic: boolean } = { bold: false, italic: false };
 
     for (const rec of records) {
         switch (rec.type) {
@@ -415,6 +528,73 @@ function parse_sheet_records(
                     raw: result.value, formatted: result.value,
                     bold: style.bold, italic: style.italic,
                 });
+                break;
+            }
+
+            case RT_FORMULA: {
+                // FORMULA record: row(2), col(2), xf(2), result(8), flags(2), reserved(4), ...
+                const buf = rec.data;
+                if (buf.length < 20) break;
+                const row = buf.readUInt16LE(0);
+                const col = buf.readUInt16LE(2);
+                const xf_index = buf.readUInt16LE(4);
+                const style = get_style(xf_index, xfs, fonts);
+                const key = `${row}:${col}`;
+
+                // Bytes 12-13 of the result (offset 6+6=12, 6+7=13) indicate the type:
+                // If byte 6+6 (offset 12) == 0xFF and byte 6+7 (offset 13) == 0xFF,
+                // the result is NOT a number — check byte 6 for the type.
+                // Actually in BIFF8: result is at offset 6, 8 bytes.
+                // If bytes 12-13 (last 2 of the 8-byte result) == 0xFFFF, it's a special value.
+                const result_high = buf.readUInt16LE(12);
+                if (result_high === 0xFFFF) {
+                    const result_type = buf[6];
+                    if (result_type === 0) {
+                        // String result — the actual string comes in a following STRING record
+                        pending_formula_key = key;
+                        pending_formula_style = style;
+                    } else if (result_type === 1) {
+                        // Boolean
+                        const bool_val = buf[8] === 1;
+                        cells.set(key, {
+                            raw: bool_val,
+                            formatted: bool_val ? 'TRUE' : 'FALSE',
+                            bold: style.bold, italic: style.italic,
+                        });
+                    } else if (result_type === 2) {
+                        // Error
+                        const error_codes: Record<number, string> = {
+                            0x00: '#NULL!', 0x07: '#DIV/0!', 0x0F: '#VALUE!',
+                            0x17: '#REF!', 0x1D: '#NAME?', 0x24: '#NUM!', 0x2A: '#N/A',
+                        };
+                        const err_val = buf[8];
+                        const formatted = error_codes[err_val] ?? `#ERR(${err_val})`;
+                        cells.set(key, { raw: formatted, formatted, bold: style.bold, italic: style.italic });
+                    } else if (result_type === 3) {
+                        // Empty string
+                        cells.set(key, { raw: '', formatted: '', bold: style.bold, italic: style.italic });
+                    }
+                } else {
+                    // Numeric result — read as IEEE 754 double
+                    const value = buf.readDoubleLE(6);
+                    const formatted = format_value(value, xf_index, xfs, format_map);
+                    cells.set(key, { raw: value, formatted, bold: style.bold, italic: style.italic });
+                }
+                break;
+            }
+
+            case RT_STRING: {
+                // STRING record follows a FORMULA when the cached result is a string
+                if (!pending_formula_key) break;
+                const buf = rec.data;
+                if (buf.length < 3) break;
+                const char_count = buf.readUInt16LE(0);
+                const result = read_biff8_string(buf, 2, char_count);
+                cells.set(pending_formula_key, {
+                    raw: result.value, formatted: result.value,
+                    bold: pending_formula_style.bold, italic: pending_formula_style.italic,
+                });
+                pending_formula_key = null;
                 break;
             }
 
