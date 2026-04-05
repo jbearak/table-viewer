@@ -883,5 +883,20 @@ export function parse_xls(buffer: Buffer): ParseResult {
         sheets.push(sheet_data);
     }
 
-    return { data: { sheets }, warnings };
+    return { data: { sheets, hasFormatting: has_formatting(sheets) }, warnings };
+}
+
+function has_formatting(sheets: SheetData[]): boolean {
+    for (const sheet of sheets) {
+        for (const row of sheet.rows) {
+            for (const cell of row) {
+                if (!cell || cell.raw === null) continue;
+                const display = typeof cell.raw === 'boolean'
+                    ? (cell.raw ? 'TRUE' : 'FALSE')
+                    : String(cell.raw);
+                if (cell.formatted !== display) return true;
+            }
+        }
+    }
+    return false;
 }

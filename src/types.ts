@@ -1,5 +1,6 @@
 export interface WorkbookData {
     sheets: SheetData[];
+    hasFormatting: boolean;
 }
 
 export interface SheetData {

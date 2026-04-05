@@ -229,18 +229,22 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = workbook.sheets.map((s) => s.name);
+    const has_multiple_sheets = workbook.sheets.length > 1;
+    const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
 
     return (
-        <div className={`viewer ${vertical_tabs ? 'vertical-tabs' : ''}`}>
+        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
+                show_formatting_button={workbook.hasFormatting}
                 vertical_tabs={vertical_tabs}
                 on_toggle_tab_orientation={
                     handle_toggle_tab_orientation
                 }
+                show_vertical_tabs_button={has_multiple_sheets}
             />
-            {vertical_tabs ? (
+            {effective_vertical_tabs ? (
                 <div className="content-area">
                     <SheetTabs
                         sheets={sheet_names}
