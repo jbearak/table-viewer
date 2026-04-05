@@ -5,9 +5,10 @@ import {
     expand_range_for_merges,
     resolve_merge_anchor,
     move_active_cell,
+    format_selection_for_clipboard,
     type SelectionRange,
 } from '../webview/selection';
-import type { MergeRange } from '../types';
+import type { MergeRange, CellData } from '../types';
 
 describe('normalize_range', () => {
     it('returns top-left to bottom-right regardless of input order', () => {
@@ -98,5 +99,49 @@ describe('move_active_cell', () => {
         const merges: MergeRange[] = [{ startRow: 1, startCol: 0, endRow: 2, endCol: 0 }];
         expect(move_active_cell(0, 0, 'down', row_count, col_count, merges)).toEqual({ row: 1, col: 0 });
         expect(move_active_cell(1, 0, 'down', row_count, col_count, merges)).toEqual({ row: 3, col: 0 });
+    });
+});
+
+function cell(raw: string | number | null, formatted?: string): CellData {
+    return { raw, formatted: formatted ?? String(raw ?? ''), bold: false, italic: false };
+}
+
+describe('format_selection_for_clipboard', () => {
+    const rows: (CellData | null)[][] = [
+        [cell('A1'), cell('B1'), cell('C1')],
+        [cell('A2'), cell('B2'), cell('C2')],
+        [cell('A3'), cell('B3'), cell('C3')],
+    ];
+    it('formats single cell as plain text', () => {
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 0 };
+        expect(format_selection_for_clipboard(rows, range, [], true)).toBe('A1');
+    });
+    it('formats multi-cell range as TSV', () => {
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 1, end_col: 1 };
+        expect(format_selection_for_clipboard(rows, range, [], true)).toBe('A1\tB1\nA2\tB2');
+    });
+    it('uses raw values when show_formatting is false', () => {
+        const rows_with_fmt: (CellData | null)[][] = [[cell(42, '$42.00'), cell(100, '$100.00')]];
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 1 };
+        expect(format_selection_for_clipboard(rows_with_fmt, range, [], false)).toBe('42\t100');
+    });
+    it('uses formatted values when show_formatting is true', () => {
+        const rows_with_fmt: (CellData | null)[][] = [[cell(42, '$42.00'), cell(100, '$100.00')]];
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 1 };
+        expect(format_selection_for_clipboard(rows_with_fmt, range, [], true)).toBe('$42.00\t$100.00');
+    });
+    it('handles null cells as empty strings', () => {
+        const rows_with_null: (CellData | null)[][] = [[cell('A1'), null, cell('C1')]];
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 2 };
+        expect(format_selection_for_clipboard(rows_with_null, range, [], true)).toBe('A1\t\tC1');
+    });
+    it('places merged cell value at top-left only, empty elsewhere', () => {
+        const merged_rows: (CellData | null)[][] = [
+            [cell('merged'), null, cell('C1')],
+            [null, null, cell('C2')],
+        ];
+        const merges: MergeRange[] = [{ startRow: 0, startCol: 0, endRow: 1, endCol: 1 }];
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 1, end_col: 2 };
+        expect(format_selection_for_clipboard(merged_rows, range, merges, true)).toBe('merged\t\tC1\n\t\tC2');
     });
 });

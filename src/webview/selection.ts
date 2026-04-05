@@ -37,6 +37,35 @@ export function resolve_merge_anchor(row: number, col: number, merges: MergeRang
     return { row, col };
 }
 
+export function format_selection_for_clipboard(rows: (CellData | null)[][], range: SelectionRange, merges: MergeRange[], show_formatting: boolean): string {
+    const n = normalize_range(range);
+    function cell_text(cell: CellData | null): string {
+        if (!cell) return '';
+        if (show_formatting) return cell.formatted;
+        return cell.raw !== null ? String(cell.raw) : '';
+    }
+    const hidden = new Set<string>();
+    for (const m of merges) {
+        for (let r = m.startRow; r <= m.endRow; r++) {
+            for (let c = m.startCol; c <= m.endCol; c++) {
+                if (r === m.startRow && c === m.startCol) continue;
+                hidden.add(`${r}:${c}`);
+            }
+        }
+    }
+    const output_rows: string[] = [];
+    for (let r = n.start_row; r <= n.end_row; r++) {
+        const row = rows[r];
+        const cells: string[] = [];
+        for (let c = n.start_col; c <= n.end_col; c++) {
+            if (hidden.has(`${r}:${c}`)) { cells.push(''); }
+            else { cells.push(cell_text(row?.[c] ?? null)); }
+        }
+        output_rows.push(cells.join('\t'));
+    }
+    return output_rows.join('\n');
+}
+
 export type Direction = 'up' | 'down' | 'left' | 'right';
 
 export function move_active_cell(row: number, col: number, direction: Direction, row_count: number, col_count: number, merges: MergeRange[]): { row: number; col: number } {
