@@ -23,7 +23,7 @@ export function serial_to_iso(serial: number, datemode: DateMode): string {
 }
 
 /** Elapsed-time formats use bracketed hour/minute/second tokens like [h], [mm], [ss]. */
-const ELAPSED_TIME_RE = /\[[hms]\]/i;
+const ELAPSED_TIME_RE = /\[[hms]+\]/i;
 
 /** Check whether an XF format index refers to a date/time format. */
 export function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): boolean {

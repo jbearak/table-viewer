@@ -3,6 +3,7 @@ import {
     assert_safe_sheet_count,
     assert_safe_sheet_shape,
     create_workbook_budget,
+    type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
 import { serial_to_iso, is_date_format, format_value, get_style } from './spreadsheet-format';
@@ -32,6 +33,16 @@ function is_tag_boundary(ch: string | undefined): boolean {
     return ch === '>' || ch === ' ' || ch === '/' || ch === '\t' || ch === '\n' || ch === '\r';
 }
 
+/** Check whether the region between start and tag_end represents a self-closing tag (handles `<tag/>` and `<tag />`). */
+function is_self_closing(xml: string, start: number, tag_end: number): boolean {
+    for (let i = tag_end - 1; i > start; i--) {
+        const ch = xml[i];
+        if (ch === '/') return true;
+        if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') return false;
+    }
+    return false;
+}
+
 /**
  * Iterate every occurrence of `<tag ...>...</tag>` or self-closing `<tag .../>`.
  * Calls `cb` with the full opening tag string and inner content (empty for self-closing).
@@ -55,7 +66,7 @@ function iter_elements(xml: string, tag: string, cb: (open_tag: string, inner: s
 
         const open_tag = xml.substring(start, tag_end + 1);
 
-        if (xml[tag_end - 1] === '/') {
+        if (is_self_closing(xml, start, tag_end)) {
             // Self-closing
             cb(open_tag, '');
             pos = tag_end + 1;
@@ -85,7 +96,7 @@ function get_text(xml: string, tag: string): string | null {
         }
         const tag_end = xml.indexOf('>', start);
         if (tag_end === -1) return null;
-        if (xml[tag_end - 1] === '/') return '';
+        if (is_self_closing(xml, start, tag_end)) return '';
         const close = `</${tag}>`;
         const close_pos = xml.indexOf(close, tag_end);
         if (close_pos === -1) return null;
@@ -243,10 +254,15 @@ function parse_worksheet(
     xfs: XfEntry[],
     fonts: FontEntry[],
     format_map: Map<number, string>,
-    datemode: DateMode
+    datemode: DateMode,
+    budget: WorkbookBudget
 ): { rows: (CellData | null)[][]; merges: MergeRange[]; row_count: number; col_count: number } {
-    // Parse dimension
+    // Parse dimension and validate row/col limits early before materializing cells
     const dim = parse_dimension(xml);
+    if (dim && dim.row_count > 0 && dim.col_count > 0) {
+        // Check row/col limits without mutating budget — full budget check happens after parsing
+        assert_safe_sheet_shape({ total_cells: 0 }, dim.row_count, dim.col_count, 0);
+    }
 
     // Parse merge cells
     const merges: MergeRange[] = [];
@@ -329,6 +345,12 @@ function parse_worksheet(
                         }
                     }
                     formatted = raw !== null ? String(raw) : '';
+                } else if (t === 'd') {
+                    // ISO 8601 date cell
+                    if (v_text !== null && v_text !== '') {
+                        raw = v_text;
+                        formatted = v_text;
+                    }
                 } else {
                     // Numeric (default) — includes dates, formulas with numeric results
                     if (v_text !== null && v_text !== '') {
@@ -356,6 +378,9 @@ function parse_worksheet(
     // Use dimension if available and non-degenerate, otherwise fall back to observed max
     const row_count = dim && dim.row_count > 0 ? Math.max(dim.row_count, max_row) : max_row;
     const col_count = dim && dim.col_count > 0 ? Math.max(dim.col_count, max_col) : max_col;
+
+    // Validate final shape (catches cells beyond dimension and merge count)
+    assert_safe_sheet_shape(budget, row_count, col_count, merges.length);
 
     // Build rows array
     const rows: (CellData | null)[][] = [];
@@ -441,10 +466,8 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         }
 
         const { rows, merges, row_count, col_count } = parse_worksheet(
-            ws_xml, sst, xfs, fonts, format_map, datemode
+            ws_xml, sst, xfs, fonts, format_map, datemode, budget
         );
-
-        assert_safe_sheet_shape(budget, row_count, col_count, merges.length);
 
         sheets.push({
             name: entry.name,
