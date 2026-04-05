@@ -31,6 +31,8 @@ export interface BiffRecord {
     type: number;
     data: Buffer;
     offset: number;
+    /** @internal Used during scanning to collect Continue chunks before final concat */
+    _chunks?: Buffer[];
 }
 
 export interface ParseResult {
@@ -85,9 +87,20 @@ export function scan_records(buf: Buffer): ScanResult {
 
         if (type === RECORD_CONTINUE && records.length > 0) {
             const prev = records[records.length - 1];
-            prev.data = Buffer.concat([prev.data, data]);
+            if (!prev._chunks) {
+                prev._chunks = [prev.data];
+            }
+            prev._chunks.push(data);
         } else {
             records.push({ type, data, offset });
+        }
+    }
+
+    // Finalize any records that accumulated Continue chunks (single concat, not quadratic)
+    for (const rec of records) {
+        if (rec._chunks) {
+            rec.data = Buffer.concat(rec._chunks);
+            delete rec._chunks;
         }
     }
 
@@ -332,11 +345,12 @@ function parse_sheet_records(
 
             case RT_MULRK: {
                 const buf = rec.data;
+                if (buf.length < 6) break; // minimum: row(2) + first_col(2) + last_col(2)
                 const row = buf.readUInt16LE(0);
                 const first_col = buf.readUInt16LE(2);
                 const last_col = buf.readUInt16LE(buf.length - 2);
                 let pos = 4;
-                for (let c = first_col; c <= last_col; c++) {
+                for (let c = first_col; c <= last_col && pos + 6 <= buf.length - 2; c++) {
                     const xf_index = buf.readUInt16LE(pos);
                     const rk_val = buf.readInt32LE(pos + 2);
                     const value = decode_rk(rk_val);
@@ -406,9 +420,10 @@ function parse_sheet_records(
 
             case RT_MERGECELLS: {
                 const buf = rec.data;
+                if (buf.length < 2) break;
                 const count = buf.readUInt16LE(0);
                 let pos = 2;
-                for (let i = 0; i < count; i++) {
+                for (let i = 0; i < count && pos + 8 <= buf.length; i++) {
                     const startRow = buf.readUInt16LE(pos);
                     const endRow = buf.readUInt16LE(pos + 2);
                     const startCol = buf.readUInt16LE(pos + 4);
