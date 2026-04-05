@@ -120,7 +120,7 @@ class ViewerPanel implements vscode.Disposable {
         }
     }
 
-    private async parse_file(): Promise<WorkbookData> {
+    private async parse_file(): Promise<{ data: WorkbookData; warnings: string[] }> {
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {
@@ -131,7 +131,7 @@ class ViewerPanel implements vscode.Disposable {
 
     private async send_initial_data(): Promise<void> {
         try {
-            const data = await this.parse_file();
+            const { data, warnings } = await this.parse_file();
             const state = this.state_store.get(this.file_path);
             const config = vscode.workspace.getConfiguration('tableViewer');
             const default_orientation = config.get<'horizontal' | 'vertical'>(
@@ -145,20 +145,26 @@ class ViewerPanel implements vscode.Disposable {
                 state,
                 defaultTabOrientation: default_orientation,
             });
+
+            if (warnings.length > 0) {
+                vscode.window.showWarningMessage(warnings[0]);
+            }
         } catch (err) {
-            vscode.window.showErrorMessage(
-                `Failed to open file: ${err}`
-            );
+            const message = err instanceof Error ? err.message : String(err);
+            vscode.window.showErrorMessage(message);
         }
     }
 
     private async send_reload(): Promise<void> {
         try {
-            const data = await this.parse_file();
+            const { data, warnings } = await this.parse_file();
             this.panel.webview.postMessage({
                 type: 'reload',
                 data,
             });
+            if (warnings.length > 0) {
+                vscode.window.showWarningMessage(warnings[0]);
+            }
         } catch {
             // File may be mid-write; ignore transient errors
         }
