@@ -86,6 +86,7 @@
     "@types/vscode": "^1.110.0",
     "@vscode/vsce": "^2.26.0",
     "esbuild": "^0.28.0",
+    "jsdom": "^29.0.1",
     "typescript": "^5.4.0",
     "vitest": "^4.1.2"
   }

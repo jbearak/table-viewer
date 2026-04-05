@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Add vitest and configure test infrastructure
+## Task 1: Add vitest and configure test infrastructure
 
 **Files:**
 - Create: `vitest.config.ts`
@@ -61,7 +61,7 @@ git commit -m "chore: add vitest test infrastructure"
 
 ---
 
-### Task 2: Generate test fixture .xls files
+## Task 2: Generate test fixture .xls files
 
 Use the currently-installed `xlsx` library to generate fixture files before we remove it. This ensures the fixtures are valid BIFF8 files.
 
@@ -223,7 +223,7 @@ git commit -m "test: add .xls fixture files for BIFF8 parser tests"
 
 ---
 
-### Task 3: Write parity baseline tests using current xlsx parser
+## Task 3: Write parity baseline tests using current xlsx parser
 
 Before rewriting `parse_xls`, capture its current output as the expected baseline. These tests will later verify the new parser produces identical results.
 
@@ -357,7 +357,7 @@ git commit -m "test: add parity baseline tests for .xls parser"
 
 ---
 
-### Task 4: Replace XLSX.SSF with standalone ssf in parse-xlsx.ts
+## Task 4: Replace XLSX.SSF with standalone ssf in parse-xlsx.ts
 
 The quick win — swap one import and one call site.
 
@@ -441,7 +441,7 @@ git commit -m "refactor: replace XLSX.SSF with standalone ssf package"
 
 ---
 
-### Task 5: Build the BIFF8 record scanner (Layer 1)
+## Task 5: Build the BIFF8 record scanner (Layer 1)
 
 The low-level layer: extract BIFF8 records from a byte buffer, handling Continue record stitching.
 
@@ -598,7 +598,7 @@ git commit -m "feat: implement BIFF8 record scanner with Continue stitching"
 
 ---
 
-### Task 6: Build BIFF8 string decoder and RK number decoder
+## Task 6: Build BIFF8 string decoder and RK number decoder
 
 The two trickiest encoding details, tested in isolation.
 
@@ -730,6 +730,9 @@ export interface StringReadResult {
 
 export function read_biff8_string(buf: Buffer, offset: number, char_count: number): StringReadResult {
     let pos = offset;
+    if (pos >= buf.length) {
+        return { value: '', bytesRead: 0 };
+    }
     const flags = buf[pos];
     pos += 1;
 
@@ -741,31 +744,41 @@ export function read_biff8_string(buf: Buffer, offset: number, char_count: numbe
     let ext_string_size = 0;
 
     if (has_rich_text) {
+        if (pos + 2 > buf.length) {
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
         rich_text_runs = buf.readUInt16LE(pos);
         pos += 2;
     }
     if (has_ext_string) {
-        ext_string_size = buf.readInt32LE(pos);
+        if (pos + 4 > buf.length) {
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
+        ext_string_size = buf.readUInt32LE(pos);
         pos += 4;
     }
 
     let value: string;
     if (is_utf16) {
-        value = buf.toString('utf16le', pos, pos + char_count * 2);
-        pos += char_count * 2;
+        const bytes_available = Math.max(0, buf.length - pos);
+        const chars_available = Math.floor(bytes_available / 2);
+        const chars_to_read = Math.min(char_count, chars_available);
+        value = buf.toString('utf16le', pos, pos + chars_to_read * 2);
+        pos += chars_to_read * 2;
     } else {
         // Compressed Latin-1: each byte is a code point
         value = '';
-        for (let i = 0; i < char_count; i++) {
+        const chars_to_read = Math.min(char_count, Math.max(0, buf.length - pos));
+        for (let i = 0; i < chars_to_read; i++) {
             value += String.fromCharCode(buf[pos + i]);
         }
-        pos += char_count;
+        pos += chars_to_read;
     }
 
     // Skip rich text run data (4 bytes per run)
-    pos += rich_text_runs * 4;
+    pos = Math.min(buf.length, pos + rich_text_runs * 4);
     // Skip extended string data
-    pos += ext_string_size;
+    pos = Math.min(buf.length, pos + ext_string_size);
 
     return { value, bytesRead: pos - offset };
 }
@@ -785,7 +798,7 @@ git commit -m "feat: implement BIFF8 RK number and string decoders"
 
 ---
 
-### Task 7: Build the BIFF8 record interpreter (Layer 2) and parse_xls function
+## Task 7: Build the BIFF8 record interpreter (Layer 2) and parse_xls function
 
 The main parser that walks records and builds `WorkbookData`.
 
@@ -1272,7 +1285,7 @@ git commit -m "feat: implement BIFF8 record interpreter and parse_xls function"
 
 ---
 
-### Task 8: Update custom-editor.ts for new return type and error handling
+## Task 8: Update custom-editor.ts for new return type and error handling
 
 **Files:**
 - Modify: `src/custom-editor.ts`
@@ -1418,7 +1431,7 @@ git commit -m "feat: surface parser warnings and specific error messages"
 
 ---
 
-### Task 9: Remove xlsx dependency and final verification
+## Task 9: Remove xlsx dependency and final verification
 
 **Files:**
 - Modify: `package.json`
@@ -1469,7 +1482,7 @@ git commit -m "fix: remove vulnerable xlsx dependency (GHSA-4r6h-8v6p-xvw6, GHSA
 
 ---
 
-### Task 10: Add edge case tests
+## Task 10: Add edge case tests
 
 **Files:**
 - Modify: `src/test/parse-xls.test.ts`

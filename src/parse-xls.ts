@@ -14,6 +14,7 @@ const RECORD_CONTINUE = 0x003C;
 const RT_BOF = 0x0809;
 const RT_EOF = 0x000A;
 const RT_BOUNDSHEET8 = 0x0085;
+const RT_DATEMODE = 0x0022;
 const RT_SST = 0x00FC;
 const RT_FONT = 0x0031;
 const RT_XF = 0x00E0;
@@ -66,6 +67,12 @@ interface FontEntry {
 interface XfEntry {
     font_index: number;
     format_index: number;
+}
+
+type DateMode = 0 | 1;
+
+function warn_malformed_record(message: string): void {
+    console.warn(`[parse-xls] ${message}`);
 }
 
 // --- Layer 1: Record Scanner ---
@@ -148,6 +155,10 @@ export function decode_rk(rk: number): number {
 
 export function read_biff8_string(buf: Buffer, offset: number, char_count: number): StringReadResult {
     let pos = offset;
+    if (pos >= buf.length) {
+        warn_malformed_record('Skipping truncated BIFF8 string with missing flags byte');
+        return { value: '', bytesRead: 0 };
+    }
     const flags = buf[pos];
     pos += 1;
 
@@ -159,28 +170,46 @@ export function read_biff8_string(buf: Buffer, offset: number, char_count: numbe
     let ext_string_size = 0;
 
     if (has_rich_text) {
+        if (pos + 2 > buf.length) {
+            warn_malformed_record('Skipping truncated BIFF8 string with missing rich text run count');
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
         rich_text_runs = buf.readUInt16LE(pos);
         pos += 2;
     }
     if (has_ext_string) {
+        if (pos + 4 > buf.length) {
+            warn_malformed_record('Skipping truncated BIFF8 string with missing extended string size');
+            return { value: '', bytesRead: Math.max(0, buf.length - offset) };
+        }
         ext_string_size = buf.readUInt32LE(pos);
         pos += 4;
     }
 
     let value: string;
     if (is_utf16) {
-        value = buf.toString('utf16le', pos, pos + char_count * 2);
-        pos += char_count * 2;
+        const bytes_available = Math.max(0, buf.length - pos);
+        const chars_available = Math.floor(bytes_available / 2);
+        const chars_to_read = Math.min(char_count, chars_available);
+        if (chars_to_read < char_count) {
+            warn_malformed_record('Truncated UTF-16 BIFF8 string; returning partial value');
+        }
+        value = buf.toString('utf16le', pos, pos + chars_to_read * 2);
+        pos += chars_to_read * 2;
     } else {
         value = '';
-        for (let i = 0; i < char_count; i++) {
+        const chars_to_read = Math.min(char_count, Math.max(0, buf.length - pos));
+        if (chars_to_read < char_count) {
+            warn_malformed_record('Truncated compressed BIFF8 string; returning partial value');
+        }
+        for (let i = 0; i < chars_to_read; i++) {
             value += String.fromCharCode(buf[pos + i]);
         }
-        pos += char_count;
+        pos += chars_to_read;
     }
 
-    pos += rich_text_runs * 4;
-    pos += ext_string_size;
+    pos = Math.min(buf.length, pos + rich_text_runs * 4);
+    pos = Math.min(buf.length, pos + ext_string_size);
 
     return { value, bytesRead: pos - offset };
 }
@@ -254,6 +283,10 @@ function read_biff8_string_chunked(
             Math.floor(bytes_left_in_chunk / char_size)
         );
 
+        if (is_utf16 && chars_in_chunk === 0 && bytes_left_in_chunk === 1) {
+            throw new Error('Truncated UTF-16 input in BIFF8 string continuation');
+        }
+
         if (chars_in_chunk > 0) {
             if (is_utf16) {
                 value += total_buf.toString('utf16le', abs_pos, abs_pos + chars_in_chunk * 2);
@@ -308,17 +341,28 @@ function read_sst(records: BiffRecord[]): string[] {
             chunk_offsets.push(running);
             running += c.length;
         }
+        if (total_buf.length < 8) {
+            warn_malformed_record('Skipping truncated SST record header');
+            delete rec._chunks;
+            break;
+        }
 
         const unique_count = total_buf.readUInt32LE(4);
         let abs_pos = 8;
 
         for (let i = 0; i < unique_count && abs_pos < total_buf.length; i++) {
-            if (abs_pos + 2 > total_buf.length) break;
+            if (abs_pos + 2 > total_buf.length) {
+                warn_malformed_record('Stopping SST parsing at truncated character count');
+                break;
+            }
             const char_count = total_buf.readUInt16LE(abs_pos);
             abs_pos += 2;
 
             // Read flags
-            if (abs_pos >= total_buf.length) break;
+            if (abs_pos >= total_buf.length) {
+                warn_malformed_record('Stopping SST parsing at truncated flags byte');
+                break;
+            }
             const flags = total_buf[abs_pos];
             abs_pos += 1;
 
@@ -343,6 +387,7 @@ function read_sst(records: BiffRecord[]): string[] {
             let is_utf16 = (flags & 0x01) !== 0;
             let value = '';
             let chars_remaining = char_count;
+            let trailing_utf16_byte: number | null = null;
 
             while (chars_remaining > 0 && abs_pos < total_buf.length) {
                 // Find which chunk we're in
@@ -367,6 +412,10 @@ function read_sst(records: BiffRecord[]): string[] {
                     Math.floor(bytes_left_in_chunk / char_size)
                 );
 
+                if (is_utf16 && chars_in_chunk === 0 && bytes_left_in_chunk === 1) {
+                    throw new Error('Truncated UTF-16 input in BIFF8 string continuation');
+                }
+
                 if (chars_in_chunk > 0) {
                     if (is_utf16) {
                         value += total_buf.toString('utf16le', abs_pos, abs_pos + chars_in_chunk * 2);
@@ -378,6 +427,9 @@ function read_sst(records: BiffRecord[]): string[] {
                         abs_pos += chars_in_chunk;
                     }
                     chars_remaining -= chars_in_chunk;
+                } else if (is_utf16 && bytes_left_in_chunk === 1) {
+                    trailing_utf16_byte = total_buf[abs_pos];
+                    abs_pos += 1;
                 }
 
                 // If we hit a chunk boundary mid-string, read the new compression flag
@@ -385,12 +437,25 @@ function read_sst(records: BiffRecord[]): string[] {
                     const new_flags = total_buf[abs_pos];
                     abs_pos += 1;
                     is_utf16 = (new_flags & 0x01) !== 0;
+                    if (trailing_utf16_byte !== null) {
+                        if (abs_pos >= total_buf.length) {
+                            warn_malformed_record('Stopping SST parsing at truncated UTF-16 continuation');
+                            break;
+                        }
+                        value += Buffer.from([trailing_utf16_byte, total_buf[abs_pos]]).toString('utf16le');
+                        trailing_utf16_byte = null;
+                        abs_pos += 1;
+                        chars_remaining -= 1;
+                    }
+                } else if (chars_in_chunk === 0) {
+                    warn_malformed_record('Stopping SST parsing after zero-progress chunk');
+                    break;
                 }
             }
 
             // Skip rich text run data and extended string data
-            abs_pos += rich_text_runs * 4;
-            abs_pos += ext_string_size;
+            abs_pos = Math.min(total_buf.length, abs_pos + rich_text_runs * 4);
+            abs_pos = Math.min(total_buf.length, abs_pos + ext_string_size);
 
             strings.push(value);
         }
@@ -408,11 +473,18 @@ function read_fonts(records: BiffRecord[]): FontEntry[] {
     for (const rec of records) {
         if (rec.type !== RT_FONT) continue;
         const buf = rec.data;
+        if (buf.length < 8) {
+            warn_malformed_record('Skipping truncated FONT record');
+            continue;
+        }
         const grbit = buf.readUInt16LE(2);
         // BIFF8 FONT: 0-1 height, 2-3 grbit, 4-5 color index, 6-7 bold weight
         const weight = buf.readUInt16LE(6);
         const italic = (grbit & 0x02) !== 0;
         const bold = weight >= 700;
+        if (fonts.length === 4) {
+            fonts.push({ bold: false, italic: false });
+        }
         fonts.push({ bold, italic });
     }
 
@@ -425,6 +497,10 @@ function read_xfs(records: BiffRecord[]): XfEntry[] {
     for (const rec of records) {
         if (rec.type !== RT_XF) continue;
         const buf = rec.data;
+        if (buf.length < 4) {
+            warn_malformed_record('Skipping truncated XF record');
+            continue;
+        }
         const font_index = buf.readUInt16LE(0);
         const format_index = buf.readUInt16LE(2);
         xfs.push({ font_index, format_index });
@@ -439,6 +515,10 @@ function read_formats(records: BiffRecord[]): Map<number, string> {
     for (const rec of records) {
         if (rec.type !== RT_FORMAT) continue;
         const buf = rec.data;
+        if (buf.length < 5) {
+            warn_malformed_record('Skipping truncated FORMAT record');
+            continue;
+        }
         const index = buf.readUInt16LE(0);
         const char_count = buf.readUInt16LE(2);
         const result = read_biff8_string(buf, 4, char_count);
@@ -454,6 +534,10 @@ function read_bound_sheets(records: BiffRecord[]): SheetEntry[] {
     for (const rec of records) {
         if (rec.type !== RT_BOUNDSHEET8) continue;
         const buf = rec.data;
+        if (buf.length < 8) {
+            warn_malformed_record('Skipping truncated BOUNDSHEET8 record');
+            continue;
+        }
         const offset = buf.readUInt32LE(0);
         const char_count = buf[6];
         const result = read_biff8_string(buf, 7, char_count);
@@ -463,49 +547,72 @@ function read_bound_sheets(records: BiffRecord[]): SheetEntry[] {
     return sheets;
 }
 
+function read_datemode(records: BiffRecord[]): DateMode {
+    const rec = records.find((record) => record.type === RT_DATEMODE);
+    if (!rec || rec.data.length < 2) return 0;
+    return rec.data.readUInt16LE(0) === 1 ? 1 : 0;
+}
+
 /** Convert an Excel date serial number to an ISO 8601 string. */
-function serial_to_iso(serial: number): string {
-    // Excel epoch: Jan 0 1900 (Dec 30 1899 in real dates).
-    // Intentionally reproduces the Lotus 1-2-3 leap-year bug for serials > 59.
-    const epoch = new Date(Date.UTC(1899, 11, 30));
-    const ms = epoch.getTime() + serial * 86400000;
+function serial_to_iso(serial: number, datemode: DateMode): string {
+    if (datemode === 1) {
+        const epoch = new Date(Date.UTC(1904, 0, 1));
+        const ms = epoch.getTime() + serial * 86400000;
+        return new Date(ms).toISOString();
+    }
+
+    let adjusted_serial = serial;
+    if (adjusted_serial >= 60) {
+        adjusted_serial -= 1;
+    }
+
+    const epoch = new Date(Date.UTC(1899, 11, 31));
+    const ms = epoch.getTime() + adjusted_serial * 86400000;
     return new Date(ms).toISOString();
 }
+
+/** Elapsed-time formats use bracketed hour/minute/second tokens like [h], [mm], [ss]. */
+const ELAPSED_TIME_RE = /\[[hms]\]/i;
 
 /** Check whether an XF format index refers to a date/time format. */
 function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): boolean {
     if (xf_index >= xfs.length) return false;
     const fmt_index = xfs[xf_index].format_index;
     const fmt = format_map.get(fmt_index);
-    if (fmt) return SSF.is_date(fmt);
+    if (fmt) return SSF.is_date(fmt) && !ELAPSED_TIME_RE.test(fmt);
     // Built-in formats 14-22, 27-36, 45-47 are dates
     const builtin = (SSF as Record<string, unknown>)._table as Record<number, string> | undefined;
     const builtin_fmt = builtin?.[fmt_index];
-    if (builtin_fmt) return SSF.is_date(builtin_fmt);
+    if (builtin_fmt) return SSF.is_date(builtin_fmt) && !ELAPSED_TIME_RE.test(builtin_fmt);
     return false;
 }
 
 /** Normalize a numeric raw value: return ISO string for dates, number otherwise. */
-function normalize_numeric_raw(
-    value: number, xf_index: number, xfs: XfEntry[], format_map: Map<number, string>
-): string | number {
-    if (is_date_format(xf_index, xfs, format_map)) {
-        return serial_to_iso(value);
-    }
+function normalize_numeric_raw(value: number): number {
     return value;
 }
 
-function format_value(raw: number, xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): string {
+function format_value(
+    raw: number,
+    xf_index: number,
+    xfs: XfEntry[],
+    format_map: Map<number, string>,
+    datemode: DateMode
+): string {
     if (xf_index >= xfs.length) return String(raw);
     const xf = xfs[xf_index];
     const fmt_index = xf.format_index;
     const fmt = format_map.get(fmt_index);
+    const formatted_raw =
+        datemode === 1 && is_date_format(xf_index, xfs, format_map)
+            ? raw + 1462
+            : raw;
     try {
         if (fmt) {
-            return SSF.format(fmt, raw);
+            return SSF.format(fmt, formatted_raw);
         }
         // SSF handles built-in format indices (0-49) natively
-        return SSF.format(fmt_index, raw);
+        return SSF.format(fmt_index, formatted_raw);
     } catch {
         return String(raw);
     }
@@ -527,6 +634,7 @@ function parse_sheet_records(
     xfs: XfEntry[],
     fonts: FontEntry[],
     format_map: Map<number, string>,
+    datemode: DateMode,
     budget: WorkbookBudget,
 ): SheetData {
     let row_count = 0;
@@ -541,6 +649,10 @@ function parse_sheet_records(
         switch (rec.type) {
             case RT_DIMENSION: {
                 const buf = rec.data;
+                if (buf.length < 12) {
+                    warn_malformed_record('Skipping truncated DIMENSION record');
+                    break;
+                }
                 row_count = buf.readUInt32LE(4);
                 col_count = buf.readUInt16LE(10);
                 break;
@@ -548,6 +660,10 @@ function parse_sheet_records(
 
             case RT_LABELSST: {
                 const buf = rec.data;
+                if (buf.length < 10) {
+                    warn_malformed_record('Skipping truncated LABELSST record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
@@ -563,13 +679,17 @@ function parse_sheet_records(
 
             case RT_NUMBER: {
                 const buf = rec.data;
+                if (buf.length < 14) {
+                    warn_malformed_record('Skipping truncated NUMBER record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
                 const value = buf.readDoubleLE(6);
                 const style = get_style(xf_index, xfs, fonts);
-                const formatted = format_value(value, xf_index, xfs, format_map);
-                const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                const raw = normalize_numeric_raw(value);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -579,13 +699,17 @@ function parse_sheet_records(
 
             case RT_RK: {
                 const buf = rec.data;
+                if (buf.length < 10) {
+                    warn_malformed_record('Skipping truncated RK record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
                 const value = decode_rk(buf.readInt32LE(6));
                 const style = get_style(xf_index, xfs, fonts);
-                const formatted = format_value(value, xf_index, xfs, format_map);
-                const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                const raw = normalize_numeric_raw(value);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -605,8 +729,8 @@ function parse_sheet_records(
                     const rk_val = buf.readInt32LE(pos + 2);
                     const value = decode_rk(rk_val);
                     const style = get_style(xf_index, xfs, fonts);
-                    const formatted = format_value(value, xf_index, xfs, format_map);
-                    const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                    const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                    const raw = normalize_numeric_raw(value);
                     cells.set(`${row}:${c}`, {
                         raw, formatted,
                         bold: style.bold, italic: style.italic,
@@ -618,6 +742,10 @@ function parse_sheet_records(
 
             case RT_BOOLERR: {
                 const buf = rec.data;
+                if (buf.length < 8) {
+                    warn_malformed_record('Skipping truncated BOOLERR record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
@@ -643,6 +771,10 @@ function parse_sheet_records(
 
             case RT_BLANK: {
                 const buf = rec.data;
+                if (buf.length < 6) {
+                    warn_malformed_record('Skipping truncated BLANK record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
@@ -656,6 +788,10 @@ function parse_sheet_records(
 
             case RT_LABEL: {
                 const buf = rec.data;
+                if (buf.length < 9) {
+                    warn_malformed_record('Skipping truncated LABEL record');
+                    break;
+                }
                 const row = buf.readUInt16LE(0);
                 const col = buf.readUInt16LE(2);
                 const xf_index = buf.readUInt16LE(4);
@@ -715,8 +851,8 @@ function parse_sheet_records(
                 } else {
                     // Numeric result — read as IEEE 754 double
                     const value = buf.readDoubleLE(6);
-                    const formatted = format_value(value, xf_index, xfs, format_map);
-                    const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                    const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                    const raw = normalize_numeric_raw(value);
                     cells.set(key, { raw, formatted, bold: style.bold, italic: style.italic });
                 }
                 break;
@@ -726,7 +862,7 @@ function parse_sheet_records(
                 // STRING record follows a FORMULA when the cached result is a string
                 if (!pending_formula_key) break;
                 const buf = rec.data;
-                if (buf.length < 3) break;
+                if (buf.length < 2) break;
                 const char_count = buf.readUInt16LE(0);
                 const result = read_biff8_string_chunked(rec, 2, char_count);
                 cells.set(pending_formula_key, {
@@ -758,11 +894,31 @@ function parse_sheet_records(
     assert_safe_sheet_shape(budget, row_count, col_count, merges.length);
 
     // Build merged cells set
+    const normalized_merges: MergeRange[] = [];
     const merged_cells = new Set<string>();
     for (const m of merges) {
-        for (let r = m.startRow; r <= m.endRow; r++) {
-            for (let c = m.startCol; c <= m.endCol; c++) {
-                if (r === m.startRow && c === m.startCol) continue;
+        if (row_count <= 0 || col_count <= 0) continue;
+        if (m.startRow > m.endRow || m.startCol > m.endCol) continue;
+        if (m.startRow >= row_count || m.startCol >= col_count) continue;
+        if (m.endRow < 0 || m.endCol < 0) continue;
+
+        const clampedStartRow = Math.max(0, m.startRow);
+        const clampedEndRow = Math.min(row_count - 1, m.endRow);
+        const clampedStartCol = Math.max(0, m.startCol);
+        const clampedEndCol = Math.min(col_count - 1, m.endCol);
+
+        if (clampedStartRow > clampedEndRow || clampedStartCol > clampedEndCol) continue;
+
+        normalized_merges.push({
+            startRow: clampedStartRow,
+            startCol: clampedStartCol,
+            endRow: clampedEndRow,
+            endCol: clampedEndCol,
+        });
+
+        for (let r = clampedStartRow; r <= clampedEndRow; r++) {
+            for (let c = clampedStartCol; c <= clampedEndCol; c++) {
+                if (r === clampedStartRow && c === clampedStartCol) continue;
                 merged_cells.add(`${r}:${c}`);
             }
         }
@@ -785,7 +941,7 @@ function parse_sheet_records(
     return {
         name: '',
         rows,
-        merges,
+        merges: normalized_merges,
         columnCount: col_count,
         rowCount: row_count,
     };
@@ -822,13 +978,17 @@ export function parse_xls(buffer: Buffer): ParseResult {
     // Check BIFF version
     const first_bof = records.find(r => r.type === RT_BOF);
     if (first_bof) {
-        const version = first_bof.data.readUInt16LE(0);
-        if (version !== BIFF8_VERSION) {
-            const ver_names: Record<number, string> = {
-                0x0200: 'BIFF2', 0x0300: 'BIFF3', 0x0400: 'BIFF4', 0x0500: 'BIFF5',
-            };
-            const name = ver_names[version] ?? `0x${version.toString(16)}`;
-            throw new Error(`Unsupported Excel format: ${name}`);
+        if (first_bof.data.length < 2) {
+            warn_malformed_record('Skipping BIFF version check for truncated BOF record');
+        } else {
+            const version = first_bof.data.readUInt16LE(0);
+            if (version !== BIFF8_VERSION) {
+                const ver_names: Record<number, string> = {
+                    0x0200: 'BIFF2', 0x0300: 'BIFF3', 0x0400: 'BIFF4', 0x0500: 'BIFF5',
+                };
+                const name = ver_names[version] ?? `0x${version.toString(16)}`;
+                throw new Error(`Unsupported Excel format: ${name}`);
+            }
         }
     }
 
@@ -842,6 +1002,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
     const fonts = read_fonts(records);
     const xfs = read_xfs(records);
     const format_map = read_formats(records);
+    const datemode = read_datemode(records);
     const sheet_entries = read_bound_sheets(records);
     assert_safe_sheet_count(sheet_entries.length);
     const budget = create_workbook_budget();
@@ -877,6 +1038,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
             xfs,
             fonts,
             format_map,
+            datemode,
             budget
         );
         sheet_data.name = entry.name;

@@ -189,6 +189,11 @@ body {
     outline: none;
 }
 
+.table-container:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: -2px;
+}
+
 /* Prevent text selection while drag-selecting cells */
 .table-container:active {
     user-select: none;
@@ -209,13 +214,21 @@ body {
 }
 
 .context-menu-item {
+    display: block;
+    width: 100%;
     padding: 6px 20px;
     cursor: pointer;
+    border: 0;
+    background: transparent;
     color: var(--vscode-menu-foreground, #ccc);
     white-space: nowrap;
+    text-align: left;
+    font: inherit;
 }
 
-.context-menu-item:hover {
+.context-menu-item:hover,
+.context-menu-item:focus-visible {
     background: var(--vscode-menu-selectionBackground, #094771);
     color: var(--vscode-menu-selectionForeground, #fff);
+    outline: none;
 }

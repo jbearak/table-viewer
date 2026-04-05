@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { SheetData } from '../types';
 import {
     type SelectionRange,
@@ -30,6 +30,57 @@ export function use_selection(
     const row_count = sheet.rowCount;
     const col_count = sheet.columnCount;
 
+    useEffect(() => {
+        set_selection(null);
+        set_context_menu(null);
+        dragging_ref.current = false;
+    }, [sheet]);
+
+    useEffect(() => {
+        const stop_dragging = () => {
+            dragging_ref.current = false;
+        };
+
+        document.addEventListener('mouseup', stop_dragging);
+        window.addEventListener('pointerup', stop_dragging);
+
+        return () => {
+            document.removeEventListener('mouseup', stop_dragging);
+            window.removeEventListener('pointerup', stop_dragging);
+        };
+    }, []);
+
+    const build_selection_state = useCallback(
+        (
+            range: SelectionRange,
+            anchor_row: number,
+            anchor_col: number,
+            focus_row: number,
+            focus_col: number
+        ): SelectionState => {
+            const expanded = expand_range_for_merges(range, merges);
+            const anchor = resolve_merge_anchor(anchor_row, anchor_col, merges);
+            const focus = resolve_merge_anchor(focus_row, focus_col, merges);
+
+            return {
+                range: expanded,
+                anchor_row: anchor.row,
+                anchor_col: anchor.col,
+                focus_row: focus.row,
+                focus_col: focus.col,
+            };
+        },
+        [merges]
+    );
+
+    const safe_write_to_clipboard = useCallback(async (text: string) => {
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (error) {
+            console.error('Failed to write to clipboard', error);
+        }
+    }, []);
+
     const select_cell = useCallback(
         (row: number, col: number) => {
             const anchor = resolve_merge_anchor(row, col, merges);
@@ -39,16 +90,17 @@ export function use_selection(
                 end_row: anchor.row,
                 end_col: anchor.col,
             };
-            const expanded = expand_range_for_merges(range, merges);
-            set_selection({
-                range: expanded,
-                anchor_row: anchor.row,
-                anchor_col: anchor.col,
-                focus_row: anchor.row,
-                focus_col: anchor.col,
-            });
+            set_selection(
+                build_selection_state(
+                    range,
+                    anchor.row,
+                    anchor.col,
+                    anchor.row,
+                    anchor.col
+                )
+            );
         },
-        [merges]
+        [build_selection_state, merges]
     );
 
     const extend_selection = useCallback(
@@ -60,15 +112,17 @@ export function use_selection(
                 end_row: to_row,
                 end_col: to_col,
             };
-            const expanded = expand_range_for_merges(range, merges);
-            set_selection({
-                ...selection,
-                range: expanded,
-                focus_row: to_row,
-                focus_col: to_col,
-            });
+            set_selection(
+                build_selection_state(
+                    range,
+                    selection.anchor_row,
+                    selection.anchor_col,
+                    to_row,
+                    to_col
+                )
+            );
         },
-        [selection, merges]
+        [selection, build_selection_state]
     );
 
     const on_cell_mouse_down = useCallback(
@@ -104,6 +158,10 @@ export function use_selection(
     const on_context_menu = useCallback(
         (row: number, col: number, e: React.MouseEvent) => {
             e.preventDefault();
+            const anchor = resolve_merge_anchor(row, col, merges);
+            const target_row = anchor.row;
+            const target_col = anchor.col;
+
             if (selection) {
                 const n = normalize_range(selection.range);
                 const inside =
@@ -111,15 +169,22 @@ export function use_selection(
                     row <= n.end_row &&
                     col >= n.start_col &&
                     col <= n.end_col;
+
                 if (!inside) {
                     select_cell(row, col);
                 }
             } else {
                 select_cell(row, col);
             }
-            set_context_menu({ x: e.clientX, y: e.clientY, row, col });
+
+            set_context_menu({
+                x: e.clientX,
+                y: e.clientY,
+                row: target_row,
+                col: target_col,
+            });
         },
-        [selection, select_cell]
+        [selection, select_cell, merges]
     );
 
     const dismiss_context_menu = useCallback(() => {
@@ -134,8 +199,8 @@ export function use_selection(
             merges,
             show_formatting
         );
-        await navigator.clipboard.writeText(text);
-    }, [selection, sheet.rows, merges, show_formatting]);
+        await safe_write_to_clipboard(text);
+    }, [selection, sheet.rows, merges, show_formatting, safe_write_to_clipboard]);
 
     const copy_cell = useCallback(
         async (row: number, col: number) => {
@@ -151,65 +216,55 @@ export function use_selection(
                 merges,
                 show_formatting
             );
-            await navigator.clipboard.writeText(text);
+            await safe_write_to_clipboard(text);
         },
-        [sheet.rows, merges, show_formatting]
+        [sheet.rows, merges, show_formatting, safe_write_to_clipboard]
     );
 
     const select_row = useCallback(
         (row: number) => {
+            if (col_count === 0) return;
             const range: SelectionRange = {
                 start_row: row,
                 start_col: 0,
                 end_row: row,
                 end_col: col_count - 1,
             };
-            const expanded = expand_range_for_merges(range, merges);
-            set_selection({
-                range: expanded,
-                anchor_row: row,
-                anchor_col: 0,
-                focus_row: row,
-                focus_col: col_count - 1,
-            });
+            set_selection(
+                build_selection_state(range, row, 0, row, col_count - 1)
+            );
         },
-        [col_count, merges]
+        [col_count, build_selection_state]
     );
 
     const select_column = useCallback(
         (col: number) => {
+            if (row_count === 0) return;
             const range: SelectionRange = {
                 start_row: 0,
                 start_col: col,
                 end_row: row_count - 1,
                 end_col: col,
             };
-            const expanded = expand_range_for_merges(range, merges);
-            set_selection({
-                range: expanded,
-                anchor_row: 0,
-                anchor_col: col,
-                focus_row: row_count - 1,
-                focus_col: col,
-            });
+            set_selection(
+                build_selection_state(range, 0, col, row_count - 1, col)
+            );
         },
-        [row_count, merges]
+        [row_count, build_selection_state]
     );
 
     const select_all = useCallback(() => {
-        set_selection({
-            range: {
-                start_row: 0,
-                start_col: 0,
-                end_row: row_count - 1,
-                end_col: col_count - 1,
-            },
-            anchor_row: 0,
-            anchor_col: 0,
-            focus_row: row_count - 1,
-            focus_col: col_count - 1,
-        });
-    }, [row_count, col_count]);
+        if (row_count === 0 || col_count === 0) return;
+        const range: SelectionRange = {
+            start_row: 0,
+            start_col: 0,
+            end_row: row_count - 1,
+            end_col: col_count - 1,
+        };
+        set_selection(
+            build_selection_state(range, 0, 0, row_count - 1, col_count - 1)
+        );
+    }, [row_count, col_count, build_selection_state]);
 
     const clear_selection = useCallback(() => {
         set_selection(null);
@@ -290,14 +345,15 @@ export function use_selection(
                     end_row: next.row,
                     end_col: next.col,
                 };
-                const expanded = expand_range_for_merges(range, merges);
-                set_selection({
-                    range: expanded,
-                    anchor_row,
-                    anchor_col,
-                    focus_row: next.row,
-                    focus_col: next.col,
-                });
+                set_selection(
+                    build_selection_state(
+                        range,
+                        anchor_row,
+                        anchor_col,
+                        next.row,
+                        next.col
+                    )
+                );
             } else {
                 const next = move_active_cell(
                     current_row,
@@ -315,6 +371,7 @@ export function use_selection(
             row_count,
             col_count,
             merges,
+            build_selection_state,
             select_all,
             copy_selection,
             clear_selection,
