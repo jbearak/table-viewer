@@ -58,7 +58,7 @@
   "scripts": {
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs --minify",
-    "bundle:webview": "esbuild src/webview/index.tsx --bundle --outfile=dist/webview/index.js --platform=browser --format=iife --loader:.css=css --minify",
+    "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --loader:.css=css --minify",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },

@@ -231,10 +231,12 @@ function RowResizeHandle({
     );
 
     return (
-        <div
-            className="row-resize-handle"
-            onMouseDown={handle_mouse_down}
-        />
+        <td style={{ padding: 0, width: 0, border: 'none', position: 'relative' }}>
+            <div
+                className="row-resize-handle"
+                onMouseDown={handle_mouse_down}
+            />
+        </td>
     );
 }
 
