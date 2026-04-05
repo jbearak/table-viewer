@@ -108,7 +108,6 @@ Default orientation is controlled by the `tableViewer.tabOrientation` VS Code se
 
 Plain HTML `<table>` inside a scrollable `<div>` with overflow in both axes:
 
-- **Sticky first row** — `position: sticky; top: 0` so the first row (conventionally headers) remains visible while scrolling vertically
 - **Merged cells** — `rowspan`/`colspan` on the anchor `<td>`
 - **Bold cells** — `font-weight: bold`
 - **Italic cells** — `font-style: italic`
