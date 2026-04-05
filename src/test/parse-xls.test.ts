@@ -110,3 +110,23 @@ describe('parse_xls', () => {
         });
     });
 });
+
+describe('parse_xls error handling', () => {
+    it('throws for invalid buffer', () => {
+        expect(() => parse_xls(Buffer.from('not an xls file'))).toThrow(
+            'Not a valid .xls file'
+        );
+    });
+
+    it('throws for empty buffer', () => {
+        expect(() => parse_xls(Buffer.alloc(0))).toThrow();
+    });
+});
+
+describe('parse_xls warnings', () => {
+    it('returns empty warnings for valid files', () => {
+        const result = parse_xls(read_fixture('basic.xls'));
+        const warnings = 'warnings' in result ? result.warnings : [];
+        expect(warnings).toHaveLength(0);
+    });
+});
