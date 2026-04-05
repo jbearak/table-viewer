@@ -249,6 +249,7 @@ export function App(): React.JSX.Element {
                         vertical={true}
                     />
                     <TableWithSelection
+                        key={active_sheet_index}
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={
@@ -271,6 +272,7 @@ export function App(): React.JSX.Element {
                         vertical={false}
                     />
                     <TableWithSelection
+                        key={active_sheet_index}
                         sheet={current_sheet}
                         show_formatting={show_formatting}
                         column_widths={

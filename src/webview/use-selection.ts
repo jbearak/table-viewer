@@ -44,6 +44,8 @@ export function use_selection(
                 range: expanded,
                 anchor_row: anchor.row,
                 anchor_col: anchor.col,
+                focus_row: anchor.row,
+                focus_col: anchor.col,
             });
         },
         [merges]
@@ -62,6 +64,8 @@ export function use_selection(
             set_selection({
                 ...selection,
                 range: expanded,
+                focus_row: to_row,
+                focus_col: to_col,
             });
         },
         [selection, merges]
@@ -162,6 +166,8 @@ export function use_selection(
                 range: expanded,
                 anchor_row: row,
                 anchor_col: 0,
+                focus_row: row,
+                focus_col: col_count - 1,
             });
         },
         [col_count, merges]
@@ -180,6 +186,8 @@ export function use_selection(
                 range: expanded,
                 anchor_row: 0,
                 anchor_col: col,
+                focus_row: row_count - 1,
+                focus_col: col,
             });
         },
         [row_count, merges]
@@ -195,6 +203,8 @@ export function use_selection(
             },
             anchor_row: 0,
             anchor_col: 0,
+            focus_row: row_count - 1,
+            focus_col: col_count - 1,
         });
     }, [row_count, col_count]);
 
@@ -256,15 +266,14 @@ export function use_selection(
             const current_col = selection?.anchor_col ?? 0;
 
             if (e.shiftKey && e.key !== 'Tab') {
-                const edge = selection
-                    ? {
-                          row: normalize_range(selection.range).end_row,
-                          col: normalize_range(selection.range).end_col,
-                      }
-                    : { row: current_row, col: current_col };
+                // Use the focus (moving edge) for shift-extension,
+                // not the normalized end. This allows Shift+Up/Left
+                // to extend correctly when focus is above/left of anchor.
+                const focus_row = selection?.focus_row ?? current_row;
+                const focus_col = selection?.focus_col ?? current_col;
                 const next = move_active_cell(
-                    edge.row,
-                    edge.col,
+                    focus_row,
+                    focus_col,
                     direction,
                     row_count,
                     col_count,
@@ -283,6 +292,8 @@ export function use_selection(
                     range: expanded,
                     anchor_row,
                     anchor_col,
+                    focus_row: next.row,
+                    focus_col: next.col,
                 });
             } else {
                 const next = move_active_cell(
