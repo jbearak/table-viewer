@@ -37,6 +37,23 @@ export function resolve_merge_anchor(row: number, col: number, merges: MergeRang
     return { row, col };
 }
 
+export type Direction = 'up' | 'down' | 'left' | 'right';
+
+export function move_active_cell(row: number, col: number, direction: Direction, row_count: number, col_count: number, merges: MergeRange[]): { row: number; col: number } {
+    const current_merge = merges.find((m) => m.startRow === row && m.startCol === col);
+    let next_row = row;
+    let next_col = col;
+    switch (direction) {
+        case 'up': next_row = row - 1; break;
+        case 'down': next_row = current_merge ? current_merge.endRow + 1 : row + 1; break;
+        case 'left': next_col = col - 1; break;
+        case 'right': next_col = current_merge ? current_merge.endCol + 1 : col + 1; break;
+    }
+    next_row = Math.max(0, Math.min(next_row, row_count - 1));
+    next_col = Math.max(0, Math.min(next_col, col_count - 1));
+    return resolve_merge_anchor(next_row, next_col, merges);
+}
+
 export function expand_range_for_merges(range: SelectionRange, merges: MergeRange[]): SelectionRange {
     let n = normalize_range(range);
     let changed = true;

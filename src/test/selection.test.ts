@@ -4,6 +4,7 @@ import {
     is_cell_in_range,
     expand_range_for_merges,
     resolve_merge_anchor,
+    move_active_cell,
     type SelectionRange,
 } from '../webview/selection';
 import type { MergeRange } from '../types';
@@ -62,5 +63,40 @@ describe('resolve_merge_anchor', () => {
     });
     it('returns same position when not inside a merge', () => {
         expect(resolve_merge_anchor(0, 0, merges)).toEqual({ row: 0, col: 0 });
+    });
+});
+
+describe('move_active_cell', () => {
+    const row_count = 5;
+    const col_count = 4;
+    const no_merges: MergeRange[] = [];
+
+    it('moves right', () => {
+        expect(move_active_cell(0, 0, 'right', row_count, col_count, no_merges)).toEqual({ row: 0, col: 1 });
+    });
+    it('moves left', () => {
+        expect(move_active_cell(0, 1, 'left', row_count, col_count, no_merges)).toEqual({ row: 0, col: 0 });
+    });
+    it('moves down', () => {
+        expect(move_active_cell(0, 0, 'down', row_count, col_count, no_merges)).toEqual({ row: 1, col: 0 });
+    });
+    it('moves up', () => {
+        expect(move_active_cell(1, 0, 'up', row_count, col_count, no_merges)).toEqual({ row: 0, col: 0 });
+    });
+    it('clamps at boundaries', () => {
+        expect(move_active_cell(0, 0, 'up', row_count, col_count, no_merges)).toEqual({ row: 0, col: 0 });
+        expect(move_active_cell(0, 0, 'left', row_count, col_count, no_merges)).toEqual({ row: 0, col: 0 });
+        expect(move_active_cell(4, 3, 'down', row_count, col_count, no_merges)).toEqual({ row: 4, col: 3 });
+        expect(move_active_cell(4, 3, 'right', row_count, col_count, no_merges)).toEqual({ row: 4, col: 3 });
+    });
+    it('skips over merged cells moving right', () => {
+        const merges: MergeRange[] = [{ startRow: 0, startCol: 1, endRow: 0, endCol: 2 }];
+        expect(move_active_cell(0, 0, 'right', row_count, col_count, merges)).toEqual({ row: 0, col: 1 });
+        expect(move_active_cell(0, 1, 'right', row_count, col_count, merges)).toEqual({ row: 0, col: 3 });
+    });
+    it('skips over merged cells moving down', () => {
+        const merges: MergeRange[] = [{ startRow: 1, startCol: 0, endRow: 2, endCol: 0 }];
+        expect(move_active_cell(0, 0, 'down', row_count, col_count, merges)).toEqual({ row: 1, col: 0 });
+        expect(move_active_cell(1, 0, 'down', row_count, col_count, merges)).toEqual({ row: 3, col: 0 });
     });
 });
