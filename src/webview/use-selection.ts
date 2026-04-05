@@ -249,7 +249,7 @@ export function use_selection(
                 Tab: 'right',
             };
 
-            let key = e.key;
+            let key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
             if (e.key === 'Tab' && e.shiftKey) {
                 key = 'ShiftTab';
             }
