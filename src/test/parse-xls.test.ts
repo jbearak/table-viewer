@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { parse_xls } from '../parse-xls';
+import type { WorkbookData } from '../types';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -9,11 +10,16 @@ function read_fixture(name: string): Buffer {
     return fs.readFileSync(path.join(FIXTURES, name));
 }
 
+/** Extract WorkbookData from either old (WorkbookData) or new ({ data, warnings }) return type */
+function get_data(result: WorkbookData | { data: WorkbookData; warnings: string[] }): WorkbookData {
+    return 'data' in result && 'warnings' in result ? result.data : result as WorkbookData;
+}
+
 describe('parse_xls', () => {
     describe('basic.xls', () => {
         it('parses two sheets with correct names', () => {
             const result = parse_xls(read_fixture('basic.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             expect(data.sheets).toHaveLength(2);
             expect(data.sheets[0].name).toBe('People');
             expect(data.sheets[1].name).toBe('Inventory');
@@ -21,7 +27,7 @@ describe('parse_xls', () => {
 
         it('parses string, number, and boolean cell values', () => {
             const result = parse_xls(read_fixture('basic.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             const people = data.sheets[0];
 
             // Header row
@@ -38,7 +44,7 @@ describe('parse_xls', () => {
 
         it('returns correct row and column counts', () => {
             const result = parse_xls(read_fixture('basic.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             const people = data.sheets[0];
             expect(people.rowCount).toBe(3);
             expect(people.columnCount).toBe(4);
@@ -48,7 +54,7 @@ describe('parse_xls', () => {
     describe('merged.xls', () => {
         it('detects merge ranges', () => {
             const result = parse_xls(read_fixture('merged.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             const sheet = data.sheets[0];
             expect(sheet.merges).toHaveLength(2);
 
@@ -64,7 +70,7 @@ describe('parse_xls', () => {
 
         it('returns null for non-anchor merged cells', () => {
             const result = parse_xls(read_fixture('merged.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             const sheet = data.sheets[0];
 
             // A1 is the anchor — should have content
@@ -78,7 +84,7 @@ describe('parse_xls', () => {
     describe('empty-sheet.xls', () => {
         it('handles empty sheets', () => {
             const result = parse_xls(read_fixture('empty-sheet.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             expect(data.sheets).toHaveLength(2);
 
             const empty = data.sheets.find(s => s.name === 'EmptySheet');
@@ -94,7 +100,7 @@ describe('parse_xls', () => {
     describe('large-range.xls', () => {
         it('handles sparse data across a wide range', () => {
             const result = parse_xls(read_fixture('large-range.xls'));
-            const data = 'data' in result ? result.data : result;
+            const data = get_data(result);
             const sheet = data.sheets[0];
             expect(sheet.rowCount).toBe(50);
             expect(sheet.columnCount).toBe(26); // A through Z
