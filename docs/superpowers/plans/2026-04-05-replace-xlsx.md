@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Add vitest and configure test infrastructure
+## Task 1: Add vitest and configure test infrastructure
 
 **Files:**
 - Create: `vitest.config.ts`
@@ -61,7 +61,7 @@ git commit -m "chore: add vitest test infrastructure"
 
 ---
 
-### Task 2: Generate test fixture .xls files
+## Task 2: Generate test fixture .xls files
 
 Use the currently-installed `xlsx` library to generate fixture files before we remove it. This ensures the fixtures are valid BIFF8 files.
 
@@ -223,7 +223,7 @@ git commit -m "test: add .xls fixture files for BIFF8 parser tests"
 
 ---
 
-### Task 3: Write parity baseline tests using current xlsx parser
+## Task 3: Write parity baseline tests using current xlsx parser
 
 Before rewriting `parse_xls`, capture its current output as the expected baseline. These tests will later verify the new parser produces identical results.
 
@@ -357,7 +357,7 @@ git commit -m "test: add parity baseline tests for .xls parser"
 
 ---
 
-### Task 4: Replace XLSX.SSF with standalone ssf in parse-xlsx.ts
+## Task 4: Replace XLSX.SSF with standalone ssf in parse-xlsx.ts
 
 The quick win — swap one import and one call site.
 
@@ -441,7 +441,7 @@ git commit -m "refactor: replace XLSX.SSF with standalone ssf package"
 
 ---
 
-### Task 5: Build the BIFF8 record scanner (Layer 1)
+## Task 5: Build the BIFF8 record scanner (Layer 1)
 
 The low-level layer: extract BIFF8 records from a byte buffer, handling Continue record stitching.
 
@@ -598,7 +598,7 @@ git commit -m "feat: implement BIFF8 record scanner with Continue stitching"
 
 ---
 
-### Task 6: Build BIFF8 string decoder and RK number decoder
+## Task 6: Build BIFF8 string decoder and RK number decoder
 
 The two trickiest encoding details, tested in isolation.
 
@@ -785,7 +785,7 @@ git commit -m "feat: implement BIFF8 RK number and string decoders"
 
 ---
 
-### Task 7: Build the BIFF8 record interpreter (Layer 2) and parse_xls function
+## Task 7: Build the BIFF8 record interpreter (Layer 2) and parse_xls function
 
 The main parser that walks records and builds `WorkbookData`.
 
@@ -1272,7 +1272,7 @@ git commit -m "feat: implement BIFF8 record interpreter and parse_xls function"
 
 ---
 
-### Task 8: Update custom-editor.ts for new return type and error handling
+## Task 8: Update custom-editor.ts for new return type and error handling
 
 **Files:**
 - Modify: `src/custom-editor.ts`
@@ -1418,7 +1418,7 @@ git commit -m "feat: surface parser warnings and specific error messages"
 
 ---
 
-### Task 9: Remove xlsx dependency and final verification
+## Task 9: Remove xlsx dependency and final verification
 
 **Files:**
 - Modify: `package.json`
@@ -1469,7 +1469,7 @@ git commit -m "fix: remove vulnerable xlsx dependency (GHSA-4r6h-8v6p-xvw6, GHSA
 
 ---
 
-### Task 10: Add edge case tests
+## Task 10: Add edge case tests
 
 **Files:**
 - Modify: `src/test/parse-xls.test.ts`

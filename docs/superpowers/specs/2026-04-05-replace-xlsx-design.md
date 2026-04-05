@@ -56,6 +56,8 @@ Replace `xlsx` with two small, focused dependencies and a custom minimal BIFF8 p
 | BoolErr | 0x0205 | Boolean or error cell |
 | Blank | 0x0201 | Empty formatted cell |
 | MergeCells | 0x00E5 | Merge ranges |
+| Formula | 0x0006 | Formula cell — cached result only |
+| String | 0x0207 | Cached string result for Formula |
 | Label | 0x0204 | Inline string cell (older files) |
 
 ### Data flow
@@ -90,7 +92,7 @@ Both `parse_xls` and `parse_xlsx` return `{ data: WorkbookData, warnings: string
 
 ## Intentionally unsupported
 
-Formulas (cached values are read via Number/BoolErr/LabelSST), charts, images, comments, conditional formatting, hyperlinks, VBA, print settings, protection, macros. None of these are relevant for a read-only table viewer.
+Formulas are supported only via cached results parsed from `FORMULA`/`STRING` records (including numeric, boolean, error, and string results). Formula expressions are not parsed or recalculated; charts, images, comments, conditional formatting, hyperlinks, VBA, print settings, protection, and macros remain unsupported. None of these are relevant for a read-only table viewer.
 
 ## File changes
 

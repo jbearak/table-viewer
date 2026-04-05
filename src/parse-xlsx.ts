@@ -113,7 +113,7 @@ function format_cell_value(cell: ExcelJS.Cell): string {
     const raw = normalize_value(cell.value);
     if (raw === null) return '';
 
-    // Apply Excel number format via SheetJS SSF
+    // Apply Excel number format via ssf
     const num_fmt = cell.numFmt;
     if (num_fmt && typeof raw === 'number') {
         try {

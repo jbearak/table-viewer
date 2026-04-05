@@ -66,5 +66,6 @@ export function assert_safe_sheet_shape(
 }
 
 function format_mebibytes(bytes: number): string {
-    return String(bytes / MEBIBYTE);
+    const mebibytes = bytes / MEBIBYTE;
+    return String(Math.round(mebibytes * 10) / 10);
 }

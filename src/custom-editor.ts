@@ -62,6 +62,7 @@ export class TableViewerEditorProvider
 
 class ViewerPanel implements vscode.Disposable {
     private disposables: vscode.Disposable[] = [];
+    private consecutive_reload_failures = 0;
     private file_path: string;
     private watcher: vscode.FileSystemWatcher;
 
@@ -161,15 +162,33 @@ class ViewerPanel implements vscode.Disposable {
     private async send_reload(): Promise<void> {
         try {
             const { data, warnings } = await this.parse_file();
-            this.panel.webview.postMessage({
+            const delivered = await this.panel.webview.postMessage({
                 type: 'reload',
                 data,
             });
+            if (!delivered) return;
+            this.consecutive_reload_failures = 0;
             if (warnings.length > 0) {
                 vscode.window.showWarningMessage(warnings[0]);
             }
-        } catch {
-            // File may be mid-write; ignore transient errors
+        } catch (err) {
+            const code = typeof err === 'object'
+                && err !== null
+                && 'code' in err
+                && typeof err.code === 'string'
+                ? err.code
+                : null;
+
+            if (code === 'EBUSY' || code === 'EPERM') {
+                return;
+            }
+
+            this.consecutive_reload_failures += 1;
+            if (this.consecutive_reload_failures >= 3) {
+                const message = err instanceof Error ? err.message : String(err);
+                console.error('Failed to reload table viewer data', err);
+                vscode.window.showErrorMessage(`Failed to reload spreadsheet: ${message}`);
+            }
         }
     }
 }
