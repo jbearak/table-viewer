@@ -1,3 +1,4 @@
+import { get_raw_cell_text } from '../cell-display';
 import type { CellData, MergeRange } from '../types';
 
 export interface SelectionRange {
@@ -45,7 +46,7 @@ export function format_selection_for_clipboard(rows: (CellData | null)[][], rang
     function cell_text(cell: CellData | null): string {
         if (!cell) return '';
         if (show_formatting) return cell.formatted;
-        return cell.raw !== null ? String(cell.raw) : '';
+        return get_raw_cell_text(cell.raw);
     }
     const hidden = new Set<string>();
     for (const m of merges) {

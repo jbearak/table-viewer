@@ -5,6 +5,7 @@ import {
     assert_safe_sheet_shape,
     create_workbook_budget,
 } from './spreadsheet-safety';
+import { workbook_has_formatting } from './cell-display';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
@@ -70,22 +71,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         });
     });
 
-    return { data: { sheets, hasFormatting: has_formatting(sheets) }, warnings: [] };
-}
-
-function has_formatting(sheets: SheetData[]): boolean {
-    for (const sheet of sheets) {
-        for (const row of sheet.rows) {
-            for (const cell of row) {
-                if (!cell || cell.raw === null) continue;
-                const display = typeof cell.raw === 'boolean'
-                    ? (cell.raw ? 'TRUE' : 'FALSE')
-                    : String(cell.raw);
-                if (cell.formatted !== display) return true;
-            }
-        }
-    }
-    return false;
+    return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings: [] };
 }
 
 function extract_cell_data(cell: ExcelJS.Cell): CellData {

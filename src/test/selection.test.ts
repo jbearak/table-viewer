@@ -119,7 +119,7 @@ describe('move_active_cell', () => {
     });
 });
 
-function cell(raw: string | number | null, formatted?: string): CellData {
+function cell(raw: CellData['raw'], formatted?: string): CellData {
     return { raw, formatted: formatted ?? String(raw ?? ''), bold: false, italic: false };
 }
 
@@ -345,6 +345,11 @@ describe('format_selection_for_clipboard', () => {
         const rows_with_fmt: (CellData | null)[][] = [[cell(42, '$42.00'), cell(100, '$100.00')]];
         const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 1 };
         expect(format_selection_for_clipboard(rows_with_fmt, range, [], false)).toBe('42\t100');
+    });
+    it('renders raw booleans with String(cell.raw)', () => {
+        const rows_with_bool: (CellData | null)[][] = [[cell(true, 'TRUE'), cell(false, 'FALSE')]];
+        const range: SelectionRange = { start_row: 0, start_col: 0, end_row: 0, end_col: 1 };
+        expect(format_selection_for_clipboard(rows_with_bool, range, [], false)).toBe('true\tfalse');
     });
     it('uses formatted values when show_formatting is true', () => {
         const rows_with_fmt: (CellData | null)[][] = [[cell(42, '$42.00'), cell(100, '$100.00')]];

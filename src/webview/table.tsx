@@ -1,4 +1,5 @@
 import React, { useCallback, useRef } from 'react';
+import { get_raw_cell_text } from '../cell-display';
 import type { SheetData, CellData, MergeRange } from '../types';
 import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
 
@@ -176,7 +177,7 @@ function CellContent({
 
     const text = show_formatting
         ? cell.formatted
-        : (cell.raw !== null ? String(cell.raw) : '');
+        : get_raw_cell_text(cell.raw);
 
     let content: React.ReactNode = text;
 
