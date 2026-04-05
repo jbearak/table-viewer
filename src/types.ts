@@ -23,18 +23,31 @@ export interface MergeRange {
     endRow: number;
     endCol: number;
 }
+export interface ScrollPosition {
+    top: number;
+    left: number;
+}
 
 export interface PerFileState {
-    columnWidths?: Record<string, Record<number, number>>;
-    rowHeights?: Record<string, Record<number, number>>;
-    scrollPosition?: Record<string, { top: number; left: number }>;
-    activeSheet?: string;
+    columnWidths?: (Record<number, number> | undefined)[];
+    rowHeights?: (Record<number, number> | undefined)[];
+    scrollPosition?: (ScrollPosition | undefined)[];
+    activeSheetIndex?: number;
     tabOrientation?: 'horizontal' | 'vertical' | null;
 }
 
+export interface LegacyPerFileState {
+    columnWidths?: Record<string, Record<number, number>>;
+    rowHeights?: Record<string, Record<number, number>>;
+    scrollPosition?: Record<string, ScrollPosition>;
+    activeSheet?: string;
+    tabOrientation?: 'horizontal' | 'vertical' | null;
+}
+export type StoredPerFileState = PerFileState | LegacyPerFileState;
+
 /** Messages from extension host to webview */
 export type HostMessage =
-    | { type: 'workbookData'; data: WorkbookData; state: PerFileState; defaultTabOrientation: 'horizontal' | 'vertical' }
+    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical' }
     | { type: 'reload'; data: WorkbookData };
 
 /** Messages from webview to extension host */

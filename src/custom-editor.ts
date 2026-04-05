@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { parse_xlsx } from './parse-xlsx';
 import { parse_xls } from './parse-xls';
+import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WorkbookData, WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
@@ -61,6 +62,7 @@ export class TableViewerEditorProvider
 
 class ViewerPanel implements vscode.Disposable {
     private disposables: vscode.Disposable[] = [];
+    private consecutive_reload_failures = 0;
     private file_path: string;
     private watcher: vscode.FileSystemWatcher;
 
@@ -120,7 +122,9 @@ class ViewerPanel implements vscode.Disposable {
         }
     }
 
-    private async parse_file(): Promise<WorkbookData> {
+    private async parse_file(): Promise<{ data: WorkbookData; warnings: string[] }> {
+        const stat = await vscode.workspace.fs.stat(this.uri);
+        assert_safe_file_size(stat.size);
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {
@@ -131,7 +135,7 @@ class ViewerPanel implements vscode.Disposable {
 
     private async send_initial_data(): Promise<void> {
         try {
-            const data = await this.parse_file();
+            const { data, warnings } = await this.parse_file();
             const state = this.state_store.get(this.file_path);
             const config = vscode.workspace.getConfiguration('tableViewer');
             const default_orientation = config.get<'horizontal' | 'vertical'>(
@@ -145,22 +149,46 @@ class ViewerPanel implements vscode.Disposable {
                 state,
                 defaultTabOrientation: default_orientation,
             });
+
+            if (warnings.length > 0) {
+                vscode.window.showWarningMessage(warnings[0]);
+            }
         } catch (err) {
-            vscode.window.showErrorMessage(
-                `Failed to open file: ${err}`
-            );
+            const message = err instanceof Error ? err.message : String(err);
+            vscode.window.showErrorMessage(message);
         }
     }
 
     private async send_reload(): Promise<void> {
         try {
-            const data = await this.parse_file();
-            this.panel.webview.postMessage({
+            const { data, warnings } = await this.parse_file();
+            const delivered = await this.panel.webview.postMessage({
                 type: 'reload',
                 data,
             });
-        } catch {
-            // File may be mid-write; ignore transient errors
+            if (!delivered) return;
+            this.consecutive_reload_failures = 0;
+            if (warnings.length > 0) {
+                vscode.window.showWarningMessage(warnings[0]);
+            }
+        } catch (err) {
+            const code = typeof err === 'object'
+                && err !== null
+                && 'code' in err
+                && typeof err.code === 'string'
+                ? err.code
+                : null;
+
+            if (code === 'EBUSY' || code === 'EPERM') {
+                return;
+            }
+
+            this.consecutive_reload_failures += 1;
+            if (this.consecutive_reload_failures >= 3) {
+                const message = err instanceof Error ? err.message : String(err);
+                console.error('Failed to reload table viewer data', err);
+                vscode.window.showErrorMessage(`Failed to reload spreadsheet: ${message}`);
+            }
         }
     }
 }

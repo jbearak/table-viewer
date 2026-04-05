@@ -1,20 +1,37 @@
 import ExcelJS from 'exceljs';
-import XLSX from 'xlsx';
+import SSF from 'ssf';
+import {
+    assert_safe_sheet_count,
+    assert_safe_sheet_shape,
+    create_workbook_budget,
+} from './spreadsheet-safety';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
-export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
+export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
     const workbook = new ExcelJS.Workbook();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await workbook.xlsx.load(buffer as any);
+    assert_safe_sheet_count(workbook.worksheets.length);
 
     const sheets: SheetData[] = [];
+    const budget = create_workbook_budget();
 
     workbook.eachSheet((worksheet) => {
+        const merge_models = Object.values(worksheet.model.merges ?? []);
         const merges: MergeRange[] = [];
         const merged_cells = new Set<string>();
+        const row_count = worksheet.rowCount;
+        const col_count = worksheet.columnCount;
+
+        assert_safe_sheet_shape(
+            budget,
+            row_count,
+            col_count,
+            merge_models.length
+        );
 
         // Collect merge ranges
-        for (const [, model] of Object.entries(worksheet.model.merges ?? [])) {
+        for (const model of merge_models) {
             const range = parse_merge_range(model as string);
             if (!range) continue;
             merges.push(range);
@@ -25,9 +42,6 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
                 }
             }
         }
-
-        const row_count = worksheet.rowCount;
-        const col_count = worksheet.columnCount;
         const rows: (CellData | null)[][] = [];
 
         for (let r = 1; r <= row_count; r++) {
@@ -56,7 +70,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
         });
     });
 
-    return { sheets };
+    return { data: { sheets }, warnings: [] };
 }
 
 function extract_cell_data(cell: ExcelJS.Cell): CellData {
@@ -99,11 +113,11 @@ function format_cell_value(cell: ExcelJS.Cell): string {
     const raw = normalize_value(cell.value);
     if (raw === null) return '';
 
-    // Apply Excel number format via SheetJS SSF
+    // Apply Excel number format via ssf
     const num_fmt = cell.numFmt;
     if (num_fmt && typeof raw === 'number') {
         try {
-            return XLSX.SSF.format(num_fmt, raw);
+            return SSF.format(num_fmt, raw);
         } catch {
             // Fall through to default
         }
