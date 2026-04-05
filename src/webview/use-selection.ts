@@ -158,8 +158,9 @@ export function use_selection(
     const on_context_menu = useCallback(
         (row: number, col: number, e: React.MouseEvent) => {
             e.preventDefault();
-            let target_row = row;
-            let target_col = col;
+            const anchor = resolve_merge_anchor(row, col, merges);
+            const target_row = anchor.row;
+            const target_col = anchor.col;
 
             if (selection) {
                 const n = normalize_range(selection.range);
@@ -169,11 +170,7 @@ export function use_selection(
                     col >= n.start_col &&
                     col <= n.end_col;
 
-                if (inside) {
-                    const anchor = resolve_merge_anchor(row, col, merges);
-                    target_row = anchor.row;
-                    target_col = anchor.col;
-                } else {
+                if (!inside) {
                     select_cell(row, col);
                 }
             } else {
