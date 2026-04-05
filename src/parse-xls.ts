@@ -1,5 +1,4 @@
 import CFB from 'cfb';
-import SSF from 'ssf';
 import {
     assert_safe_sheet_count,
     assert_safe_sheet_shape,
@@ -7,6 +6,8 @@ import {
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
+import { format_value, get_style } from './spreadsheet-format';
+import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 // --- Constants ---
@@ -60,17 +61,6 @@ interface SheetEntry {
     offset: number;
 }
 
-interface FontEntry {
-    bold: boolean;
-    italic: boolean;
-}
-
-interface XfEntry {
-    font_index: number;
-    format_index: number;
-}
-
-type DateMode = 0 | 1;
 
 function warn_malformed_record(message: string): void {
     console.warn(`[parse-xls] ${message}`);
@@ -554,79 +544,6 @@ function read_datemode(records: BiffRecord[]): DateMode {
     return rec.data.readUInt16LE(0) === 1 ? 1 : 0;
 }
 
-/** Convert an Excel date serial number to an ISO 8601 string. */
-function serial_to_iso(serial: number, datemode: DateMode): string {
-    if (datemode === 1) {
-        const epoch = new Date(Date.UTC(1904, 0, 1));
-        const ms = epoch.getTime() + serial * 86400000;
-        return new Date(ms).toISOString();
-    }
-
-    let adjusted_serial = serial;
-    if (adjusted_serial >= 60) {
-        adjusted_serial -= 1;
-    }
-
-    const epoch = new Date(Date.UTC(1899, 11, 31));
-    const ms = epoch.getTime() + adjusted_serial * 86400000;
-    return new Date(ms).toISOString();
-}
-
-/** Elapsed-time formats use bracketed hour/minute/second tokens like [h], [mm], [ss]. */
-const ELAPSED_TIME_RE = /\[[hms]\]/i;
-
-/** Check whether an XF format index refers to a date/time format. */
-function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): boolean {
-    if (xf_index >= xfs.length) return false;
-    const fmt_index = xfs[xf_index].format_index;
-    const fmt = format_map.get(fmt_index);
-    if (fmt) return SSF.is_date(fmt) && !ELAPSED_TIME_RE.test(fmt);
-    // Built-in formats 14-22, 27-36, 45-47 are dates
-    const builtin = (SSF as Record<string, unknown>)._table as Record<number, string> | undefined;
-    const builtin_fmt = builtin?.[fmt_index];
-    if (builtin_fmt) return SSF.is_date(builtin_fmt) && !ELAPSED_TIME_RE.test(builtin_fmt);
-    return false;
-}
-
-/** Normalize a numeric raw value: return ISO string for dates, number otherwise. */
-function normalize_numeric_raw(value: number): number {
-    return value;
-}
-
-function format_value(
-    raw: number,
-    xf_index: number,
-    xfs: XfEntry[],
-    format_map: Map<number, string>,
-    datemode: DateMode
-): string {
-    if (xf_index >= xfs.length) return String(raw);
-    const xf = xfs[xf_index];
-    const fmt_index = xf.format_index;
-    const fmt = format_map.get(fmt_index);
-    const formatted_raw =
-        datemode === 1 && is_date_format(xf_index, xfs, format_map)
-            ? raw + 1462
-            : raw;
-    try {
-        if (fmt) {
-            return SSF.format(fmt, formatted_raw);
-        }
-        // SSF handles built-in format indices (0-49) natively
-        return SSF.format(fmt_index, formatted_raw);
-    } catch {
-        return String(raw);
-    }
-}
-
-function get_style(xf_index: number, xfs: XfEntry[], fonts: FontEntry[]): { bold: boolean; italic: boolean } {
-    if (xf_index >= xfs.length) return { bold: false, italic: false };
-    const xf = xfs[xf_index];
-    const font_idx = xf.font_index;
-    if (font_idx >= fonts.length) return { bold: false, italic: false };
-    return fonts[font_idx];
-}
-
 // --- Layer 2: Sheet Parser ---
 
 function parse_sheet_records(
@@ -690,7 +607,7 @@ function parse_sheet_records(
                 const value = buf.readDoubleLE(6);
                 const style = get_style(xf_index, xfs, fonts);
                 const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                const raw = normalize_numeric_raw(value);
+                const raw = value;
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -710,7 +627,7 @@ function parse_sheet_records(
                 const value = decode_rk(buf.readInt32LE(6));
                 const style = get_style(xf_index, xfs, fonts);
                 const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                const raw = normalize_numeric_raw(value);
+                const raw = value;
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -731,7 +648,7 @@ function parse_sheet_records(
                     const value = decode_rk(rk_val);
                     const style = get_style(xf_index, xfs, fonts);
                     const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                    const raw = normalize_numeric_raw(value);
+                    const raw = value;
                     cells.set(`${row}:${c}`, {
                         raw, formatted,
                         bold: style.bold, italic: style.italic,
@@ -853,7 +770,7 @@ function parse_sheet_records(
                     // Numeric result — read as IEEE 754 double
                     const value = buf.readDoubleLE(6);
                     const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                    const raw = normalize_numeric_raw(value);
+                    const raw = value;
                     cells.set(key, { raw, formatted, bold: style.bold, italic: style.italic });
                 }
                 break;
