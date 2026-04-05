@@ -529,7 +529,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
         const sheet_start_pos = entry.offset;
         let start_idx = records.findIndex(r => r.offset >= sheet_start_pos && r.type === RT_BOF);
         if (start_idx === -1) {
-            warnings.push(`Could not find sheet data for "${entry.name}"`);
+            warnings.push('Some sheet data could not be found. The file may be damaged.');
             sheets.push({
                 name: entry.name,
                 rows: [],
