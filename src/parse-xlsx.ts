@@ -1,9 +1,10 @@
 import ExcelJS from 'exceljs';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
-export async function parse_xlsx(buffer: Buffer): Promise<WorkbookData> {
+export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer as unknown as Parameters<typeof workbook.xlsx.load>[0]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await workbook.xlsx.load(buffer as any);
 
     const sheets: SheetData[] = [];
 
