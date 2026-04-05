@@ -787,7 +787,7 @@ function parse_sheet_records(
             }
 
             case RT_LABEL: {
-                const buf = rec.data;
+                const buf = rec._chunks ? Buffer.concat(rec._chunks) : rec.data;
                 if (buf.length < 9) {
                     warn_malformed_record('Skipping truncated LABEL record');
                     break;
