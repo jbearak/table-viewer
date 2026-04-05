@@ -545,4 +545,18 @@ describe('use_selection DOM flows', () => {
         expect(get_selection_state(rendered.container)).toBeNull();
         expect(get_context_menu_state(rendered.container)).toBeNull();
     });
+
+    it('does not produce negative selection endpoints on empty sheets', () => {
+        const empty_sheet = make_sheet([], [], 'Empty sheet');
+        const rendered = render_hook_harness(empty_sheet);
+
+        dispatch_mouse_event(get_control(rendered.container, 'select-all'), 'click');
+        expect(get_selection_state(rendered.container)).toBeNull();
+
+        dispatch_mouse_event(get_control(rendered.container, 'select-row'), 'click');
+        expect(get_selection_state(rendered.container)).toBeNull();
+
+        dispatch_mouse_event(get_control(rendered.container, 'select-column'), 'click');
+        expect(get_selection_state(rendered.container)).toBeNull();
+    });
 });

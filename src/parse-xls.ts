@@ -571,16 +571,19 @@ function serial_to_iso(serial: number, datemode: DateMode): string {
     return new Date(ms).toISOString();
 }
 
+/** Elapsed-time formats use bracketed hour/minute/second tokens like [h], [mm], [ss]. */
+const ELAPSED_TIME_RE = /\[[hms]\]/i;
+
 /** Check whether an XF format index refers to a date/time format. */
 function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): boolean {
     if (xf_index >= xfs.length) return false;
     const fmt_index = xfs[xf_index].format_index;
     const fmt = format_map.get(fmt_index);
-    if (fmt) return SSF.is_date(fmt);
+    if (fmt) return SSF.is_date(fmt) && !ELAPSED_TIME_RE.test(fmt);
     // Built-in formats 14-22, 27-36, 45-47 are dates
     const builtin = (SSF as Record<string, unknown>)._table as Record<number, string> | undefined;
     const builtin_fmt = builtin?.[fmt_index];
-    if (builtin_fmt) return SSF.is_date(builtin_fmt);
+    if (builtin_fmt) return SSF.is_date(builtin_fmt) && !ELAPSED_TIME_RE.test(builtin_fmt);
     return false;
 }
 

@@ -223,6 +223,7 @@ export function use_selection(
 
     const select_row = useCallback(
         (row: number) => {
+            if (col_count === 0) return;
             const range: SelectionRange = {
                 start_row: row,
                 start_col: 0,
@@ -238,6 +239,7 @@ export function use_selection(
 
     const select_column = useCallback(
         (col: number) => {
+            if (row_count === 0) return;
             const range: SelectionRange = {
                 start_row: 0,
                 start_col: col,
@@ -252,6 +254,7 @@ export function use_selection(
     );
 
     const select_all = useCallback(() => {
+        if (row_count === 0 || col_count === 0) return;
         const range: SelectionRange = {
             start_row: 0,
             start_col: 0,
