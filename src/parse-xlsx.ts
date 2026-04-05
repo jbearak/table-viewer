@@ -1,8 +1,8 @@
 import ExcelJS from 'exceljs';
-import XLSX from 'xlsx';
+import SSF from 'ssf';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
-export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
+export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
     const workbook = new ExcelJS.Workbook();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await workbook.xlsx.load(buffer as any);
@@ -56,7 +56,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<WorkbookData> {
         });
     });
 
-    return { sheets };
+    return { data: { sheets }, warnings: [] };
 }
 
 function extract_cell_data(cell: ExcelJS.Cell): CellData {
@@ -103,7 +103,7 @@ function format_cell_value(cell: ExcelJS.Cell): string {
     const num_fmt = cell.numFmt;
     if (num_fmt && typeof raw === 'number') {
         try {
-            return XLSX.SSF.format(num_fmt, raw);
+            return SSF.format(num_fmt, raw);
         } catch {
             // Fall through to default
         }
