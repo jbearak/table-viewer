@@ -64,6 +64,8 @@
     }
   },
   "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
@@ -77,12 +79,13 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/node": "^18.19.0",
+    "@types/node": "^22.19.17",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@types/vscode": "^1.110.0",
     "@vscode/vsce": "^2.26.0",
     "esbuild": "^0.28.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.2"
   }
 }
