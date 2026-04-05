@@ -60,15 +60,22 @@ interface XfEntry {
 
 // --- Layer 1: Record Scanner ---
 
-export function scan_records(buf: Buffer): BiffRecord[] {
+export interface ScanResult {
+    records: BiffRecord[];
+    truncated: boolean;
+}
+
+export function scan_records(buf: Buffer): ScanResult {
     const records: BiffRecord[] = [];
     let pos = 0;
+    let truncated = false;
 
     while (pos + 4 <= buf.length) {
         const type = buf.readUInt16LE(pos);
         const len = buf.readUInt16LE(pos + 2);
 
         if (pos + 4 + len > buf.length) {
+            truncated = true;
             break;
         }
 
@@ -84,7 +91,7 @@ export function scan_records(buf: Buffer): BiffRecord[] {
         }
     }
 
-    return records;
+    return { records, truncated };
 }
 
 // --- Layer 2 Helpers: Decoders ---
@@ -128,7 +135,7 @@ export function read_biff8_string(buf: Buffer, offset: number, char_count: numbe
         pos += 2;
     }
     if (has_ext_string) {
-        ext_string_size = buf.readInt32LE(pos);
+        ext_string_size = buf.readUInt32LE(pos);
         pos += 4;
     }
 
@@ -466,7 +473,11 @@ export function parse_xls(buffer: Buffer): ParseResult {
     }
 
     const wb_buf = Buffer.from(workbook_entry.content);
-    const records = scan_records(wb_buf);
+    const { records, truncated } = scan_records(wb_buf);
+
+    if (truncated) {
+        warnings.push('Some data in this file could not be read. The file may be damaged.');
+    }
 
     if (records.length === 0) {
         throw new Error('No workbook data found in .xls file');
@@ -481,7 +492,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
                 0x0200: 'BIFF2', 0x0300: 'BIFF3', 0x0400: 'BIFF4', 0x0500: 'BIFF5',
             };
             const name = ver_names[version] ?? `0x${version.toString(16)}`;
-            throw new Error(`Unsupported Excel format: ${name}. Only BIFF8 (.xls from Excel 97+) is supported.`);
+            throw new Error(`Unsupported Excel format: ${name}`);
         }
     }
 
