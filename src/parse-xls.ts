@@ -14,6 +14,7 @@ const RECORD_CONTINUE = 0x003C;
 const RT_BOF = 0x0809;
 const RT_EOF = 0x000A;
 const RT_BOUNDSHEET8 = 0x0085;
+const RT_DATEMODE = 0x0022;
 const RT_SST = 0x00FC;
 const RT_FONT = 0x0031;
 const RT_XF = 0x00E0;
@@ -67,6 +68,8 @@ interface XfEntry {
     font_index: number;
     format_index: number;
 }
+
+type DateMode = 0 | 1;
 
 // --- Layer 1: Record Scanner ---
 
@@ -254,6 +257,10 @@ function read_biff8_string_chunked(
             Math.floor(bytes_left_in_chunk / char_size)
         );
 
+        if (is_utf16 && chars_in_chunk === 0 && bytes_left_in_chunk === 1) {
+            throw new Error('Truncated UTF-16 input in BIFF8 string continuation');
+        }
+
         if (chars_in_chunk > 0) {
             if (is_utf16) {
                 value += total_buf.toString('utf16le', abs_pos, abs_pos + chars_in_chunk * 2);
@@ -367,6 +374,10 @@ function read_sst(records: BiffRecord[]): string[] {
                     Math.floor(bytes_left_in_chunk / char_size)
                 );
 
+                if (is_utf16 && chars_in_chunk === 0 && bytes_left_in_chunk === 1) {
+                    throw new Error('Truncated UTF-16 input in BIFF8 string continuation');
+                }
+
                 if (chars_in_chunk > 0) {
                     if (is_utf16) {
                         value += total_buf.toString('utf16le', abs_pos, abs_pos + chars_in_chunk * 2);
@@ -463,12 +474,27 @@ function read_bound_sheets(records: BiffRecord[]): SheetEntry[] {
     return sheets;
 }
 
+function read_datemode(records: BiffRecord[]): DateMode {
+    const rec = records.find((record) => record.type === RT_DATEMODE);
+    if (!rec || rec.data.length < 2) return 0;
+    return rec.data.readUInt16LE(0) === 1 ? 1 : 0;
+}
+
 /** Convert an Excel date serial number to an ISO 8601 string. */
-function serial_to_iso(serial: number): string {
-    // Excel epoch: Jan 0 1900 (Dec 30 1899 in real dates).
-    // Intentionally reproduces the Lotus 1-2-3 leap-year bug for serials > 59.
-    const epoch = new Date(Date.UTC(1899, 11, 30));
-    const ms = epoch.getTime() + serial * 86400000;
+function serial_to_iso(serial: number, datemode: DateMode): string {
+    if (datemode === 1) {
+        const epoch = new Date(Date.UTC(1904, 0, 1));
+        const ms = epoch.getTime() + serial * 86400000;
+        return new Date(ms).toISOString();
+    }
+
+    let adjusted_serial = serial;
+    if (adjusted_serial >= 60) {
+        adjusted_serial -= 1;
+    }
+
+    const epoch = new Date(Date.UTC(1899, 11, 31));
+    const ms = epoch.getTime() + adjusted_serial * 86400000;
     return new Date(ms).toISOString();
 }
 
@@ -486,26 +512,31 @@ function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number
 }
 
 /** Normalize a numeric raw value: return ISO string for dates, number otherwise. */
-function normalize_numeric_raw(
-    value: number, xf_index: number, xfs: XfEntry[], format_map: Map<number, string>
-): string | number {
-    if (is_date_format(xf_index, xfs, format_map)) {
-        return serial_to_iso(value);
-    }
+function normalize_numeric_raw(value: number): number {
     return value;
 }
 
-function format_value(raw: number, xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): string {
+function format_value(
+    raw: number,
+    xf_index: number,
+    xfs: XfEntry[],
+    format_map: Map<number, string>,
+    datemode: DateMode
+): string {
     if (xf_index >= xfs.length) return String(raw);
     const xf = xfs[xf_index];
     const fmt_index = xf.format_index;
     const fmt = format_map.get(fmt_index);
+    const formatted_raw =
+        datemode === 1 && is_date_format(xf_index, xfs, format_map)
+            ? raw + 1462
+            : raw;
     try {
         if (fmt) {
-            return SSF.format(fmt, raw);
+            return SSF.format(fmt, formatted_raw);
         }
         // SSF handles built-in format indices (0-49) natively
-        return SSF.format(fmt_index, raw);
+        return SSF.format(fmt_index, formatted_raw);
     } catch {
         return String(raw);
     }
@@ -527,6 +558,7 @@ function parse_sheet_records(
     xfs: XfEntry[],
     fonts: FontEntry[],
     format_map: Map<number, string>,
+    datemode: DateMode,
     budget: WorkbookBudget,
 ): SheetData {
     let row_count = 0;
@@ -568,8 +600,8 @@ function parse_sheet_records(
                 const xf_index = buf.readUInt16LE(4);
                 const value = buf.readDoubleLE(6);
                 const style = get_style(xf_index, xfs, fonts);
-                const formatted = format_value(value, xf_index, xfs, format_map);
-                const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                const raw = normalize_numeric_raw(value);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -584,8 +616,8 @@ function parse_sheet_records(
                 const xf_index = buf.readUInt16LE(4);
                 const value = decode_rk(buf.readInt32LE(6));
                 const style = get_style(xf_index, xfs, fonts);
-                const formatted = format_value(value, xf_index, xfs, format_map);
-                const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                const raw = normalize_numeric_raw(value);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -605,8 +637,8 @@ function parse_sheet_records(
                     const rk_val = buf.readInt32LE(pos + 2);
                     const value = decode_rk(rk_val);
                     const style = get_style(xf_index, xfs, fonts);
-                    const formatted = format_value(value, xf_index, xfs, format_map);
-                    const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                    const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                    const raw = normalize_numeric_raw(value);
                     cells.set(`${row}:${c}`, {
                         raw, formatted,
                         bold: style.bold, italic: style.italic,
@@ -715,8 +747,8 @@ function parse_sheet_records(
                 } else {
                     // Numeric result — read as IEEE 754 double
                     const value = buf.readDoubleLE(6);
-                    const formatted = format_value(value, xf_index, xfs, format_map);
-                    const raw = normalize_numeric_raw(value, xf_index, xfs, format_map);
+                    const formatted = format_value(value, xf_index, xfs, format_map, datemode);
+                    const raw = normalize_numeric_raw(value);
                     cells.set(key, { raw, formatted, bold: style.bold, italic: style.italic });
                 }
                 break;
@@ -726,7 +758,7 @@ function parse_sheet_records(
                 // STRING record follows a FORMULA when the cached result is a string
                 if (!pending_formula_key) break;
                 const buf = rec.data;
-                if (buf.length < 3) break;
+                if (buf.length < 2) break;
                 const char_count = buf.readUInt16LE(0);
                 const result = read_biff8_string_chunked(rec, 2, char_count);
                 cells.set(pending_formula_key, {
@@ -842,6 +874,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
     const fonts = read_fonts(records);
     const xfs = read_xfs(records);
     const format_map = read_formats(records);
+    const datemode = read_datemode(records);
     const sheet_entries = read_bound_sheets(records);
     assert_safe_sheet_count(sheet_entries.length);
     const budget = create_workbook_budget();
@@ -877,6 +910,7 @@ export function parse_xls(buffer: Buffer): ParseResult {
             xfs,
             fonts,
             format_map,
+            datemode,
             budget
         );
         sheet_data.name = entry.name;

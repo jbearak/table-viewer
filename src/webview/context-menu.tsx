@@ -20,6 +20,10 @@ export function ContextMenu({
 }: ContextMenuProps): React.JSX.Element {
     const menu_ref = useRef<HTMLDivElement>(null);
 
+    useEffect(() => {
+        menu_ref.current?.focus();
+    }, []);
+
     // Viewport-clamped positioning
     useEffect(() => {
         const el = menu_ref.current;
@@ -70,23 +74,37 @@ export function ContextMenu({
             document.removeEventListener('scroll', handle_scroll, true);
     }, [on_dismiss]);
 
+    const on_key_down = (e: React.KeyboardEvent<HTMLDivElement>) => {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            on_dismiss();
+        }
+    };
+
+    const activate_item = (item: MenuItem) => {
+        item.on_click();
+        on_dismiss();
+    };
+
     return (
         <div
             ref={menu_ref}
             className="context-menu"
             style={{ left: x, top: y }}
+            role="menu"
+            tabIndex={-1}
+            onKeyDown={on_key_down}
         >
             {items.map((item, i) => (
-                <div
+                <button
                     key={i}
+                    type="button"
                     className="context-menu-item"
-                    onClick={() => {
-                        item.on_click();
-                        on_dismiss();
-                    }}
+                    role="menuitem"
+                    onClick={() => activate_item(item)}
                 >
                     {item.label}
-                </div>
+                </button>
             ))}
         </div>
     );
