@@ -75,6 +75,9 @@ export function use_selection(
         (row: number, col: number, e: React.MouseEvent) => {
             if (e.button !== 0) return;
             e.preventDefault();
+            // Focus the table container so keyboard events fire
+            const container = (e.target as HTMLElement).closest('.table-container') as HTMLElement | null;
+            container?.focus();
             dragging_ref.current = true;
 
             if (e.shiftKey && selection) {
