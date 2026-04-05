@@ -9,9 +9,20 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 # Check for node
 if ! command -v node &> /dev/null; then
     echo "Error: node is required but not installed."
+    exit 1
+fi
+
+# Check Node version (require >=22)
+NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
+if [ "$NODE_MAJOR" -lt 22 ]; then
+    echo "Error: Node >= 22 is required (found $(node -v))."
     exit 1
 fi
 
