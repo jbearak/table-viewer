@@ -453,7 +453,7 @@ function parse_sheet_records(
 export function parse_xls(buffer: Buffer): ParseResult {
     const warnings: string[] = [];
 
-    let cfb_file: CFB.CFBContainer;
+    let cfb_file: ReturnType<typeof CFB.read>;
     try {
         cfb_file = CFB.read(buffer, { type: 'buffer' });
     } catch {
