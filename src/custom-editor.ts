@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { parse_xlsx } from './parse-xlsx';
 import { parse_xls } from './parse-xls';
 import type { FileStateStore } from './state';
-import type { WorkbookData, PerFileState, WebviewMessage } from './types';
+import type { WorkbookData, WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
 
 export const VIEW_TYPE = 'tableViewer.editor';
