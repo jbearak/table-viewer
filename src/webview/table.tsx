@@ -1,5 +1,6 @@
 import React, { useCallback, useRef } from 'react';
 import type { SheetData, CellData, MergeRange } from '../types';
+import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
 
 interface TableProps {
     sheet: SheetData;
@@ -9,6 +10,12 @@ interface TableProps {
     on_column_resize: (col: number, width: number) => void;
     on_row_resize: (row: number, height: number) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
+    selection: SelectionState | null;
+    on_cell_mouse_down: (row: number, col: number, e: React.MouseEvent) => void;
+    on_cell_mouse_move: (row: number, col: number) => void;
+    on_cell_mouse_up: () => void;
+    on_context_menu: (row: number, col: number, e: React.MouseEvent) => void;
+    on_key_down: (e: React.KeyboardEvent) => void;
 }
 
 export function Table({
@@ -19,11 +26,15 @@ export function Table({
     on_column_resize,
     on_row_resize,
     scroll_ref,
+    selection,
+    on_cell_mouse_down,
+    on_cell_mouse_move,
+    on_cell_mouse_up,
+    on_context_menu,
+    on_key_down,
 }: TableProps): React.JSX.Element {
     const merge_map = build_merge_map(sheet.merges);
 
-    // For each column, find the first row where it has a visible
-    // (non-hidden) cell — that's where we render the resize handle.
     const resize_handle_row = new Map<number, number>();
     for (let c = 0; c < sheet.columnCount; c++) {
         for (let r = 0; r < sheet.rows.length; r++) {
@@ -35,8 +46,16 @@ export function Table({
         }
     }
 
+    const sel_range = selection ? normalize_range(selection.range) : null;
+
     return (
-        <div className="table-container" ref={scroll_ref as React.LegacyRef<HTMLDivElement>}>
+        <div
+            className="table-container"
+            ref={scroll_ref as React.LegacyRef<HTMLDivElement>}
+            tabIndex={0}
+            onKeyDown={on_key_down}
+            onMouseUp={on_cell_mouse_up}
+        >
             <table className="data-table">
                 <tbody>
                     {sheet.rows.map((row, r) => (
@@ -69,10 +88,30 @@ export function Table({
                                 const show_resize_handle =
                                     resize_handle_row.get(c) === r;
 
+                                const selected = is_cell_in_range(
+                                    r,
+                                    c,
+                                    sel_range
+                                );
+                                const is_anchor =
+                                    selection !== null &&
+                                    r === selection.anchor_row &&
+                                    c === selection.anchor_col;
+
+                                const class_names = [
+                                    selected ? 'selected' : '',
+                                    is_anchor ? 'active-cell' : '',
+                                ]
+                                    .filter(Boolean)
+                                    .join(' ');
+
                                 return (
                                     <td
                                         key={c}
                                         {...span_props}
+                                        className={
+                                            class_names || undefined
+                                        }
                                         style={{
                                             ...(column_widths[c]
                                                 ? {
@@ -81,19 +120,35 @@ export function Table({
                                                   }
                                                 : undefined),
                                             ...(show_resize_handle
-                                                ? { position: 'relative' }
+                                                ? {
+                                                      position:
+                                                          'relative',
+                                                  }
                                                 : undefined),
                                         }}
+                                        onMouseDown={(e) =>
+                                            on_cell_mouse_down(r, c, e)
+                                        }
+                                        onMouseMove={() =>
+                                            on_cell_mouse_move(r, c)
+                                        }
+                                        onContextMenu={(e) =>
+                                            on_context_menu(r, c, e)
+                                        }
                                     >
                                         {show_resize_handle && (
                                             <ColumnResizeHandle
                                                 col={c}
-                                                on_resize={on_column_resize}
+                                                on_resize={
+                                                    on_column_resize
+                                                }
                                             />
                                         )}
                                         <CellContent
                                             cell={cell}
-                                            show_formatting={show_formatting}
+                                            show_formatting={
+                                                show_formatting
+                                            }
                                         />
                                     </td>
                                 );
@@ -150,6 +205,7 @@ function ColumnResizeHandle({
     const handle_mouse_down = useCallback(
         (e: React.MouseEvent) => {
             e.preventDefault();
+            e.stopPropagation();
             dragging_ref.current = true;
 
             const start_x = e.clientX;
