@@ -266,3 +266,13 @@ body {
     color: var(--vscode-menu-selectionForeground, #fff);
     outline: none;
 }
+
+.truncation-banner {
+    padding: 4px 8px;
+    background: var(--vscode-editorInfo-background, rgba(0, 122, 204, 0.1));
+    color: var(--vscode-editorInfo-foreground, var(--vscode-foreground, #ccc));
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    font-size: 12px;
+    flex-shrink: 0;
+    text-align: center;
+}

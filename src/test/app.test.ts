@@ -146,3 +146,63 @@ describe('App auto-fit state', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
     });
 });
+
+describe('truncation banner', () => {
+    afterEach(() => {
+        if (root) {
+            act(() => root!.unmount());
+            root = null;
+        }
+        container?.remove();
+        container = null;
+        vi.restoreAllMocks();
+    });
+
+    it('renders truncation banner when truncationMessage is present', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows');
+    });
+
+    it('does not render truncation banner when truncationMessage is absent', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).toBeNull();
+    });
+});

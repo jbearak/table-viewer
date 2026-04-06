@@ -30,6 +30,8 @@ export function App(): React.JSX.Element {
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    const [truncation_message, set_truncation_message] = useState<string | null>(null);
+    const [preview_mode, set_preview_mode] = useState(false);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const table_ref = useRef<HTMLTableElement | null>(null);
@@ -80,6 +82,8 @@ export function App(): React.JSX.Element {
                         : msg.defaultTabOrientation === 'vertical'
                 );
                 state_ref.current = s;
+                set_truncation_message(msg.truncationMessage ?? null);
+                set_preview_mode(msg.previewMode ?? false);
 
                 requestAnimationFrame(() => {
                     const pos =
@@ -132,6 +136,7 @@ export function App(): React.JSX.Element {
                     ),
                     activeSheetIndex: next_active_sheet_index,
                 };
+                set_truncation_message(msg.truncationMessage ?? null);
                 persist_immediate();
             }
         };
@@ -143,6 +148,56 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
     }, []);
+
+    useEffect(() => {
+        if (!preview_mode) return;
+
+        const handler = (event: MessageEvent) => {
+            const msg = event.data;
+            if (msg.type === 'scrollToRow' && typeof msg.row === 'number') {
+                const table = table_ref.current;
+                const scroller = scroll_ref.current;
+                if (!table || !scroller) return;
+
+                const rows = table.querySelectorAll('tbody tr');
+                const target_row = rows[msg.row] as HTMLElement | undefined;
+                if (target_row) {
+                    scroller.scrollTop = target_row.offsetTop;
+                }
+            }
+        };
+
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [preview_mode]);
+
+    useEffect(() => {
+        if (!preview_mode) return;
+        const scroller = scroll_ref.current;
+        if (!scroller) return;
+
+        const report_visible_row = () => {
+            const table = table_ref.current;
+            if (!table) return;
+
+            const rows = table.querySelectorAll('tbody tr');
+            const scroll_top = scroller.scrollTop;
+            let visible_row = 0;
+
+            for (let i = 0; i < rows.length; i++) {
+                const row_el = rows[i] as HTMLElement;
+                if (row_el.offsetTop + row_el.offsetHeight > scroll_top) {
+                    visible_row = i;
+                    break;
+                }
+            }
+
+            vscode_api.postMessage({ type: 'visibleRowChanged', row: visible_row });
+        };
+
+        scroller.addEventListener('scroll', report_visible_row, { passive: true });
+        return () => scroller.removeEventListener('scroll', report_visible_row);
+    }, [preview_mode]);
 
     useEffect(() => {
         const el = scroll_ref.current;
@@ -392,6 +447,9 @@ export function App(): React.JSX.Element {
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
             />
+            {truncation_message && (
+                <div className="truncation-banner">{truncation_message}</div>
+            )}
             {effective_vertical_tabs ? (
                 <div className="content-area">
                     <SheetTabs
