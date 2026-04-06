@@ -176,27 +176,36 @@ export function App(): React.JSX.Element {
         const scroller = scroll_ref.current;
         if (!scroller) return;
 
+        let raf_id: number | null = null;
+
         const report_visible_row = () => {
-            const table = table_ref.current;
-            if (!table) return;
+            if (raf_id !== null) return;
+            raf_id = requestAnimationFrame(() => {
+                raf_id = null;
+                const table = table_ref.current;
+                if (!table) return;
 
-            const rows = table.querySelectorAll('tbody tr');
-            const scroll_top = scroller.scrollTop;
-            let visible_row = 0;
+                const rows = table.querySelectorAll('tbody tr');
+                const scroll_top = scroller.scrollTop;
+                let visible_row = 0;
 
-            for (let i = 0; i < rows.length; i++) {
-                const row_el = rows[i] as HTMLElement;
-                if (row_el.offsetTop + row_el.offsetHeight > scroll_top) {
-                    visible_row = i;
-                    break;
+                for (let i = 0; i < rows.length; i++) {
+                    const row_el = rows[i] as HTMLElement;
+                    if (row_el.offsetTop + row_el.offsetHeight > scroll_top) {
+                        visible_row = i;
+                        break;
+                    }
                 }
-            }
 
-            vscode_api.postMessage({ type: 'visibleRowChanged', row: visible_row });
+                vscode_api.postMessage({ type: 'visibleRowChanged', row: visible_row });
+            });
         };
 
         scroller.addEventListener('scroll', report_visible_row, { passive: true });
-        return () => scroller.removeEventListener('scroll', report_visible_row);
+        return () => {
+            scroller.removeEventListener('scroll', report_visible_row);
+            if (raf_id !== null) cancelAnimationFrame(raf_id);
+        };
     }, [preview_mode]);
 
     useEffect(() => {
