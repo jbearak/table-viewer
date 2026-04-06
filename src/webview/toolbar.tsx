@@ -14,6 +14,10 @@ interface ToolbarProps {
     show_vertical_tabs_button: boolean;
     auto_fit_active: boolean;
     on_toggle_auto_fit: () => void;
+    edit_mode: boolean;
+    is_dirty: boolean;
+    on_toggle_edit_mode: () => void;
+    show_edit_button: boolean;
 }
 
 export function Toolbar({
@@ -25,6 +29,10 @@ export function Toolbar({
     show_vertical_tabs_button,
     auto_fit_active,
     on_toggle_auto_fit,
+    edit_mode,
+    is_dirty,
+    on_toggle_edit_mode,
+    show_edit_button,
 }: ToolbarProps): React.JSX.Element {
 
     return (
@@ -63,6 +71,19 @@ export function Toolbar({
                 }
                 onClick={on_toggle_auto_fit}
             />
+            {show_edit_button && (
+                <ToolbarButton
+                    label="Edit"
+                    active={edit_mode}
+                    tooltip_text={
+                        edit_mode
+                            ? 'Exit edit mode.'
+                            : 'Enter edit mode to modify cell values.'
+                    }
+                    onClick={on_toggle_edit_mode}
+                    extra_class={is_dirty ? 'has-unsaved' : undefined}
+                />
+            )}
         </div>
     );
 }
@@ -72,11 +93,13 @@ function ToolbarButton({
     active,
     tooltip_text,
     onClick,
+    extra_class,
 }: {
     label: string;
     active: boolean;
     tooltip_text: string;
     onClick: () => void;
+    extra_class?: string;
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
@@ -141,7 +164,7 @@ function ToolbarButton({
             <button
                 ref={button_ref}
                 type="button"
-                className={`toggle ${active ? 'active' : ''}`}
+                className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
                 onClick={onClick}
                 onMouseOver={() => set_is_hovered(true)}
                 onMouseOut={() => set_is_hovered(false)}
