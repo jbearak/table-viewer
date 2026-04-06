@@ -104,7 +104,7 @@ git commit -m "Add CSV/TSV message types: scrollToRow, visibleRowChanged, trunca
 - [ ] **Step 1: Create test fixtures**
 
 Create `src/test/fixtures/basic.csv`:
-```
+```csv
 Name,Age,City
 Alice,30,New York
 Bob,25,London
@@ -112,7 +112,7 @@ Charlie,35,Paris
 ```
 
 Create `src/test/fixtures/basic.tsv`:
-```
+```tsv
 Name	Age	City
 Alice	30	New York
 Bob	25	London
@@ -120,7 +120,7 @@ Charlie	35	Paris
 ```
 
 Create `src/test/fixtures/quoted-multiline.csv`:
-```
+```csv
 Name,Bio,City
 Alice,"Line 1
 Line 2",New York
@@ -365,8 +365,18 @@ function build_line_map(source: string, parsed_rows: string[][]): number[] {
         // We advance pos past the characters for this row + its delimiter.
         // Rather than reconstructing, we count newlines consumed by this row.
         const row_text = reconstruct_row_text(row, source, pos);
-        for (const ch of row_text) {
-            if (ch === '\n') current_line++;
+        for (let i = 0; i < row_text.length; i++) {
+            const ch = row_text[i];
+            if (ch === '\n') {
+                current_line++;
+                continue;
+            }
+            if (ch === '\r') {
+                if (i + 1 < row_text.length && row_text[i + 1] === '\n') {
+                    i++;
+                }
+                current_line++;
+            }
         }
         pos += row_text.length;
 

@@ -12,14 +12,16 @@ export function get_preview_reveal_target_line(
     if (line_count <= 0) return null;
 
     const clamped_source_line = clamp_line(source_line, line_count);
-    if (visible_window && visible_window.top_line === clamped_source_line) {
+    const reveal_target = clamp_line(
+        clamped_source_line - PREVIEW_EDITOR_TOP_PADDING_LINES,
+        line_count
+    );
+
+    if (visible_window && visible_window.top_line === reveal_target) {
         return null;
     }
 
-    return clamp_line(
-        clamped_source_line + PREVIEW_EDITOR_TOP_PADDING_LINES,
-        line_count
-    );
+    return reveal_target;
 }
 
 function clamp_line(line: number, line_count: number): number {
