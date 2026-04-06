@@ -5,6 +5,7 @@ import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
+import { serialize_csv } from './serialize-csv';
 
 export function open_csv_table(
     uri: vscode.Uri,
@@ -32,6 +33,7 @@ export function open_csv_table(
 
     const disposables: vscode.Disposable[] = [];
     let consecutive_reload_failures = 0;
+    let suppress_next_reload = false;
 
     function get_delimiter(): ',' | '\t' {
         return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
@@ -55,9 +57,12 @@ export function open_csv_table(
         return parse_csv(text, get_delimiter(), get_csv_max_rows());
     }
 
+    let last_parsed: CsvParseResult | null = null;
+
     async function send_initial_data(): Promise<void> {
         try {
             const result = await parse_file();
+            last_parsed = result;
             const state = state_store.get(file_path);
             const config = vscode.workspace.getConfiguration('tableViewer');
             const default_orientation = config.get<'horizontal' | 'vertical'>(
@@ -70,6 +75,7 @@ export function open_csv_table(
                 state,
                 defaultTabOrientation: default_orientation,
                 truncationMessage: result.truncationMessage,
+                csvEditable: true,
             });
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -78,8 +84,13 @@ export function open_csv_table(
     }
 
     async function send_reload(): Promise<void> {
+        if (suppress_next_reload) {
+            suppress_next_reload = false;
+            return;
+        }
         try {
             const result = await parse_file();
+            last_parsed = result;
             const delivered = await panel.webview.postMessage({
                 type: 'reload',
                 data: result.data,
@@ -102,7 +113,7 @@ export function open_csv_table(
     }
 
     disposables.push(
-        panel.webview.onDidReceiveMessage((msg: WebviewMessage) => {
+        panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
             switch (msg.type) {
                 case 'ready':
                     send_initial_data();
@@ -110,6 +121,41 @@ export function open_csv_table(
                 case 'stateChanged':
                     state_store.set(file_path, msg.state);
                     break;
+                case 'saveCsv': {
+                    if (!last_parsed) return;
+                    try {
+                        const content = serialize_csv(
+                            last_parsed.data.sheets[0].rows,
+                            get_delimiter(),
+                            msg.edits
+                        );
+                        suppress_next_reload = true;
+                        await vscode.workspace.fs.writeFile(
+                            uri,
+                            new TextEncoder().encode(content)
+                        );
+                        last_parsed = await parse_file();
+                        panel.webview.postMessage({ type: 'saveResult', success: true });
+                    } catch (err) {
+                        const message = err instanceof Error ? err.message : String(err);
+                        vscode.window.showErrorMessage(`Failed to save: ${message}`);
+                        panel.webview.postMessage({ type: 'saveResult', success: false });
+                    }
+                    break;
+                }
+                case 'showSaveDialog': {
+                    const choice = await vscode.window.showWarningMessage(
+                        'You have unsaved changes.',
+                        { modal: true },
+                        'Save',
+                        'Discard'
+                    );
+                    panel.webview.postMessage({
+                        type: 'saveDialogResult',
+                        choice: choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel',
+                    });
+                    break;
+                }
             }
         })
     );
