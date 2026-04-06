@@ -182,6 +182,14 @@ function setup_preview(
         );
     }
 
+    function get_sticky_header_lines(): number {
+        const rainbow_csv = vscode.extensions.getExtension('mechatroner.rainbow-csv');
+        if (!rainbow_csv) return 0;
+        const enabled = vscode.workspace.getConfiguration('rainbow_csv')
+            .get<boolean>('enable_sticky_header', false);
+        return enabled ? 1 : 0;
+    }
+
     async function reveal_source_line(
         editor: vscode.TextEditor,
         source_line: number
@@ -194,7 +202,8 @@ function setup_preview(
                     top_line: visible_range.start.line,
                 }
                 : null,
-            editor.document.lineCount
+            editor.document.lineCount,
+            get_sticky_header_lines()
         );
         if (reveal_target_line === null) return;
         const show_options: vscode.TextDocumentShowOptions = {
