@@ -55,8 +55,9 @@ Table Viewer is the result.
 - **Enter** confirms and moves to the cell below; **Tab** moves right
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file
-- Edited cells show a dot indicator until saved
+- Edited cells are highlighted with a different background color until saved
 - When exiting edit mode with unsaved changes, you're prompted to save or discard
+- Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
 
 ## Usage
 
@@ -64,8 +65,8 @@ Table Viewer is the result.
 
 **CSV/TSV files** open in VS Code's built-in text editor. Two buttons appear in the editor title bar:
 
-- The **preview icon** opens a synced side-by-side preview (alt-click opens it in the same tab)
-- The **table icon** opens the file as a standalone table view
+- The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
+- The **table icon** opens the file as a standalone table view (use this if you want to edit)
 
 ## Settings
 
