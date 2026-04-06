@@ -13,7 +13,7 @@ function get_measurement_element(
 
     let node = text_walker.nextNode();
     while (node) {
-        if ((node.textContent ?? '').length > 0) {
+        if ((node.textContent ?? '').trim().length > 0) {
             return node.parentElement ?? target_td;
         }
         node = text_walker.nextNode();

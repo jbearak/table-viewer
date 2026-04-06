@@ -37,9 +37,21 @@ export function App(): React.JSX.Element {
     const scroll_positions_ref = useRef<
         ({ top: number; left: number } | undefined)[]
     >([]);
+    const auto_fit_active_ref = useRef<boolean[]>([]);
+    const auto_fit_snapshot_ref = useRef<
+        (Record<number, number> | undefined)[]
+    >([]);
 
     const { persist_debounced, persist_immediate } =
         use_state_sync(state_ref);
+
+    useEffect(() => {
+        auto_fit_active_ref.current = auto_fit_active;
+    }, [auto_fit_active]);
+
+    useEffect(() => {
+        auto_fit_snapshot_ref.current = auto_fit_snapshot;
+    }, [auto_fit_snapshot]);
 
     useEffect(() => {
         const handler = (event: MessageEvent) => {
@@ -47,6 +59,8 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'workbookData') {
                 set_workbook(msg.data);
+                auto_fit_active_ref.current = [];
+                auto_fit_snapshot_ref.current = [];
                 set_auto_fit_active([]);
                 set_auto_fit_snapshot([]);
                 const s = normalize_per_file_state(
@@ -79,6 +93,8 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'reload') {
                 set_workbook(msg.data);
+                auto_fit_active_ref.current = [];
+                auto_fit_snapshot_ref.current = [];
                 set_auto_fit_active([]);
                 set_auto_fit_snapshot([]);
                 const sheet_count = msg.data.sheets.length;
@@ -194,6 +210,34 @@ export function App(): React.JSX.Element {
         });
     }, [persist_immediate]);
 
+    const deactivate_auto_fit_for_sheet = useCallback((sheet_index: number) => {
+        const is_active = auto_fit_active_ref.current[sheet_index];
+        const has_snapshot =
+            auto_fit_snapshot_ref.current[sheet_index] !== undefined;
+
+        if (!is_active && !has_snapshot) return;
+
+        if (is_active) {
+            set_auto_fit_active((prev) => {
+                if (!prev[sheet_index]) return prev;
+                const next = [...prev];
+                next[sheet_index] = false;
+                auto_fit_active_ref.current = next;
+                return next;
+            });
+        }
+
+        if (has_snapshot) {
+            set_auto_fit_snapshot((prev) => {
+                if (prev[sheet_index] === undefined) return prev;
+                const next = [...prev];
+                next[sheet_index] = undefined;
+                auto_fit_snapshot_ref.current = next;
+                return next;
+            });
+        }
+    }, []);
+
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
             set_column_widths((prev) => {
@@ -208,22 +252,10 @@ export function App(): React.JSX.Element {
                 persist_immediate();
                 return next;
             });
-
             // Deactivate auto-fit if it was active (keep current widths, discard snapshot)
-            if (auto_fit_active[active_sheet_index]) {
-                set_auto_fit_active((prev) => {
-                    const next = [...prev];
-                    next[active_sheet_index] = false;
-                    return next;
-                });
-                set_auto_fit_snapshot((prev) => {
-                    const next = [...prev];
-                    next[active_sheet_index] = undefined;
-                    return next;
-                });
-            }
+            deactivate_auto_fit_for_sheet(active_sheet_index);
         },
-        [active_sheet_index, persist_immediate, auto_fit_active]
+        [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
     );
 
     const handle_auto_size = useCallback(
@@ -255,11 +287,13 @@ export function App(): React.JSX.Element {
             set_auto_fit_active((prev) => {
                 const next = [...prev];
                 next[active_sheet_index] = false;
+                auto_fit_active_ref.current = next;
                 return next;
             });
             set_auto_fit_snapshot((prev) => {
                 const next = [...prev];
                 next[active_sheet_index] = undefined;
+                auto_fit_snapshot_ref.current = next;
                 return next;
             });
         } else {
@@ -272,6 +306,7 @@ export function App(): React.JSX.Element {
                 next[active_sheet_index] = current_widths
                     ? { ...current_widths }
                     : undefined;
+                auto_fit_snapshot_ref.current = next;
                 return next;
             });
 
@@ -301,6 +336,7 @@ export function App(): React.JSX.Element {
             set_auto_fit_active((prev) => {
                 const next = [...prev];
                 next[active_sheet_index] = true;
+                auto_fit_active_ref.current = next;
                 return next;
             });
         }
