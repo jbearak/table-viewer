@@ -67,7 +67,7 @@ describe('build_boundary_groups', () => {
         expect(col_boundary_groups.get(2)).toEqual(new Set([0, 1]));
     });
 
-    it('returns empty maps for a single-cell table', () => {
+    it('returns maps with the single cell right and bottom boundaries', () => {
         const { col_boundary_groups, row_boundary_groups } =
             build_boundary_groups(1, 1, []);
 

@@ -10,8 +10,10 @@ interface TableProps {
     column_widths: Record<number, number>;
     row_heights: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    on_column_resize_batch: (updates: { col: number; width: number }[]) => void;
     on_auto_size: (col: number) => void;
     on_row_resize: (row: number, height: number) => void;
+    on_row_resize_batch: (updates: { row: number; height: number }[]) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
     selection: SelectionState | null;
@@ -28,8 +30,10 @@ export function Table({
     column_widths,
     row_heights,
     on_column_resize,
+    on_column_resize_batch,
     on_auto_size,
     on_row_resize,
+    on_row_resize_batch,
     scroll_ref,
     table_ref,
     selection,
@@ -54,8 +58,11 @@ export function Table({
             if (active_col_boundary === null) return false;
             const cell_right_boundary = c + col_span - 1;
             if (cell_right_boundary !== active_col_boundary.boundary) return false;
-            // Span-cell hover: only highlight the hovered cell's boundary, not the group
-            if (active_col_boundary.is_span) return false;
+            if (active_col_boundary.is_span) {
+                // Span-cell hover: highlight only the hovered cell's own border
+                const { first, last } = visible_range_ref.current;
+                return r >= first && r <= last;
+            }
             const { first, last } = visible_range_ref.current;
             if (r < first || r > last) return false;
             const group = col_boundary_groups.get(active_col_boundary.boundary);
@@ -70,7 +77,10 @@ export function Table({
             if (active_row_boundary === null) return false;
             const cell_bottom_boundary = r + row_span - 1;
             if (cell_bottom_boundary !== active_row_boundary.boundary) return false;
-            if (active_row_boundary.is_span) return false;
+            if (active_row_boundary.is_span) {
+                // Span-cell hover: highlight only the hovered cell's own border
+                return true;
+            }
             const group = row_boundary_groups.get(active_row_boundary.boundary);
             return group !== undefined && group.has(c);
         },
@@ -227,6 +237,7 @@ export function Table({
                                         <ColumnResizeHandle
                                             col={span_props.colSpan ? c + (span_props.colSpan - 1) : c}
                                             on_resize={on_column_resize}
+                                            on_resize_batch={on_column_resize_batch}
                                             on_auto_size={on_auto_size}
                                             colspan_cols={span_props.colSpan && span_props.colSpan > 1
                                                 ? Array.from({ length: span_props.colSpan }, (_, i) => c + i)
@@ -238,6 +249,7 @@ export function Table({
                                         <RowResizeHandle
                                             row={span_props.rowSpan ? r + (span_props.rowSpan - 1) : r}
                                             on_resize={on_row_resize}
+                                            on_resize_batch={on_row_resize_batch}
                                             rowspan_rows={span_props.rowSpan && span_props.rowSpan > 1
                                                 ? Array.from({ length: span_props.rowSpan }, (_, i) => r + i)
                                                 : undefined}
@@ -290,6 +302,7 @@ function CellContent({
 interface ColumnResizeHandleProps {
     col: number;
     on_resize: (col: number, width: number) => void;
+    on_resize_batch: (updates: { col: number; width: number }[]) => void;
     on_auto_size: (col: number) => void;
     colspan_cols?: number[];
     column_widths: Record<number, number>;
@@ -300,6 +313,7 @@ interface ColumnResizeHandleProps {
 function ColumnResizeHandle({
     col,
     on_resize,
+    on_resize_batch,
     on_auto_size,
     colspan_cols,
     column_widths,
@@ -338,10 +352,11 @@ function ColumnResizeHandle({
                     document.removeEventListener('mousemove', handle_mouse_move);
                     document.removeEventListener('mouseup', handle_mouse_up);
                     const per_col_delta = (up_e.clientX - start_x) / colspan_cols.length;
-                    for (let i = 0; i < colspan_cols.length; i++) {
-                        const final_width = Math.max(40, col_start_widths[i] + per_col_delta);
-                        on_resize(colspan_cols[i], final_width);
-                    }
+                    const updates = colspan_cols.map((c, i) => ({
+                        col: c,
+                        width: Math.max(40, col_start_widths[i] + per_col_delta),
+                    }));
+                    on_resize_batch(updates);
                     on_hover_end();
                 };
 
@@ -367,7 +382,7 @@ function ColumnResizeHandle({
                 document.addEventListener('mouseup', handle_mouse_up);
             }
         },
-        [col, on_resize, colspan_cols, column_widths, on_hover_end]
+        [col, on_resize, on_resize_batch, colspan_cols, column_widths, on_hover_end]
     );
 
     const handle_double_click = useCallback(
@@ -401,6 +416,7 @@ function ColumnResizeHandle({
 interface RowResizeHandleProps {
     row: number;
     on_resize: (row: number, height: number) => void;
+    on_resize_batch: (updates: { row: number; height: number }[]) => void;
     rowspan_rows?: number[];
     on_hover_start: (boundary_row: number, is_span: boolean) => void;
     on_hover_end: () => void;
@@ -409,6 +425,7 @@ interface RowResizeHandleProps {
 function RowResizeHandle({
     row,
     on_resize,
+    on_resize_batch,
     rowspan_rows,
     on_hover_start,
     on_hover_end,
@@ -447,10 +464,11 @@ function RowResizeHandle({
                     document.removeEventListener('mousemove', handle_mouse_move);
                     document.removeEventListener('mouseup', handle_mouse_up);
                     const per_row_delta = (up_e.clientY - start_y) / rowspan_rows.length;
-                    for (let i = 0; i < rowspan_rows.length; i++) {
-                        const final_height = Math.max(20, row_start_heights[i] + per_row_delta);
-                        on_resize(rowspan_rows[i], final_height);
-                    }
+                    const updates = rowspan_rows.map((r, i) => ({
+                        row: r,
+                        height: Math.max(20, row_start_heights[i] + per_row_delta),
+                    }));
+                    on_resize_batch(updates);
                     on_hover_end();
                 };
 
@@ -476,7 +494,7 @@ function RowResizeHandle({
                 document.addEventListener('mouseup', handle_mouse_up);
             }
         },
-        [row, on_resize, rowspan_rows, on_hover_end]
+        [row, on_resize, on_resize_batch, rowspan_rows, on_hover_end]
     );
 
     return (
