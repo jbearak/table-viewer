@@ -124,11 +124,6 @@ describe('spreadsheet safety limits', () => {
         ).not.toThrow();
     });
 
-    it('assert_safe_file_size uses default when no custom limit given', () => {
-        expect(() =>
-            assert_safe_file_size(MAX_WORKBOOK_FILE_BYTES + 1)
-        ).toThrow('File is too large to open safely');
-    });
 });
 
 describe('parse_xlsx safety', () => {

@@ -148,16 +148,6 @@ describe('App auto-fit state', () => {
 });
 
 describe('truncation banner', () => {
-    afterEach(() => {
-        if (root) {
-            act(() => root!.unmount());
-            root = null;
-        }
-        container?.remove();
-        container = null;
-        vi.restoreAllMocks();
-    });
-
     it('renders truncation banner when truncationMessage is present', async () => {
         await render_app();
 
