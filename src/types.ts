@@ -48,10 +48,12 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
 /** Messages from extension host to webview */
 export type HostMessage =
-    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical' }
-    | { type: 'reload'; data: WorkbookData };
+    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean }
+    | { type: 'reload'; data: WorkbookData; truncationMessage?: string }
+    | { type: 'scrollToRow'; row: number };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
-    | { type: 'stateChanged'; state: PerFileState };
+    | { type: 'stateChanged'; state: PerFileState }
+    | { type: 'visibleRowChanged'; row: number };
