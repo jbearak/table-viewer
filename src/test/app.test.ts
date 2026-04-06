@@ -457,4 +457,31 @@ describe('Context menu edit item', () => {
         expect(editor_input).not.toBeNull();
         expect((editor_input as HTMLInputElement).value).toBe('b');
     });
+
+    it('clicking inside the cell editor does not dismiss the editor', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and start editing
+        await click_button('Edit');
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+        editor_input.focus();
+        expect(document.activeElement).toBe(editor_input);
+
+        // Click inside the editor (mousedown bubbles through React's event system)
+        await act(async () => {
+            editor_input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        });
+
+        // The editor input should still have focus (table's mousedown didn't steal it)
+        expect(document.activeElement).toBe(editor_input);
+        // And the editor should still be visible
+        expect(container!.querySelector('.cell-editor-input')).not.toBeNull();
+    });
 });

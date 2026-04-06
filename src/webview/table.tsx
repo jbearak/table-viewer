@@ -276,7 +276,7 @@ export function Table({
                                             on_hover_end={handle_row_hover_end}
                                         />
                                         {editing_cell && editing_cell.row === r && editing_cell.col === c ? (
-                                            <div className="cell-editor-wrapper">
+                                            <div className="cell-editor-wrapper" onMouseDown={(e) => e.stopPropagation()}>
                                                 <CellEditor
                                                     value={editing_cell.value}
                                                     on_confirm={on_confirm_edit}
