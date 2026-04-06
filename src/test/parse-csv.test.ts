@@ -115,6 +115,14 @@ describe('parse_csv', () => {
         expect(result.line_map).toEqual([0, 1, 2]);
     });
 
+    it('counts standalone \\r inside multiline quoted fields', () => {
+        const src = 'a,"b\rc"\r1';
+        const result = parse_csv(src, ',', 10_000);
+
+        expect(result.data.sheets[0].rowCount).toBe(2);
+        expect(result.line_map).toEqual([0, 2]);
+    });
+
     it('handles rows with varying column counts by padding with nulls', () => {
         const src = 'a,b,c\n1\n2,3';
         const result = parse_csv(src, ',', 10_000);

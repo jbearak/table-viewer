@@ -33,6 +33,21 @@ function make_workbook(sheet_names: string[]): WorkbookData {
     };
 }
 
+function make_preview_workbook(row_count: number): WorkbookData {
+    return {
+        hasFormatting: false,
+        sheets: [{
+            name: 'Sheet1',
+            rows: Array.from({ length: row_count }, (_, row_index) => [
+                make_cell(`row ${row_index}`),
+            ]),
+            merges: [],
+            columnCount: 1,
+            rowCount: row_count,
+        }],
+    };
+}
+
 async function render_app() {
     vi.resetModules();
     const post_message = vi.fn();
@@ -100,7 +115,30 @@ function cleanup() {
     container?.remove();
     container = null;
     document.body.innerHTML = '';
+    vi.useRealTimers();
     vi.unstubAllGlobals();
+}
+
+function stub_rect(
+    element: Element,
+    rect: { top: number; bottom: number }
+) {
+    Object.defineProperty(element, 'getBoundingClientRect', {
+        configurable: true,
+        value: () => ({
+            top: rect.top,
+            bottom: rect.bottom,
+            left: 0,
+            right: 200,
+            width: 200,
+            height: rect.bottom - rect.top,
+            x: 0,
+            y: rect.top,
+            toJSON() {
+                return this;
+            },
+        }),
+    });
 }
 
 afterEach(() => {
@@ -194,5 +232,127 @@ describe('truncation banner', () => {
 
         const banner = container!.querySelector('.truncation-banner');
         expect(banner).toBeNull();
+    });
+});
+
+describe('preview scroll sync', () => {
+    it('posts visibleRowChanged only when the top visible row changes', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal(
+            'requestAnimationFrame',
+            (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0) as unknown as number
+        );
+        vi.stubGlobal(
+            'cancelAnimationFrame',
+            (handle: number) => clearTimeout(handle)
+        );
+
+        const { post_message } = await render_app();
+
+        await dispatch_host_message({
+            ...workbook_data_message(make_preview_workbook(3)),
+            previewMode: true,
+        });
+        post_message.mockClear();
+
+        const scroller = container!.querySelector('.table-container') as HTMLDivElement;
+        const rows = Array.from(
+            container!.querySelectorAll('tbody tr')
+        ) as HTMLElement[];
+
+        const scroller_rect = { top: 100, bottom: 260 };
+        const row_rects = [
+            { top: 90, bottom: 120 },
+            { top: 120, bottom: 150 },
+            { top: 150, bottom: 180 },
+        ];
+
+        stub_rect(scroller, scroller_rect);
+        rows.forEach((row, index) => stub_rect(row, row_rects[index]));
+
+        await act(async () => {
+            scroller.dispatchEvent(new Event('scroll'));
+            vi.runAllTimers();
+        });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'visibleRowChanged',
+            row: 0,
+        });
+
+        post_message.mockClear();
+        await act(async () => {
+            scroller.dispatchEvent(new Event('scroll'));
+            vi.runAllTimers();
+        });
+        expect(post_message).not.toHaveBeenCalled();
+
+        row_rects[0].top = 20;
+        row_rects[0].bottom = 40;
+        row_rects[1].top = 80;
+        row_rects[1].bottom = 140;
+        row_rects[2].top = 140;
+        row_rects[2].bottom = 200;
+
+        await act(async () => {
+            scroller.dispatchEvent(new Event('scroll'));
+            vi.runAllTimers();
+        });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'visibleRowChanged',
+            row: 1,
+        });
+    });
+
+    it('scrolls the preview to the requested row', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            ...workbook_data_message(make_preview_workbook(3)),
+            previewMode: true,
+        });
+
+        const scroller = container!.querySelector('.table-container') as HTMLDivElement;
+        const rows = Array.from(
+            container!.querySelectorAll('tbody tr')
+        ) as HTMLElement[];
+
+        scroller.scrollTop = 50;
+        stub_rect(scroller, { top: 100, bottom: 260 });
+        stub_rect(rows[2], { top: 170, bottom: 200 });
+
+        await dispatch_host_message({ type: 'scrollToRow', row: 2 });
+
+        expect(scroller.scrollTop).toBe(120);
+    });
+
+    it('resets scroll position on workbookData when there is no saved state', async () => {
+        vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+            cb(0);
+            return 1;
+        });
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+
+        await render_app();
+
+        await dispatch_host_message({
+            ...workbook_data_message(make_preview_workbook(3)),
+            previewMode: true,
+            state: {
+                scrollPosition: [{ top: 120, left: 35 }],
+            },
+        });
+
+        const scroller = container!.querySelector('.table-container') as HTMLDivElement;
+        scroller.scrollTop = 120;
+        scroller.scrollLeft = 35;
+
+        await dispatch_host_message({
+            ...workbook_data_message(make_preview_workbook(2)),
+            previewMode: true,
+            state: {},
+        });
+
+        expect(scroller.scrollTop).toBe(0);
+        expect(scroller.scrollLeft).toBe(0);
     });
 });

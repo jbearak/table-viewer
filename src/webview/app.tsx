@@ -43,6 +43,7 @@ export function App(): React.JSX.Element {
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
     >([]);
+    const last_reported_preview_row_ref = useRef<number | null>(null);
 
     const { persist_debounced, persist_immediate } =
         use_state_sync(state_ref);
@@ -81,6 +82,7 @@ export function App(): React.JSX.Element {
                         ? tab_orient === 'vertical'
                         : msg.defaultTabOrientation === 'vertical'
                 );
+                last_reported_preview_row_ref.current = null;
                 state_ref.current = s;
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
@@ -91,6 +93,9 @@ export function App(): React.JSX.Element {
                     if (pos && scroll_ref.current) {
                         scroll_ref.current.scrollTop = pos.top;
                         scroll_ref.current.scrollLeft = pos.left;
+                    } else if (scroll_ref.current) {
+                        scroll_ref.current.scrollTop = 0;
+                        scroll_ref.current.scrollLeft = 0;
                     }
                 });
             }
@@ -136,6 +141,7 @@ export function App(): React.JSX.Element {
                     ),
                     activeSheetIndex: next_active_sheet_index,
                 };
+                last_reported_preview_row_ref.current = null;
                 set_truncation_message(msg.truncationMessage ?? null);
                 persist_immediate();
             }
@@ -199,6 +205,10 @@ export function App(): React.JSX.Element {
                     }
                 }
 
+                if (last_reported_preview_row_ref.current === visible_row) {
+                    return;
+                }
+                last_reported_preview_row_ref.current = visible_row;
                 vscode_api.postMessage({ type: 'visibleRowChanged', row: visible_row });
             });
         };

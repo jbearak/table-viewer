@@ -106,8 +106,18 @@ function build_line_map(source: string, parsed_rows: string[][]): number[] {
         line_map.push(current_line);
 
         const row_text = reconstruct_row_text(row, source, pos);
-        for (const ch of row_text) {
-            if (ch === '\n') current_line++;
+        for (let i = 0; i < row_text.length; i++) {
+            const ch = row_text[i];
+            if (ch === '\n') {
+                current_line++;
+                continue;
+            }
+            if (ch === '\r') {
+                if (i + 1 < row_text.length && row_text[i + 1] === '\n') {
+                    i++;
+                }
+                current_line++;
+            }
         }
         pos += row_text.length;
 

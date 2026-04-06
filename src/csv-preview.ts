@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { parse_csv, type CsvParseResult } from './parse-csv';
+import { get_preview_reveal_target_line } from './preview-scroll-sync';
 import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
@@ -181,6 +182,41 @@ function setup_preview(
         );
     }
 
+    async function reveal_source_line(
+        editor: vscode.TextEditor,
+        source_line: number
+    ): Promise<void> {
+        const visible_range = editor.visibleRanges[0];
+        const reveal_target_line = get_preview_reveal_target_line(
+            source_line,
+            visible_range
+                ? {
+                    top_line: visible_range.start.line,
+                }
+                : null,
+            editor.document.lineCount
+        );
+        if (reveal_target_line === null) return;
+        const show_options: vscode.TextDocumentShowOptions = {
+            preserveFocus: true,
+        };
+        if (editor.viewColumn !== undefined) {
+            show_options.viewColumn = editor.viewColumn;
+        }
+
+        const shown_editor = await vscode.window.showTextDocument(
+            editor.document,
+            show_options
+        );
+        const range = new vscode.Range(
+            reveal_target_line,
+            0,
+            reveal_target_line,
+            0
+        );
+        shown_editor.revealRange(range, vscode.TextEditorRevealType.AtTop);
+    }
+
     let last_editor_top_line = -1;
 
     disposables.push(
@@ -228,8 +264,7 @@ function setup_preview(
                     if (preview_lockout_timer !== undefined) clearTimeout(preview_lockout_timer);
                     preview_lockout_timer = setTimeout(() => { preview_lockout = false; }, SCROLL_LOCKOUT_MS);
 
-                    const range = new vscode.Range(source_line, 0, source_line, 0);
-                    editor.revealRange(range, vscode.TextEditorRevealType.AtTop);
+                    void reveal_source_line(editor, source_line);
                     break;
                 }
             }
