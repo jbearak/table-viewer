@@ -6,7 +6,7 @@ import {
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
-import { serial_to_iso, is_date_format, format_value, get_style } from './spreadsheet-format';
+import { serial_to_iso, is_date_format, is_valid_excel_date_serial, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
@@ -238,9 +238,9 @@ function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: s
 
 // --- Worksheet Parsing ---
 
-function parse_cell_ref(ref: string): { row: number; col: number } {
+function parse_cell_ref(ref: string): { row: number; col: number } | null {
     const match = ref.match(/^([A-Z]+)(\d+)$/);
-    if (!match) return { row: 0, col: 0 };
+    if (!match) return null;
     return {
         col: col_letter_to_index(match[1]),
         row: parseInt(match[2], 10) - 1,
@@ -255,10 +255,13 @@ function parse_dimension(xml: string): { row_count: number; col_count: number } 
         const parts = ref.split(':');
         if (parts.length === 1) {
             // Single cell ref like "A1" — could be empty sheet
+            if (!parse_cell_ref(parts[0])) return;
             result = { row_count: 0, col_count: 0 };
             return;
         }
+        const start = parse_cell_ref(parts[0]);
         const end = parse_cell_ref(parts[1]);
+        if (!start || !end) return;
         result = { row_count: end.row + 1, col_count: end.col + 1 };
     });
     return result;
@@ -306,7 +309,9 @@ function parse_worksheet(
             iter_elements(row_inner, 'c', (c_open, c_inner) => {
                 const ref = get_attr(c_open, 'r');
                 if (!ref) return;
-                const { row, col } = parse_cell_ref(ref);
+                const cell_ref = parse_cell_ref(ref);
+                if (!cell_ref) return;
+                const { row, col } = cell_ref;
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
 
@@ -362,11 +367,13 @@ function parse_worksheet(
                 } else {
                     // Numeric (default) — includes dates, formulas with numeric results
                     if (v_text !== null && v_text !== '') {
-                        const num = parseFloat(v_text);
-                        if (!Number.isFinite(num)) {
+                        const num = Number(v_text);
+                        if (v_text.trim() === '' || !Number.isFinite(num)) {
                             // non-numeric or infinite — leave as null
                         } else if (is_date_format(xf_index, xfs, format_map)) {
-                            raw = serial_to_iso(num, datemode);
+                            raw = is_valid_excel_date_serial(num, datemode)
+                                ? serial_to_iso(num, datemode)
+                                : num;
                             formatted = format_value(num, xf_index, xfs, format_map, datemode);
                         } else {
                             raw = num;

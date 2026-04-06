@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
-import { parse_xls } from '../parse-xls';
+import { parse_xls, parse_sheet_records, type BiffRecord } from '../parse-xls';
+import { create_workbook_budget } from '../spreadsheet-safety';
 import type { WorkbookData } from '../types';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -13,6 +14,79 @@ function read_fixture(name: string): Buffer {
 /** Extract WorkbookData from either old (WorkbookData) or new ({ data, warnings }) return type */
 function get_data(result: WorkbookData | { data: WorkbookData; warnings: string[] }): WorkbookData {
     return 'data' in result && 'warnings' in result ? result.data : result as WorkbookData;
+}
+
+const RT_DIMENSION = 0x0200;
+const RT_NUMBER = 0x0203;
+const RT_RK = 0x027E;
+const RT_MULRK = 0x00BD;
+const RT_FORMULA = 0x0006;
+const OUT_OF_RANGE_DATE_SERIAL = 200000000;
+const DATE_XFS = [{ font_index: 0, format_index: 14 }];
+const DEFAULT_FONTS = [{ bold: false, italic: false }];
+
+function build_record(type: number, data: Buffer): BiffRecord {
+    return { type, data, offset: 0 };
+}
+
+function build_dimension_record(row_count: number, col_count: number): BiffRecord {
+    const data = Buffer.alloc(12);
+    data.writeUInt32LE(row_count, 4);
+    data.writeUInt16LE(col_count, 10);
+    return build_record(RT_DIMENSION, data);
+}
+
+function build_number_record(value: number): BiffRecord {
+    const data = Buffer.alloc(14);
+    data.writeUInt16LE(0, 0);
+    data.writeUInt16LE(0, 2);
+    data.writeUInt16LE(0, 4);
+    data.writeDoubleLE(value, 6);
+    return build_record(RT_NUMBER, data);
+}
+
+function encode_integer_rk(value: number): number {
+    return (value << 2) | 0x02;
+}
+
+function build_rk_record(value: number): BiffRecord {
+    const data = Buffer.alloc(10);
+    data.writeUInt16LE(0, 0);
+    data.writeUInt16LE(0, 2);
+    data.writeUInt16LE(0, 4);
+    data.writeInt32LE(encode_integer_rk(value), 6);
+    return build_record(RT_RK, data);
+}
+
+function build_mulrk_record(value: number): BiffRecord {
+    const data = Buffer.alloc(12);
+    data.writeUInt16LE(0, 0);
+    data.writeUInt16LE(0, 2);
+    data.writeUInt16LE(0, 4);
+    data.writeInt32LE(encode_integer_rk(value), 6);
+    data.writeUInt16LE(0, 10);
+    return build_record(RT_MULRK, data);
+}
+
+function build_formula_record(value: number): BiffRecord {
+    const data = Buffer.alloc(20);
+    data.writeUInt16LE(0, 0);
+    data.writeUInt16LE(0, 2);
+    data.writeUInt16LE(0, 4);
+    data.writeDoubleLE(value, 6);
+    return build_record(RT_FORMULA, data);
+}
+
+function parse_single_cell_sheet(record: BiffRecord) {
+    return parse_sheet_records(
+        [build_dimension_record(1, 1), record],
+        [],
+        DATE_XFS,
+        DEFAULT_FONTS,
+        new Map(),
+        0,
+        create_workbook_budget()
+    );
 }
 
 describe('parse_xls', () => {
@@ -128,5 +202,27 @@ describe('parse_xls warnings', () => {
         const result = parse_xls(read_fixture('basic.xls'));
         const warnings = 'warnings' in result ? result.warnings : [];
         expect(warnings).toHaveLength(0);
+    });
+});
+
+describe('parse_sheet_records date guards', () => {
+    it('keeps out-of-range NUMBER date serials as numbers', () => {
+        const sheet = parse_single_cell_sheet(build_number_record(OUT_OF_RANGE_DATE_SERIAL));
+        expect(sheet.rows[0][0]?.raw).toBe(OUT_OF_RANGE_DATE_SERIAL);
+    });
+
+    it('keeps out-of-range RK date serials as numbers', () => {
+        const sheet = parse_single_cell_sheet(build_rk_record(OUT_OF_RANGE_DATE_SERIAL));
+        expect(sheet.rows[0][0]?.raw).toBe(OUT_OF_RANGE_DATE_SERIAL);
+    });
+
+    it('keeps out-of-range MULRK date serials as numbers', () => {
+        const sheet = parse_single_cell_sheet(build_mulrk_record(OUT_OF_RANGE_DATE_SERIAL));
+        expect(sheet.rows[0][0]?.raw).toBe(OUT_OF_RANGE_DATE_SERIAL);
+    });
+
+    it('keeps out-of-range FORMULA date serials as numbers', () => {
+        const sheet = parse_single_cell_sheet(build_formula_record(OUT_OF_RANGE_DATE_SERIAL));
+        expect(sheet.rows[0][0]?.raw).toBe(OUT_OF_RANGE_DATE_SERIAL);
     });
 });

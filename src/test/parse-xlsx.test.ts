@@ -1,12 +1,55 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import CFB from 'cfb';
 import { parse_xlsx } from '../parse-xlsx';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
 function read_fixture(name: string): Uint8Array {
     return fs.readFileSync(path.join(FIXTURES, name));
+}
+
+function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
+    const cfb_file = CFB.utils.cfb_new();
+    const styles_override = styles_xml
+        ? '\n  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        : '';
+
+    const content_types = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${styles_override}
+</Types>`;
+
+    const rels = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+    const workbook = `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>`;
+
+    const workbook_rels = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`;
+
+    CFB.utils.cfb_add(cfb_file, '/[Content_Types].xml', Buffer.from(content_types));
+    CFB.utils.cfb_add(cfb_file, '/_rels/.rels', Buffer.from(rels));
+    CFB.utils.cfb_add(cfb_file, '/xl/workbook.xml', Buffer.from(workbook));
+    CFB.utils.cfb_add(cfb_file, '/xl/_rels/workbook.xml.rels', Buffer.from(workbook_rels));
+    CFB.utils.cfb_add(cfb_file, '/xl/worksheets/sheet1.xml', Buffer.from(sheet_xml));
+    if (styles_xml) {
+        CFB.utils.cfb_add(cfb_file, '/xl/styles.xml', Buffer.from(styles_xml));
+    }
+
+    const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip' });
+    return new Uint8Array(out as ArrayBuffer);
 }
 
 describe('parse_xlsx', () => {
@@ -166,6 +209,60 @@ describe('parse_xlsx', () => {
             const pct = sheet.rows[0][1]?.formatted;
             expect(pct).toContain('75');
             expect(pct).toContain('%');
+        });
+    });
+
+    describe('defensive parsing', () => {
+        it('skips invalid cell refs instead of writing to A1', async () => {
+            const buffer = build_test_xlsx(`<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="B2"/>
+  <sheetData>
+    <row r="2">
+      <c r="not-a-ref" t="inlineStr"><is><t>poison</t></is></c>
+      <c r="B2" t="inlineStr"><is><t>ok</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>`);
+
+            const { data } = await parse_xlsx(buffer);
+            const sheet = data.sheets[0];
+            expect(sheet.rows[0][0]?.raw).toBeNull();
+            expect(sheet.rows[1][1]?.raw).toBe('ok');
+        });
+
+        it('rejects permissive numeric strings like 1oops', async () => {
+            const buffer = build_test_xlsx(`<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>1oops</v></c></row>
+  </sheetData>
+</worksheet>`);
+
+            const { data } = await parse_xlsx(buffer);
+            const cell = data.sheets[0].rows[0][0];
+            expect(cell?.raw).toBeNull();
+            expect(cell?.formatted).toBe('');
+        });
+
+        it('keeps out-of-range date serials as numbers without throwing', async () => {
+            const styles = `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font/></fonts>
+  <cellXfs count="1"><xf numFmtId="14" fontId="0"/></cellXfs>
+</styleSheet>`;
+            const buffer = build_test_xlsx(`<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData>
+    <row r="1"><c r="A1" s="0"><v>1000000000000</v></c></row>
+  </sheetData>
+</worksheet>`, styles);
+
+            const { data } = await parse_xlsx(buffer);
+            const cell = data.sheets[0].rows[0][0];
+            expect(cell?.raw).toBe(1000000000000);
         });
     });
 });
