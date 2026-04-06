@@ -68,4 +68,21 @@ describe('get_preview_reveal_target_line', () => {
             get_preview_reveal_target_line(20, { top_line: 10 }, 100, 0)
         ).toBe(25);
     });
+
+    // Regression: Devin's review suggested subtracting padding instead of
+    // adding it. Subtraction causes the reveal target to land within the
+    // already-visible range, so VS Code skips the reveal and the editor
+    // doesn't scroll until ~11-12 rows have been scrolled in the preview.
+    it('reveal target must be greater than source_line (padding is additive)', () => {
+        const source_line = 20;
+        const result = get_preview_reveal_target_line(
+            source_line, { top_line: 10 }, 100
+        );
+        expect(result).toBeGreaterThan(source_line);
+    });
+
+    it('reveal target advances even from line 0', () => {
+        const result = get_preview_reveal_target_line(0, null, 100);
+        expect(result).toBe(5);
+    });
 });
