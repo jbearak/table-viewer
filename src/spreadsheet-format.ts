@@ -27,7 +27,7 @@ const ELAPSED_TIME_RE = /\[[hms]+\]/i;
 
 /** Check whether an XF format index refers to a date/time format. */
 export function is_date_format(xf_index: number, xfs: XfEntry[], format_map: Map<number, string>): boolean {
-    if (xf_index >= xfs.length) return false;
+    if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return false;
     const fmt_index = xfs[xf_index].format_index;
     const fmt = format_map.get(fmt_index);
     if (fmt) return SSF.is_date(fmt) && !ELAPSED_TIME_RE.test(fmt);
@@ -45,7 +45,7 @@ export function format_value(
     format_map: Map<number, string>,
     datemode: DateMode
 ): string {
-    if (xf_index >= xfs.length) return String(raw);
+    if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return String(raw);
     const xf = xfs[xf_index];
     const fmt_index = xf.format_index;
     const fmt = format_map.get(fmt_index);
@@ -65,9 +65,9 @@ export function format_value(
 }
 
 export function get_style(xf_index: number, xfs: XfEntry[], fonts: FontEntry[]): { bold: boolean; italic: boolean } {
-    if (xf_index >= xfs.length) return { bold: false, italic: false };
+    if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return { bold: false, italic: false };
     const xf = xfs[xf_index];
     const font_idx = xf.font_index;
-    if (font_idx >= fonts.length) return { bold: false, italic: false };
+    if (!Number.isInteger(font_idx) || font_idx < 0 || font_idx >= fonts.length) return { bold: false, italic: false };
     return fonts[font_idx];
 }

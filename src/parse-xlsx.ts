@@ -15,17 +15,33 @@ import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 function decode_xml(s: string): string {
     if (s.indexOf('&') === -1) return s;
     return s
-        .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'");
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, '&');
 }
 
 function get_attr(tag: string, attr: string): string | null {
     const re = new RegExp(`\\b${attr}="([^"]*)"`, '');
     const m = tag.match(re);
     return m ? decode_xml(m[1]) : null;
+}
+
+/** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
+function find_tag_end(xml: string, start: number): number {
+    let in_quote: string | null = null;
+    for (let i = start; i < xml.length; i++) {
+        const ch = xml[i];
+        if (in_quote) {
+            if (ch === in_quote) in_quote = null;
+        } else if (ch === '"' || ch === "'") {
+            in_quote = ch;
+        } else if (ch === '>') {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /** Check whether the character after a tag-name match is a valid tag delimiter. */
@@ -61,7 +77,7 @@ function iter_elements(xml: string, tag: string, cb: (open_tag: string, inner: s
         }
 
         // Find end of opening tag
-        const tag_end = xml.indexOf('>', start);
+        const tag_end = find_tag_end(xml, start);
         if (tag_end === -1) break;
 
         const open_tag = xml.substring(start, tag_end + 1);
@@ -94,7 +110,7 @@ function get_text(xml: string, tag: string): string | null {
             pos = start + 1;
             continue;
         }
-        const tag_end = xml.indexOf('>', start);
+        const tag_end = find_tag_end(xml, start);
         if (tag_end === -1) return null;
         if (is_self_closing(xml, start, tag_end)) return '';
         const close = `</${tag}>`;
@@ -276,16 +292,8 @@ function parse_worksheet(
         });
     }
 
-    // Build merged cells set
+    // Build merged cells set — deferred until after safety validation
     const merged_cells = new Set<string>();
-    for (const range of merges) {
-        for (let r = range.startRow; r <= range.endRow; r++) {
-            for (let c = range.startCol; c <= range.endCol; c++) {
-                if (r === range.startRow && c === range.startCol) continue;
-                merged_cells.add(`${r}:${c}`);
-            }
-        }
-    }
 
     // Parse cells
     const cells = new Map<string, CellData>();
@@ -355,7 +363,9 @@ function parse_worksheet(
                     // Numeric (default) — includes dates, formulas with numeric results
                     if (v_text !== null && v_text !== '') {
                         const num = parseFloat(v_text);
-                        if (is_date_format(xf_index, xfs, format_map)) {
+                        if (!Number.isFinite(num)) {
+                            // non-numeric or infinite — leave as null
+                        } else if (is_date_format(xf_index, xfs, format_map)) {
                             raw = serial_to_iso(num, datemode);
                             formatted = format_value(num, xf_index, xfs, format_map, datemode);
                         } else {
@@ -382,6 +392,28 @@ function parse_worksheet(
     // Validate final shape (catches cells beyond dimension and merge count)
     assert_safe_sheet_shape(budget, row_count, col_count, merges.length);
 
+    // Expand merges into merged_cells set, clamping to validated bounds
+    const normalized_merges: MergeRange[] = [];
+    for (const m of merges) {
+        if (m.startRow >= row_count || m.startCol >= col_count) continue;
+        if (m.startRow > m.endRow || m.startCol > m.endCol) continue;
+        if (m.endRow < 0 || m.endCol < 0) continue;
+
+        const sr = Math.max(0, m.startRow);
+        const er = Math.min(row_count - 1, m.endRow);
+        const sc = Math.max(0, m.startCol);
+        const ec = Math.min(col_count - 1, m.endCol);
+        if (sr > er || sc > ec) continue;
+
+        normalized_merges.push({ startRow: sr, startCol: sc, endRow: er, endCol: ec });
+        for (let r = sr; r <= er; r++) {
+            for (let c = sc; c <= ec; c++) {
+                if (r === sr && c === sc) continue;
+                merged_cells.add(`${r}:${c}`);
+            }
+        }
+    }
+
     // Build rows array
     const rows: (CellData | null)[][] = [];
     for (let r = 0; r < row_count; r++) {
@@ -396,7 +428,7 @@ function parse_worksheet(
         rows.push(row_data);
     }
 
-    return { rows, merges, row_count, col_count };
+    return { rows, merges: normalized_merges, row_count, col_count };
 }
 
 // --- Merge Range / Column Helpers ---

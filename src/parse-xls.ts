@@ -6,7 +6,7 @@ import {
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
-import { format_value, get_style } from './spreadsheet-format';
+import { is_date_format, serial_to_iso, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
@@ -607,7 +607,7 @@ function parse_sheet_records(
                 const value = buf.readDoubleLE(6);
                 const style = get_style(xf_index, xfs, fonts);
                 const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                const raw = value;
+                const raw = is_date_format(xf_index, xfs, format_map) ? serial_to_iso(value, datemode) : value;
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -627,7 +627,7 @@ function parse_sheet_records(
                 const value = decode_rk(buf.readInt32LE(6));
                 const style = get_style(xf_index, xfs, fonts);
                 const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                const raw = value;
+                const raw = is_date_format(xf_index, xfs, format_map) ? serial_to_iso(value, datemode) : value;
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
                     bold: style.bold, italic: style.italic,
@@ -648,7 +648,7 @@ function parse_sheet_records(
                     const value = decode_rk(rk_val);
                     const style = get_style(xf_index, xfs, fonts);
                     const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                    const raw = value;
+                    const raw = is_date_format(xf_index, xfs, format_map) ? serial_to_iso(value, datemode) : value;
                     cells.set(`${row}:${c}`, {
                         raw, formatted,
                         bold: style.bold, italic: style.italic,
@@ -770,7 +770,7 @@ function parse_sheet_records(
                     // Numeric result — read as IEEE 754 double
                     const value = buf.readDoubleLE(6);
                     const formatted = format_value(value, xf_index, xfs, format_map, datemode);
-                    const raw = value;
+                    const raw = is_date_format(xf_index, xfs, format_map) ? serial_to_iso(value, datemode) : value;
                     cells.set(key, { raw, formatted, bold: style.bold, italic: style.italic });
                 }
                 break;
