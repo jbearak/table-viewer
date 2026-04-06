@@ -693,6 +693,8 @@ function TableWithSelection({
             const original = cell !== null ? String(cell?.raw ?? '') : '';
             if (active_value !== original) {
                 edits[`${row}:${col}`] = active_value;
+            } else {
+                delete edits[`${row}:${col}`];
             }
         }
         return edits;

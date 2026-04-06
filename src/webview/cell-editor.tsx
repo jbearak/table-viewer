@@ -56,6 +56,11 @@ export function CellEditor({
             return;
         }
 
+        // Allow Ctrl/Cmd+S to propagate to window-level save handler
+        if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+            return;
+        }
+
         // Stop propagation for all other keys to prevent table keyboard handlers
         e.stopPropagation();
     };

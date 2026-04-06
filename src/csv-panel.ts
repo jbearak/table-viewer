@@ -118,16 +118,23 @@ export function open_csv_table(
                 case 'ready':
                     send_initial_data();
                     break;
-                case 'stateChanged':
-                    state_store.set(file_path, msg.state);
+                case 'stateChanged': {
+                    const existing = state_store.get(file_path) as import('./types').PerFileState;
+                    const new_state = { ...msg.state };
+                    if (existing.pendingEdits) {
+                        new_state.pendingEdits = existing.pendingEdits;
+                    }
+                    state_store.set(file_path, new_state);
                     break;
+                }
                 case 'saveCsv': {
                     if (!last_parsed) return;
                     try {
                         const content = serialize_csv(
                             last_parsed.data.sheets[0].rows,
                             get_delimiter(),
-                            msg.edits
+                            msg.edits,
+                            last_parsed.originalColumnCounts
                         );
                         suppress_next_reload = true;
                         await vscode.workspace.fs.writeFile(
@@ -135,6 +142,11 @@ export function open_csv_table(
                             new TextEncoder().encode(content)
                         );
                         last_parsed = await parse_file();
+                        panel.webview.postMessage({
+                            type: 'reload',
+                            data: last_parsed.data,
+                            truncationMessage: last_parsed.truncationMessage,
+                        });
                         // Clear cached edits on successful save
                         const current = state_store.get(file_path) as import('./types').PerFileState;
                         const { pendingEdits: _, ...rest } = current;
