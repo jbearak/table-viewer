@@ -89,6 +89,32 @@ describe('parse_csv', () => {
         expect(result.truncationMessage).toBeUndefined();
     });
 
+    it('preserves trailing row with empty field when source has no trailing newline', () => {
+        const src = 'a\n""';
+        const result = parse_csv(src, ',', 10_000);
+
+        const sheet = result.data.sheets[0];
+        expect(sheet.rowCount).toBe(2);
+        expect(sheet.rows[0][0]?.raw).toBe('a');
+        // Second row has one empty quoted field — should be null (empty string)
+        expect(sheet.rows[1][0]).toBeNull();
+    });
+
+    it('strips trailing empty row when source ends with newline', () => {
+        const src = 'a,b\n1,2\n';
+        const result = parse_csv(src, ',', 10_000);
+
+        expect(result.data.sheets[0].rowCount).toBe(2);
+    });
+
+    it('produces correct line_map for \\r-delimited files', () => {
+        const src = 'a,b\r1,2\r3,4';
+        const result = parse_csv(src, ',', 10_000);
+
+        expect(result.data.sheets[0].rowCount).toBe(3);
+        expect(result.line_map).toEqual([0, 1, 2]);
+    });
+
     it('handles rows with varying column counts by padding with nulls', () => {
         const src = 'a,b,c\n1\n2,3';
         const result = parse_csv(src, ',', 10_000);

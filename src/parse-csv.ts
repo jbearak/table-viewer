@@ -20,8 +20,14 @@ export function parse_csv(
 
     let parsed_rows = result.data as string[][];
 
-    // Remove trailing empty row if source ends with newline
+    // Remove trailing empty row produced by papaparse when source ends with newline.
+    // Only strip if source actually ends with a line terminator — otherwise the
+    // trailing [''] is a legitimate row with one empty field.
+    const ends_with_newline = source.length > 0 &&
+        (source[source.length - 1] === '\n' || source[source.length - 1] === '\r');
+
     if (
+        ends_with_newline &&
         parsed_rows.length > 0 &&
         parsed_rows[parsed_rows.length - 1].length === 1 &&
         parsed_rows[parsed_rows.length - 1][0] === ''
@@ -110,7 +116,7 @@ function build_line_map(source: string, parsed_rows: string[][]): number[] {
             if (source[pos] === '\r' && pos + 1 < source.length && source[pos + 1] === '\n') {
                 current_line++;
                 pos += 2;
-            } else if (source[pos] === '\n') {
+            } else if (source[pos] === '\n' || source[pos] === '\r') {
                 current_line++;
                 pos += 1;
             }

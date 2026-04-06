@@ -59,8 +59,10 @@ export function show_csv_preview(
     active_preview = { panel, uri, dispose: cleanup };
 
     panel.onDidDispose(() => {
-        cleanup();
-        active_preview = null;
+        if (active_preview) {
+            active_preview.dispose();
+            active_preview = null;
+        }
     });
 }
 

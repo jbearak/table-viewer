@@ -162,7 +162,9 @@ export function App(): React.JSX.Element {
                 const rows = table.querySelectorAll('tbody tr');
                 const target_row = rows[msg.row] as HTMLElement | undefined;
                 if (target_row) {
-                    scroller.scrollTop = target_row.offsetTop;
+                    const row_rect = target_row.getBoundingClientRect();
+                    const scroller_rect = scroller.getBoundingClientRect();
+                    scroller.scrollTop += row_rect.top - scroller_rect.top;
                 }
             }
         };
@@ -186,12 +188,12 @@ export function App(): React.JSX.Element {
                 if (!table) return;
 
                 const rows = table.querySelectorAll('tbody tr');
-                const scroll_top = scroller.scrollTop;
+                const scroller_top = scroller.getBoundingClientRect().top;
                 let visible_row = 0;
 
                 for (let i = 0; i < rows.length; i++) {
-                    const row_el = rows[i] as HTMLElement;
-                    if (row_el.offsetTop + row_el.offsetHeight > scroll_top) {
+                    const row_rect = (rows[i] as HTMLElement).getBoundingClientRect();
+                    if (row_rect.bottom > scroller_top) {
                         visible_row = i;
                         break;
                     }
