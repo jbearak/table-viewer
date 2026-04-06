@@ -181,6 +181,8 @@ function setup_preview(
         );
     }
 
+    let last_editor_top_line = -1;
+
     disposables.push(
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
             if (preview_lockout) return;
@@ -188,6 +190,9 @@ function setup_preview(
             if (e.visibleRanges.length === 0) return;
 
             const top_line = e.visibleRanges[0].start.line;
+            if (top_line === last_editor_top_line) return;
+            last_editor_top_line = top_line;
+
             const row = find_row_for_line(top_line);
 
             // Set lockout to prevent the webview's scroll response from bouncing back
