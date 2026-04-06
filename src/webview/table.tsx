@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { get_raw_cell_text } from '../cell-display';
 import type { SheetData, CellData, MergeRange } from '../types';
 import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
@@ -39,12 +39,11 @@ export function Table({
     on_context_menu,
     on_key_down,
 }: TableProps): React.JSX.Element {
-    const merge_map = build_merge_map(sheet.merges);
+    const merge_map = useMemo(() => build_merge_map(sheet.merges), [sheet.merges]);
 
-    const { col_boundary_groups, row_boundary_groups } = build_boundary_groups(
-        sheet.rows.length,
-        sheet.columnCount,
-        sheet.merges
+    const { col_boundary_groups, row_boundary_groups } = useMemo(
+        () => build_boundary_groups(sheet.rows.length, sheet.columnCount, sheet.merges),
+        [sheet.rows.length, sheet.columnCount, sheet.merges]
     );
 
     const [active_col_boundary, set_active_col_boundary] = useState<number | null>(null);
@@ -63,6 +62,7 @@ export function Table({
         [active_col_boundary, col_boundary_groups]
     );
 
+    // No horizontal visible-range filtering — tables rarely have enough columns to matter
     const is_row_highlighted = useCallback(
         (r: number, c: number, row_span: number): boolean => {
             if (active_row_boundary === null) return false;
@@ -92,6 +92,7 @@ export function Table({
     );
 
     const visible_range_ref = useRef<{ first: number; last: number }>({ first: 0, last: Infinity });
+    // Dummy state to force re-render when visible range changes during scroll
     const [, set_render_tick] = useState(0);
 
     // Recompute visible range when active boundary changes
