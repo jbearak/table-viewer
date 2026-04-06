@@ -135,6 +135,10 @@ export function open_csv_table(
                             new TextEncoder().encode(content)
                         );
                         last_parsed = await parse_file();
+                        // Clear cached edits on successful save
+                        const current = state_store.get(file_path) as import('./types').PerFileState;
+                        const { pendingEdits: _, ...rest } = current;
+                        state_store.set(file_path, rest);
                         panel.webview.postMessage({ type: 'saveResult', success: true });
                     } catch (err) {
                         const message = err instanceof Error ? err.message : String(err);
@@ -143,7 +147,17 @@ export function open_csv_table(
                     }
                     break;
                 }
-                case 'showSaveDialog': {
+                case 'pendingEditsChanged': {
+                const current = state_store.get(file_path) as import('./types').PerFileState;
+                if (msg.edits) {
+                    state_store.set(file_path, { ...current, pendingEdits: msg.edits });
+                } else {
+                    const { pendingEdits: _, ...rest } = current;
+                    state_store.set(file_path, rest);
+                }
+                break;
+            }
+            case 'showSaveDialog': {
                     const choice = await vscode.window.showWarningMessage(
                         'You have unsaved changes.',
                         { modal: true },

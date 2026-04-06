@@ -35,6 +35,7 @@ export interface PerFileState {
     scrollPosition?: (ScrollPosition | undefined)[];
     activeSheetIndex?: number;
     tabOrientation?: 'horizontal' | 'vertical' | null;
+    pendingEdits?: Record<string, string>;
 }
 
 export interface LegacyPerFileState {
@@ -60,4 +61,5 @@ export type WebviewMessage =
     | { type: 'stateChanged'; state: PerFileState }
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'saveCsv'; edits: Record<string, string> }
-    | { type: 'showSaveDialog' };
+    | { type: 'showSaveDialog' }
+    | { type: 'pendingEditsChanged'; edits: Record<string, string> | null };

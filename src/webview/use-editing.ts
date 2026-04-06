@@ -10,11 +10,16 @@ export interface EditingCell {
 export function use_editing(
     rows: (CellData | null)[][],
     row_count: number,
-    col_count: number
+    col_count: number,
+    initial_edits?: Record<string, string>
 ) {
-    const [edit_mode, set_edit_mode] = useState(false);
+    const [edit_mode, set_edit_mode] = useState(
+        () => initial_edits !== undefined && Object.keys(initial_edits).length > 0
+    );
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
-    const [dirty_cells, set_dirty_cells] = useState<Map<string, string>>(new Map());
+    const [dirty_cells, set_dirty_cells] = useState<Map<string, string>>(
+        () => initial_edits ? new Map(Object.entries(initial_edits)) : new Map()
+    );
 
     const is_dirty = dirty_cells.size > 0;
 

@@ -34,6 +34,7 @@ export function App(): React.JSX.Element {
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
+    const [initial_pending_edits, set_initial_pending_edits] = useState<Record<string, string> | undefined>(undefined);
     const [toolbar_edit_state, set_toolbar_edit_state] = useState<{ edit_mode: boolean; is_dirty: boolean }>({ edit_mode: false, is_dirty: false });
     const editing_ref = useRef<{ toggle_edit_mode: () => void; handle_toggle: () => void }>({ toggle_edit_mode: () => {}, handle_toggle: () => {} });
 
@@ -95,6 +96,7 @@ export function App(): React.JSX.Element {
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
                 set_csv_editable(msg.csvEditable ?? false);
+                set_initial_pending_edits(s.pendingEdits);
 
                 requestAnimationFrame(() => {
                     const pos =
@@ -551,6 +553,7 @@ export function App(): React.JSX.Element {
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
                         csv_editable={csv_editable}
+                        initial_pending_edits={initial_pending_edits}
                         on_edit_mode_change={handle_edit_mode_change}
                         editing_ref={editing_ref}
                     />
@@ -581,6 +584,7 @@ export function App(): React.JSX.Element {
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
                         csv_editable={csv_editable}
+                        initial_pending_edits={initial_pending_edits}
                         on_edit_mode_change={handle_edit_mode_change}
                         editing_ref={editing_ref}
                     />
@@ -603,6 +607,7 @@ interface TableWithSelectionProps {
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
     csv_editable: boolean;
+    initial_pending_edits?: Record<string, string>;
     on_edit_mode_change: (edit_mode: boolean, is_dirty: boolean) => void;
     editing_ref: React.MutableRefObject<{ toggle_edit_mode: () => void; handle_toggle: () => void }>;
 }
@@ -620,16 +625,28 @@ function TableWithSelection({
     scroll_ref,
     table_ref,
     csv_editable,
+    initial_pending_edits,
     on_edit_mode_change,
     editing_ref,
 }: TableWithSelectionProps): React.JSX.Element {
     const sel = use_selection(sheet, show_formatting);
-    const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount);
+    const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount, initial_pending_edits);
 
     // Report edit state up to App for toolbar
     useEffect(() => {
         on_edit_mode_change(editing.edit_mode, editing.is_dirty);
     }, [editing.edit_mode, editing.is_dirty, on_edit_mode_change]);
+
+    // Cache dirty edits to extension state so they survive tab close
+    useEffect(() => {
+        if (editing.is_dirty) {
+            const edits: Record<string, string> = {};
+            editing.dirty_cells.forEach((value, key) => { edits[key] = value; });
+            vscode_api.postMessage({ type: 'pendingEditsChanged', edits });
+        } else {
+            vscode_api.postMessage({ type: 'pendingEditsChanged', edits: null });
+        }
+    }, [editing.dirty_cells, editing.is_dirty]);
 
     // Register ref for toolbar toggle
     useEffect(() => {

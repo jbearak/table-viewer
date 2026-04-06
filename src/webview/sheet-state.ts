@@ -43,6 +43,7 @@ export function normalize_per_file_state(
             sheet_names
         ),
         tabOrientation: state.tabOrientation ?? null,
+        pendingEdits: 'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined,
     };
 }
 
