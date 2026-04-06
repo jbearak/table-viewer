@@ -15,10 +15,13 @@ export function create_workbook_budget(): WorkbookBudget {
     return { total_cells: 0 };
 }
 
-export function assert_safe_file_size(size: number): void {
-    if (size > MAX_WORKBOOK_FILE_BYTES) {
+export function assert_safe_file_size(size: number, max_mib?: number): void {
+    const limit = max_mib !== undefined
+        ? max_mib * MEBIBYTE
+        : MAX_WORKBOOK_FILE_BYTES;
+    if (size > limit) {
         throw new Error(
-            `File is too large to open safely (max ${format_mebibytes(MAX_WORKBOOK_FILE_BYTES)} MiB)`
+            `File is too large to open safely (max ${format_mebibytes(limit)} MiB)`
         );
     }
 }

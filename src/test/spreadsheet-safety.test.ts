@@ -111,6 +111,24 @@ describe('spreadsheet safety limits', () => {
             assert_safe_sheet_shape(budget, 1, 1, 0)
         ).toThrow('Workbook is too large to render safely');
     });
+
+    it('assert_safe_file_size accepts a custom limit', () => {
+        // 1 MiB custom limit
+        expect(() =>
+            assert_safe_file_size(2 * 1024 * 1024, 1)
+        ).toThrow('File is too large to open safely');
+
+        // Should not throw at 0.5 MiB with 1 MiB limit
+        expect(() =>
+            assert_safe_file_size(0.5 * 1024 * 1024, 1)
+        ).not.toThrow();
+    });
+
+    it('assert_safe_file_size uses default when no custom limit given', () => {
+        expect(() =>
+            assert_safe_file_size(MAX_WORKBOOK_FILE_BYTES + 1)
+        ).toThrow('File is too large to open safely');
+    });
 });
 
 describe('parse_xlsx safety', () => {
