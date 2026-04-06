@@ -74,12 +74,14 @@
   },
   "dependencies": {
     "cfb": "^1.2.2",
+    "papaparse": "^5.5.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ssf": "^0.11.2"
   },
   "devDependencies": {
     "@types/node": "^22.19.17",
+    "@types/papaparse": "^5.5.2",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@types/vscode": "^1.110.0",
