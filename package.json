@@ -11,7 +11,7 @@
     "url": "https://github.com/jbearak/table-viewer.git"
   },
   "engines": {
-    "node": ">=22",
+    "node": ">=24",
     "vscode": "^1.114.0"
   },
   "categories": [
