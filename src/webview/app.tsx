@@ -14,6 +14,7 @@ import { use_selection } from './use-selection';
 import { use_editing } from './use-editing';
 import { normalize_range } from './selection';
 import { measure_column_fit_width } from './measure-column';
+import { auto_resize_row_after_edit } from './auto-resize-row';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -756,6 +757,15 @@ function TableWithSelection({
         const { row, col } = editing.editing_cell;
         editing.confirm_edit(value);
 
+        // After re-render, auto-resize the row if the new content needs more space
+        if (value.includes('\n') && table_ref.current) {
+            requestAnimationFrame(() => {
+                if (table_ref.current) {
+                    auto_resize_row_after_edit(table_ref.current, row, row_heights, on_row_resize);
+                }
+            });
+        }
+
         if (advance === 'down' && row < sheet.rowCount - 1) {
             sel.select_cell(row + 1, col);
             setTimeout(() => editing.start_editing(row + 1, col), 0);
@@ -763,7 +773,7 @@ function TableWithSelection({
             sel.select_cell(row, col + 1);
             setTimeout(() => editing.start_editing(row, col + 1), 0);
         }
-    }, [editing, sel, sheet.rowCount, sheet.columnCount]);
+    }, [editing, sel, sheet.rowCount, sheet.columnCount, table_ref, row_heights, on_row_resize]);
 
     const handle_column_resize = useCallback(
         (col: number, width: number) => {

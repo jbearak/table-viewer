@@ -122,6 +122,20 @@ describe('CellEditor', () => {
         expect(document.activeElement).toBe(textarea);
     });
 
+    it('places cursor at end (no selection) after Shift+Enter switches to textarea', async () => {
+        await render_editor({ value: 'hello', on_confirm: vi.fn(), on_cancel: vi.fn() });
+
+        const input = container!.querySelector('input') as HTMLInputElement;
+        await act(async () => {
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }));
+        });
+
+        const textarea = container!.querySelector('textarea') as HTMLTextAreaElement;
+        // Cursor should be at the end, not selecting all text
+        expect(textarea.selectionStart).toBe(textarea.value.length);
+        expect(textarea.selectionEnd).toBe(textarea.value.length);
+    });
+
     it('calls on_confirm with value and "right" on Tab', async () => {
         const on_confirm = vi.fn();
         await render_editor({ value: 'test', on_confirm, on_cancel: vi.fn() });

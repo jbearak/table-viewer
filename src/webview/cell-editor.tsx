@@ -14,12 +14,21 @@ export function CellEditor({
     const [current_value, set_current_value] = useState(value);
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const [is_multiline, set_is_multiline] = useState(value.includes('\n'));
+    const mounted_ref = useRef(false);
 
     useEffect(() => {
         const el = input_ref.current;
         if (el) {
             el.focus();
-            el.select();
+            if (mounted_ref.current) {
+                // Switching to textarea — place cursor at end
+                const len = el.value.length;
+                el.setSelectionRange(len, len);
+            } else {
+                // Initial mount — select all for easy replacement
+                el.select();
+                mounted_ref.current = true;
+            }
         }
     }, [is_multiline]);
 
