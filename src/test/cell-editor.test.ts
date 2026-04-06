@@ -109,6 +109,19 @@ describe('CellEditor', () => {
         expect(on_confirm).not.toHaveBeenCalled();
     });
 
+    it('focuses the textarea after Shift+Enter switches from input to textarea', async () => {
+        await render_editor({ value: 'hello', on_confirm: vi.fn(), on_cancel: vi.fn() });
+
+        const input = container!.querySelector('input') as HTMLInputElement;
+        await act(async () => {
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }));
+        });
+
+        const textarea = container!.querySelector('textarea') as HTMLTextAreaElement;
+        expect(textarea).not.toBeNull();
+        expect(document.activeElement).toBe(textarea);
+    });
+
     it('calls on_confirm with value and "right" on Tab', async () => {
         const on_confirm = vi.fn();
         await render_editor({ value: 'test', on_confirm, on_cancel: vi.fn() });

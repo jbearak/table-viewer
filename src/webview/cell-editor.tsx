@@ -21,7 +21,7 @@ export function CellEditor({
             el.focus();
             el.select();
         }
-    }, []);
+    }, [is_multiline]);
 
     const handle_key_down = (e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
         // Read the live DOM value so we get any imperatively-set value
