@@ -2,7 +2,7 @@
   "name": "table-viewer",
   "displayName": "Table Viewer",
   "description": "Read-only viewer for Excel, CSV, and TSV files with merged cells, formatting, and persistent UI state",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "jbearak",
   "license": "GPL-3.0",
   "author": "Jonathan Marc Bearak",
