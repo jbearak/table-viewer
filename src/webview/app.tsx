@@ -780,6 +780,18 @@ function TableWithSelection({
 
     const menu_items: MenuItem[] = [];
     if (sel.context_menu) {
+        if (csv_editable) {
+            menu_items.push({
+                label: 'Edit cell',
+                on_click: () => {
+                    const { row, col } = sel.context_menu!;
+                    if (!editing.edit_mode) {
+                        editing.set_edit_mode(true);
+                    }
+                    editing.force_start_editing(row, col);
+                },
+            });
+        }
         menu_items.push({
             label: 'Copy cell',
             on_click: () =>

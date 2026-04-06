@@ -356,3 +356,105 @@ describe('preview scroll sync', () => {
         expect(scroller.scrollLeft).toBe(0);
     });
 });
+
+function make_csv_workbook(): WorkbookData {
+    return {
+        hasFormatting: false,
+        sheets: [{
+            name: 'Sheet1',
+            rows: [
+                [make_cell('a'), make_cell('b')],
+                [make_cell('c'), make_cell('d')],
+            ],
+            merges: [],
+            columnCount: 2,
+            rowCount: 2,
+        }],
+    };
+}
+
+function csv_workbook_data_message(workbook: WorkbookData): HostMessage {
+    return {
+        type: 'workbookData',
+        data: workbook,
+        state: {},
+        defaultTabOrientation: 'horizontal',
+        csvEditable: true,
+    };
+}
+
+describe('Context menu edit item', () => {
+    it('shows "Edit cell" in context menu when csvEditable is true', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Right-click a cell to open the context menu
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        const menu = container!.querySelector('.context-menu');
+        expect(menu).not.toBeNull();
+        const items = Array.from(menu!.querySelectorAll('.context-menu-item'))
+            .map(el => el.textContent);
+        expect(items).toContain('Edit cell');
+    });
+
+    it('does not show "Edit cell" when csvEditable is false', async () => {
+        await render_app();
+        await dispatch_host_message(workbook_data_message(make_csv_workbook()));
+
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        const menu = container!.querySelector('.context-menu');
+        expect(menu).not.toBeNull();
+        const items = Array.from(menu!.querySelectorAll('.context-menu-item'))
+            .map(el => el.textContent);
+        expect(items).not.toContain('Edit cell');
+    });
+
+    it('clicking "Edit cell" enters edit mode and starts editing the cell', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Right-click cell at row 0, col 1
+        const cells = container!.querySelectorAll('td');
+        const target_cell = cells[1]; // second cell (0,1)
+        await act(async () => {
+            target_cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        // Click "Edit cell"
+        const menu_items = container!.querySelectorAll('.context-menu-item');
+        const edit_item = Array.from(menu_items).find(el => el.textContent === 'Edit cell');
+        expect(edit_item).toBeDefined();
+        await act(async () => {
+            (edit_item as HTMLButtonElement).click();
+        });
+
+        // Should now have an Edit button active in the toolbar
+        const edit_button = get_button('Edit');
+        expect(edit_button.classList.contains('active')).toBe(true);
+
+        // Should have the cell editor input visible
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).not.toBeNull();
+        expect((editor_input as HTMLInputElement).value).toBe('b');
+    });
+});

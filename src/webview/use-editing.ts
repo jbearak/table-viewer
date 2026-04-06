@@ -23,8 +23,7 @@ export function use_editing(
         set_editing_cell(null);
     }, []);
 
-    const start_editing = useCallback((row: number, col: number) => {
-        if (!edit_mode) return;
+    const begin_editing = useCallback((row: number, col: number) => {
         const key = `${row}:${col}`;
         const dirty_value = dirty_cells.get(key);
         if (dirty_value !== undefined) {
@@ -34,7 +33,18 @@ export function use_editing(
         const cell = rows[row]?.[col];
         const value = cell !== null ? String(cell?.raw ?? '') : '';
         set_editing_cell({ row, col, value });
-    }, [edit_mode, rows, dirty_cells]);
+    }, [rows, dirty_cells]);
+
+    const start_editing = useCallback((row: number, col: number) => {
+        if (!edit_mode) return;
+        begin_editing(row, col);
+    }, [edit_mode, begin_editing]);
+
+    // Like start_editing but bypasses the edit_mode check.
+    // Used when entering edit mode and starting editing in the same tick.
+    const force_start_editing = useCallback((row: number, col: number) => {
+        begin_editing(row, col);
+    }, [begin_editing]);
 
     const confirm_edit = useCallback((new_value: string) => {
         if (!editing_cell) return;
@@ -101,6 +111,7 @@ export function use_editing(
         toggle_edit_mode,
         set_edit_mode,
         start_editing,
+        force_start_editing,
         confirm_edit,
         cancel_edit,
         clear_dirty,
