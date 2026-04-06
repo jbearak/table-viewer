@@ -11,6 +11,8 @@ import {
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import { use_selection } from './use-selection';
+import { normalize_range } from './selection';
+import { measure_column_fit_width } from './measure-column';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -26,6 +28,7 @@ export function App(): React.JSX.Element {
     >([]);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
+    const table_ref = useRef<HTMLTableElement | null>(null);
     const state_ref = useRef<PerFileState>({});
     const scroll_positions_ref = useRef<
         ({ top: number; left: number } | undefined)[]
@@ -201,6 +204,18 @@ export function App(): React.JSX.Element {
         [active_sheet_index, persist_immediate]
     );
 
+    const handle_auto_size = useCallback(
+        (col: number) => {
+            const table = table_ref.current;
+            if (!table) return;
+            const sheet = workbook?.sheets[active_sheet_index];
+            if (!sheet) return;
+            const width = measure_column_fit_width(table, col, sheet.merges);
+            handle_column_resize(col, width);
+        },
+        [workbook, active_sheet_index, handle_column_resize]
+    );
+
     const handle_row_resize = useCallback(
         (row: number, height: number) => {
             set_row_heights((prev) => {
@@ -263,8 +278,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
                         scroll_ref={scroll_ref}
+                        table_ref={table_ref}
                     />
                 </div>
             ) : (
@@ -286,8 +303,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
                         scroll_ref={scroll_ref}
+                        table_ref={table_ref}
                     />
                 </>
             )}
@@ -301,8 +320,10 @@ interface TableWithSelectionProps {
     column_widths: Record<number, number>;
     row_heights: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    on_auto_size: (col: number) => void;
     on_row_resize: (row: number, height: number) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
+    table_ref: React.RefObject<HTMLTableElement | null>;
 }
 
 function TableWithSelection({
@@ -311,10 +332,44 @@ function TableWithSelection({
     column_widths,
     row_heights,
     on_column_resize,
+    on_auto_size,
     on_row_resize,
     scroll_ref,
+    table_ref,
 }: TableWithSelectionProps): React.JSX.Element {
     const sel = use_selection(sheet, show_formatting);
+
+    const handle_column_resize = useCallback(
+        (col: number, width: number) => {
+            if (sel.selection) {
+                const range = normalize_range(sel.selection.range);
+                if (col >= range.start_col && col <= range.end_col && range.start_col !== range.end_col) {
+                    for (let c = range.start_col; c <= range.end_col; c++) {
+                        on_column_resize(c, width);
+                    }
+                    return;
+                }
+            }
+            on_column_resize(col, width);
+        },
+        [sel.selection, on_column_resize]
+    );
+
+    const handle_auto_size = useCallback(
+        (col: number) => {
+            if (sel.selection) {
+                const range = normalize_range(sel.selection.range);
+                if (col >= range.start_col && col <= range.end_col && range.start_col !== range.end_col) {
+                    for (let c = range.start_col; c <= range.end_col; c++) {
+                        on_auto_size(c);
+                    }
+                    return;
+                }
+            }
+            on_auto_size(col);
+        },
+        [sel.selection, on_auto_size]
+    );
 
     const menu_items: MenuItem[] = [];
     if (sel.context_menu) {
@@ -350,9 +405,11 @@ function TableWithSelection({
                 show_formatting={show_formatting}
                 column_widths={column_widths}
                 row_heights={row_heights}
-                on_column_resize={on_column_resize}
+                on_column_resize={handle_column_resize}
+                on_auto_size={handle_auto_size}
                 on_row_resize={on_row_resize}
                 scroll_ref={scroll_ref}
+                table_ref={table_ref}
                 selection={sel.selection}
                 on_cell_mouse_down={sel.on_cell_mouse_down}
                 on_cell_mouse_move={sel.on_cell_mouse_move}
