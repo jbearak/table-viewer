@@ -124,7 +124,9 @@ class ViewerPanel implements vscode.Disposable {
 
     private async parse_file(): Promise<{ data: WorkbookData; warnings: string[] }> {
         const stat = await vscode.workspace.fs.stat(this.uri);
-        assert_safe_file_size(stat.size);
+        const max_mib = vscode.workspace.getConfiguration('tableViewer')
+            .get<number>('maxFileSizeMiB', 16)!;
+        assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {

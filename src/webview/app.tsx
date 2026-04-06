@@ -30,6 +30,8 @@ export function App(): React.JSX.Element {
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    const [truncation_message, set_truncation_message] = useState<string | null>(null);
+    const [preview_mode, set_preview_mode] = useState(false);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const table_ref = useRef<HTMLTableElement | null>(null);
@@ -41,6 +43,7 @@ export function App(): React.JSX.Element {
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
     >([]);
+    const last_reported_preview_row_ref = useRef<number | null>(null);
 
     const { persist_debounced, persist_immediate } =
         use_state_sync(state_ref);
@@ -79,7 +82,10 @@ export function App(): React.JSX.Element {
                         ? tab_orient === 'vertical'
                         : msg.defaultTabOrientation === 'vertical'
                 );
+                last_reported_preview_row_ref.current = null;
                 state_ref.current = s;
+                set_truncation_message(msg.truncationMessage ?? null);
+                set_preview_mode(msg.previewMode ?? false);
 
                 requestAnimationFrame(() => {
                     const pos =
@@ -87,6 +93,9 @@ export function App(): React.JSX.Element {
                     if (pos && scroll_ref.current) {
                         scroll_ref.current.scrollTop = pos.top;
                         scroll_ref.current.scrollLeft = pos.left;
+                    } else if (scroll_ref.current) {
+                        scroll_ref.current.scrollTop = 0;
+                        scroll_ref.current.scrollLeft = 0;
                     }
                 });
             }
@@ -132,6 +141,8 @@ export function App(): React.JSX.Element {
                     ),
                     activeSheetIndex: next_active_sheet_index,
                 };
+                last_reported_preview_row_ref.current = null;
+                set_truncation_message(msg.truncationMessage ?? null);
                 persist_immediate();
             }
         };
@@ -143,6 +154,71 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
     }, []);
+
+    useEffect(() => {
+        if (!preview_mode) return;
+
+        const handler = (event: MessageEvent) => {
+            const msg = event.data;
+            if (msg.type === 'scrollToRow' && typeof msg.row === 'number') {
+                const table = table_ref.current;
+                const scroller = scroll_ref.current;
+                if (!table || !scroller) return;
+
+                const rows = table.querySelectorAll('tbody tr');
+                const target_row = rows[msg.row] as HTMLElement | undefined;
+                if (target_row) {
+                    const row_rect = target_row.getBoundingClientRect();
+                    const scroller_rect = scroller.getBoundingClientRect();
+                    scroller.scrollTop += row_rect.top - scroller_rect.top;
+                }
+            }
+        };
+
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [preview_mode]);
+
+    useEffect(() => {
+        if (!preview_mode) return;
+        const scroller = scroll_ref.current;
+        if (!scroller) return;
+
+        let raf_id: number | null = null;
+
+        const report_visible_row = () => {
+            if (raf_id !== null) return;
+            raf_id = requestAnimationFrame(() => {
+                raf_id = null;
+                const table = table_ref.current;
+                if (!table) return;
+
+                const rows = table.querySelectorAll('tbody tr');
+                const scroller_top = scroller.getBoundingClientRect().top;
+                let visible_row = 0;
+
+                for (let i = 0; i < rows.length; i++) {
+                    const row_rect = (rows[i] as HTMLElement).getBoundingClientRect();
+                    if (row_rect.bottom > scroller_top) {
+                        visible_row = i;
+                        break;
+                    }
+                }
+
+                if (last_reported_preview_row_ref.current === visible_row) {
+                    return;
+                }
+                last_reported_preview_row_ref.current = visible_row;
+                vscode_api.postMessage({ type: 'visibleRowChanged', row: visible_row });
+            });
+        };
+
+        scroller.addEventListener('scroll', report_visible_row, { passive: true });
+        return () => {
+            scroller.removeEventListener('scroll', report_visible_row);
+            if (raf_id !== null) cancelAnimationFrame(raf_id);
+        };
+    }, [preview_mode]);
 
     useEffect(() => {
         const el = scroll_ref.current;
@@ -392,6 +468,9 @@ export function App(): React.JSX.Element {
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
             />
+            {truncation_message && (
+                <div className="truncation-banner">{truncation_message}</div>
+            )}
             {effective_vertical_tabs ? (
                 <div className="content-area">
                     <SheetTabs
