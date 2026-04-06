@@ -674,6 +674,8 @@ function TableWithSelection({
 
     // Track pending action after save completes
     const pending_after_save_ref = useRef<'none' | 'exit_edit_mode'>('none');
+    // Snapshot of dirty keys sent in the current save, so we only clear those on success
+    const saved_dirty_keys_ref = useRef<Set<string>>(new Set());
 
     // Confirm active cell editor and collect edits for saving
     const collect_edits_for_save = useCallback(() => {
@@ -710,6 +712,8 @@ function TableWithSelection({
                 const edits = collect_edits_for_save();
                 if (Object.keys(edits).length > 0) {
                     pending_after_save_ref.current = 'none';
+                    saved_dirty_keys_ref.current = new Set(Object.keys(edits));
+                    editing.save_in_flight_ref.current = true;
                     vscode_api.postMessage({ type: 'saveCsv', edits });
                 }
             }
@@ -723,8 +727,10 @@ function TableWithSelection({
         const handler = (event: MessageEvent) => {
             const msg = event.data;
             if (msg.type === 'saveResult') {
+                editing.save_in_flight_ref.current = false;
                 if (msg.success) {
-                    editing.clear_dirty();
+                    editing.clear_dirty_keys(saved_dirty_keys_ref.current);
+                    saved_dirty_keys_ref.current = new Set();
                     if (pending_after_save_ref.current === 'exit_edit_mode') {
                         editing.toggle_edit_mode();
                     }
@@ -736,6 +742,8 @@ function TableWithSelection({
                     const edits = collect_edits_for_save();
                     if (Object.keys(edits).length > 0) {
                         pending_after_save_ref.current = 'exit_edit_mode';
+                        saved_dirty_keys_ref.current = new Set(Object.keys(edits));
+                        editing.save_in_flight_ref.current = true;
                         vscode_api.postMessage({ type: 'saveCsv', edits });
                     } else {
                         editing.toggle_edit_mode();
@@ -749,7 +757,7 @@ function TableWithSelection({
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [editing.clear_dirty, editing.toggle_edit_mode, collect_edits_for_save]);
+    }, [editing.clear_dirty, editing.clear_dirty_keys, editing.toggle_edit_mode, collect_edits_for_save]);
 
     // Handle confirm with navigation
     const handle_confirm_edit = useCallback((value: string, advance: 'down' | 'right' | 'none') => {

@@ -8,17 +8,24 @@ export function serialize_csv(
 ): string {
     const lines: string[] = [];
 
+    // Precompute per-row max edited column so the inner loop is O(1)
+    let max_edit_col: Map<number, number> | undefined;
+    if (edits) {
+        max_edit_col = new Map();
+        for (const key of Object.keys(edits)) {
+            const [er, ec] = key.split(':').map(Number);
+            const cur = max_edit_col.get(er);
+            if (cur === undefined || ec > cur) max_edit_col.set(er, ec);
+        }
+    }
+
     for (let r = 0; r < rows.length; r++) {
         const fields: string[] = [];
         let col_count = original_column_counts?.[r] ?? rows[r].length;
         // Extend if any edit targets a column beyond original count
-        if (edits) {
-            for (const key of Object.keys(edits)) {
-                const [er, ec] = key.split(':').map(Number);
-                if (er === r && ec >= col_count) {
-                    col_count = ec + 1;
-                }
-            }
+        const max_ec = max_edit_col?.get(r);
+        if (max_ec !== undefined && max_ec >= col_count) {
+            col_count = max_ec + 1;
         }
         for (let c = 0; c < col_count; c++) {
             const key = `${r}:${c}`;

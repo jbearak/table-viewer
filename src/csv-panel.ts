@@ -153,6 +153,7 @@ export function open_csv_table(
                         state_store.set(file_path, rest);
                         panel.webview.postMessage({ type: 'saveResult', success: true });
                     } catch (err) {
+                        suppress_next_reload = false;
                         const message = err instanceof Error ? err.message : String(err);
                         vscode.window.showErrorMessage(`Failed to save: ${message}`);
                         panel.webview.postMessage({ type: 'saveResult', success: false });

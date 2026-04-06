@@ -25,7 +25,9 @@ The viewer is currently read-only. Adding lightweight editing for CSV/TSV files 
 ### Cell Interaction
 
 - **Double-click** a cell to start editing. An input appears over the cell with the raw value.
-- **Enter** confirms the edit and opens the cell below for editing.
+- **Enter** (no cell editor active) opens the selected cell for editing.
+- **Enter** (cell editor active) confirms the edit and opens the cell below for editing.
+- **Shift+Enter / Alt+Enter** inserts a line break at the cursor position. If the cell is a single-line `<input>`, it switches to a `<textarea>`.
 - **Tab** confirms the edit and opens the cell to the right for editing.
 - **Escape** cancels the edit (reverts to the value before this edit session).
 - **Empty cells** are editable — double-clicking opens an empty input.

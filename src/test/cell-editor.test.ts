@@ -82,6 +82,7 @@ describe('CellEditor', () => {
         expect(container!.querySelector('textarea')).toBeNull();
 
         const input = container!.querySelector('input') as HTMLInputElement;
+        input.setSelectionRange(input.value.length, input.value.length);
         await act(async () => {
             input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }));
         });
@@ -100,6 +101,7 @@ describe('CellEditor', () => {
         await render_editor({ value: 'world', on_confirm, on_cancel: vi.fn() });
 
         const input = container!.querySelector('input') as HTMLInputElement;
+        input.setSelectionRange(input.value.length, input.value.length);
         await act(async () => {
             input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true }));
         });

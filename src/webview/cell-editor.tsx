@@ -15,15 +15,17 @@ export function CellEditor({
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const [is_multiline, set_is_multiline] = useState(value.includes('\n'));
     const mounted_ref = useRef(false);
+    const cursor_pos_ref = useRef<number | null>(null);
 
     useEffect(() => {
         const el = input_ref.current;
         if (el) {
             el.focus();
             if (mounted_ref.current) {
-                // Switching to textarea — place cursor at end
-                const len = el.value.length;
-                el.setSelectionRange(len, len);
+                // Switching to textarea — restore cursor position from before the switch
+                const pos = cursor_pos_ref.current ?? el.value.length;
+                el.setSelectionRange(pos, pos);
+                cursor_pos_ref.current = null;
             } else {
                 // Initial mount — select all for easy replacement
                 el.select();
@@ -53,7 +55,10 @@ export function CellEditor({
         if (e.key === 'Enter' && (e.shiftKey || e.altKey)) {
             e.preventDefault();
             e.stopPropagation();
-            const new_value = live_value + '\n';
+            const start = e.currentTarget.selectionStart ?? live_value.length;
+            const end = e.currentTarget.selectionEnd ?? start;
+            const new_value = live_value.slice(0, start) + '\n' + live_value.slice(end);
+            cursor_pos_ref.current = start + 1;
             set_current_value(new_value);
             set_is_multiline(true);
             return;

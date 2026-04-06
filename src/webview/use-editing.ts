@@ -86,17 +86,36 @@ export function use_editing(
         set_dirty_cells(new Map());
     }, []);
 
+    const clear_dirty_keys = useCallback((keys: Set<string>) => {
+        set_dirty_cells(prev => {
+            const next = new Map(prev);
+            for (const key of keys) next.delete(key);
+            return next;
+        });
+    }, []);
+
     const get_display_value = useCallback((row: number, col: number): string | null => {
         return dirty_cells.get(`${row}:${col}`) ?? null;
     }, [dirty_cells]);
 
-    // Reset editing state when rows change externally (e.g., file reload)
+    // Flag set before posting saveCsv so the rows-change effect can distinguish
+    // save-triggered reloads from external file changes.
+    const save_in_flight_ref = useRef(false);
+
+    // Reset editing state when rows change externally (e.g., file reload).
+    // When a save is in flight the reload comes from our own write — preserve edit mode.
     const prev_rows_ref = useRef(rows);
     useEffect(() => {
         if (prev_rows_ref.current !== rows && edit_mode) {
-            set_editing_cell(null);
-            set_dirty_cells(new Map());
-            set_edit_mode(false);
+            if (save_in_flight_ref.current) {
+                // Save-triggered reload: close any open editor but keep edit mode
+                set_editing_cell(null);
+            } else {
+                // External reload: exit edit mode entirely
+                set_editing_cell(null);
+                set_dirty_cells(new Map());
+                set_edit_mode(false);
+            }
         }
         prev_rows_ref.current = rows;
     }, [rows, edit_mode]);
@@ -120,6 +139,8 @@ export function use_editing(
         confirm_edit,
         cancel_edit,
         clear_dirty,
+        clear_dirty_keys,
+        save_in_flight_ref,
         get_display_value,
         get_active_editor_value,
     };
