@@ -26,6 +26,10 @@ export function App(): React.JSX.Element {
     const [row_heights, set_row_heights] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
+    const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
+        (Record<number, number> | undefined)[]
+    >([]);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const table_ref = useRef<HTMLTableElement | null>(null);
@@ -200,8 +204,22 @@ export function App(): React.JSX.Element {
                 persist_immediate();
                 return next;
             });
+
+            // Deactivate auto-fit if it was active (keep current widths, discard snapshot)
+            if (auto_fit_active[active_sheet_index]) {
+                set_auto_fit_active((prev) => {
+                    const next = [...prev];
+                    next[active_sheet_index] = false;
+                    return next;
+                });
+                set_auto_fit_snapshot((prev) => {
+                    const next = [...prev];
+                    next[active_sheet_index] = undefined;
+                    return next;
+                });
+            }
         },
-        [active_sheet_index, persist_immediate]
+        [active_sheet_index, persist_immediate, auto_fit_active]
     );
 
     const handle_auto_size = useCallback(
@@ -215,6 +233,79 @@ export function App(): React.JSX.Element {
         },
         [workbook, active_sheet_index, handle_column_resize]
     );
+
+    const handle_toggle_auto_fit = useCallback(() => {
+        if (auto_fit_active[active_sheet_index]) {
+            // Deactivate: restore snapshotted widths
+            const snapshot = auto_fit_snapshot[active_sheet_index];
+            set_column_widths((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = snapshot;
+                state_ref.current = {
+                    ...state_ref.current,
+                    columnWidths: [...next],
+                };
+                persist_immediate();
+                return next;
+            });
+            set_auto_fit_active((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = false;
+                return next;
+            });
+            set_auto_fit_snapshot((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = undefined;
+                return next;
+            });
+        } else {
+            // Activate: snapshot current widths, then auto-fit all columns
+            const current_widths = column_widths[active_sheet_index];
+            set_auto_fit_snapshot((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = current_widths
+                    ? { ...current_widths }
+                    : undefined;
+                return next;
+            });
+
+            const table = table_ref.current;
+            const sheet = workbook?.sheets[active_sheet_index];
+            if (table && sheet) {
+                set_column_widths((prev) => {
+                    const next = [...prev];
+                    const new_widths: Record<number, number> = {};
+                    for (let c = 0; c < sheet.columnCount; c++) {
+                        new_widths[c] = measure_column_fit_width(
+                            table,
+                            c,
+                            sheet.merges
+                        );
+                    }
+                    next[active_sheet_index] = new_widths;
+                    state_ref.current = {
+                        ...state_ref.current,
+                        columnWidths: [...next],
+                    };
+                    persist_immediate();
+                    return next;
+                });
+            }
+
+            set_auto_fit_active((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = true;
+                return next;
+            });
+        }
+    }, [
+        active_sheet_index,
+        auto_fit_active,
+        auto_fit_snapshot,
+        column_widths,
+        workbook,
+        persist_immediate,
+    ]);
 
     const handle_row_resize = useCallback(
         (row: number, height: number) => {
@@ -254,10 +345,10 @@ export function App(): React.JSX.Element {
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={workbook.hasFormatting}
                 vertical_tabs={vertical_tabs}
-                on_toggle_tab_orientation={
-                    handle_toggle_tab_orientation
-                }
+                on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
+                auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
+                on_toggle_auto_fit={handle_toggle_auto_fit}
             />
             {effective_vertical_tabs ? (
                 <div className="content-area">
