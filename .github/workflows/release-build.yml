@@ -1,0 +1,92 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v0.1.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-build-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Validate tag + version
+        shell: bash
+        env:
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$THE_TAG" =~ ^v[0-9] ]]; then
+            echo "ERROR: tag must start with 'v' and a digit (e.g., v0.1.1). Got: $THE_TAG" >&2
+            exit 1
+          fi
+
+          if [[ "$THE_TAG" =~ [[:space:]] ]]; then
+            echo "ERROR: tag must not contain whitespace. Got: $THE_TAG" >&2
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
+            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
+            exit 1
+          fi
+
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          EXPECTED_TAG="v${PKG_VERSION}"
+          if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
+            echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Package extension
+        run: npm run package
+
+      - name: Calculate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for vsix in table-viewer-*.vsix; do
+            sha256sum "$vsix" > "$vsix.sha256"
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ inputs.tag || github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            table-viewer-*.vsix
+            table-viewer-*.vsix.sha256
