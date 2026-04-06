@@ -40,17 +40,6 @@ export function Table({
 }: TableProps): React.JSX.Element {
     const merge_map = build_merge_map(sheet.merges);
 
-    const resize_handle_row = new Map<number, number>();
-    for (let c = 0; c < sheet.columnCount; c++) {
-        for (let r = 0; r < sheet.rows.length; r++) {
-            const entry = merge_map.get(`${r}:${c}`);
-            if (entry !== 'hidden') {
-                resize_handle_row.set(c, r);
-                break;
-            }
-        }
-    }
-
     const sel_range = selection ? normalize_range(selection.range) : null;
 
     return (
@@ -90,9 +79,6 @@ export function Table({
                                         merge_info.colSpan;
                                 }
 
-                                const show_resize_handle =
-                                    resize_handle_row.get(c) === r;
-
                                 const selected = is_cell_in_range(
                                     r,
                                     c,
@@ -118,16 +104,11 @@ export function Table({
                                             class_names || undefined
                                         }
                                         style={{
+                                            position: 'relative',
                                             ...(column_widths[c]
                                                 ? {
                                                       width: `${column_widths[c]}px`,
                                                       minWidth: `${column_widths[c]}px`,
-                                                  }
-                                                : undefined),
-                                            ...(show_resize_handle
-                                                ? {
-                                                      position:
-                                                          'relative',
                                                   }
                                                 : undefined),
                                         }}
@@ -141,15 +122,21 @@ export function Table({
                                             on_context_menu(r, c, e)
                                         }
                                     >
-                                        {show_resize_handle && (
-                                            <ColumnResizeHandle
-                                                col={c}
-                                                on_resize={
-                                                    on_column_resize
-                                                }
-                                                on_auto_size={on_auto_size}
-                                            />
-                                        )}
+                                        <ColumnResizeHandle
+                                            col={span_props.colSpan ? c + (span_props.colSpan - 1) : c}
+                                            on_resize={on_column_resize}
+                                            on_auto_size={on_auto_size}
+                                            colspan_cols={span_props.colSpan && span_props.colSpan > 1
+                                                ? Array.from({ length: span_props.colSpan }, (_, i) => c + i)
+                                                : undefined}
+                                        />
+                                        <RowResizeHandle
+                                            row={span_props.rowSpan ? r + (span_props.rowSpan - 1) : r}
+                                            on_resize={on_row_resize}
+                                            rowspan_rows={span_props.rowSpan && span_props.rowSpan > 1
+                                                ? Array.from({ length: span_props.rowSpan }, (_, i) => r + i)
+                                                : undefined}
+                                        />
                                         <CellContent
                                             cell={cell}
                                             show_formatting={
@@ -159,10 +146,6 @@ export function Table({
                                     </td>
                                 );
                             })}
-                            <RowResizeHandle
-                                row={r}
-                                on_resize={on_row_resize}
-                            />
                         </tr>
                     ))}
                 </tbody>
@@ -201,12 +184,14 @@ interface ColumnResizeHandleProps {
     col: number;
     on_resize: (col: number, width: number) => void;
     on_auto_size: (col: number) => void;
+    colspan_cols?: number[];
 }
 
 function ColumnResizeHandle({
     col,
     on_resize,
     on_auto_size,
+    colspan_cols,
 }: ColumnResizeHandleProps): React.JSX.Element {
     const dragging_ref = useRef(false);
 
@@ -220,39 +205,66 @@ function ColumnResizeHandle({
             const td = (e.target as HTMLElement).parentElement!;
             const start_width = td.offsetWidth;
 
-            const handle_mouse_move = (move_e: MouseEvent) => {
-                const new_width = Math.max(
-                    40,
-                    start_width + move_e.clientX - start_x
-                );
-                td.style.width = `${new_width}px`;
-                td.style.minWidth = `${new_width}px`;
-            };
+            if (colspan_cols && colspan_cols.length > 1) {
+                const handle_mouse_move = (move_e: MouseEvent) => {
+                    const new_width = Math.max(
+                        40 * colspan_cols.length,
+                        start_width + move_e.clientX - start_x
+                    );
+                    td.style.width = `${new_width}px`;
+                    td.style.minWidth = `${new_width}px`;
+                };
 
-            const handle_mouse_up = (up_e: MouseEvent) => {
-                dragging_ref.current = false;
-                document.removeEventListener('mousemove', handle_mouse_move);
-                document.removeEventListener('mouseup', handle_mouse_up);
-                const final_width = Math.max(
-                    40,
-                    start_width + up_e.clientX - start_x
-                );
-                on_resize(col, final_width);
-            };
+                const handle_mouse_up = (up_e: MouseEvent) => {
+                    dragging_ref.current = false;
+                    document.removeEventListener('mousemove', handle_mouse_move);
+                    document.removeEventListener('mouseup', handle_mouse_up);
+                    const total_delta = up_e.clientX - start_x;
+                    const per_col_delta = total_delta / colspan_cols.length;
+                    const per_col_start = start_width / colspan_cols.length;
+                    for (const c of colspan_cols) {
+                        const final_width = Math.max(40, per_col_start + per_col_delta);
+                        on_resize(c, final_width);
+                    }
+                };
 
-            document.addEventListener('mousemove', handle_mouse_move);
-            document.addEventListener('mouseup', handle_mouse_up);
+                document.addEventListener('mousemove', handle_mouse_move);
+                document.addEventListener('mouseup', handle_mouse_up);
+            } else {
+                const handle_mouse_move = (move_e: MouseEvent) => {
+                    const new_width = Math.max(40, start_width + move_e.clientX - start_x);
+                    td.style.width = `${new_width}px`;
+                    td.style.minWidth = `${new_width}px`;
+                };
+
+                const handle_mouse_up = (up_e: MouseEvent) => {
+                    dragging_ref.current = false;
+                    document.removeEventListener('mousemove', handle_mouse_move);
+                    document.removeEventListener('mouseup', handle_mouse_up);
+                    const final_width = Math.max(40, start_width + up_e.clientX - start_x);
+                    on_resize(col, final_width);
+                };
+
+                document.addEventListener('mousemove', handle_mouse_move);
+                document.addEventListener('mouseup', handle_mouse_up);
+            }
         },
-        [col, on_resize]
+        [col, on_resize, colspan_cols]
     );
 
     const handle_double_click = useCallback(
         (e: React.MouseEvent) => {
             e.preventDefault();
             e.stopPropagation();
-            on_auto_size(col);
+            if (colspan_cols && colspan_cols.length > 1) {
+                for (const c of colspan_cols) {
+                    on_auto_size(c);
+                }
+            } else {
+                on_auto_size(col);
+            }
         },
-        [col, on_auto_size]
+        [col, on_auto_size, colspan_cols]
     );
 
     return (
@@ -267,50 +279,70 @@ function ColumnResizeHandle({
 interface RowResizeHandleProps {
     row: number;
     on_resize: (row: number, height: number) => void;
+    rowspan_rows?: number[];
 }
 
 function RowResizeHandle({
     row,
     on_resize,
+    rowspan_rows,
 }: RowResizeHandleProps): React.JSX.Element {
     const handle_mouse_down = useCallback(
         (e: React.MouseEvent) => {
             e.preventDefault();
+            e.stopPropagation();
             const tr = (e.target as HTMLElement).closest('tr')!;
             const start_y = e.clientY;
             const start_height = tr.offsetHeight;
 
-            const handle_mouse_move = (move_e: MouseEvent) => {
-                const new_height = Math.max(
-                    20,
-                    start_height + move_e.clientY - start_y
-                );
-                tr.style.height = `${new_height}px`;
-            };
+            if (rowspan_rows && rowspan_rows.length > 1) {
+                const handle_mouse_move = (move_e: MouseEvent) => {
+                    const new_height = Math.max(
+                        20 * rowspan_rows.length,
+                        start_height + move_e.clientY - start_y
+                    );
+                    tr.style.height = `${new_height}px`;
+                };
 
-            const handle_mouse_up = (up_e: MouseEvent) => {
-                document.removeEventListener('mousemove', handle_mouse_move);
-                document.removeEventListener('mouseup', handle_mouse_up);
-                const final_height = Math.max(
-                    20,
-                    start_height + up_e.clientY - start_y
-                );
-                on_resize(row, final_height);
-            };
+                const handle_mouse_up = (up_e: MouseEvent) => {
+                    document.removeEventListener('mousemove', handle_mouse_move);
+                    document.removeEventListener('mouseup', handle_mouse_up);
+                    const total_delta = up_e.clientY - start_y;
+                    const per_row_delta = total_delta / rowspan_rows.length;
+                    const per_row_start = start_height / rowspan_rows.length;
+                    for (const r of rowspan_rows) {
+                        const final_height = Math.max(20, per_row_start + per_row_delta);
+                        on_resize(r, final_height);
+                    }
+                };
 
-            document.addEventListener('mousemove', handle_mouse_move);
-            document.addEventListener('mouseup', handle_mouse_up);
+                document.addEventListener('mousemove', handle_mouse_move);
+                document.addEventListener('mouseup', handle_mouse_up);
+            } else {
+                const handle_mouse_move = (move_e: MouseEvent) => {
+                    const new_height = Math.max(20, start_height + move_e.clientY - start_y);
+                    tr.style.height = `${new_height}px`;
+                };
+
+                const handle_mouse_up = (up_e: MouseEvent) => {
+                    document.removeEventListener('mousemove', handle_mouse_move);
+                    document.removeEventListener('mouseup', handle_mouse_up);
+                    const final_height = Math.max(20, start_height + up_e.clientY - start_y);
+                    on_resize(row, final_height);
+                };
+
+                document.addEventListener('mousemove', handle_mouse_move);
+                document.addEventListener('mouseup', handle_mouse_up);
+            }
         },
-        [row, on_resize]
+        [row, on_resize, rowspan_rows]
     );
 
     return (
-        <td style={{ padding: 0, width: 0, border: 'none', position: 'relative' }}>
-            <div
-                className="row-resize-handle"
-                onMouseDown={handle_mouse_down}
-            />
-        </td>
+        <div
+            className="row-resize-handle"
+            onMouseDown={handle_mouse_down}
+        />
     );
 }
 
