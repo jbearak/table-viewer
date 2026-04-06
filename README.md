@@ -49,6 +49,15 @@ Table Viewer is the result.
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menu for copy, select row, select column, select all
 
+**Editing (CSV/TSV only)**
+- Click the **Edit** button in the toolbar to enter edit mode
+- Double-click a cell to edit its value
+- **Enter** confirms and moves to the cell below; **Tab** moves right
+- **Escape** cancels the current edit
+- **Ctrl+S** / **Cmd+S** saves all changes back to the file
+- Edited cells show a dot indicator until saved
+- When exiting edit mode with unsaved changes, you're prompted to save or discard
+
 ## Usage
 
 **Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file.
