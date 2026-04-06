@@ -861,7 +861,18 @@ function TableWithSelection({
                 on_cell_mouse_move={sel.on_cell_mouse_move}
                 on_cell_mouse_up={sel.on_cell_mouse_up}
                 on_context_menu={sel.on_context_menu}
-                on_key_down={sel.on_key_down}
+                on_key_down={(e) => {
+                    if (e.key === 'Enter' && !editing.editing_cell && csv_editable && sel.selection) {
+                        e.preventDefault();
+                        const { anchor_row, anchor_col } = sel.selection;
+                        if (!editing.edit_mode) {
+                            editing.set_edit_mode(true);
+                        }
+                        editing.force_start_editing(anchor_row, anchor_col);
+                        return;
+                    }
+                    sel.on_key_down(e);
+                }}
                 editing_cell={editing.editing_cell}
                 dirty_cells={editing.dirty_cells}
                 edit_mode={editing.edit_mode}

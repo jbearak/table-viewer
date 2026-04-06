@@ -51,7 +51,7 @@ Table Viewer is the result.
 
 **Editing (CSV/TSV only)**
 - Click the **Edit** button in the toolbar to enter edit mode
-- Double-click a cell to edit its value
+- Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - **Enter** confirms and moves to the cell below; **Tab** moves right
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file

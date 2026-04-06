@@ -485,6 +485,59 @@ describe('Context menu edit item', () => {
         expect(container!.querySelector('.cell-editor-input')).not.toBeNull();
     });
 
+    it('pressing Enter on a selected cell starts editing it', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Click cell (0,0) to select it
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+        });
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        });
+
+        // Press Enter on the table container
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        await act(async () => {
+            table_container.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        });
+
+        // Should have enabled edit mode
+        const edit_button = get_button('Edit');
+        expect(edit_button.classList.contains('active')).toBe(true);
+
+        // Should have the cell editor input visible with cell (0,0) value
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).not.toBeNull();
+        expect((editor_input as HTMLInputElement).value).toBe('a');
+    });
+
+    it('Enter does not start editing when csvEditable is false', async () => {
+        await render_app();
+        await dispatch_host_message(workbook_data_message(make_csv_workbook()));
+
+        // Click cell (0,0) to select it
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+        });
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        });
+
+        // Press Enter
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        await act(async () => {
+            table_container.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        });
+
+        // Should NOT have the cell editor
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).toBeNull();
+    });
+
     it('clicking another cell commits the current edit', async () => {
         await render_app();
         await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
