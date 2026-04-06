@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { measure_column_fit_width } from '../webview/measure-column';
 import type { MergeRange } from '../types';
 
@@ -92,5 +92,54 @@ describe('measure_column_fit_width', () => {
         ]);
         const width = measure_column_fit_width(table, 0, []);
         expect(width).toBeGreaterThanOrEqual(40);
+    });
+
+    it('measures styled cells using the rendered text element', () => {
+        const table = document.createElement('table');
+        const tbody = document.createElement('tbody');
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        const bold = document.createElement('b');
+        const italic = document.createElement('i');
+        italic.textContent = 'Styled';
+        bold.appendChild(italic);
+        td.appendChild(bold);
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        table.appendChild(tbody);
+        document.body.appendChild(table);
+
+        const original_get_computed_style = window.getComputedStyle.bind(window);
+        const computed_style_spy = vi
+            .spyOn(window, 'getComputedStyle')
+            .mockImplementation((elt: Element, pseudo_elt?: string | null) => {
+                const style = original_get_computed_style(
+                    elt,
+                    pseudo_elt
+                );
+                if (elt === italic) {
+                    return {
+                        ...style,
+                        fontFamily: 'serif',
+                        fontSize: '13px',
+                        fontWeight: '700',
+                        fontStyle: 'italic',
+                    } as CSSStyleDeclaration;
+                }
+                if (elt === td) {
+                    return {
+                        ...style,
+                        fontFamily: 'monospace',
+                        fontSize: '13px',
+                        fontWeight: '400',
+                        fontStyle: 'normal',
+                    } as CSSStyleDeclaration;
+                }
+                return style;
+            });
+
+        measure_column_fit_width(table, 0, []);
+
+        expect(computed_style_spy.mock.calls[0]?.[0]).toBe(italic);
     });
 });

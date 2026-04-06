@@ -47,6 +47,8 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'workbookData') {
                 set_workbook(msg.data);
+                set_auto_fit_active([]);
+                set_auto_fit_snapshot([]);
                 const s = normalize_per_file_state(
                     msg.state,
                     msg.data.sheets.map((sheet) => sheet.name)
@@ -77,6 +79,8 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'reload') {
                 set_workbook(msg.data);
+                set_auto_fit_active([]);
+                set_auto_fit_snapshot([]);
                 const sheet_count = msg.data.sheets.length;
 
                 set_column_widths((prev) =>

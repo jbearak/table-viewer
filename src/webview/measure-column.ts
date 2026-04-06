@@ -3,6 +3,25 @@ import type { MergeRange } from '../types';
 const MIN_WIDTH = 40;
 const PADDING = 16;
 
+function get_measurement_element(
+    target_td: HTMLTableCellElement
+): HTMLElement {
+    const text_walker = document.createTreeWalker(
+        target_td,
+        NodeFilter.SHOW_TEXT
+    );
+
+    let node = text_walker.nextNode();
+    while (node) {
+        if ((node.textContent ?? '').length > 0) {
+            return node.parentElement ?? target_td;
+        }
+        node = text_walker.nextNode();
+    }
+
+    return target_td;
+}
+
 export function measure_column_fit_width(
     table: HTMLTableElement,
     col: number,
@@ -58,8 +77,13 @@ export function measure_column_fit_width(
 
             if (!target_td) return;
 
-            // Copy font styles from the cell
-            const computed = window.getComputedStyle(target_td);
+            const measurement_element = get_measurement_element(target_td);
+
+            // Copy font styles from the rendered text container so bold/italic
+            // cells are measured using their actual display font.
+            const computed = window.getComputedStyle(
+                measurement_element
+            );
             measurer.style.fontFamily = computed.fontFamily;
             measurer.style.fontSize = computed.fontSize;
             measurer.style.fontWeight = computed.fontWeight;
