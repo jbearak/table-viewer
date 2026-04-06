@@ -226,6 +226,19 @@ describe('Toolbar', () => {
         );
     });
 
+    it('hides the tooltip when the button is clicked', () => {
+        render_toolbar();
+
+        const formatting = get_button('Formatting');
+        dispatch_mouse_event(formatting, 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+
+        act(() => {
+            formatting.click();
+        });
+        expect(get_tooltip()).toBeNull();
+    });
+
     it('clamps tooltip positioning so it stays inside the viewport near the left edge', () => {
         const original_inner_width = window.innerWidth;
         Object.defineProperty(window, 'innerWidth', {
