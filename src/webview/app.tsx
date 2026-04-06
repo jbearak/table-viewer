@@ -11,6 +11,8 @@ import {
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import { use_selection } from './use-selection';
+import { normalize_range } from './selection';
+import { measure_column_fit_width } from './measure-column';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -24,15 +26,32 @@ export function App(): React.JSX.Element {
     const [row_heights, set_row_heights] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
+    const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
+        (Record<number, number> | undefined)[]
+    >([]);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
+    const table_ref = useRef<HTMLTableElement | null>(null);
     const state_ref = useRef<PerFileState>({});
     const scroll_positions_ref = useRef<
         ({ top: number; left: number } | undefined)[]
     >([]);
+    const auto_fit_active_ref = useRef<boolean[]>([]);
+    const auto_fit_snapshot_ref = useRef<
+        (Record<number, number> | undefined)[]
+    >([]);
 
     const { persist_debounced, persist_immediate } =
         use_state_sync(state_ref);
+
+    useEffect(() => {
+        auto_fit_active_ref.current = auto_fit_active;
+    }, [auto_fit_active]);
+
+    useEffect(() => {
+        auto_fit_snapshot_ref.current = auto_fit_snapshot;
+    }, [auto_fit_snapshot]);
 
     useEffect(() => {
         const handler = (event: MessageEvent) => {
@@ -40,6 +59,10 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'workbookData') {
                 set_workbook(msg.data);
+                auto_fit_active_ref.current = [];
+                auto_fit_snapshot_ref.current = [];
+                set_auto_fit_active([]);
+                set_auto_fit_snapshot([]);
                 const s = normalize_per_file_state(
                     msg.state,
                     msg.data.sheets.map((sheet) => sheet.name)
@@ -70,6 +93,10 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'reload') {
                 set_workbook(msg.data);
+                auto_fit_active_ref.current = [];
+                auto_fit_snapshot_ref.current = [];
+                set_auto_fit_active([]);
+                set_auto_fit_snapshot([]);
                 const sheet_count = msg.data.sheets.length;
 
                 set_column_widths((prev) =>
@@ -183,6 +210,34 @@ export function App(): React.JSX.Element {
         });
     }, [persist_immediate]);
 
+    const deactivate_auto_fit_for_sheet = useCallback((sheet_index: number) => {
+        const is_active = auto_fit_active_ref.current[sheet_index];
+        const has_snapshot =
+            auto_fit_snapshot_ref.current[sheet_index] !== undefined;
+
+        if (!is_active && !has_snapshot) return;
+
+        if (is_active) {
+            set_auto_fit_active((prev) => {
+                if (!prev[sheet_index]) return prev;
+                const next = [...prev];
+                next[sheet_index] = false;
+                auto_fit_active_ref.current = next;
+                return next;
+            });
+        }
+
+        if (has_snapshot) {
+            set_auto_fit_snapshot((prev) => {
+                if (prev[sheet_index] === undefined) return prev;
+                const next = [...prev];
+                next[sheet_index] = undefined;
+                auto_fit_snapshot_ref.current = next;
+                return next;
+            });
+        }
+    }, []);
+
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
             set_column_widths((prev) => {
@@ -197,9 +252,102 @@ export function App(): React.JSX.Element {
                 persist_immediate();
                 return next;
             });
+            // Deactivate auto-fit if it was active (keep current widths, discard snapshot)
+            deactivate_auto_fit_for_sheet(active_sheet_index);
         },
-        [active_sheet_index, persist_immediate]
+        [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
     );
+
+    const handle_auto_size = useCallback(
+        (col: number) => {
+            const table = table_ref.current;
+            if (!table) return;
+            const sheet = workbook?.sheets[active_sheet_index];
+            if (!sheet) return;
+            const width = measure_column_fit_width(table, col, sheet.merges);
+            handle_column_resize(col, width);
+        },
+        [workbook, active_sheet_index, handle_column_resize]
+    );
+
+    const handle_toggle_auto_fit = useCallback(() => {
+        if (auto_fit_active[active_sheet_index]) {
+            // Deactivate: restore snapshotted widths
+            const snapshot = auto_fit_snapshot[active_sheet_index];
+            set_column_widths((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = snapshot;
+                state_ref.current = {
+                    ...state_ref.current,
+                    columnWidths: [...next],
+                };
+                persist_immediate();
+                return next;
+            });
+            set_auto_fit_active((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = false;
+                auto_fit_active_ref.current = next;
+                return next;
+            });
+            set_auto_fit_snapshot((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = undefined;
+                auto_fit_snapshot_ref.current = next;
+                return next;
+            });
+        } else {
+            // Activate: snapshot current widths, then auto-fit all columns
+            const current_widths = column_widths[active_sheet_index];
+            // undefined means no custom widths were set — restoring it
+            // returns the sheet to default (browser-determined) widths
+            set_auto_fit_snapshot((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = current_widths
+                    ? { ...current_widths }
+                    : undefined;
+                auto_fit_snapshot_ref.current = next;
+                return next;
+            });
+
+            const table = table_ref.current;
+            const sheet = workbook?.sheets[active_sheet_index];
+            if (table && sheet) {
+                set_column_widths((prev) => {
+                    const next = [...prev];
+                    const new_widths: Record<number, number> = {};
+                    for (let c = 0; c < sheet.columnCount; c++) {
+                        new_widths[c] = measure_column_fit_width(
+                            table,
+                            c,
+                            sheet.merges
+                        );
+                    }
+                    next[active_sheet_index] = new_widths;
+                    state_ref.current = {
+                        ...state_ref.current,
+                        columnWidths: [...next],
+                    };
+                    persist_immediate();
+                    return next;
+                });
+            }
+
+            set_auto_fit_active((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = true;
+                auto_fit_active_ref.current = next;
+                return next;
+            });
+        }
+    }, [
+        active_sheet_index,
+        auto_fit_active,
+        auto_fit_snapshot,
+        column_widths,
+        workbook,
+        persist_immediate,
+    ]);
 
     const handle_row_resize = useCallback(
         (row: number, height: number) => {
@@ -239,10 +387,10 @@ export function App(): React.JSX.Element {
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={workbook.hasFormatting}
                 vertical_tabs={vertical_tabs}
-                on_toggle_tab_orientation={
-                    handle_toggle_tab_orientation
-                }
+                on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
+                auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
+                on_toggle_auto_fit={handle_toggle_auto_fit}
             />
             {effective_vertical_tabs ? (
                 <div className="content-area">
@@ -263,8 +411,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
                         scroll_ref={scroll_ref}
+                        table_ref={table_ref}
                     />
                 </div>
             ) : (
@@ -286,8 +436,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
                         scroll_ref={scroll_ref}
+                        table_ref={table_ref}
                     />
                 </>
             )}
@@ -301,8 +453,10 @@ interface TableWithSelectionProps {
     column_widths: Record<number, number>;
     row_heights: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    on_auto_size: (col: number) => void;
     on_row_resize: (row: number, height: number) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
+    table_ref: React.RefObject<HTMLTableElement | null>;
 }
 
 function TableWithSelection({
@@ -311,10 +465,44 @@ function TableWithSelection({
     column_widths,
     row_heights,
     on_column_resize,
+    on_auto_size,
     on_row_resize,
     scroll_ref,
+    table_ref,
 }: TableWithSelectionProps): React.JSX.Element {
     const sel = use_selection(sheet, show_formatting);
+
+    const handle_column_resize = useCallback(
+        (col: number, width: number) => {
+            if (sel.selection) {
+                const range = normalize_range(sel.selection.range);
+                if (col >= range.start_col && col <= range.end_col && range.start_col !== range.end_col) {
+                    for (let c = range.start_col; c <= range.end_col; c++) {
+                        on_column_resize(c, width);
+                    }
+                    return;
+                }
+            }
+            on_column_resize(col, width);
+        },
+        [sel.selection, on_column_resize]
+    );
+
+    const handle_auto_size = useCallback(
+        (col: number) => {
+            if (sel.selection) {
+                const range = normalize_range(sel.selection.range);
+                if (col >= range.start_col && col <= range.end_col && range.start_col !== range.end_col) {
+                    for (let c = range.start_col; c <= range.end_col; c++) {
+                        on_auto_size(c);
+                    }
+                    return;
+                }
+            }
+            on_auto_size(col);
+        },
+        [sel.selection, on_auto_size]
+    );
 
     const menu_items: MenuItem[] = [];
     if (sel.context_menu) {
@@ -350,9 +538,11 @@ function TableWithSelection({
                 show_formatting={show_formatting}
                 column_widths={column_widths}
                 row_heights={row_heights}
-                on_column_resize={on_column_resize}
+                on_column_resize={handle_column_resize}
+                on_auto_size={handle_auto_size}
                 on_row_resize={on_row_resize}
                 scroll_ref={scroll_ref}
+                table_ref={table_ref}
                 selection={sel.selection}
                 on_cell_mouse_down={sel.on_cell_mouse_down}
                 on_cell_mouse_move={sel.on_cell_mouse_move}

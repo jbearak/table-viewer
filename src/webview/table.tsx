@@ -9,8 +9,10 @@ interface TableProps {
     column_widths: Record<number, number>;
     row_heights: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    on_auto_size: (col: number) => void;
     on_row_resize: (row: number, height: number) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
+    table_ref: React.RefObject<HTMLTableElement | null>;
     selection: SelectionState | null;
     on_cell_mouse_down: (row: number, col: number, e: React.MouseEvent) => void;
     on_cell_mouse_move: (row: number, col: number) => void;
@@ -25,8 +27,10 @@ export function Table({
     column_widths,
     row_heights,
     on_column_resize,
+    on_auto_size,
     on_row_resize,
     scroll_ref,
+    table_ref,
     selection,
     on_cell_mouse_down,
     on_cell_mouse_move,
@@ -57,7 +61,7 @@ export function Table({
             onKeyDown={on_key_down}
             onMouseUp={on_cell_mouse_up}
         >
-            <table className="data-table">
+            <table className="data-table" ref={table_ref as React.LegacyRef<HTMLTableElement>}>
                 <tbody>
                     {sheet.rows.map((row, r) => (
                         <tr
@@ -143,6 +147,7 @@ export function Table({
                                                 on_resize={
                                                     on_column_resize
                                                 }
+                                                on_auto_size={on_auto_size}
                                             />
                                         )}
                                         <CellContent
@@ -195,11 +200,13 @@ function CellContent({
 interface ColumnResizeHandleProps {
     col: number;
     on_resize: (col: number, width: number) => void;
+    on_auto_size: (col: number) => void;
 }
 
 function ColumnResizeHandle({
     col,
     on_resize,
+    on_auto_size,
 }: ColumnResizeHandleProps): React.JSX.Element {
     const dragging_ref = useRef(false);
 
@@ -239,10 +246,20 @@ function ColumnResizeHandle({
         [col, on_resize]
     );
 
+    const handle_double_click = useCallback(
+        (e: React.MouseEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            on_auto_size(col);
+        },
+        [col, on_auto_size]
+    );
+
     return (
         <div
             className="col-resize-handle"
             onMouseDown={handle_mouse_down}
+            onDoubleClick={handle_double_click}
         />
     );
 }

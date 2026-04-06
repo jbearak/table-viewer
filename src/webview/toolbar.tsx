@@ -12,6 +12,8 @@ interface ToolbarProps {
     vertical_tabs: boolean;
     on_toggle_tab_orientation: () => void;
     show_vertical_tabs_button: boolean;
+    auto_fit_active: boolean;
+    on_toggle_auto_fit: () => void;
 }
 
 export function Toolbar({
@@ -21,8 +23,9 @@ export function Toolbar({
     vertical_tabs,
     on_toggle_tab_orientation,
     show_vertical_tabs_button,
-}: ToolbarProps): React.JSX.Element | null {
-    if (!show_formatting_button && !show_vertical_tabs_button) return null;
+    auto_fit_active,
+    on_toggle_auto_fit,
+}: ToolbarProps): React.JSX.Element {
 
     return (
         <div className="toolbar">
@@ -50,6 +53,16 @@ export function Toolbar({
                     onClick={on_toggle_tab_orientation}
                 />
             )}
+            <ToolbarButton
+                label="Auto-fit Columns"
+                active={auto_fit_active}
+                tooltip_text={
+                    auto_fit_active
+                        ? 'Restore original column widths.'
+                        : 'Auto-fit all columns to their content.'
+                }
+                onClick={on_toggle_auto_fit}
+            />
         </div>
     );
 }

@@ -26,6 +26,8 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         vertical_tabs: false,
         on_toggle_tab_orientation,
         show_vertical_tabs_button: true,
+        auto_fit_active: false,
+        on_toggle_auto_fit: vi.fn(),
         ...props,
     };
 
@@ -179,6 +181,49 @@ describe('Toolbar', () => {
             formatting.blur();
         });
         expect(get_tooltip()).toBeNull();
+    });
+
+    it('renders the Auto-fit Columns button and calls on_toggle_auto_fit on click', () => {
+        const on_toggle_auto_fit = vi.fn();
+        render_toolbar({
+            auto_fit_active: false,
+            on_toggle_auto_fit,
+        });
+
+        const auto_fit = get_button('Auto-fit Columns');
+        expect(auto_fit).toBeDefined();
+        expect(auto_fit.classList.contains('active')).toBe(false);
+
+        act(() => {
+            auto_fit.click();
+        });
+        expect(on_toggle_auto_fit).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows active state and correct tooltip when auto-fit is active', () => {
+        render_toolbar({
+            auto_fit_active: true,
+            on_toggle_auto_fit: vi.fn(),
+        });
+
+        const auto_fit = get_button('Auto-fit Columns');
+        expect(auto_fit.classList.contains('active')).toBe(true);
+
+        dispatch_mouse_event(auto_fit, 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths.');
+    });
+
+    it('shows correct tooltip when auto-fit is inactive', () => {
+        render_toolbar({
+            auto_fit_active: false,
+            on_toggle_auto_fit: vi.fn(),
+        });
+
+        const auto_fit = get_button('Auto-fit Columns');
+        dispatch_mouse_event(auto_fit, 'mouseover');
+        expect(get_tooltip()?.textContent).toBe(
+            'Auto-fit all columns to their content.'
+        );
     });
 
     it('clamps tooltip positioning so it stays inside the viewport near the left edge', () => {
