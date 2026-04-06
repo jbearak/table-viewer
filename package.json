@@ -74,7 +74,6 @@
   },
   "dependencies": {
     "cfb": "^1.2.2",
-    "exceljs": "^4.4.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ssf": "^0.11.2"
