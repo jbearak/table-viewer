@@ -484,4 +484,44 @@ describe('Context menu edit item', () => {
         // And the editor should still be visible
         expect(container!.querySelector('.cell-editor-input')).not.toBeNull();
     });
+
+    it('clicking another cell commits the current edit', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and double-click cell (0,0) to edit
+        await click_button('Edit');
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        // Type a new value
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+        await act(async () => {
+            // Simulate typing by changing the input value via React's onChange
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            )!.set!;
+            nativeInputValueSetter.call(editor_input, 'EDITED');
+            editor_input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+
+        // Click on a different cell (0,1) — should commit the edit
+        await act(async () => {
+            cells[1].dispatchEvent(new MouseEvent('mousedown', {
+                bubbles: true,
+                button: 0,
+            }));
+        });
+
+        // The editor should be closed
+        expect(container!.querySelector('.cell-editor-input')).toBeNull();
+
+        // The first cell should show the edited value and have a dirty indicator
+        const first_cell = cells[0];
+        expect(first_cell.textContent).toBe('EDITED');
+        expect(first_cell.classList.contains('dirty-cell')).toBe(true);
+    });
 });

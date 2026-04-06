@@ -832,7 +832,13 @@ function TableWithSelection({
                 scroll_ref={scroll_ref}
                 table_ref={table_ref}
                 selection={sel.selection}
-                on_cell_mouse_down={sel.on_cell_mouse_down}
+                on_cell_mouse_down={(row, col, e) => {
+                    if (editing.editing_cell) {
+                        const value = editing.get_active_editor_value() ?? editing.editing_cell.value;
+                        editing.confirm_edit(value);
+                    }
+                    sel.on_cell_mouse_down(row, col, e);
+                }}
                 on_cell_mouse_move={sel.on_cell_mouse_move}
                 on_cell_mouse_up={sel.on_cell_mouse_up}
                 on_context_menu={sel.on_context_menu}
