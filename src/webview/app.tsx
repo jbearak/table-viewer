@@ -636,14 +636,50 @@ function TableWithSelection({
         editing_ref.current = {
             toggle_edit_mode: editing.toggle_edit_mode,
             handle_toggle: () => {
-                if (editing.edit_mode && editing.is_dirty) {
+                // Check if there's an in-progress cell edit with changes
+                const active_value = editing.get_active_editor_value();
+                const has_active_changes = active_value !== null && editing.editing_cell && (() => {
+                    const { row, col } = editing.editing_cell!;
+                    const cell = sheet.rows[row]?.[col];
+                    const original = cell !== null ? String(cell?.raw ?? '') : '';
+                    return active_value !== original;
+                })();
+
+                if (editing.edit_mode && (editing.is_dirty || has_active_changes)) {
                     vscode_api.postMessage({ type: 'showSaveDialog' });
                 } else {
                     editing.toggle_edit_mode();
                 }
             },
         };
-    }, [editing.toggle_edit_mode, editing.edit_mode, editing.is_dirty, editing_ref]);
+    }, [editing.toggle_edit_mode, editing.edit_mode, editing.is_dirty, editing.editing_cell, editing.get_active_editor_value, editing_ref, sheet.rows]);
+
+    // Track pending action after save completes
+    const pending_after_save_ref = useRef<'none' | 'exit_edit_mode'>('none');
+
+    // Confirm active cell editor and collect edits for saving
+    const collect_edits_for_save = useCallback(() => {
+        // Confirm the active cell if one is being edited
+        const active_value = editing.get_active_editor_value();
+        if (active_value !== null) {
+            editing.confirm_edit(active_value);
+        }
+        // Collect dirty cells (may include the just-confirmed cell after state settles)
+        const edits: Record<string, string> = {};
+        editing.dirty_cells.forEach((value, key) => {
+            edits[key] = value;
+        });
+        // Also include the just-confirmed cell if it hasn't settled into dirty_cells yet
+        if (active_value !== null && editing.editing_cell) {
+            const { row, col } = editing.editing_cell;
+            const cell = sheet.rows[row]?.[col];
+            const original = cell !== null ? String(cell?.raw ?? '') : '';
+            if (active_value !== original) {
+                edits[`${row}:${col}`] = active_value;
+            }
+        }
+        return edits;
+    }, [editing, sheet.rows]);
 
     // Handle Cmd+S for saving
     useEffect(() => {
@@ -651,41 +687,49 @@ function TableWithSelection({
         const handler = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && e.key === 's') {
                 e.preventDefault();
-                if (editing.is_dirty) {
-                    const edits: Record<string, string> = {};
-                    editing.dirty_cells.forEach((value, key) => {
-                        edits[key] = value;
-                    });
+                const edits = collect_edits_for_save();
+                if (Object.keys(edits).length > 0) {
+                    pending_after_save_ref.current = 'none';
                     vscode_api.postMessage({ type: 'saveCsv', edits });
-                    editing.clear_dirty();
                 }
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editing.edit_mode, editing.is_dirty, editing.dirty_cells, editing.clear_dirty]);
+    }, [editing.edit_mode, collect_edits_for_save]);
 
-    // Handle saveDialogResult messages
+    // Handle saveResult and saveDialogResult messages
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data;
+            if (msg.type === 'saveResult') {
+                if (msg.success) {
+                    editing.clear_dirty();
+                    if (pending_after_save_ref.current === 'exit_edit_mode') {
+                        editing.toggle_edit_mode();
+                    }
+                }
+                pending_after_save_ref.current = 'none';
+            }
             if (msg.type === 'saveDialogResult') {
                 if (msg.choice === 'save') {
-                    const edits: Record<string, string> = {};
-                    editing.dirty_cells.forEach((value, key) => {
-                        edits[key] = value;
-                    });
-                    vscode_api.postMessage({ type: 'saveCsv', edits });
-                }
-                if (msg.choice !== 'cancel') {
+                    const edits = collect_edits_for_save();
+                    if (Object.keys(edits).length > 0) {
+                        pending_after_save_ref.current = 'exit_edit_mode';
+                        vscode_api.postMessage({ type: 'saveCsv', edits });
+                    } else {
+                        editing.toggle_edit_mode();
+                    }
+                } else if (msg.choice === 'discard') {
                     editing.clear_dirty();
                     editing.toggle_edit_mode();
                 }
+                // 'cancel' — do nothing
             }
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [editing.dirty_cells, editing.clear_dirty, editing.toggle_edit_mode]);
+    }, [editing.clear_dirty, editing.toggle_edit_mode, collect_edits_for_save]);
 
     // Handle confirm with navigation
     const handle_confirm_edit = useCallback((value: string, advance: 'down' | 'right' | 'none') => {

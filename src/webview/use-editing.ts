@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import type { CellData } from '../types';
 
 export interface EditingCell {
@@ -75,6 +75,24 @@ export function use_editing(
         return dirty_cells.get(`${row}:${col}`) ?? null;
     }, [dirty_cells]);
 
+    // Reset editing state when rows change externally (e.g., file reload)
+    const prev_rows_ref = useRef(rows);
+    useEffect(() => {
+        if (prev_rows_ref.current !== rows && edit_mode) {
+            set_editing_cell(null);
+            set_dirty_cells(new Map());
+            set_edit_mode(false);
+        }
+        prev_rows_ref.current = rows;
+    }, [rows, edit_mode]);
+
+    // Read the current value from the active cell editor DOM input
+    const get_active_editor_value = useCallback((): string | null => {
+        if (!editing_cell) return null;
+        const el = document.querySelector('.cell-editor-input') as HTMLInputElement | HTMLTextAreaElement | null;
+        return el ? el.value : editing_cell.value;
+    }, [editing_cell]);
+
     return {
         edit_mode,
         editing_cell,
@@ -87,5 +105,6 @@ export function use_editing(
         cancel_edit,
         clear_dirty,
         get_display_value,
+        get_active_editor_value,
     };
 }
