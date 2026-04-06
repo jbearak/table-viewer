@@ -53,6 +53,7 @@ Table Viewer is the result.
 - Click the **Edit** button in the toolbar to enter edit mode
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - **Enter** confirms and moves to the cell below; **Tab** moves right
+- **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file
 - Edited cells are highlighted with a different background color until saved

@@ -13,7 +13,7 @@ export function CellEditor({
 }: CellEditorProps): React.JSX.Element {
     const [current_value, set_current_value] = useState(value);
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
-    const is_multiline = value.includes('\n');
+    const [is_multiline, set_is_multiline] = useState(value.includes('\n'));
 
     useEffect(() => {
         const el = input_ref.current;
@@ -38,6 +38,15 @@ export function CellEditor({
             e.preventDefault();
             e.stopPropagation();
             on_confirm(live_value, 'right');
+            return;
+        }
+
+        if (e.key === 'Enter' && (e.shiftKey || e.altKey)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const new_value = live_value + '\n';
+            set_current_value(new_value);
+            set_is_multiline(true);
             return;
         }
 
