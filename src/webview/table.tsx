@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { get_raw_cell_text } from '../cell-display';
 import type { SheetData, CellData, MergeRange } from '../types';
 import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
@@ -55,6 +55,8 @@ export function Table({
             if (active_col_boundary === null) return false;
             const cell_right_boundary = c + col_span - 1;
             if (cell_right_boundary !== active_col_boundary) return false;
+            const { first, last } = visible_range_ref.current;
+            if (r < first || r > last) return false;
             const group = col_boundary_groups.get(active_col_boundary);
             return group !== undefined && group.has(r);
         },
@@ -88,6 +90,43 @@ export function Table({
         () => set_active_row_boundary(null),
         []
     );
+
+    const visible_range_ref = useRef<{ first: number; last: number }>({ first: 0, last: Infinity });
+    const [, set_render_tick] = useState(0);
+
+    // Recompute visible range when active boundary changes
+    useEffect(() => {
+        if (active_col_boundary === null && active_row_boundary === null) return;
+        const scroll_el = scroll_ref.current;
+        const table_el = table_ref.current;
+        if (!scroll_el || !table_el) return;
+        visible_range_ref.current = get_visible_row_range(scroll_el, table_el);
+    }, [active_col_boundary, active_row_boundary]);
+
+    // Update highlights on scroll during drag
+    useEffect(() => {
+        if (active_col_boundary === null && active_row_boundary === null) return;
+        const scroll_el = scroll_ref.current;
+        const table_el = table_ref.current;
+        if (!scroll_el || !table_el) return;
+
+        let raf_id: number | null = null;
+
+        const on_scroll = () => {
+            if (raf_id !== null) return;
+            raf_id = requestAnimationFrame(() => {
+                raf_id = null;
+                visible_range_ref.current = get_visible_row_range(scroll_el, table_el);
+                set_render_tick(t => t + 1);
+            });
+        };
+
+        scroll_el.addEventListener('scroll', on_scroll, { passive: true });
+        return () => {
+            scroll_el.removeEventListener('scroll', on_scroll);
+            if (raf_id !== null) cancelAnimationFrame(raf_id);
+        };
+    }, [active_col_boundary, active_row_boundary]);
 
     const sel_range = selection ? normalize_range(selection.range) : null;
 
@@ -430,6 +469,47 @@ function RowResizeHandle({
             }}
         />
     );
+}
+
+function get_visible_row_range(
+    scroll_el: HTMLElement,
+    table_el: HTMLTableElement
+): { first: number; last: number } {
+    const rows = table_el.querySelectorAll('tbody tr');
+    if (rows.length === 0) return { first: 0, last: -1 };
+
+    const scroll_top = scroll_el.scrollTop;
+    const viewport_bottom = scroll_top + scroll_el.clientHeight;
+
+    // Binary search for first visible row
+    let lo = 0;
+    let hi = rows.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        const row = rows[mid] as HTMLElement;
+        if (row.offsetTop + row.offsetHeight < scroll_top) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const first = lo;
+
+    // Binary search for last visible row
+    lo = first;
+    hi = rows.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        const row = rows[mid] as HTMLElement;
+        if (row.offsetTop > viewport_bottom) {
+            hi = mid - 1;
+        } else {
+            lo = mid;
+        }
+    }
+    const last = lo;
+
+    return { first, last };
 }
 
 type MergeMapEntry =
