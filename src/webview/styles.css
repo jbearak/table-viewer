@@ -312,19 +312,7 @@ body {
 }
 
 .data-table td.dirty-cell {
-    position: relative;
-}
-
-.data-table td.dirty-cell::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--vscode-editorWarning-foreground, #cca700);
-    z-index: 3;
+    background: rgba(204, 167, 0, 0.12);
 }
 
 .toggle.has-unsaved {
