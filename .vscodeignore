@@ -4,3 +4,7 @@ tsconfig.json
 .gitignore
 .superpowers/**
 docs/**
+.claude/**
+.github/**
+scripts/**
+vitest.config.ts
