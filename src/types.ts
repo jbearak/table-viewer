@@ -48,12 +48,16 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
 /** Messages from extension host to webview */
 export type HostMessage =
-    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean }
+    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean }
     | { type: 'reload'; data: WorkbookData; truncationMessage?: string }
-    | { type: 'scrollToRow'; row: number };
+    | { type: 'scrollToRow'; row: number }
+    | { type: 'saveResult'; success: boolean }
+    | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
     | { type: 'stateChanged'; state: PerFileState }
-    | { type: 'visibleRowChanged'; row: number };
+    | { type: 'visibleRowChanged'; row: number }
+    | { type: 'saveCsv'; edits: Record<string, string> }
+    | { type: 'showSaveDialog' };
