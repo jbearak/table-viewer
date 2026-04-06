@@ -577,4 +577,32 @@ describe('Context menu edit item', () => {
         expect(first_cell.textContent).toBe('EDITED');
         expect(first_cell.classList.contains('dirty-cell')).toBe(true);
     });
+
+    it('Escape cancels edit and returns focus to the table container', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and double-click cell (0,0) to edit
+        await click_button('Edit');
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        // Editor should be open
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+
+        // Press Escape to cancel
+        await act(async () => {
+            editor_input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        });
+
+        // Editor should be closed
+        expect(container!.querySelector('.cell-editor-input')).toBeNull();
+
+        // Focus should be on the table container
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        expect(document.activeElement).toBe(table_container);
+    });
 });

@@ -772,8 +772,10 @@ function TableWithSelection({
         } else if (advance === 'right' && col < sheet.columnCount - 1) {
             sel.select_cell(row, col + 1);
             setTimeout(() => editing.start_editing(row, col + 1), 0);
+        } else {
+            scroll_ref.current?.focus();
         }
-    }, [editing, sel, sheet.rowCount, sheet.columnCount, table_ref, row_heights, on_row_resize]);
+    }, [editing, sel, sheet.rowCount, sheet.columnCount, table_ref, row_heights, on_row_resize, scroll_ref]);
 
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
@@ -890,7 +892,10 @@ function TableWithSelection({
                     if (editing.edit_mode) editing.start_editing(r, c);
                 }}
                 on_confirm_edit={handle_confirm_edit}
-                on_cancel_edit={() => editing.cancel_edit()}
+                on_cancel_edit={() => {
+                    editing.cancel_edit();
+                    scroll_ref.current?.focus();
+                }}
                 get_display_value={editing.get_display_value}
             />
             {sel.context_menu && (

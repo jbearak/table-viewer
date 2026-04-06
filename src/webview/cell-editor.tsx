@@ -59,15 +59,7 @@ export function CellEditor({
             return;
         }
 
-        if (e.key === 'Enter' && !is_multiline) {
-            e.preventDefault();
-            e.stopPropagation();
-            on_confirm(live_value, 'down');
-            return;
-        }
-
-        // For multiline: Ctrl/Cmd+Enter confirms
-        if (e.key === 'Enter' && is_multiline && (e.metaKey || e.ctrlKey)) {
+        if (e.key === 'Enter') {
             e.preventDefault();
             e.stopPropagation();
             on_confirm(live_value, 'down');

@@ -72,6 +72,7 @@ describe('CellEditor', () => {
         expect(on_cancel).toHaveBeenCalled();
     });
 
+
     it('Shift+Enter inserts a newline and switches to textarea', async () => {
         const on_confirm = vi.fn();
         await render_editor({ value: 'hello', on_confirm, on_cancel: vi.fn() });
@@ -134,6 +135,16 @@ describe('CellEditor', () => {
         // Cursor should be at the end, not selecting all text
         expect(textarea.selectionStart).toBe(textarea.value.length);
         expect(textarea.selectionEnd).toBe(textarea.value.length);
+    });
+
+    it('Enter in multiline textarea confirms the edit', async () => {
+        const on_confirm = vi.fn();
+        await render_editor({ value: 'line1\nline2', on_confirm, on_cancel: vi.fn() });
+        const textarea = container!.querySelector('textarea') as HTMLTextAreaElement;
+        await act(async () => {
+            textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        });
+        expect(on_confirm).toHaveBeenCalledWith('line1\nline2', 'down');
     });
 
     it('calls on_confirm with value and "right" on Tab', async () => {
