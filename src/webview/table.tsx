@@ -3,6 +3,8 @@ import { get_raw_cell_text } from '../cell-display';
 import type { SheetData, CellData, MergeRange } from '../types';
 import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
 import { build_boundary_groups } from './boundary-groups';
+import { CellEditor } from './cell-editor';
+import type { EditingCell } from './use-editing';
 
 interface TableProps {
     sheet: SheetData;
@@ -22,6 +24,13 @@ interface TableProps {
     on_cell_mouse_up: () => void;
     on_context_menu: (row: number, col: number, e: React.MouseEvent) => void;
     on_key_down: (e: React.KeyboardEvent) => void;
+    editing_cell: EditingCell | null;
+    dirty_cells: Map<string, string>;
+    edit_mode: boolean;
+    on_double_click: (row: number, col: number) => void;
+    on_confirm_edit: (value: string, advance: 'down' | 'right' | 'none') => void;
+    on_cancel_edit: () => void;
+    get_display_value: (row: number, col: number) => string | null;
 }
 
 export function Table({
@@ -42,6 +51,13 @@ export function Table({
     on_cell_mouse_up,
     on_context_menu,
     on_key_down,
+    editing_cell,
+    dirty_cells,
+    edit_mode,
+    on_double_click,
+    on_confirm_edit,
+    on_cancel_edit,
+    get_display_value,
 }: TableProps): React.JSX.Element {
     const merge_map = useMemo(() => build_merge_map(sheet.merges), [sheet.merges]);
 
@@ -198,12 +214,14 @@ export function Table({
 
                                 const col_highlighted = is_col_highlighted(r, c, col_span);
                                 const row_highlighted = is_row_highlighted(r, c, row_span);
+                                const is_dirty_cell = dirty_cells.has(`${r}:${c}`);
 
                                 const class_names = [
                                     selected ? 'selected' : '',
                                     is_anchor ? 'active-cell' : '',
                                     col_highlighted ? 'resize-col-highlight' : '',
                                     row_highlighted ? 'resize-row-highlight' : '',
+                                    is_dirty_cell ? 'dirty-cell' : '',
                                 ]
                                     .filter(Boolean)
                                     .join(' ');
@@ -233,6 +251,7 @@ export function Table({
                                         onContextMenu={(e) =>
                                             on_context_menu(r, c, e)
                                         }
+                                        onDoubleClick={() => on_double_click(r, c)}
                                     >
                                         <ColumnResizeHandle
                                             col={span_props.colSpan ? c + (span_props.colSpan - 1) : c}
@@ -256,12 +275,21 @@ export function Table({
                                             on_hover_start={handle_row_hover_start}
                                             on_hover_end={handle_row_hover_end}
                                         />
-                                        <CellContent
-                                            cell={cell}
-                                            show_formatting={
-                                                show_formatting
-                                            }
-                                        />
+                                        {editing_cell && editing_cell.row === r && editing_cell.col === c ? (
+                                            <div className="cell-editor-wrapper">
+                                                <CellEditor
+                                                    value={editing_cell.value}
+                                                    on_confirm={on_confirm_edit}
+                                                    on_cancel={on_cancel_edit}
+                                                />
+                                            </div>
+                                        ) : (
+                                            <CellContent
+                                                cell={cell}
+                                                show_formatting={show_formatting}
+                                                display_override={get_display_value(r, c)}
+                                            />
+                                        )}
                                     </td>
                                 );
                             })}
@@ -276,23 +304,27 @@ export function Table({
 function CellContent({
     cell,
     show_formatting,
+    display_override,
 }: {
     cell: CellData | null;
     show_formatting: boolean;
+    display_override?: string | null;
 }): React.JSX.Element {
-    if (!cell) return <></>;
+    if (!cell && (display_override === null || display_override === undefined)) return <></>;
 
-    const text = show_formatting
-        ? cell.formatted
-        : get_raw_cell_text(cell.raw);
+    const text = display_override !== null && display_override !== undefined
+        ? display_override
+        : show_formatting
+            ? cell!.formatted
+            : get_raw_cell_text(cell!.raw);
 
     let content: React.ReactNode = text;
 
-    if (cell.bold && cell.italic) {
+    if (cell?.bold && cell?.italic) {
         content = <b><i>{text}</i></b>;
-    } else if (cell.bold) {
+    } else if (cell?.bold) {
         content = <b>{text}</b>;
-    } else if (cell.italic) {
+    } else if (cell?.italic) {
         content = <i>{text}</i>;
     }
 

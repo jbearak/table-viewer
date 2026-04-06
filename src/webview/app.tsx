@@ -11,6 +11,7 @@ import {
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import { use_selection } from './use-selection';
+import { use_editing } from './use-editing';
 import { normalize_range } from './selection';
 import { measure_column_fit_width } from './measure-column';
 import './styles.css';
@@ -32,6 +33,13 @@ export function App(): React.JSX.Element {
     >([]);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
+    const [csv_editable, set_csv_editable] = useState(false);
+    const [toolbar_edit_state, set_toolbar_edit_state] = useState<{ edit_mode: boolean; is_dirty: boolean }>({ edit_mode: false, is_dirty: false });
+    const editing_ref = useRef<{ toggle_edit_mode: () => void; handle_toggle: () => void }>({ toggle_edit_mode: () => {}, handle_toggle: () => {} });
+
+    const handle_edit_mode_change = useCallback((edit_mode: boolean, is_dirty: boolean) => {
+        set_toolbar_edit_state({ edit_mode, is_dirty });
+    }, []);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const table_ref = useRef<HTMLTableElement | null>(null);
@@ -86,6 +94,7 @@ export function App(): React.JSX.Element {
                 state_ref.current = s;
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
+                set_csv_editable(msg.csvEditable ?? false);
 
                 requestAnimationFrame(() => {
                     const pos =
@@ -508,6 +517,10 @@ export function App(): React.JSX.Element {
                 show_vertical_tabs_button={has_multiple_sheets}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
+                edit_mode={toolbar_edit_state.edit_mode}
+                is_dirty={toolbar_edit_state.is_dirty}
+                on_toggle_edit_mode={() => editing_ref.current.handle_toggle()}
+                show_edit_button={csv_editable}
             />
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}</div>
@@ -537,6 +550,9 @@ export function App(): React.JSX.Element {
                         on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
+                        csv_editable={csv_editable}
+                        on_edit_mode_change={handle_edit_mode_change}
+                        editing_ref={editing_ref}
                     />
                 </div>
             ) : (
@@ -564,6 +580,9 @@ export function App(): React.JSX.Element {
                         on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
+                        csv_editable={csv_editable}
+                        on_edit_mode_change={handle_edit_mode_change}
+                        editing_ref={editing_ref}
                     />
                 </>
             )}
@@ -583,6 +602,9 @@ interface TableWithSelectionProps {
     on_row_resize_batch: (updates: { row: number; height: number }[]) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
+    csv_editable: boolean;
+    on_edit_mode_change: (edit_mode: boolean, is_dirty: boolean) => void;
+    editing_ref: React.MutableRefObject<{ toggle_edit_mode: () => void; handle_toggle: () => void }>;
 }
 
 function TableWithSelection({
@@ -597,8 +619,88 @@ function TableWithSelection({
     on_row_resize_batch,
     scroll_ref,
     table_ref,
+    csv_editable,
+    on_edit_mode_change,
+    editing_ref,
 }: TableWithSelectionProps): React.JSX.Element {
     const sel = use_selection(sheet, show_formatting);
+    const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount);
+
+    // Report edit state up to App for toolbar
+    useEffect(() => {
+        on_edit_mode_change(editing.edit_mode, editing.is_dirty);
+    }, [editing.edit_mode, editing.is_dirty, on_edit_mode_change]);
+
+    // Register ref for toolbar toggle
+    useEffect(() => {
+        editing_ref.current = {
+            toggle_edit_mode: editing.toggle_edit_mode,
+            handle_toggle: () => {
+                if (editing.edit_mode && editing.is_dirty) {
+                    vscode_api.postMessage({ type: 'showSaveDialog' });
+                } else {
+                    editing.toggle_edit_mode();
+                }
+            },
+        };
+    }, [editing.toggle_edit_mode, editing.edit_mode, editing.is_dirty, editing_ref]);
+
+    // Handle Cmd+S for saving
+    useEffect(() => {
+        if (!editing.edit_mode) return;
+        const handler = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+                e.preventDefault();
+                if (editing.is_dirty) {
+                    const edits: Record<string, string> = {};
+                    editing.dirty_cells.forEach((value, key) => {
+                        edits[key] = value;
+                    });
+                    vscode_api.postMessage({ type: 'saveCsv', edits });
+                    editing.clear_dirty();
+                }
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [editing.edit_mode, editing.is_dirty, editing.dirty_cells, editing.clear_dirty]);
+
+    // Handle saveDialogResult messages
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data;
+            if (msg.type === 'saveDialogResult') {
+                if (msg.choice === 'save') {
+                    const edits: Record<string, string> = {};
+                    editing.dirty_cells.forEach((value, key) => {
+                        edits[key] = value;
+                    });
+                    vscode_api.postMessage({ type: 'saveCsv', edits });
+                }
+                if (msg.choice !== 'cancel') {
+                    editing.clear_dirty();
+                    editing.toggle_edit_mode();
+                }
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [editing.dirty_cells, editing.clear_dirty, editing.toggle_edit_mode]);
+
+    // Handle confirm with navigation
+    const handle_confirm_edit = useCallback((value: string, advance: 'down' | 'right' | 'none') => {
+        if (!editing.editing_cell) return;
+        const { row, col } = editing.editing_cell;
+        editing.confirm_edit(value);
+
+        if (advance === 'down' && row < sheet.rowCount - 1) {
+            sel.select_cell(row + 1, col);
+            setTimeout(() => editing.start_editing(row + 1, col), 0);
+        } else if (advance === 'right' && col < sheet.columnCount - 1) {
+            sel.select_cell(row, col + 1);
+            setTimeout(() => editing.start_editing(row, col + 1), 0);
+        }
+    }, [editing, sel, sheet.rowCount, sheet.columnCount]);
 
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
@@ -679,6 +781,15 @@ function TableWithSelection({
                 on_cell_mouse_up={sel.on_cell_mouse_up}
                 on_context_menu={sel.on_context_menu}
                 on_key_down={sel.on_key_down}
+                editing_cell={editing.editing_cell}
+                dirty_cells={editing.dirty_cells}
+                edit_mode={editing.edit_mode}
+                on_double_click={(r, c) => {
+                    if (editing.edit_mode) editing.start_editing(r, c);
+                }}
+                on_confirm_edit={handle_confirm_edit}
+                on_cancel_edit={() => editing.cancel_edit()}
+                get_display_value={editing.get_display_value}
             />
             {sel.context_menu && (
                 <ContextMenu
