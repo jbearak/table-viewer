@@ -142,7 +142,7 @@ function ToolbarButton({
                 ref={button_ref}
                 type="button"
                 className={`toggle ${active ? 'active' : ''}`}
-                onClick={() => { set_is_hovered(false); button_ref.current?.blur(); onClick(); }}
+                onClick={(e) => { set_is_hovered(false); if (e.nativeEvent instanceof PointerEvent) button_ref.current?.blur(); onClick(); }}
                 onMouseOver={() => set_is_hovered(true)}
                 onMouseOut={() => set_is_hovered(false)}
                 onFocus={() => set_is_focused(true)}
