@@ -25,8 +25,7 @@ export function Toolbar({
     show_vertical_tabs_button,
     auto_fit_active,
     on_toggle_auto_fit,
-}: ToolbarProps): React.JSX.Element | null {
-    if (!show_formatting_button && !show_vertical_tabs_button) return null;
+}: ToolbarProps): React.JSX.Element {
 
     return (
         <div className="toolbar">

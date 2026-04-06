@@ -261,6 +261,8 @@ export function App(): React.JSX.Element {
         } else {
             // Activate: snapshot current widths, then auto-fit all columns
             const current_widths = column_widths[active_sheet_index];
+            // undefined means no custom widths were set — restoring it
+            // returns the sheet to default (browser-determined) widths
             set_auto_fit_snapshot((prev) => {
                 const next = [...prev];
                 next[active_sheet_index] = current_widths
