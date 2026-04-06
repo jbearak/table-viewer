@@ -443,6 +443,47 @@ export function App(): React.JSX.Element {
         [active_sheet_index, persist_immediate]
     );
 
+    const handle_column_resize_batch = useCallback(
+        (updates: { col: number; width: number }[]) => {
+            set_column_widths((prev) => {
+                const next = [...prev];
+                const sheet_widths = { ...(next[active_sheet_index] ?? {}) };
+                for (const { col, width } of updates) {
+                    sheet_widths[col] = width;
+                }
+                next[active_sheet_index] = sheet_widths;
+                state_ref.current = {
+                    ...state_ref.current,
+                    columnWidths: [...next],
+                };
+                persist_immediate();
+                return next;
+            });
+            deactivate_auto_fit_for_sheet(active_sheet_index);
+        },
+        [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
+    );
+
+    const handle_row_resize_batch = useCallback(
+        (updates: { row: number; height: number }[]) => {
+            set_row_heights((prev) => {
+                const next = [...prev];
+                const sheet_heights = { ...(next[active_sheet_index] ?? {}) };
+                for (const { row, height } of updates) {
+                    sheet_heights[row] = height;
+                }
+                next[active_sheet_index] = sheet_heights;
+                state_ref.current = {
+                    ...state_ref.current,
+                    rowHeights: [...next],
+                };
+                persist_immediate();
+                return next;
+            });
+        },
+        [active_sheet_index, persist_immediate]
+    );
+
     if (!workbook) {
         return <div className="loading">Loading...</div>;
     }
@@ -490,8 +531,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_column_resize_batch={handle_column_resize_batch}
                         on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
+                        on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
                     />
@@ -515,8 +558,10 @@ export function App(): React.JSX.Element {
                             row_heights[active_sheet_index] ?? {}
                         }
                         on_column_resize={handle_column_resize}
+                        on_column_resize_batch={handle_column_resize_batch}
                         on_auto_size={handle_auto_size}
                         on_row_resize={handle_row_resize}
+                        on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
                     />
@@ -532,8 +577,10 @@ interface TableWithSelectionProps {
     column_widths: Record<number, number>;
     row_heights: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    on_column_resize_batch: (updates: { col: number; width: number }[]) => void;
     on_auto_size: (col: number) => void;
     on_row_resize: (row: number, height: number) => void;
+    on_row_resize_batch: (updates: { row: number; height: number }[]) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
 }
@@ -544,8 +591,10 @@ function TableWithSelection({
     column_widths,
     row_heights,
     on_column_resize,
+    on_column_resize_batch,
     on_auto_size,
     on_row_resize,
+    on_row_resize_batch,
     scroll_ref,
     table_ref,
 }: TableWithSelectionProps): React.JSX.Element {
@@ -618,8 +667,10 @@ function TableWithSelection({
                 column_widths={column_widths}
                 row_heights={row_heights}
                 on_column_resize={handle_column_resize}
+                on_column_resize_batch={on_column_resize_batch}
                 on_auto_size={handle_auto_size}
                 on_row_resize={on_row_resize}
+                on_row_resize_batch={on_row_resize_batch}
                 scroll_ref={scroll_ref}
                 table_ref={table_ref}
                 selection={sel.selection}

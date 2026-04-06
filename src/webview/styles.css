@@ -173,10 +173,10 @@ body {
     position: absolute;
     top: 0;
     right: 0;
-    width: 5px;
+    width: 7px;
     height: 100%;
     cursor: col-resize;
-    z-index: 1;
+    z-index: 2;
 }
 
 .col-resize-handle:hover,
@@ -189,7 +189,7 @@ body {
     bottom: 0;
     left: 0;
     width: 100%;
-    height: 5px;
+    height: 7px;
     cursor: row-resize;
     z-index: 1;
 }
@@ -197,6 +197,14 @@ body {
 .row-resize-handle:hover,
 .row-resize-handle.dragging {
     background: var(--vscode-focusBorder, #007acc);
+}
+
+.data-table td.resize-col-highlight {
+    border-right: 2px solid var(--vscode-focusBorder, #007acc);
+}
+
+.data-table td.resize-row-highlight {
+    border-bottom: 2px solid var(--vscode-focusBorder, #007acc);
 }
 
 .loading {
