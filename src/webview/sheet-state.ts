@@ -43,6 +43,9 @@ export function normalize_per_file_state(
             sheet_names
         ),
         tabOrientation: state.tabOrientation ?? null,
+        pendingEdits: normalize_pending_edits(
+            'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined
+        ),
     };
 }
 
@@ -71,6 +74,21 @@ function normalize_active_sheet_index(
     }
 
     return 0;
+}
+
+function normalize_pending_edits(
+    value: unknown
+): Record<string, string> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return undefined;
+    }
+    const result: Record<string, string> = {};
+    for (const [key, val] of Object.entries(value)) {
+        if (typeof val === 'string') {
+            result[key] = val;
+        }
+    }
+    return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function normalize_sheet_state_array<T>(

@@ -399,6 +399,7 @@ export function use_selection(
         dismiss_context_menu,
         copy_selection,
         copy_cell,
+        select_cell,
         select_row,
         select_column,
         select_all,

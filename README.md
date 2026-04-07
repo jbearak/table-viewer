@@ -49,14 +49,40 @@ Table Viewer is the result.
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menu for copy, select row, select column, select all
 
+**Editing (CSV/TSV only)**
+- Click the **Edit** button in the toolbar to enter edit mode
+- Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
+- **Enter** confirms and moves to the cell below; **Tab** moves right
+- **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
+- **Escape** cancels the current edit
+- **Ctrl+S** / **Cmd+S** saves all changes back to the file
+- Edited cells are highlighted with a different background color until saved
+- When exiting edit mode with unsaved changes, you're prompted to save or discard
+- Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
+
 ## Usage
 
 **Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file.
 
 **CSV/TSV files** open in VS Code's built-in text editor. Two buttons appear in the editor title bar:
 
-- The **preview icon** opens a synced side-by-side preview (alt-click opens it in the same tab)
-- The **table icon** opens the file as a standalone table view
+- The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
+- The **table icon** opens the file as a standalone table view (use this if you want to edit)
+
+## Default editor behavior
+
+Table Viewer registers as the default editor for Excel files (`.xlsx`, `.xls`) because VS Code's built-in text editor isn't useful for binary Excel data. If you have another Excel viewer installed, VS Code will ask which one you'd like to use.
+
+For CSV and TSV files, Table Viewer does *not* register as the default editor. This preserves VS Code's normal text editing behavior — you can still edit CSV/TSV files as text, use find-and-replace, and so on. The table view is available via the toolbar buttons described above.
+
+If you'd prefer Table Viewer to open CSV/TSV files directly, add this to your `settings.json`:
+
+```json
+"workbench.editorAssociations": {
+    "*.csv": "tableViewer.editor",
+    "*.tsv": "tableViewer.editor"
+}
+```
 
 ## Settings
 

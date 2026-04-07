@@ -284,3 +284,42 @@ body {
     flex-shrink: 0;
     text-align: center;
 }
+
+/* Cell editing */
+
+.cell-editor-wrapper {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    min-height: 100%;
+    z-index: 10;
+}
+
+.cell-editor-input {
+    width: 100%;
+    padding: 3px 6px;
+    border: 2px solid var(--vscode-focusBorder, #007acc);
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 13px;
+    outline: none;
+    box-sizing: border-box;
+    resize: none;
+}
+
+.data-table td.dirty-cell {
+    background: rgba(204, 167, 0, 0.12);
+}
+
+.toggle.has-unsaved {
+    border-color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.toggle.active.has-unsaved {
+    background: var(--vscode-editorWarning-foreground, #cca700);
+    border-color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-button-foreground, #fff);
+}

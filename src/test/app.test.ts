@@ -356,3 +356,253 @@ describe('preview scroll sync', () => {
         expect(scroller.scrollLeft).toBe(0);
     });
 });
+
+function make_csv_workbook(): WorkbookData {
+    return {
+        hasFormatting: false,
+        sheets: [{
+            name: 'Sheet1',
+            rows: [
+                [make_cell('a'), make_cell('b')],
+                [make_cell('c'), make_cell('d')],
+            ],
+            merges: [],
+            columnCount: 2,
+            rowCount: 2,
+        }],
+    };
+}
+
+function csv_workbook_data_message(workbook: WorkbookData): HostMessage {
+    return {
+        type: 'workbookData',
+        data: workbook,
+        state: {},
+        defaultTabOrientation: 'horizontal',
+        csvEditable: true,
+    };
+}
+
+describe('Context menu edit item', () => {
+    it('shows "Edit cell" in context menu when csvEditable is true', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Right-click a cell to open the context menu
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        const menu = container!.querySelector('.context-menu');
+        expect(menu).not.toBeNull();
+        const items = Array.from(menu!.querySelectorAll('.context-menu-item'))
+            .map(el => el.textContent);
+        expect(items).toContain('Edit cell');
+    });
+
+    it('does not show "Edit cell" when csvEditable is false', async () => {
+        await render_app();
+        await dispatch_host_message(workbook_data_message(make_csv_workbook()));
+
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        const menu = container!.querySelector('.context-menu');
+        expect(menu).not.toBeNull();
+        const items = Array.from(menu!.querySelectorAll('.context-menu-item'))
+            .map(el => el.textContent);
+        expect(items).not.toContain('Edit cell');
+    });
+
+    it('clicking "Edit cell" enters edit mode and starts editing the cell', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Right-click cell at row 0, col 1
+        const cells = container!.querySelectorAll('td');
+        const target_cell = cells[1]; // second cell (0,1)
+        await act(async () => {
+            target_cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+
+        // Click "Edit cell"
+        const menu_items = container!.querySelectorAll('.context-menu-item');
+        const edit_item = Array.from(menu_items).find(el => el.textContent === 'Edit cell');
+        expect(edit_item).toBeDefined();
+        await act(async () => {
+            (edit_item as HTMLButtonElement).click();
+        });
+
+        // Should now have an Edit button active in the toolbar
+        const edit_button = get_button('Edit');
+        expect(edit_button.classList.contains('active')).toBe(true);
+
+        // Should have the cell editor input visible
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).not.toBeNull();
+        expect((editor_input as HTMLInputElement).value).toBe('b');
+    });
+
+    it('clicking inside the cell editor does not dismiss the editor', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and start editing
+        await click_button('Edit');
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+        editor_input.focus();
+        expect(document.activeElement).toBe(editor_input);
+
+        // Click inside the editor (mousedown bubbles through React's event system)
+        await act(async () => {
+            editor_input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        });
+
+        // The editor input should still have focus (table's mousedown didn't steal it)
+        expect(document.activeElement).toBe(editor_input);
+        // And the editor should still be visible
+        expect(container!.querySelector('.cell-editor-input')).not.toBeNull();
+    });
+
+    it('pressing Enter on a selected cell starts editing it', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Click cell (0,0) to select it
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+        });
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        });
+
+        // Press Enter on the table container
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        await act(async () => {
+            table_container.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        });
+
+        // Should have enabled edit mode
+        const edit_button = get_button('Edit');
+        expect(edit_button.classList.contains('active')).toBe(true);
+
+        // Should have the cell editor input visible with cell (0,0) value
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).not.toBeNull();
+        expect((editor_input as HTMLInputElement).value).toBe('a');
+    });
+
+    it('Enter does not start editing when csvEditable is false', async () => {
+        await render_app();
+        await dispatch_host_message(workbook_data_message(make_csv_workbook()));
+
+        // Click cell (0,0) to select it
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+        });
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        });
+
+        // Press Enter
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        await act(async () => {
+            table_container.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        });
+
+        // Should NOT have the cell editor
+        const editor_input = container!.querySelector('.cell-editor-input');
+        expect(editor_input).toBeNull();
+    });
+
+    it('clicking another cell commits the current edit', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and double-click cell (0,0) to edit
+        await click_button('Edit');
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        // Type a new value
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+        await act(async () => {
+            // Simulate typing by changing the input value via React's onChange
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            )!.set!;
+            nativeInputValueSetter.call(editor_input, 'EDITED');
+            editor_input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+
+        // Click on a different cell (0,1) — should commit the edit
+        await act(async () => {
+            cells[1].dispatchEvent(new MouseEvent('mousedown', {
+                bubbles: true,
+                button: 0,
+            }));
+        });
+
+        // The editor should be closed
+        expect(container!.querySelector('.cell-editor-input')).toBeNull();
+
+        // The first cell should show the edited value and have a dirty indicator
+        const first_cell = cells[0];
+        expect(first_cell.textContent).toBe('EDITED');
+        expect(first_cell.classList.contains('dirty-cell')).toBe(true);
+    });
+
+    it('Escape cancels edit and returns focus to the table container', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        // Enter edit mode and double-click cell (0,0) to edit
+        await click_button('Edit');
+        const cells = container!.querySelectorAll('td');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        // Editor should be open
+        const editor_input = container!.querySelector('.cell-editor-input') as HTMLInputElement;
+        expect(editor_input).not.toBeNull();
+
+        // Press Escape to cancel
+        await act(async () => {
+            editor_input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        });
+
+        // Editor should be closed
+        expect(container!.querySelector('.cell-editor-input')).toBeNull();
+
+        // Focus should be on the table container
+        const table_container = container!.querySelector('.table-container') as HTMLDivElement;
+        expect(document.activeElement).toBe(table_container);
+    });
+});

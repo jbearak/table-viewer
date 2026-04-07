@@ -11,8 +11,10 @@ import {
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import { use_selection } from './use-selection';
+import { use_editing } from './use-editing';
 import { normalize_range } from './selection';
 import { measure_column_fit_width } from './measure-column';
+import { auto_resize_row_after_edit } from './auto-resize-row';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -32,6 +34,14 @@ export function App(): React.JSX.Element {
     >([]);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
+    const [csv_editable, set_csv_editable] = useState(false);
+    const [initial_pending_edits, set_initial_pending_edits] = useState<Record<string, string> | undefined>(undefined);
+    const [toolbar_edit_state, set_toolbar_edit_state] = useState<{ edit_mode: boolean; is_dirty: boolean }>({ edit_mode: false, is_dirty: false });
+    const editing_ref = useRef<{ toggle_edit_mode: () => void; handle_toggle: () => void }>({ toggle_edit_mode: () => {}, handle_toggle: () => {} });
+
+    const handle_edit_mode_change = useCallback((edit_mode: boolean, is_dirty: boolean) => {
+        set_toolbar_edit_state({ edit_mode, is_dirty });
+    }, []);
 
     const scroll_ref = useRef<HTMLDivElement | null>(null);
     const table_ref = useRef<HTMLTableElement | null>(null);
@@ -86,6 +96,8 @@ export function App(): React.JSX.Element {
                 state_ref.current = s;
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
+                set_csv_editable(msg.csvEditable ?? false);
+                set_initial_pending_edits(s.pendingEdits);
 
                 requestAnimationFrame(() => {
                     const pos =
@@ -508,6 +520,10 @@ export function App(): React.JSX.Element {
                 show_vertical_tabs_button={has_multiple_sheets}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
+                edit_mode={toolbar_edit_state.edit_mode}
+                is_dirty={toolbar_edit_state.is_dirty}
+                on_toggle_edit_mode={() => editing_ref.current.handle_toggle()}
+                show_edit_button={csv_editable}
             />
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}</div>
@@ -537,6 +553,10 @@ export function App(): React.JSX.Element {
                         on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
+                        csv_editable={csv_editable}
+                        initial_pending_edits={initial_pending_edits}
+                        on_edit_mode_change={handle_edit_mode_change}
+                        editing_ref={editing_ref}
                     />
                 </div>
             ) : (
@@ -564,6 +584,10 @@ export function App(): React.JSX.Element {
                         on_row_resize_batch={handle_row_resize_batch}
                         scroll_ref={scroll_ref}
                         table_ref={table_ref}
+                        csv_editable={csv_editable}
+                        initial_pending_edits={initial_pending_edits}
+                        on_edit_mode_change={handle_edit_mode_change}
+                        editing_ref={editing_ref}
                     />
                 </>
             )}
@@ -583,6 +607,10 @@ interface TableWithSelectionProps {
     on_row_resize_batch: (updates: { row: number; height: number }[]) => void;
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
+    csv_editable: boolean;
+    initial_pending_edits?: Record<string, string>;
+    on_edit_mode_change: (edit_mode: boolean, is_dirty: boolean) => void;
+    editing_ref: React.MutableRefObject<{ toggle_edit_mode: () => void; handle_toggle: () => void }>;
 }
 
 function TableWithSelection({
@@ -597,8 +625,181 @@ function TableWithSelection({
     on_row_resize_batch,
     scroll_ref,
     table_ref,
+    csv_editable,
+    initial_pending_edits,
+    on_edit_mode_change,
+    editing_ref,
 }: TableWithSelectionProps): React.JSX.Element {
     const sel = use_selection(sheet, show_formatting);
+    const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount, initial_pending_edits);
+
+    // Report edit state up to App for toolbar
+    useEffect(() => {
+        on_edit_mode_change(editing.edit_mode, editing.is_dirty);
+    }, [editing.edit_mode, editing.is_dirty, on_edit_mode_change]);
+
+    // Cache dirty edits to extension state so they survive tab close
+    useEffect(() => {
+        if (editing.is_dirty) {
+            const edits: Record<string, string> = {};
+            editing.dirty_cells.forEach((value, key) => { edits[key] = value; });
+            vscode_api.postMessage({ type: 'pendingEditsChanged', edits });
+        } else {
+            vscode_api.postMessage({ type: 'pendingEditsChanged', edits: null });
+        }
+    }, [editing.dirty_cells, editing.is_dirty]);
+
+    // Register ref for toolbar toggle
+    useEffect(() => {
+        editing_ref.current = {
+            toggle_edit_mode: editing.toggle_edit_mode,
+            handle_toggle: () => {
+                // Check if there's an in-progress cell edit with changes
+                const active_value = editing.get_active_editor_value();
+                const has_active_changes = active_value !== null && editing.editing_cell && (() => {
+                    const { row, col } = editing.editing_cell!;
+                    const cell = sheet.rows[row]?.[col];
+                    const original = cell !== null ? String(cell?.raw ?? '') : '';
+                    return active_value !== original;
+                })();
+
+                if (editing.edit_mode && (editing.is_dirty || has_active_changes)) {
+                    vscode_api.postMessage({ type: 'showSaveDialog' });
+                } else {
+                    editing.toggle_edit_mode();
+                }
+            },
+        };
+    }, [editing.toggle_edit_mode, editing.edit_mode, editing.is_dirty, editing.editing_cell, editing.get_active_editor_value, editing_ref, sheet.rows]);
+
+    // Track pending action after save completes
+    const pending_after_save_ref = useRef<'none' | 'exit_edit_mode'>('none');
+    // Snapshot of dirty keys sent in the current save, so we only clear those on success
+    const saved_dirty_keys_ref = useRef<Set<string>>(new Set());
+    // Safety timeout to reset save_in_flight_ref if saveResult never arrives
+    const save_timeout_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const set_save_in_flight = useCallback((value: boolean) => {
+        editing.save_in_flight_ref.current = value;
+        if (save_timeout_ref.current !== null) {
+            clearTimeout(save_timeout_ref.current);
+            save_timeout_ref.current = null;
+        }
+        if (value) {
+            save_timeout_ref.current = setTimeout(() => {
+                editing.save_in_flight_ref.current = false;
+                save_timeout_ref.current = null;
+            }, 10_000);
+        }
+    }, [editing.save_in_flight_ref]);
+
+    // Confirm active cell editor and collect edits for saving
+    const collect_edits_for_save = useCallback(() => {
+        // Confirm the active cell if one is being edited
+        const active_value = editing.get_active_editor_value();
+        if (active_value !== null) {
+            editing.confirm_edit(active_value);
+        }
+        // Collect dirty cells (may include the just-confirmed cell after state settles)
+        const edits: Record<string, string> = {};
+        editing.dirty_cells.forEach((value, key) => {
+            edits[key] = value;
+        });
+        // Also include the just-confirmed cell if it hasn't settled into dirty_cells yet
+        if (active_value !== null && editing.editing_cell) {
+            const { row, col } = editing.editing_cell;
+            const cell = sheet.rows[row]?.[col];
+            const original = cell !== null ? String(cell?.raw ?? '') : '';
+            if (active_value !== original) {
+                edits[`${row}:${col}`] = active_value;
+            } else {
+                delete edits[`${row}:${col}`];
+            }
+        }
+        return edits;
+    }, [editing, sheet.rows]);
+
+    // Handle Cmd+S for saving
+    useEffect(() => {
+        if (!editing.edit_mode) return;
+        const handler = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+                e.preventDefault();
+                const edits = collect_edits_for_save();
+                if (Object.keys(edits).length > 0) {
+                    pending_after_save_ref.current = 'none';
+                    saved_dirty_keys_ref.current = new Set(Object.keys(edits));
+                    set_save_in_flight(true);
+                    vscode_api.postMessage({ type: 'saveCsv', edits });
+                }
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [editing.edit_mode, collect_edits_for_save, set_save_in_flight]);
+
+    // Handle saveResult and saveDialogResult messages
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data;
+            if (msg.type === 'saveResult') {
+                set_save_in_flight(false);
+                if (msg.success) {
+                    editing.clear_dirty_keys(saved_dirty_keys_ref.current);
+                    saved_dirty_keys_ref.current = new Set();
+                    if (pending_after_save_ref.current === 'exit_edit_mode') {
+                        editing.toggle_edit_mode();
+                    }
+                }
+                pending_after_save_ref.current = 'none';
+            }
+            if (msg.type === 'saveDialogResult') {
+                if (msg.choice === 'save') {
+                    const edits = collect_edits_for_save();
+                    if (Object.keys(edits).length > 0) {
+                        pending_after_save_ref.current = 'exit_edit_mode';
+                        saved_dirty_keys_ref.current = new Set(Object.keys(edits));
+                        set_save_in_flight(true);
+                        vscode_api.postMessage({ type: 'saveCsv', edits });
+                    } else {
+                        editing.toggle_edit_mode();
+                    }
+                } else if (msg.choice === 'discard') {
+                    editing.clear_dirty();
+                    editing.toggle_edit_mode();
+                }
+                // 'cancel' — do nothing
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [editing.clear_dirty, editing.clear_dirty_keys, editing.toggle_edit_mode, collect_edits_for_save, set_save_in_flight]);
+
+    // Handle confirm with navigation
+    const handle_confirm_edit = useCallback((value: string, advance: 'down' | 'right' | 'none') => {
+        if (!editing.editing_cell) return;
+        const { row, col } = editing.editing_cell;
+        editing.confirm_edit(value);
+
+        // After re-render, auto-resize the row if the new content needs more space
+        if (value.includes('\n') && table_ref.current) {
+            requestAnimationFrame(() => {
+                if (table_ref.current) {
+                    auto_resize_row_after_edit(table_ref.current, row, row_heights, on_row_resize);
+                }
+            });
+        }
+
+        if (advance === 'down' && row < sheet.rowCount - 1) {
+            sel.select_cell(row + 1, col);
+            setTimeout(() => editing.start_editing(row + 1, col), 0);
+        } else if (advance === 'right' && col < sheet.columnCount - 1) {
+            sel.select_cell(row, col + 1);
+            setTimeout(() => editing.start_editing(row, col + 1), 0);
+        } else {
+            scroll_ref.current?.focus();
+        }
+    }, [editing, sel, sheet.rowCount, sheet.columnCount, table_ref, row_heights, on_row_resize, scroll_ref]);
 
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
@@ -634,6 +835,18 @@ function TableWithSelection({
 
     const menu_items: MenuItem[] = [];
     if (sel.context_menu) {
+        if (csv_editable) {
+            menu_items.push({
+                label: 'Edit cell',
+                on_click: () => {
+                    const { row, col } = sel.context_menu!;
+                    if (!editing.edit_mode) {
+                        editing.set_edit_mode(true);
+                    }
+                    editing.force_start_editing(row, col);
+                },
+            });
+        }
         menu_items.push({
             label: 'Copy cell',
             on_click: () =>
@@ -674,11 +887,40 @@ function TableWithSelection({
                 scroll_ref={scroll_ref}
                 table_ref={table_ref}
                 selection={sel.selection}
-                on_cell_mouse_down={sel.on_cell_mouse_down}
+                on_cell_mouse_down={(row, col, e) => {
+                    if (editing.editing_cell) {
+                        const value = editing.get_active_editor_value() ?? editing.editing_cell.value;
+                        editing.confirm_edit(value);
+                    }
+                    sel.on_cell_mouse_down(row, col, e);
+                }}
                 on_cell_mouse_move={sel.on_cell_mouse_move}
                 on_cell_mouse_up={sel.on_cell_mouse_up}
                 on_context_menu={sel.on_context_menu}
-                on_key_down={sel.on_key_down}
+                on_key_down={(e) => {
+                    if (e.key === 'Enter' && !editing.editing_cell && csv_editable && sel.selection) {
+                        e.preventDefault();
+                        const { anchor_row, anchor_col } = sel.selection;
+                        if (!editing.edit_mode) {
+                            editing.set_edit_mode(true);
+                        }
+                        editing.force_start_editing(anchor_row, anchor_col);
+                        return;
+                    }
+                    sel.on_key_down(e);
+                }}
+                editing_cell={editing.editing_cell}
+                dirty_cells={editing.dirty_cells}
+                edit_mode={editing.edit_mode}
+                on_double_click={(r, c) => {
+                    if (editing.edit_mode) editing.start_editing(r, c);
+                }}
+                on_confirm_edit={handle_confirm_edit}
+                on_cancel_edit={() => {
+                    editing.cancel_edit();
+                    scroll_ref.current?.focus();
+                }}
+                get_display_value={editing.get_display_value}
             />
             {sel.context_menu && (
                 <ContextMenu
