@@ -3,6 +3,7 @@ import {
     assert_safe_sheet_count,
     assert_safe_sheet_shape,
     create_workbook_budget,
+    MAX_WORKBOOK_CELLS,
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
@@ -383,6 +384,11 @@ function parse_worksheet(
                 }
 
                 cells.set(`${row}:${col}`, { raw, formatted, ...style });
+                if (cells.size > MAX_WORKBOOK_CELLS) {
+                    throw new Error(
+                        `Worksheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
+                    );
+                }
             });
         });
     }

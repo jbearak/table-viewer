@@ -49,15 +49,15 @@ export function open_csv_table(
             .get<number>('csvMaxRows', 10_000)!;
     }
 
-    async function parse_file(): Promise<CsvParseResult> {
+    async function parse_file(): Promise<CsvParseResult & { mtime: number }> {
         const stat = await vscode.workspace.fs.stat(uri);
         assert_safe_file_size(stat.size, get_max_file_size_mib());
         const raw = await vscode.workspace.fs.readFile(uri);
         const text = new TextDecoder('utf-8').decode(raw);
-        return parse_csv(text, get_delimiter(), get_csv_max_rows());
+        return { ...parse_csv(text, get_delimiter(), get_csv_max_rows()), mtime: stat.mtime };
     }
 
-    let last_parsed: CsvParseResult | null = null;
+    let last_parsed: (CsvParseResult & { mtime: number }) | null = null;
 
     async function send_initial_data(): Promise<void> {
         try {
@@ -136,6 +136,23 @@ export function open_csv_table(
                         return;
                     }
                     try {
+                        // Verify file hasn't changed since we last parsed it
+                        const current_stat = await vscode.workspace.fs.stat(uri);
+                        if (current_stat.mtime !== last_parsed.mtime) {
+                            vscode.window.showWarningMessage(
+                                'File was modified externally. Please review the changes and try again.'
+                            );
+                            last_parsed = await parse_file();
+                            panel.webview.postMessage({
+                                type: 'reload',
+                                data: last_parsed.data,
+                                truncationMessage: last_parsed.truncationMessage,
+                                csvEditable: !last_parsed.truncationMessage,
+                                csvEditingSupported: true,
+                            });
+                            panel.webview.postMessage({ type: 'saveResult', success: false });
+                            return;
+                        }
                         const content = serialize_csv(
                             last_parsed.data.sheets[0].rows,
                             get_delimiter(),

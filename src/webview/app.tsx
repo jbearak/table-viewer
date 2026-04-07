@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { WorkbookData, PerFileState, HostMessage } from '../types';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
@@ -36,7 +36,7 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
-    const [initial_pending_edits, set_initial_pending_edits] = useState<Record<string, string> | undefined>(undefined);
+    const [initial_pending_edits, set_initial_pending_edits] = useState<Record<string, string | { value: string; base: string }> | undefined>(undefined);
     const [toolbar_edit_state, set_toolbar_edit_state] = useState<{ edit_mode: boolean; is_dirty: boolean }>({ edit_mode: false, is_dirty: false });
     const editing_ref = useRef<{ toggle_edit_mode: () => void; handle_toggle: () => void }>({ toggle_edit_mode: () => {}, handle_toggle: () => {} });
 
@@ -616,7 +616,7 @@ interface TableWithSelectionProps {
     scroll_ref: React.RefObject<HTMLDivElement | null>;
     table_ref: React.RefObject<HTMLTableElement | null>;
     csv_editable: boolean;
-    initial_pending_edits?: Record<string, string>;
+    initial_pending_edits?: Record<string, string | { value: string; base: string }>;
     on_edit_mode_change: (edit_mode: boolean, is_dirty: boolean) => void;
     editing_ref: React.MutableRefObject<{ toggle_edit_mode: () => void; handle_toggle: () => void }>;
 }
@@ -641,6 +641,26 @@ function TableWithSelection({
     const sel = use_selection(sheet, show_formatting);
     const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount, initial_pending_edits);
 
+    // Track which conflict key signature was dismissed (empty = not dismissed)
+    const [dismissed_signature, set_dismissed_signature] = useState('');
+
+    // Stable serialization of the conflicted key set for change detection
+    const conflict_key_signature = useMemo(
+        () => [...editing.conflicted_keys].sort().join(','),
+        [editing.conflicted_keys]
+    );
+
+    const show_conflict_banner = editing.conflicted_keys.size > 0 && conflict_key_signature !== dismissed_signature;
+
+    // Exit edit mode when CSV editing becomes disabled (e.g., file truncated on reload)
+    useEffect(() => {
+        if (!csv_editable && editing.edit_mode) {
+            editing.cancel_edit();
+            editing.clear_dirty();
+            editing.set_edit_mode(false);
+        }
+    }, [csv_editable, editing.edit_mode, editing.cancel_edit, editing.clear_dirty, editing.set_edit_mode]);
+
     // Report edit state up to App for toolbar
     useEffect(() => {
         on_edit_mode_change(editing.edit_mode, editing.is_dirty);
@@ -649,8 +669,8 @@ function TableWithSelection({
     // Cache dirty edits to extension state so they survive tab close
     useEffect(() => {
         if (editing.is_dirty) {
-            const edits: Record<string, string> = {};
-            editing.dirty_cells.forEach((value, key) => { edits[key] = value; });
+            const edits: Record<string, { value: string; base: string }> = {};
+            editing.dirty_cells.forEach((entry, key) => { edits[key] = entry; });
             vscode_api.postMessage({ type: 'pendingEditsChanged', edits });
         } else {
             vscode_api.postMessage({ type: 'pendingEditsChanged', edits: null });
@@ -710,8 +730,8 @@ function TableWithSelection({
         }
         // Collect dirty cells (may include the just-confirmed cell after state settles)
         const edits: Record<string, string> = {};
-        editing.dirty_cells.forEach((value, key) => {
-            edits[key] = value;
+        editing.dirty_cells.forEach((entry, key) => {
+            edits[key] = entry.value;
         });
         // Also include the just-confirmed cell if it hasn't settled into dirty_cells yet
         if (active_value !== null && editing.editing_cell) {
@@ -855,6 +875,15 @@ function TableWithSelection({
                 },
             });
         }
+        if (editing.dirty_cells.has(`${sel.context_menu.row}:${sel.context_menu.col}`)) {
+            menu_items.push({
+                label: 'Discard edit',
+                on_click: () => {
+                    const { row, col } = sel.context_menu!;
+                    editing.discard_edit(`${row}:${col}`);
+                },
+            });
+        }
         menu_items.push({
             label: 'Copy cell',
             on_click: () =>
@@ -882,6 +911,18 @@ function TableWithSelection({
 
     return (
         <>
+            {show_conflict_banner && (
+                <div className="conflict-banner">
+                    <span>
+                        File changed externally. {editing.conflicted_keys.size} edit{editing.conflicted_keys.size !== 1 ? 's' : ''} may be affected — highlighted cells show conflicts.
+                    </span>
+                    <span className="conflict-banner-actions">
+                        <button onClick={() => set_dismissed_signature(conflict_key_signature)}>Keep All</button>
+                        <button onClick={() => { editing.discard_conflicted(); }}>Discard Conflicted</button>
+                        <button onClick={() => { editing.cancel_edit(); editing.clear_dirty(); editing.set_edit_mode(false); }}>Discard All</button>
+                    </span>
+                </div>
+            )}
             <Table
                 sheet={sheet}
                 show_formatting={show_formatting}
@@ -919,6 +960,7 @@ function TableWithSelection({
                 }}
                 editing_cell={editing.editing_cell}
                 dirty_cells={editing.dirty_cells}
+                conflicted_keys={editing.conflicted_keys}
                 edit_mode={editing.edit_mode}
                 on_double_click={(r, c) => {
                     if (editing.edit_mode) editing.start_editing(r, c);

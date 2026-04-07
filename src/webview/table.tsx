@@ -4,7 +4,7 @@ import type { SheetData, CellData, MergeRange } from '../types';
 import { type SelectionState, normalize_range, is_cell_in_range } from './selection';
 import { build_boundary_groups } from './boundary-groups';
 import { CellEditor } from './cell-editor';
-import type { EditingCell } from './use-editing';
+import type { EditingCell, DirtyEntry } from './use-editing';
 
 interface TableProps {
     sheet: SheetData;
@@ -25,7 +25,8 @@ interface TableProps {
     on_context_menu: (row: number, col: number, e: React.MouseEvent) => void;
     on_key_down: (e: React.KeyboardEvent) => void;
     editing_cell: EditingCell | null;
-    dirty_cells: Map<string, string>;
+    dirty_cells: Map<string, DirtyEntry>;
+    conflicted_keys: Set<string>;
     edit_mode: boolean;
     on_double_click: (row: number, col: number) => void;
     on_confirm_edit: (value: string, advance: 'down' | 'right' | 'none') => void;
@@ -53,6 +54,7 @@ export function Table({
     on_key_down,
     editing_cell,
     dirty_cells,
+    conflicted_keys,
     edit_mode,
     on_double_click,
     on_confirm_edit,
@@ -219,6 +221,7 @@ export function Table({
                                 const col_highlighted = is_col_highlighted(r, c, col_span);
                                 const row_highlighted = is_row_highlighted(r, c, row_span);
                                 const is_dirty_cell = dirty_cells.has(`${r}:${c}`);
+                                const is_conflicted = conflicted_keys.has(`${r}:${c}`);
 
                                 const class_names = [
                                     !is_editing_cell ? 'display-cell' : '',
@@ -227,6 +230,7 @@ export function Table({
                                     col_highlighted ? 'resize-col-highlight' : '',
                                     row_highlighted ? 'resize-row-highlight' : '',
                                     is_dirty_cell ? 'dirty-cell' : '',
+                                    is_conflicted ? 'cell-conflicted' : '',
                                 ]
                                     .filter(Boolean)
                                     .join(' ');

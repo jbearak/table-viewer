@@ -59,6 +59,7 @@ Table Viewer is the result.
 - Edited cells are highlighted with a different background color until saved
 - When exiting edit mode with unsaved changes, you're prompted to save or discard
 - Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
+- If the file changes on disk while you have unsaved edits, a banner appears. Conflicted edits — where the underlying cell also changed externally — are flagged with warning-colored text on top of the usual background highlight; you can keep all edits, discard only the conflicted ones, or discard all
 
 ## Usage
 
