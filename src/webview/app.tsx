@@ -534,7 +534,7 @@ export function App(): React.JSX.Element {
                 show_edit_button={csv_editable}
             />
             {truncation_message && (
-                <div className="truncation-banner">{truncation_message}{csv_editing_supported ? '. Editing is disabled for truncated files.' : ''}</div>
+                <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
             )}
             {effective_vertical_tabs ? (
                 <div className="content-area">

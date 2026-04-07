@@ -131,6 +131,10 @@ export function open_csv_table(
                 }
                 case 'saveCsv': {
                     if (!last_parsed) return;
+                    if (last_parsed.truncationMessage) {
+                        panel.webview.postMessage({ type: 'saveResult', success: false });
+                        return;
+                    }
                     try {
                         const content = serialize_csv(
                             last_parsed.data.sheets[0].rows,
