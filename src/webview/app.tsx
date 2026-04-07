@@ -920,7 +920,7 @@ function TableWithSelection({
                     <span className="conflict-banner-actions">
                         <button onClick={() => set_conflict_banner_dismissed(true)}>Keep All</button>
                         <button onClick={() => { editing.discard_conflicted(); }}>Discard Conflicted</button>
-                        <button onClick={() => { editing.clear_dirty(); editing.set_edit_mode(false); }}>Discard All</button>
+                        <button onClick={() => { editing.cancel_edit(); editing.clear_dirty(); editing.set_edit_mode(false); }}>Discard All</button>
                     </span>
                 </div>
             )}
