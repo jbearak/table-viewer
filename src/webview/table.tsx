@@ -211,12 +211,17 @@ export function Table({
 
                                 const col_span = span_props.colSpan ?? 1;
                                 const row_span = span_props.rowSpan ?? 1;
+                                const is_editing_cell =
+                                    editing_cell !== null &&
+                                    editing_cell.row === r &&
+                                    editing_cell.col === c;
 
                                 const col_highlighted = is_col_highlighted(r, c, col_span);
                                 const row_highlighted = is_row_highlighted(r, c, row_span);
                                 const is_dirty_cell = dirty_cells.has(`${r}:${c}`);
 
                                 const class_names = [
+                                    !is_editing_cell ? 'display-cell' : '',
                                     selected ? 'selected' : '',
                                     is_anchor ? 'active-cell' : '',
                                     col_highlighted ? 'resize-col-highlight' : '',
@@ -275,7 +280,7 @@ export function Table({
                                             on_hover_start={handle_row_hover_start}
                                             on_hover_end={handle_row_hover_end}
                                         />
-                                        {editing_cell && editing_cell.row === r && editing_cell.col === c ? (
+                                        {is_editing_cell ? (
                                             <div className="cell-editor-wrapper" onMouseDown={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
                                                 <CellEditor
                                                     value={editing_cell.value}

@@ -169,6 +169,10 @@ body {
     min-width: 40px;
 }
 
+.data-table td.display-cell {
+    cursor: default;
+}
+
 .col-resize-handle {
     position: absolute;
     top: 0;
@@ -294,6 +298,7 @@ body {
     right: 0;
     min-height: 100%;
     z-index: 10;
+    cursor: text;
 }
 
 .cell-editor-input {
@@ -307,6 +312,7 @@ body {
     outline: none;
     box-sizing: border-box;
     resize: none;
+    cursor: text;
 }
 
 .data-table td.dirty-cell {
