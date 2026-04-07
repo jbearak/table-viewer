@@ -7,18 +7,27 @@ export interface EditingCell {
     value: string;
 }
 
+export interface DirtyEntry {
+    value: string;
+    base: string;
+}
+
 export function use_editing(
     rows: (CellData | null)[][],
     row_count: number,
     col_count: number,
-    initial_edits?: Record<string, string>
+    initial_edits?: Record<string, string | DirtyEntry>
 ) {
     const [edit_mode, set_edit_mode] = useState(
         () => initial_edits !== undefined && Object.keys(initial_edits).length > 0
     );
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
-    const [dirty_cells, set_dirty_cells] = useState<Map<string, string>>(
-        () => initial_edits ? new Map(Object.entries(initial_edits)) : new Map()
+    const [dirty_cells, set_dirty_cells] = useState<Map<string, DirtyEntry>>(
+        () => initial_edits ? new Map(
+            Object.entries(initial_edits).map(([k, v]) =>
+                [k, typeof v === 'object' && v !== null ? v as DirtyEntry : { value: v, base: '' }]
+            )
+        ) : new Map()
     );
 
     const is_dirty = dirty_cells.size > 0;
@@ -30,9 +39,9 @@ export function use_editing(
 
     const begin_editing = useCallback((row: number, col: number) => {
         const key = `${row}:${col}`;
-        const dirty_value = dirty_cells.get(key);
-        if (dirty_value !== undefined) {
-            set_editing_cell({ row, col, value: dirty_value });
+        const dirty_entry = dirty_cells.get(key);
+        if (dirty_entry !== undefined) {
+            set_editing_cell({ row, col, value: dirty_entry.value });
             return;
         }
         const cell = rows[row]?.[col];
@@ -73,7 +82,7 @@ export function use_editing(
 
         set_dirty_cells(prev => {
             const next = new Map(prev);
-            next.set(key, new_value);
+            next.set(key, { value: new_value, base: original });
             return next;
         });
     }, [editing_cell, rows]);
@@ -95,7 +104,8 @@ export function use_editing(
     }, []);
 
     const get_display_value = useCallback((row: number, col: number): string | null => {
-        return dirty_cells.get(`${row}:${col}`) ?? null;
+        const entry = dirty_cells.get(`${row}:${col}`);
+        return entry?.value ?? null;
     }, [dirty_cells]);
 
     // Flag set before posting saveCsv so the rows-change effect can distinguish
@@ -111,10 +121,9 @@ export function use_editing(
                 // Save-triggered reload: close any open editor but keep edit mode
                 set_editing_cell(null);
             } else {
-                // External reload: exit edit mode entirely
+                // External reload: close active editor but preserve dirty edits
+                // so the user doesn't silently lose unsaved work.
                 set_editing_cell(null);
-                set_dirty_cells(new Map());
-                set_edit_mode(false);
             }
         }
         prev_rows_ref.current = rows;

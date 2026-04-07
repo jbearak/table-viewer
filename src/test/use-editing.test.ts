@@ -81,7 +81,7 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         expect(hook_result!.is_dirty).toBe(true);
-        expect(hook_result!.dirty_cells.get('0:0')).toBe('A');
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({ value: 'A', base: 'a' });
         expect(hook_result!.editing_cell).toBe(null);
     });
 
@@ -125,5 +125,23 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('a'); });
         expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('confirm_edit stores the base value alongside the dirty value', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+        const entry = hook_result!.dirty_cells.get('0:0');
+        expect(entry).toEqual({ value: 'A', base: 'a' });
+    });
+
+    it('confirm_edit stores empty base for null cells', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(2, 1); });
+        await act(async () => { hook_result!.confirm_edit('X'); });
+        const entry = hook_result!.dirty_cells.get('2:1');
+        expect(entry).toEqual({ value: 'X', base: '' });
     });
 });
