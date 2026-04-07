@@ -500,6 +500,22 @@ function csv_workbook_data_message(workbook: WorkbookData): HostMessage {
 }
 
 describe('Context menu edit item', () => {
+    it('marks non-editing cells as display-mode cells and removes that state while editing', async () => {
+        await render_app();
+        await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
+
+        const cells = container!.querySelectorAll('td');
+        expect(cells[0].classList.contains('display-cell')).toBe(true);
+        expect(cells[1].classList.contains('display-cell')).toBe(true);
+
+        await click_button('Edit');
+        await act(async () => {
+            cells[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        });
+
+        expect(cells[0].classList.contains('display-cell')).toBe(false);
+        expect(container!.querySelector('.cell-editor-input')).not.toBeNull();
+    });
     it('shows "Edit cell" in context menu when csvEditable is true', async () => {
         await render_app();
         await dispatch_host_message(csv_workbook_data_message(make_csv_workbook()));
