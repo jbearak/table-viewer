@@ -144,6 +144,117 @@ afterEach(() => {
     cleanup();
 });
 
+describe('bold and italic rendering', () => {
+    it('renders bold cells with <b> tag when formatting is on', async () => {
+        await render_app();
+        const workbook: WorkbookData = {
+            hasFormatting: true,
+            sheets: [{
+                name: 'Sheet1',
+                rows: [[
+                    { raw: 'Normal', formatted: 'Normal', bold: false, italic: false },
+                    { raw: 'Bold', formatted: 'Bold', bold: true, italic: false },
+                ]],
+                merges: [],
+                columnCount: 2,
+                rowCount: 1,
+            }],
+        };
+        await dispatch_host_message(workbook_data_message(workbook));
+
+        const tds = container!.querySelectorAll('.data-table td');
+        expect(tds.length).toBe(2);
+
+        // Normal cell should NOT have <b> tag
+        expect(tds[0].querySelector('b')).toBeNull();
+
+        // Bold cell should have <b> tag
+        const bold_tag = tds[1].querySelector('b');
+        expect(bold_tag).not.toBeNull();
+        expect(bold_tag!.textContent).toBe('Bold');
+    });
+
+    it('renders bold+italic cells with <b><i> tags', async () => {
+        await render_app();
+        const workbook: WorkbookData = {
+            hasFormatting: true,
+            sheets: [{
+                name: 'Sheet1',
+                rows: [[
+                    { raw: 'BoldItalic', formatted: 'BoldItalic', bold: true, italic: true },
+                ]],
+                merges: [],
+                columnCount: 1,
+                rowCount: 1,
+            }],
+        };
+        await dispatch_host_message(workbook_data_message(workbook));
+
+        const td = container!.querySelector('.data-table td');
+        expect(td).not.toBeNull();
+
+        const bold_tag = td!.querySelector('b');
+        expect(bold_tag).not.toBeNull();
+        const italic_tag = bold_tag!.querySelector('i');
+        expect(italic_tag).not.toBeNull();
+        expect(italic_tag!.textContent).toBe('BoldItalic');
+    });
+
+    it('renders italic-only cells with <i> tag', async () => {
+        await render_app();
+        const workbook: WorkbookData = {
+            hasFormatting: true,
+            sheets: [{
+                name: 'Sheet1',
+                rows: [[
+                    { raw: 'Italic', formatted: 'Italic', bold: false, italic: true },
+                ]],
+                merges: [],
+                columnCount: 1,
+                rowCount: 1,
+            }],
+        };
+        await dispatch_host_message(workbook_data_message(workbook));
+
+        const td = container!.querySelector('.data-table td');
+        expect(td).not.toBeNull();
+
+        expect(td!.querySelector('b')).toBeNull();
+        const italic_tag = td!.querySelector('i');
+        expect(italic_tag).not.toBeNull();
+        expect(italic_tag!.textContent).toBe('Italic');
+    });
+
+    it('hides bold/italic when formatting toggle is off', async () => {
+        await render_app();
+        const workbook: WorkbookData = {
+            hasFormatting: true,
+            sheets: [{
+                name: 'Sheet1',
+                rows: [[
+                    { raw: 'Bold', formatted: 'Bold', bold: true, italic: false },
+                ]],
+                merges: [],
+                columnCount: 1,
+                rowCount: 1,
+            }],
+        };
+        await dispatch_host_message(workbook_data_message(workbook));
+
+        // Bold should render initially (show_formatting defaults to true)
+        let td = container!.querySelector('.data-table td');
+        expect(td!.querySelector('b')).not.toBeNull();
+
+        // Toggle formatting off
+        await click_button('Formatting');
+
+        // Bold should be removed
+        td = container!.querySelector('.data-table td');
+        expect(td!.querySelector('b')).toBeNull();
+        expect(td!.textContent).toContain('Bold');
+    });
+});
+
 describe('App auto-fit state', () => {
     it('clears auto-fit state when a new workbook loads', async () => {
         await render_app();

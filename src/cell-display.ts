@@ -10,6 +10,7 @@ export function workbook_has_formatting(sheets: SheetData[]): boolean {
             for (const cell of row) {
                 if (!cell || cell.raw === null) continue;
                 if (cell.formatted !== get_raw_cell_text(cell.raw)) return true;
+                if (cell.bold || cell.italic) return true;
             }
         }
     }

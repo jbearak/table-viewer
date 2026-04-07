@@ -33,4 +33,16 @@ describe('workbook_has_formatting', () => {
         const sheets = [sheet([[cell(true, 'true'), cell(42, '42')]])];
         expect(workbook_has_formatting(sheets)).toBe(false);
     });
+
+    it('detects bold cells as having formatting', () => {
+        const bold_cell: CellData = { raw: 'text', formatted: 'text', bold: true, italic: false };
+        const sheets = [sheet([[bold_cell]])];
+        expect(workbook_has_formatting(sheets)).toBe(true);
+    });
+
+    it('detects italic cells as having formatting', () => {
+        const italic_cell: CellData = { raw: 'text', formatted: 'text', bold: false, italic: true };
+        const sheets = [sheet([[italic_cell]])];
+        expect(workbook_has_formatting(sheets)).toBe(true);
+    });
 });

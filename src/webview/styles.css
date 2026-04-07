@@ -169,6 +169,14 @@ body {
     min-width: 40px;
 }
 
+.data-table b {
+    font-weight: bold;
+}
+
+.data-table i {
+    font-style: italic;
+}
+
 .data-table td.display-cell {
     cursor: default;
 }
