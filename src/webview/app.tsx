@@ -155,6 +155,9 @@ export function App(): React.JSX.Element {
                 };
                 last_reported_preview_row_ref.current = null;
                 set_truncation_message(msg.truncationMessage ?? null);
+                if (msg.csvEditable !== undefined) {
+                    set_csv_editable(msg.csvEditable);
+                }
                 persist_immediate();
             }
         };
@@ -526,7 +529,7 @@ export function App(): React.JSX.Element {
                 show_edit_button={csv_editable}
             />
             {truncation_message && (
-                <div className="truncation-banner">{truncation_message}</div>
+                <div className="truncation-banner">{truncation_message}. Editing is disabled for truncated files.</div>
             )}
             {effective_vertical_tabs ? (
                 <div className="content-area">

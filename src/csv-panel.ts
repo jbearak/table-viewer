@@ -75,7 +75,7 @@ export function open_csv_table(
                 state,
                 defaultTabOrientation: default_orientation,
                 truncationMessage: result.truncationMessage,
-                csvEditable: true,
+                csvEditable: !result.truncationMessage,
             });
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -94,6 +94,7 @@ export function open_csv_table(
                 type: 'reload',
                 data: result.data,
                 truncationMessage: result.truncationMessage,
+                csvEditable: !result.truncationMessage,
             });
             if (!delivered) return;
             consecutive_reload_failures = 0;
@@ -146,6 +147,7 @@ export function open_csv_table(
                             type: 'reload',
                             data: last_parsed.data,
                             truncationMessage: last_parsed.truncationMessage,
+                            csvEditable: !last_parsed.truncationMessage,
                         });
                         // Clear cached edits on successful save
                         const current = state_store.get(file_path) as import('./types').PerFileState;
