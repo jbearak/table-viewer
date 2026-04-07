@@ -204,11 +204,65 @@ describe('truncation banner', () => {
             state: {},
             defaultTabOrientation: 'horizontal',
             truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditingSupported: true,
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows. Editing is disabled for truncated files.');
+    });
+
+    it('omits editing-disabled text in preview mode (editing never available)', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            // No csvEditable, no csvEditingSupported — this is preview mode
         });
 
         const banner = container!.querySelector('.truncation-banner');
         expect(banner).not.toBeNull();
         expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows');
+    });
+
+    it('shows editing-disabled text when csvEditingSupported and truncated', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditable: false,
+            csvEditingSupported: true,
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows. Editing is disabled for truncated files.');
     });
 
     it('does not render truncation banner when truncationMessage is absent', async () => {
@@ -232,6 +286,68 @@ describe('truncation banner', () => {
 
         const banner = container!.querySelector('.truncation-banner');
         expect(banner).toBeNull();
+    });
+
+    it('disables editing when file is truncated', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: make_csv_workbook(),
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditable: false,
+        });
+
+        // Edit button should not be visible
+        const buttons = Array.from(container!.querySelectorAll('button'));
+        const edit_button = buttons.find(b => b.textContent === 'Edit');
+        expect(edit_button).toBeUndefined();
+
+        // Context menu should not contain "Edit cell"
+        const cell = container!.querySelector('td') as HTMLTableCellElement;
+        await act(async () => {
+            cell.dispatchEvent(new MouseEvent('contextmenu', {
+                bubbles: true,
+                clientX: 50,
+                clientY: 50,
+            }));
+        });
+        const menu = container!.querySelector('.context-menu');
+        expect(menu).not.toBeNull();
+        const items = Array.from(menu!.querySelectorAll('.context-menu-item'))
+            .map(el => el.textContent);
+        expect(items).not.toContain('Edit cell');
+    });
+
+    it('disables editing when a reload introduces truncation', async () => {
+        await render_app();
+
+        // Initial load: editable, no truncation
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: make_csv_workbook(),
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            csvEditable: true,
+        });
+
+        // Edit button should be visible
+        const buttons_before = Array.from(container!.querySelectorAll('button'));
+        expect(buttons_before.find(b => b.textContent === 'Edit')).toBeDefined();
+
+        // Reload with truncation
+        await dispatch_host_message({
+            type: 'reload',
+            data: make_csv_workbook(),
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditable: false,
+        });
+
+        // Edit button should be gone
+        const buttons_after = Array.from(container!.querySelectorAll('button'));
+        expect(buttons_after.find(b => b.textContent === 'Edit')).toBeUndefined();
     });
 });
 
