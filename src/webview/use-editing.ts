@@ -31,9 +31,14 @@ export function use_editing(
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
     const [dirty_cells, set_dirty_cells] = useState<Map<string, DirtyEntry>>(
         () => initial_edits ? new Map(
-            Object.entries(initial_edits).map(([k, v]) =>
-                [k, typeof v === 'object' && v !== null ? v as DirtyEntry : { value: v, base: '' }]
-            )
+            Object.entries(initial_edits).map(([k, v]) => {
+                if (typeof v === 'object' && v !== null) return [k, v as DirtyEntry];
+                // Old-format string entry: derive base from current rows to avoid false conflicts
+                const [r, c] = k.split(':').map(Number);
+                const cell = rows[r]?.[c];
+                const base = cell !== null ? String(cell?.raw ?? '') : '';
+                return [k, { value: v, base }];
+            })
         ) : new Map()
     );
 
@@ -116,15 +121,19 @@ export function use_editing(
     }, [dirty_cells]);
 
     const discard_edit = useCallback((key: string) => {
+        if (editing_cell && `${editing_cell.row}:${editing_cell.col}` === key) {
+            set_editing_cell(null);
+        }
         set_dirty_cells(prev => {
             if (!prev.has(key)) return prev;
             const next = new Map(prev);
             next.delete(key);
             return next;
         });
-    }, []);
+    }, [editing_cell]);
 
     const discard_conflicted = useCallback(() => {
+        set_editing_cell(null);
         set_dirty_cells(prev => {
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of prev) {

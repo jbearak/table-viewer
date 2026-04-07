@@ -78,14 +78,14 @@ function normalize_active_sheet_index(
 
 function normalize_pending_edits(
     value: unknown
-): Record<string, { value: string; base: string }> | undefined {
+): Record<string, string | { value: string; base: string }> | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return undefined;
     }
-    const result: Record<string, { value: string; base: string }> = {};
+    const result: Record<string, string | { value: string; base: string }> = {};
     for (const [key, val] of Object.entries(value)) {
         if (typeof val === 'string') {
-            result[key] = { value: val, base: '' };
+            result[key] = val;
         } else if (
             typeof val === 'object' && val !== null &&
             'value' in val && typeof (val as Record<string, unknown>).value === 'string' &&

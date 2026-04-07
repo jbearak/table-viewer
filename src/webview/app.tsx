@@ -657,10 +657,11 @@ function TableWithSelection({
     // Exit edit mode when CSV editing becomes disabled (e.g., file truncated on reload)
     useEffect(() => {
         if (!csv_editable && editing.edit_mode) {
+            editing.cancel_edit();
             editing.clear_dirty();
             editing.set_edit_mode(false);
         }
-    }, [csv_editable, editing.edit_mode, editing.clear_dirty, editing.set_edit_mode]);
+    }, [csv_editable, editing.edit_mode, editing.cancel_edit, editing.clear_dirty, editing.set_edit_mode]);
 
     // Report edit state up to App for toolbar
     useEffect(() => {
