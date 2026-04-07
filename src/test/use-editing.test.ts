@@ -37,6 +37,26 @@ async function render() {
     });
 }
 
+function ReloadableComponent({ rows }: { rows: (CellData | null)[][] }) {
+    hook_result = use_editing(rows, rows.length, rows[0]?.length ?? 0);
+    return null;
+}
+
+async function render_reloadable(initial_rows: (CellData | null)[][]) {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+        root!.render(React.createElement(ReloadableComponent, { rows: initial_rows }));
+    });
+}
+
+async function rerender_with_rows(new_rows: (CellData | null)[][]) {
+    await act(async () => {
+        root!.render(React.createElement(ReloadableComponent, { rows: new_rows }));
+    });
+}
+
 afterEach(() => {
     if (root && container) {
         root.unmount();
@@ -143,5 +163,79 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.confirm_edit('X'); });
         const entry = hook_result!.dirty_cells.get('2:1');
         expect(entry).toEqual({ value: 'X', base: '' });
+    });
+});
+
+describe('conflict detection', () => {
+    it('marks conflicted keys when base value changes after reload', async () => {
+        await render_reloadable(rows);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+
+        // Simulate external reload: cell 0:0 changed from 'a' to 'z'
+        const new_rows: (CellData | null)[][] = [
+            [cell('z'), cell('b'), cell('c')],
+            [cell('d'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender_with_rows(new_rows);
+
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
+    });
+
+    it('does not mark conflict when base value unchanged after reload', async () => {
+        await render_reloadable(rows);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+
+        // Reload with same base values
+        const new_rows: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            [cell('d'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender_with_rows(new_rows);
+
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(false);
+    });
+
+    it('discard_edit removes a single dirty entry', async () => {
+        await render_reloadable(rows);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+        await act(async () => { hook_result!.start_editing(0, 1); });
+        await act(async () => { hook_result!.confirm_edit('B'); });
+        expect(hook_result!.dirty_cells.size).toBe(2);
+
+        await act(async () => { hook_result!.discard_edit('0:0'); });
+        expect(hook_result!.dirty_cells.size).toBe(1);
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+        expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
+    });
+
+    it('discard_conflicted removes only conflicted entries', async () => {
+        await render_reloadable(rows);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        // Edit two cells
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+        await act(async () => { hook_result!.start_editing(0, 1); });
+        await act(async () => { hook_result!.confirm_edit('B'); });
+
+        // Reload: only cell 0:0 changed externally
+        const new_rows: (CellData | null)[][] = [
+            [cell('z'), cell('b'), cell('c')],
+            [cell('d'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender_with_rows(new_rows);
+
+        expect(hook_result!.conflicted_keys.size).toBe(1);
+        await act(async () => { hook_result!.discard_conflicted(); });
+        expect(hook_result!.dirty_cells.size).toBe(1);
+        expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
     });
 });

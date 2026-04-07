@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import type { CellData } from '../types';
 
 export interface EditingCell {
@@ -108,6 +108,43 @@ export function use_editing(
         return entry?.value ?? null;
     }, [dirty_cells]);
 
+    const discard_edit = useCallback((key: string) => {
+        set_dirty_cells(prev => {
+            if (!prev.has(key)) return prev;
+            const next = new Map(prev);
+            next.delete(key);
+            return next;
+        });
+    }, []);
+
+    const discard_conflicted = useCallback(() => {
+        set_dirty_cells(prev => {
+            const next = new Map<string, DirtyEntry>();
+            for (const [key, entry] of prev) {
+                const [r, c] = key.split(':').map(Number);
+                const cell = rows[r]?.[c];
+                const current_base = cell !== null ? String(cell?.raw ?? '') : '';
+                if (current_base === entry.base) {
+                    next.set(key, entry);
+                }
+            }
+            return next;
+        });
+    }, [rows]);
+
+    const conflicted_keys = useMemo(() => {
+        const keys = new Set<string>();
+        for (const [key, entry] of dirty_cells) {
+            const [r, c] = key.split(':').map(Number);
+            const cell = rows[r]?.[c];
+            const current_base = cell !== null ? String(cell?.raw ?? '') : '';
+            if (current_base !== entry.base) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }, [dirty_cells, rows]);
+
     // Flag set before posting saveCsv so the rows-change effect can distinguish
     // save-triggered reloads from external file changes.
     const save_in_flight_ref = useRef(false);
@@ -152,5 +189,8 @@ export function use_editing(
         save_in_flight_ref,
         get_display_value,
         get_active_editor_value,
+        conflicted_keys,
+        discard_edit,
+        discard_conflicted,
     };
 }
