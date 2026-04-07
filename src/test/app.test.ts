@@ -32,6 +32,24 @@ function make_workbook(sheet_names: string[]): WorkbookData {
     };
 }
 
+function make_formatting_workbook(...cells: Partial<CellData>[]): WorkbookData {
+    return {
+        hasFormatting: true,
+        sheets: [{
+            name: 'Sheet1',
+            rows: [cells.map(c => ({
+                raw: c.raw ?? '',
+                formatted: c.formatted ?? String(c.raw ?? ''),
+                bold: c.bold ?? false,
+                italic: c.italic ?? false,
+            }))],
+            merges: [],
+            columnCount: cells.length,
+            rowCount: 1,
+        }],
+    };
+}
+
 function make_preview_workbook(row_count: number): WorkbookData {
     return {
         hasFormatting: false,
@@ -147,19 +165,10 @@ afterEach(() => {
 describe('bold and italic rendering', () => {
     it('renders bold cells with <b> tag when formatting is on', async () => {
         await render_app();
-        const workbook: WorkbookData = {
-            hasFormatting: true,
-            sheets: [{
-                name: 'Sheet1',
-                rows: [[
-                    { raw: 'Normal', formatted: 'Normal', bold: false, italic: false },
-                    { raw: 'Bold', formatted: 'Bold', bold: true, italic: false },
-                ]],
-                merges: [],
-                columnCount: 2,
-                rowCount: 1,
-            }],
-        };
+        const workbook = make_formatting_workbook(
+            { raw: 'Normal' },
+            { raw: 'Bold', bold: true },
+        );
         await dispatch_host_message(workbook_data_message(workbook));
 
         const tds = container!.querySelectorAll('.data-table td');
@@ -176,18 +185,9 @@ describe('bold and italic rendering', () => {
 
     it('renders bold+italic cells with <b><i> tags', async () => {
         await render_app();
-        const workbook: WorkbookData = {
-            hasFormatting: true,
-            sheets: [{
-                name: 'Sheet1',
-                rows: [[
-                    { raw: 'BoldItalic', formatted: 'BoldItalic', bold: true, italic: true },
-                ]],
-                merges: [],
-                columnCount: 1,
-                rowCount: 1,
-            }],
-        };
+        const workbook = make_formatting_workbook(
+            { raw: 'BoldItalic', bold: true, italic: true },
+        );
         await dispatch_host_message(workbook_data_message(workbook));
 
         const td = container!.querySelector('.data-table td');
@@ -202,18 +202,9 @@ describe('bold and italic rendering', () => {
 
     it('renders italic-only cells with <i> tag', async () => {
         await render_app();
-        const workbook: WorkbookData = {
-            hasFormatting: true,
-            sheets: [{
-                name: 'Sheet1',
-                rows: [[
-                    { raw: 'Italic', formatted: 'Italic', bold: false, italic: true },
-                ]],
-                merges: [],
-                columnCount: 1,
-                rowCount: 1,
-            }],
-        };
+        const workbook = make_formatting_workbook(
+            { raw: 'Italic', italic: true },
+        );
         await dispatch_host_message(workbook_data_message(workbook));
 
         const td = container!.querySelector('.data-table td');
@@ -227,18 +218,9 @@ describe('bold and italic rendering', () => {
 
     it('hides bold/italic when formatting toggle is off', async () => {
         await render_app();
-        const workbook: WorkbookData = {
-            hasFormatting: true,
-            sheets: [{
-                name: 'Sheet1',
-                rows: [[
-                    { raw: 'Bold', formatted: 'Bold', bold: true, italic: false },
-                ]],
-                merges: [],
-                columnCount: 1,
-                rowCount: 1,
-            }],
-        };
+        const workbook = make_formatting_workbook(
+            { raw: 'Bold', bold: true },
+        );
         await dispatch_host_message(workbook_data_message(workbook));
 
         // Bold should render initially (show_formatting defaults to true)

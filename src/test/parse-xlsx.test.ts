@@ -10,10 +10,16 @@ function read_fixture(name: string): Uint8Array {
     return fs.readFileSync(path.join(FIXTURES, name));
 }
 
-function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
+function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xml?: string }): Uint8Array {
     const cfb_file = CFB.utils.cfb_new();
+    const styles_xml = opts?.styles_xml;
+    const sst_xml = opts?.sst_xml;
+
     const styles_override = styles_xml
         ? '\n  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        : '';
+    const sst_override = sst_xml
+        ? '\n  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
         : '';
 
     const content_types = `<?xml version="1.0" encoding="UTF-8"?>
@@ -21,7 +27,7 @@ function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
   <Default Extension="xml" ContentType="application/xml"/>
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${styles_override}
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${styles_override}${sst_override}
 </Types>`;
 
     const rels = `<?xml version="1.0" encoding="UTF-8"?>
@@ -47,50 +53,9 @@ function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
     if (styles_xml) {
         CFB.utils.cfb_add(cfb_file, '/xl/styles.xml', Buffer.from(styles_xml));
     }
-
-    const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip' });
-    return new Uint8Array(out as ArrayBuffer);
-}
-
-function build_test_xlsx_with_sst(
-    sheet_xml: string,
-    styles_xml: string,
-    sst_xml: string,
-): Uint8Array {
-    const cfb_file = CFB.utils.cfb_new();
-
-    const content_types = `<?xml version="1.0" encoding="UTF-8"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
-  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
-</Types>`;
-
-    const rels = `<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>`;
-
-    const workbook = `<?xml version="1.0" encoding="UTF-8"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
-</workbook>`;
-
-    const workbook_rels = `<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>`;
-
-    CFB.utils.cfb_add(cfb_file, '/[Content_Types].xml', Buffer.from(content_types));
-    CFB.utils.cfb_add(cfb_file, '/_rels/.rels', Buffer.from(rels));
-    CFB.utils.cfb_add(cfb_file, '/xl/workbook.xml', Buffer.from(workbook));
-    CFB.utils.cfb_add(cfb_file, '/xl/_rels/workbook.xml.rels', Buffer.from(workbook_rels));
-    CFB.utils.cfb_add(cfb_file, '/xl/worksheets/sheet1.xml', Buffer.from(sheet_xml));
-    CFB.utils.cfb_add(cfb_file, '/xl/styles.xml', Buffer.from(styles_xml));
-    CFB.utils.cfb_add(cfb_file, '/xl/sharedStrings.xml', Buffer.from(sst_xml));
+    if (sst_xml) {
+        CFB.utils.cfb_add(cfb_file, '/xl/sharedStrings.xml', Buffer.from(sst_xml));
+    }
 
     const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip' });
     return new Uint8Array(out as ArrayBuffer);
@@ -139,7 +104,7 @@ describe('parse_xlsx', () => {
   </sheetData>
 </worksheet>`;
 
-            const buffer = build_test_xlsx_with_sst(sheet, styles, sst);
+            const buffer = build_test_xlsx(sheet, { styles_xml: styles, sst_xml: sst });
             const { data } = await parse_xlsx(buffer);
             const row = data.sheets[0].rows[0];
 
@@ -182,7 +147,7 @@ describe('parse_xlsx', () => {
   </sheetData>
 </worksheet>`;
 
-            const buffer = build_test_xlsx(sheet, styles);
+            const buffer = build_test_xlsx(sheet, { styles_xml: styles });
             const { data } = await parse_xlsx(buffer);
 
             expect(data.sheets[0].rows[0][0]?.bold).toBe(true);
@@ -395,7 +360,7 @@ describe('parse_xlsx', () => {
   <sheetData>
     <row r="1"><c r="A1" s="0"><v>1000000000000</v></c></row>
   </sheetData>
-</worksheet>`, styles);
+</worksheet>`, { styles_xml: styles });
 
             const { data } = await parse_xlsx(buffer);
             const cell = data.sheets[0].rows[0][0];
