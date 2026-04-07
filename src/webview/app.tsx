@@ -643,11 +643,13 @@ function TableWithSelection({
 
     const [conflict_banner_dismissed, set_conflict_banner_dismissed] = useState(false);
 
-    // Reset banner dismissal when conflicts appear
+    // Reset banner dismissal only when conflicts first appear (0 → >0)
+    const prev_conflict_count = useRef(0);
     useEffect(() => {
-        if (editing.conflicted_keys.size > 0) {
+        if (editing.conflicted_keys.size > 0 && prev_conflict_count.current === 0) {
             set_conflict_banner_dismissed(false);
         }
+        prev_conflict_count.current = editing.conflicted_keys.size;
     }, [editing.conflicted_keys.size]);
 
     const show_conflict_banner = editing.conflicted_keys.size > 0 && !conflict_banner_dismissed;

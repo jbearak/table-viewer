@@ -12,6 +12,13 @@ export interface DirtyEntry {
     base: string;
 }
 
+function is_entry_conflicted(key: string, entry: DirtyEntry, rows: (CellData | null)[][]): boolean {
+    const [r, c] = key.split(':').map(Number);
+    const cell = rows[r]?.[c];
+    const current_base = cell !== null ? String(cell?.raw ?? '') : '';
+    return current_base !== entry.base;
+}
+
 export function use_editing(
     rows: (CellData | null)[][],
     row_count: number,
@@ -121,10 +128,7 @@ export function use_editing(
         set_dirty_cells(prev => {
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of prev) {
-                const [r, c] = key.split(':').map(Number);
-                const cell = rows[r]?.[c];
-                const current_base = cell !== null ? String(cell?.raw ?? '') : '';
-                if (current_base === entry.base) {
+                if (!is_entry_conflicted(key, entry, rows)) {
                     next.set(key, entry);
                 }
             }
@@ -135,10 +139,7 @@ export function use_editing(
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
         for (const [key, entry] of dirty_cells) {
-            const [r, c] = key.split(':').map(Number);
-            const cell = rows[r]?.[c];
-            const current_base = cell !== null ? String(cell?.raw ?? '') : '';
-            if (current_base !== entry.base) {
+            if (is_entry_conflicted(key, entry, rows)) {
                 keys.add(key);
             }
         }
