@@ -35,6 +35,7 @@ export function App(): React.JSX.Element {
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
+    const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     const [initial_pending_edits, set_initial_pending_edits] = useState<Record<string, string> | undefined>(undefined);
     const [toolbar_edit_state, set_toolbar_edit_state] = useState<{ edit_mode: boolean; is_dirty: boolean }>({ edit_mode: false, is_dirty: false });
     const editing_ref = useRef<{ toggle_edit_mode: () => void; handle_toggle: () => void }>({ toggle_edit_mode: () => {}, handle_toggle: () => {} });
@@ -97,6 +98,7 @@ export function App(): React.JSX.Element {
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
                 set_csv_editable(msg.csvEditable ?? false);
+                set_csv_editing_supported(msg.csvEditingSupported ?? false);
                 set_initial_pending_edits(s.pendingEdits);
 
                 requestAnimationFrame(() => {
@@ -157,6 +159,9 @@ export function App(): React.JSX.Element {
                 set_truncation_message(msg.truncationMessage ?? null);
                 if (msg.csvEditable !== undefined) {
                     set_csv_editable(msg.csvEditable);
+                }
+                if (msg.csvEditingSupported !== undefined) {
+                    set_csv_editing_supported(msg.csvEditingSupported);
                 }
                 persist_immediate();
             }
@@ -529,7 +534,7 @@ export function App(): React.JSX.Element {
                 show_edit_button={csv_editable}
             />
             {truncation_message && (
-                <div className="truncation-banner">{truncation_message}. Editing is disabled for truncated files.</div>
+                <div className="truncation-banner">{truncation_message}{csv_editing_supported ? '. Editing is disabled for truncated files.' : ''}</div>
             )}
             {effective_vertical_tabs ? (
                 <div className="content-area">

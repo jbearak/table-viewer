@@ -204,6 +204,60 @@ describe('truncation banner', () => {
             state: {},
             defaultTabOrientation: 'horizontal',
             truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditingSupported: true,
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows. Editing is disabled for truncated files.');
+    });
+
+    it('omits editing-disabled text in preview mode (editing never available)', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            // No csvEditable, no csvEditingSupported — this is preview mode
+        });
+
+        const banner = container!.querySelector('.truncation-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toBe('Showing 10,000 of 50,000 rows');
+    });
+
+    it('shows editing-disabled text when csvEditingSupported and truncated', async () => {
+        await render_app();
+
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [[make_cell('a')]],
+                    merges: [],
+                    columnCount: 1,
+                    rowCount: 1,
+                }],
+            },
+            state: {},
+            defaultTabOrientation: 'horizontal',
+            truncationMessage: 'Showing 10,000 of 50,000 rows',
+            csvEditable: false,
+            csvEditingSupported: true,
         });
 
         const banner = container!.querySelector('.truncation-banner');
