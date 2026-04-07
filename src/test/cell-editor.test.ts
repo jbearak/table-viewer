@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 
-import React from 'react';
+import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react-dom/test-utils';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -12,7 +11,9 @@ let container: HTMLDivElement | null = null;
 
 afterEach(() => {
     if (root && container) {
-        root.unmount();
+        act(() => {
+            root!.unmount();
+        });
         document.body.removeChild(container);
     }
     root = null;
