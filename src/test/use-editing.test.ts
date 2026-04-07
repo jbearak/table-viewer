@@ -238,4 +238,34 @@ describe('conflict detection', () => {
         expect(hook_result!.dirty_cells.size).toBe(1);
         expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
     });
+
+    it('discard_conflicted preserves active editor on non-conflicted cell', async () => {
+        await render_reloadable(rows);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        // Edit cell 0:0 and confirm
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.confirm_edit('A'); });
+        // Edit cell 0:1 and confirm (non-conflicted)
+        await act(async () => { hook_result!.start_editing(0, 1); });
+        await act(async () => { hook_result!.confirm_edit('B'); });
+
+        // Reload: only cell 0:0 changed externally → 0:0 is conflicted, 0:1 is not
+        const new_rows: (CellData | null)[][] = [
+            [cell('z'), cell('b'), cell('c')],
+            [cell('d'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender_with_rows(new_rows);
+
+        // Now start editing a non-conflicted cell (0:2)
+        await act(async () => { hook_result!.start_editing(0, 2); });
+        expect(hook_result!.editing_cell).toEqual({ row: 0, col: 2, value: 'c' });
+
+        // Discard conflicted should NOT close the active editor on the non-conflicted cell
+        await act(async () => { hook_result!.discard_conflicted(); });
+        expect(hook_result!.editing_cell).toEqual({ row: 0, col: 2, value: 'c' });
+        // Conflicted entry removed, non-conflicted entries preserved
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+        expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
+    });
 });

@@ -738,3 +738,72 @@ describe('Context menu edit item', () => {
         expect(document.activeElement).toBe(table_container);
     });
 });
+
+describe('conflict banner', () => {
+    it('re-shows banner when new conflicts appear after Keep All dismissal', async () => {
+        await render_app();
+
+        // Load workbook with pre-existing pending edits on cells (0,0) and (0,1)
+        await dispatch_host_message({
+            type: 'workbookData',
+            data: make_csv_workbook(),
+            state: {
+                pendingEdits: {
+                    '0:0': { value: 'X', base: 'a' },
+                    '0:1': { value: 'Y', base: 'b' },
+                },
+            },
+            defaultTabOrientation: 'horizontal',
+            csvEditable: true,
+        });
+
+        // Both cells should be dirty
+        expect(container!.querySelectorAll('.dirty-cell').length).toBe(2);
+
+        // Reload: cell (0,0) changed externally → conflict on 0:0
+        await dispatch_host_message({
+            type: 'reload',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [
+                        [make_cell('z'), make_cell('b')],
+                        [make_cell('c'), make_cell('d')],
+                    ],
+                    merges: [],
+                    columnCount: 2,
+                    rowCount: 2,
+                }],
+            },
+        });
+
+        // Banner should be visible (0:0 is conflicted)
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // Dismiss with Keep All
+        await click_button('Keep All');
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+
+        // Second reload: cell (0,1) ALSO changed externally → new conflict on 0:1
+        await dispatch_host_message({
+            type: 'reload',
+            data: {
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rows: [
+                        [make_cell('z'), make_cell('w')],
+                        [make_cell('c'), make_cell('d')],
+                    ],
+                    merges: [],
+                    columnCount: 2,
+                    rowCount: 2,
+                }],
+            },
+        });
+
+        // Banner should reappear because the conflict set changed (0:1 now conflicted too)
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+    });
+});

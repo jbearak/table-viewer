@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { WorkbookData, PerFileState, HostMessage } from '../types';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
@@ -641,18 +641,16 @@ function TableWithSelection({
     const sel = use_selection(sheet, show_formatting);
     const editing = use_editing(sheet.rows, sheet.rowCount, sheet.columnCount, initial_pending_edits);
 
-    const [conflict_banner_dismissed, set_conflict_banner_dismissed] = useState(false);
+    // Track which conflict key signature was dismissed (empty = not dismissed)
+    const [dismissed_signature, set_dismissed_signature] = useState('');
 
-    // Reset banner dismissal only when conflicts first appear (0 → >0)
-    const prev_conflict_count = useRef(0);
-    useEffect(() => {
-        if (editing.conflicted_keys.size > 0 && prev_conflict_count.current === 0) {
-            set_conflict_banner_dismissed(false);
-        }
-        prev_conflict_count.current = editing.conflicted_keys.size;
-    }, [editing.conflicted_keys.size]);
+    // Stable serialization of the conflicted key set for change detection
+    const conflict_key_signature = useMemo(
+        () => [...editing.conflicted_keys].sort().join(','),
+        [editing.conflicted_keys]
+    );
 
-    const show_conflict_banner = editing.conflicted_keys.size > 0 && !conflict_banner_dismissed;
+    const show_conflict_banner = editing.conflicted_keys.size > 0 && conflict_key_signature !== dismissed_signature;
 
     // Exit edit mode when CSV editing becomes disabled (e.g., file truncated on reload)
     useEffect(() => {
@@ -919,7 +917,7 @@ function TableWithSelection({
                         File changed externally. {editing.conflicted_keys.size} edit{editing.conflicted_keys.size !== 1 ? 's' : ''} may be affected — highlighted cells show conflicts.
                     </span>
                     <span className="conflict-banner-actions">
-                        <button onClick={() => set_conflict_banner_dismissed(true)}>Keep All</button>
+                        <button onClick={() => set_dismissed_signature(conflict_key_signature)}>Keep All</button>
                         <button onClick={() => { editing.discard_conflicted(); }}>Discard Conflicted</button>
                         <button onClick={() => { editing.cancel_edit(); editing.clear_dirty(); editing.set_edit_mode(false); }}>Discard All</button>
                     </span>

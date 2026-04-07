@@ -133,7 +133,13 @@ export function use_editing(
     }, [editing_cell]);
 
     const discard_conflicted = useCallback(() => {
-        set_editing_cell(null);
+        if (editing_cell) {
+            const active_key = `${editing_cell.row}:${editing_cell.col}`;
+            const active_entry = dirty_cells.get(active_key);
+            if (active_entry && is_entry_conflicted(active_key, active_entry, rows)) {
+                set_editing_cell(null);
+            }
+        }
         set_dirty_cells(prev => {
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of prev) {
@@ -143,7 +149,7 @@ export function use_editing(
             }
             return next;
         });
-    }, [rows]);
+    }, [rows, editing_cell, dirty_cells]);
 
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
