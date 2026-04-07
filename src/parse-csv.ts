@@ -6,6 +6,7 @@ export interface CsvParseResult {
     line_map: number[];
     truncationMessage?: string;
     originalColumnCounts: number[];
+    lineEnding: '\r\n' | '\r' | '\n';
 }
 
 export function parse_csv(
@@ -77,6 +78,8 @@ export function parse_csv(
         return cells;
     });
 
+    const lineEnding = detect_line_ending(source);
+
     return {
         data: {
             hasFormatting: false,
@@ -91,6 +94,7 @@ export function parse_csv(
         line_map,
         truncationMessage,
         originalColumnCounts,
+        lineEnding,
     };
 }
 
@@ -165,4 +169,14 @@ function reconstruct_row_text(
     }
 
     return source.slice(start_pos, pos);
+}
+
+function detect_line_ending(source: string): '\r\n' | '\r' | '\n' {
+    for (let i = 0; i < source.length; i++) {
+        if (source[i] === '\r') {
+            return (i + 1 < source.length && source[i + 1] === '\n') ? '\r\n' : '\r';
+        }
+        if (source[i] === '\n') return '\n';
+    }
+    return '\n';
 }

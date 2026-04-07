@@ -4,7 +4,8 @@ export function serialize_csv(
     rows: (CellData | null)[][],
     delimiter: ',' | '\t',
     edits?: Record<string, string>,
-    original_column_counts?: number[]
+    original_column_counts?: number[],
+    line_ending: '\r\n' | '\r' | '\n' = '\n'
 ): string {
     const lines: string[] = [];
 
@@ -41,7 +42,7 @@ export function serialize_csv(
         lines.push(fields.join(delimiter));
     }
 
-    return lines.join('\n') + '\n';
+    return lines.join(line_ending) + line_ending;
 }
 
 function quote_field(value: string, delimiter: string): string {

@@ -33,7 +33,7 @@ export function open_csv_table(
 
     const disposables: vscode.Disposable[] = [];
     let consecutive_reload_failures = 0;
-    let suppress_next_reload = false;
+    let suppress_reload_until = 0;
 
     function get_delimiter(): ',' | '\t' {
         return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
@@ -84,8 +84,7 @@ export function open_csv_table(
     }
 
     async function send_reload(): Promise<void> {
-        if (suppress_next_reload) {
-            suppress_next_reload = false;
+        if (Date.now() < suppress_reload_until) {
             return;
         }
         try {
@@ -134,9 +133,10 @@ export function open_csv_table(
                             last_parsed.data.sheets[0].rows,
                             get_delimiter(),
                             msg.edits,
-                            last_parsed.originalColumnCounts
+                            last_parsed.originalColumnCounts,
+                            last_parsed.lineEnding
                         );
-                        suppress_next_reload = true;
+                        suppress_reload_until = Date.now() + 2000;
                         await vscode.workspace.fs.writeFile(
                             uri,
                             new TextEncoder().encode(content)
@@ -153,7 +153,7 @@ export function open_csv_table(
                         state_store.set(file_path, rest);
                         panel.webview.postMessage({ type: 'saveResult', success: true });
                     } catch (err) {
-                        suppress_next_reload = false;
+                        suppress_reload_until = 0;
                         const message = err instanceof Error ? err.message : String(err);
                         vscode.window.showErrorMessage(`Failed to save: ${message}`);
                         panel.webview.postMessage({ type: 'saveResult', success: false });

@@ -676,6 +676,22 @@ function TableWithSelection({
     const pending_after_save_ref = useRef<'none' | 'exit_edit_mode'>('none');
     // Snapshot of dirty keys sent in the current save, so we only clear those on success
     const saved_dirty_keys_ref = useRef<Set<string>>(new Set());
+    // Safety timeout to reset save_in_flight_ref if saveResult never arrives
+    const save_timeout_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const set_save_in_flight = useCallback((value: boolean) => {
+        editing.save_in_flight_ref.current = value;
+        if (save_timeout_ref.current !== null) {
+            clearTimeout(save_timeout_ref.current);
+            save_timeout_ref.current = null;
+        }
+        if (value) {
+            save_timeout_ref.current = setTimeout(() => {
+                editing.save_in_flight_ref.current = false;
+                save_timeout_ref.current = null;
+            }, 10_000);
+        }
+    }, [editing.save_in_flight_ref]);
 
     // Confirm active cell editor and collect edits for saving
     const collect_edits_for_save = useCallback(() => {
@@ -713,21 +729,21 @@ function TableWithSelection({
                 if (Object.keys(edits).length > 0) {
                     pending_after_save_ref.current = 'none';
                     saved_dirty_keys_ref.current = new Set(Object.keys(edits));
-                    editing.save_in_flight_ref.current = true;
+                    set_save_in_flight(true);
                     vscode_api.postMessage({ type: 'saveCsv', edits });
                 }
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editing.edit_mode, collect_edits_for_save]);
+    }, [editing.edit_mode, collect_edits_for_save, set_save_in_flight]);
 
     // Handle saveResult and saveDialogResult messages
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data;
             if (msg.type === 'saveResult') {
-                editing.save_in_flight_ref.current = false;
+                set_save_in_flight(false);
                 if (msg.success) {
                     editing.clear_dirty_keys(saved_dirty_keys_ref.current);
                     saved_dirty_keys_ref.current = new Set();
@@ -743,7 +759,7 @@ function TableWithSelection({
                     if (Object.keys(edits).length > 0) {
                         pending_after_save_ref.current = 'exit_edit_mode';
                         saved_dirty_keys_ref.current = new Set(Object.keys(edits));
-                        editing.save_in_flight_ref.current = true;
+                        set_save_in_flight(true);
                         vscode_api.postMessage({ type: 'saveCsv', edits });
                     } else {
                         editing.toggle_edit_mode();
@@ -757,7 +773,7 @@ function TableWithSelection({
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [editing.clear_dirty, editing.clear_dirty_keys, editing.toggle_edit_mode, collect_edits_for_save]);
+    }, [editing.clear_dirty, editing.clear_dirty_keys, editing.toggle_edit_mode, collect_edits_for_save, set_save_in_flight]);
 
     // Handle confirm with navigation
     const handle_confirm_edit = useCallback((value: string, advance: 'down' | 'right' | 'none') => {
