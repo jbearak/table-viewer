@@ -289,6 +289,40 @@ body {
     text-align: center;
 }
 
+.conflict-banner {
+    padding: 4px 8px;
+    background: var(--vscode-editorWarning-background, rgba(204, 167, 0, 0.1));
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    font-size: 12px;
+    flex-shrink: 0;
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.conflict-banner-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.conflict-banner-actions button {
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ccc);
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 2px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 11px;
+}
+
+.conflict-banner-actions button:hover {
+    background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
 /* Cell editing */
 
 .cell-editor-wrapper {
@@ -317,6 +351,10 @@ body {
 
 .data-table td.dirty-cell {
     background: rgba(204, 167, 0, 0.12);
+}
+
+.data-table td.cell-conflicted {
+    color: var(--vscode-editorWarning-foreground, #cca700);
 }
 
 .toggle.has-unsaved {
