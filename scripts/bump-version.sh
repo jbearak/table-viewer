@@ -93,8 +93,11 @@ node -e "
   fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
 
+# Sync lockfile version
+npm install --package-lock-only --ignore-scripts >/dev/null 2>&1
+
 # Git operations
-git add package.json
+git add package.json package-lock.json
 git commit -m "chore: bump version to $NEW_VERSION"
 git tag -a "$TAG" -m "Version $NEW_VERSION"
 
