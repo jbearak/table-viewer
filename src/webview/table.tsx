@@ -329,12 +329,14 @@ function CellContent({
 
     let content: React.ReactNode = text;
 
-    if (cell?.bold && cell?.italic) {
-        content = <b><i>{text}</i></b>;
-    } else if (cell?.bold) {
-        content = <b>{text}</b>;
-    } else if (cell?.italic) {
-        content = <i>{text}</i>;
+    if (show_formatting) {
+        if (cell?.bold && cell?.italic) {
+            content = <b><i>{text}</i></b>;
+        } else if (cell?.bold) {
+            content = <b>{text}</b>;
+        } else if (cell?.italic) {
+            content = <i>{text}</i>;
+        }
     }
 
     return <>{content}</>;

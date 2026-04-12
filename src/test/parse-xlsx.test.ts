@@ -10,10 +10,16 @@ function read_fixture(name: string): Uint8Array {
     return fs.readFileSync(path.join(FIXTURES, name));
 }
 
-function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
+function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xml?: string }): Uint8Array {
     const cfb_file = CFB.utils.cfb_new();
+    const styles_xml = opts?.styles_xml;
+    const sst_xml = opts?.sst_xml;
+
     const styles_override = styles_xml
         ? '\n  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        : '';
+    const sst_override = sst_xml
+        ? '\n  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
         : '';
 
     const content_types = `<?xml version="1.0" encoding="UTF-8"?>
@@ -21,7 +27,7 @@ function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
   <Default Extension="xml" ContentType="application/xml"/>
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${styles_override}
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${styles_override}${sst_override}
 </Types>`;
 
     const rels = `<?xml version="1.0" encoding="UTF-8"?>
@@ -47,12 +53,108 @@ function build_test_xlsx(sheet_xml: string, styles_xml?: string): Uint8Array {
     if (styles_xml) {
         CFB.utils.cfb_add(cfb_file, '/xl/styles.xml', Buffer.from(styles_xml));
     }
+    if (sst_xml) {
+        CFB.utils.cfb_add(cfb_file, '/xl/sharedStrings.xml', Buffer.from(sst_xml));
+    }
 
     const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip' });
     return new Uint8Array(out as ArrayBuffer);
 }
 
 describe('parse_xlsx', () => {
+    describe('bold formatting from Excel-style XML', () => {
+        it('detects bold cells using shared strings with s attribute', async () => {
+            // Mimics real Excel output: cells reference shared strings AND have style index
+            const styles = `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  mc:Ignorable="x14ac"
+  xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac">
+  <fonts count="3" x14ac:knownFonts="1">
+    <font><sz val="11"/><color theme="1"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><color theme="1"/><name val="Calibri"/></font>
+    <font><b/><i/><sz val="11"/><color theme="1"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+  </cellXfs>
+</styleSheet>`;
+
+            const sst = `<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
+  <si><t>Normal</t></si>
+  <si><t>Bold</t></si>
+  <si><t>BoldItalic</t></si>
+</sst>`;
+
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C1"/>
+  <sheetData>
+    <row r="1" spans="1:3">
+      <c r="A1" t="s"><v>0</v></c>
+      <c r="B1" s="1" t="s"><v>1</v></c>
+      <c r="C1" s="2" t="s"><v>2</v></c>
+    </row>
+  </sheetData>
+</worksheet>`;
+
+            const buffer = build_test_xlsx(sheet, { styles_xml: styles, sst_xml: sst });
+            const { data } = await parse_xlsx(buffer);
+            const row = data.sheets[0].rows[0];
+
+            // Normal cell
+            expect(row[0]?.bold).toBe(false);
+            expect(row[0]?.italic).toBe(false);
+            expect(row[0]?.raw).toBe('Normal');
+
+            // Bold cell
+            expect(row[1]?.bold).toBe(true);
+            expect(row[1]?.italic).toBe(false);
+            expect(row[1]?.raw).toBe('Bold');
+
+            // Bold+Italic cell
+            expect(row[2]?.bold).toBe(true);
+            expect(row[2]?.italic).toBe(true);
+            expect(row[2]?.raw).toBe('BoldItalic');
+        });
+
+        it('includes bold/italic in workbook hasFormatting flag', async () => {
+            // A workbook where cells ONLY have bold formatting (no number formatting)
+            // should still report hasFormatting=true so the formatting toggle appears
+            const styles = `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="11"/></font>
+    <font><b/><sz val="11"/></font>
+  </fonts>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0"/>
+    <xf numFmtId="0" fontId="1"/>
+  </cellXfs>
+</styleSheet>`;
+
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData>
+    <row r="1"><c r="A1" s="1" t="inlineStr"><is><t>Bold text</t></is></c></row>
+  </sheetData>
+</worksheet>`;
+
+            const buffer = build_test_xlsx(sheet, { styles_xml: styles });
+            const { data } = await parse_xlsx(buffer);
+
+            expect(data.sheets[0].rows[0][0]?.bold).toBe(true);
+            expect(data.hasFormatting).toBe(true);
+        });
+    });
+
     describe('basic.xlsx', () => {
         it('parses two sheets with correct names', async () => {
             const { data, warnings } = await parse_xlsx(read_fixture('basic.xlsx'));
@@ -258,7 +360,7 @@ describe('parse_xlsx', () => {
   <sheetData>
     <row r="1"><c r="A1" s="0"><v>1000000000000</v></c></row>
   </sheetData>
-</worksheet>`, styles);
+</worksheet>`, { styles_xml: styles });
 
             const { data } = await parse_xlsx(buffer);
             const cell = data.sheets[0].rows[0][0];
