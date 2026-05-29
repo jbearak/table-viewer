@@ -6,6 +6,13 @@ import {
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import { workbook_has_formatting } from './cell-display';
+import {
+    densify,
+    fill_store,
+    working_has_formatting,
+    type CellSink,
+    type WorkingSet,
+} from './data-source/cell-fill';
 import { is_date_format, is_valid_excel_date_serial, serial_to_iso, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
@@ -558,7 +565,24 @@ function get_raw_numeric_cell_value(
 
 // --- Layer 2: Sheet Parser ---
 
-export function parse_sheet_records(
+/**
+ * The sparse working set for one parsed .xls worksheet, before densification.
+ * Extends the shared {@link WorkingSet} shape (cells / merged_cells / dims) with
+ * the per-sheet normalized merge ranges, mirroring the .xlsx parser. The
+ * null/blank rule, fill seam, densification and hasFormatting computation all
+ * live in `./data-source/cell-fill`.
+ */
+interface SheetWorking extends WorkingSet {
+    merges: MergeRange[];
+}
+
+/**
+ * Scan a sheet's BIFF records into the sparse working set (cells + merge cover +
+ * dims + normalized merges). This is the single place that materializes the
+ * sparse representation; both the densifying `parse_sheet_records` and the
+ * direct-to-store streaming path consume it, so they cannot diverge.
+ */
+function parse_sheet_working(
     records: BiffRecord[],
     sst: string[],
     xfs: XfEntry[],
@@ -566,7 +590,7 @@ export function parse_sheet_records(
     format_map: Map<number, string>,
     datemode: DateMode,
     budget: WorkbookBudget,
-): SheetData {
+): SheetWorking {
     let row_count = 0;
     let col_count = 0;
     const cells = new Map<string, CellData>();
@@ -854,32 +878,68 @@ export function parse_sheet_records(
         }
     }
 
-    // Build rows array
-    const rows: (CellData | null)[][] = [];
-    for (let r = 0; r < row_count; r++) {
-        const row_data: (CellData | null)[] = [];
-        for (let c = 0; c < col_count; c++) {
-            if (merged_cells.has(`${r}:${c}`)) {
-                row_data.push(null);
-            } else {
-                row_data.push(cells.get(`${r}:${c}`) ?? { raw: null, formatted: '', bold: false, italic: false });
-            }
-        }
-        rows.push(row_data);
-    }
+    return {
+        cells,
+        merged_cells,
+        merges: normalized_merges,
+        row_count,
+        col_count,
+    };
+}
 
+/**
+ * Parse a sheet's records and densify into the legacy SheetData shape. Kept for
+ * back-compat callers (and tests); densification goes through the shared helper
+ * so the dense output is byte-identical to the streaming store's reads.
+ */
+export function parse_sheet_records(
+    records: BiffRecord[],
+    sst: string[],
+    xfs: XfEntry[],
+    fonts: FontEntry[],
+    format_map: Map<number, string>,
+    datemode: DateMode,
+    budget: WorkbookBudget,
+): SheetData {
+    const working = parse_sheet_working(records, sst, xfs, fonts, format_map, datemode, budget);
     return {
         name: '',
-        rows,
-        merges: normalized_merges,
-        columnCount: col_count,
-        rowCount: row_count,
+        rows: densify(working),
+        merges: working.merges,
+        columnCount: working.col_count,
+        rowCount: working.row_count,
     };
 }
 
 // --- Public API ---
 
-export function parse_xls(buffer: Buffer): ParseResult {
+/**
+ * Per-sheet slice produced by `open_workbook`: the sheet name plus the record
+ * slice for that sheet (or null when the sheet's BOF could not be located).
+ */
+interface SheetSlice {
+    name: string;
+    records: BiffRecord[] | null;
+}
+
+interface OpenedWorkbook {
+    sst: string[];
+    fonts: FontEntry[];
+    xfs: XfEntry[];
+    format_map: Map<number, string>;
+    datemode: DateMode;
+    budget: WorkbookBudget;
+    sheets: SheetSlice[];
+    warnings: string[];
+}
+
+/**
+ * Open an .xls workbook: validate the container, read the global tables, and
+ * slice the records for each sheet. Shared by the densifying `parse_xls` and the
+ * streaming `parse_xls_streaming` so the validation, global-table reads, sheet
+ * boundary detection and warning ordering are byte-identical across both paths.
+ */
+function open_workbook(buffer: Buffer): OpenedWorkbook {
     const warnings: string[] = [];
 
     let cfb_file: ReturnType<typeof CFB.read>;
@@ -937,20 +997,13 @@ export function parse_xls(buffer: Buffer): ParseResult {
     assert_safe_sheet_count(sheet_entries.length);
     const budget = create_workbook_budget();
 
-    // Parse each sheet
-    const sheets: SheetData[] = [];
+    const sheets: SheetSlice[] = [];
     for (const entry of sheet_entries) {
         const sheet_start_pos = entry.offset;
         let start_idx = records.findIndex(r => r.offset >= sheet_start_pos && r.type === RT_BOF);
         if (start_idx === -1) {
             warnings.push('Some sheet data could not be found. The file may be damaged.');
-            sheets.push({
-                name: entry.name,
-                rows: [],
-                merges: [],
-                columnCount: 0,
-                rowCount: 0,
-            });
+            sheets.push({ name: entry.name, records: null });
             continue;
         }
 
@@ -961,19 +1014,87 @@ export function parse_xls(buffer: Buffer): ParseResult {
             warnings.push('Some data in this file could not be read. The file may be damaged.');
         }
 
-        const sheet_records = records.slice(start_idx, end_idx);
+        sheets.push({ name: entry.name, records: records.slice(start_idx, end_idx) });
+    }
+
+    return { sst, fonts, xfs, format_map, datemode, budget, sheets, warnings };
+}
+
+export function parse_xls(buffer: Buffer): ParseResult {
+    const wb = open_workbook(buffer);
+
+    const sheets: SheetData[] = [];
+    for (const slice of wb.sheets) {
+        if (slice.records === null) {
+            sheets.push({ name: slice.name, rows: [], merges: [], columnCount: 0, rowCount: 0 });
+            continue;
+        }
         const sheet_data = parse_sheet_records(
-            sheet_records,
-            sst,
-            xfs,
-            fonts,
-            format_map,
-            datemode,
-            budget
+            slice.records, wb.sst, wb.xfs, wb.fonts, wb.format_map, wb.datemode, wb.budget
         );
-        sheet_data.name = entry.name;
+        sheet_data.name = slice.name;
         sheets.push(sheet_data);
     }
 
-    return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings };
+    return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings: wb.warnings };
+}
+
+// --- Streaming API (direct-to-builder; no densified intermediate) ---
+
+export type { CellSink } from './data-source/cell-fill';
+
+/** Per-sheet streaming entry: meta plus a `fill` that writes cells into a sink. */
+export interface StreamingSheet {
+    name: string;
+    rowCount: number;
+    columnCount: number;
+    merges: MergeRange[];
+    /**
+     * Fill the provided sink (sized rowCount x columnCount) with this sheet's
+     * cells via the shared `fill_store`, applying the SAME null/blank rule and
+     * raw normalization the densify path uses — so the resulting store is
+     * byte-identical to the legacy densify-then-copy output.
+     */
+    fill(sink: CellSink): void;
+}
+
+export interface StreamingWorkbook {
+    sheets: StreamingSheet[];
+    hasFormatting: boolean;
+    warnings: string[];
+}
+
+/**
+ * Parse an .xls into per-sheet meta + a fill function, never materializing the
+ * intermediate (CellData|null)[][]. Lets a consumer build its own columnar store
+ * directly, eliminating the transient 2x representation peak (Task A7) — the same
+ * seam the .xlsx parser exposes.
+ */
+export function parse_xls_streaming(buffer: Buffer): StreamingWorkbook {
+    const wb = open_workbook(buffer);
+
+    const sheets: StreamingSheet[] = [];
+    const workings: SheetWorking[] = [];
+
+    for (const slice of wb.sheets) {
+        if (slice.records === null) {
+            sheets.push({ name: slice.name, rowCount: 0, columnCount: 0, merges: [], fill: () => {} });
+            continue;
+        }
+        const working = parse_sheet_working(
+            slice.records, wb.sst, wb.xfs, wb.fonts, wb.format_map, wb.datemode, wb.budget
+        );
+        workings.push(working);
+        sheets.push({
+            name: slice.name,
+            rowCount: working.row_count,
+            columnCount: working.col_count,
+            merges: working.merges,
+            fill(sink: CellSink): void {
+                fill_store(working, sink);
+            },
+        });
+    }
+
+    return { sheets, hasFormatting: working_has_formatting(workings), warnings: wb.warnings };
 }
