@@ -1,8 +1,10 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { parse_csv, type CsvParseResult } from './parse-csv';
+import { parse_csv } from './parse-csv';
+import { CsvDataSource } from './data-source/csv-source';
+import { ViewerPanelCore } from './panel-core';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
-import { assert_safe_file_size } from './spreadsheet-safety';
+import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
@@ -78,6 +80,11 @@ function setup_preview(
     let line_map: number[] = [];
     let consecutive_reload_failures = 0;
 
+    // Paginated protocol engine. `line_map` (row -> source line) for scroll sync
+    // still comes from a parse_csv pass; the grid itself streams rows via the core.
+    let core: ViewerPanelCore | undefined;
+    let source: CsvDataSource | undefined;
+
     // Scroll sync lockout state
     let editor_lockout = false;
     let preview_lockout = false;
@@ -98,31 +105,44 @@ function setup_preview(
             .get<number>('csvMaxRows', 10_000)!;
     }
 
-    async function parse_file(): Promise<CsvParseResult> {
+    async function load(): Promise<CsvDataSource> {
         const stat = await vscode.workspace.fs.stat(uri);
         assert_safe_file_size(stat.size, get_max_file_size_mib());
         const raw = await vscode.workspace.fs.readFile(uri);
+        const delimiter = get_delimiter();
+        const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
+        // Scroll sync needs row -> source-line; only parse_csv computes it.
         const text = new TextDecoder('utf-8').decode(raw);
-        return parse_csv(text, get_delimiter(), get_csv_max_rows());
+        line_map = parse_csv(text, delimiter, max_rows).line_map;
+        const ds = await CsvDataSource.create(raw, delimiter, max_rows);
+        adopt(ds);
+        return ds;
+    }
+
+    function adopt(ds: CsvDataSource): void {
+        if (source && source !== ds) source.close();
+        source = ds;
+        if (core) {
+            core.set_source(ds);
+        } else {
+            core = new ViewerPanelCore(panel, ds);
+        }
     }
 
     async function send_initial_data(): Promise<void> {
         try {
-            const result = await parse_file();
-            line_map = result.line_map;
+            const ds = await load();
             const state = state_store.get(file_path);
             const config = vscode.workspace.getConfiguration('tableViewer');
             const default_orientation = config.get<'horizontal' | 'vertical'>(
                 'tabOrientation', 'horizontal'
             );
 
-            panel.webview.postMessage({
-                type: 'workbookData',
-                data: result.data,
+            await core!.send_meta({
                 state,
                 defaultTabOrientation: default_orientation,
-                truncationMessage: result.truncationMessage,
                 previewMode: true,
+                truncationMessage: ds.truncationMessage,
             });
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -132,12 +152,9 @@ function setup_preview(
 
     async function send_reload(): Promise<void> {
         try {
-            const result = await parse_file();
-            line_map = result.line_map;
-            const delivered = await panel.webview.postMessage({
-                type: 'reload',
-                data: result.data,
-                truncationMessage: result.truncationMessage,
+            const ds = await load();
+            const delivered = await core!.send_meta_reload({
+                truncationMessage: ds.truncationMessage,
             });
             if (!delivered) return;
             consecutive_reload_failures = 0;
@@ -276,6 +293,10 @@ function setup_preview(
                     void reveal_source_line(editor, source_line);
                     break;
                 }
+                default:
+                    // requestRows (paginated protocol) -> core answers with rowData.
+                    void core?.handle_message(msg);
+                    break;
             }
         })
     );
@@ -299,6 +320,7 @@ function setup_preview(
     return () => {
         if (editor_lockout_timer !== undefined) clearTimeout(editor_lockout_timer);
         if (preview_lockout_timer !== undefined) clearTimeout(preview_lockout_timer);
+        source?.close();
         for (const d of disposables) d.dispose();
     };
 }

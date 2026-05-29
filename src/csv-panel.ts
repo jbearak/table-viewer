@@ -1,7 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
-import { workbook_data_from_source } from './data-source/to-workbook-data';
 import { ViewerPanelCore } from './panel-core';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
@@ -37,9 +36,8 @@ export function open_csv_table(
     let consecutive_reload_failures = 0;
     let suppress_reload_until = 0;
 
-    // Protocol engine (paginated sheetMeta/rowData). Created on first successful
-    // parse; the legacy workbookData/reload messages are also sent transitionally
-    // so the existing DOM renderer keeps working until Phase C switches the webview.
+    // Protocol engine (paginated sheetMeta/rowData), created on first successful
+    // parse. The Glide webview consumes the paginated protocol exclusively.
     let core: ViewerPanelCore | undefined;
     let source: CsvDataSource | undefined;
     // mtime of the file as of the last successful parse, for the save conflict check.
@@ -101,17 +99,6 @@ export function open_csv_table(
                 csvEditable: !ds.truncationMessage,
                 csvEditingSupported: true,
             });
-
-            // Transitional legacy blob so the current DOM renderer keeps working.
-            panel.webview.postMessage({
-                type: 'workbookData',
-                data: workbook_data_from_source(ds),
-                state,
-                defaultTabOrientation: default_orientation,
-                truncationMessage: ds.truncationMessage,
-                csvEditable: !ds.truncationMessage,
-                csvEditingSupported: true,
-            });
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(message);
@@ -120,15 +107,8 @@ export function open_csv_table(
 
     async function post_reload(ds: CsvDataSource): Promise<boolean> {
         // Paginated protocol: bump generation + clear cache + post metaReload.
-        await core!.send_meta_reload({
-            csvEditable: !ds.truncationMessage,
-            csvEditingSupported: true,
-        });
-        // Transitional legacy reload for the current DOM renderer.
-        return panel.webview.postMessage({
-            type: 'reload',
-            data: workbook_data_from_source(ds),
-            truncationMessage: ds.truncationMessage,
+        // The returned flag is false when the panel is hidden/disposed.
+        return core!.send_meta_reload({
             csvEditable: !ds.truncationMessage,
             csvEditingSupported: true,
         });

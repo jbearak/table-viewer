@@ -2,7 +2,6 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
-import { workbook_data_from_source } from './data-source/to-workbook-data';
 import type { DataSource } from './data-source/interface';
 import { ViewerPanelCore } from './panel-core';
 import { assert_safe_file_size } from './spreadsheet-safety';
@@ -68,9 +67,8 @@ class ViewerPanel implements vscode.Disposable {
     private consecutive_reload_failures = 0;
     private file_path: string;
     private watcher: vscode.FileSystemWatcher;
-    // Protocol engine (paginated sheetMeta/rowData). Created on first successful
-    // parse; the legacy workbookData/reload messages are also sent transitionally
-    // so the existing DOM renderer keeps working until Phase C switches the webview.
+    // Protocol engine (paginated sheetMeta/rowData), created on first successful
+    // parse. The Glide webview consumes the paginated protocol exclusively.
     private core: ViewerPanelCore | undefined;
     private source: DataSource | undefined;
 
@@ -175,14 +173,6 @@ class ViewerPanel implements vscode.Disposable {
             // Paginated protocol.
             await this.core!.send_meta({ state, defaultTabOrientation: default_orientation });
 
-            // Transitional legacy blob so the current DOM renderer keeps working.
-            this.panel.webview.postMessage({
-                type: 'workbookData',
-                data: workbook_data_from_source(source),
-                state,
-                defaultTabOrientation: default_orientation,
-            });
-
             const warnings = source.warnings ?? [];
             if (warnings.length > 0) {
                 vscode.window.showWarningMessage(warnings[0]);
@@ -199,13 +189,9 @@ class ViewerPanel implements vscode.Disposable {
             this.adopt_source(source);
 
             // Paginated protocol: bump generation + clear cache + post metaReload.
-            await this.core!.send_meta_reload();
-
-            // Transitional legacy reload for the current DOM renderer.
-            const delivered = await this.panel.webview.postMessage({
-                type: 'reload',
-                data: workbook_data_from_source(source),
-            });
+            // postMessage returns false when the panel is hidden/disposed — treat
+            // that as "not delivered" (no failure) and bail without resetting.
+            const delivered = await this.core!.send_meta_reload();
             if (!delivered) return;
             this.consecutive_reload_failures = 0;
 
