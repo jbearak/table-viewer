@@ -67,14 +67,4 @@ describe('paginated protocol message shapes', () => {
             expect(msg.generation).toBe(3);
         }
     });
-
-    it('legacy workbookData/reload variants remain on HostMessage during transition', () => {
-        const wb: HostMessage = {
-            type: 'workbookData',
-            data: { hasFormatting: false, sheets: [] },
-            state: {},
-            defaultTabOrientation: 'horizontal',
-        };
-        expect(wb.type).toBe('workbookData');
-    });
 });

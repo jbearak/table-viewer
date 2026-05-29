@@ -1,9 +1,9 @@
 /**
- * Pure column auto-fit model (Phase E). Replaces the DOM-walking
- * `measure-column.ts`: the Glide grid has no `<td>`s to measure, so widths are
- * computed from sampled loaded-row text via an injected `measure` (an offscreen
- * canvas `measureText` in the grid shell). Keeping `measure` a parameter lets the
- * fitting rule be unit-tested without a canvas.
+ * Pure column auto-fit model. Replaces the former DOM-walking column measurer:
+ * the Glide grid has no `<td>`s to measure, so widths are computed from sampled
+ * loaded-row text via an injected `measure` (an offscreen canvas `measureText`
+ * in the grid shell). Keeping `measure` a parameter lets the fitting rule be
+ * unit-tested without a canvas.
  */
 import type { RenderedCell } from '../data-source/interface';
 

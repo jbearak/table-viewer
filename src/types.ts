@@ -56,10 +56,6 @@ export type HostMessage =
     | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
     | { type: 'metaReload'; meta: WorkbookMeta; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
-    // Legacy single-blob protocol. Kept through Phases B–D so the existing DOM
-    // renderer keeps working while the Glide webview is built; removed in Phase E.
-    | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean }
-    | { type: 'reload'; data: WorkbookData; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
     | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' };
