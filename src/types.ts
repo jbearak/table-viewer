@@ -1,3 +1,5 @@
+import type { WorkbookMeta, RenderedCell } from './data-source/interface';
+
 export interface WorkbookData {
     sheets: SheetData[];
     hasFormatting: boolean;
@@ -49,6 +51,13 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
 /** Messages from extension host to webview */
 export type HostMessage =
+    // Paginated protocol (Phase B+). `generation` rises on every (re)load so the
+    // webview can drop row windows that belong to a superseded document version.
+    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
+    | { type: 'metaReload'; meta: WorkbookMeta; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
+    | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
+    // Legacy single-blob protocol. Kept through Phases B–D so the existing DOM
+    // renderer keeps working while the Glide webview is built; removed in Phase E.
     | { type: 'workbookData'; data: WorkbookData; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean }
     | { type: 'reload'; data: WorkbookData; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean }
     | { type: 'scrollToRow'; row: number }
@@ -58,6 +67,7 @@ export type HostMessage =
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
+    | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState }
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'saveCsv'; edits: Record<string, string> }
