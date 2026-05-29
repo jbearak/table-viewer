@@ -61,7 +61,11 @@ export class ColumnarStore {
 
         set(r: number, c: number, cell: RenderedCell | null): void {
             const i = r * this.cols + c;
-            if (cell === null) { this.rawIdx[i] = NULL_IDX; return; }
+            if (r < 0 || r >= this.rows || c < 0 || c >= this.cols) {
+                throw new RangeError(`cell (${r},${c}) out of bounds for ${this.rows}x${this.cols} store`);
+            }
+            if (cell === null) { this.rawIdx[i] = NULL_IDX; this.fmtIdx[i] = NULL_IDX; return; }
+            // raw === null normalised to '' — consistent with interface's null = empty cell semantics
             this.rawIdx[i] = this.intern(cell.raw ?? '');
             this.fmtIdx[i] = this.intern(cell.formatted);
             this.flags[i] = (cell.bold ? BOLD : 0) | (cell.italic ? ITALIC : 0);

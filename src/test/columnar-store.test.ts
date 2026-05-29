@@ -31,6 +31,13 @@ describe('ColumnarStore', () => {
         const store = b.build();
         expect(store.read_window(1, 10).length).toBe(1);
     });
+    it('start entirely past end returns empty array', () => {
+        const b = new ColumnarStore.Builder(2, 1);
+        b.set(0, 0, { raw: 'a', formatted: 'a', bold: false, italic: false });
+        b.set(1, 0, { raw: 'b', formatted: 'b', bold: false, italic: false });
+        const store = b.build();
+        expect(store.read_window(99, 5).length).toBe(0);
+    });
     it('distinguishes null cell from empty-string cell', () => {
         const b = new ColumnarStore.Builder(2, 1);
         b.set(0, 0, null);
