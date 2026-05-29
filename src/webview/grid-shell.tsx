@@ -1,4 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type MutableRefObject,
+} from 'react';
 import {
     CompactSelection,
     DataEditor,
@@ -19,6 +26,7 @@ import { build_grid_columns } from './grid-model';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import { use_editing, type DirtyEntry } from './use-editing';
+import { collect_save_edits, type LiveEdit } from './csv-save-model';
 import { CsvCellEditor } from './csv-cell-editor';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
@@ -56,6 +64,23 @@ export interface EditingStatus {
     conflicted: string[];
 }
 
+/**
+ * Imperative editing actions GridShell exposes to {@link App} (the toolbar
+ * toggle and conflict banner live in App's layout, but the dirty map lives here
+ * next to the loader). Populated into a ref App provides.
+ */
+export interface EditingHandle {
+    /** Collect dirty + in-progress edits and post `saveCsv`; returns whether a
+     *  save was actually posted (false when there's nothing to save). */
+    request_save(): boolean;
+    /** Drop every dirty edit. */
+    clear_dirty(): void;
+    /** Drop only edits whose underlying cell drifted (conflict resolution). */
+    discard_conflicted(): void;
+    /** True when there are committed edits or an open editor with changes. */
+    has_uncommitted_changes(): boolean;
+}
+
 export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
@@ -76,6 +101,9 @@ export interface GridShellProps {
     csv_editable?: boolean;
     initial_edits?: Record<string, string | DirtyEntry>;
     on_editing_change?: (status: EditingStatus) => void;
+    // App provides this ref; GridShell populates it with imperative save/discard
+    // actions so App's toolbar + conflict banner can drive editing that lives here.
+    editing_ref?: MutableRefObject<EditingHandle | null>;
 }
 
 /**
@@ -101,6 +129,7 @@ export function GridShell({
     csv_editable = false,
     initial_edits,
     on_editing_change,
+    editing_ref,
 }: GridShellProps): React.JSX.Element {
     const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
     const theme = use_vscode_theme();
@@ -140,11 +169,15 @@ export function GridShell({
         [version],
     );
 
-    const { dirty_cells, conflicted_keys, commit_edit } = use_editing(
-        get_cell_raw,
-        generation,
-        initial_edits,
-    );
+    const {
+        dirty_cells,
+        conflicted_keys,
+        commit_edit,
+        clear_dirty,
+        clear_dirty_keys,
+        discard_conflicted,
+        save_in_flight_ref,
+    } = use_editing(get_cell_raw, generation, initial_edits);
     const editable_cells = edit_mode && csv_editable;
 
     // Surface editing state to App (toolbar dot, pending-edit persistence,
@@ -156,6 +189,111 @@ export function GridShell({
             conflicted: [...conflicted_keys],
         });
     }, [dirty_cells, conflicted_keys, on_editing_change]);
+
+    // Persist the dirty map to the host so edits survive a webview reload. Posting
+    // null clears the stored state. Runs on the initial render too: a restored map
+    // simply round-trips back (harmless), and an empty map posts null (already so).
+    useEffect(() => {
+        vscode_api.postMessage({
+            type: 'pendingEditsChanged',
+            edits: dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
+        });
+    }, [dirty_cells]);
+
+    // Mirrors read imperatively by the save handle (which must stay stable so the
+    // ref App holds doesn't churn): the live dirty map and current selection.
+    const dirty_cells_ref = useRef(dirty_cells);
+    dirty_cells_ref.current = dirty_cells;
+    const grid_selection_ref = useRef(grid_selection);
+    grid_selection_ref.current = grid_selection;
+    // Keys posted in the in-flight save, cleared from the dirty map on success.
+    const saved_keys_ref = useRef<Set<string>>(new Set());
+
+    // Read the value + location of an open Glide overlay editor. Glide owns the
+    // overlay (our hook's editing_cell stays null), so the location comes from the
+    // selected cell and the live text from the portalled .gdg-clip-region input.
+    const read_live_edit = useCallback((): LiveEdit | null => {
+        const el = document.querySelector(
+            '.gdg-clip-region textarea, .gdg-clip-region input',
+        ) as HTMLInputElement | HTMLTextAreaElement | null;
+        if (!el) return null;
+        const loc = grid_selection_ref.current.current?.cell;
+        if (!loc) return null;
+        const [col, row] = loc;
+        return {
+            key: `${row}:${col}`,
+            value: el.value,
+            original: get_cell_raw(row, col),
+        };
+    }, [get_cell_raw]);
+
+    // Collect committed dirty edits + any in-progress editor and post saveCsv.
+    // Returns false (no message sent) when there is nothing to save.
+    const request_save = useCallback((): boolean => {
+        const edits = collect_save_edits(dirty_cells_ref.current, read_live_edit());
+        const keys = Object.keys(edits);
+        if (keys.length === 0) return false;
+        saved_keys_ref.current = new Set(keys);
+        save_in_flight_ref.current = true;
+        vscode_api.postMessage({ type: 'saveCsv', edits });
+        return true;
+    }, [read_live_edit, save_in_flight_ref]);
+
+    const has_uncommitted_changes = useCallback((): boolean => {
+        if (dirty_cells_ref.current.size > 0) return true;
+        const live = read_live_edit();
+        return !!live && live.value !== live.original;
+    }, [read_live_edit]);
+
+    // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
+    // catch it at the window so it works whether or not an overlay is focused.
+    useEffect(() => {
+        if (!editable_cells) return;
+        const handler = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+                e.preventDefault();
+                request_save();
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [editable_cells, request_save]);
+
+    // Host reports the save outcome: clear the in-flight flag and, on success,
+    // drop exactly the keys we saved (concurrent edits to other cells survive).
+    useEffect(() => {
+        const handler = (e: MessageEvent) => {
+            const msg = e.data;
+            if (!msg || msg.type !== 'saveResult') return;
+            save_in_flight_ref.current = false;
+            if (msg.success) {
+                clear_dirty_keys(saved_keys_ref.current);
+                saved_keys_ref.current = new Set();
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [clear_dirty_keys, save_in_flight_ref]);
+
+    // Expose the imperative actions to App through the ref it provides.
+    useEffect(() => {
+        if (!editing_ref) return;
+        editing_ref.current = {
+            request_save,
+            clear_dirty,
+            discard_conflicted,
+            has_uncommitted_changes,
+        };
+        return () => {
+            editing_ref.current = null;
+        };
+    }, [
+        editing_ref,
+        request_save,
+        clear_dirty,
+        discard_conflicted,
+        has_uncommitted_changes,
+    ]);
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {

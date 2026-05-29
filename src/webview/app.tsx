@@ -3,7 +3,7 @@ import type { PerFileState, HostMessage } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
-import { GridShell, type EditingStatus } from './grid-shell';
+import { GridShell, type EditingStatus, type EditingHandle } from './grid-shell';
 import {
     clamp_sheet_index,
     normalize_per_file_state,
@@ -47,8 +47,24 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     const [edit_mode, set_edit_mode] = useState(false);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
+    // Pending edits restored from per-file state, fed to GridShell on (re)mount so
+    // unsaved work survives a webview reload. CSV is single-sheet, so this flat map
+    // belongs to the one editable sheet.
+    const [initial_edits, set_initial_edits] = useState<
+        Record<string, string | { value: string; base: string }> | undefined
+    >(undefined);
+    // Conflict signature the user dismissed ("Keep All"); the banner reappears only
+    // if a *different* set of cells later conflicts.
+    const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
+        useState<string | null>(null);
 
     const state_ref = useRef<PerFileState>({});
+    // GridShell populates this with imperative save/discard actions (the dirty map
+    // lives next to the loader); App calls them from the toolbar + conflict banner.
+    const editing_ref = useRef<EditingHandle | null>(null);
+    // True between posting a save (from the exit dialog) and its saveResult, so a
+    // successful save then completes the deferred exit from edit mode.
+    const pending_exit_ref = useRef(false);
     const auto_fit_active_ref = useRef<boolean[]>([]);
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
@@ -93,12 +109,18 @@ export function App(): React.JSX.Element {
                 state_ref.current = s;
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
-                set_csv_editable(msg.csvEditable ?? false);
+                const can_edit = msg.csvEditable ?? false;
+                set_csv_editable(can_edit);
                 set_csv_editing_supported(msg.csvEditingSupported ?? false);
-                // A fresh document starts read-only; the GridShell remounts via
-                // its key so its dirty map clears with it.
-                set_edit_mode(false);
+                // A fresh document is read-only unless it carries restored pending
+                // edits, in which case we re-enter edit mode and feed them to the
+                // GridShell (which remounts via its key, reading initial_edits once).
+                const restored_edits = s.pendingEdits;
+                set_initial_edits(restored_edits);
+                set_edit_mode(!!restored_edits && can_edit);
                 set_editing_status(null);
+                set_dismissed_conflict_signature(null);
+                pending_exit_ref.current = false;
             }
 
             if (msg.type === 'metaReload') {
@@ -175,8 +197,53 @@ export function App(): React.JSX.Element {
     }, []);
 
     const handle_toggle_edit_mode = useCallback(() => {
-        set_edit_mode((prev) => !prev);
+        if (!edit_mode) {
+            set_edit_mode(true);
+            return;
+        }
+        // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
+        // dialog (handled below); otherwise exit immediately.
+        if (editing_ref.current?.has_uncommitted_changes()) {
+            vscode_api.postMessage({ type: 'showSaveDialog' });
+            return;
+        }
+        set_edit_mode(false);
+    }, [edit_mode]);
+
+    // React to the host's save-dialog choice (from the exit flow) and to the save
+    // outcome. GridShell separately clears the dirty map on a successful save; here
+    // we only complete a deferred exit from edit mode.
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            if (msg.type === 'saveDialogResult') {
+                if (msg.choice === 'save') {
+                    if (editing_ref.current?.request_save()) {
+                        pending_exit_ref.current = true;
+                    } else {
+                        set_edit_mode(false);
+                    }
+                } else if (msg.choice === 'discard') {
+                    editing_ref.current?.clear_dirty();
+                    set_edit_mode(false);
+                }
+                // 'cancel' → stay in edit mode, keep edits.
+            } else if (msg.type === 'saveResult') {
+                if (pending_exit_ref.current) {
+                    pending_exit_ref.current = false;
+                    if (msg.success) set_edit_mode(false);
+                }
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
     }, []);
+
+    // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
+    // edit mode so the toolbar/banner don't dangle.
+    useEffect(() => {
+        if (edit_mode && !csv_editable) set_edit_mode(false);
+    }, [edit_mode, csv_editable]);
 
     // GridShell owns the dirty map (next to the loader); it reports status up so
     // the toolbar dirty dot, pending-edit persistence, and conflict banner —
@@ -330,6 +397,15 @@ export function App(): React.JSX.Element {
     const has_multiple_sheets = meta.sheets.length > 1;
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
 
+    // Conflict banner: a stable signature of the conflicted cell set, so dismissing
+    // it ("Keep All") sticks until a *different* set of cells drifts.
+    const conflicted_keys = editing_status?.conflicted ?? [];
+    const conflict_signature = [...conflicted_keys].sort().join(',');
+    const show_conflict_banner =
+        edit_mode &&
+        conflicted_keys.length > 0 &&
+        conflict_signature !== dismissed_conflict_signature;
+
     const grid = (
         <GridShell
             key={`${active_sheet_index}:${load_epoch}`}
@@ -345,7 +421,9 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode}
             csv_editable={csv_editable}
+            initial_edits={initial_edits}
             on_editing_change={handle_editing_change}
+            editing_ref={editing_ref}
         />
     );
 
@@ -367,6 +445,35 @@ export function App(): React.JSX.Element {
             />
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
+            )}
+            {show_conflict_banner && (
+                <div className="conflict-banner">
+                    File changed externally. {conflicted_keys.length} edit
+                    {conflicted_keys.length === 1 ? '' : 's'} may be affected —
+                    highlighted cells show conflicts.
+                    <div className="conflict-banner-actions">
+                        <button
+                            onClick={() =>
+                                set_dismissed_conflict_signature(conflict_signature)
+                            }
+                        >
+                            Keep All
+                        </button>
+                        <button
+                            onClick={() => editing_ref.current?.discard_conflicted()}
+                        >
+                            Discard Conflicted
+                        </button>
+                        <button
+                            onClick={() => {
+                                editing_ref.current?.clear_dirty();
+                                set_edit_mode(false);
+                            }}
+                        >
+                            Discard All
+                        </button>
+                    </div>
+                </div>
             )}
             {effective_vertical_tabs ? (
                 <div className="content-area">
