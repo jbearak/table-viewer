@@ -1,6 +1,6 @@
 import type { MergeEntry } from './merge-index';
 import type { RenderedCell } from '../data-source/interface';
-import { font_style } from './cell-renderer';
+import { font_shorthand } from './cell-renderer';
 
 /**
  * Pure geometry/selection helpers for the merge overlay (Phase D, D-wire-2).
@@ -105,8 +105,7 @@ export function block_font(
     italic: boolean,
     family: string,
 ): string {
-    const base = font_style(bold, italic) ?? '13px';
-    return `${base} ${family}`;
+    return `${font_shorthand(bold, italic, 13)} ${family}`;
 }
 
 /** Text the overlay paints for a merge block's anchor: the formatted value when

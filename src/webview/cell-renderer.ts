@@ -20,16 +20,26 @@ import type { MergeIndex } from './merge-index';
  *  - **Plain cells**: text with raw/formatted + optional bold/italic font.
  */
 
+/**
+ * Core CSS `font` shorthand fragment shared by every font builder in the
+ * webview: optional `italic` style, optional `600` weight, then `<size>px` — in
+ * the order the CSS/canvas font parser requires (style → weight → size). No
+ * family (callers append it when needed). A plain cell yields just `<size>px`.
+ */
+export function font_shorthand(bold: boolean, italic: boolean, size_px: number): string {
+    const parts: string[] = [];
+    if (italic) parts.push('italic');
+    if (bold) parts.push('600');
+    parts.push(`${size_px}px`);
+    return parts.join(' ');
+}
+
 /** CSS font shorthand fragment for Glide's `baseFontStyle` (family/size context
  *  comes from the theme). Undefined when neither flag is set so the theme font
  *  wins. */
 export function font_style(bold: boolean, italic: boolean): string | undefined {
     if (!bold && !italic) return undefined;
-    const parts: string[] = [];
-    if (italic) parts.push('italic');
-    if (bold) parts.push('600');
-    parts.push('13px');
-    return parts.join(' ');
+    return font_shorthand(bold, italic, 13);
 }
 
 const BLANK: GridCell = {

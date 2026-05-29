@@ -36,12 +36,10 @@ describe('font_style', () => {
     it('is undefined when neither bold nor italic', () => {
         expect(font_style(false, false)).toBeUndefined();
     });
-    it('encodes bold as 600 and italic as italic, with a size', () => {
-        expect(font_style(true, false)).toContain('600');
-        expect(font_style(false, true)).toContain('italic');
-        const both = font_style(true, true)!;
-        expect(both).toContain('600');
-        expect(both).toContain('italic');
+    it('encodes bold as 600 and italic as italic, with a size, in style→weight→size order', () => {
+        expect(font_style(true, false)).toBe('600 13px');
+        expect(font_style(false, true)).toBe('italic 13px');
+        expect(font_style(true, true)).toBe('italic 600 13px');
     });
 });
 

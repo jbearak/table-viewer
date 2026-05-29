@@ -6,6 +6,7 @@
  * unit-tested without a canvas.
  */
 import type { RenderedCell } from '../data-source/interface';
+import { font_shorthand } from './cell-renderer';
 
 /** Smallest width a fitted column may take (matches the old DOM measurer). */
 export const MIN_COLUMN_WIDTH = 40;
@@ -31,12 +32,7 @@ export function canvas_font(
     family: string,
     size = 13,
 ): string {
-    const parts: string[] = [];
-    if (italic) parts.push('italic');
-    if (bold) parts.push('600');
-    parts.push(`${size}px`);
-    parts.push(family);
-    return parts.join(' ');
+    return `${font_shorthand(bold, italic, size)} ${family}`;
 }
 
 /**
