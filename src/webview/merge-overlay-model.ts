@@ -1,4 +1,5 @@
 import type { MergeEntry } from './merge-index';
+import type { RenderedCell } from '../data-source/interface';
 import { font_style } from './cell-renderer';
 
 /**
@@ -87,4 +88,11 @@ export function block_font(
 ): string {
     const base = font_style(bold, italic) ?? '13px';
     return `${base} ${family}`;
+}
+
+/** Text the overlay paints for a merge block's anchor: the formatted value when
+ *  the Formatting toggle is on, otherwise the raw underlying value. Mirrors
+ *  `text_cell` in cell-renderer.ts so merged and plain cells toggle in lockstep. */
+export function block_text(anchor: RenderedCell, show_formatting: boolean): string {
+    return show_formatting ? anchor.formatted : (anchor.raw ?? '');
 }

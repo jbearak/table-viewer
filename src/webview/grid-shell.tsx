@@ -701,9 +701,11 @@ export function GridShell({
         ensure_rows(0, 40);
     }, [ensure_rows]);
 
-    // When a page lands (version bump), repaint the visible region so the new
-    // cells replace their loading placeholders. A parent re-render alone does not
-    // reliably invalidate Glide's per-cell cache, so damage explicitly.
+    // Repaint the visible region on the discrete events that change the content
+    // of already-painted cells: a page landing (version bump) and the formatting
+    // toggle (raw ↔ formatted). A parent re-render alone does not reliably
+    // invalidate Glide's per-cell cache, so damage explicitly. (Edits/save/discard
+    // damage their own cells; sheet/merge changes remount via the grid key.)
     useEffect(() => {
         const grid = grid_ref.current;
         if (!grid) return;
@@ -716,7 +718,7 @@ export function GridShell({
             }
         }
         grid.updateCells(cells);
-    }, [version]);
+    }, [version, show_formatting]);
 
     // Preview mode: host asks us to scroll a specific row into view.
     useEffect(() => {

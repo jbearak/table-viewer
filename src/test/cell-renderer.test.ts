@@ -73,6 +73,31 @@ describe('build_grid_cell — plain cells', () => {
     });
 });
 
+describe('build_grid_cell — formatting toggle (raw vs formatted)', () => {
+    // A cell where the raw value differs from its formatted display, e.g. a
+    // number with a display format ('3.14') over its full precision ('3.14159').
+    const num: RenderedCell = { raw: '3.14159', formatted: '3.14', bold: false, italic: false };
+    const num_rows: (RenderedCell | null)[] = [num];
+    const plain_idx = new MergeIndex([]);
+    const num_cell = (show_formatting: boolean) =>
+        build_grid_cell(0, 0, num_rows, plain_idx, show_formatting);
+
+    it('displays the formatted value when show_formatting is on', () => {
+        const c = num_cell(true);
+        expect((c as { displayData: string }).displayData).toBe('3.14');
+    });
+
+    it('displays the raw value when show_formatting is off', () => {
+        const c = num_cell(false);
+        expect((c as { displayData: string }).displayData).toBe('3.14159');
+    });
+
+    it('keeps the underlying data on the raw value regardless of toggle', () => {
+        expect((num_cell(true) as { data: string }).data).toBe('3.14159');
+        expect((num_cell(false) as { data: string }).data).toBe('3.14159');
+    });
+});
+
 describe('build_grid_cell — horizontal merges (native span)', () => {
     it('anchor returns span across the merged columns with its content', () => {
         const c = cell(0, 0);

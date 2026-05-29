@@ -3,10 +3,12 @@ import { MergeIndex } from '../webview/merge-index';
 import type { MergeRange } from '../types';
 import {
     block_font,
+    block_text,
     block_intersects_region,
     overlay_block_rect,
     overlay_entries,
 } from '../webview/merge-overlay-model';
+import type { RenderedCell } from '../data-source/interface';
 
 // Same fixture as the cell-renderer / merge-index tests:
 // horizontal header, vertical "Tall", 2D "Box".
@@ -86,5 +88,17 @@ describe('block_font', () => {
         expect(block_font(true, false, 'Arial')).toBe('600 13px Arial');
         expect(block_font(false, true, 'Arial')).toBe('italic 13px Arial');
         expect(block_font(true, true, 'Arial')).toBe('italic 600 13px Arial');
+    });
+});
+
+describe('block_text', () => {
+    const num: RenderedCell = { raw: '3.14159', formatted: '3.14', bold: false, italic: false };
+
+    it('uses the formatted value when show_formatting is on', () => {
+        expect(block_text(num, true)).toBe('3.14');
+    });
+
+    it('uses the raw value when show_formatting is off', () => {
+        expect(block_text(num, false)).toBe('3.14159');
     });
 });

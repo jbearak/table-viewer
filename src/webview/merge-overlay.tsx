@@ -12,6 +12,7 @@ import type { MergeIndex } from './merge-index';
 import { HEADER_HEIGHT_PX } from './grid-model';
 import {
     block_font,
+    block_text,
     block_intersects_region,
     overlay_block_rect,
     overlay_entries,
@@ -135,7 +136,8 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.width - 1, r.height - 1);
 
                     const anchor = get_row(entry.startRow)?.[entry.startCol];
-                    if (anchor && anchor.formatted) {
+                    const text = anchor ? block_text(anchor, show_formatting) : '';
+                    if (anchor && text) {
                         const bold = show_formatting && anchor.bold;
                         const italic = show_formatting && anchor.italic;
                         ctx.save();
@@ -147,7 +149,7 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                         ctx.textAlign = 'left';
                         ctx.textBaseline = 'middle';
                         ctx.fillText(
-                            anchor.formatted,
+                            text,
                             r.x + TEXT_PADDING_PX,
                             r.y + r.height / 2,
                         );

@@ -71,7 +71,10 @@ function text_cell(
     if (style) theme_override.baseFontStyle = style;
     if (overlay?.bg) theme_override.bgCell = overlay.bg;
     const has_override = theme_override.baseFontStyle !== undefined || theme_override.bgCell !== undefined;
-    const display = overlay?.dirty_value ?? c.formatted;
+    // The Formatting toggle switches the *displayed* text between the formatted
+    // value (e.g. '3.14') and the raw underlying value (e.g. '3.14159'). `data`
+    // always holds the raw value so editing and copy work off the source text.
+    const display = overlay?.dirty_value ?? (show_formatting ? c.formatted : (c.raw ?? ''));
     return {
         kind: GridCellKind.Text,
         data: overlay?.dirty_value ?? (c.raw ?? ''),
