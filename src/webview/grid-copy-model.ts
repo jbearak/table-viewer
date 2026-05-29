@@ -9,24 +9,21 @@ export interface SelectionRect {
     height: number;
 }
 
-/**
- * Why a copy came back incomplete:
- * - `row-cap`: the selection had more rows than `max_rows`, so trailing rows
- *   were dropped entirely.
- * - `non-resident`: at least one selected row's page wasn't loaded, so it was
- *   emitted as blank columns.
- */
-export type TruncationReason = 'row-cap' | 'non-resident';
-
 export interface TsvResult {
     /** Tab/newline-joined cell text for the clipboard. */
     text: string;
     /**
-     * Why the copy was clipped, or null when it was complete: either a selected
-     * row's page was not resident (emitted as blanks) or the selection exceeded
-     * `max_rows`.
+     * The selection had more rows than `max_rows`, so trailing rows were
+     * dropped entirely.
      */
-    truncationReason: TruncationReason | null;
+    rowCapped: boolean;
+    /**
+     * At least one emitted row's page wasn't resident, so that row was written
+     * as blank columns. Independent of `rowCapped`: a copy can hit both at once
+     * (some emitted rows blank *and* trailing rows dropped), and both are
+     * reported because they describe different damage to the clipboard data.
+     */
+    nonResident: boolean;
 }
 
 /** Default cap so a runaway "select all" copy can't blow up the clipboard. */
@@ -34,22 +31,30 @@ export const DEFAULT_MAX_ROWS = 100_000;
 
 /**
  * Builds a user-facing warning explaining why a copied selection was clipped,
- * or null when nothing was clipped. Pure so it can be unit-tested and reused by
- * the host message-surfacing path.
+ * or null when nothing was clipped. When both clip conditions apply they are
+ * both surfaced, since each describes a distinct problem with the copied data.
+ * Pure so it can be unit-tested and reused by the host message-surfacing path.
  */
 export function copy_truncation_message(
-    reason: TruncationReason | null,
+    result: Pick<TsvResult, 'rowCapped' | 'nonResident'>,
 ): string | null {
-    switch (reason) {
-        case 'row-cap':
-            return `Copied data was clipped: only the first ${DEFAULT_MAX_ROWS.toLocaleString(
+    const clauses: string[] = [];
+    if (result.rowCapped) {
+        clauses.push(
+            `only the first ${DEFAULT_MAX_ROWS.toLocaleString(
                 'en-US',
-            )} rows of the selection were copied (copy limit).`;
-        case 'non-resident':
-            return 'Copied data was clipped: rows beyond the loaded range were blank. Scroll through the selection to load it, then copy again.';
-        default:
-            return null;
+            )} rows of the selection were copied (copy limit)`,
+        );
     }
+    if (result.nonResident) {
+        clauses.push(
+            'rows beyond the loaded range were blank — scroll through the selection to load it, then copy again',
+        );
+    }
+    if (clauses.length === 0) {
+        return null;
+    }
+    return `Copied data was clipped: ${clauses.join('; ')}.`;
 }
 
 /**
@@ -58,8 +63,8 @@ export function copy_truncation_message(
  *
  * - Merge-hidden cells emit empty strings; the merge anchor keeps its text.
  * - Rows whose page isn't resident (`get_row` returns undefined) emit blank
- *   columns and set `truncationReason` to `non-resident`.
- * - The row count is capped at `max_rows`; exceeding it sets `row-cap`.
+ *   columns and set `nonResident`.
+ * - The row count is capped at `max_rows`; exceeding it sets `rowCapped`.
  */
 export function format_selection_tsv(
     rect: SelectionRect,
@@ -68,16 +73,9 @@ export function format_selection_tsv(
     show_formatting: boolean,
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
-    // Non-resident wins over row-cap: blank-filled rows sit *inside* the
-    // returned TSV (silent corruption of emitted data), whereas the cap only
-    // drops trailing rows the user can see are missing. Surface the more
-    // dangerous reason when both apply.
-    let cap_truncated = false;
     let non_resident = false;
     const row_limit = Math.min(rect.height, max_rows);
-    if (row_limit < rect.height) {
-        cap_truncated = true;
-    }
+    const cap_truncated = row_limit < rect.height;
 
     const lines: string[] = [];
     for (let r = 0; r < row_limit; r++) {
@@ -106,10 +104,9 @@ export function format_selection_tsv(
         lines.push(cells.join('\t'));
     }
 
-    const truncationReason: TruncationReason | null = non_resident
-        ? 'non-resident'
-        : cap_truncated
-            ? 'row-cap'
-            : null;
-    return { text: lines.join('\n'), truncationReason };
+    return {
+        text: lines.join('\n'),
+        rowCapped: cap_truncated,
+        nonResident: non_resident,
+    };
 }

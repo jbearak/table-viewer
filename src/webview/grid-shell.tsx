@@ -543,7 +543,7 @@ export function GridShell({
                 merge_index,
                 show_formatting,
             );
-            const warning = copy_truncation_message(result.truncationReason);
+            const warning = copy_truncation_message(result);
             if (warning) {
                 vscode_api.postMessage({ type: 'showWarning', message: warning });
             }
