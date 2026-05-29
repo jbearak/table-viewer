@@ -4,6 +4,7 @@ import {
     type DataEditorRef,
     type GridCell,
     type GridColumn,
+    type GridMouseEventArgs,
     type Item,
     type Rectangle,
 } from '@glideapps/glide-data-grid';
@@ -13,7 +14,15 @@ import { build_grid_columns } from './grid-model';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell } from './cell-renderer';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
+import {
+    RowResizeOverlay,
+    type RowResizeOverlayHandle,
+} from './row-resize-overlay';
+import { row_boundary_hit } from './row-resize-model';
 import { row_height, type RowHeightOverrides } from './row-heights';
+
+/** Pixel proximity to a row border that arms the resize strip. */
+const ROW_RESIZE_TOLERANCE_PX = 5;
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
 import { vscode_api } from './use-state-sync';
@@ -50,6 +59,7 @@ export function GridShell({
     column_widths,
     on_column_resize,
     row_heights,
+    on_row_resize,
     merges,
     preview_mode = false,
 }: GridShellProps): React.JSX.Element {
@@ -57,6 +67,7 @@ export function GridShell({
     const theme = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
+    const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
 
@@ -87,6 +98,50 @@ export function GridShell({
     const get_row_height = useCallback(
         (row: number) => row_height(row_heights, row),
         [row_heights],
+    );
+
+    // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
+    // hover args give the cell's client `bounds` + in-cell `localEventY`.
+    const on_item_hovered = useCallback(
+        (args: GridMouseEventArgs) => {
+            if (args.kind !== 'cell') {
+                row_resize_ref.current?.set_target(null);
+                return;
+            }
+            const row = args.location[1];
+            const hit = row_boundary_hit(
+                row,
+                args.bounds.y,
+                args.bounds.height,
+                args.localEventY,
+                ROW_RESIZE_TOLERANCE_PX,
+            );
+            row_resize_ref.current?.set_target(
+                hit
+                    ? {
+                          row: hit.row,
+                          boundary_y: hit.boundary_y,
+                          height: row_height(row_heights, hit.row),
+                      }
+                    : null,
+            );
+        },
+        [row_heights],
+    );
+
+    // Live drag: persist the new height (mirrors column resize) and nudge Glide +
+    // the merge overlay to redraw the affected row at its new height.
+    const handle_row_resize_drag = useCallback(
+        (row: number, height: number) => {
+            on_row_resize(row, height);
+            const cells: { cell: Item }[] = [];
+            for (let c = 0; c < sheet_meta.columnCount; c++) {
+                cells.push({ cell: [c, row] });
+            }
+            grid_ref.current?.updateCells(cells);
+            overlay_ref.current?.repaint();
+        },
+        [on_row_resize, sheet_meta.columnCount],
     );
 
     const on_visible_region_changed = useCallback(
@@ -166,6 +221,7 @@ export function GridShell({
                 getCellsForSelection={true}
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
+                onItemHovered={on_item_hovered}
             />
             <MergeOverlay
                 ref={overlay_ref}
@@ -175,6 +231,10 @@ export function GridShell({
                 show_formatting={show_formatting}
                 get_row={get_row}
                 version={version}
+            />
+            <RowResizeOverlay
+                ref={row_resize_ref}
+                on_resize={handle_row_resize_drag}
             />
         </div>
     );
