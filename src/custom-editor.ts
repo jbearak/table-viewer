@@ -1,10 +1,13 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { parse_xlsx } from './parse-xlsx';
-import { parse_xls } from './parse-xls';
+import { XlsxDataSource } from './data-source/xlsx-source';
+import { XlsDataSource } from './data-source/xls-source';
+import { workbook_data_from_source } from './data-source/to-workbook-data';
+import type { DataSource } from './data-source/interface';
+import { ViewerPanelCore } from './panel-core';
 import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
-import type { WorkbookData, WebviewMessage } from './types';
+import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
 
 export const VIEW_TYPE = 'tableViewer.editor';
@@ -65,6 +68,11 @@ class ViewerPanel implements vscode.Disposable {
     private consecutive_reload_failures = 0;
     private file_path: string;
     private watcher: vscode.FileSystemWatcher;
+    // Protocol engine (paginated sheetMeta/rowData). Created on first successful
+    // parse; the legacy workbookData/reload messages are also sent transitionally
+    // so the existing DOM renderer keeps working until Phase C switches the webview.
+    private core: ViewerPanelCore | undefined;
+    private source: DataSource | undefined;
 
     constructor(
         private readonly panel: vscode.WebviewPanel,
@@ -103,6 +111,7 @@ class ViewerPanel implements vscode.Disposable {
     }
 
     dispose(): void {
+        this.source?.close();
         for (const d of this.disposables) {
             d.dispose();
         }
@@ -119,10 +128,14 @@ class ViewerPanel implements vscode.Disposable {
                     msg.state
                 );
                 break;
+            default:
+                // requestRows (paginated protocol) -> core answers with rowData.
+                await this.core?.handle_message(msg);
+                break;
         }
     }
 
-    private async parse_file(): Promise<{ data: WorkbookData; warnings: string[] }> {
+    private async build_source(): Promise<DataSource> {
         const stat = await vscode.workspace.fs.stat(this.uri);
         const max_mib = vscode.workspace.getConfiguration('tableViewer')
             .get<number>('maxFileSizeMiB', 16)!;
@@ -130,28 +143,47 @@ class ViewerPanel implements vscode.Disposable {
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {
-            return parse_xlsx(raw);
+            return XlsxDataSource.create(raw);
         }
-        return parse_xls(Buffer.from(raw));
+        return XlsDataSource.create(Buffer.from(raw));
+    }
+
+    private adopt_source(source: DataSource): void {
+        if (this.source && this.source !== source) {
+            this.source.close();
+        }
+        this.source = source;
+        if (this.core) {
+            this.core.set_source(source);
+        } else {
+            this.core = new ViewerPanelCore(this.panel, source);
+        }
+    }
+
+    private get_default_orientation(): 'horizontal' | 'vertical' {
+        return vscode.workspace.getConfiguration('tableViewer')
+            .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
     }
 
     private async send_initial_data(): Promise<void> {
         try {
-            const { data, warnings } = await this.parse_file();
+            const source = await this.build_source();
+            this.adopt_source(source);
             const state = this.state_store.get(this.file_path);
-            const config = vscode.workspace.getConfiguration('tableViewer');
-            const default_orientation = config.get<'horizontal' | 'vertical'>(
-                'tabOrientation',
-                'horizontal'
-            );
+            const default_orientation = this.get_default_orientation();
 
+            // Paginated protocol.
+            await this.core!.send_meta({ state, defaultTabOrientation: default_orientation });
+
+            // Transitional legacy blob so the current DOM renderer keeps working.
             this.panel.webview.postMessage({
                 type: 'workbookData',
-                data,
+                data: workbook_data_from_source(source),
                 state,
                 defaultTabOrientation: default_orientation,
             });
 
+            const warnings = source.warnings ?? [];
             if (warnings.length > 0) {
                 vscode.window.showWarningMessage(warnings[0]);
             }
@@ -163,13 +195,21 @@ class ViewerPanel implements vscode.Disposable {
 
     private async send_reload(): Promise<void> {
         try {
-            const { data, warnings } = await this.parse_file();
+            const source = await this.build_source();
+            this.adopt_source(source);
+
+            // Paginated protocol: bump generation + clear cache + post metaReload.
+            await this.core!.send_meta_reload();
+
+            // Transitional legacy reload for the current DOM renderer.
             const delivered = await this.panel.webview.postMessage({
                 type: 'reload',
-                data,
+                data: workbook_data_from_source(source),
             });
             if (!delivered) return;
             this.consecutive_reload_failures = 0;
+
+            const warnings = source.warnings ?? [];
             if (warnings.length > 0) {
                 vscode.window.showWarningMessage(warnings[0]);
             }

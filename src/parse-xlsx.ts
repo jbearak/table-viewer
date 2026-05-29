@@ -384,9 +384,15 @@ function parse_worksheet(
                 }
 
                 cells.set(`${row}:${col}`, { raw, formatted, ...style });
+                // Defensive pre-check: bound the in-progress cell map during
+                // streaming parse so a single pathological sheet can't exhaust
+                // memory before the cumulative budget is enforced below. A lone
+                // sheet can never legitimately exceed the whole-workbook cell
+                // cap, so MAX_WORKBOOK_CELLS is the correct ceiling here; the
+                // real per-workbook budget is assert_safe_sheet_shape() (line ~406).
                 if (cells.size > MAX_WORKBOOK_CELLS) {
                     throw new Error(
-                        `Worksheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
+                        `Spreadsheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
                     );
                 }
             });
