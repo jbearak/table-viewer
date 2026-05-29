@@ -1,6 +1,5 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { parse_csv } from './parse-csv';
 import { CsvDataSource } from './data-source/csv-source';
 import { ViewerPanelCore } from './panel-core';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
@@ -81,7 +80,8 @@ function setup_preview(
     let consecutive_reload_failures = 0;
 
     // Paginated protocol engine. `line_map` (row -> source line) for scroll sync
-    // still comes from a parse_csv pass; the grid itself streams rows via the core.
+    // comes from the same CsvDataSource that streams the grid rows, so the two
+    // always agree on row count and boundaries.
     let core: ViewerPanelCore | undefined;
     let source: CsvDataSource | undefined;
 
@@ -111,11 +111,11 @@ function setup_preview(
         const raw = await vscode.workspace.fs.readFile(uri);
         const delimiter = get_delimiter();
         const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-        // Scroll sync needs row -> source-line; only parse_csv computes it.
-        const text = new TextDecoder('utf-8').decode(raw);
-        line_map = parse_csv(text, delimiter, max_rows).line_map;
         const ds = await CsvDataSource.create(raw, delimiter, max_rows);
         adopt(ds);
+        // Scroll sync needs row -> source-line; derive it from the same source
+        // that backs the grid so row counts can never drift apart.
+        line_map = ds.lineMap();
         return ds;
     }
 

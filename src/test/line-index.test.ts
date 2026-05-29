@@ -1,8 +1,14 @@
 // src/test/line-index.test.ts
 import { describe, it, expect } from 'vitest';
-import { build_line_index, split_csv_rows } from '../data-source/line-index';
+import { build_line_index, build_line_map, split_csv_rows } from '../data-source/line-index';
 
 const enc = (s: string) => new TextEncoder().encode(s);
+
+/** Build the row -> source-line map for a string (comma delimiter by default). */
+function lm(s: string, delimiter = 0x2c): number[] {
+    const buf = enc(s);
+    return build_line_map(buf, build_line_index(buf, delimiter));
+}
 
 describe('build_line_index', () => {
     it('indexes simple LF rows', () => {
@@ -168,6 +174,18 @@ describe('split_csv_rows', () => {
         ]);
     });
 
+    // build_line_map shares this scan's row boundaries, so pin them together too.
+    describe('build_line_map agrees on row count', () => {
+        for (const src of [
+            'a,b\nc,d\ne,f\n', 'a,b\r\nc,d\nx,y\r\n', '"x\ny",z\np,q\n',
+            'a,b\n"x\ny\nz', 'a\n\nb\n', '"a"b,c\n', '',
+        ]) {
+            it(`matches for ${JSON.stringify(src)}`, () => {
+                expect(lm(src).length).toBe(build_line_index(enc(src)).rowCount);
+            });
+        }
+    });
+
     // The save path relies on build_line_index's per-row field counts matching
     // exactly the cells split_csv_rows produces. If they ever diverge, serialize
     // emits spurious or missing columns. Pin them together across awkward inputs.
@@ -197,5 +215,35 @@ describe('split_csv_rows', () => {
                 }
             });
         }
+    });
+});
+
+describe('build_line_map', () => {
+    it('maps each row to its source line for simple LF files', () => {
+        expect(lm('a,b\nc,d\ne,f\ng,h\n')).toEqual([0, 1, 2, 3]);
+    });
+    it('leaves a gap for a multi-line quoted field', () => {
+        // Row 1 spans two source lines (embedded \n), so row 2 starts on line 3.
+        expect(lm('Name,Bio\nAlice,"Line 1\nLine 2"\nBob,"x"\n')).toEqual([0, 1, 3]);
+    });
+    it('counts standalone CR terminators (CR-delimited file)', () => {
+        expect(lm('a,b\r1,2\r3,4')).toEqual([0, 1, 2]);
+    });
+    it('counts a standalone CR embedded in a quoted field', () => {
+        expect(lm('a,"b\rc"\r1')).toEqual([0, 2]);
+    });
+    it('counts CRLF as a single line break', () => {
+        expect(lm('a\r\nb\r\nc\r\n')).toEqual([0, 1, 2]);
+    });
+    it('handles a file with no trailing newline', () => {
+        expect(lm('a\nb')).toEqual([0, 1]);
+    });
+    it('returns an empty map for empty input', () => {
+        expect(lm('')).toEqual([]);
+    });
+    it('caps the map to the requested row count', () => {
+        const buf = enc('a\nb\nc\nd\n');
+        const map = build_line_map(buf, build_line_index(buf), 2);
+        expect(map).toEqual([0, 1]);
     });
 });

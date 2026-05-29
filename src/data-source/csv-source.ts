@@ -1,6 +1,6 @@
 // src/data-source/csv-source.ts
 import type { DataSource, RenderedCell, RowWindow, WorkbookMeta } from './interface';
-import { build_line_index, split_csv_rows, type LineIndex } from './line-index';
+import { build_line_index, build_line_map, split_csv_rows, type LineIndex } from './line-index';
 
 /**
  * DataSource backed by a UTF-8 CSV/TSV byte buffer.
@@ -31,6 +31,8 @@ export class CsvDataSource implements DataSource {
     private readonly _colCount: number;
     /** Buffer with any leading UTF-8 BOM removed (see constructor). */
     private readonly buf: Uint8Array;
+    /** Lazily-built row -> source-line map (preview scroll sync only). */
+    private _lineMap?: number[];
 
     /**
      * Async factory mirroring XlsxDataSource.create, so panel-core can build any
@@ -130,6 +132,18 @@ export class CsvDataSource implements DataSource {
 
     read_all_rows(_sheet: number): (RenderedCell | null)[][] {
         return this.read_rows(0, 0, this._rowCount).rows;
+    }
+
+    /**
+     * Row -> 0-based source-line map for the CSV preview pane's scroll sync.
+     * Built from the same row boundaries as the grid (so its length always equals
+     * the grid's rowCount) and cached, since the preview reads it on every reload.
+     */
+    lineMap(): number[] {
+        if (!this._lineMap) {
+            this._lineMap = build_line_map(this.buf, this.index, this._rowCount);
+        }
+        return this._lineMap;
     }
 
     close(): void { /* nothing to release */ }

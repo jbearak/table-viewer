@@ -107,6 +107,51 @@ export function build_line_index(buf: Uint8Array, delimiter: number = COMMA): Li
 }
 
 /**
+ * Map each grid row to the 0-based source text line where it begins — the data
+ * the CSV preview pane needs for scroll synchronization. Row r's value is the
+ * number of physical line terminators (LF, CR, or CRLF — CRLF counted once) that
+ * appear before row r's start byte, which equals the editor line that row sits
+ * on. Embedded newlines inside a quoted field advance the line counter (the
+ * editor still renders them as separate lines) but not the row, so a multi-line
+ * quoted field correctly leaves a gap in the returned values.
+ *
+ * Derived from the SAME row boundaries as build_line_index (passed in as
+ * `index`), so the result is always exactly `min(rowCount, index.rowCount)` long
+ * and can never disagree with the grid's row count. Line counting here needs no
+ * quote awareness: the editor treats every physical newline as a line break, and
+ * the index already tells us where each row starts.
+ */
+export function build_line_map(
+    buf: Uint8Array,
+    index: LineIndex,
+    rowCount: number = index.rowCount,
+): number[] {
+    const n = Math.min(rowCount, index.rowCount);
+    const line_map = new Array<number>(n);
+    let line = 0;
+    let r = 0;
+    for (let i = 0; i < buf.length && r < n; i++) {
+        // Record the line for every row that starts at byte i (offsets are
+        // strictly increasing, so at most one row matches per byte).
+        while (r < n && index.offsetOf(r) === i) {
+            line_map[r] = line;
+            r++;
+        }
+        const b = buf[i];
+        if (b === LF) {
+            line++;
+        } else if (b === CR) {
+            if (i + 1 < buf.length && buf[i + 1] === LF) i++; // CRLF counts once
+            line++;
+        }
+    }
+    // Defensive: any rows whose start offset is at/after buffer end (not emitted
+    // by build_line_index) take the final line count.
+    while (r < n) { line_map[r] = line; r++; }
+    return line_map;
+}
+
+/**
  * Parse a decoded CSV/TSV text fragment into rows of string fields, using the
  * EXACT model as build_line_index above. This is the single source of truth for
  * cell values: because the byte scanner (which yields row offsets and per-row

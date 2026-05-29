@@ -168,4 +168,31 @@ describe('CsvDataSource', () => {
             expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('a,b');
         });
     });
+
+    describe('lineMap (preview scroll sync)', () => {
+        it('maps rows to source lines, accounting for multi-line quoted fields', () => {
+            const ds = new CsvDataSource(
+                enc('Name,Bio\nAlice,"Line 1\nLine 2"\nBob,x\n'), ',', 10000,
+            );
+            expect(ds.lineMap()).toEqual([0, 1, 3]);
+        });
+        it('length always equals the grid row count (mixed line endings)', () => {
+            const ds = new CsvDataSource(enc('a,b\r\nc,d\nx,y\r\n'), ',', 10000);
+            expect(ds.lineMap().length).toBe(ds.meta().sheets[0].rowCount);
+            expect(ds.lineMap()).toEqual([0, 1, 2]);
+        });
+        it('length always equals the grid row count (stray quote)', () => {
+            const ds = new CsvDataSource(enc('"a"b,c\nd,e\n'), ',', 10000);
+            expect(ds.lineMap().length).toBe(ds.meta().sheets[0].rowCount);
+        });
+        it('is capped to max_rows like the grid', () => {
+            const ds = new CsvDataSource(enc('a\nb\nc\nd\n'), ',', 2);
+            expect(ds.lineMap().length).toBe(ds.meta().sheets[0].rowCount);
+            expect(ds.lineMap()).toEqual([0, 1]);
+        });
+        it('ignores a leading BOM for line numbering', () => {
+            const ds = new CsvDataSource(enc('﻿a,b\nc,d\n'), ',', 10000);
+            expect(ds.lineMap()).toEqual([0, 1]);
+        });
+    });
 });
