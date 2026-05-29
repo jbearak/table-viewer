@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+    CompactSelection,
     DataEditor,
     type DataEditorRef,
     type GridCell,
     type GridColumn,
     type GridMouseEventArgs,
+    type GridSelection,
     type Item,
     type Rectangle,
 } from '@glideapps/glide-data-grid';
@@ -19,6 +21,7 @@ import {
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
+import { expand_glide_selection } from './selection-glide';
 import { row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
@@ -70,6 +73,14 @@ export function GridShell({
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
+
+    // Controlled selection. We intercept every change to snap it onto whole
+    // merges (a click/drag landing on a covered cell selects the merge block);
+    // native Ctrl+C then copies the rectangle via `getCellsForSelection`.
+    const [grid_selection, set_grid_selection] = useState<GridSelection>({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+    });
 
     const columns = useMemo<GridColumn[]>(
         () => build_grid_columns(sheet_meta.columnCount, column_widths),
@@ -142,6 +153,26 @@ export function GridShell({
             overlay_ref.current?.repaint();
         },
         [on_row_resize, sheet_meta.columnCount],
+    );
+
+    const on_grid_selection_change = useCallback(
+        (sel: GridSelection) => {
+            if (!sel.current) {
+                set_grid_selection(sel);
+                return;
+            }
+            const { cell, range } = expand_glide_selection(
+                sel.current.cell,
+                sel.current.range,
+                merges,
+            );
+            set_grid_selection({
+                columns: sel.columns,
+                rows: sel.rows,
+                current: { cell, range, rangeStack: sel.current.rangeStack },
+            });
+        },
+        [merges],
     );
 
     const on_visible_region_changed = useCallback(
@@ -219,6 +250,8 @@ export function GridShell({
                 smoothScrollX
                 smoothScrollY
                 getCellsForSelection={true}
+                gridSelection={grid_selection}
+                onGridSelectionChange={on_grid_selection_change}
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
