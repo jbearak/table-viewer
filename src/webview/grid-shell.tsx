@@ -10,6 +10,7 @@ import {
     CompactSelection,
     DataEditor,
     GridCellKind,
+    type CellClickedEventArgs,
     type DataEditorRef,
     type EditableGridCell,
     type GridCell,
@@ -23,6 +24,8 @@ import {
 import type { SheetMeta } from '../data-source/interface';
 import type { MergeRange } from '../types';
 import { build_grid_columns } from './grid-model';
+import { ContextMenu, type MenuItem } from './context-menu';
+import { format_selection_tsv, type SelectionRect } from './grid-copy-model';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import { use_editing, type DirtyEntry } from './use-editing';
@@ -161,6 +164,15 @@ export function GridShell({
         columns: CompactSelection.empty(),
         rows: CompactSelection.empty(),
     });
+
+    // Right-click context menu, anchored at client coords with the cell that was
+    // clicked (merge-snapped). Null when closed.
+    const [context_menu, set_context_menu] = useState<{
+        x: number;
+        y: number;
+        row: number;
+        col: number;
+    } | null>(null);
 
     const columns = useMemo<GridColumn[]>(
         () => build_grid_columns(sheet_meta.columnCount, column_widths),
@@ -482,6 +494,130 @@ export function GridShell({
         [merges],
     );
 
+    // --- Context menu: copy + select actions over the paged cache -------------
+    const safe_write_to_clipboard = useCallback(async (text: string) => {
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (error) {
+            console.error('Failed to write to clipboard', error);
+        }
+    }, []);
+
+    // Serialize a rectangle from the paged cache and write it to the clipboard.
+    // Reads via get_row_ref so the callback stays stable across page loads; warns
+    // when the copy was clipped (non-resident rows or the row cap).
+    const copy_rect = useCallback(
+        (rect: SelectionRect) => {
+            const result = format_selection_tsv(
+                rect,
+                get_row_ref.current,
+                merges,
+                show_formatting,
+            );
+            if (result.truncated) {
+                console.warn(
+                    'Table Viewer: copied selection was clipped — rows beyond the loaded range or the copy cap were blank.',
+                );
+            }
+            void safe_write_to_clipboard(result.text);
+        },
+        [merges, show_formatting, safe_write_to_clipboard],
+    );
+
+    const select_rect = useCallback((anchor: Item, range: Rectangle) => {
+        set_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell: anchor, range, rangeStack: [] },
+        });
+    }, []);
+
+    const select_row = useCallback(
+        (row: number) => {
+            if (sheet_meta.columnCount === 0) return;
+            select_rect([0, row], {
+                x: 0,
+                y: row,
+                width: sheet_meta.columnCount,
+                height: 1,
+            });
+        },
+        [sheet_meta.columnCount, select_rect],
+    );
+
+    const select_column = useCallback(
+        (col: number) => {
+            if (sheet_meta.rowCount === 0) return;
+            select_rect([col, 0], {
+                x: col,
+                y: 0,
+                width: 1,
+                height: sheet_meta.rowCount,
+            });
+        },
+        [sheet_meta.rowCount, select_rect],
+    );
+
+    const select_all = useCallback(() => {
+        if (sheet_meta.rowCount === 0 || sheet_meta.columnCount === 0) return;
+        select_rect([0, 0], {
+            x: 0,
+            y: 0,
+            width: sheet_meta.columnCount,
+            height: sheet_meta.rowCount,
+        });
+    }, [sheet_meta.rowCount, sheet_meta.columnCount, select_rect]);
+
+    const discard_edit = useCallback(
+        (row: number, col: number) => {
+            clear_dirty_keys(new Set([`${row}:${col}`]));
+            grid_ref.current?.updateCells([{ cell: [col, row] }]);
+        },
+        [clear_dirty_keys],
+    );
+
+    // Glide gives no clientX/clientY — derive them from the cell bounds plus the
+    // in-cell offset. Right-clicking outside the current selection collapses it to
+    // the clicked cell (merge-snapped), matching native grid behavior.
+    const on_cell_context_menu = useCallback(
+        (cell: Item, event: CellClickedEventArgs) => {
+            event.preventDefault();
+            const [col, row] = cell;
+            const { cell: anchor } = expand_glide_selection(
+                cell,
+                { x: col, y: row, width: 1, height: 1 },
+                merges,
+            );
+            const [anchor_col, anchor_row] = anchor;
+
+            const sel = grid_selection_ref.current.current;
+            const inside =
+                !!sel &&
+                col >= sel.range.x &&
+                col < sel.range.x + sel.range.width &&
+                row >= sel.range.y &&
+                row < sel.range.y + sel.range.height;
+            if (!inside) {
+                select_rect(anchor, {
+                    x: anchor_col,
+                    y: anchor_row,
+                    width: 1,
+                    height: 1,
+                });
+            }
+
+            set_context_menu({
+                x: event.bounds.x + event.localEventX,
+                y: event.bounds.y + event.localEventY,
+                row: anchor_row,
+                col: anchor_col,
+            });
+        },
+        [merges, select_rect],
+    );
+
+    const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
+
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
@@ -541,6 +677,38 @@ export function GridShell({
         [on_column_resize],
     );
 
+    // Build menu items for the open context menu. "Copy selection" appears only
+    // for a multi-cell selection; "Discard edit" only when the clicked cell is
+    // dirty. Editing the cell isn't offered (no clean Glide open-overlay API).
+    const menu_items: MenuItem[] = [];
+    if (context_menu) {
+        const { row, col } = context_menu;
+        const range = grid_selection.current?.range;
+        const is_multi_cell = !!range && range.width * range.height > 1;
+        if (dirty_cells.has(`${row}:${col}`)) {
+            menu_items.push({
+                label: 'Discard edit',
+                on_click: () => discard_edit(row, col),
+            });
+        }
+        menu_items.push({
+            label: 'Copy cell',
+            on_click: () => copy_rect({ x: col, y: row, width: 1, height: 1 }),
+        });
+        if (is_multi_cell && range) {
+            menu_items.push({
+                label: 'Copy selection',
+                on_click: () => copy_rect(range),
+            });
+        }
+        menu_items.push({ label: 'Select row', on_click: () => select_row(row) });
+        menu_items.push({
+            label: 'Select column',
+            on_click: () => select_column(col),
+        });
+        menu_items.push({ label: 'Select all', on_click: select_all });
+    }
+
     return (
         <div className="grid-shell-root">
             <DataEditor
@@ -563,6 +731,7 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
+                onCellContextMenu={on_cell_context_menu}
                 provideEditor={provide_editor}
             />
             <MergeOverlay
@@ -578,6 +747,14 @@ export function GridShell({
                 ref={row_resize_ref}
                 on_resize={handle_row_resize_drag}
             />
+            {context_menu && (
+                <ContextMenu
+                    x={context_menu.x}
+                    y={context_menu.y}
+                    items={menu_items}
+                    on_dismiss={dismiss_context_menu}
+                />
+            )}
         </div>
     );
 }
