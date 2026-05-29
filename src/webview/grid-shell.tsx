@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
     DataEditor,
-    GridCellKind,
     type DataEditorRef,
     type GridCell,
     type GridColumn,
@@ -9,7 +8,11 @@ import {
     type Rectangle,
 } from '@glideapps/glide-data-grid';
 import type { SheetMeta } from '../data-source/interface';
-import { build_grid_columns, ROW_HEIGHT_PX } from './grid-model';
+import type { MergeRange } from '../types';
+import { build_grid_columns } from './grid-model';
+import { MergeIndex } from './merge-index';
+import { build_grid_cell } from './cell-renderer';
+import { row_height, type RowHeightOverrides } from './row-heights';
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
 import { vscode_api } from './use-state-sync';
@@ -22,26 +25,21 @@ export interface GridShellProps {
     show_formatting: boolean;
     column_widths: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    row_heights: RowHeightOverrides;
+    // Wired by the row-resize overlay (D-wire-3); accepted now so App's contract
+    // is stable while the overlay lands.
+    on_row_resize: (row: number, height: number) => void;
+    merges: MergeRange[];
     preview_mode?: boolean;
 }
 
-/** CSS font shorthand fragment for Glide's baseFontStyle (size/family added by
- *  the theme). Empty when neither flag is set so the default theme font wins. */
-function font_style(bold: boolean, italic: boolean): string | undefined {
-    if (!bold && !italic) return undefined;
-    const parts: string[] = [];
-    if (italic) parts.push('italic');
-    if (bold) parts.push('600');
-    parts.push('13px');
-    return parts.join(' ');
-}
-
 /**
- * Glide DataEditor wrapper (Phase C): virtualized rows fed by the paged loader,
+ * Glide DataEditor wrapper (Phase D): virtualized rows fed by the paged loader,
  * lettered columns from sheet meta, VS Code theming, scroll-driven fetching,
- * column-resize persistence, and plain text + bold/italic cells. Merges render
- * as plain cells for now (Phase D makes them exact). Read-only; editing/selection
- * are restored in Phase E.
+ * column-resize persistence, per-row variable heights, and merge-aware cells via
+ * {@link build_grid_cell} (native span for horizontal merges; vertical/2D merges
+ * blank here and painted by the overlay). Read-only; editing/selection restored
+ * in Phase E.
  */
 export function GridShell({
     sheet_meta,
@@ -50,6 +48,8 @@ export function GridShell({
     show_formatting,
     column_widths,
     on_column_resize,
+    row_heights,
+    merges,
     preview_mode = false,
 }: GridShellProps): React.JSX.Element {
     const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
@@ -63,33 +63,28 @@ export function GridShell({
         [sheet_meta.columnCount, column_widths],
     );
 
+    const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
+
     const { ensure_rows, get_row, version } = loader;
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
             const [col, row] = cell;
-            const cells = get_row(row);
-            const c = cells ? cells[col] : undefined;
-            if (!c) {
-                // Empty cell, or a page still loading — render blank text.
-                return {
-                    kind: GridCellKind.Text,
-                    data: '',
-                    displayData: '',
-                    allowOverlay: false,
-                };
-            }
-            const style = show_formatting ? font_style(c.bold, c.italic) : undefined;
-            return {
-                kind: GridCellKind.Text,
-                data: c.raw ?? '',
-                displayData: c.formatted,
-                allowOverlay: false,
-                themeOverride: style ? { baseFontStyle: style } : undefined,
-            };
+            return build_grid_cell(
+                row,
+                col,
+                get_row(row),
+                merge_index,
+                show_formatting,
+            );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
-        [get_row, show_formatting, version],
+        [get_row, show_formatting, version, merge_index],
+    );
+
+    const get_row_height = useCallback(
+        (row: number) => row_height(row_heights, row),
+        [row_heights],
     );
 
     const on_visible_region_changed = useCallback(
@@ -157,7 +152,7 @@ export function GridShell({
             rows={sheet_meta.rowCount}
             columns={columns}
             getCellContent={get_cell_content}
-            rowHeight={ROW_HEIGHT_PX}
+            rowHeight={get_row_height}
             rowMarkers="number"
             theme={theme}
             smoothScrollX

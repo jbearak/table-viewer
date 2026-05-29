@@ -36,6 +36,9 @@ export function App(): React.JSX.Element {
     const [column_widths, set_column_widths] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    const [row_heights, set_row_heights] = useState<
+        (Record<number, number> | undefined)[]
+    >([]);
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
@@ -79,6 +82,7 @@ export function App(): React.JSX.Element {
                 );
                 set_active_sheet_index(s.activeSheetIndex ?? 0);
                 set_column_widths(s.columnWidths ?? []);
+                set_row_heights(s.rowHeights ?? []);
 
                 const tab_orient = s.tabOrientation ?? null;
                 set_vertical_tabs(
@@ -103,6 +107,9 @@ export function App(): React.JSX.Element {
                 const sheet_count = msg.meta.sheets.length;
 
                 set_column_widths((prev) =>
+                    trim_sheet_state_array(prev, sheet_count)
+                );
+                set_row_heights((prev) =>
                     trim_sheet_state_array(prev, sheet_count)
                 );
 
@@ -223,6 +230,24 @@ export function App(): React.JSX.Element {
         [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
     );
 
+    const handle_row_resize = useCallback(
+        (row: number, height: number) => {
+            set_row_heights((prev) => {
+                const next = [...prev];
+                const sheet_heights = { ...(next[active_sheet_index] ?? {}) };
+                sheet_heights[row] = height;
+                next[active_sheet_index] = sheet_heights;
+                state_ref.current = {
+                    ...state_ref.current,
+                    rowHeights: [...next],
+                };
+                persist_immediate();
+                return next;
+            });
+        },
+        [active_sheet_index, persist_immediate]
+    );
+
     const handle_toggle_auto_fit = useCallback(() => {
         if (auto_fit_active[active_sheet_index]) {
             // Deactivate: restore snapshotted widths.
@@ -299,6 +324,9 @@ export function App(): React.JSX.Element {
             show_formatting={show_formatting}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
+            row_heights={row_heights[active_sheet_index] ?? {}}
+            on_row_resize={handle_row_resize}
+            merges={current_sheet.merges}
             preview_mode={preview_mode}
         />
     );

@@ -17,7 +17,10 @@ vi.mock('../webview/grid-shell', () => ({
         show_formatting: boolean;
         preview_mode?: boolean;
         column_widths: Record<number, number>;
+        row_heights: Record<number, number>;
+        merges: { startRow: number }[];
         on_column_resize: (col: number, width: number) => void;
+        on_row_resize: (row: number, height: number) => void;
     }) =>
         React.createElement(
             'div',
@@ -28,6 +31,8 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-col-widths': JSON.stringify(props.column_widths),
+                'data-row-heights': JSON.stringify(props.row_heights),
+                'data-merges': String(props.merges?.length ?? 0),
             },
             React.createElement(
                 'button',
@@ -36,6 +41,14 @@ vi.mock('../webview/grid-shell', () => ({
                     onClick: () => props.on_column_resize(2, 222),
                 },
                 'resize'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-row-resize',
+                    onClick: () => props.on_row_resize(3, 50),
+                },
+                'row-resize'
             )
         ),
 }));
@@ -262,6 +275,50 @@ describe('column width persistence', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({
             0: 150,
         });
+    });
+});
+
+describe('row height persistence', () => {
+    it('stores a row resize per sheet and persists it', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+
+        // Grid receives the updated height for row 3.
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
+            3: 50,
+        });
+        const last = post_message.mock.calls.at(-1)![0];
+        expect(last.type).toBe('stateChanged');
+        expect(last.state.rowHeights[0]).toEqual({ 3: 50 });
+    });
+
+    it('restores saved row heights from sheetMeta state', async () => {
+        await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1']), {
+                state: { rowHeights: [{ 1: 44 }] },
+            })
+        );
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
+            1: 44,
+        });
+    });
+});
+
+describe('merges', () => {
+    it('threads the active sheet merge ranges into the grid', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].merges = [
+            { startRow: 0, startCol: 0, endRow: 0, endCol: 2 },
+        ];
+        await dispatch_host_message(sheet_meta_message(meta));
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
     });
 });
 
