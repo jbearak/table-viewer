@@ -12,6 +12,7 @@ import type { MergeRange } from '../types';
 import { build_grid_columns } from './grid-model';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell } from './cell-renderer';
+import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import { row_height, type RowHeightOverrides } from './row-heights';
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
@@ -55,6 +56,7 @@ export function GridShell({
     const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
     const theme = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
+    const overlay_ref = useRef<MergeOverlayHandle | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
 
@@ -90,6 +92,9 @@ export function GridShell({
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
+            // Repaint the merge overlay against the live scroll (fires per
+            // smooth-scroll frame, so blocks stay pinned to their cells).
+            overlay_ref.current?.repaint(range);
             const start = range.y;
             const end = range.y + range.height - 1;
             ensure_rows(start, end);
@@ -144,22 +149,33 @@ export function GridShell({
     );
 
     return (
-        <DataEditor
-            ref={grid_ref}
-            className="glide-grid"
-            width="100%"
-            height="100%"
-            rows={sheet_meta.rowCount}
-            columns={columns}
-            getCellContent={get_cell_content}
-            rowHeight={get_row_height}
-            rowMarkers="number"
-            theme={theme}
-            smoothScrollX
-            smoothScrollY
-            getCellsForSelection={true}
-            onVisibleRegionChanged={on_visible_region_changed}
-            onColumnResize={handle_column_resize}
-        />
+        <div className="grid-shell-root">
+            <DataEditor
+                ref={grid_ref}
+                className="glide-grid"
+                width="100%"
+                height="100%"
+                rows={sheet_meta.rowCount}
+                columns={columns}
+                getCellContent={get_cell_content}
+                rowHeight={get_row_height}
+                rowMarkers="number"
+                theme={theme}
+                smoothScrollX
+                smoothScrollY
+                getCellsForSelection={true}
+                onVisibleRegionChanged={on_visible_region_changed}
+                onColumnResize={handle_column_resize}
+            />
+            <MergeOverlay
+                ref={overlay_ref}
+                grid_ref={grid_ref}
+                merge_index={merge_index}
+                theme={theme}
+                show_formatting={show_formatting}
+                get_row={get_row}
+                version={version}
+            />
+        </div>
     );
 }

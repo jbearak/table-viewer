@@ -13,6 +13,11 @@ export const PAGE_SIZE = 100;
 /** Constant row height for Phase C; Phase D introduces variable heights. */
 export const ROW_HEIGHT_PX = 24;
 
+/** Glide's default header height (we don't override `headerHeight` on the
+ *  DataEditor). The merge overlay clips its painting to below this so a block
+ *  scrolled partly under the header never paints over the column letters. */
+export const HEADER_HEIGHT_PX = 36;
+
 export const MIN_COLUMN_WIDTH_PX = 40;
 export const MAX_COLUMN_WIDTH_PX = 800;
 export const DEFAULT_COLUMN_WIDTH_PX = 120;

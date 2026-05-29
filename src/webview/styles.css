@@ -154,6 +154,17 @@ body {
     overflow: auto;
 }
 
+/* Wraps the Glide canvas and the transparent merge overlay; fills the
+   remaining flex space (column layout, or row layout with vertical tabs) and
+   anchors the absolutely-positioned overlay. */
+.grid-shell-root {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
 .data-table {
     border-collapse: collapse;
     font-family: var(--vscode-editor-font-family, monospace);
