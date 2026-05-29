@@ -27,6 +27,23 @@ export function build_webview_html(
         )
     );
 
+    // Content-Security-Policy for the Glide DataEditor (Phase C).
+    //
+    // Glide is built on styled-components v5, which injects its stylesheet as an
+    // inline <style> element at runtime with no nonce. CSP3 ignores
+    // 'unsafe-inline' in style-src whenever a nonce- or hash-source is also
+    // present, so style-src must NOT carry a nonce — it lists the webview host
+    // source (for our external <link> stylesheet) plus 'unsafe-inline' (for
+    // Glide's injected <style>). The <link> below keeps its nonce attribute,
+    // which is harmless and ignored since the host source already authorizes it.
+    //
+    // img-src adds data:/blob: because Glide draws header/group icons and
+    // markdown-cell images from data URIs onto the canvas. Glide v6 uses no web
+    // workers (canvas + offscreen measureText only), so no worker-src is needed.
+    // script-src stays nonce-locked; default-src stays 'none'.
+    //
+    // NOTE: validated against the documented styled-components/Glide v6 behavior;
+    // re-confirm with devtools (no CSP violations) during the Phase C smoke test.
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -34,7 +51,8 @@ export function build_webview_html(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none';
-               style-src ${webview.cspSource} 'nonce-${nonce}';
+               style-src ${webview.cspSource} 'unsafe-inline';
+               img-src ${webview.cspSource} data: blob:;
                script-src 'nonce-${nonce}';
                font-src ${webview.cspSource};">
 <title>Table Viewer</title>
