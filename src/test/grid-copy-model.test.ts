@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { format_selection_tsv, copy_truncation_message } from '../webview/grid-copy-model';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeRange } from '../types';
+import { MergeIndex } from '../webview/merge-index';
 
 const cell = (raw: string, formatted = raw): RenderedCell => ({
     raw,
@@ -17,7 +18,7 @@ function loader(
     return (row) => grid[row];
 }
 
-const NO_MERGES: MergeRange[] = [];
+const NO_MERGES = new MergeIndex([]);
 
 describe('format_selection_tsv', () => {
     it('copies a single cell', () => {
@@ -77,10 +78,48 @@ describe('format_selection_tsv', () => {
         const out = format_selection_tsv(
             { x: 0, y: 0, width: 3, height: 1 },
             get_row,
-            merges,
+            new MergeIndex(merges),
             true,
         );
         expect(out.text).toBe('merged\t\tx');
+    });
+
+    it('blanks vertically covered cells in a multi-row merge', () => {
+        // A 2x1 vertical merge over (0,0)-(1,0): the cell at (1,0) is covered
+        // (inside the merge, not the anchor) and must copy as blank.
+        const get_row = loader({
+            0: [cell('merged'), cell('a')],
+            1: [cell('shadow'), cell('b')],
+        });
+        const merges: MergeRange[] = [
+            { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
+        ];
+        const out = format_selection_tsv(
+            { x: 0, y: 0, width: 2, height: 2 },
+            get_row,
+            new MergeIndex(merges),
+            true,
+        );
+        expect(out.text).toBe('merged\ta\n\tb');
+    });
+
+    it('blanks a covered cell reached via the rect x/y offset', () => {
+        // Selecting only the bottom-right 1x1 covered cell of a 2x2 merge
+        // anchored at (5,5) proves abs coords (not rect-relative) drive
+        // is_covered: (6,6) is covered, so it copies blank.
+        const get_row = loader({
+            6: [null, null, null, null, null, null, cell('shadow')],
+        });
+        const merges: MergeRange[] = [
+            { startRow: 5, startCol: 5, endRow: 6, endCol: 6 },
+        ];
+        const out = format_selection_tsv(
+            { x: 6, y: 6, width: 1, height: 1 },
+            get_row,
+            new MergeIndex(merges),
+            true,
+        );
+        expect(out.text).toBe('');
     });
 
     it('emits blanks and flags truncated when a row is not loaded', () => {

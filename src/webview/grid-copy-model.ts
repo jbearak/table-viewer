@@ -1,5 +1,5 @@
 import type { RenderedCell } from '../data-source/interface';
-import type { MergeRange } from '../types';
+import type { MergeIndex } from './merge-index';
 
 /** Rectangular selection in grid coordinates (Glide's Rectangle shape). */
 export interface SelectionRect {
@@ -54,26 +54,6 @@ export function copy_truncation_message(
 }
 
 /**
- * Returns true when (row, col) falls inside a merge range but is NOT the
- * anchor (top-left) cell. Such cells render blank in the grid, so copying
- * them should likewise emit nothing while the anchor keeps the merged text.
- */
-function is_merge_hidden(row: number, col: number, merges: MergeRange[]): boolean {
-    for (const m of merges) {
-        if (
-            row >= m.startRow &&
-            row <= m.endRow &&
-            col >= m.startCol &&
-            col <= m.endCol &&
-            !(row === m.startRow && col === m.startCol)
-        ) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
  * Serializes a rectangular selection to TSV (tabs between columns, newlines
  * between rows) by reading cells from the paged loader.
  *
@@ -85,7 +65,7 @@ function is_merge_hidden(row: number, col: number, merges: MergeRange[]): boolea
 export function format_selection_tsv(
     rect: SelectionRect,
     get_row: (row: number) => (RenderedCell | null)[] | undefined,
-    merges: MergeRange[],
+    merge_index: MergeIndex,
     show_formatting: boolean,
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
@@ -113,7 +93,7 @@ export function format_selection_tsv(
                 cells.push('');
                 continue;
             }
-            if (is_merge_hidden(abs_row, abs_col, merges)) {
+            if (merge_index.is_covered(abs_row, abs_col)) {
                 cells.push('');
                 continue;
             }

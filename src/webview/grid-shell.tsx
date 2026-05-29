@@ -540,7 +540,7 @@ export function GridShell({
             const result = format_selection_tsv(
                 rect,
                 get_row_ref.current,
-                merges,
+                merge_index,
                 show_formatting,
             );
             const warning = copy_truncation_message(result.truncationReason);
@@ -549,7 +549,7 @@ export function GridShell({
             }
             void safe_write_to_clipboard(result.text);
         },
-        [merges, show_formatting, safe_write_to_clipboard],
+        [merge_index, show_formatting, safe_write_to_clipboard],
     );
 
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
