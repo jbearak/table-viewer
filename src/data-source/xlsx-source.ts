@@ -55,6 +55,7 @@ export class XlsxDataSource implements DataSource {
                 rowCount: s.rowCount,
                 columnCount: s.columnCount,
                 merges: s.merges,
+                // workbook-level flag; parse_xlsx exposes no per-sheet formatting granularity
                 hasFormatting: has_formatting,
                 store: b.build(),
             };
@@ -76,6 +77,9 @@ export class XlsxDataSource implements DataSource {
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
+        if (sheet_index < 0 || sheet_index >= this.sheets.length) {
+            throw new RangeError(`sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`);
+        }
         const s = this.sheets[sheet_index];
         return { startRow: Math.max(0, start_row), rows: s.store.read_window(start_row, count) };
     }

@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { XlsxDataSource } from '../data-source/xlsx-source';
 import { parse_xlsx } from '../parse-xlsx';
+import type { RenderedCell } from '../data-source/interface';
 
 const load = (name: string) => new Uint8Array(readFileSync(join(__dirname, 'fixtures', name)));
 
@@ -33,7 +34,7 @@ describe('XlsxDataSource', () => {
     it('preserves bold/italic flags', async () => {
         const ds = await XlsxDataSource.create(load('styled.xlsx'));
         const w = ds.read_rows(0, 0, 50);
-        const anyStyled = w.rows.flat().some((c) => c && (c.bold || c.italic));
+        const anyStyled = w.rows.flat().some((c: RenderedCell | null) => c != null && (c.bold || c.italic));
         expect(anyStyled).toBe(true);
     });
 });
