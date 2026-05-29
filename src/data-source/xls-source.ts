@@ -91,9 +91,5 @@ export class XlsDataSource implements DataSource {
         return { startRow: clamped, rows: s.store.read_window(clamped, count) };
     }
 
-    read_all_rows(_sheet_index: number): never {
-        throw new Error('read_all_rows is unsupported for xls (read-only)');
-    }
-
     close(): void { /* GC */ }
 }

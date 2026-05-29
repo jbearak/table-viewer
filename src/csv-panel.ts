@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
+import type { RenderedCell } from './data-source/interface';
 import { ViewerPanelCore } from './panel-core';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
@@ -177,12 +178,29 @@ export function open_csv_table(
                             panel.webview.postMessage({ type: 'saveResult', success: false });
                             return;
                         }
+                        // Stream the sheet to the serializer in fixed-size row
+                        // windows so the full (RenderedCell | null)[][] for the
+                        // whole file never exists at once: each window's cell
+                        // objects become GC-eligible after it is serialized. The
+                        // generator yields rows in absolute order from row 0 to
+                        // rowCount-1 exactly once (read_rows clamps the final
+                        // window to rowCount), so output is byte-identical to
+                        // serializing one materialized array.
+                        const SAVE_WINDOW = 10_000;
+                        const src = source;
+                        const row_count = src.meta().sheets[0].rowCount;
+                        function* row_windows(): Generator<(RenderedCell | null)[]> {
+                            for (let start = 0; start < row_count; start += SAVE_WINDOW) {
+                                const { rows } = src.read_rows(0, start, SAVE_WINDOW);
+                                for (const row of rows) yield row;
+                            }
+                        }
                         const content = serialize_csv(
-                            source.read_all_rows(0),
+                            row_windows(),
                             get_delimiter(),
                             msg.edits,
-                            source.originalColumnCounts,
-                            source.lineEnding
+                            src.originalColumnCounts,
+                            src.lineEnding
                         );
                         suppress_reload_until = Date.now() + 2000;
                         await vscode.workspace.fs.writeFile(

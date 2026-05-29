@@ -7,7 +7,8 @@ const enc = (s: string) => new TextEncoder().encode(s);
 
 /** Read a source's full cell grid as raw strings ('' for null cells). */
 function grid(ds: CsvDataSource): string[][] {
-    return ds.read_all_rows(0).map((row) =>
+    const rowCount = ds.meta().sheets[0].rowCount;
+    return ds.read_rows(0, 0, rowCount).rows.map((row) =>
         row.map((cell) => (cell ? String((cell as CellData).raw ?? '') : ''))
     );
 }
@@ -20,8 +21,18 @@ function grid(ds: CsvDataSource): string[][] {
 function round_trip(buf: Uint8Array, delimiter: ',' | '\t' = ',') {
     const ds = new CsvDataSource(buf, delimiter, 10000);
     const before = grid(ds);
+    // Serialize via small (2-row) windows, mirroring the csv-panel save path and
+    // exercising the Iterable contract / chunk-boundary handling.
+    const rowCount = ds.meta().sheets[0].rowCount;
+    function* windows(): Generator<(CellData | null)[]> {
+        for (let start = 0; start < rowCount; start += 2) {
+            for (const row of ds.read_rows(0, start, 2).rows) {
+                yield row as (CellData | null)[];
+            }
+        }
+    }
     const text = serialize_csv(
-        ds.read_all_rows(0),
+        windows(),
         delimiter,
         undefined,
         ds.originalColumnCounts,
@@ -72,9 +83,9 @@ describe('CsvDataSource', () => {
         expect(ds.meta().sheets[0].rowCount).toBe(2);
         expect(ds.truncationMessage).toMatch(/2 of 4/);
     });
-    it('read_all_rows returns the full sheet', () => {
+    it('read_rows over the whole sheet returns every row', () => {
         const ds = new CsvDataSource(enc('a\nb\nc\n'), ',', 10000);
-        expect(ds.read_all_rows(0).length).toBe(3);
+        expect(ds.read_rows(0, 0, ds.meta().sheets[0].rowCount).rows.length).toBe(3);
     });
     it('supports TSV delimiter', () => {
         const ds = new CsvDataSource(enc('a\tb\n1\t2\n'), '\t', 10000);

@@ -33,8 +33,6 @@ export interface DataSource {
     meta(): WorkbookMeta;
     /** Materialize a window of rows for one sheet. count may overshoot rowCount. */
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow;
-    /** Full row-major view of a sheet (for CSV serialize-on-save). Throws for xlsx/xls. */
-    read_all_rows(sheet_index: number): (RenderedCell | null)[][];
     /** Release buffers/handles. */
     close(): void;
 

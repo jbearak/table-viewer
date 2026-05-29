@@ -23,7 +23,6 @@ describe('data-source interface shapes', () => {
         const ds: DataSource = {
             meta: () => ({ hasFormatting: false, sheets: [] }),
             read_rows: () => ({ startRow: 0, rows: [] }),
-            read_all_rows: () => [],
             close: () => {},
         };
         expect(ds.meta().sheets).toEqual([]);
@@ -32,7 +31,6 @@ describe('data-source interface shapes', () => {
         const ds: DataSource = {
             meta: () => ({ hasFormatting: false, sheets: [] }),
             read_rows: () => ({ startRow: 0, rows: [] }),
-            read_all_rows: () => [],
             close: () => {},
             truncationMessage: 'Showing 2 of 4 rows',
             warnings: ['heads up'],

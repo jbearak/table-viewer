@@ -1,7 +1,18 @@
 import type { CellData } from './types';
 
+/**
+ * Serialize rows to CSV/TSV text.
+ *
+ * `rows` is an `Iterable` of rows rather than a materialized 2-D array so the
+ * CSV save path can stream windows from the data source (one window's cell
+ * objects become GC-eligible after it is serialized) without ever holding the
+ * whole sheet in memory. Arrays are themselves iterable, so callers that pass a
+ * full `(CellData | null)[][]` keep working unchanged. The absolute row index is
+ * tracked manually as we iterate, since `edits` and `original_column_counts` are
+ * both keyed/indexed by absolute row number.
+ */
 export function serialize_csv(
-    rows: (CellData | null)[][],
+    rows: Iterable<(CellData | null)[]>,
     delimiter: ',' | '\t',
     edits?: Record<string, string>,
     original_column_counts?: number[],
@@ -20,9 +31,10 @@ export function serialize_csv(
         }
     }
 
-    for (let r = 0; r < rows.length; r++) {
+    let r = 0;
+    for (const row of rows) {
         const fields: string[] = [];
-        let col_count = original_column_counts?.[r] ?? rows[r].length;
+        let col_count = original_column_counts?.[r] ?? row.length;
         // Extend if any edit targets a column beyond original count
         const max_ec = max_edit_col?.get(r);
         if (max_ec !== undefined && max_ec >= col_count) {
@@ -34,12 +46,13 @@ export function serialize_csv(
             if (edits && key in edits) {
                 value = edits[key];
             } else {
-                const cell = rows[r][c];
-                value = cell !== null ? String(cell.raw ?? '') : '';
+                const cell = row[c];
+                value = cell !== null && cell !== undefined ? String(cell.raw ?? '') : '';
             }
             fields.push(quote_field(value, delimiter));
         }
         lines.push(fields.join(delimiter));
+        r++;
     }
 
     return lines.join(line_ending) + line_ending;

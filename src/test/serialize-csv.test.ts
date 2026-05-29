@@ -72,4 +72,47 @@ describe('serialize_csv', () => {
         };
         expect(serialize_csv(rows, ',', edits)).toBe('filled,b\n');
     });
+
+    describe('windowed (Iterable) serialization', () => {
+        // A generator that yields the same rows in fixed-size windows. Proves
+        // serialize_csv produces byte-identical output whether fed the whole
+        // array at once or row-by-row from windows — the csv-panel save path.
+        function* chunked(
+            rows: (CellData | null)[][],
+            window: number,
+        ): Generator<(CellData | null)[]> {
+            for (let start = 0; start < rows.length; start += window) {
+                const end = Math.min(start + window, rows.length);
+                for (let i = start; i < end; i++) yield rows[i];
+            }
+        }
+
+        it('windowed output equals whole-array output (data, padding, trailing newline)', () => {
+            const rows: (CellData | null)[][] = [
+                [cell('a'), cell('b'), cell('c')],
+                [cell('1')],                       // short row -> padding via originalColumnCounts
+                [cell('x'), null, cell('z')],      // null cell
+                [cell('m'), cell('n')],
+                [cell('say "hi"'), cell('p,q')],   // quoting
+            ];
+            const originalColumnCounts = [3, 1, 3, 2, 2];
+            const edits: Record<string, string> = { '1:2': 'EXT' }; // edit beyond original count
+            const whole = serialize_csv(rows, ',', edits, originalColumnCounts, '\r\n');
+            const windowed = serialize_csv(chunked(rows, 2), ',', edits, originalColumnCounts, '\r\n');
+            expect(windowed).toBe(whole);
+        });
+
+        it('applies an edit in a later window at the correct absolute row', () => {
+            const rows: (CellData | null)[][] = [
+                [cell('a'), cell('b')],
+                [cell('c'), cell('d')],
+                [cell('e'), cell('f')],
+                [cell('g'), cell('h')],
+            ];
+            // Edit lands in the 3rd window (rows 2 and 3 with window=2 => row 3 col 1).
+            const edits: Record<string, string> = { '3:1': 'EDITED' };
+            const windowed = serialize_csv(chunked(rows, 2), ',', edits);
+            expect(windowed).toBe('a,b\nc,d\ne,f\ng,EDITED\n');
+        });
+    });
 });

@@ -51,10 +51,6 @@ describe('XlsDataSource', () => {
         const ds = new XlsDataSource(load('basic.xls'));
         expect(() => ds.read_rows(99, 0, 10)).toThrow(RangeError);
     });
-    it('throws for read_all_rows (xls is read-only)', () => {
-        const ds = new XlsDataSource(load('basic.xls'));
-        expect(() => ds.read_all_rows(0)).toThrow();
-    });
     it('exposes public warnings array', () => {
         const ds = new XlsDataSource(load('basic.xls'));
         expect(Array.isArray(ds.warnings)).toBe(true);

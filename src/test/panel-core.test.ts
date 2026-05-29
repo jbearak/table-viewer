@@ -21,7 +21,6 @@ class StubSource implements DataSource {
         }
         return { startRow: start, rows };
     }
-    read_all_rows(): (RenderedCell | null)[][] { return []; }
     close(): void {}
 }
 

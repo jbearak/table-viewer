@@ -130,10 +130,6 @@ export class CsvDataSource implements DataSource {
         return { startRow: start, rows };
     }
 
-    read_all_rows(_sheet: number): (RenderedCell | null)[][] {
-        return this.read_rows(0, 0, this._rowCount).rows;
-    }
-
     /**
      * Row -> 0-based source-line map for the CSV preview pane's scroll sync.
      * Built from the same row boundaries as the grid (so its length always equals
