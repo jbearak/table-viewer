@@ -39,18 +39,44 @@ const BLANK: GridCell = {
     allowOverlay: false,
 };
 
+/**
+ * Per-cell editing state, supplied by the grid shell only in CSV edit mode
+ * (CSV sheets have no merges, so this is applied solely to the plain-cell path).
+ * Colors are theme-resolved by the caller to keep this module canvas/theme-free.
+ */
+export interface CellEditOverlay {
+    /** When set, display this dirty value instead of the persisted content. */
+    dirty_value?: string;
+    /** themeOverride background tint for dirty / conflicted cells. */
+    bg?: string;
+    /** Open Glide's edit overlay on this cell. */
+    editable?: boolean;
+}
+
+const EMPTY_CELL: RenderedCell = {
+    raw: '',
+    formatted: '',
+    bold: false,
+    italic: false,
+};
+
 function text_cell(
     c: RenderedCell,
     show_formatting: boolean,
     span?: [number, number],
+    overlay?: CellEditOverlay,
 ): GridCell {
     const style = show_formatting ? font_style(c.bold, c.italic) : undefined;
+    const theme_override: { baseFontStyle?: string; bgCell?: string } = {};
+    if (style) theme_override.baseFontStyle = style;
+    if (overlay?.bg) theme_override.bgCell = overlay.bg;
+    const has_override = theme_override.baseFontStyle !== undefined || theme_override.bgCell !== undefined;
     return {
         kind: GridCellKind.Text,
-        data: c.raw ?? '',
-        displayData: c.formatted,
-        allowOverlay: false,
-        ...(style ? { themeOverride: { baseFontStyle: style } } : {}),
+        data: overlay?.dirty_value ?? (c.raw ?? ''),
+        displayData: overlay?.dirty_value ?? c.formatted,
+        allowOverlay: overlay?.editable ?? false,
+        ...(has_override ? { themeOverride: theme_override } : {}),
         ...(span ? { span } : {}),
     };
 }
@@ -65,6 +91,7 @@ export function build_grid_cell(
     cells: (RenderedCell | null)[] | undefined,
     merge_index: MergeIndex,
     show_formatting: boolean,
+    overlay?: CellEditOverlay,
 ): GridCell {
     const entry = merge_index.entry_at(row, col);
 
@@ -81,6 +108,12 @@ export function build_grid_cell(
     }
 
     const c = cells ? cells[col] : undefined;
-    if (!c) return BLANK;
-    return text_cell(c, show_formatting);
+    if (!c) {
+        // In CSV edit mode an empty cell can still be edited or hold a dirty
+        // value, so synthesize a blank editable cell; otherwise it's read-only.
+        return overlay
+            ? text_cell(EMPTY_CELL, show_formatting, undefined, overlay)
+            : BLANK;
+    }
+    return text_cell(c, show_formatting, undefined, overlay);
 }
