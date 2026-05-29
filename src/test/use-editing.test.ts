@@ -16,43 +16,39 @@ function cell(raw: string): CellData {
     return { raw, formatted: raw, bold: false, italic: false };
 }
 
-const rows: (CellData | null)[][] = [
+const base_rows: (CellData | null)[][] = [
     [cell('a'), cell('b'), cell('c')],
     [cell('d'), cell('e'), cell('f')],
     [cell('g'), null, cell('i')],
 ];
 
-function TestComponent({ rows }: { rows: (CellData | null)[][] }) {
-    hook_result = use_editing(rows, 3, 3);
+// Mirrors the live consumer: read the cell's raw text from the paged cache,
+// mapping blank / not-yet-loaded cells to ''.
+function make_get_cell_raw(rows: (CellData | null)[][]) {
+    return (r: number, c: number): string => {
+        const cell = rows[r]?.[c];
+        return cell != null ? String(cell.raw ?? '') : '';
+    };
+}
+
+function Harness({ rows, token }: { rows: (CellData | null)[][]; token: number }) {
+    hook_result = use_editing(make_get_cell_raw(rows), token);
     return null;
 }
 
-async function render() {
+async function render(rows: (CellData | null)[][] = base_rows, token = 0) {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
     await act(async () => {
-        root!.render(React.createElement(TestComponent, { rows }));
+        root!.render(React.createElement(Harness, { rows, token }));
     });
 }
 
-function ReloadableComponent({ rows }: { rows: (CellData | null)[][] }) {
-    hook_result = use_editing(rows, rows.length, rows[0]?.length ?? 0);
-    return null;
-}
-
-async function render_reloadable(initial_rows: (CellData | null)[][]) {
-    container = document.createElement('div');
-    document.body.appendChild(container);
-    root = createRoot(container);
+// Simulate a data reload: swap the rows the callback reads and bump the token.
+async function rerender(rows: (CellData | null)[][], token: number) {
     await act(async () => {
-        root!.render(React.createElement(ReloadableComponent, { rows: initial_rows }));
-    });
-}
-
-async function rerender_with_rows(new_rows: (CellData | null)[][]) {
-    await act(async () => {
-        root!.render(React.createElement(ReloadableComponent, { rows: new_rows }));
+        root!.render(React.createElement(Harness, { rows, token }));
     });
 }
 
@@ -169,7 +165,7 @@ describe('use_editing', () => {
 
 describe('conflict detection', () => {
     it('marks conflicted keys when base value changes after reload', async () => {
-        await render_reloadable(rows);
+        await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
@@ -180,13 +176,13 @@ describe('conflict detection', () => {
             [cell('d'), cell('e'), cell('f')],
             [cell('g'), null, cell('i')],
         ];
-        await rerender_with_rows(new_rows);
+        await rerender(new_rows, 1);
 
         expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
     });
 
     it('does not mark conflict when base value unchanged after reload', async () => {
-        await render_reloadable(rows);
+        await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
@@ -197,13 +193,13 @@ describe('conflict detection', () => {
             [cell('d'), cell('e'), cell('f')],
             [cell('g'), null, cell('i')],
         ];
-        await rerender_with_rows(new_rows);
+        await rerender(new_rows, 1);
 
         expect(hook_result!.conflicted_keys.has('0:0')).toBe(false);
     });
 
     it('discard_edit removes a single dirty entry', async () => {
-        await render_reloadable(rows);
+        await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
@@ -218,7 +214,7 @@ describe('conflict detection', () => {
     });
 
     it('discard_conflicted removes only conflicted entries', async () => {
-        await render_reloadable(rows);
+        await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         // Edit two cells
         await act(async () => { hook_result!.start_editing(0, 0); });
@@ -232,7 +228,7 @@ describe('conflict detection', () => {
             [cell('d'), cell('e'), cell('f')],
             [cell('g'), null, cell('i')],
         ];
-        await rerender_with_rows(new_rows);
+        await rerender(new_rows, 1);
 
         expect(hook_result!.conflicted_keys.size).toBe(1);
         await act(async () => { hook_result!.discard_conflicted(); });
@@ -241,7 +237,7 @@ describe('conflict detection', () => {
     });
 
     it('discard_conflicted preserves active editor on non-conflicted cell', async () => {
-        await render_reloadable(rows);
+        await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         // Edit cell 0:0 and confirm
         await act(async () => { hook_result!.start_editing(0, 0); });
@@ -256,7 +252,7 @@ describe('conflict detection', () => {
             [cell('d'), cell('e'), cell('f')],
             [cell('g'), null, cell('i')],
         ];
-        await rerender_with_rows(new_rows);
+        await rerender(new_rows, 1);
 
         // Now start editing a non-conflicted cell (0:2)
         await act(async () => { hook_result!.start_editing(0, 2); });
@@ -268,5 +264,17 @@ describe('conflict detection', () => {
         // Conflicted entry removed, non-conflicted entries preserved
         expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
         expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
+    });
+
+    it('closes the active editor when the reload token changes', async () => {
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        expect(hook_result!.editing_cell).not.toBe(null);
+
+        // External reload bumps the token: open editor closes, edit mode stays on.
+        await rerender(base_rows, 1);
+        expect(hook_result!.editing_cell).toBe(null);
+        expect(hook_result!.edit_mode).toBe(true);
     });
 });
