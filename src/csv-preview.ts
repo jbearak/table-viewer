@@ -299,6 +299,9 @@ function setup_preview(
                     void reveal_source_line(editor, source_line);
                     break;
                 }
+                case 'showWarning':
+                    vscode.window.showWarningMessage(msg.message);
+                    break;
                 default:
                     // requestRows (paginated protocol) -> core answers with rowData.
                     void core?.handle_message(msg);
