@@ -45,4 +45,31 @@ describe('build_line_index', () => {
         expect(idx.rowCount).toBe(2);
         expect(idx.offsetOf(1)).toBe(enc('"a,""b"",c"\n').length);
     });
+    it('treats a quote in the middle of an unquoted field as a literal (newline still splits)', () => {
+        // PapaParse only enters quoted mode when `"` starts a field. Here `a"b`
+        // is an unquoted field, so the following `\n` is a real row boundary —
+        // the old parity-toggle scanner wrongly swallowed it.
+        const src = 'a"b\nc,d\n';
+        const idx = build_line_index(enc(src));
+        expect(idx.rowCount).toBe(2);
+        expect(idx.offsetOf(1)).toBe('a"b\n'.length);
+    });
+    it('does not merge rows when a quoted field is left unbalanced mid-buffer', () => {
+        // `"x` opens a quoted field that never closes; everything after stays
+        // "in quotes" through EOF, matching PapaParse swallowing the rest.
+        const src = 'a,b\n"x\ny\nz';
+        const idx = build_line_index(enc(src));
+        expect(idx.rowCount).toBe(2);
+        expect(idx.offsetOf(1)).toBe('a,b\n'.length);
+    });
+    it('honours the delimiter for field-start detection (TSV)', () => {
+        // Tab-delimited: the `"` after the tab starts a quoted field, so its
+        // embedded newline must not split the row. With the comma default this
+        // would (incorrectly) not be treated as a field start.
+        const TAB = 0x09;
+        const src = 'a\t"x\ny"\np\tq\n';
+        const idx = build_line_index(enc(src), TAB);
+        expect(idx.rowCount).toBe(2);
+        expect(idx.offsetOf(1)).toBe('a\t"x\ny"\n'.length);
+    });
 });

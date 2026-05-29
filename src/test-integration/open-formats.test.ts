@@ -22,8 +22,12 @@ describe('open supported formats', () => {
 
     afterEach(async () => {
         await close_all_editors();
-        // Let the host tear the tab group down before the next case inspects it.
+        // Let the host tear both tab kinds down before the next case inspects them.
+        // Awaiting only the webview tab would let a lingering custom-editor tab from
+        // a prior case make the next has_custom_tab('tableViewer.editor') wait_for
+        // resolve immediately against the stale tab (a false positive).
         await wait_for(() => has_webview_tab('tableViewer.csvTable') === false, 5000);
+        await wait_for(() => has_custom_tab('tableViewer.editor') === false, 5000);
     });
 
     it('CSV opens as a Table Viewer webview panel', async () => {

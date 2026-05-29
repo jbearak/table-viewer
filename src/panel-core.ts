@@ -123,7 +123,15 @@ export class ViewerPanelCore {
             this.cache.delete(key);
             this.cache.set(key, window);
         } else {
-            window = this.source.read_rows(msg.sheetIndex, start_row, msg.count);
+            try {
+                window = this.source.read_rows(msg.sheetIndex, start_row, msg.count);
+            } catch {
+                // A source can throw (e.g. RangeError for an out-of-range
+                // sheetIndex). Answer with an empty window instead of leaving the
+                // webview's request unresolved. The error is deterministic for a
+                // given key, so caching the empty result is safe.
+                window = { startRow: start_row, rows: [] };
+            }
             this.cache.set(key, window);
             this.evict_excess();
         }

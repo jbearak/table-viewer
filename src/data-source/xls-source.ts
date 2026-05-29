@@ -84,7 +84,11 @@ export class XlsDataSource implements DataSource {
             throw new RangeError(`sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`);
         }
         const s = this.sheets[sheet_index];
-        return { startRow: Math.max(0, start_row), rows: s.store.read_window(start_row, count) };
+        // Clamp to the same bounds ColumnarStore.read_window applies internally so
+        // the reported startRow always matches the offset the returned rows begin
+        // at (an out-of-range start_row would otherwise desync the two).
+        const clamped = Math.max(0, Math.min(start_row, s.store.rowCount));
+        return { startRow: clamped, rows: s.store.read_window(clamped, count) };
     }
 
     read_all_rows(_sheet_index: number): never {

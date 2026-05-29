@@ -46,7 +46,9 @@ export class CsvDataSource implements DataSource {
         private readonly delimiter: ',' | '\t',
         max_rows: number,
     ) {
-        this.index = build_line_index(buf);
+        // Pass the delimiter byte so the indexer's field-start quote detection
+        // matches PapaParse (a `"` only opens a quoted field at a field start).
+        this.index = build_line_index(buf, delimiter.charCodeAt(0));
 
         // One full pass for shape only (row lengths), reusing parse-csv's
         // trailing-empty-row rule. We decode the whole buffer once here for

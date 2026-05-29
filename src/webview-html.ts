@@ -27,23 +27,22 @@ export function build_webview_html(
         )
     );
 
-    // Content-Security-Policy for the Glide DataEditor (Phase C).
+    // Content-Security-Policy for the Glide DataEditor.
     //
-    // Glide is built on styled-components v5, which injects its stylesheet as an
-    // inline <style> element at runtime with no nonce. CSP3 ignores
-    // 'unsafe-inline' in style-src whenever a nonce- or hash-source is also
-    // present, so style-src must NOT carry a nonce — it lists the webview host
-    // source (for our external <link> stylesheet) plus 'unsafe-inline' (for
-    // Glide's injected <style>). The <link> below keeps its nonce attribute,
-    // which is harmless and ignored since the host source already authorizes it.
+    // Glide v6 (we pin 6.0.3) dropped styled-components for @linaria/react, a
+    // zero-runtime CSS-in-JS library: all of Glide's styles are extracted at
+    // build time into the mandatory dist/index.css, which we ship in our bundled
+    // stylesheet and load via the <link> below. Glide injects no runtime <style>
+    // element, and our webview bundle contains no createElement('style'),
+    // insertRule, or setAttribute('style') (React applies inline styles via the
+    // CSSOM .style property, which CSP does not gate). So style-src needs only
+    // the webview host source for the external <link> stylesheet — no
+    // 'unsafe-inline', no nonce.
     //
     // img-src adds data:/blob: because Glide draws header/group icons and
     // markdown-cell images from data URIs onto the canvas. Glide v6 uses no web
     // workers (canvas + offscreen measureText only), so no worker-src is needed.
     // script-src stays nonce-locked; default-src stays 'none'.
-    //
-    // NOTE: validated against the documented styled-components/Glide v6 behavior;
-    // re-confirm with devtools (no CSP violations) during the Phase C smoke test.
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -51,7 +50,7 @@ export function build_webview_html(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none';
-               style-src ${webview.cspSource} 'unsafe-inline';
+               style-src ${webview.cspSource};
                img-src ${webview.cspSource} data: blob:;
                script-src 'nonce-${nonce}';
                font-src ${webview.cspSource};">
