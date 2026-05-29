@@ -15,6 +15,7 @@ import {
     type EditableGridCell,
     type GridCell,
     type GridColumn,
+    type GridKeyEventArgs,
     type GridMouseEventArgs,
     type GridSelection,
     type Item,
@@ -26,6 +27,8 @@ import type { MergeRange } from '../types';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu, type MenuItem } from './context-menu';
 import { format_selection_tsv, type SelectionRect } from './grid-copy-model';
+import { resolve_nav } from './grid-nav-model';
+import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import { use_editing, type DirtyEntry } from './use-editing';
@@ -618,6 +621,51 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
+    // Merge-aware keyboard nav. Glide handles plain sheets, range extension, Tab,
+    // and Ctrl+A natively; we only intercept where it falls short — arrow keys on
+    // merged sheets (it otherwise gets stuck stepping into overlay-covered cells)
+    // and hjkl vim nav in view mode. resolve_nav decides; move_active_cell jumps
+    // past a merge to its far edge so navigation never stalls.
+    const on_key_down = useCallback(
+        (args: GridKeyEventArgs) => {
+            const decision = resolve_nav({
+                key: args.key,
+                shift: args.shiftKey,
+                ctrl: args.ctrlKey,
+                meta: args.metaKey,
+                alt: args.altKey,
+                editable: editable_cells,
+                has_merges: merges.length > 0,
+            });
+            if (!decision) return;
+            const cur = grid_selection_ref.current.current?.cell;
+            if (!cur) return;
+            const [cur_col, cur_row] = cur;
+            const next = move_active_cell(
+                cur_row,
+                cur_col,
+                decision.direction,
+                sheet_meta.rowCount,
+                sheet_meta.columnCount,
+                merges,
+            );
+            args.cancel();
+            args.preventDefault();
+            const { cell, range } = expand_glide_selection(
+                [next.col, next.row],
+                { x: next.col, y: next.row, width: 1, height: 1 },
+                merges,
+            );
+            set_grid_selection({
+                columns: CompactSelection.empty(),
+                rows: CompactSelection.empty(),
+                current: { cell, range, rangeStack: [] },
+            });
+            grid_ref.current?.scrollTo(cell[0], cell[1]);
+        },
+        [editable_cells, merges, sheet_meta.rowCount, sheet_meta.columnCount],
+    );
+
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
@@ -732,6 +780,7 @@ export function GridShell({
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
                 onCellContextMenu={on_cell_context_menu}
+                onKeyDown={on_key_down}
                 provideEditor={provide_editor}
             />
             <MergeOverlay
