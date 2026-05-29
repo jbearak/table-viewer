@@ -19,8 +19,9 @@ export interface UseRowLoader {
  * React binding for {@link RowLoader}. Threads `sheet_index`/`generation` in,
  * subscribes to host `rowData` messages, and forces a re-render (which the grid
  * shell uses to repaint freshly-loaded cells). On a sheet switch or reload the
- * cache is cleared; the grid re-requests the visible region on its next
- * `onVisibleRegionChanged`.
+ * cache is cleared and the loader immediately re-requests the currently-visible
+ * region at the new generation (see {@link RowLoader.configure}), so a remount-
+ * free `metaReload` never leaves the visible rows blank until the next scroll.
  */
 export function use_row_loader(
     sheet_index: number,

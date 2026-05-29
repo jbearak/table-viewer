@@ -26,6 +26,7 @@ export class RowLoader {
     private row_count = 0;
     private req_seq = 0;
     private viewport = { start: 0, end: 0 };
+    private viewport_set = false;
 
     constructor(
         private readonly post: PostFn,
@@ -46,18 +47,33 @@ export class RowLoader {
      * Point the loader at a sheet + generation. Clears the cache whenever either
      * changes so stale rows never bleed across a sheet switch or a reload.
      * Idempotent: safe to call on every render.
+     *
+     * When a sheet switch or reload (generation bump) clears the cache, the
+     * currently-visible pages are immediately re-requested at the new
+     * generation. Without this, a `metaReload` that keeps the grid mounted
+     * would leave the visible region blank until the user happens to scroll
+     * (Glide only re-fetches via `onVisibleRegionChanged`, which does not fire
+     * when the region is unchanged). The first `configure` of a session has no
+     * established viewport yet, so nothing is re-requested — the grid's mount
+     * effect drives the initial load.
      */
     configure(sheet_index: number, row_count: number, generation: number): void {
         const changed = sheet_index !== this.sheet_index || generation !== this._generation;
         this.sheet_index = sheet_index;
         this.row_count = row_count;
         this._generation = generation;
-        if (changed) this.clear();
+        if (changed) {
+            this.clear();
+            if (this.viewport_set) {
+                this.ensure_rows(this.viewport.start, this.viewport.end);
+            }
+        }
     }
 
     /** Request any not-yet-resident pages covering the inclusive visible range. */
     ensure_rows(start_row: number, end_row: number): void {
         this.viewport = { start: start_row, end: end_row };
+        this.viewport_set = true;
         for (const start of get_needed_page_starts(start_row, end_row)) {
             if (this.row_count > 0 && start >= this.row_count) continue;
             if (this.pages.has(start)) {

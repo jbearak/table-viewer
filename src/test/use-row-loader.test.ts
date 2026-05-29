@@ -103,6 +103,35 @@ describe('RowLoader', () => {
         expect(loader.get_row(0)).toBeUndefined();
     });
 
+    it('re-requests the current visible region after a generation bump', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 10_000, 1);
+        // User scrolled past page 0: the visible region sits on rows ~500-540.
+        loader.ensure_rows(500, 540);
+        loader.on_row_data(row_data(0, 500, 1));
+        expect(loader.get_row(510)).toBeDefined();
+        post.mockClear();
+
+        // A metaReload bumps the generation. The cache clears; the visible
+        // region must be re-fetched at the NEW generation without waiting for a
+        // scroll, otherwise the grid paints blanks until the user scrolls.
+        loader.configure(0, 10_000, 2);
+        expect(loader.get_row(510)).toBeUndefined();
+
+        const reqs = post.mock.calls.map((c) => c[0] as RequestRows);
+        const page500 = reqs.find((r) => r.startRow === 500);
+        expect(page500).toBeDefined();
+        expect(page500!.generation).toBe(2);
+    });
+
+    it('does not re-request anything on the initial configure (no viewport yet)', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 10_000, 1); // first mount: sheet/gen "change" from defaults
+        expect(post).not.toHaveBeenCalled();
+    });
+
     it('evicts least-recently-used pages beyond the cap, protecting the viewport', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {}, 3); // cap = 3
