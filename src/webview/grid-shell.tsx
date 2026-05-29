@@ -27,6 +27,12 @@ import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import { use_editing, type DirtyEntry } from './use-editing';
 import { collect_save_edits, type LiveEdit } from './csv-save-model';
+import {
+    canvas_font,
+    fit_column_widths,
+    measurable_from_rendered,
+    type MeasurableCell,
+} from './fit-column-model';
 import { CsvCellEditor } from './csv-cell-editor';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
@@ -39,6 +45,11 @@ import { row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+
+/** Resident-row cap sampled when auto-fitting columns (bounds the measure cost
+ *  on huge sheets; we only ever measure already-loaded text, never force a
+ *  fetch). */
+const AUTO_FIT_SAMPLE_ROWS = 2000;
 
 /** Canvas-drawn tint for a cell holding an unsaved edit (low-alpha warning
  *  amber). Concrete rgba — `themeOverride.bgCell` is painted on canvas and can't
@@ -104,6 +115,9 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with imperative save/discard
     // actions so App's toolbar + conflict banner can drive editing that lives here.
     editing_ref?: MutableRefObject<EditingHandle | null>;
+    // App provides this ref; GridShell populates it with a function that measures
+    // loaded rows and returns fitted column widths (null when nothing is loaded).
+    auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
 }
 
 /**
@@ -130,6 +144,7 @@ export function GridShell({
     initial_edits,
     on_editing_change,
     editing_ref,
+    auto_fit_ref,
 }: GridShellProps): React.JSX.Element {
     const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
     const theme = use_vscode_theme();
@@ -154,7 +169,7 @@ export function GridShell({
 
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
 
-    const { ensure_rows, get_row, version } = loader;
+    const { ensure_rows, get_row, sample_loaded_rows, version } = loader;
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against get_row's per-render identity; `version` in the deps
@@ -294,6 +309,44 @@ export function GridShell({
         discard_conflicted,
         has_uncommitted_changes,
     ]);
+
+    // --- Column auto-fit (canvas measureText over sampled loaded rows) ---------
+    // Offscreen 2D context, created lazily. measureText returns CSS px, matching
+    // the units column widths use, so no devicePixelRatio scaling is needed.
+    const measure_ctx_ref = useRef<CanvasRenderingContext2D | null>(null);
+    const font_family = theme.fontFamily ?? 'sans-serif';
+    // Stabilize the per-render loader closure so the ref-population effect below
+    // doesn't re-run every render.
+    const sample_loaded_rows_ref = useRef(sample_loaded_rows);
+    sample_loaded_rows_ref.current = sample_loaded_rows;
+
+    const compute_auto_fit = useCallback((): Record<number, number> | null => {
+        if (!measure_ctx_ref.current) {
+            measure_ctx_ref.current = document
+                .createElement('canvas')
+                .getContext('2d');
+        }
+        const ctx = measure_ctx_ref.current;
+        if (!ctx) return null;
+        const sample = sample_loaded_rows_ref.current(AUTO_FIT_SAMPLE_ROWS);
+        if (sample.length === 0) return null;
+        const cells = sample.map((row) =>
+            row.map((c) => measurable_from_rendered(c, show_formatting)),
+        );
+        const measure = (cell: MeasurableCell): number => {
+            ctx.font = canvas_font(cell.bold, cell.italic, font_family);
+            return ctx.measureText(cell.text).width;
+        };
+        return fit_column_widths(cells, sheet_meta.columnCount, measure);
+    }, [show_formatting, font_family, sheet_meta.columnCount]);
+
+    useEffect(() => {
+        if (!auto_fit_ref) return;
+        auto_fit_ref.current = compute_auto_fit;
+        return () => {
+            auto_fit_ref.current = null;
+        };
+    }, [auto_fit_ref, compute_auto_fit]);
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {

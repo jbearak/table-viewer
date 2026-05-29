@@ -127,4 +127,42 @@ describe('RowLoader', () => {
         expect(post).toHaveBeenCalledTimes(1);
         expect((post.mock.calls[0][0] as RequestRows).startRow).toBe(0);
     });
+
+    describe('sample_loaded_rows', () => {
+        it('returns resident rows, capped at max', () => {
+            const loader = new RowLoader(vi.fn(), () => {});
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(row_data(0, 0, 1));
+            const sample = loader.sample_loaded_rows(5);
+            expect(sample.length).toBe(5);
+            expect(sample[0]?.[0]?.raw).toBe('r0c0');
+        });
+
+        it('is empty when no page is resident', () => {
+            const loader = new RowLoader(vi.fn(), () => {});
+            loader.configure(0, 1000, 1);
+            expect(loader.sample_loaded_rows(10)).toEqual([]);
+        });
+
+        it('excludes rows past row_count in a partial final page', () => {
+            const loader = new RowLoader(vi.fn(), () => {});
+            loader.configure(0, 3, 1); // only 3 rows, but a full page is delivered
+            loader.ensure_rows(0, 2);
+            loader.on_row_data(row_data(0, 0, 1));
+            expect(loader.sample_loaded_rows(100).length).toBe(3);
+        });
+
+        it('draws from multiple resident pages', () => {
+            const loader = new RowLoader(vi.fn(), () => {});
+            loader.configure(0, 100_000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(row_data(0, 0, 1));
+            loader.ensure_rows(PAGE_SIZE, PAGE_SIZE + 10);
+            loader.on_row_data(row_data(0, PAGE_SIZE, 1));
+            // Ask for more than one page's worth so the second page contributes.
+            const sample = loader.sample_loaded_rows(PAGE_SIZE + 5);
+            expect(sample.length).toBe(PAGE_SIZE + 5);
+        });
+    });
 });

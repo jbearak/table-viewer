@@ -9,6 +9,8 @@ export { RowLoader };
 export interface UseRowLoader {
     ensure_rows(start_row: number, end_row: number): void;
     get_row(row: number): (RenderedCell | null)[] | undefined;
+    /** Up to `max` resident rows for sampling (column auto-fit). */
+    sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
     readonly version: number;
 }
@@ -45,6 +47,7 @@ export function use_row_loader(
     return {
         ensure_rows: (s, en) => loader.ensure_rows(s, en),
         get_row: (r) => loader.get_row(r),
+        sample_loaded_rows: (max) => loader.sample_loaded_rows(max),
         version,
     };
 }

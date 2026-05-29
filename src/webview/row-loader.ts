@@ -90,6 +90,24 @@ export class RowLoader {
         return true;
     }
 
+    /**
+     * Up to `max` resident rows drawn across all cached pages, for sampling
+     * (column auto-fit measures loaded text only — it never forces a fetch).
+     * Rows past `row_count` in a partial final page are excluded.
+     */
+    sample_loaded_rows(max: number): (RenderedCell | null)[][] {
+        const out: (RenderedCell | null)[][] = [];
+        for (const [start, page] of this.pages) {
+            for (let i = 0; i < page.length; i++) {
+                if (out.length >= max) return out;
+                const abs = start + i;
+                if (this.row_count > 0 && abs >= this.row_count) break;
+                out.push(page[i]);
+            }
+        }
+        return out;
+    }
+
     /** Cells for an absolute row, or undefined while its page is loading. */
     get_row(row: number): (RenderedCell | null)[] | undefined {
         const start = Math.floor(row / PAGE_SIZE) * PAGE_SIZE;

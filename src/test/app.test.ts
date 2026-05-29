@@ -21,8 +21,16 @@ vi.mock('../webview/grid-shell', () => ({
         merges: { startRow: number }[];
         on_column_resize: (col: number, width: number) => void;
         on_row_resize: (row: number, height: number) => void;
-    }) =>
-        React.createElement(
+        auto_fit_ref?: {
+            current: (() => Record<number, number> | null) | null;
+        };
+    }) => {
+        // Mirror the real GridShell: publish a measure function into the ref so
+        // App's auto-fit toggle has fitted widths to apply.
+        if (props.auto_fit_ref) {
+            props.auto_fit_ref.current = () => ({ 0: 120 });
+        }
+        return React.createElement(
             'div',
             {
                 className: 'grid-shell-stub',
@@ -50,7 +58,8 @@ vi.mock('../webview/grid-shell', () => ({
                 },
                 'row-resize'
             )
-        ),
+        );
+    },
 }));
 
 let root: Root | null = null;

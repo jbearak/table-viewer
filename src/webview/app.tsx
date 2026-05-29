@@ -62,6 +62,9 @@ export function App(): React.JSX.Element {
     // GridShell populates this with imperative save/discard actions (the dirty map
     // lives next to the loader); App calls them from the toolbar + conflict banner.
     const editing_ref = useRef<EditingHandle | null>(null);
+    // GridShell populates this with a measure function returning fitted column
+    // widths (null when nothing is loaded); App calls it from the auto-fit toggle.
+    const auto_fit_ref = useRef<(() => Record<number, number> | null) | null>(null);
     // True between posting a save (from the exit dialog) and its saveResult, so a
     // successful save then completes the deferred exit from edit mode.
     const pending_exit_ref = useRef(false);
@@ -357,9 +360,11 @@ export function App(): React.JSX.Element {
                 return next;
             });
         } else {
-            // Activate: snapshot current widths. Canvas-measured auto-fit lands in
-            // Phase E (offscreen measureText over loaded rows); for now this is a
-            // state-only toggle so the toolbar control stays consistent.
+            // Activate: measure the grid's loaded rows and apply the fitted
+            // widths, snapshotting the current widths so deactivation restores
+            // them. If nothing is loaded there's nothing to measure — leave off.
+            const fitted = auto_fit_ref.current?.();
+            if (!fitted) return;
             const current_widths = column_widths[active_sheet_index];
             set_auto_fit_snapshot((prev) => {
                 const next = [...prev];
@@ -367,6 +372,16 @@ export function App(): React.JSX.Element {
                     ? { ...current_widths }
                     : undefined;
                 auto_fit_snapshot_ref.current = next;
+                return next;
+            });
+            set_column_widths((prev) => {
+                const next = [...prev];
+                next[active_sheet_index] = fitted;
+                state_ref.current = {
+                    ...state_ref.current,
+                    columnWidths: [...next],
+                };
+                persist_immediate();
                 return next;
             });
             set_auto_fit_active((prev) => {
@@ -424,6 +439,7 @@ export function App(): React.JSX.Element {
             initial_edits={initial_edits}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
+            auto_fit_ref={auto_fit_ref}
         />
     );
 
