@@ -34,8 +34,8 @@ describe('XlsDataSource', () => {
     it('preserves bold/italic flags when present (basic.xls has number-format hasFormatting)', () => {
         // NOTE: The styled.xls fixture was created without BIFF8 bold/italic encoding —
         // parse_xls reports hasFormatting:false and zero styled cells for it.
-        // basic.xls has hasFormatting:true (number formats differ from raw), confirming
-        // XlsDataSource correctly propagates whatever parse_xls reports.
+        // basic.xls has hasFormatting:true (some cells differ from raw and/or are styled),
+        // confirming XlsDataSource correctly propagates whatever parse_xls reports.
         const ds = new XlsDataSource(load('basic.xls'));
         const m = ds.meta();
         expect(m.hasFormatting).toBe(true);
@@ -53,7 +53,7 @@ describe('XlsDataSource', () => {
     });
     it('throws for read_all_rows (xls is read-only)', () => {
         const ds = new XlsDataSource(load('basic.xls'));
-        expect(() => ds.read_all_rows()).toThrow();
+        expect(() => ds.read_all_rows(0)).toThrow();
     });
     it('exposes public warnings array', () => {
         const ds = new XlsDataSource(load('basic.xls'));

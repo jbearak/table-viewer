@@ -84,7 +84,7 @@ export class XlsxDataSource implements DataSource {
         return { startRow: Math.max(0, start_row), rows: s.store.read_window(start_row, count) };
     }
 
-    read_all_rows(): never {
+    read_all_rows(_sheet_index: number): never {
         throw new Error('read_all_rows is unsupported for xlsx (read-only)');
     }
 
