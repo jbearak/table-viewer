@@ -38,8 +38,9 @@ export function build_line_index(buf: Uint8Array): LineIndex {
         }
     }
 
-    // Use a typed array for memory; 1M rows -> 4 MB.
-    const arr = Int32Array.from(offsets);
+    // Use a typed array for memory; Float64Array (8 bytes/row) -> ~8 MB per 1M rows.
+    // Float64Array is required because byte offsets can exceed the signed 32-bit max (~2 GB).
+    const arr = Float64Array.from(offsets);
     return {
         rowCount: arr.length,
         offsetOf: (r) => arr[r],

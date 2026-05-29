@@ -34,4 +34,15 @@ describe('build_line_index', () => {
         const idx = build_line_index(buf);
         expect(idx.endOffsetOf(idx.rowCount - 1)).toBe(buf.length);
     });
+    it('empty buffer has rowCount 0', () => {
+        const idx = build_line_index(enc(''));
+        expect(idx.rowCount).toBe(0);
+    });
+    it('doubled-quote escape keeps parity correct', () => {
+        // Row 0: `"a,""b"",c"` (quoted field with escaped quotes), row 1: `x,y`
+        const src = '"a,""b"",c"\nx,y\n';
+        const idx = build_line_index(enc(src));
+        expect(idx.rowCount).toBe(2);
+        expect(idx.offsetOf(1)).toBe(enc('"a,""b"",c"\n').length);
+    });
 });
