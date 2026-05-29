@@ -127,6 +127,37 @@ export function use_editing(
         [editing_cell, get_cell_raw],
     );
 
+    // Location-based commit for Glide, whose overlay editor reports edits via
+    // onCellEdited(location, newCell). Unlike confirm_edit it doesn't rely on
+    // editing_cell, but it still clears the open editor if it happens to match.
+    const commit_edit = useCallback(
+        (row: number, col: number, new_value: string) => {
+            const key = `${row}:${col}`;
+            const original = get_cell_raw(row, col);
+
+            set_editing_cell((prev) =>
+                prev && prev.row === row && prev.col === col ? null : prev,
+            );
+
+            if (new_value === original) {
+                set_dirty_cells((prev) => {
+                    if (!prev.has(key)) return prev;
+                    const next = new Map(prev);
+                    next.delete(key);
+                    return next;
+                });
+                return;
+            }
+
+            set_dirty_cells((prev) => {
+                const next = new Map(prev);
+                next.set(key, { value: new_value, base: original });
+                return next;
+            });
+        },
+        [get_cell_raw],
+    );
+
     const cancel_edit = useCallback(() => {
         set_editing_cell(null);
     }, []);
@@ -235,6 +266,7 @@ export function use_editing(
         start_editing,
         force_start_editing,
         confirm_edit,
+        commit_edit,
         cancel_edit,
         clear_dirty,
         clear_dirty_keys,

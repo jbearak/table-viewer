@@ -163,6 +163,50 @@ describe('use_editing', () => {
     });
 });
 
+// Glide opens its own overlay editor and reports edits via
+// onCellEdited(location, newCell) — the location is supplied, not tracked in
+// editing_cell. commit_edit is the location-based counterpart to confirm_edit.
+describe('commit_edit (location-based)', () => {
+    it('stores the dirty value at the given location without start_editing', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        expect(hook_result!.is_dirty).toBe(true);
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({ value: 'A', base: 'a' });
+    });
+
+    it('does not mark dirty when the value equals the original', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('removes an existing dirty entry when reverted to the original', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(true);
+        await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+    });
+
+    it('clears the active editor when it matches the committed location', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        expect(hook_result!.editing_cell).toBe(null);
+    });
+
+    it('stores empty base for null cells', async () => {
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(2, 1, 'X'); });
+        expect(hook_result!.dirty_cells.get('2:1')).toEqual({ value: 'X', base: '' });
+    });
+});
+
 describe('conflict detection', () => {
     it('marks conflicted keys when base value changes after reload', async () => {
         await render(base_rows, 0);
