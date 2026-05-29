@@ -19,6 +19,7 @@ describe('xlsx streaming parity (Task A7)', () => {
 
             expect(streaming.sheets.length).toBe(legacy.data.sheets.length);
             expect(streaming.hasFormatting).toBe(legacy.data.hasFormatting);
+            expect(streaming.warnings).toEqual(legacy.warnings);
 
             for (let si = 0; si < legacy.data.sheets.length; si++) {
                 const ls = legacy.data.sheets[si];

@@ -65,6 +65,10 @@ export class TableViewerEditorProvider
 class ViewerPanel implements vscode.Disposable {
     private disposables: vscode.Disposable[] = [];
     private consecutive_reload_failures = 0;
+    // Monotonic guard so out-of-order reload completions can't adopt a stale
+    // source: each send_reload() bumps this, and a completion only wins if its
+    // captured value still matches.
+    private reload_seq = 0;
     private file_path: string;
     private watcher: vscode.FileSystemWatcher;
     // Protocol engine (paginated sheetMeta/rowData), created on first successful
@@ -142,6 +146,9 @@ class ViewerPanel implements vscode.Disposable {
             .get<number>('maxFileSizeMiB', 256)!;
         assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(this.uri);
+        // Re-check against the bytes actually read: the file may have grown
+        // between stat() and readFile().
+        assert_safe_file_size(raw.byteLength, max_mib);
         const ext = this.file_path.toLowerCase();
         if (ext.endsWith('.xlsx')) {
             return XlsxDataSource.create(raw);
@@ -187,8 +194,15 @@ class ViewerPanel implements vscode.Disposable {
     }
 
     private async send_reload(): Promise<void> {
+        const seq = ++this.reload_seq;
         try {
             const source = await this.build_source();
+            // A newer reload superseded us while we were parsing: discard this
+            // result so the freshest source always wins.
+            if (seq !== this.reload_seq) {
+                source.close();
+                return;
+            }
             this.adopt_source(source);
 
             // Paginated protocol: bump generation + clear cache + post metaReload.
