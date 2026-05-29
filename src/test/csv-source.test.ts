@@ -71,4 +71,23 @@ describe('CsvDataSource', () => {
         const w = ds.read_rows(0, 0, 10);
         expect(w.rows.length).toBe(2);
     });
+    it('create() is an async factory yielding a working source', async () => {
+        const ds = await CsvDataSource.create(enc('a,b\n1,2\n'), ',', 10000);
+        expect(ds).toBeInstanceOf(CsvDataSource);
+        expect(ds.meta().sheets[0].rowCount).toBe(2);
+        expect(ds.read_rows(0, 1, 1).rows[0][0]?.raw).toBe('1');
+    });
+    it('exposes originalColumnCounts (per-row, pre-padding) for the save path', () => {
+        const ds = new CsvDataSource(enc('a,b,c\n1\n2,3\n'), ',', 10000);
+        expect(ds.originalColumnCounts).toEqual([3, 1, 2]);
+    });
+    it('caps originalColumnCounts to max_rows', () => {
+        const ds = new CsvDataSource(enc('a,b\n1\n2,3,4\n'), ',', 2);
+        expect(ds.originalColumnCounts).toEqual([2, 1]);
+    });
+    it('detects lineEnding for the save path', () => {
+        expect(new CsvDataSource(enc('a\r\nb\r\n'), ',', 10000).lineEnding).toBe('\r\n');
+        expect(new CsvDataSource(enc('a\nb\n'), ',', 10000).lineEnding).toBe('\n');
+        expect(new CsvDataSource(enc('a\rb\r'), ',', 10000).lineEnding).toBe('\r');
+    });
 });

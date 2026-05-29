@@ -37,4 +37,16 @@ export interface DataSource {
     read_all_rows(sheet_index: number): (RenderedCell | null)[][];
     /** Release buffers/handles. */
     close(): void;
+
+    // --- Optional diagnostics, read polymorphically by panel-core ---
+    // Kept optional so each source only carries what applies to its format.
+
+    /** Set when the source was truncated (e.g. CSV beyond max_rows). */
+    truncationMessage?: string;
+    /** Parse-time warnings to surface to the user (xlsx/xls). */
+    warnings?: string[];
+    /** CSV save path: per-row field counts before padding, capped to kept rows. */
+    originalColumnCounts?: number[];
+    /** CSV save path: detected line terminator, so re-serialization round-trips. */
+    lineEnding?: '\r\n' | '\r' | '\n';
 }

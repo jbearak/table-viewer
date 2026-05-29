@@ -20,9 +20,26 @@ import { build_line_index, type LineIndex } from './line-index';
  */
 export class CsvDataSource implements DataSource {
     readonly truncationMessage?: string;
+    /** Per-row field counts before padding, capped to kept rows (save path). */
+    readonly originalColumnCounts: number[];
+    /** Detected line terminator so re-serialization round-trips (save path). */
+    readonly lineEnding: '\r\n' | '\r' | '\n';
     private readonly index: LineIndex;
     private readonly _rowCount: number;
     private readonly _colCount: number;
+
+    /**
+     * Async factory mirroring XlsxDataSource.create, so panel-core can build any
+     * format via one `await Source.create(...)` without branching on construction
+     * style. CSV parsing is synchronous; this just wraps the constructor.
+     */
+    static async create(
+        buf: Uint8Array,
+        delimiter: ',' | '\t',
+        max_rows: number,
+    ): Promise<CsvDataSource> {
+        return new CsvDataSource(buf, delimiter, max_rows);
+    }
 
     constructor(
         private readonly buf: Uint8Array,
@@ -55,10 +72,15 @@ export class CsvDataSource implements DataSource {
         }
         this._rowCount = kept;
         let colCount = 0;
+        const originalColumnCounts: number[] = new Array(kept);
         for (let i = 0; i < kept; i++) {
-            if (rows_data[i].length > colCount) colCount = rows_data[i].length;
+            const len = rows_data[i].length;
+            originalColumnCounts[i] = len;
+            if (len > colCount) colCount = len;
         }
         this._colCount = colCount;
+        this.originalColumnCounts = originalColumnCounts;
+        this.lineEnding = detect_line_ending(full_source);
     }
 
     meta(): WorkbookMeta {
@@ -113,4 +135,16 @@ export class CsvDataSource implements DataSource {
         }
         return cells;
     }
+}
+
+/** First line terminator wins; defaults to '\n' for single-line sources.
+ *  Mirrors parse-csv.ts so CSV save round-trips the original ending. */
+function detect_line_ending(source: string): '\r\n' | '\r' | '\n' {
+    for (let i = 0; i < source.length; i++) {
+        if (source[i] === '\r') {
+            return (i + 1 < source.length && source[i + 1] === '\n') ? '\r\n' : '\r';
+        }
+        if (source[i] === '\n') return '\n';
+    }
+    return '\n';
 }

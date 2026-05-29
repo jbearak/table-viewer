@@ -59,4 +59,9 @@ describe('XlsDataSource', () => {
         const ds = new XlsDataSource(load('basic.xls'));
         expect(Array.isArray(ds.warnings)).toBe(true);
     });
+    it('create() is an async factory yielding a working source', async () => {
+        const ds = await XlsDataSource.create(load('basic.xls'));
+        expect(ds).toBeInstanceOf(XlsDataSource);
+        expect(ds.meta().sheets.length).toBeGreaterThan(0);
+    });
 });

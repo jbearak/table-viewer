@@ -26,6 +26,15 @@ export class XlsDataSource implements DataSource {
     private readonly _hasFormatting: boolean;
     readonly warnings: string[];
 
+    /**
+     * Async factory mirroring XlsxDataSource.create, so panel-core can build any
+     * format via one `await Source.create(...)` without branching on construction
+     * style. parse_xls is synchronous; this just wraps the constructor.
+     */
+    static async create(buf: Buffer): Promise<XlsDataSource> {
+        return new XlsDataSource(buf);
+    }
+
     constructor(buf: Buffer) {
         const parsed = parse_xls(buf);
         const has_formatting = parsed.data.hasFormatting;

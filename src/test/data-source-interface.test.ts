@@ -28,4 +28,20 @@ describe('data-source interface shapes', () => {
         };
         expect(ds.meta().sheets).toEqual([]);
     });
+    it('DataSource carries optional diagnostics read polymorphically by panel-core', () => {
+        const ds: DataSource = {
+            meta: () => ({ hasFormatting: false, sheets: [] }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_all_rows: () => [],
+            close: () => {},
+            truncationMessage: 'Showing 2 of 4 rows',
+            warnings: ['heads up'],
+            originalColumnCounts: [3, 1, 2],
+            lineEnding: '\r\n',
+        };
+        expect(ds.truncationMessage).toMatch(/2 of 4/);
+        expect(ds.warnings).toEqual(['heads up']);
+        expect(ds.originalColumnCounts).toEqual([3, 1, 2]);
+        expect(ds.lineEnding).toBe('\r\n');
+    });
 });
