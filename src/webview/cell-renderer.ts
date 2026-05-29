@@ -78,8 +78,10 @@ function text_cell(
         displayData: display,
         allowOverlay: overlay?.editable ?? false,
         // Render hard line breaks across multiple lines so a grown row's content
-        // is visible (rows auto-grow after a multiline edit in grid-shell).
-        ...(display.includes('\n') ? { allowWrapping: true } : {}),
+        // is visible (rows auto-grow after a multiline edit in grid-shell). Not
+        // applied to spanned (horizontal-merge) cells — wrapping inside a span is
+        // unsupported and multiline merge text is vanishingly rare.
+        ...(display.includes('\n') && !span ? { allowWrapping: true } : {}),
         ...(has_override ? { themeOverride: theme_override } : {}),
         ...(span ? { span } : {}),
     };

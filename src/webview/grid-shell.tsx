@@ -602,7 +602,7 @@ export function GridShell({
         (cell: Item, event: CellClickedEventArgs) => {
             event.preventDefault();
             const [col, row] = cell;
-            const { cell: anchor } = expand_glide_selection(
+            const { cell: anchor, range: anchor_range } = expand_glide_selection(
                 cell,
                 { x: col, y: row, width: 1, height: 1 },
                 merges,
@@ -617,12 +617,9 @@ export function GridShell({
                 row >= sel.range.y &&
                 row < sel.range.y + sel.range.height;
             if (!inside) {
-                select_rect(anchor, {
-                    x: anchor_col,
-                    y: anchor_row,
-                    width: 1,
-                    height: 1,
-                });
+                // Use the merge-expanded range so right-clicking any covered cell
+                // selects (and highlights) the whole merge block, not just 1x1.
+                select_rect(anchor, anchor_range);
             }
 
             set_context_menu({
