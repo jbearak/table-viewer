@@ -7,9 +7,8 @@ import {
 } from './spreadsheet-safety';
 import {
     densify,
-    fill_store,
+    make_streaming_sheet,
     working_has_formatting,
-    type CellSink,
     type WorkingSet,
     type StreamingSheet,
     type StreamingWorkbook,
@@ -1068,23 +1067,11 @@ export function parse_xls_streaming(buffer: Buffer): StreamingWorkbook {
             sheets.push({ name: slice.name, rowCount: 0, columnCount: 0, merges: [], fill: () => {} });
             continue;
         }
-        let working: SheetWorking | null = parse_sheet_working(
+        const working = parse_sheet_working(
             slice.records, wb.sst, wb.xfs, wb.fonts, wb.format_map, wb.datemode, wb.budget
         );
         workings.push(working);
-        sheets.push({
-            name: slice.name,
-            rowCount: working.row_count,
-            columnCount: working.col_count,
-            merges: working.merges,
-            fill(sink: CellSink): void {
-                if (!working) throw new Error('StreamingSheet.fill called after its working-set was released');
-                fill_store(working, sink);
-                // Release the working-set so it can be GC'd once this sheet's
-                // store is built, before the next sheet is filled.
-                working = null;
-            },
-        });
+        sheets.push(make_streaming_sheet(slice.name, working, working.merges));
     }
 
     return { sheets, hasFormatting: working_has_formatting(workings), warnings: wb.warnings };

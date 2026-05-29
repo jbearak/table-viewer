@@ -100,6 +100,32 @@ export function fill_store(working: WorkingSet, sink: CellSink): void {
 }
 
 /**
+ * Build the {@link StreamingSheet} seam for one parsed worksheet. Captures
+ * `working` in a `fill` closure that writes it into a sink via {@link fill_store}
+ * exactly once, then releases the reference so the working-set can be GC'd before
+ * the next sheet is filled. Both the .xlsx and .xls streaming parsers produce this
+ * identical seam, so it lives here rather than being copied into each parser.
+ */
+export function make_streaming_sheet(
+    name: string,
+    working: WorkingSet,
+    merges: MergeRange[],
+): StreamingSheet {
+    let pending: WorkingSet | null = working;
+    return {
+        name,
+        rowCount: working.row_count,
+        columnCount: working.col_count,
+        merges,
+        fill(sink: CellSink): void {
+            if (!pending) throw new Error('StreamingSheet.fill called after its working-set was released');
+            fill_store(pending, sink);
+            pending = null;
+        },
+    };
+}
+
+/**
  * Densify a worksheet working set into the legacy (CellData|null)[][] shape.
  * Kept so the non-streaming public parsers (and their tests / other callers)
  * behave byte-identically; the streaming path avoids this allocation entirely.
