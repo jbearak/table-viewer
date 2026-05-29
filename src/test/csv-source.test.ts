@@ -1,7 +1,36 @@
 import { describe, it, expect } from 'vitest';
 import { CsvDataSource } from '../data-source/csv-source';
+import { serialize_csv } from '../serialize-csv';
+import type { CellData } from '../types';
 
 const enc = (s: string) => new TextEncoder().encode(s);
+
+/** Read a source's full cell grid as raw strings ('' for null cells). */
+function grid(ds: CsvDataSource): string[][] {
+    return ds.read_all_rows(0).map((row) =>
+        row.map((cell) => (cell ? String((cell as CellData).raw ?? '') : ''))
+    );
+}
+
+/**
+ * Round-trip a buffer through the save path: parse → serialize (no edits) →
+ * re-parse. The cell grids before and after must be identical — that is the
+ * core anti-corruption invariant. Returns both grids and the serialized text.
+ */
+function round_trip(buf: Uint8Array, delimiter: ',' | '\t' = ',') {
+    const ds = new CsvDataSource(buf, delimiter, 10000);
+    const before = grid(ds);
+    const text = serialize_csv(
+        ds.read_all_rows(0),
+        delimiter,
+        undefined,
+        ds.originalColumnCounts,
+        ds.lineEnding,
+    );
+    const reloaded = new CsvDataSource(enc(text), delimiter, 10000);
+    const after = grid(reloaded);
+    return { before, after, text };
+}
 
 describe('CsvDataSource', () => {
     it('reports rowCount and columnCount in meta', () => {
@@ -89,5 +118,54 @@ describe('CsvDataSource', () => {
         expect(new CsvDataSource(enc('a\r\nb\r\n'), ',', 10000).lineEnding).toBe('\r\n');
         expect(new CsvDataSource(enc('a\nb\n'), ',', 10000).lineEnding).toBe('\n');
         expect(new CsvDataSource(enc('a\rb\r'), ',', 10000).lineEnding).toBe('\r');
+    });
+
+    describe('save round-trips without data corruption', () => {
+        it('round-trips well-formed quoted fields unchanged', () => {
+            const { before, after, text } = round_trip(enc('x,"a,b",z\n1,2,3\n'));
+            expect(before).toEqual([['x', 'a,b', 'z'], ['1', '2', '3']]);
+            expect(after).toEqual(before);
+            expect(text).toBe('x,"a,b",z\n1,2,3\n');
+        });
+
+        it('round-trips a trailing-empty-field row without growing columns', () => {
+            const { before, after } = round_trip(enc('a,b,c\n1,2\n'));
+            expect(before).toEqual([['a', 'b', 'c'], ['1', '2', '']]);
+            expect(after).toEqual(before);
+        });
+
+        it('does not inject a spurious trailing column for a stray quote', () => {
+            // `"a"b,c` is malformed; both the index and the cell parse must agree
+            // it is two fields. Pre-fix, the index said 2 but Papa produced cells
+            // that serialized to `"a""b,c\n",` — an extra empty column.
+            const { before, after, text } = round_trip(enc('"a"b,c\n'));
+            expect(before).toEqual([['ab', 'c']]);
+            expect(after).toEqual(before);
+            expect(text).toBe('ab,c\n');
+        });
+
+        it('loses no cells across mixed line endings', () => {
+            // Pre-fix, PapaParse auto-detected a single newline type, so the LF
+            // row merged into a neighbour and the final `y` was dropped.
+            const { before, after } = round_trip(enc('a,b\r\nc,d\nx,y\r\n'));
+            expect(before).toEqual([['a', 'b'], ['c', 'd'], ['x', 'y']]);
+            expect(after).toEqual(before);
+        });
+
+        it('strips a leading UTF-8 BOM so the first cell is clean', () => {
+            const ds = new CsvDataSource(enc('﻿a,b\n1,2\n'), ',', 10000);
+            expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('a');
+            const { before, after } = round_trip(enc('﻿a,b\n1,2\n'));
+            expect(before).toEqual([['a', 'b'], ['1', '2']]);
+            expect(after).toEqual(before);
+        });
+
+        it('a leading BOM before a quoted field still opens the quote', () => {
+            // After BOM strip, the first byte is `"`, which must open a quoted
+            // field — both in the index scan and the cell parse.
+            const ds = new CsvDataSource(enc('﻿"a,b",c\n'), ',', 10000);
+            expect(ds.meta().sheets[0].columnCount).toBe(2);
+            expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('a,b');
+        });
     });
 });

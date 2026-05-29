@@ -1,7 +1,6 @@
 // src/data-source/csv-source.ts
-import Papa from 'papaparse';
 import type { DataSource, RenderedCell, RowWindow, WorkbookMeta } from './interface';
-import { build_line_index, type LineIndex } from './line-index';
+import { build_line_index, split_csv_rows, type LineIndex } from './line-index';
 
 /**
  * DataSource backed by a UTF-8 CSV/TSV byte buffer.
@@ -30,6 +29,8 @@ export class CsvDataSource implements DataSource {
     private readonly index: LineIndex;
     private readonly _rowCount: number;
     private readonly _colCount: number;
+    /** Buffer with any leading UTF-8 BOM removed (see constructor). */
+    private readonly buf: Uint8Array;
 
     /**
      * Async factory mirroring XlsxDataSource.create, so panel-core can build any
@@ -45,17 +46,26 @@ export class CsvDataSource implements DataSource {
     }
 
     constructor(
-        private readonly buf: Uint8Array,
+        buf: Uint8Array,
         private readonly delimiter: ',' | '\t',
         max_rows: number,
     ) {
+        // Strip a leading UTF-8 BOM (EF BB BF) up front so the byte scan and the
+        // decoded fragments in read_rows operate on identical content. Otherwise
+        // the index would see the BOM as 3 literal bytes before the first field
+        // (so a following `"` would NOT be treated as a field start), while the
+        // string parser — fed BOM-free text — would open a quoted field. Removing
+        // it once here keeps both views aligned and drops the BOM from saves.
+        this.buf = (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf)
+            ? buf.subarray(3)
+            : buf;
         // Pass the delimiter byte so the indexer's field-start quote detection
-        // matches PapaParse (a `"` only opens a quoted field at a field start).
-        // The index also yields per-row field counts, so the shape below is read
-        // straight off the byte scan — no whole-buffer decode or full parse. A
-        // trailing newline produces no extra empty row (build_line_index skips the
-        // end-of-buffer boundary), matching parse-csv's trailing-empty-row rule.
-        this.index = build_line_index(buf, delimiter.charCodeAt(0));
+        // matches the cell parser (a `"` only opens a quoted field at a field
+        // start). The index also yields per-row field counts, so the shape below
+        // is read straight off the byte scan — no whole-buffer decode or full
+        // parse. A trailing newline produces no extra empty row (build_line_index
+        // skips the end-of-buffer boundary), matching the cell parser's rule.
+        this.index = build_line_index(this.buf, delimiter.charCodeAt(0));
 
         const total = this.index.rowCount;
         let kept = total;
@@ -74,7 +84,7 @@ export class CsvDataSource implements DataSource {
         }
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
-        this.lineEnding = detect_line_ending(buf);
+        this.lineEnding = detect_line_ending(this.buf);
     }
 
     meta(): WorkbookMeta {
@@ -101,12 +111,15 @@ export class CsvDataSource implements DataSource {
         // Slice the Uint8Array by byte offsets, then decode — correct for multibyte
         // characters. (String.prototype.slice uses UTF-16 char indices, which
         // diverge from UTF-8 byte offsets whenever multibyte chars are present.)
+        // ignoreBOM:true so the decoder never strips a leading U+FEFF: the real
+        // BOM was already removed at construction, and we need the string indices
+        // to line up byte-for-byte with the index scan that produced the offsets.
         const fragment_bytes = this.buf.subarray(byteStart, byteEnd);
-        const fragment = new TextDecoder('utf-8').decode(fragment_bytes);
+        const fragment = new TextDecoder('utf-8', { ignoreBOM: true }).decode(fragment_bytes);
 
-        const parsed = Papa.parse(fragment, {
-            delimiter: this.delimiter, header: false, skipEmptyLines: false,
-        }).data as string[][];
+        // Use the shared row parser so the cells here always match the per-row
+        // field counts the index derived from the same model — no save-path drift.
+        const parsed = split_csv_rows(fragment, this.delimiter);
 
         const rows: (RenderedCell | null)[][] = [];
         for (let i = 0; i < end - start; i++) {

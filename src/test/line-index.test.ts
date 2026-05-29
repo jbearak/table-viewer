@@ -1,6 +1,6 @@
 // src/test/line-index.test.ts
 import { describe, it, expect } from 'vitest';
-import { build_line_index } from '../data-source/line-index';
+import { build_line_index, split_csv_rows } from '../data-source/line-index';
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
@@ -120,5 +120,82 @@ describe('build_line_index', () => {
             expect(idx.fieldCountOf(0)).toBe(3);
             expect(idx.fieldCountOf(1)).toBe(2);
         });
+    });
+});
+
+describe('split_csv_rows', () => {
+    it('splits simple LF rows into fields', () => {
+        expect(split_csv_rows('a,b\nc,d\n', ',')).toEqual([['a', 'b'], ['c', 'd']]);
+    });
+    it('does not emit a phantom empty row after a trailing newline', () => {
+        expect(split_csv_rows('a,b\n', ',')).toEqual([['a', 'b']]);
+    });
+    it('keeps the final row when there is no trailing newline', () => {
+        expect(split_csv_rows('a,b\nc,d', ',')).toEqual([['a', 'b'], ['c', 'd']]);
+    });
+    it('returns no rows for an empty string', () => {
+        expect(split_csv_rows('', ',')).toEqual([]);
+    });
+    it('treats CR, LF, and CRLF all as row terminators', () => {
+        expect(split_csv_rows('a,b\r\nc,d\nx,y\r\n', ',')).toEqual([
+            ['a', 'b'], ['c', 'd'], ['x', 'y'],
+        ]);
+    });
+    it('preserves a quoted field containing the delimiter and a newline', () => {
+        expect(split_csv_rows('"x,y\nz",w\np,q\n', ',')).toEqual([
+            ['x,y\nz', 'w'], ['p', 'q'],
+        ]);
+    });
+    it('unescapes a doubled quote inside a quoted field', () => {
+        expect(split_csv_rows('"a,""b"",c"\nx,y\n', ',')).toEqual([
+            ['a,"b",c'], ['x', 'y'],
+        ]);
+    });
+    it('treats a stray quote in the middle of an unquoted field as literal', () => {
+        // `"a"b` is one field whose value is `ab`: the quoted part `a` plus the
+        // trailing literal `b`. Crucially it is ONE field, matching build_line_index.
+        expect(split_csv_rows('"a"b,c\n', ',')).toEqual([['ab', 'c']]);
+    });
+    it('counts an empty trailing field after a delimiter', () => {
+        expect(split_csv_rows('a,\n', ',')).toEqual([['a', '']]);
+    });
+    it('emits a blank line as one empty field', () => {
+        expect(split_csv_rows('a\n\nb\n', ',')).toEqual([['a'], [''], ['b']]);
+    });
+    it('honours the delimiter for field-start quote detection (TSV)', () => {
+        expect(split_csv_rows('a\t"x\ny"\np\tq\n', '\t')).toEqual([
+            ['a', 'x\ny'], ['p', 'q'],
+        ]);
+    });
+
+    // The save path relies on build_line_index's per-row field counts matching
+    // exactly the cells split_csv_rows produces. If they ever diverge, serialize
+    // emits spurious or missing columns. Pin them together across awkward inputs.
+    describe('agrees with build_line_index on shape', () => {
+        const cases = [
+            'a,b\nc,d\ne,f\n',
+            'a,b\nc,d,e\nf\n',
+            'a,b\nc,d',
+            '"x\ny",z\np,q\n',
+            '"a,""b"",c"\nx,y\n',
+            'a"b\nc,d\n',
+            'a,b\n"x\ny\nz',
+            'a,b\r\nc,d\nx,y\r\n',
+            '"a"b,c\n',
+            'a,\n',
+            'a\n\nb\n',
+            'café,x\n1,2\n',
+            '',
+        ];
+        for (const src of cases) {
+            it(`matches for ${JSON.stringify(src)}`, () => {
+                const idx = build_line_index(enc(src));
+                const rows = split_csv_rows(src, ',');
+                expect(rows.length).toBe(idx.rowCount);
+                for (let r = 0; r < idx.rowCount; r++) {
+                    expect(rows[r].length).toBe(idx.fieldCountOf(r));
+                }
+            });
+        }
     });
 });
