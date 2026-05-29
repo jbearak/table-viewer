@@ -22,11 +22,14 @@ const base_rows: (CellData | null)[][] = [
     [cell('g'), null, cell('i')],
 ];
 
-// Mirrors the live consumer: read the cell's raw text from the paged cache,
-// mapping blank / not-yet-loaded cells to ''.
+// Mirrors the live consumer: read the cell's raw text from the paged cache.
+// A row that is absent from `rows` (undefined entry) models a page that is NOT
+// resident, and yields `undefined` — distinct from a loaded-but-blank cell ('').
 function make_get_cell_raw(rows: (CellData | null)[][]) {
-    return (r: number, c: number): string => {
-        const cell = rows[r]?.[c];
+    return (r: number, c: number): string | undefined => {
+        const row = rows[r];
+        if (row === undefined) return undefined; // page not resident
+        const cell = row[c];
         return cell != null ? String(cell.raw ?? '') : '';
     };
 }
@@ -320,5 +323,168 @@ describe('conflict detection', () => {
         await rerender(base_rows, 1);
         expect(hook_result!.editing_cell).toBe(null);
         expect(hook_result!.edit_mode).toBe(true);
+    });
+});
+
+// A "page not resident" row is modeled by a `undefined` entry in the rows array
+// (see make_get_cell_raw). These tests guard against the false-conflict bug:
+// get_cell_raw returning '' for an evicted page must NOT look like a changed
+// on-disk value.
+describe('conflict detection with non-resident pages', () => {
+    // base_rows but with row 1 evicted (page not resident).
+    function rows_with_row1_evicted(): (CellData | null)[][] {
+        const rows: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            // row 1 omitted via a hole — modeled as undefined below
+            undefined as unknown as (CellData | null)[],
+            [cell('g'), null, cell('i')],
+        ];
+        return rows;
+    }
+
+    it('B1: a dirty cell whose page is NOT resident is never conflicted', async () => {
+        // Edit cell 1:0 (base 'd') while it is resident.
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(1, 0); });
+        await act(async () => { hook_result!.confirm_edit('D'); });
+        expect(hook_result!.dirty_cells.get('1:0')).toEqual({ value: 'D', base: 'd' });
+
+        // Page for row 1 gets evicted (reload + eviction). get_cell_raw -> undefined.
+        await rerender(rows_with_row1_evicted(), 1);
+
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+        expect(hook_result!.conflicted_keys.size).toBe(0);
+    });
+
+    it('B2: a dirty cell whose page IS resident with disk != base is conflicted', async () => {
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(1, 0); });
+        await act(async () => { hook_result!.confirm_edit('D'); });
+
+        // Reload: row 1 resident, on-disk 1:0 changed 'd' -> 'z'.
+        const new_rows: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            [cell('z'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender(new_rows, 1);
+
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(true);
+    });
+
+    it('B3: a dirty cell whose page IS resident with disk == base is not conflicted', async () => {
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(1, 0); });
+        await act(async () => { hook_result!.confirm_edit('D'); });
+
+        await rerender(base_rows, 1);
+
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+    });
+
+    it('B4: discard_conflicted does not drop an edit whose page is non-resident', async () => {
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(1, 0); });
+        await act(async () => { hook_result!.confirm_edit('D'); });
+
+        await rerender(rows_with_row1_evicted(), 1);
+
+        await act(async () => { hook_result!.discard_conflicted(); });
+        expect(hook_result!.dirty_cells.has('1:0')).toBe(true);
+        expect(hook_result!.dirty_cells.get('1:0')).toEqual({ value: 'D', base: 'd' });
+    });
+});
+
+// Old-format restore: initial_edits with plain string values (no base). When the
+// cell's page is not resident at mount, base must NOT be baked in as '' (which
+// would be a permanent false conflict). It must be captured against the true
+// on-disk value once the page becomes resident.
+describe('old-format string-edit restore (B5)', () => {
+    function InitHarness({
+        rows,
+        token,
+        initial_edits,
+    }: {
+        rows: (CellData | null)[][];
+        token: number;
+        initial_edits: Record<string, string>;
+    }) {
+        hook_result = use_editing(make_get_cell_raw(rows), token, initial_edits);
+        return null;
+    }
+
+    async function render_init(
+        rows: (CellData | null)[][],
+        token: number,
+        initial_edits: Record<string, string>,
+    ) {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(
+                React.createElement(InitHarness, { rows, token, initial_edits }),
+            );
+        });
+    }
+
+    async function rerender_init(
+        rows: (CellData | null)[][],
+        token: number,
+        initial_edits: Record<string, string>,
+    ) {
+        await act(async () => {
+            root!.render(
+                React.createElement(InitHarness, { rows, token, initial_edits }),
+            );
+        });
+    }
+
+    it('B5: non-resident page at mount does not yield a false conflict, and works once resident', async () => {
+        const initial_edits = { '1:0': 'D' };
+        // Row 1 not resident at mount.
+        const rows_evicted: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            undefined as unknown as (CellData | null)[],
+            [cell('g'), null, cell('i')],
+        ];
+        await render_init(rows_evicted, 0, initial_edits);
+
+        // No false conflict while the page is unknown.
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+
+        // Page becomes resident, matching on-disk base 'd' — still not conflicted.
+        await rerender_init(base_rows, 1, initial_edits);
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+    });
+
+    it('B5: base is captured on first residency, then later external changes ARE detected', async () => {
+        const initial_edits = { '1:0': 'D' };
+        const rows_evicted: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            undefined as unknown as (CellData | null)[],
+            [cell('g'), null, cell('i')],
+        ];
+        await render_init(rows_evicted, 0, initial_edits);
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+
+        // Page first becomes resident with the true on-disk value 'd' — this is
+        // captured as the base (no false conflict from a baked-in '').
+        await rerender_init(base_rows, 1, initial_edits);
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
+
+        // A SUBSEQUENT external change of 1:0 ('d' -> 'z') is now detected against
+        // the captured base.
+        const changed: (CellData | null)[][] = [
+            [cell('a'), cell('b'), cell('c')],
+            [cell('z'), cell('e'), cell('f')],
+            [cell('g'), null, cell('i')],
+        ];
+        await rerender_init(changed, 2, initial_edits);
+        expect(hook_result!.conflicted_keys.has('1:0')).toBe(true);
     });
 });

@@ -192,8 +192,12 @@ export function GridShell({
     const get_row_ref = useRef(get_row);
     get_row_ref.current = get_row;
     const get_cell_raw = useCallback(
-        (r: number, c: number): string => {
-            const cell = get_row_ref.current(r)?.[c];
+        (r: number, c: number): string | undefined => {
+            const row = get_row_ref.current(r);
+            // Page not resident (evicted / not yet fetched): return undefined so
+            // conflict detection treats it as unknown, never as a changed value.
+            if (row === undefined) return undefined;
+            const cell = row[c];
             return cell ? String(cell.raw ?? '') : '';
         },
         [version],
@@ -253,7 +257,7 @@ export function GridShell({
         return {
             key: `${row}:${col}`,
             value: el.value,
-            original: get_cell_raw(row, col),
+            original: get_cell_raw(row, col) ?? '',
         };
     }, [get_cell_raw]);
 
