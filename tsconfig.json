@@ -16,5 +16,9 @@
     "types": ["vscode", "node"]
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  // Integration tests use ambient Mocha globals (describe/it/before) and are
+  // type-checked by their own project (tsconfig.integration.json, which adds
+  // the "mocha" types). Excluding them here keeps `tsc -p .` / `npm run watch`
+  // clean — this root project only declares vscode/node types.
+  "exclude": ["node_modules", "dist", "src/test-integration"]
 }

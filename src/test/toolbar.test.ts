@@ -251,7 +251,7 @@ describe('Toolbar', () => {
 
         const rect_spy = vi
             .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
-            .mockImplementation(function () {
+            .mockImplementation(function (this: HTMLElement) {
                 if (
                     this instanceof HTMLButtonElement &&
                     this.textContent === 'Vertical Tabs'

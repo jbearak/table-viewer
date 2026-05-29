@@ -147,9 +147,10 @@ function ToolbarButton({
             set_tooltip_style({
                 left: `${left}px`,
                 top: `${button_rect.bottom + tooltip_gap}px`,
-                ['--toolbar-tooltip-arrow-left' as '--toolbar-tooltip-arrow-left']:
-                    `${arrow_left}px`,
-            });
+                // CSS custom property — not part of React's CSSProperties type,
+                // so the object literal is cast rather than the (ineffective) key.
+                '--toolbar-tooltip-arrow-left': `${arrow_left}px`,
+            } as React.CSSProperties);
         };
 
         update_tooltip_position();
