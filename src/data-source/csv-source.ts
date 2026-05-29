@@ -54,7 +54,11 @@ export class CsvDataSource implements DataSource {
                 `Showing ${max_rows.toLocaleString()} of ${total.toLocaleString()} rows`;
         }
         this._rowCount = kept;
-        this._colCount = rows_data.slice(0, kept).reduce((m, r) => Math.max(m, r.length), 0);
+        let colCount = 0;
+        for (let i = 0; i < kept; i++) {
+            if (rows_data[i].length > colCount) colCount = rows_data[i].length;
+        }
+        this._colCount = colCount;
     }
 
     meta(): WorkbookMeta {

@@ -15,6 +15,7 @@ describe('CsvDataSource', () => {
         const ds = new CsvDataSource(enc('a,b\n1,2\n3,4\n5,6\n'), ',', 10000);
         const w = ds.read_rows(0, 1, 2);
         expect(w.startRow).toBe(1);
+        expect(w.rows.length).toBe(2);
         expect(w.rows[0][0]?.raw).toBe('1');
         expect(w.rows[1][1]?.raw).toBe('4');
     });
@@ -57,5 +58,17 @@ describe('CsvDataSource', () => {
         const ds = new CsvDataSource(enc('café,x\n1,2\n3,4\n'), ',', 10000);
         const w = ds.read_rows(0, 1, 1);
         expect(w.rows[0][0]?.raw).toBe('1');
+    });
+    it('returns empty rows when start_row >= rowCount (fast path)', () => {
+        const ds = new CsvDataSource(enc('a\nb\nc\n'), ',', 10000);
+        // 3-row source; requesting start_row=99 triggers the start>=end fast path
+        const w = ds.read_rows(0, 99, 5);
+        expect(w.rows.length).toBe(0);
+    });
+    it('read_rows respects max_rows truncation', () => {
+        const ds = new CsvDataSource(enc('a\nb\nc\nd\n'), ',', 2);
+        // max_rows=2 on a 4-row source; reading from row 0 should return at most 2 rows
+        const w = ds.read_rows(0, 0, 10);
+        expect(w.rows.length).toBe(2);
     });
 });
