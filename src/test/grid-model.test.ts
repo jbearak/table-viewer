@@ -3,7 +3,6 @@ import {
     PAGE_SIZE,
     get_needed_page_starts,
     clamp_column_width,
-    estimate_text_width_px,
     column_letter,
     build_grid_columns,
     MIN_COLUMN_WIDTH_PX,
@@ -43,17 +42,6 @@ describe('clamp_column_width', () => {
     });
     it('passes through an in-range width', () => {
         expect(clamp_column_width(150)).toBe(150);
-    });
-});
-
-describe('estimate_text_width_px', () => {
-    it('grows with text length', () => {
-        expect(estimate_text_width_px('aaaa')).toBeGreaterThan(
-            estimate_text_width_px('a')
-        );
-    });
-    it('includes cell padding for the empty string', () => {
-        expect(estimate_text_width_px('')).toBeGreaterThan(0);
     });
 });
 

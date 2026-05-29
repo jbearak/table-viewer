@@ -10,9 +10,6 @@ import type { SizedGridColumn } from '@glideapps/glide-data-grid';
  *  cache (and the host-side LRU) key on stable boundaries. */
 export const PAGE_SIZE = 100;
 
-/** Constant row height for Phase C; Phase D introduces variable heights. */
-export const ROW_HEIGHT_PX = 24;
-
 /** Glide's default header height (we don't override `headerHeight` on the
  *  DataEditor). The merge overlay clips its painting to below this so a block
  *  scrolled partly under the header never paints over the column letters. */
@@ -21,11 +18,6 @@ export const HEADER_HEIGHT_PX = 36;
 export const MIN_COLUMN_WIDTH_PX = 40;
 export const MAX_COLUMN_WIDTH_PX = 800;
 export const DEFAULT_COLUMN_WIDTH_PX = 120;
-
-// Rough monospace-ish estimate at the 13px cell font; only used for width
-// heuristics, never for exact layout (Glide measures text itself when drawing).
-const AVG_CHAR_WIDTH_PX = 7;
-const CELL_PADDING_PX = 12; // 6px on each side, mirroring .data-table td
 
 /**
  * Page-aligned start indices whose pages intersect the inclusive visible range
@@ -43,11 +35,6 @@ export function get_needed_page_starts(start_row: number, end_row: number): numb
 /** Clamp a column width to the renderer's allowed range. */
 export function clamp_column_width(width: number): number {
     return Math.max(MIN_COLUMN_WIDTH_PX, Math.min(MAX_COLUMN_WIDTH_PX, width));
-}
-
-/** Cheap text-width estimate (chars × avg glyph width + padding). */
-export function estimate_text_width_px(text: string): number {
-    return text.length * AVG_CHAR_WIDTH_PX + CELL_PADDING_PX;
 }
 
 /** Spreadsheet column label for a 0-based index: 0→A, 25→Z, 26→AA, 702→AAA. */
