@@ -106,11 +106,16 @@ describe('spreadsheet safety limits', () => {
         ).toThrow('Worksheet has too many merged ranges to open safely');
     });
 
+    it('exposes the configured caps', () => {
+        expect(MAX_CSV_ROWS).toBe(1_000_000);
+        expect(MAX_WORKBOOK_CELLS).toBe(50_000_000);
+    });
+
     it('rejects excessive total cell counts across a workbook', () => {
-        // Fill the budget to exactly MAX_WORKBOOK_CELLS, then one more cell tips it over.
+        // Fill the budget to exactly MAX_WORKBOOK_CELLS (50,000,000), then one more cell tips it over.
         const budget = create_workbook_budget();
-        // Use a sheet that consumes all 50,000,000 allowed cells.
-        assert_safe_sheet_shape(budget, 1_000_000, 50, 0);
+        // 1,000,000 rows × 50 cols = MAX_WORKBOOK_CELLS exactly — still ok.
+        assert_safe_sheet_shape(budget, MAX_WORKBOOK_CELLS / 50, 50, 0);
         expect(() =>
             assert_safe_sheet_shape(budget, 1, 1, 0)
         ).toThrow('Workbook is too large to render safely');
