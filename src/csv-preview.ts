@@ -32,7 +32,7 @@ export function show_csv_preview(
         // Reuse panel for different file: clean up old listeners, set up new ones
         active_preview.dispose();
         const new_cleanup = setup_preview(
-            active_preview.panel, uri, state_store, true
+            active_preview.panel, uri, extension_uri, state_store, true
         );
         active_preview.uri = uri;
         active_preview.dispose = new_cleanup;
@@ -56,7 +56,7 @@ export function show_csv_preview(
     const nonce = generate_nonce();
     panel.webview.html = build_webview_html(panel.webview, extension_uri, nonce);
 
-    const cleanup = setup_preview(panel, uri, state_store, false);
+    const cleanup = setup_preview(panel, uri, extension_uri, state_store, false);
 
     active_preview = { panel, uri, dispose: cleanup };
 
@@ -71,6 +71,7 @@ export function show_csv_preview(
 function setup_preview(
     panel: vscode.WebviewPanel,
     uri: vscode.Uri,
+    extension_uri: vscode.Uri,
     state_store: FileStateStore,
     reusing: boolean
 ): () => void {
@@ -106,9 +107,14 @@ function setup_preview(
     }
 
     async function load(): Promise<CsvDataSource> {
+        const max_file_size_mib = get_max_file_size_mib();
         const stat = await vscode.workspace.fs.stat(uri);
-        assert_safe_file_size(stat.size, get_max_file_size_mib());
+        assert_safe_file_size(stat.size, max_file_size_mib);
         const raw = await vscode.workspace.fs.readFile(uri);
+        // Re-check after read: the file can grow between stat() and readFile()
+        // (this is a live-reload viewer, so concurrent writes are expected), and
+        // raw.byteLength is the buffer we actually allocated.
+        assert_safe_file_size(raw.byteLength, max_file_size_mib);
         const delimiter = get_delimiter();
         const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
         const ds = await CsvDataSource.create(raw, delimiter, max_rows);
@@ -311,10 +317,15 @@ function setup_preview(
     disposables.push(watcher.onDidCreate(() => send_reload()));
     disposables.push(watcher);
 
-    // When reusing an existing panel, the webview is already loaded and won't
-    // send 'ready' again. Trigger initial data send directly.
+    // When reusing an existing panel for a different file, rebuild the webview
+    // HTML rather than messaging the live (stale) one. This clears the previous
+    // file's rendered grid immediately — so a slow or failing load can't leave
+    // it on screen under the new title — and re-triggers the 'ready' handshake,
+    // which calls send_initial_data() exactly once for the new file.
     if (reusing) {
-        send_initial_data();
+        panel.webview.html = build_webview_html(
+            panel.webview, extension_uri, generate_nonce()
+        );
     }
 
     return () => {
