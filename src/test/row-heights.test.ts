@@ -3,6 +3,7 @@ import {
     DEFAULT_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
+    natural_row_height,
     row_height,
     set_row_height,
     span_height,
@@ -45,5 +46,33 @@ describe('row-heights', () => {
 
     it('set_row_height overwrites an existing override', () => {
         expect(set_row_height({ 4: 30 }, 4, 80)).toEqual({ 4: 80 });
+    });
+
+    describe('natural_row_height', () => {
+        it('returns the default height for single-line text', () => {
+            expect(natural_row_height('hello', 18, 6)).toBe(DEFAULT_ROW_HEIGHT_PX);
+        });
+
+        it('treats empty text as a single line', () => {
+            expect(natural_row_height('', 18, 6)).toBe(DEFAULT_ROW_HEIGHT_PX);
+        });
+
+        it('grows with each explicit newline', () => {
+            expect(natural_row_height('a\nb', 18, 6)).toBe(2 * 18 + 6);
+            expect(natural_row_height('a\nb\nc', 18, 6)).toBe(3 * 18 + 6);
+        });
+
+        it('counts a trailing newline as an extra line', () => {
+            expect(natural_row_height('a\n', 18, 6)).toBe(2 * 18 + 6);
+        });
+
+        it('honors custom line height and padding', () => {
+            expect(natural_row_height('a\nb', 30, 10)).toBe(2 * 30 + 10);
+        });
+
+        it('never returns below the default height', () => {
+            // Tiny line metrics still clamp up to the default single-row height.
+            expect(natural_row_height('a\nb', 5, 0)).toBe(DEFAULT_ROW_HEIGHT_PX);
+        });
     });
 });

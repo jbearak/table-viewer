@@ -47,7 +47,7 @@ import {
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
 import { expand_glide_selection } from './selection-glide';
-import { row_height, type RowHeightOverrides } from './row-heights';
+import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
@@ -411,9 +411,25 @@ export function GridShell({
             const text =
                 new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
             commit_edit(row, col, text);
+            // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
+            // mirroring the old renderer. Only ever grows a row, never shrinks a
+            // user-sized one; repaints the whole row + overlay at the new height.
+            if (text.includes('\n')) {
+                const needed = natural_row_height(text);
+                if (needed > row_height(row_heights, row)) {
+                    on_row_resize(row, needed);
+                    const cells: { cell: Item }[] = [];
+                    for (let c = 0; c < sheet_meta.columnCount; c++) {
+                        cells.push({ cell: [c, row] });
+                    }
+                    grid_ref.current?.updateCells(cells);
+                    overlay_ref.current?.repaint();
+                    return;
+                }
+            }
             grid_ref.current?.updateCells([{ cell: [col, row] }]);
         },
-        [commit_edit],
+        [commit_edit, row_heights, on_row_resize, sheet_meta.columnCount],
     );
 
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc

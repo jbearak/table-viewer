@@ -43,6 +43,28 @@ export function clamp_row_height(height: number): number {
     return Math.max(MIN_ROW_HEIGHT_PX, height);
 }
 
+/** Per-line text height used when growing a row to fit multiline content. */
+export const DEFAULT_LINE_HEIGHT_PX = 18;
+/** Vertical padding added around the text block of a multiline row. */
+export const DEFAULT_ROW_PADDING_PX = 6;
+
+/**
+ * Natural height needed to display `text` given its explicit line breaks.
+ * Counts `\n`-separated lines (empty text is one line) and returns
+ * `lines * line_height + padding`, floored at {@link DEFAULT_ROW_HEIGHT_PX} so a
+ * single line keeps the standard height. Soft wrapping of long single lines is
+ * not modeled — only hard newlines (the Shift+Alt+Enter editing case) grow rows.
+ */
+export function natural_row_height(
+    text: string,
+    line_height = DEFAULT_LINE_HEIGHT_PX,
+    padding = DEFAULT_ROW_PADDING_PX,
+    default_height = DEFAULT_ROW_HEIGHT_PX,
+): number {
+    const lines = text.length === 0 ? 1 : text.split('\n').length;
+    return Math.max(default_height, lines * line_height + padding);
+}
+
 /** Return a new overrides record with `row` set to a clamped `height`. */
 export function set_row_height(
     overrides: RowHeightOverrides,

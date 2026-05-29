@@ -71,11 +71,15 @@ function text_cell(
     if (style) theme_override.baseFontStyle = style;
     if (overlay?.bg) theme_override.bgCell = overlay.bg;
     const has_override = theme_override.baseFontStyle !== undefined || theme_override.bgCell !== undefined;
+    const display = overlay?.dirty_value ?? c.formatted;
     return {
         kind: GridCellKind.Text,
         data: overlay?.dirty_value ?? (c.raw ?? ''),
-        displayData: overlay?.dirty_value ?? c.formatted,
+        displayData: display,
         allowOverlay: overlay?.editable ?? false,
+        // Render hard line breaks across multiple lines so a grown row's content
+        // is visible (rows auto-grow after a multiline edit in grid-shell).
+        ...(display.includes('\n') ? { allowWrapping: true } : {}),
         ...(has_override ? { themeOverride: theme_override } : {}),
         ...(span ? { span } : {}),
     };
