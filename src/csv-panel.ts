@@ -210,6 +210,10 @@ export function open_csv_table(
                     }
                     break;
                 }
+                case 'showWarning': {
+                    vscode.window.showWarningMessage(msg.message);
+                    break;
+                }
                 case 'showSaveDialog': {
                     const choice = await vscode.window.showWarningMessage(
                         'You have unsaved changes.',

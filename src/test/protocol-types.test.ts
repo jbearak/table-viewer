@@ -52,6 +52,17 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
+    it('WebviewMessage carries a showWarning variant with a message', () => {
+        const msg: WebviewMessage = {
+            type: 'showWarning',
+            message: 'Copied data was clipped.',
+        };
+        expect(msg.type).toBe('showWarning');
+        if (msg.type === 'showWarning') {
+            expect(msg.message).toBe('Copied data was clipped.');
+        }
+    });
+
     it('WebviewMessage carries a requestRows variant', () => {
         const msg: WebviewMessage = {
             type: 'requestRows',

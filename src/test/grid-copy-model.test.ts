@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { format_selection_tsv } from '../webview/grid-copy-model';
+import { format_selection_tsv, copy_truncation_message } from '../webview/grid-copy-model';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeRange } from '../types';
 
@@ -28,7 +28,7 @@ describe('format_selection_tsv', () => {
             NO_MERGES,
             true,
         );
-        expect(out).toEqual({ text: 'b', truncated: false });
+        expect(out).toEqual({ text: 'b', truncated: false, truncationReason: null });
     });
 
     it('joins columns with tabs and rows with newlines', () => {
@@ -93,6 +93,7 @@ describe('format_selection_tsv', () => {
         );
         expect(out.text).toBe('a\tb\n\t');
         expect(out.truncated).toBe(true);
+        expect(out.truncationReason).toBe('non-resident');
     });
 
     it('caps the row count at max_rows and flags truncated', () => {
@@ -107,6 +108,50 @@ describe('format_selection_tsv', () => {
         );
         expect(out.text).toBe('r0\nr1\nr2');
         expect(out.truncated).toBe(true);
+        expect(out.truncationReason).toBe('row-cap');
+    });
+
+    it('reports no truncation reason for a complete copy', () => {
+        const out = format_selection_tsv(
+            { x: 0, y: 0, width: 1, height: 1 },
+            loader({ 0: [cell('a')] }),
+            NO_MERGES,
+            true,
+        );
+        expect(out.truncated).toBe(false);
+        expect(out.truncationReason).toBeNull();
+    });
+
+    it('prefers the row-cap reason when the selection also overflows the cap', () => {
+        // height 5 > cap 2: capped rows never get read, so the cap is the
+        // dominant reason the user should hear about.
+        const out = format_selection_tsv(
+            { x: 0, y: 0, width: 1, height: 5 },
+            loader({ 0: [cell('a')], 1: [cell('b')] }),
+            NO_MERGES,
+            true,
+            2,
+        );
+        expect(out.truncated).toBe(true);
+        expect(out.truncationReason).toBe('row-cap');
+    });
+});
+
+describe('copy_truncation_message', () => {
+    it('returns null when nothing was clipped', () => {
+        expect(copy_truncation_message(null)).toBeNull();
+    });
+
+    it('explains a non-resident clip (rows beyond the loaded range)', () => {
+        const msg = copy_truncation_message('non-resident');
+        expect(msg).toMatch(/copied/i);
+        expect(msg).toMatch(/loaded/i);
+    });
+
+    it('explains a row-cap clip mentioning the 100,000-row limit', () => {
+        const msg = copy_truncation_message('row-cap');
+        expect(msg).toMatch(/copied/i);
+        expect(msg).toMatch(/100,000/);
     });
 
     it('treats null cells as empty', () => {

@@ -126,6 +126,9 @@ class ViewerPanel implements vscode.Disposable {
                     msg.state
                 );
                 break;
+            case 'showWarning':
+                vscode.window.showWarningMessage(msg.message);
+                break;
             default:
                 // requestRows (paginated protocol) -> core answers with rowData.
                 await this.core?.handle_message(msg);

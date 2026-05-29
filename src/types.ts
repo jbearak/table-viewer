@@ -68,4 +68,7 @@ export type WebviewMessage =
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'saveCsv'; edits: Record<string, string> }
     | { type: 'showSaveDialog' }
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null };
+    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null }
+    // User-facing warning raised inside the webview (e.g. a clipped copy) that
+    // the host surfaces via vscode.window.showWarningMessage.
+    | { type: 'showWarning'; message: string };

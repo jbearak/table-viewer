@@ -26,7 +26,11 @@ import type { SheetMeta } from '../data-source/interface';
 import type { MergeRange } from '../types';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu, type MenuItem } from './context-menu';
-import { format_selection_tsv, type SelectionRect } from './grid-copy-model';
+import {
+    format_selection_tsv,
+    copy_truncation_message,
+    type SelectionRect,
+} from './grid-copy-model';
 import { resolve_nav } from './grid-nav-model';
 import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
@@ -527,8 +531,10 @@ export function GridShell({
     }, []);
 
     // Serialize a rectangle from the paged cache and write it to the clipboard.
-    // Reads via get_row_ref so the callback stays stable across page loads; warns
-    // when the copy was clipped (non-resident rows or the row cap).
+    // Reads via get_row_ref so the callback stays stable across page loads. When
+    // the copy is clipped (non-resident rows or the row cap) the available data
+    // is still copied, but the host surfaces a visible warning so the paste
+    // isn't silently incomplete.
     const copy_rect = useCallback(
         (rect: SelectionRect) => {
             const result = format_selection_tsv(
@@ -537,10 +543,9 @@ export function GridShell({
                 merges,
                 show_formatting,
             );
-            if (result.truncated) {
-                console.warn(
-                    'Table Viewer: copied selection was clipped — rows beyond the loaded range or the copy cap were blank.',
-                );
+            const warning = copy_truncation_message(result.truncationReason);
+            if (warning) {
+                vscode_api.postMessage({ type: 'showWarning', message: warning });
             }
             void safe_write_to_clipboard(result.text);
         },
