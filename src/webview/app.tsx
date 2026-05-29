@@ -3,7 +3,7 @@ import type { PerFileState, HostMessage } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { Toolbar } from './toolbar';
 import { SheetTabs } from './sheet-tabs';
-import { GridShell } from './grid-shell';
+import { GridShell, type EditingStatus } from './grid-shell';
 import {
     clamp_sheet_index,
     normalize_per_file_state,
@@ -11,8 +11,6 @@ import {
 } from './sheet-state';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import './styles.css';
-
-const NOOP = (): void => {};
 
 /**
  * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
@@ -47,6 +45,8 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
+    const [edit_mode, set_edit_mode] = useState(false);
+    const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
 
     const state_ref = useRef<PerFileState>({});
     const auto_fit_active_ref = useRef<boolean[]>([]);
@@ -95,6 +95,10 @@ export function App(): React.JSX.Element {
                 set_preview_mode(msg.previewMode ?? false);
                 set_csv_editable(msg.csvEditable ?? false);
                 set_csv_editing_supported(msg.csvEditingSupported ?? false);
+                // A fresh document starts read-only; the GridShell remounts via
+                // its key so its dirty map clears with it.
+                set_edit_mode(false);
+                set_editing_status(null);
             }
 
             if (msg.type === 'metaReload') {
@@ -168,6 +172,17 @@ export function App(): React.JSX.Element {
 
     const handle_toggle_formatting = useCallback(() => {
         set_show_formatting((prev) => !prev);
+    }, []);
+
+    const handle_toggle_edit_mode = useCallback(() => {
+        set_edit_mode((prev) => !prev);
+    }, []);
+
+    // GridShell owns the dirty map (next to the loader); it reports status up so
+    // the toolbar dirty dot, pending-edit persistence, and conflict banner —
+    // App-level concerns — can react.
+    const handle_editing_change = useCallback((status: EditingStatus) => {
+        set_editing_status(status);
     }, []);
 
     const handle_toggle_tab_orientation = useCallback(() => {
@@ -328,6 +343,9 @@ export function App(): React.JSX.Element {
             on_row_resize={handle_row_resize}
             merges={current_sheet.merges}
             preview_mode={preview_mode}
+            edit_mode={edit_mode}
+            csv_editable={csv_editable}
+            on_editing_change={handle_editing_change}
         />
     );
 
@@ -342,10 +360,10 @@ export function App(): React.JSX.Element {
                 show_vertical_tabs_button={has_multiple_sheets}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
-                edit_mode={false}
-                is_dirty={false}
-                on_toggle_edit_mode={NOOP}
-                show_edit_button={false}
+                edit_mode={edit_mode}
+                is_dirty={editing_status?.is_dirty ?? false}
+                on_toggle_edit_mode={handle_toggle_edit_mode}
+                show_edit_button={csv_editing_supported}
             />
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>

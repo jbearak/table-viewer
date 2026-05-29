@@ -2,19 +2,24 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
     CompactSelection,
     DataEditor,
+    GridCellKind,
     type DataEditorRef,
+    type EditableGridCell,
     type GridCell,
     type GridColumn,
     type GridMouseEventArgs,
     type GridSelection,
     type Item,
+    type ProvideEditorCallback,
     type Rectangle,
 } from '@glideapps/glide-data-grid';
 import type { SheetMeta } from '../data-source/interface';
 import type { MergeRange } from '../types';
 import { build_grid_columns } from './grid-model';
 import { MergeIndex } from './merge-index';
-import { build_grid_cell } from './cell-renderer';
+import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
+import { use_editing, type DirtyEntry } from './use-editing';
+import { CsvCellEditor } from './csv-cell-editor';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
     RowResizeOverlay,
@@ -26,10 +31,30 @@ import { row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+
+/** Canvas-drawn tint for a cell holding an unsaved edit (low-alpha warning
+ *  amber). Concrete rgba — `themeOverride.bgCell` is painted on canvas and can't
+ *  resolve CSS `var()`. */
+const DIRTY_BG = 'rgba(204, 167, 0, 0.16)';
+/** Stronger reddish tint for an edit whose underlying cell drifted (conflict). */
+const CONFLICT_BG = 'rgba(229, 75, 75, 0.22)';
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
 import { vscode_api } from './use-state-sync';
 import '@glideapps/glide-data-grid/dist/index.css';
+
+/**
+ * Editing snapshot reported up to {@link App} so it can drive the toolbar dirty
+ * indicator, persist pending edits, and surface the conflict banner — all
+ * App-level concerns, while the dirty map itself lives next to the loader here.
+ */
+export interface EditingStatus {
+    is_dirty: boolean;
+    /** Live `"row:col" → {value, base}` dirty map, for persistence + save. */
+    edits: Record<string, DirtyEntry>;
+    /** Keys whose underlying cell drifted since the edit (external change). */
+    conflicted: string[];
+}
 
 export interface GridShellProps {
     sheet_meta: SheetMeta;
@@ -44,6 +69,13 @@ export interface GridShellProps {
     on_row_resize: (row: number, height: number) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
+    // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
+    // only possible when csv_editable. CSV sheets have no merges, so edits only
+    // ever touch the plain-cell path.
+    edit_mode?: boolean;
+    csv_editable?: boolean;
+    initial_edits?: Record<string, string | DirtyEntry>;
+    on_editing_change?: (status: EditingStatus) => void;
 }
 
 /**
@@ -65,6 +97,10 @@ export function GridShell({
     on_row_resize,
     merges,
     preview_mode = false,
+    edit_mode = false,
+    csv_editable = false,
+    initial_edits,
+    on_editing_change,
 }: GridShellProps): React.JSX.Element {
     const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
     const theme = use_vscode_theme();
@@ -91,19 +127,99 @@ export function GridShell({
 
     const { ensure_rows, get_row, version } = loader;
 
+    // Read a cell's persisted raw text from the paged cache for the editing hook.
+    // Stabilized against get_row's per-render identity; `version` in the deps
+    // makes conflict detection re-run as freshly-loaded pages arrive.
+    const get_row_ref = useRef(get_row);
+    get_row_ref.current = get_row;
+    const get_cell_raw = useCallback(
+        (r: number, c: number): string => {
+            const cell = get_row_ref.current(r)?.[c];
+            return cell ? String(cell.raw ?? '') : '';
+        },
+        [version],
+    );
+
+    const { dirty_cells, conflicted_keys, commit_edit } = use_editing(
+        get_cell_raw,
+        generation,
+        initial_edits,
+    );
+    const editable_cells = edit_mode && csv_editable;
+
+    // Surface editing state to App (toolbar dot, pending-edit persistence,
+    // conflict banner). Object.fromEntries snapshots the live Map per change.
+    useEffect(() => {
+        on_editing_change?.({
+            is_dirty: dirty_cells.size > 0,
+            edits: Object.fromEntries(dirty_cells),
+            conflicted: [...conflicted_keys],
+        });
+    }, [dirty_cells, conflicted_keys, on_editing_change]);
+
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
             const [col, row] = cell;
+            const key = `${row}:${col}`;
+            const dirty = dirty_cells.get(key);
+            // Tint + dirty text whenever an edit exists; open the overlay only in
+            // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
+            let overlay: CellEditOverlay | undefined;
+            if (editable_cells || dirty) {
+                overlay = {
+                    editable: editable_cells,
+                    dirty_value: dirty?.value,
+                    bg: dirty
+                        ? conflicted_keys.has(key)
+                            ? CONFLICT_BG
+                            : DIRTY_BG
+                        : undefined,
+                };
+            }
             return build_grid_cell(
                 row,
                 col,
                 get_row(row),
                 merge_index,
                 show_formatting,
+                overlay,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
-        [get_row, show_formatting, version, merge_index],
+        [
+            get_row,
+            show_formatting,
+            version,
+            merge_index,
+            editable_cells,
+            dirty_cells,
+            conflicted_keys,
+        ],
+    );
+
+    // Glide opens its own overlay editor; it reports the committed value here
+    // with the cell location, which we fold into the dirty map.
+    const on_cell_edited = useCallback(
+        (cell: Item, new_value: EditableGridCell) => {
+            const [col, row] = cell;
+            const text =
+                new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
+            commit_edit(row, col, text);
+            grid_ref.current?.updateCells([{ cell: [col, row] }]);
+        },
+        [commit_edit],
+    );
+
+    // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
+    // cancel). Only consulted for editable Text cells.
+    const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
+        (cell) => {
+            if (!editable_cells || cell.kind !== GridCellKind.Text) return undefined;
+            // disablePadding/disableStyling: the editor carries its own
+            // .cell-editor-input border + background, so suppress Glide's overlay box.
+            return { editor: CsvCellEditor, disablePadding: true, disableStyling: true };
+        },
+        [editable_cells],
     );
 
     const get_row_height = useCallback(
@@ -255,6 +371,8 @@ export function GridShell({
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
+                onCellEdited={on_cell_edited}
+                provideEditor={provide_editor}
             />
             <MergeOverlay
                 ref={overlay_ref}
