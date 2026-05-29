@@ -1,14 +1,14 @@
-// NOTE: parse_xlsx is async (returns a Promise), so XlsxDataSource cannot be
-// constructed synchronously. Use the static async factory `XlsxDataSource.create(buf)`
-// instead of `new XlsxDataSource(buf)`.
+// NOTE: parse_xlsx_streaming is async (returns a Promise), so XlsxDataSource cannot
+// be constructed synchronously. Use the static async factory
+// `XlsxDataSource.create(buf)` instead of `new XlsxDataSource(buf)`.
 //
-// Memory note for 1M-row goal: This implementation builds the legacy (CellData|null)[][]
-// first, then the columnar copy — transient 2× peak. For true 1M-row xlsx, follow up
-// (Phase A optimization task, only if needed) by adding a `parse_xlsx_into(builder)` seam
-// in `src/parse-xlsx.ts` that writes cells directly to the builder, eliminating the
-// intermediate array. Tracked as Task A7.
+// Memory note for 1M-row goal (Task A7 — resolved): cells flow from the parse
+// working-set directly into each sheet's ColumnarStore via parse_xlsx_streaming's
+// `fill` seam. The legacy densified (CellData|null)[][] is never materialized, so
+// the parse working-set and the columnar store no longer co-exist as two full
+// representations of the same sheet — the transient 2× peak is gone.
 
-import { parse_xlsx } from '../parse-xlsx';
+import { parse_xlsx_streaming } from '../parse-xlsx';
 import { ColumnarStore } from './columnar-store';
 import type { DataSource, RowWindow, WorkbookMeta } from './interface';
 import type { MergeRange } from '../types';
@@ -34,22 +34,15 @@ export class XlsxDataSource implements DataSource {
     }
 
     static async create(buf: Uint8Array): Promise<XlsxDataSource> {
-        const parsed = await parse_xlsx(buf);
-        const has_formatting = parsed.data.hasFormatting;
-        const sheets: SheetEntry[] = parsed.data.sheets.map((s) => {
+        const parsed = await parse_xlsx_streaming(buf);
+        const has_formatting = parsed.hasFormatting;
+        const sheets: SheetEntry[] = parsed.sheets.map((s) => {
+            // Fill the columnar store directly from the parse working-set; no
+            // intermediate (CellData|null)[][] is ever allocated. The fill seam
+            // applies the same null/blank + raw-normalization rules this loop
+            // used to apply inline.
             const b = new ColumnarStore.Builder(s.rowCount, s.columnCount);
-            for (let r = 0; r < s.rowCount; r++) {
-                const row = s.rows[r] ?? [];
-                for (let c = 0; c < s.columnCount; c++) {
-                    const cell = row[c] ?? null;
-                    b.set(r, c, cell === null ? null : {
-                        raw: cell.raw === null ? '' : String(cell.raw),
-                        formatted: cell.formatted,
-                        bold: cell.bold,
-                        italic: cell.italic,
-                    });
-                }
-            }
+            s.fill(b);
             return {
                 name: s.name,
                 rowCount: s.rowCount,

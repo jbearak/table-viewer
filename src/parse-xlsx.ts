@@ -6,7 +6,7 @@ import {
     MAX_WORKBOOK_CELLS,
     type WorkbookBudget,
 } from './spreadsheet-safety';
-import { workbook_has_formatting } from './cell-display';
+import { workbook_has_formatting, get_raw_cell_text } from './cell-display';
 import { serial_to_iso, is_date_format, is_valid_excel_date_serial, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
@@ -268,7 +268,36 @@ function parse_dimension(xml: string): { row_count: number; col_count: number } 
     return result;
 }
 
-function parse_worksheet(
+/**
+ * The sparse working set for one parsed worksheet, before densification.
+ * `cells` holds only the non-blank cells that appeared in the XML; `merged_cells`
+ * holds the "r:c" keys covered by (but not anchoring) a merge. `cell_at` is the
+ * single shared place where the null-vs-blank resolution rule is encoded.
+ */
+interface WorksheetWorking {
+    cells: Map<string, CellData>;
+    merged_cells: Set<string>;
+    merges: MergeRange[];
+    row_count: number;
+    col_count: number;
+}
+
+/**
+ * Resolve the cell at (r, c) for a parsed worksheet's working set, applying the
+ * exact null/blank contract:
+ *   - merged-covered (non-anchor) cell  -> null
+ *   - cell present in the XML           -> that CellData
+ *   - otherwise (blank)                 -> { raw: null, formatted: '', bold: false, italic: false }
+ * This is the ONLY place this rule lives; both the densify path and the
+ * direct-to-builder streaming path call it so they cannot diverge.
+ */
+function cell_at(working: WorksheetWorking, r: number, c: number): CellData | null {
+    const key = `${r}:${c}`;
+    if (working.merged_cells.has(key)) return null;
+    return working.cells.get(key) ?? { raw: null, formatted: '', bold: false, italic: false };
+}
+
+function parse_worksheet_core(
     xml: string,
     sst: string[],
     xfs: XfEntry[],
@@ -276,7 +305,7 @@ function parse_worksheet(
     format_map: Map<number, string>,
     datemode: DateMode,
     budget: WorkbookBudget
-): { rows: (CellData | null)[][]; merges: MergeRange[]; row_count: number; col_count: number } {
+): WorksheetWorking {
     // Parse dimension and validate row/col limits early before materializing cells
     const dim = parse_dimension(xml);
     if (dim && dim.row_count > 0 && dim.col_count > 0) {
@@ -401,7 +430,7 @@ function parse_worksheet(
 
     // If no cells were found, the sheet is empty regardless of what dimension says
     if (cells.size === 0) {
-        return { rows: [], merges, row_count: 0, col_count: 0 };
+        return { cells, merged_cells, merges: [], row_count: 0, col_count: 0 };
     }
 
     // Use dimension if available and non-degenerate, otherwise fall back to observed max
@@ -433,21 +462,25 @@ function parse_worksheet(
         }
     }
 
-    // Build rows array
+    return { cells, merged_cells, merges: normalized_merges, row_count, col_count };
+}
+
+/**
+ * Densify a worksheet working set into the legacy (CellData|null)[][] shape.
+ * Kept so `parse_xlsx` (and its tests / other callers) behave byte-identically;
+ * the streaming path avoids this allocation entirely.
+ */
+function densify_worksheet(working: WorksheetWorking): (CellData | null)[][] {
+    const { row_count, col_count } = working;
     const rows: (CellData | null)[][] = [];
     for (let r = 0; r < row_count; r++) {
         const row_data: (CellData | null)[] = [];
         for (let c = 0; c < col_count; c++) {
-            if (merged_cells.has(`${r}:${c}`)) {
-                row_data.push(null);
-            } else {
-                row_data.push(cells.get(`${r}:${c}`) ?? { raw: null, formatted: '', bold: false, italic: false });
-            }
+            row_data.push(cell_at(working, r, c));
         }
         rows.push(row_data);
     }
-
-    return { rows, merges: normalized_merges, row_count, col_count };
+    return rows;
 }
 
 // --- Merge Range / Column Helpers ---
@@ -516,18 +549,138 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
             continue;
         }
 
-        const { rows, merges, row_count, col_count } = parse_worksheet(
+        const working = parse_worksheet_core(
             ws_xml, sst, xfs, fonts, format_map, datemode, budget
         );
 
         sheets.push({
             name: entry.name,
-            rows,
-            merges,
-            columnCount: col_count,
-            rowCount: row_count,
+            rows: densify_worksheet(working),
+            merges: working.merges,
+            columnCount: working.col_count,
+            rowCount: working.row_count,
         });
     }
 
     return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings: [] };
+}
+
+// --- Streaming API (direct-to-builder; no densified intermediate) ---
+
+/**
+ * A minimal builder seam: anything that can be sized by (rows, cols) and accept
+ * `set(r, c, cell)` calls. ColumnarStore.Builder satisfies this structurally.
+ */
+export interface CellSink {
+    set(r: number, c: number, cell: CellData | null): void;
+}
+
+/** Per-sheet streaming entry: meta plus a `fill` that writes cells into a sink. */
+export interface StreamingSheet {
+    name: string;
+    rowCount: number;
+    columnCount: number;
+    merges: MergeRange[];
+    /**
+     * Fill the provided sink (sized rowCount x columnCount) with this sheet's
+     * cells. Applies the SAME cell_at null/blank rule and the SAME raw
+     * normalization (raw === null -> '', else String(raw)) that the legacy
+     * densify-then-copy path used, so the resulting store is byte-identical.
+     */
+    fill(sink: CellSink): void;
+}
+
+export interface StreamingWorkbook {
+    sheets: StreamingSheet[];
+    hasFormatting: boolean;
+    warnings: string[];
+}
+
+/**
+ * Compute the workbook-level hasFormatting flag directly from sheet working sets,
+ * without densifying. Equivalent to workbook_has_formatting() over the densified
+ * sheets: that function skips null cells (merged-covered) and cells with
+ * raw === null (blanks), so only real `cells` entries that are NOT merged-covered
+ * can flip the flag — exactly what we check here.
+ */
+function working_has_formatting(workings: WorksheetWorking[]): boolean {
+    for (const working of workings) {
+        for (const [key, cell] of working.cells) {
+            if (cell.raw === null) continue;
+            if (working.merged_cells.has(key)) continue; // densified -> null, skipped
+            if (cell.formatted !== get_raw_cell_text(cell.raw)) return true;
+            if (cell.bold || cell.italic) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Parse an .xlsx into per-sheet meta + a fill function, never materializing the
+ * intermediate (CellData|null)[][]. Lets a consumer build its own columnar store
+ * directly, eliminating the transient 2x representation peak (Task A7).
+ */
+export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<StreamingWorkbook> {
+    let cfb_file: ReturnType<typeof CFB.read>;
+    try {
+        cfb_file = CFB.read(buffer, { type: 'buffer' });
+    } catch {
+        throw new Error('Not a valid .xlsx file');
+    }
+
+    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
+    if (!workbook_xml) throw new Error('No workbook data found in .xlsx file');
+
+    const { sheets: sheet_entries, datemode } = parse_workbook_xml(workbook_xml);
+    assert_safe_sheet_count(sheet_entries.length);
+
+    const rels = parse_sheet_rels(cfb_file);
+
+    const sst_xml = get_entry_text(cfb_file, '/xl/sharedStrings.xml');
+    const sst = sst_xml ? parse_shared_strings(sst_xml) : [];
+
+    const styles_xml = get_entry_text(cfb_file, '/xl/styles.xml');
+    const { fonts, xfs, format_map } = styles_xml
+        ? parse_styles(styles_xml)
+        : { fonts: [], xfs: [], format_map: new Map<number, string>() };
+
+    const budget = create_workbook_budget();
+    const sheets: StreamingSheet[] = [];
+    const workings: WorksheetWorking[] = [];
+
+    for (const entry of sheet_entries) {
+        const sheet_path = rels.get(entry.rId);
+        if (!sheet_path) continue;
+
+        const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
+        if (!ws_xml) {
+            sheets.push({ name: entry.name, rowCount: 0, columnCount: 0, merges: [], fill: () => {} });
+            continue;
+        }
+
+        const working = parse_worksheet_core(ws_xml, sst, xfs, fonts, format_map, datemode, budget);
+        workings.push(working);
+
+        sheets.push({
+            name: entry.name,
+            rowCount: working.row_count,
+            columnCount: working.col_count,
+            merges: working.merges,
+            fill(sink: CellSink): void {
+                for (let r = 0; r < working.row_count; r++) {
+                    for (let c = 0; c < working.col_count; c++) {
+                        const cell = cell_at(working, r, c);
+                        sink.set(r, c, cell === null ? null : {
+                            raw: cell.raw === null ? '' : String(cell.raw),
+                            formatted: cell.formatted,
+                            bold: cell.bold,
+                            italic: cell.italic,
+                        });
+                    }
+                }
+            },
+        });
+    }
+
+    return { sheets, hasFormatting: working_has_formatting(workings), warnings: [] };
 }
