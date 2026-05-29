@@ -131,6 +131,9 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "compile:integration": "tsc -p tsconfig.integration.json",
+    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run compile:integration",
+    "test:integration": "vscode-test",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
@@ -146,14 +149,18 @@
     "ssf": "^0.11.2"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^22.19.17",
     "@types/papaparse": "^5.5.2",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@types/vscode": "^1.110.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^2.26.0",
     "esbuild": "^0.28.0",
     "jsdom": "^29.0.1",
+    "mocha": "^11.7.6",
     "typescript": "^5.4.0",
     "vitest": "^4.1.2"
   }
