@@ -61,6 +61,12 @@ export function build_webview_html(
 <body>
 <div id="root"></div>
 <script nonce="${nonce}" src="${js_uri}"></script>
+<!-- Glide's DataEditor portals its cell-overlay editor into an element with
+     id="portal"; without it getElementById("portal") returns null and the
+     editor silently never mounts (the Edit toggle flips but nothing edits).
+     Must be the last child of <body> so the fixed-position overlay stacks
+     above the grid. -->
+<div id="portal"></div>
 </body>
 </html>`;
 }
