@@ -592,7 +592,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             continue;
         }
 
-        const working = parse_worksheet_core(ws_xml, sst, xfs, fonts, format_map, datemode, budget);
+        let working: WorksheetWorking | null = parse_worksheet_core(ws_xml, sst, xfs, fonts, format_map, datemode, budget);
         workings.push(working);
 
         sheets.push({
@@ -601,7 +601,11 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             columnCount: working.col_count,
             merges: working.merges,
             fill(sink: CellSink): void {
+                if (!working) throw new Error('StreamingSheet.fill called after its working-set was released');
                 fill_store(working, sink);
+                // Release the working-set so it can be GC'd once this sheet's
+                // store is built, before the next sheet is filled.
+                working = null;
             },
         });
     }

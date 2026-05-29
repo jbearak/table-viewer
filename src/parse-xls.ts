@@ -1068,7 +1068,7 @@ export function parse_xls_streaming(buffer: Buffer): StreamingWorkbook {
             sheets.push({ name: slice.name, rowCount: 0, columnCount: 0, merges: [], fill: () => {} });
             continue;
         }
-        const working = parse_sheet_working(
+        let working: SheetWorking | null = parse_sheet_working(
             slice.records, wb.sst, wb.xfs, wb.fonts, wb.format_map, wb.datemode, wb.budget
         );
         workings.push(working);
@@ -1078,7 +1078,11 @@ export function parse_xls_streaming(buffer: Buffer): StreamingWorkbook {
             columnCount: working.col_count,
             merges: working.merges,
             fill(sink: CellSink): void {
+                if (!working) throw new Error('StreamingSheet.fill called after its working-set was released');
                 fill_store(working, sink);
+                // Release the working-set so it can be GC'd once this sheet's
+                // store is built, before the next sheet is filled.
+                working = null;
             },
         });
     }

@@ -22,7 +22,7 @@ export interface MeasurableCell {
 
 /**
  * Build a CSS `font` shorthand for a canvas 2D context, matching how the grid
- * renders cells (see {@link font_style} in cell-renderer): optional `italic`,
+ * renders cells (see {@link font_shorthand} in cell-renderer): optional `italic`,
  * optional `600` weight, then `<size>px <family>`. Order matters — the canvas
  * parser expects style before weight before size.
  */

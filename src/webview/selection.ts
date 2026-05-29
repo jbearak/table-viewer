@@ -7,15 +7,6 @@ export interface SelectionRange {
     end_col: number;
 }
 
-export interface SelectionState {
-    range: SelectionRange;
-    anchor_row: number;
-    anchor_col: number;
-    /** The moving edge of the selection (may differ from range.end after normalization) */
-    focus_row: number;
-    focus_col: number;
-}
-
 export function normalize_range(range: SelectionRange): SelectionRange {
     return {
         start_row: Math.min(range.start_row, range.end_row),
