@@ -922,6 +922,22 @@ These came out of the per-task and final holistic reviews of Phase A. None block
 - **If** gridlines draw with a clip = complement of span rects (confirmed for horizontal in deep-dive): replicate for vertical by passing merged rects, OR
 - **Else**: render merges on a **transparent overlay canvas** stacked above the Glide canvas, redrawn on every `onVisibleRegionChanged`, that paints the merged block (bg, content, 4-sided border) and is kept in sync with scroll. The overlay approach is the safe fallback that guarantees exactness without forking Glide. Pick one in D0 and record the rationale.
 
+#### D0 findings (resolved against installed v6.0.3 — DECISION: hybrid)
+
+Verified in `node_modules/@glideapps/glide-data-grid/dist/esm/internal/data-grid/render/`:
+
+- **Draw order (`data-grid-render.js:262-265`):** `drawGrid` runs `const spans = drawCells(...)` **first**, then `drawBlanks` → `drawExtraRowThemes` → `drawGridLines(..., spans, ...)`. Cells are painted before gridlines, and the `spans` array `drawCells` returns is handed to `drawGridLines`.
+- **Gridline suppression (`data-grid-render.lines.js:188-196`):** when `spans` is present, `drawGridLines` builds a clip = full canvas rect + each span rect (inset 1px) and `ctx.clip("evenodd")`, so **all** gridlines (vertical *and* horizontal) falling inside a span rect are skipped. Border around the span survives (inset by 1px).
+- **Span geometry (`data-grid-render.cells.js:115-153`):** a `GridCell` with `span: [startCol, endCol]` produces, via `getSpanBounds`, a rect of height **`rh` (a single row)** — `result.push({ x, y: drawY, width, height: rh })` at lines 139-144. The native span is therefore **horizontal-only**: it can merge columns within one row but cannot express a row span.
+
+**Conclusion → hybrid mechanism:**
+1. **Horizontal-only merges (`rowSpan === 1 && colSpan > 1`):** use Glide's native `cell.span = [anchorCol, endCol]` on the anchor; covered columns in that row return a blank cell. This is pixel-exact for free (one content block, interior vertical lines clipped out, border intact) and integrates with native selection/copy.
+2. **Any merge with `rowSpan > 1` (vertical and mixed 2D):** native span cannot suppress the interior **horizontal** gridlines (spans are single-row-tall), and Glide exposes no per-cell horizontal-line hook, so these are painted on a **transparent overlay `<canvas>`** stacked above the grid (`row-resize-overlay.tsx` establishes the same overlay pattern). The overlay is repainted on every `onVisibleRegionChanged` and on theme/size change; each visible block is positioned with `gridRef.getBounds(col, row)` (returns a pixel `Rectangle`), and painted as: fill `theme.bgCell` → centered content (bold/italic) → 4-sided `theme.borderColor` border (covers the interior lines Glide drew underneath). Covered cells return blank content so nothing bleeds at the block edges.
+
+**Rejected:** patching Glide internals to feed multi-row span rects (upgrade-fragile); `getRowThemeOverride` to hide horizontal borders (per-row, not per-column-range — not exact).
+
+**Testability note:** merge classification + span emission (`merge-index.ts`, `cell-renderer.ts`) and overlay block geometry are extracted as pure, unit-tested functions. The canvas paint + `getBounds` positioning is thin React wiring verified by the manual smoke checklist (cannot run live VS Code in this environment — tracked as a Phase D follow-up alongside Phase C's smoke checklist).
+
 **Files & responsibilities:**
 - `src/webview/merge-index.ts` — `MergeIndex` built from `SheetMeta.merges`: `is_anchor(r,c)→MergeEntry|null`, `covered_by(r,c)→anchorKey|null`, `anchor_of(r,c)→{row,col}|null`. Pure; unit-tested (mirror `selection.ts` test style, fixtures from `merged.xlsx`). Reuse `resolve_merge_anchor`/`expand_range_for_merges` already in `src/webview/selection.ts`.
 - `src/webview/row-heights.ts` — sparse `Map<number,number>` overrides + `row_height_fn(i)=override ?? host_height ?? DEFAULT`; `span_height(startRow,endRow)` summing heights (used by merge draw). 
