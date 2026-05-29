@@ -702,10 +702,18 @@ export function GridShell({
     }, [ensure_rows]);
 
     // Repaint the visible region on the discrete events that change the content
-    // of already-painted cells: a page landing (version bump) and the formatting
-    // toggle (raw ↔ formatted). A parent re-render alone does not reliably
-    // invalidate Glide's per-cell cache, so damage explicitly. (Edits/save/discard
-    // damage their own cells; sheet/merge changes remount via the grid key.)
+    // or tint of already-painted cells: a page landing (version bump), the
+    // formatting toggle (raw ↔ formatted), and any change to the dirty-edit or
+    // conflict sets (which drive each cell's background tint). A parent re-render
+    // alone does not reliably invalidate Glide's per-cell cache, so damage
+    // explicitly.
+    //
+    // Single-cell edits/discards damage their own cell inline (on_cell_edited,
+    // discard_edit), but the bulk paths change many cells' tint at once with no
+    // inline damage: clearing the saved keys after a successful save, "Discard
+    // Conflicted", and "Discard All". Depending on dirty_cells/conflicted_keys
+    // here repaints them so a stale tint never lingers until the next scroll.
+    // (Sheet/merge changes remount via the grid key.)
     useEffect(() => {
         const grid = grid_ref.current;
         if (!grid) return;
@@ -718,7 +726,7 @@ export function GridShell({
             }
         }
         grid.updateCells(cells);
-    }, [version, show_formatting]);
+    }, [version, show_formatting, dirty_cells, conflicted_keys]);
 
     // Preview mode: host asks us to scroll a specific row into view.
     useEffect(() => {
