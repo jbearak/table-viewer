@@ -115,13 +115,13 @@
         },
         "tableViewer.csvMaxRows": {
           "type": "integer",
-          "default": 10000,
+          "default": 1000000,
           "minimum": 1,
           "description": "Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner."
         },
         "tableViewer.maxFileSizeMiB": {
           "type": "number",
-          "default": 16,
+          "default": 256,
           "minimum": 1,
           "description": "Maximum file size in MiB for all file types (xlsx, xls, csv, tsv)."
         }

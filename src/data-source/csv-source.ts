@@ -6,10 +6,13 @@ import { build_line_index, type LineIndex } from './line-index';
 /**
  * DataSource backed by a UTF-8 CSV/TSV byte buffer.
  *
- * Construction cost: one O(n) PapaParse pass to determine shape (row and column
- * counts), plus one O(n) byte scan to build the line index. Thereafter, read_rows
- * pays only for the requested window (a byte subarray slice + PapaParse of that
- * fragment).
+ * Construction cost: one O(n) byte scan (build_line_index) that yields both the
+ * row offsets and each row's field count, so the sheet's shape (row and column
+ * counts) is known without ever decoding the whole buffer or materialising every
+ * parsed row. This matters at scale: the old "decode all + PapaParse all" shape
+ * pass transiently held the entire file as a JS string plus a string[][] of every
+ * cell (~1 GB RSS at 1M rows). Thereafter, read_rows pays only for the requested
+ * window (a byte subarray slice + PapaParse of that fragment).
  *
  * NOTE on byte vs. char offsets: line-index offsets are UTF-8 byte positions.
  * read_rows therefore slices `this.buf` (Uint8Array) using those byte offsets and
@@ -48,24 +51,13 @@ export class CsvDataSource implements DataSource {
     ) {
         // Pass the delimiter byte so the indexer's field-start quote detection
         // matches PapaParse (a `"` only opens a quoted field at a field start).
+        // The index also yields per-row field counts, so the shape below is read
+        // straight off the byte scan — no whole-buffer decode or full parse. A
+        // trailing newline produces no extra empty row (build_line_index skips the
+        // end-of-buffer boundary), matching parse-csv's trailing-empty-row rule.
         this.index = build_line_index(buf, delimiter.charCodeAt(0));
 
-        // One full pass for shape only (row lengths), reusing parse-csv's
-        // trailing-empty-row rule. We decode the whole buffer once here for
-        // the shape scan; thereafter read_rows decodes only the requested fragment.
-        const full_source = new TextDecoder('utf-8').decode(buf);
-        const parsed = Papa.parse(full_source, { delimiter, header: false, skipEmptyLines: false });
-        let rows_data = parsed.data as string[][];
-
-        const ends_nl = full_source.length > 0 &&
-            (full_source[full_source.length - 1] === '\n' ||
-             full_source[full_source.length - 1] === '\r');
-        const last = rows_data[rows_data.length - 1];
-        if (ends_nl && last && last.length === 1 && last[0] === '') {
-            rows_data = rows_data.slice(0, -1);
-        }
-
-        const total = rows_data.length;
+        const total = this.index.rowCount;
         let kept = total;
         if (total > max_rows) {
             kept = max_rows;
@@ -76,13 +68,13 @@ export class CsvDataSource implements DataSource {
         let colCount = 0;
         const originalColumnCounts: number[] = new Array(kept);
         for (let i = 0; i < kept; i++) {
-            const len = rows_data[i].length;
+            const len = this.index.fieldCountOf(i);
             originalColumnCounts[i] = len;
             if (len > colCount) colCount = len;
         }
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
-        this.lineEnding = detect_line_ending(full_source);
+        this.lineEnding = detect_line_ending(buf);
     }
 
     meta(): WorkbookMeta {
@@ -139,14 +131,19 @@ export class CsvDataSource implements DataSource {
     }
 }
 
+const LF = 0x0a; // \n
+const CR = 0x0d; // \r
+
 /** First line terminator wins; defaults to '\n' for single-line sources.
- *  Mirrors parse-csv.ts so CSV save round-trips the original ending. */
-function detect_line_ending(source: string): '\r\n' | '\r' | '\n' {
-    for (let i = 0; i < source.length; i++) {
-        if (source[i] === '\r') {
-            return (i + 1 < source.length && source[i + 1] === '\n') ? '\r\n' : '\r';
+ *  Mirrors parse-csv.ts so CSV save round-trips the original ending. Scans the
+ *  raw bytes (stopping at the first terminator) so we never decode the whole
+ *  buffer just to learn its line ending. */
+function detect_line_ending(buf: Uint8Array): '\r\n' | '\r' | '\n' {
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === CR) {
+            return (i + 1 < buf.length && buf[i + 1] === LF) ? '\r\n' : '\r';
         }
-        if (source[i] === '\n') return '\n';
+        if (buf[i] === LF) return '\n';
     }
     return '\n';
 }

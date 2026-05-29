@@ -136,7 +136,7 @@ class ViewerPanel implements vscode.Disposable {
     private async build_source(): Promise<DataSource> {
         const stat = await vscode.workspace.fs.stat(this.uri);
         const max_mib = vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxFileSizeMiB', 16)!;
+            .get<number>('maxFileSizeMiB', 256)!;
         assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(this.uri);
         const ext = this.file_path.toLowerCase();

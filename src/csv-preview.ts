@@ -97,12 +97,12 @@ function setup_preview(
 
     function get_max_file_size_mib(): number {
         return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxFileSizeMiB', 16)!;
+            .get<number>('maxFileSizeMiB', 256)!;
     }
 
     function get_csv_max_rows(): number {
         return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('csvMaxRows', 10_000)!;
+            .get<number>('csvMaxRows', 1_000_000)!;
     }
 
     async function load(): Promise<CsvDataSource> {

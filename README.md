@@ -91,8 +91,8 @@ If you'd prefer Table Viewer to open CSV/TSV files directly, add this to your `s
 |---------|---------|-------------|
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
-| `tableViewer.csvMaxRows` | `10000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
-| `tableViewer.maxFileSizeMiB` | `16` | Maximum file size in MiB. Applies to all supported file types. |
+| `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
+| `tableViewer.maxFileSizeMiB` | `256` | Maximum file size in MiB. Applies to all supported file types. |
 
 ## License
 

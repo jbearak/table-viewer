@@ -72,4 +72,53 @@ describe('build_line_index', () => {
         expect(idx.rowCount).toBe(2);
         expect(idx.offsetOf(1)).toBe('a\t"x\ny"\n'.length);
     });
+
+    describe('fieldCountOf', () => {
+        it('counts fields per row (delimiters + 1)', () => {
+            const idx = build_line_index(enc('a,b\nc,d,e\nf\n'));
+            expect(idx.fieldCountOf(0)).toBe(2);
+            expect(idx.fieldCountOf(1)).toBe(3);
+            expect(idx.fieldCountOf(2)).toBe(1);
+        });
+        it('counts an empty middle field', () => {
+            const idx = build_line_index(enc('a,,c\n'));
+            expect(idx.fieldCountOf(0)).toBe(3);
+        });
+        it('counts a blank line as a single empty field', () => {
+            const idx = build_line_index(enc('a\n\nb\n'));
+            expect(idx.rowCount).toBe(3);
+            expect(idx.fieldCountOf(0)).toBe(1);
+            expect(idx.fieldCountOf(1)).toBe(1);
+            expect(idx.fieldCountOf(2)).toBe(1);
+        });
+        it('ignores delimiters and newlines inside a quoted field', () => {
+            // `"x,y\nz",w` is two fields: the quoted field swallows the comma
+            // and newline, then `w` follows the closing delimiter.
+            const idx = build_line_index(enc('"x,y\nz",w\np,q,r\n'));
+            expect(idx.rowCount).toBe(2);
+            expect(idx.fieldCountOf(0)).toBe(2);
+            expect(idx.fieldCountOf(1)).toBe(3);
+        });
+        it('counts the final row when there is no trailing newline', () => {
+            const idx = build_line_index(enc('a,b\nc,d,e'));
+            expect(idx.fieldCountOf(0)).toBe(2);
+            expect(idx.fieldCountOf(1)).toBe(3);
+        });
+        it('treats a doubled-quote escape as one field', () => {
+            const idx = build_line_index(enc('"a,""b"",c"\nx,y\n'));
+            expect(idx.fieldCountOf(0)).toBe(1);
+            expect(idx.fieldCountOf(1)).toBe(2);
+        });
+        it('counts an unbalanced quoted tail as one field', () => {
+            const idx = build_line_index(enc('a,b\n"x\ny\nz'));
+            expect(idx.fieldCountOf(0)).toBe(2);
+            expect(idx.fieldCountOf(1)).toBe(1);
+        });
+        it('honours the delimiter when counting fields (TSV)', () => {
+            const TAB = 0x09;
+            const idx = build_line_index(enc('a\tb\tc\np\tq\n'), TAB);
+            expect(idx.fieldCountOf(0)).toBe(3);
+            expect(idx.fieldCountOf(1)).toBe(2);
+        });
+    });
 });
