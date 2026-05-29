@@ -166,6 +166,11 @@ export function open_csv_table(
                             vscode.window.showWarningMessage(
                                 'File was modified externally. Please review the changes and try again.'
                             );
+                            // The external modification that tripped the mtime check
+                            // also fires the watcher's onDidChange. Suppress it so we
+                            // don't redundantly re-parse + metaReload the same file
+                            // twice (mirrors the success branch).
+                            suppress_reload_until = Date.now() + 2000;
                             const { source: ds, mtime } = await build_source();
                             adopt_source(ds, mtime);
                             await post_reload(ds);
