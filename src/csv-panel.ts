@@ -1,11 +1,13 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { parse_csv, type CsvParseResult } from './parse-csv';
-import { assert_safe_file_size } from './spreadsheet-safety';
-import type { FileStateStore } from './state';
-import type { WebviewMessage } from './types';
-import { build_webview_html, generate_nonce } from './webview-html';
+import { CsvDataSource } from './data-source/csv-source';
+import { workbook_data_from_source } from './data-source/to-workbook-data';
+import { ViewerPanelCore } from './panel-core';
+import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
+import type { FileStateStore } from './state';
+import type { PerFileState, WebviewMessage } from './types';
+import { build_webview_html, generate_nonce } from './webview-html';
 
 export function open_csv_table(
     uri: vscode.Uri,
@@ -35,6 +37,14 @@ export function open_csv_table(
     let consecutive_reload_failures = 0;
     let suppress_reload_until = 0;
 
+    // Protocol engine (paginated sheetMeta/rowData). Created on first successful
+    // parse; the legacy workbookData/reload messages are also sent transitionally
+    // so the existing DOM renderer keeps working until Phase C switches the webview.
+    let core: ViewerPanelCore | undefined;
+    let source: CsvDataSource | undefined;
+    // mtime of the file as of the last successful parse, for the save conflict check.
+    let last_mtime = 0;
+
     function get_delimiter(): ',' | '\t' {
         return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
     }
@@ -49,33 +59,57 @@ export function open_csv_table(
             .get<number>('csvMaxRows', 10_000)!;
     }
 
-    async function parse_file(): Promise<CsvParseResult & { mtime: number }> {
+    function get_default_orientation(): 'horizontal' | 'vertical' {
+        return vscode.workspace.getConfiguration('tableViewer')
+            .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
+    }
+
+    async function build_source(): Promise<{ source: CsvDataSource; mtime: number }> {
         const stat = await vscode.workspace.fs.stat(uri);
         assert_safe_file_size(stat.size, get_max_file_size_mib());
         const raw = await vscode.workspace.fs.readFile(uri);
-        const text = new TextDecoder('utf-8').decode(raw);
-        return { ...parse_csv(text, get_delimiter(), get_csv_max_rows()), mtime: stat.mtime };
+        // User config caps the row count, but MAX_CSV_ROWS is the hard ceiling.
+        const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
+        const ds = await CsvDataSource.create(raw, get_delimiter(), max_rows);
+        return { source: ds, mtime: stat.mtime };
     }
 
-    let last_parsed: (CsvParseResult & { mtime: number }) | null = null;
+    function adopt_source(ds: CsvDataSource, mtime: number): void {
+        if (source && source !== ds) {
+            source.close();
+        }
+        source = ds;
+        last_mtime = mtime;
+        if (core) {
+            core.set_source(ds);
+        } else {
+            core = new ViewerPanelCore(panel, ds);
+        }
+    }
 
     async function send_initial_data(): Promise<void> {
         try {
-            const result = await parse_file();
-            last_parsed = result;
+            const { source: ds, mtime } = await build_source();
+            adopt_source(ds, mtime);
             const state = state_store.get(file_path);
-            const config = vscode.workspace.getConfiguration('tableViewer');
-            const default_orientation = config.get<'horizontal' | 'vertical'>(
-                'tabOrientation', 'horizontal'
-            );
+            const default_orientation = get_default_orientation();
 
-            panel.webview.postMessage({
-                type: 'workbookData',
-                data: result.data,
+            // Paginated protocol.
+            await core!.send_meta({
                 state,
                 defaultTabOrientation: default_orientation,
-                truncationMessage: result.truncationMessage,
-                csvEditable: !result.truncationMessage,
+                csvEditable: !ds.truncationMessage,
+                csvEditingSupported: true,
+            });
+
+            // Transitional legacy blob so the current DOM renderer keeps working.
+            panel.webview.postMessage({
+                type: 'workbookData',
+                data: workbook_data_from_source(ds),
+                state,
+                defaultTabOrientation: default_orientation,
+                truncationMessage: ds.truncationMessage,
+                csvEditable: !ds.truncationMessage,
                 csvEditingSupported: true,
             });
         } catch (err) {
@@ -84,20 +118,30 @@ export function open_csv_table(
         }
     }
 
+    async function post_reload(ds: CsvDataSource): Promise<boolean> {
+        // Paginated protocol: bump generation + clear cache + post metaReload.
+        await core!.send_meta_reload({
+            csvEditable: !ds.truncationMessage,
+            csvEditingSupported: true,
+        });
+        // Transitional legacy reload for the current DOM renderer.
+        return panel.webview.postMessage({
+            type: 'reload',
+            data: workbook_data_from_source(ds),
+            truncationMessage: ds.truncationMessage,
+            csvEditable: !ds.truncationMessage,
+            csvEditingSupported: true,
+        });
+    }
+
     async function send_reload(): Promise<void> {
         if (Date.now() < suppress_reload_until) {
             return;
         }
         try {
-            const result = await parse_file();
-            last_parsed = result;
-            const delivered = await panel.webview.postMessage({
-                type: 'reload',
-                data: result.data,
-                truncationMessage: result.truncationMessage,
-                csvEditable: !result.truncationMessage,
-                csvEditingSupported: true,
-            });
+            const { source: ds, mtime } = await build_source();
+            adopt_source(ds, mtime);
+            const delivered = await post_reload(ds);
             if (!delivered) return;
             consecutive_reload_failures = 0;
         } catch (err) {
@@ -118,10 +162,10 @@ export function open_csv_table(
         panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
             switch (msg.type) {
                 case 'ready':
-                    send_initial_data();
+                    await send_initial_data();
                     break;
                 case 'stateChanged': {
-                    const existing = state_store.get(file_path) as import('./types').PerFileState;
+                    const existing = state_store.get(file_path) as PerFileState;
                     const new_state = { ...msg.state };
                     if (existing.pendingEdits) {
                         new_state.pendingEdits = existing.pendingEdits;
@@ -130,51 +174,41 @@ export function open_csv_table(
                     break;
                 }
                 case 'saveCsv': {
-                    if (!last_parsed) return;
-                    if (last_parsed.truncationMessage) {
+                    if (!source) return;
+                    if (source.truncationMessage) {
                         panel.webview.postMessage({ type: 'saveResult', success: false });
                         return;
                     }
                     try {
                         // Verify file hasn't changed since we last parsed it
                         const current_stat = await vscode.workspace.fs.stat(uri);
-                        if (current_stat.mtime !== last_parsed.mtime) {
+                        if (current_stat.mtime !== last_mtime) {
                             vscode.window.showWarningMessage(
                                 'File was modified externally. Please review the changes and try again.'
                             );
-                            last_parsed = await parse_file();
-                            panel.webview.postMessage({
-                                type: 'reload',
-                                data: last_parsed.data,
-                                truncationMessage: last_parsed.truncationMessage,
-                                csvEditable: !last_parsed.truncationMessage,
-                                csvEditingSupported: true,
-                            });
+                            const { source: ds, mtime } = await build_source();
+                            adopt_source(ds, mtime);
+                            await post_reload(ds);
                             panel.webview.postMessage({ type: 'saveResult', success: false });
                             return;
                         }
                         const content = serialize_csv(
-                            last_parsed.data.sheets[0].rows,
+                            source.read_all_rows(0),
                             get_delimiter(),
                             msg.edits,
-                            last_parsed.originalColumnCounts,
-                            last_parsed.lineEnding
+                            source.originalColumnCounts,
+                            source.lineEnding
                         );
                         suppress_reload_until = Date.now() + 2000;
                         await vscode.workspace.fs.writeFile(
                             uri,
                             new TextEncoder().encode(content)
                         );
-                        last_parsed = await parse_file();
-                        panel.webview.postMessage({
-                            type: 'reload',
-                            data: last_parsed.data,
-                            truncationMessage: last_parsed.truncationMessage,
-                            csvEditable: !last_parsed.truncationMessage,
-                            csvEditingSupported: true,
-                        });
+                        const { source: ds, mtime } = await build_source();
+                        adopt_source(ds, mtime);
+                        await post_reload(ds);
                         // Clear cached edits on successful save
-                        const current = state_store.get(file_path) as import('./types').PerFileState;
+                        const current = state_store.get(file_path) as PerFileState;
                         const { pendingEdits: _, ...rest } = current;
                         state_store.set(file_path, rest);
                         panel.webview.postMessage({ type: 'saveResult', success: true });
@@ -187,16 +221,16 @@ export function open_csv_table(
                     break;
                 }
                 case 'pendingEditsChanged': {
-                const current = state_store.get(file_path) as import('./types').PerFileState;
-                if (msg.edits) {
-                    state_store.set(file_path, { ...current, pendingEdits: msg.edits });
-                } else {
-                    const { pendingEdits: _, ...rest } = current;
-                    state_store.set(file_path, rest);
+                    const current = state_store.get(file_path) as PerFileState;
+                    if (msg.edits) {
+                        state_store.set(file_path, { ...current, pendingEdits: msg.edits });
+                    } else {
+                        const { pendingEdits: _, ...rest } = current;
+                        state_store.set(file_path, rest);
+                    }
+                    break;
                 }
-                break;
-            }
-            case 'showSaveDialog': {
+                case 'showSaveDialog': {
                     const choice = await vscode.window.showWarningMessage(
                         'You have unsaved changes.',
                         { modal: true },
@@ -209,6 +243,10 @@ export function open_csv_table(
                     });
                     break;
                 }
+                default:
+                    // requestRows (paginated protocol) -> core answers with rowData.
+                    await core?.handle_message(msg);
+                    break;
             }
         })
     );
@@ -225,6 +263,7 @@ export function open_csv_table(
 
     const panel_disposable: vscode.Disposable = {
         dispose() {
+            source?.close();
             for (const d of disposables) d.dispose();
         },
     };
