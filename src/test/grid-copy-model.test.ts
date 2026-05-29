@@ -158,9 +158,9 @@ describe('format_selection_tsv', () => {
         expect(out.truncationReason).toBeNull();
     });
 
-    it('prefers the row-cap reason when the selection also overflows the cap', () => {
-        // height 5 > cap 2: capped rows never get read, so the cap is the
-        // dominant reason the user should hear about.
+    it('reports row-cap when the selection overflows the cap but every copied row is resident', () => {
+        // height 5 > cap 2, and both copied rows (0, 1) are loaded, so no
+        // emitted row is blank: the cap is the only applicable reason.
         const out = format_selection_tsv(
             { x: 0, y: 0, width: 1, height: 5 },
             loader({ 0: [cell('a')], 1: [cell('b')] }),
@@ -169,6 +169,21 @@ describe('format_selection_tsv', () => {
             2,
         );
         expect(out.truncationReason).toBe('row-cap');
+    });
+
+    it('prefers non-resident over row-cap when an emitted row was blank-filled', () => {
+        // height 5 > cap 2, and copied row 1 is non-resident (blank in the TSV).
+        // The blank-row corruption is more dangerous than the visible trailing
+        // drop, so non-resident must win.
+        const out = format_selection_tsv(
+            { x: 0, y: 0, width: 1, height: 5 },
+            loader({ 0: [cell('a')] }), // row 1 missing
+            NO_MERGES,
+            true,
+            2,
+        );
+        expect(out.text).toBe('a\n');
+        expect(out.truncationReason).toBe('non-resident');
     });
 });
 

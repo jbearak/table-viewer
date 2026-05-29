@@ -68,8 +68,10 @@ export function format_selection_tsv(
     show_formatting: boolean,
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
-    // Row-cap wins over non-resident: capped rows are never read, so the cap is
-    // the most actionable reason to surface when both apply.
+    // Non-resident wins over row-cap: blank-filled rows sit *inside* the
+    // returned TSV (silent corruption of emitted data), whereas the cap only
+    // drops trailing rows the user can see are missing. Surface the more
+    // dangerous reason when both apply.
     let cap_truncated = false;
     let non_resident = false;
     const row_limit = Math.min(rect.height, max_rows);
@@ -104,10 +106,10 @@ export function format_selection_tsv(
         lines.push(cells.join('\t'));
     }
 
-    const truncationReason: TruncationReason | null = cap_truncated
-        ? 'row-cap'
-        : non_resident
-            ? 'non-resident'
+    const truncationReason: TruncationReason | null = non_resident
+        ? 'non-resident'
+        : cap_truncated
+            ? 'row-cap'
             : null;
     return { text: lines.join('\n'), truncationReason };
 }
