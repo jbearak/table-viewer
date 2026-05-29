@@ -10,6 +10,8 @@ import {
     MAX_SHEET_MERGES,
     MAX_SHEET_ROWS,
     MAX_WORKBOOK_SHEETS,
+    MAX_WORKBOOK_CELLS,
+    MAX_CSV_ROWS,
     assert_safe_sheet_count,
 } from '../spreadsheet-safety';
 
@@ -105,10 +107,29 @@ describe('spreadsheet safety limits', () => {
     });
 
     it('rejects excessive total cell counts across a workbook', () => {
+        // Fill the budget to exactly MAX_WORKBOOK_CELLS, then one more cell tips it over.
         const budget = create_workbook_budget();
-        assert_safe_sheet_shape(budget, 1000, 250, 0);
+        // Use a sheet that consumes all 50,000,000 allowed cells.
+        assert_safe_sheet_shape(budget, 1_000_000, 50, 0);
         expect(() =>
             assert_safe_sheet_shape(budget, 1, 1, 0)
+        ).toThrow('Workbook is too large to render safely');
+    });
+
+    it('assert_safe_sheet_shape passes for a 1,000,000-row sheet', () => {
+        // 1M rows × 10 cols = 10M cells — well under the 50M budget.
+        expect(() =>
+            assert_safe_sheet_shape(create_workbook_budget(), 1_000_000, 10, 0)
+        ).not.toThrow();
+    });
+
+    it('assert_safe_sheet_shape throws when total cells exceed 50,000,000', () => {
+        const budget = create_workbook_budget();
+        expect(() =>
+            assert_safe_sheet_shape(budget, 1_000_000, 50, 0)  // 50M cells exactly — ok
+        ).not.toThrow();
+        expect(() =>
+            assert_safe_sheet_shape(budget, 1, 1, 0)           // 50,000,001st cell — over
         ).toThrow('Workbook is too large to render safely');
     });
 

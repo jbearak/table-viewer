@@ -1,11 +1,12 @@
 const MEBIBYTE = 1024 * 1024;
 
-export const MAX_WORKBOOK_FILE_BYTES = 16 * MEBIBYTE;
+export const MAX_WORKBOOK_FILE_BYTES = 256 * MEBIBYTE;
 export const MAX_WORKBOOK_SHEETS = 64;
-export const MAX_SHEET_ROWS = 10_000;
+export const MAX_SHEET_ROWS = 1_000_000;
 export const MAX_SHEET_COLUMNS = 256;
 export const MAX_SHEET_MERGES = 10_000;
-export const MAX_WORKBOOK_CELLS = 250_000;
+export const MAX_WORKBOOK_CELLS = 50_000_000;
+export const MAX_CSV_ROWS = 1_000_000;
 
 export interface WorkbookBudget {
     total_cells: number;
