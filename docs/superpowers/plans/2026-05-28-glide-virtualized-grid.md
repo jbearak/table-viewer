@@ -868,6 +868,17 @@ git commit -m "feat(safety): raise caps for 1M-row support, add MAX_CSV_ROWS"
 
 > Expand into bite-sized TDD steps at the start of this phase. Upstream types (Phase A) now exist.
 
+### Carry-over from Phase A (address early in Phase B)
+
+These came out of the per-task and final holistic reviews of Phase A. None blocked Phase A (the layer is complete + tested), but resolve them as Phase B builds `panel-core.ts`:
+
+1. **Uniform async construction.** `CsvDataSource`/`XlsDataSource` use sync constructors but `XlsxDataSource` uses `static async create()` (because `parse_xlsx` is async). Add `static async create(...)` to all three (wrap the sync ones in `Promise.resolve`) so `panel-core` can construct any source via one `await Source.create(...)` call without format branching. Keep sync constructors internal/private.
+2. **Surface diagnostics via the interface, not downcasts.** `CsvDataSource.truncationMessage` and the xlsx/xls `warnings` are currently public fields outside the `DataSource` contract. Add optional `truncationMessage?`/`warnings?` (and the CSV `originalColumnCounts`/`lineEnding` needed by the save path) to the interface or a small diagnostics accessor, so `panel-core` reads them polymorphically.
+3. **Validate `start_row >= 0` in `panel-core`** before calling `read_rows` (CSV clamps before delegating; xlsx/xls pass the raw value to the store which clamps internally — harmless today, but validate at the boundary to keep the contract uniform).
+4. **Link `MAX_CSV_ROWS` at construction.** When `panel-core` builds a `CsvDataSource`, pass `Math.min(get_csv_max_rows(), MAX_CSV_ROWS)` as `max_rows` so the user's VS Code config still caps but the hard ceiling is enforced. `MAX_CSV_ROWS` is exported but not yet consumed.
+5. **CSV constructor memory (scale follow-up, pairs with deferred Task A7).** `CsvDataSource`'s constructor runs one full `Papa.parse` to determine row/column shape — a several-hundred-MB transient spike for a 200 MB / 1M-row CSV. Before claiming the 1M-row CSV target, replace the shape scan with `line_index.rowCount` + a one-row-at-a-time max-column scan (or only parse up to `max_rows`). Track alongside Task A7 (the xlsx direct-to-builder optimization); gate both on a real large-file fixture.
+6. **Minor:** `parse-xlsx.ts:387` per-sheet early-bailout uses the workbook-level `MAX_WORKBOOK_CELLS` constant with a per-sheet error message — rename/clarify; the cumulative guard in `assert_safe_sheet_shape` remains the real budget. `CsvDataSource.read_all_rows` ignores `sheet_index` silently (CSV is single-sheet) — fine, but note it.
+
 **Outcome:** The two host panels (`custom-editor.ts`, `csv-panel.ts`) construct a `DataSource`, send a `sheetMeta` message (structure only), and answer `requestRows` with `rowData`. A `generation` counter drops stale responses across reloads. CSV save/conflict flow is preserved by routing `serialize_csv` through `DataSource.read_all_rows`.
 
 **Files & responsibilities:**
