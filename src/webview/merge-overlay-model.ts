@@ -61,6 +61,25 @@ export function block_intersects_region(
 }
 
 /**
+ * Whether the overlay should attempt to paint this block, given its last-known
+ * visible region. The region is only a cheap cull in front of `getBounds` (the
+ * real source of truth for on-screen position). It starts degenerate
+ * ({@link CellRegion} with zero width/height) until Glide fires its first
+ * `onVisibleRegionChanged`; against that, `block_intersects_region` culls every
+ * block (its `region_end_row` is -1), so vertical/2D merges would stay blank on
+ * initial load until the first scroll/resize. A degenerate region therefore
+ * means "region not yet known" — paint unconditionally and let `getBounds` gate
+ * the actual on-screen output. Once a real region arrives, fall back to the cull.
+ */
+export function block_should_paint(
+    entry: MergeEntry,
+    region: CellRegion,
+): boolean {
+    if (region.width <= 0 || region.height <= 0) return true;
+    return block_intersects_region(entry, region);
+}
+
+/**
  * Overlay-local paint rectangle for a merge block. `top_left` / `bottom_right`
  * are the client-space bounds of the block's first and last cells (from Glide's
  * `getBounds`); `origin` is the overlay canvas's own client origin (its

@@ -5,6 +5,7 @@ import {
     block_font,
     block_text,
     block_intersects_region,
+    block_should_paint,
     overlay_block_rect,
     overlay_entries,
 } from '../webview/merge-overlay-model';
@@ -58,6 +59,26 @@ describe('block_intersects_region', () => {
         expect(
             block_intersects_region(vertical, { x: 1, y: 0, width: 5, height: 10 })
         ).toBe(false);
+    });
+});
+
+describe('block_should_paint', () => {
+    const vertical = overlay_entries(idx.entries).find((e) => e.startRow === 2)!;
+
+    it('paints unconditionally when no region has been reported yet', () => {
+        // The overlay's region starts {0,0,0,0}; block_intersects_region would
+        // cull every block against it (region_end_row = -1), so vertical/2D
+        // merges stay blank on initial load until the first scroll. A degenerate
+        // region means "unknown" — paint and let getBounds gate on-screen output.
+        expect(block_should_paint(vertical, { x: 0, y: 0, width: 0, height: 0 })).toBe(true);
+        expect(block_should_paint(vertical, { x: 3, y: 7, width: 0, height: 0 })).toBe(true);
+    });
+
+    it('falls back to the region cull once a real region is reported', () => {
+        // Region overlapping the block -> paint.
+        expect(block_should_paint(vertical, { x: 0, y: 0, width: 5, height: 10 })).toBe(true);
+        // Region entirely below the block -> cull.
+        expect(block_should_paint(vertical, { x: 0, y: 4, width: 5, height: 10 })).toBe(false);
     });
 });
 

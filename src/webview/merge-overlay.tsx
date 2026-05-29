@@ -13,7 +13,7 @@ import { HEADER_HEIGHT_PX } from './grid-model';
 import {
     block_font,
     block_text,
-    block_intersects_region,
+    block_should_paint,
     overlay_block_rect,
     overlay_entries,
     type CellRegion,
@@ -75,14 +75,14 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
         );
 
         const repaint = useCallback(
-            (region?: CellRegion) => {
+            (region?: CellRegion): boolean => {
                 if (region) region_ref.current = region;
                 const visible = region_ref.current;
                 const canvas = canvas_ref.current;
                 const grid = grid_ref.current;
-                if (!canvas || !grid) return;
+                if (!canvas || !grid) return false;
                 const ctx = canvas.getContext('2d');
-                if (!ctx) return;
+                if (!ctx) return false;
 
                 const dpr = window.devicePixelRatio || 1;
                 const rect = canvas.getBoundingClientRect();
@@ -97,7 +97,16 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
                 ctx.clearRect(0, 0, css_w, css_h);
 
-                if (entries.length === 0) return;
+                if (entries.length === 0) return true;
+
+                // Glide establishes the bounds getBounds reads from only on its
+                // first internal draw (its own rAF). A content-driven repaint
+                // (mount / page-landed / formatting toggle) can run before that
+                // draw, when getBounds still returns null and no block can be
+                // positioned. Probe the always-present top-left cell: when it has
+                // no bounds yet, report "not ready" so the caller can retry on a
+                // later frame rather than painting nothing.
+                if (!grid.getBounds(0, 0)) return false;
 
                 const origin = { x: rect.left, y: rect.top };
                 const bg = theme.bgCell ?? '#ffffff';
@@ -118,7 +127,7 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                 ctx.clip();
 
                 for (const entry of entries) {
-                    if (!block_intersects_region(entry, visible)) continue;
+                    if (!block_should_paint(entry, visible)) continue;
                     const tl = grid.getBounds(entry.startCol, entry.startRow);
                     const br = grid.getBounds(entry.endCol, entry.endRow);
                     if (!tl || !br) continue;
@@ -158,15 +167,32 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                 }
 
                 ctx.restore();
+                return true;
             },
             [entries, grid_ref, theme, show_formatting, get_row],
         );
 
         useImperativeHandle(ref, () => ({ repaint }), [repaint]);
 
-        // Repaint when content/theme/formatting change (version bump = page landed).
+        // Repaint when content/theme/formatting change (version bump = page
+        // landed). Glide's getBounds is unusable until its first internal draw,
+        // which may land after this effect runs — a single repaint here can lose
+        // that race and paint nothing on the initial frame. Retry on successive
+        // animation frames until repaint reports it found usable bounds (or we
+        // hit a frame cap). onVisibleRegionChanged also drives repaint once Glide
+        // settles, so this is the belt to that suspenders: whichever resolves
+        // bounds first paints, without waiting on a user scroll.
         useEffect(() => {
-            repaint();
+            let frame = 0;
+            let attempts = 0;
+            const MAX_ATTEMPTS = 120; // ~2s at 60fps.
+            const tick = () => {
+                if (repaint() || attempts >= MAX_ATTEMPTS) return;
+                attempts += 1;
+                frame = requestAnimationFrame(tick);
+            };
+            tick();
+            return () => cancelAnimationFrame(frame);
         }, [repaint, version]);
 
         // Repaint on container resize (the grid relayouts outside React).
