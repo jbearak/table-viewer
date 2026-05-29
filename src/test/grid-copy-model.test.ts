@@ -29,7 +29,7 @@ describe('format_selection_tsv', () => {
             NO_MERGES,
             true,
         );
-        expect(out).toEqual({ text: 'b', truncated: false, truncationReason: null });
+        expect(out).toEqual({ text: 'b', truncationReason: null });
     });
 
     it('joins columns with tabs and rows with newlines', () => {
@@ -44,7 +44,7 @@ describe('format_selection_tsv', () => {
             true,
         );
         expect(out.text).toBe('a\tb\tc\nd\te\tf');
-        expect(out.truncated).toBe(false);
+        expect(out.truncationReason).toBeNull();
     });
 
     it('copies raw text when formatting is off', () => {
@@ -131,7 +131,6 @@ describe('format_selection_tsv', () => {
             true,
         );
         expect(out.text).toBe('a\tb\n\t');
-        expect(out.truncated).toBe(true);
         expect(out.truncationReason).toBe('non-resident');
     });
 
@@ -146,7 +145,6 @@ describe('format_selection_tsv', () => {
             3,
         );
         expect(out.text).toBe('r0\nr1\nr2');
-        expect(out.truncated).toBe(true);
         expect(out.truncationReason).toBe('row-cap');
     });
 
@@ -157,7 +155,6 @@ describe('format_selection_tsv', () => {
             NO_MERGES,
             true,
         );
-        expect(out.truncated).toBe(false);
         expect(out.truncationReason).toBeNull();
     });
 
@@ -171,7 +168,6 @@ describe('format_selection_tsv', () => {
             true,
             2,
         );
-        expect(out.truncated).toBe(true);
         expect(out.truncationReason).toBe('row-cap');
     });
 });

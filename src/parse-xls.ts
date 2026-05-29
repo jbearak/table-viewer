@@ -5,13 +5,14 @@ import {
     create_workbook_budget,
     type WorkbookBudget,
 } from './spreadsheet-safety';
-import { workbook_has_formatting } from './cell-display';
 import {
     densify,
     fill_store,
     working_has_formatting,
     type CellSink,
     type WorkingSet,
+    type StreamingSheet,
+    type StreamingWorkbook,
 } from './data-source/cell-fill';
 import { is_date_format, is_valid_excel_date_serial, serial_to_iso, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
@@ -1024,45 +1025,31 @@ export function parse_xls(buffer: Buffer): ParseResult {
     const wb = open_workbook(buffer);
 
     const sheets: SheetData[] = [];
+    const workings: SheetWorking[] = [];
     for (const slice of wb.sheets) {
         if (slice.records === null) {
             sheets.push({ name: slice.name, rows: [], merges: [], columnCount: 0, rowCount: 0 });
             continue;
         }
-        const sheet_data = parse_sheet_records(
+        const working = parse_sheet_working(
             slice.records, wb.sst, wb.xfs, wb.fonts, wb.format_map, wb.datemode, wb.budget
         );
-        sheet_data.name = slice.name;
-        sheets.push(sheet_data);
+        workings.push(working);
+        sheets.push({
+            name: slice.name,
+            rows: densify(working),
+            merges: working.merges,
+            columnCount: working.col_count,
+            rowCount: working.row_count,
+        });
     }
 
-    return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings: wb.warnings };
+    return { data: { sheets, hasFormatting: working_has_formatting(workings) }, warnings: wb.warnings };
 }
 
 // --- Streaming API (direct-to-builder; no densified intermediate) ---
 
-export type { CellSink } from './data-source/cell-fill';
-
-/** Per-sheet streaming entry: meta plus a `fill` that writes cells into a sink. */
-export interface StreamingSheet {
-    name: string;
-    rowCount: number;
-    columnCount: number;
-    merges: MergeRange[];
-    /**
-     * Fill the provided sink (sized rowCount x columnCount) with this sheet's
-     * cells via the shared `fill_store`, applying the SAME null/blank rule and
-     * raw normalization the densify path uses — so the resulting store is
-     * byte-identical to the legacy densify-then-copy output.
-     */
-    fill(sink: CellSink): void;
-}
-
-export interface StreamingWorkbook {
-    sheets: StreamingSheet[];
-    hasFormatting: boolean;
-    warnings: string[];
-}
+export type { CellSink, StreamingSheet, StreamingWorkbook } from './data-source/cell-fill';
 
 /**
  * Parse an .xls into per-sheet meta + a fill function, never materializing the

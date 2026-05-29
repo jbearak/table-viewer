@@ -58,6 +58,12 @@ export function use_editing(
         () => initial_edits !== undefined && Object.keys(initial_edits).length > 0,
     );
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
+    // True while any dirty entry still has base_pending — i.e. an old-format
+    // string restore whose true on-disk base hasn't been captured yet. The lazy
+    // effect below early-returns when this is false, so the scroll hot path
+    // (get_cell_raw rebinds on every page load) pays nothing once all bases
+    // resolve. Seeded by the initializer; cleared by the effect.
+    const has_pending_base_ref = useRef(false);
     const [dirty_cells, set_dirty_cells] = useState<Map<string, DirtyEntry>>(
         () =>
             initial_edits
@@ -65,16 +71,13 @@ export function use_editing(
                       Object.entries(initial_edits).map(([k, v]) => {
                           if (typeof v === 'object' && v !== null)
                               return [k, v as DirtyEntry];
-                          // Old-format string entry: capture the base from the
-                          // current cell. If the page isn't resident yet
-                          // (undefined), defer capture — baking in '' would be a
-                          // permanent false conflict. base_pending is resolved by
-                          // the effect below once the page loads.
-                          const [r, c] = k.split(':').map(Number);
-                          const cur = get_cell_raw(r, c);
-                          return cur === undefined
-                              ? [k, { value: v, base: '', base_pending: true }]
-                              : [k, { value: v, base: cur }];
+                          // Old-format string entry: defer base capture
+                          // uniformly. Baking in a base now would risk a
+                          // permanent false conflict when the page isn't
+                          // resident; the effect below captures the true base
+                          // once the page loads.
+                          has_pending_base_ref.current = true;
+                          return [k, { value: v, base: '', base_pending: true }];
                       }),
                   )
                 : new Map(),
@@ -243,8 +246,13 @@ export function use_editing(
     // becomes resident, capture its true on-disk value as the base. Runs whenever
     // get_cell_raw's identity changes (the consumer rebinds it as pages load).
     useEffect(() => {
+        // Hot-path guard: nothing pending means nothing to resolve, so skip the
+        // Map rebuild + rescan entirely. get_cell_raw rebinds on every page load,
+        // so without this the effect would re-run on every scroll.
+        if (!has_pending_base_ref.current) return;
         set_dirty_cells((prev) => {
             let changed = false;
+            let still_pending = false;
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of prev) {
                 if (entry.base_pending) {
@@ -255,9 +263,11 @@ export function use_editing(
                         changed = true;
                         continue;
                     }
+                    still_pending = true;
                 }
                 next.set(key, entry);
             }
+            has_pending_base_ref.current = still_pending;
             return changed ? next : prev;
         });
     }, [get_cell_raw]);

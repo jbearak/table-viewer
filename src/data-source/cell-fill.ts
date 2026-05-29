@@ -15,7 +15,7 @@
 // `../types`). No parser is imported here, so there is no import cycle.
 
 import { get_raw_cell_text } from '../cell-display';
-import type { CellData } from '../types';
+import type { CellData, MergeRange } from '../types';
 
 /**
  * The sparse working set for one parsed worksheet, before densification.
@@ -39,6 +39,31 @@ export interface CellSink {
 }
 
 /**
+ * Per-sheet streaming entry: sheet meta plus a `fill` that writes the sheet's
+ * cells into a {@link CellSink}. Both the .xlsx and .xls streaming parsers
+ * produce this exact shape; `fill` applies the SAME cell_at null/blank rule and
+ * raw normalization (`raw === null -> ''`, else `String(raw)`) the densify path
+ * uses, so the resulting store is byte-identical to the legacy output.
+ */
+export interface StreamingSheet {
+    name: string;
+    rowCount: number;
+    columnCount: number;
+    merges: MergeRange[];
+    fill(sink: CellSink): void;
+}
+
+/**
+ * The result of a streaming parse: per-sheet fill seams plus the workbook-level
+ * hasFormatting flag and any warnings. Shared by both format parsers.
+ */
+export interface StreamingWorkbook {
+    sheets: StreamingSheet[];
+    hasFormatting: boolean;
+    warnings: string[];
+}
+
+/**
  * Resolve the cell at (r, c) for a parsed worksheet's working set, applying the
  * exact null/blank contract:
  *   - merged-covered (non-anchor) cell  -> null
@@ -47,7 +72,7 @@ export interface CellSink {
  * This is the ONLY place this rule lives; both the densify path and the
  * direct-to-sink streaming path call it so they cannot diverge.
  */
-export function cell_at(working: WorkingSet, r: number, c: number): CellData | null {
+function cell_at(working: WorkingSet, r: number, c: number): CellData | null {
     const key = `${r}:${c}`;
     if (working.merged_cells.has(key)) return null;
     return working.cells.get(key) ?? { raw: null, formatted: '', bold: false, italic: false };

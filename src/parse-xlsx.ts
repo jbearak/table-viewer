@@ -6,13 +6,14 @@ import {
     MAX_WORKBOOK_CELLS,
     type WorkbookBudget,
 } from './spreadsheet-safety';
-import { workbook_has_formatting } from './cell-display';
 import {
     densify,
     fill_store,
     working_has_formatting,
     type CellSink,
     type WorkingSet,
+    type StreamingSheet,
+    type StreamingWorkbook,
 } from './data-source/cell-fill';
 import { serial_to_iso, is_date_format, is_valid_excel_date_serial, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
@@ -477,7 +478,27 @@ function col_letter_to_index(letters: string): number {
 
 // --- Public API ---
 
-export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
+/**
+ * The parsed .xlsx container plus the global tables every worksheet needs:
+ * sheet entries (name + relationship id), the rels map, shared strings, styles
+ * (fonts/xfs/format_map), date system and a fresh per-workbook cell budget.
+ * Shared by the densifying `parse_xlsx` and the streaming `parse_xlsx_streaming`
+ * so the container validation and global-table reads are byte-identical across
+ * both paths (mirrors `open_workbook` on the .xls side).
+ */
+interface OpenedXlsxWorkbook {
+    cfb_file: ReturnType<typeof CFB.read>;
+    sheet_entries: Array<{ name: string; rId: string }>;
+    rels: Map<string, string>;
+    sst: string[];
+    fonts: FontEntry[];
+    xfs: XfEntry[];
+    format_map: Map<number, string>;
+    datemode: DateMode;
+    budget: WorkbookBudget;
+}
+
+function open_xlsx_workbook(buffer: Uint8Array): OpenedXlsxWorkbook {
     let cfb_file: ReturnType<typeof CFB.read>;
     try {
         cfb_file = CFB.read(buffer, { type: 'buffer' });
@@ -504,9 +525,18 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         ? parse_styles(styles_xml)
         : { fonts: [], xfs: [], format_map: new Map<number, string>() };
 
+    const budget = create_workbook_budget();
+
+    return { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget };
+}
+
+export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
+    const { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
+        open_xlsx_workbook(buffer);
+
     // Parse each worksheet
     const sheets: SheetData[] = [];
-    const budget = create_workbook_budget();
+    const workings: WorksheetWorking[] = [];
 
     for (const entry of sheet_entries) {
         const sheet_path = rels.get(entry.rId);
@@ -522,6 +552,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         const working = parse_worksheet_core(
             ws_xml, sst, xfs, fonts, format_map, datemode, budget
         );
+        workings.push(working);
 
         sheets.push({
             name: entry.name,
@@ -532,33 +563,12 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         });
     }
 
-    return { data: { sheets, hasFormatting: workbook_has_formatting(sheets) }, warnings: [] };
+    return { data: { sheets, hasFormatting: working_has_formatting(workings) }, warnings: [] };
 }
 
 // --- Streaming API (direct-to-builder; no densified intermediate) ---
 
-export type { CellSink } from './data-source/cell-fill';
-
-/** Per-sheet streaming entry: meta plus a `fill` that writes cells into a sink. */
-export interface StreamingSheet {
-    name: string;
-    rowCount: number;
-    columnCount: number;
-    merges: MergeRange[];
-    /**
-     * Fill the provided sink (sized rowCount x columnCount) with this sheet's
-     * cells. Applies the SAME cell_at null/blank rule and the SAME raw
-     * normalization (raw === null -> '', else String(raw)) that the legacy
-     * densify-then-copy path used, so the resulting store is byte-identical.
-     */
-    fill(sink: CellSink): void;
-}
-
-export interface StreamingWorkbook {
-    sheets: StreamingSheet[];
-    hasFormatting: boolean;
-    warnings: string[];
-}
+export type { CellSink, StreamingSheet, StreamingWorkbook } from './data-source/cell-fill';
 
 /**
  * Parse an .xlsx into per-sheet meta + a fill function, never materializing the
@@ -566,30 +576,9 @@ export interface StreamingWorkbook {
  * directly, eliminating the transient 2x representation peak (Task A7).
  */
 export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<StreamingWorkbook> {
-    let cfb_file: ReturnType<typeof CFB.read>;
-    try {
-        cfb_file = CFB.read(buffer, { type: 'buffer' });
-    } catch {
-        throw new Error('Not a valid .xlsx file');
-    }
+    const { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
+        open_xlsx_workbook(buffer);
 
-    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
-    if (!workbook_xml) throw new Error('No workbook data found in .xlsx file');
-
-    const { sheets: sheet_entries, datemode } = parse_workbook_xml(workbook_xml);
-    assert_safe_sheet_count(sheet_entries.length);
-
-    const rels = parse_sheet_rels(cfb_file);
-
-    const sst_xml = get_entry_text(cfb_file, '/xl/sharedStrings.xml');
-    const sst = sst_xml ? parse_shared_strings(sst_xml) : [];
-
-    const styles_xml = get_entry_text(cfb_file, '/xl/styles.xml');
-    const { fonts, xfs, format_map } = styles_xml
-        ? parse_styles(styles_xml)
-        : { fonts: [], xfs: [], format_map: new Map<number, string>() };
-
-    const budget = create_workbook_budget();
     const sheets: StreamingSheet[] = [];
     const workings: WorksheetWorking[] = [];
 

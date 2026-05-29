@@ -1,18 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import { get_raw_cell_text, workbook_has_formatting } from '../cell-display';
-import type { CellData, SheetData } from '../types';
+import { get_raw_cell_text } from '../cell-display';
+import { working_has_formatting, type WorkingSet } from '../data-source/cell-fill';
+import type { CellData } from '../types';
 
-function cell(raw: CellData['raw'], formatted: string): CellData {
-    return { raw, formatted, bold: false, italic: false };
+function cell(raw: CellData['raw'], formatted: string, bold = false, italic = false): CellData {
+    return { raw, formatted, bold, italic };
 }
 
-function sheet(rows: (CellData | null)[][]): SheetData {
+// Build a single-sheet working set from a dense list of cells laid out in one row.
+function working(cells: CellData[]): WorkingSet {
+    const map = new Map<string, CellData>();
+    cells.forEach((c, i) => map.set(`0:${i}`, c));
     return {
-        name: 'Sheet1',
-        rows,
-        merges: [],
-        columnCount: rows[0]?.length ?? 0,
-        rowCount: rows.length,
+        cells: map,
+        merged_cells: new Set<string>(),
+        row_count: 1,
+        col_count: cells.length,
     };
 }
 
@@ -23,26 +26,20 @@ describe('get_raw_cell_text', () => {
     });
 });
 
-describe('workbook_has_formatting', () => {
+describe('working_has_formatting', () => {
     it('treats uppercase formatted booleans as formatting differences', () => {
-        const sheets = [sheet([[cell(true, 'TRUE'), cell(false, 'FALSE')]])];
-        expect(workbook_has_formatting(sheets)).toBe(true);
+        expect(working_has_formatting([working([cell(true, 'TRUE'), cell(false, 'FALSE')])])).toBe(true);
     });
 
     it('ignores cells whose formatted values already match raw display text', () => {
-        const sheets = [sheet([[cell(true, 'true'), cell(42, '42')]])];
-        expect(workbook_has_formatting(sheets)).toBe(false);
+        expect(working_has_formatting([working([cell(true, 'true'), cell(42, '42')])])).toBe(false);
     });
 
     it('detects bold cells as having formatting', () => {
-        const bold_cell: CellData = { raw: 'text', formatted: 'text', bold: true, italic: false };
-        const sheets = [sheet([[bold_cell]])];
-        expect(workbook_has_formatting(sheets)).toBe(true);
+        expect(working_has_formatting([working([cell('text', 'text', true, false)])])).toBe(true);
     });
 
     it('detects italic cells as having formatting', () => {
-        const italic_cell: CellData = { raw: 'text', formatted: 'text', bold: false, italic: true };
-        const sheets = [sheet([[italic_cell]])];
-        expect(workbook_has_formatting(sheets)).toBe(true);
+        expect(working_has_formatting([working([cell('text', 'text', false, true)])])).toBe(true);
     });
 });

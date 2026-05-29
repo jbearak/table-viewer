@@ -22,11 +22,10 @@ export interface TsvResult {
     /** Tab/newline-joined cell text for the clipboard. */
     text: string;
     /**
-     * True when the result is incomplete: either a selected row's page was not
-     * resident (emitted as blanks) or the selection exceeded `max_rows`.
+     * Why the copy was clipped, or null when it was complete: either a selected
+     * row's page was not resident (emitted as blanks) or the selection exceeded
+     * `max_rows`.
      */
-    truncated: boolean;
-    /** Why the copy was clipped, or null when it was complete. */
     truncationReason: TruncationReason | null;
 }
 
@@ -59,8 +58,8 @@ export function copy_truncation_message(
  *
  * - Merge-hidden cells emit empty strings; the merge anchor keeps its text.
  * - Rows whose page isn't resident (`get_row` returns undefined) emit blank
- *   columns and flag `truncated`.
- * - The row count is capped at `max_rows`; exceeding it flags `truncated`.
+ *   columns and set `truncationReason` to `non-resident`.
+ * - The row count is capped at `max_rows`; exceeding it sets `row-cap`.
  */
 export function format_selection_tsv(
     rect: SelectionRect,
@@ -69,14 +68,12 @@ export function format_selection_tsv(
     show_formatting: boolean,
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
-    let truncated = false;
     // Row-cap wins over non-resident: capped rows are never read, so the cap is
     // the most actionable reason to surface when both apply.
     let cap_truncated = false;
     let non_resident = false;
     const row_limit = Math.min(rect.height, max_rows);
     if (row_limit < rect.height) {
-        truncated = true;
         cap_truncated = true;
     }
 
@@ -88,7 +85,6 @@ export function format_selection_tsv(
         for (let c = 0; c < rect.width; c++) {
             const abs_col = rect.x + c;
             if (row === undefined) {
-                truncated = true;
                 non_resident = true;
                 cells.push('');
                 continue;
@@ -113,5 +109,5 @@ export function format_selection_tsv(
         : non_resident
             ? 'non-resident'
             : null;
-    return { text: lines.join('\n'), truncated, truncationReason };
+    return { text: lines.join('\n'), truncationReason };
 }
