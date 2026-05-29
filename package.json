@@ -138,6 +138,7 @@
     "package": "vsce package --no-dependencies"
   },
   "dependencies": {
+    "@glideapps/glide-data-grid": "6.0.3",
     "cfb": "^1.2.2",
     "papaparse": "^5.5.3",
     "react": "^18.3.1",
