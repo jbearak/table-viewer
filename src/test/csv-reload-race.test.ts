@@ -1,10 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
-import { open_csv_table } from '../csv-panel';
+import { attach_viewer, csv_table_profile } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
 import type { FileStateStore } from '../state';
 import * as vscode_mock from './mocks/vscode';
+
+/**
+ * Drive the CSV-table lifecycle through the shared controller, mirroring the
+ * old `open_csv_table` entry point: create a mock panel, attach the editable
+ * CSV profile, and route disposal the way the custom-editor host does.
+ */
+function open_csv_table(file_uri: vscode.Uri): void {
+    const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+    const controller = attach_viewer(
+        panel as unknown as Parameters<typeof attach_viewer>[0],
+        file_uri,
+        state_store(),
+        csv_table_profile(),
+    );
+    panel.onDidDispose(() => controller.dispose());
+}
 
 const enc = new TextEncoder();
 
@@ -81,7 +97,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
 
-        open_csv_table(uri('/tmp/race.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/race.csv'));
         const watcher = vscode_mock.__getWatchers()[0];
         const first_reload = watcher.__fireChange();
         const second_reload = watcher.__fireChange();
@@ -109,7 +125,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
 
-        open_csv_table(uri('/tmp/race.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/race.csv'));
         const panel = vscode_mock.__getPanels()[0];
         const initial_ready = panel.__receive({ type: 'ready' });
         const reload_done = vscode_mock.__getWatchers()[0].__fireChange();
@@ -135,7 +151,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
 
-        open_csv_table(uri('/tmp/race.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/race.csv'));
         const panel = vscode_mock.__getPanels()[0];
         const watcher = vscode_mock.__getWatchers()[0];
         const pre_ready_done = watcher.__fireChange();
@@ -165,7 +181,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => initial.promise);
 
-        open_csv_table(uri('/tmp/race.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/race.csv'));
         const panel = vscode_mock.__getPanels()[0];
         const initial_ready = panel.__receive({ type: 'ready' });
 
@@ -217,7 +233,7 @@ describe('CSV reload races', () => {
 
         show_csv_preview(uri('/tmp/race.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         const panel = vscode_mock.__getPanels()[0];
-        await panel.__receive({ type: 'ready' });
+        void panel.__receive({ type: 'ready' });
         const reload_done = vscode_mock.__getWatchers()[0].__fireChange();
 
         reload.resolve(enc.encode('n\n1\n2\n'));
@@ -251,7 +267,7 @@ describe('CSV reload races', () => {
         await pre_ready_done;
         panel.__messages.length = 0;
 
-        await panel.__receive({ type: 'ready' });
+        void panel.__receive({ type: 'ready' });
         const post_ready_done = watcher.__fireChange();
 
         post_ready_reload.resolve(enc.encode('n\n1\n2\n'));
@@ -278,10 +294,10 @@ describe('CSV reload races', () => {
 
         show_csv_preview(uri('/tmp/old.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         const panel = vscode_mock.__getPanels()[0];
-        await panel.__receive({ type: 'ready' });
+        void panel.__receive({ type: 'ready' });
 
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
-        await panel.__receive({ type: 'ready' });
+        void panel.__receive({ type: 'ready' });
 
         new_load.resolve(enc.encode('n\n1\n2\n'));
         await flush_promises();
@@ -311,7 +327,7 @@ describe('CSV reload races', () => {
             return enc.encode('a\nb\n');                        // save's re-parse (rowCount 2)
         });
 
-        open_csv_table(uri('/tmp/save.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
@@ -346,7 +362,7 @@ describe('CSV reload races', () => {
             return enc.encode('p\nq\nr\ns\nt\n');                // external edit (rowCount 5)
         });
 
-        open_csv_table(uri('/tmp/save.csv'), uri('/ext'), state_store(), new Set());
+        open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
@@ -375,7 +391,7 @@ describe('CSV reload races', () => {
         const old_reload_done = vscode_mock.__getWatchers()[0].__fireChange();
 
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
-        await panel.__receive({ type: 'ready' });
+        void panel.__receive({ type: 'ready' });
 
         new_load.resolve(enc.encode('n\n1\n2\n'));
         await flush_promises();

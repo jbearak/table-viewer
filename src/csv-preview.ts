@@ -1,10 +1,10 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
-import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
-import { get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib } from './viewer-config';
+import { attach_viewer, type ViewerProfile } from './viewer-controller';
+import { get_csv_max_rows, get_delimiter } from './viewer-config';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
-import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
+import { MAX_CSV_ROWS } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
@@ -82,19 +82,12 @@ function setup_preview(
     reusing: boolean
 ): () => void {
     const disposables: vscode.Disposable[] = [];
-    const file_path = uri.fsPath;
+    let torn_down = false;
+    // Row -> source-line map for scroll sync, refreshed from the same
+    // CsvDataSource that backs the grid (via the profile's on_source_adopted)
+    // so row counts can never drift apart.
     let line_map: number[] = [];
-    let consecutive_reload_failures = 0;
-
-    // Paginated protocol engine. `line_map` (row -> source line) for scroll sync
-    // comes from the same CsvDataSource that streams the grid rows, so the two
-    // always agree on row count and boundaries.
-    let core: ViewerPanelCore | undefined;
-    let source: CsvDataSource | undefined;
-    let reload_seq = 0;
-    let disposed = false;
-    let initial_meta_sent = false;
-    let ready_seen = false;
+    let last_editor_top_line = -1;
 
     // Scroll sync lockout state
     const editor_lockout: ScrollLockout = { locked: false, timer: undefined };
@@ -113,95 +106,6 @@ function setup_preview(
             lockout.locked = false;
             lockout.timer = undefined;
         }, SCROLL_LOCKOUT_MS);
-    }
-
-    async function load(): Promise<CsvDataSource> {
-        const max_file_size_mib = get_max_file_size_mib();
-        const stat = await vscode.workspace.fs.stat(uri);
-        assert_safe_file_size(stat.size, max_file_size_mib);
-        const raw = await vscode.workspace.fs.readFile(uri);
-        // Re-check after read: the file can grow between stat() and readFile()
-        // (this is a live-reload viewer, so concurrent writes are expected), and
-        // raw.byteLength is the buffer we actually allocated.
-        assert_safe_file_size(raw.byteLength, max_file_size_mib);
-        const delimiter = get_delimiter(file_path);
-        const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-        return CsvDataSource.create(raw, delimiter, max_rows);
-    }
-
-    function adopt_source(ds: CsvDataSource): void {
-        core = adopt_source_into_core(core, panel, source, ds);
-        source = ds;
-        // Scroll sync needs row -> source-line; derive it from the same source
-        // that backs the grid so row counts can never drift apart.
-        line_map = ds.lineMap();
-    }
-
-    // The first structural send (paginated protocol). Shared by the initial
-    // `ready` load and the first watcher reload that wins before `ready`.
-    function send_first_meta(ds: CsvDataSource): Promise<void> {
-        return core!.send_meta({
-            state: state_store.get(file_path),
-            defaultTabOrientation: get_default_orientation(),
-            previewMode: true,
-            truncationMessage: ds.truncationMessage,
-        });
-    }
-
-    async function send_initial_data(): Promise<void> {
-        const seq = ++reload_seq;
-        try {
-            const ds = await load();
-            if (disposed || seq !== reload_seq) {
-                ds.close();
-                return;
-            }
-            adopt_source(ds);
-            await send_first_meta(ds);
-            initial_meta_sent = true;
-        } catch (err) {
-            if (disposed) return;
-            const message = err instanceof Error ? err.message : String(err);
-            vscode.window.showErrorMessage(message);
-        }
-    }
-
-    async function send_reload(): Promise<void> {
-        if (disposed) return;
-        const seq = ++reload_seq;
-        try {
-            const ds = await load();
-            // A newer reload superseded us while parsing: discard this result so
-            // stale data cannot roll back the source or scroll-sync line map.
-            if (disposed || seq !== reload_seq) {
-                ds.close();
-                return;
-            }
-            adopt_source(ds);
-            if (!initial_meta_sent) {
-                await send_first_meta(ds);
-                if (ready_seen) initial_meta_sent = true;
-                consecutive_reload_failures = 0;
-                return;
-            }
-            const delivered = await core!.send_meta_reload({
-                truncationMessage: ds.truncationMessage,
-            });
-            if (!delivered) return;
-            consecutive_reload_failures = 0;
-        } catch (err) {
-            if (disposed) return;
-            const code = typeof err === 'object' && err !== null && 'code' in err
-                && typeof err.code === 'string' ? err.code : null;
-            if (code === 'EBUSY' || code === 'EPERM') return;
-
-            consecutive_reload_failures++;
-            if (consecutive_reload_failures >= 3) {
-                const message = err instanceof Error ? err.message : String(err);
-                console.error('Failed to reload CSV preview', err);
-                vscode.window.showErrorMessage(`Failed to reload CSV preview: ${message}`);
-            }
-        }
     }
 
     // --- Scroll sync: editor → preview ---
@@ -275,11 +179,35 @@ function setup_preview(
         shown_editor.revealRange(range, vscode.TextEditorRevealType.AtTop);
     }
 
-    let last_editor_top_line = -1;
+    // Read-only preview profile: the controller owns load/adopt/reload/watcher
+    // and paginated row serving; scroll-sync is layered on via the hooks below.
+    const profile: ViewerProfile = {
+        editing: false,
+        previewMode: true,
+        async build_source(raw, file_path) {
+            const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
+            return CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
+        },
+        on_source_adopted(ds) {
+            line_map = (ds as CsvDataSource).lineMap();
+        },
+        async on_message(msg: WebviewMessage): Promise<boolean> {
+            if (msg.type !== 'visibleRowChanged') return false;
+            if (torn_down || editor_lockout.locked) return true;
+            if (msg.row < 0 || msg.row >= line_map.length) return true;
+            const editor = find_matching_editor();
+            if (!editor) return true;
+            // Set lockout to prevent editor scroll from bouncing back
+            start_lockout(preview_lockout);
+            void reveal_source_line(editor, line_map[msg.row]);
+            return true;
+        },
+    };
 
+    // --- Scroll sync: editor → preview ---
     disposables.push(
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
-            if (disposed) return;
+            if (torn_down) return;
             if (preview_lockout.locked) return;
             if (e.textEditor.document.uri.toString() !== uri.toString()) return;
             if (e.visibleRanges.length === 0) return;
@@ -297,60 +225,15 @@ function setup_preview(
         })
     );
 
-    // --- Scroll sync: preview → editor ---
-
-    disposables.push(
-        panel.webview.onDidReceiveMessage((msg: WebviewMessage) => {
-            if (disposed) return;
-            switch (msg.type) {
-                case 'ready':
-                    ready_seen = true;
-                    send_initial_data();
-                    break;
-                case 'stateChanged':
-                    state_store.set(file_path, msg.state);
-                    break;
-                case 'visibleRowChanged': {
-                    if (editor_lockout.locked) return;
-                    if (msg.row < 0 || msg.row >= line_map.length) return;
-
-                    const source_line = line_map[msg.row];
-                    const editor = find_matching_editor();
-                    if (!editor) return;
-
-                    // Set lockout to prevent editor scroll from bouncing back
-                    start_lockout(preview_lockout);
-
-                    void reveal_source_line(editor, source_line);
-                    break;
-                }
-                case 'showWarning':
-                    vscode.window.showWarningMessage(msg.message);
-                    break;
-                default:
-                    // requestRows (paginated protocol) -> core answers with rowData.
-                    void core?.handle_message(msg);
-                    break;
-            }
-        })
-    );
-
-    // File watcher
-    const dir = path.dirname(file_path);
-    const basename = path.basename(file_path);
-    const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(vscode.Uri.file(dir), basename)
-    );
-    // send_reload() already short-circuits when disposed.
-    disposables.push(watcher.onDidChange(() => send_reload()));
-    disposables.push(watcher.onDidCreate(() => send_reload()));
-    disposables.push(watcher);
+    // Attach the shared controller (owns the `ready` handshake, watcher, reload
+    // guard, and core dispatch; forwards visibleRowChanged to profile.on_message).
+    disposables.push(attach_viewer(panel, uri, state_store, profile));
 
     // When reusing an existing panel for a different file, rebuild the webview
     // HTML rather than messaging the live (stale) one. This clears the previous
-    // file's rendered grid immediately — so a slow or failing load can't leave
-    // it on screen under the new title — and re-triggers the 'ready' handshake,
-    // which calls send_initial_data() exactly once for the new file.
+    // file's rendered grid immediately and re-triggers the 'ready' handshake,
+    // which the just-attached controller handles. Attach BEFORE this rebuild so
+    // the fresh 'ready' is delivered to the new controller.
     if (reusing) {
         panel.webview.html = build_webview_html(
             panel.webview, extension_uri, generate_nonce()
@@ -358,11 +241,9 @@ function setup_preview(
     }
 
     return () => {
-        disposed = true;
-        reload_seq++;
+        torn_down = true;
         clear_lockout(editor_lockout);
         clear_lockout(preview_lockout);
-        source?.close();
         for (const d of disposables) d.dispose();
     };
 }
