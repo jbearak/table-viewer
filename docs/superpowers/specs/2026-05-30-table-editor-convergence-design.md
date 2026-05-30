@@ -112,7 +112,17 @@ Refactored to consume the controller for the common lifecycle (load / adopt / re
 
 - Register the provider under both viewTypes.
 - `openCsvTable` command → `vscode.openWith(..., 'tableViewer.editor')`.
+- New `openAsText` command → `vscode.openWith(uri, 'default')` (see below).
 - Remove the now-unused `active_panels` set (only `csv-panel.ts` populated it); the preview manages its own singleton disposal.
+
+### Command: "Open in Text Editor"
+
+The inverse of "Open as Table". When a CSV/TSV is open in the table editor, a title-bar button reopens it in VS Code's built-in text editor.
+
+- **Command** `tableViewer.openAsText` (title "Table Viewer: Open in Text Editor", icon e.g. `$(go-to-file)`). Implementation: resolve the uri from the `editor/title` menu argument (VS Code passes the resource), falling back to the active custom tab's uri (`vscode.window.tabGroups.activeTabGroup.activeTab?.input` when it is a `TabInputCustom`); then `vscode.commands.executeCommand('vscode.openWith', uri, 'default')`. The viewType `'default'` is VS Code's built-in Text Editor (`DEFAULT_EDITOR_ASSOCIATION.id`), so it opens as text **even when the user has set the table as their default editor** for CSV/TSV.
+- **Menu** `editor/title`, `group: navigation`, shown only when the table editor is active for a CSV/TSV file:
+  `when: resourceExtname =~ /\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor`.
+  This naturally excludes the Excel viewer (`tableViewer.excelViewer`), where opening binary `.xls(x)` as text would be useless.
 
 ### `package.json`
 
@@ -120,10 +130,11 @@ Refactored to consume the controller for the common lifecycle (load / adopt / re
 - Repurpose the existing `tableViewer.editor` contribution: change its selector to `*.csv` / `*.tsv` (and uppercase variants) and its `priority` to `"option"`. `"option"` never auto-opens, so the text editor stays the default for CSV/TSV — matching the README's stated intent — while the table becomes available in **"Reopen Editor With…"**.
 - Refine the `editor/title` `when` for `tableViewer.openCsvTable` so it hides when the active editor is already a table editor:
   `resourceExtname =~ /\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor && activeCustomEditorId != tableViewer.excelViewer`
+- Add the `tableViewer.openAsText` command and its `editor/title` menu entry (see "Command: Open in Text Editor").
 
 ### `README.md`
 
-The `editorAssociations` snippet keeps its `tableViewer.editor` id (now repurposed for CSV/TSV), so **the documented snippet works unchanged**. Note that opening this way is now **editable**, and mention "Reopen Editor With… → Table Viewer" as an alternative now that CSV/TSV appear in the picker.
+The `editorAssociations` snippet keeps its `tableViewer.editor` id (now repurposed for CSV/TSV), so **the documented snippet works unchanged**. Note that opening this way is now **editable**, and mention "Reopen Editor With… → Table Viewer" as an alternative now that CSV/TSV appear in the picker. Also document the new **"Open in Text Editor"** title-bar button — the way back to the text editor from the table — which matters especially for users who set the table as their default for CSV/TSV.
 
 ## Viewer-type identifiers
 
@@ -149,6 +160,7 @@ In-repo references to update: `package.json` (the two contributions), `src/custo
 - **"Open as Table" now opens a real editor tab** instead of a free-floating webview panel, so it survives window reload and is listed under "Reopen With". VS Code dedups one editor per (file, viewType) per group; split views still work (`supportsMultipleEditorsPerDocument` stays `true`).
 - The cryptic **"Not a valid .xls file"** is gone; the README's `editorAssociations` advice works, **with editing**.
 - CSV/TSV appear in **"Reopen Editor With…"** without becoming the default editor.
+- A new **"Open in Text Editor"** button in the table editor's title bar provides a one-click route back to the text editor — the symmetric counterpart to "Open as Table".
 
 ## Edge cases to honor / verify
 
@@ -163,6 +175,7 @@ In-repo references to update: `package.json` (the two contributions), `src/custo
 - **Unit** — exercise the controller with a fake panel (as `panel-core` tests already do) for each profile: the reload monotonic guard, the `mtime` dedup, the `saveCsv` conflict path, and the `pendingEdits`-preserving `stateChanged` merge.
 - **Integration** (`src/test-integration/open-formats.test.ts`) — update the existing `has_custom_tab('tableViewer.editor')` assertions to `tableViewer.excelViewer`; the custom editor opens CSV/TSV **editable** (rows render, `csvEditingSupported` true) and XLSX/XLS **read-only**; the `openWith` path from the command; a regression test that forcing the `editorAssociations` (both viewTypes) no longer errors.
 - **Preview** (`src/test-integration/preview.test.ts`) — must stay green after the refactor; scroll-sync and singleton reuse behave as before.
+- **"Open in Text Editor"** — `tableViewer.openAsText` on a CSV open in the table editor results in a text editor tab for that uri (assert via the active tab input type), and still opens as text when the table is set as the default editor.
 
 ## Out of scope
 
