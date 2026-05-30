@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { read_overlay_editor_value } from './live-editor';
 
 export interface EditingCell {
     row: number;
@@ -321,10 +322,8 @@ export function use_editing(
     // the overlay isn't mounted (e.g. between renders).
     const get_active_editor_value = useCallback((): string | null => {
         if (!editing_cell) return null;
-        const el = document.querySelector(
-            '.gdg-clip-region textarea, .gdg-clip-region input',
-        ) as HTMLInputElement | HTMLTextAreaElement | null;
-        return el ? el.value : editing_cell.value;
+        const live = read_overlay_editor_value(document);
+        return live !== null ? live : editing_cell.value;
     }, [editing_cell]);
 
     return {

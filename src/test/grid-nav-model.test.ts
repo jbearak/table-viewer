@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolve_nav } from '../webview/grid-nav-model';
+import { resolve_nav, is_copy_key } from '../webview/grid-nav-model';
 
 // Defaults for a plain (no-modifier) key press; override per case.
 const base = {
@@ -75,5 +75,23 @@ describe('resolve_nav', () => {
         expect(resolve_nav({ ...base, key: 'a', has_merges: true })).toBeNull();
         expect(resolve_nav({ ...base, key: 'Enter', has_merges: true })).toBeNull();
         expect(resolve_nav({ ...base, key: 'Tab', has_merges: true })).toBeNull();
+    });
+});
+
+describe('is_copy_key', () => {
+    it('matches Ctrl+C and Cmd+C (either case)', () => {
+        expect(is_copy_key({ ...base, key: 'c', ctrl: true })).toBe(true);
+        expect(is_copy_key({ ...base, key: 'c', meta: true })).toBe(true);
+        expect(is_copy_key({ ...base, key: 'C', ctrl: true })).toBe(true);
+    });
+
+    it('ignores a plain c and other keys', () => {
+        expect(is_copy_key({ ...base, key: 'c' })).toBe(false);
+        expect(is_copy_key({ ...base, key: 'v', ctrl: true })).toBe(false);
+    });
+
+    it('defers Shift/Alt combos so range-copy and other shortcuts stay native', () => {
+        expect(is_copy_key({ ...base, key: 'c', ctrl: true, shift: true })).toBe(false);
+        expect(is_copy_key({ ...base, key: 'c', meta: true, alt: true })).toBe(false);
     });
 });

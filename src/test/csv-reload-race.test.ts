@@ -294,6 +294,72 @@ describe('CSV reload races', () => {
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
+    it('a save is not rolled back by an in-flight stale reload', async () => {
+        // A watcher reload is in flight (awaiting its parse) when the user saves.
+        // The save re-parses the just-written file and adopts it; when the older
+        // reload finally resolves it must be discarded, not allowed to overwrite
+        // the saved source with stale content.
+        const stale = deferred<Uint8Array>();
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        let call = 0;
+
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            call++;
+            if (call === 1) return enc.encode('a\n');          // initial ready (rowCount 1)
+            if (call === 2) return stale.promise;        // in-flight reload (rowCount 3)
+            return enc.encode('a\nb\n');                        // save's re-parse (rowCount 2)
+        });
+
+        open_csv_table(uri('/tmp/save.csv'), uri('/ext'), state_store(), new Set());
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        const watcher = vscode_mock.__getWatchers()[0];
+        const reload_done = watcher.__fireChange();      // starts the in-flight reload
+
+        await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
+
+        // The older reload resolves only after the save has adopted its result.
+        stale.resolve(enc.encode('x\ny\nz\n'));                  // rowCount 3
+        await reload_done;
+
+        const reloads = meta_reloads(panel);
+        // The save's metaReload (rowCount 2) must stand; the stale reload's
+        // rowCount-3 result must never be adopted.
+        expect(reloads.some((r) => r.meta.sheets[0].rowCount === 3)).toBe(false);
+        expect(reloads.some((r) => r.meta.sheets[0].rowCount === 2)).toBe(true);
+        expect(close_spy).toHaveBeenCalled();
+    });
+
+    it('does not drop an external edit that lands right after a save', async () => {
+        // A real external change immediately after a save must still reload —
+        // ordering (reload_seq), not a wall-clock window, decides which parse
+        // wins, so a legitimate edit within the old 2s suppress window isn't lost.
+        let current_mtime = 1;
+        let call = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: current_mtime }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            call++;
+            if (call === 1) return enc.encode('a\n');            // ready (rowCount 1)
+            if (call === 2) return enc.encode('a\nb\n');         // save re-parse (rowCount 2)
+            return enc.encode('p\nq\nr\ns\nt\n');                // external edit (rowCount 5)
+        });
+
+        open_csv_table(uri('/tmp/save.csv'), uri('/ext'), state_store(), new Set());
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
+
+        // An external edit changes the file (new mtime) right after the save.
+        current_mtime = 2;
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        const reloads = meta_reloads(panel);
+        expect(reloads.some((r) => r.meta.sheets[0].rowCount === 5)).toBe(true);
+    });
+
     it('CSV preview reuse ignores an old reload that completes after the panel is reused', async () => {
         const old_reload = deferred<Uint8Array>();
         const new_load = deferred<Uint8Array>();

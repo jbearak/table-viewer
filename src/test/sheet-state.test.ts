@@ -67,4 +67,29 @@ describe('sheet-state helpers', () => {
             trim_sheet_state_array([{ 0: 100 }, undefined, { 1: 80 }], 2)
         ).toEqual([{ 0: 100 }, undefined]);
     });
+
+    it('drops malformed pending-edit keys, keeping well-formed row:col entries', () => {
+        // A corrupt/old-format persisted key (not exactly two integers) would
+        // parse to NaN coordinates downstream, leaving a phantom dirty entry
+        // that can never be flagged conflicted or resolved. Reject it here.
+        const state: PerFileState = {
+            activeSheetIndex: 0,
+            pendingEdits: {
+                '1:2': 'good',
+                '0:0': { value: 'v', base: 'b' },
+                'bad-key': 'x',
+                '1:2:3': 'y',
+                '5:': 'z',
+                ':5': 'w',
+                '': 'empty',
+            } as PerFileState['pendingEdits'],
+        };
+
+        const normalized = normalize_per_file_state(state, ['Sheet1']);
+
+        expect(normalized.pendingEdits).toEqual({
+            '1:2': 'good',
+            '0:0': { value: 'v', base: 'b' },
+        });
+    });
 });

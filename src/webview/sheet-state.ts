@@ -84,6 +84,12 @@ function normalize_pending_edits(
     }
     const result: Record<string, string | { value: string; base: string }> = {};
     for (const [key, val] of Object.entries(value)) {
+        // Keys must be exactly "<row>:<col>" integers. A malformed key (corrupt
+        // or old-format persisted state) would parse to NaN coordinates, leaving
+        // a phantom dirty entry that is never flagged conflicted nor resolvable.
+        if (!/^\d+:\d+$/.test(key)) {
+            continue;
+        }
         if (typeof val === 'string') {
             result[key] = val;
         } else if (

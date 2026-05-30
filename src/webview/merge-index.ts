@@ -63,22 +63,32 @@ export class MergeIndex {
 
     /** The merge anchored exactly at (row, col), or null. */
     is_anchor(row: number, col: number): MergeEntry | null {
+        // Fast path for the common no-merge sheet (CSV, most xlsx): skip the
+        // per-cell key-string allocation + map lookup that runs once per visible
+        // cell on every draw. See entry_at.
+        if (this.entries.length === 0) return null;
         return this.anchors.get(key(row, col)) ?? null;
     }
 
     /** The merge containing (row, col) — anchor or interior — or null. */
     entry_at(row: number, col: number): MergeEntry | null {
+        // getCellContent calls this once per visible cell on every draw. On a
+        // sheet with no merges (the common case) the map is empty, so short-
+        // circuit before allocating a `${row}:${col}` key for a guaranteed miss.
+        if (this.entries.length === 0) return null;
         return this.cellToEntry.get(key(row, col)) ?? null;
     }
 
     /** True when (row, col) is inside a merge but is not its anchor. */
     is_covered(row: number, col: number): boolean {
+        if (this.entries.length === 0) return false;
         const e = this.cellToEntry.get(key(row, col));
         return e !== undefined && !(e.startRow === row && e.startCol === col);
     }
 
     /** The anchor coordinates for (row, col); the cell itself when unmerged. */
     anchor_of(row: number, col: number): { row: number; col: number } {
+        if (this.entries.length === 0) return { row, col };
         const e = this.cellToEntry.get(key(row, col));
         return e ? { row: e.startRow, col: e.startCol } : { row, col };
     }

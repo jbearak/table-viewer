@@ -31,7 +31,7 @@ import {
     copy_truncation_message,
     type SelectionRect,
 } from './grid-copy-model';
-import { resolve_nav } from './grid-nav-model';
+import { resolve_nav, is_copy_key } from './grid-nav-model';
 import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
@@ -50,6 +50,8 @@ import {
     type RowResizeOverlayHandle,
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
+import { read_overlay_editor_value } from './live-editor';
+import { changed_tint_keys } from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
 import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
 
@@ -257,6 +259,12 @@ export function GridShell({
     // ref App holds doesn't churn): the live dirty map and current selection.
     const dirty_cells_ref = useRef(dirty_cells);
     dirty_cells_ref.current = dirty_cells;
+    // get_cell_content reads dirty/conflict state through refs so its identity
+    // stays stable across edits — otherwise every commit would rebuild the
+    // closure and invalidate Glide's whole per-cell cache. Targeted repaints
+    // (below) drive the actual damage instead.
+    const conflicted_keys_ref = useRef(conflicted_keys);
+    conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
 
@@ -264,16 +272,14 @@ export function GridShell({
     // overlay (our hook's editing_cell stays null), so the location comes from the
     // selected cell and the live text from the portalled .gdg-clip-region input.
     const read_live_edit = useCallback((): LiveEdit | null => {
-        const el = document.querySelector(
-            '.gdg-clip-region textarea, .gdg-clip-region input',
-        ) as HTMLInputElement | HTMLTextAreaElement | null;
-        if (!el) return null;
+        const value = read_overlay_editor_value(document);
+        if (value === null) return null;
         const loc = grid_selection_ref.current.current?.cell;
         if (!loc) return null;
         const [col, row] = loc;
         return {
             key: `${row}:${col}`,
-            value: el.value,
+            value,
             original: get_cell_raw(row, col) ?? '',
         };
     }, [get_cell_raw]);
@@ -402,16 +408,19 @@ export function GridShell({
         (cell: Item): GridCell => {
             const [col, row] = cell;
             const key = `${row}:${col}`;
-            const dirty = dirty_cells.get(key);
+            const dirty = dirty_cells_ref.current.get(key);
             // Tint + dirty text whenever an edit exists; open the overlay only in
             // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
+            // dirty/conflict read via refs (see conflicted_keys_ref) so this
+            // closure's identity doesn't churn per edit; the targeted repaint
+            // effect damages the cells whose tint actually changed.
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty) {
                 overlay = {
                     editable: editable_cells,
                     dirty_value: dirty?.value,
                     bg: dirty
-                        ? conflicted_keys.has(key)
+                        ? conflicted_keys_ref.current.has(key)
                             ? CONFLICT_BG
                             : DIRTY_BG
                         : undefined,
@@ -427,15 +436,7 @@ export function GridShell({
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
-        [
-            get_row,
-            show_formatting,
-            version,
-            merge_index,
-            editable_cells,
-            dirty_cells,
-            conflicted_keys,
-        ],
+        [get_row, show_formatting, version, merge_index, editable_cells],
     );
 
     // Glide opens its own overlay editor; it reports the committed value here
@@ -697,6 +698,28 @@ export function GridShell({
     // past a merge to its far edge so navigation never stalls.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
+            // Route Ctrl/Cmd+C through the guarded copy path so a large or
+            // partly-scrolled selection can't be silently copied as blank cells
+            // by Glide's native copy. copy_rect caps the row count and surfaces a
+            // warning for non-resident rows. (Header-only selections with no
+            // current range fall through to Glide's native copy.)
+            if (
+                is_copy_key({
+                    key: args.key,
+                    ctrl: args.ctrlKey,
+                    meta: args.metaKey,
+                    shift: args.shiftKey,
+                    alt: args.altKey,
+                })
+            ) {
+                const sel = grid_selection_ref.current.current;
+                if (sel) {
+                    args.cancel();
+                    args.preventDefault();
+                    copy_rect(sel.range);
+                }
+                return;
+            }
             const decision = resolve_nav({
                 key: args.key,
                 shift: args.shiftKey,
@@ -732,7 +755,7 @@ export function GridShell({
             });
             grid_ref.current?.scrollTo(cell[0], cell[1]);
         },
-        [editable_cells, merges, sheet_meta.rowCount, sheet_meta.columnCount],
+        [editable_cells, merges, sheet_meta.rowCount, sheet_meta.columnCount, copy_rect],
     );
 
     const on_visible_region_changed = useCallback(
@@ -757,19 +780,11 @@ export function GridShell({
         ensure_rows(0, 40);
     }, [ensure_rows]);
 
-    // Repaint the visible region on the discrete events that change the content,
-    // tint, or editability of already-painted cells: a page landing (version
-    // bump), the formatting toggle (raw ↔ formatted), any change to the
-    // dirty-edit or conflict sets (which drive each cell's background tint), and
-    // the edit-mode toggle (which flips every cell's allowOverlay). A parent
-    // re-render alone does not reliably invalidate Glide's per-cell cache, so
-    // damage explicitly.
-    //
-    // Single-cell edits/discards damage their own cell inline (on_cell_edited,
-    // discard_edit), but the bulk paths change many cells' tint at once with no
-    // inline damage: clearing the saved keys after a successful save, "Discard
-    // Conflicted", and "Discard All". Depending on dirty_cells/conflicted_keys
-    // here repaints them so a stale tint never lingers until the next scroll.
+    // Full-region repaint on the discrete events that change content or
+    // editability of *every* already-painted cell: a page landing (version
+    // bump), the formatting toggle (raw ↔ formatted), and the edit-mode toggle
+    // (flips each cell's allowOverlay). A parent re-render alone does not
+    // reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
     useEffect(() => {
         const grid = grid_ref.current;
@@ -783,7 +798,43 @@ export function GridShell({
             }
         }
         grid.updateCells(cells);
-    }, [version, show_formatting, dirty_cells, conflicted_keys, editable_cells]);
+    }, [version, show_formatting, editable_cells]);
+
+    // Targeted tint repaint: damage only the cells whose dirty/conflict tint
+    // actually changed, not the whole viewport. Single-cell edits/discards
+    // already damage their own cell inline; this covers the bulk transitions
+    // (save-clear of saved keys, "Discard Conflicted"/"Discard All", and reload
+    // drift flipping cells in/out of the conflicted set) without rebuilding
+    // every visible cell on each keystroke.
+    const prev_dirty_keys_ref = useRef<Set<string>>(new Set());
+    const prev_conflicted_keys_ref = useRef<Set<string>>(new Set());
+    useEffect(() => {
+        const next_dirty = new Set(dirty_cells.keys());
+        const changed = changed_tint_keys(
+            prev_dirty_keys_ref.current,
+            next_dirty,
+            prev_conflicted_keys_ref.current,
+            conflicted_keys,
+        );
+        prev_dirty_keys_ref.current = next_dirty;
+        prev_conflicted_keys_ref.current = new Set(conflicted_keys);
+        const grid = grid_ref.current;
+        if (!grid || changed.size === 0) return;
+        const r = visible_ref.current;
+        const cells: { cell: Item }[] = [];
+        for (const key of changed) {
+            const [row, col] = key.split(':').map(Number);
+            if (
+                col >= r.x &&
+                col < r.x + r.width &&
+                row >= r.y &&
+                row < r.y + r.height
+            ) {
+                cells.push({ cell: [col, row] });
+            }
+        }
+        if (cells.length > 0) grid.updateCells(cells);
+    }, [dirty_cells, conflicted_keys]);
 
     // Preview mode: host asks us to scroll a specific row into view.
     useEffect(() => {

@@ -130,6 +130,14 @@ describe('CsvDataSource', () => {
         expect(new CsvDataSource(enc('a\nb\n'), ',', 10000).lineEnding).toBe('\n');
         expect(new CsvDataSource(enc('a\rb\r'), ',', 10000).lineEnding).toBe('\r');
     });
+    it('ignores a newline inside a quoted field when detecting lineEnding', () => {
+        // The first physical row holds a quoted field with an embedded bare \n,
+        // but the real row terminator is CRLF. A quote-blind scan would latch
+        // onto the embedded \n and rewrite every terminator to \n on save.
+        expect(
+            new CsvDataSource(enc('a,"x\ny"\r\nc,d\r\n'), ',', 10000).lineEnding
+        ).toBe('\r\n');
+    });
 
     describe('save round-trips without data corruption', () => {
         it('round-trips well-formed quoted fields unchanged', () => {

@@ -43,6 +43,21 @@ const VIM_DIRECTIONS: Record<string, Direction> = {
  * - hjkl (vim nav) is intercepted in view mode regardless of merges, but never
  *   while editing, so typing a letter into an editable cell still works.
  */
+/**
+ * True for the copy shortcut (Ctrl+C / Cmd+C, no Shift/Alt). GridShell
+ * intercepts it so copy always runs through the guarded `copy_rect` path
+ * (which caps the selection and warns on non-resident rows) instead of Glide's
+ * native copy, which reads each cell via getCellContent and would silently emit
+ * blank cells for rows whose page isn't loaded.
+ */
+export function is_copy_key(
+    input: Pick<NavInput, 'key' | 'ctrl' | 'meta' | 'shift' | 'alt'>,
+): boolean {
+    if (!(input.ctrl || input.meta)) return false;
+    if (input.shift || input.alt) return false;
+    return input.key === 'c' || input.key === 'C';
+}
+
 export function resolve_nav(input: NavInput): { direction: Direction } | null {
     if (input.ctrl || input.meta || input.alt || input.shift) return null;
 

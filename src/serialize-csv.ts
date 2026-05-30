@@ -20,19 +20,23 @@ export function serialize_csv(
 ): string {
     const lines: string[] = [];
 
-    // Precompute per-row max edited column so the inner loop is O(1)
+    // Precompute per-row max edited column so the inner loop is O(1), and the
+    // highest edited row so edits that land past the source's last row (e.g. a
+    // stale edit left over after the file shrank on an external reload) are
+    // still written instead of being silently dropped on save.
     let max_edit_col: Map<number, number> | undefined;
+    let max_edit_row = -1;
     if (edits) {
         max_edit_col = new Map();
         for (const key of Object.keys(edits)) {
             const [er, ec] = key.split(':').map(Number);
             const cur = max_edit_col.get(er);
             if (cur === undefined || ec > cur) max_edit_col.set(er, ec);
+            if (er > max_edit_row) max_edit_row = er;
         }
     }
 
-    let r = 0;
-    for (const row of rows) {
+    const serialize_row = (r: number, row: (CellData | null)[]): string => {
         const fields: string[] = [];
         let col_count = original_column_counts?.[r] ?? row.length;
         // Extend if any edit targets a column beyond original count
@@ -51,11 +55,24 @@ export function serialize_csv(
             }
             fields.push(quote_field(value, delimiter));
         }
-        lines.push(fields.join(delimiter));
+        return fields.join(delimiter);
+    };
+
+    let r = 0;
+    for (const row of rows) {
+        lines.push(serialize_row(r, row));
         r++;
     }
 
-    return lines.join(line_ending) + line_ending;
+    // Append any edits keyed beyond the last source row, filling the gap with
+    // empty rows. serialize_row reads only `edits` for these (the source row is
+    // empty), so a gap row with no edit collapses to a blank line.
+    for (; r <= max_edit_row; r++) {
+        lines.push(serialize_row(r, []));
+    }
+
+    // A logically empty sheet serializes to empty output, not a lone terminator.
+    return lines.length === 0 ? '' : lines.join(line_ending) + line_ending;
 }
 
 function quote_field(value: string, delimiter: string): string {

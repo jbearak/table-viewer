@@ -73,6 +73,44 @@ describe('serialize_csv', () => {
         expect(serialize_csv(rows, ',', edits)).toBe('filled,b\n');
     });
 
+    describe('empty input', () => {
+        it('returns an empty string for zero rows and no edits', () => {
+            expect(serialize_csv([], ',')).toBe('');
+        });
+
+        it('returns an empty string for an empty generator', () => {
+            function* none(): Generator<(CellData | null)[]> {}
+            expect(serialize_csv(none(), ',')).toBe('');
+        });
+    });
+
+    describe('edits beyond the source rows (file shrank under a stale edit)', () => {
+        it('emits an edit whose row index is past the last source row', () => {
+            // One source row (index 0); an edit targets row 2. Rather than
+            // silently dropping it (data loss on save), serialize emits the
+            // intervening empty row and the edit row.
+            const rows: (CellData | null)[][] = [
+                [cell('a'), cell('b')],
+            ];
+            const edits: Record<string, string> = { '2:1': 'X' };
+            expect(serialize_csv(rows, ',', edits)).toBe('a,b\n\n,X\n');
+        });
+
+        it('emits an edit when the source yields no rows at all', () => {
+            const edits: Record<string, string> = { '0:0': 'only' };
+            expect(serialize_csv([], ',', edits)).toBe('only\n');
+        });
+
+        it('does not append rows when every edit is within the source range', () => {
+            const rows: (CellData | null)[][] = [
+                [cell('a'), cell('b')],
+                [cell('c'), cell('d')],
+            ];
+            const edits: Record<string, string> = { '1:0': 'C' };
+            expect(serialize_csv(rows, ',', edits)).toBe('a,b\nC,d\n');
+        });
+    });
+
     describe('windowed (Iterable) serialization', () => {
         // A generator that yields the same rows in fixed-size windows. Proves
         // serialize_csv produces byte-identical output whether fed the whole

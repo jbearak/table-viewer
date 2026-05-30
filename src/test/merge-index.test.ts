@@ -77,6 +77,7 @@ describe('MergeIndex', () => {
     it('handles an empty merge list', () => {
         const idx = new MergeIndex([]);
         expect(idx.is_anchor(0, 0)).toBeNull();
+        expect(idx.entry_at(0, 0)).toBeNull();
         expect(idx.is_covered(0, 0)).toBe(false);
         expect(idx.anchor_of(4, 7)).toEqual({ row: 4, col: 7 });
         expect(idx.entries).toEqual([]);

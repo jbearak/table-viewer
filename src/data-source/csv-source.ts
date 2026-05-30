@@ -91,7 +91,7 @@ export class CsvDataSource implements DataSource {
         }
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
-        this.lineEnding = detect_line_ending(this.buf);
+        this.lineEnding = detect_line_ending(this.buf, delimiter.charCodeAt(0));
         this._meta = {
             hasFormatting: false,
             sheets: [{
@@ -162,17 +162,46 @@ export class CsvDataSource implements DataSource {
 
 const LF = 0x0a; // \n
 const CR = 0x0d; // \r
+const QUOTE = 0x22; // "
 
-/** First line terminator wins; defaults to '\n' for single-line sources.
- *  Mirrors parse-csv.ts so CSV save round-trips the original ending. Scans the
- *  raw bytes (stopping at the first terminator) so we never decode the whole
- *  buffer just to learn its line ending. */
-function detect_line_ending(buf: Uint8Array): '\r\n' | '\r' | '\n' {
+/** First *unquoted* line terminator wins; defaults to '\n' for single-line
+ *  sources. Mirrors build_line_index's quote rule so a newline embedded in a
+ *  quoted field (which is not a row boundary) can't be mistaken for the file's
+ *  terminator and silently rewrite every ending on save. Scans the raw bytes
+ *  (stopping at the first real terminator) so we never decode the whole buffer
+ *  just to learn its line ending. */
+function detect_line_ending(buf: Uint8Array, delimiter: number): '\r\n' | '\r' | '\n' {
+    let in_quotes = false;
+    // A `"` only opens a quoted field at a field start (buffer start, post-
+    // delimiter, or post-boundary). The loop returns at the first boundary, so
+    // field_start only needs maintaining across delimiters within the first row.
+    let field_start = true;
     for (let i = 0; i < buf.length; i++) {
-        if (buf[i] === CR) {
+        const b = buf[i];
+        if (in_quotes) {
+            if (b === QUOTE) {
+                if (i + 1 < buf.length && buf[i + 1] === QUOTE) {
+                    i++; // escaped quote ("") — consume both, stay quoted
+                    continue;
+                }
+                in_quotes = false; // closing quote
+            }
+            continue;
+        }
+        if (b === QUOTE && field_start) {
+            in_quotes = true;
+            field_start = false;
+            continue;
+        }
+        if (b === delimiter) {
+            field_start = true;
+            continue;
+        }
+        if (b === CR) {
             return (i + 1 < buf.length && buf[i + 1] === LF) ? '\r\n' : '\r';
         }
-        if (buf[i] === LF) return '\n';
+        if (b === LF) return '\n';
+        field_start = false;
     }
     return '\n';
 }

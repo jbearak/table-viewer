@@ -36,7 +36,6 @@ export function open_csv_table(
 
     const disposables: vscode.Disposable[] = [];
     let consecutive_reload_failures = 0;
-    let suppress_reload_until = 0;
 
     // Protocol engine (paginated sheetMeta/rowData), created on first successful
     // parse. The Glide webview consumes the paginated protocol exclusively.
@@ -106,9 +105,6 @@ export function open_csv_table(
 
     async function send_reload(): Promise<void> {
         if (disposed) return;
-        if (Date.now() < suppress_reload_until) {
-            return;
-        }
         const seq = ++reload_seq;
         try {
             const { source: ds, mtime } = await build_source();
@@ -116,6 +112,18 @@ export function open_csv_table(
             // stale data cannot roll back the source or last_mtime.
             if (disposed || seq !== reload_seq) {
                 ds.close();
+                return;
+            }
+            // Nothing changed since our last parse (our own save's write fires
+            // the watcher, or a spurious event): skip the redundant re-parse +
+            // metaReload. mtime-based, so a genuine external edit — which always
+            // bumps the mtime — still goes through. This replaces the old wall-
+            // clock suppress window, which dropped real edits landing within 2s
+            // of a save. Only applies once we're showing data (initial_meta_sent);
+            // before then every delivery may be the first real one.
+            if (initial_meta_sent && mtime === last_mtime) {
+                ds.close();
+                consecutive_reload_failures = 0;
                 return;
             }
             adopt_source(ds, mtime);
@@ -174,13 +182,20 @@ export function open_csv_table(
                                 'File was modified externally. Please review the changes and try again.'
                             );
                             // The external modification that tripped the mtime check
-                            // also fires the watcher's onDidChange. Suppress it so we
-                            // don't redundantly re-parse + metaReload the same file
-                            // twice (mirrors the success branch).
-                            suppress_reload_until = Date.now() + 2000;
+                            // also fires the watcher's onDidChange. Adopting the new
+                            // content here (last_mtime = its mtime) makes send_reload's
+                            // mtime dedup skip that redundant re-parse + metaReload.
+                            // Re-parse through the same monotonic guard send_reload
+                            // uses so a watcher reload already in flight can't roll
+                            // this result back (and a newer one supersedes us).
+                            const seq = ++reload_seq;
                             const { source: ds, mtime } = await build_source();
-                            adopt_source(ds, mtime);
-                            await post_reload(ds);
+                            if (!disposed && seq === reload_seq) {
+                                adopt_source(ds, mtime);
+                                await post_reload(ds);
+                            } else {
+                                ds.close();
+                            }
                             panel.webview.postMessage({ type: 'saveResult', success: false });
                             return;
                         }
@@ -208,21 +223,28 @@ export function open_csv_table(
                             src.originalColumnCounts,
                             src.lineEnding
                         );
-                        suppress_reload_until = Date.now() + 2000;
                         await vscode.workspace.fs.writeFile(
                             uri,
                             new TextEncoder().encode(content)
                         );
+                        // Re-parse through the same monotonic guard send_reload
+                        // uses: bumping reload_seq invalidates any watcher reload
+                        // already in flight (so its older parse can't roll back
+                        // this save) and lets a newer reload supersede us.
+                        const seq = ++reload_seq;
                         const { source: ds, mtime } = await build_source();
-                        adopt_source(ds, mtime);
-                        await post_reload(ds);
+                        if (!disposed && seq === reload_seq) {
+                            adopt_source(ds, mtime);
+                            await post_reload(ds);
+                        } else {
+                            ds.close();
+                        }
                         // Clear cached edits on successful save
                         const current = state_store.get(file_path) as PerFileState;
                         const { pendingEdits: _, ...rest } = current;
                         state_store.set(file_path, rest);
                         panel.webview.postMessage({ type: 'saveResult', success: true });
                     } catch (err) {
-                        suppress_reload_until = 0;
                         const message = err instanceof Error ? err.message : String(err);
                         vscode.window.showErrorMessage(`Failed to save: ${message}`);
                         panel.webview.postMessage({ type: 'saveResult', success: false });
