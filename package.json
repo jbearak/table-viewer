@@ -56,6 +56,11 @@
         "command": "tableViewer.openCsvTable",
         "title": "Table Viewer: Open as Table",
         "icon": "$(table)"
+      },
+      {
+        "command": "tableViewer.openAsText",
+        "title": "Table Viewer: Open in Text Editor",
+        "icon": "$(go-to-file)"
       }
     ],
     "menus": {
@@ -68,14 +73,19 @@
         },
         {
           "command": "tableViewer.openCsvTable",
-          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor && activeCustomEditorId != tableViewer.excelViewer",
+          "group": "navigation"
+        },
+        {
+          "command": "tableViewer.openAsText",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor",
           "group": "navigation"
         }
       ]
     },
     "customEditors": [
       {
-        "viewType": "tableViewer.editor",
+        "viewType": "tableViewer.excelViewer",
         "displayName": "Table Viewer",
         "selector": [
           {
@@ -92,6 +102,25 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "tableViewer.editor",
+        "displayName": "Table Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.CSV"
+          },
+          {
+            "filenamePattern": "*.tsv"
+          },
+          {
+            "filenamePattern": "*.TSV"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "configuration": {
