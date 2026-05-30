@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
-import { get_csv_max_rows, get_delimiter, get_max_file_size_mib } from './viewer-config';
+import { get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib } from './viewer-config';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
@@ -117,10 +117,7 @@ function setup_preview(
         try {
             const ds = await load();
             const state = state_store.get(file_path);
-            const config = vscode.workspace.getConfiguration('tableViewer');
-            const default_orientation = config.get<'horizontal' | 'vertical'>(
-                'tabOrientation', 'horizontal'
-            );
+            const default_orientation = get_default_orientation();
 
             await core!.send_meta({
                 state,
