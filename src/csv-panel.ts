@@ -103,6 +103,23 @@ export function open_csv_table(
         });
     }
 
+    // Re-parse the on-disk file and adopt it through the same monotonic guard
+    // send_reload uses: bumping reload_seq invalidates any watcher reload already
+    // in flight (its older parse can't roll back this result) and lets a newer
+    // reload supersede us. Used by both saveCsv branches after they write or
+    // detect an external change; adopting here (last_mtime = the new mtime) makes
+    // send_reload's mtime dedup skip the watcher event the write itself fires.
+    async function reparse_and_post(): Promise<void> {
+        const seq = ++reload_seq;
+        const { source: ds, mtime } = await build_source();
+        if (!disposed && seq === reload_seq) {
+            adopt_source(ds, mtime);
+            await post_reload(ds);
+        } else {
+            ds.close();
+        }
+    }
+
     async function send_reload(): Promise<void> {
         if (disposed) return;
         const seq = ++reload_seq;
@@ -182,20 +199,10 @@ export function open_csv_table(
                                 'File was modified externally. Please review the changes and try again.'
                             );
                             // The external modification that tripped the mtime check
-                            // also fires the watcher's onDidChange. Adopting the new
-                            // content here (last_mtime = its mtime) makes send_reload's
-                            // mtime dedup skip that redundant re-parse + metaReload.
-                            // Re-parse through the same monotonic guard send_reload
-                            // uses so a watcher reload already in flight can't roll
-                            // this result back (and a newer one supersedes us).
-                            const seq = ++reload_seq;
-                            const { source: ds, mtime } = await build_source();
-                            if (!disposed && seq === reload_seq) {
-                                adopt_source(ds, mtime);
-                                await post_reload(ds);
-                            } else {
-                                ds.close();
-                            }
+                            // also fires the watcher's onDidChange; reparse_and_post
+                            // adopts the new content here so that watcher reload is
+                            // deduped, guarded against in-flight reloads.
+                            await reparse_and_post();
                             panel.webview.postMessage({ type: 'saveResult', success: false });
                             return;
                         }
@@ -227,18 +234,7 @@ export function open_csv_table(
                             uri,
                             new TextEncoder().encode(content)
                         );
-                        // Re-parse through the same monotonic guard send_reload
-                        // uses: bumping reload_seq invalidates any watcher reload
-                        // already in flight (so its older parse can't roll back
-                        // this save) and lets a newer reload supersede us.
-                        const seq = ++reload_seq;
-                        const { source: ds, mtime } = await build_source();
-                        if (!disposed && seq === reload_seq) {
-                            adopt_source(ds, mtime);
-                            await post_reload(ds);
-                        } else {
-                            ds.close();
-                        }
+                        await reparse_and_post();
                         // Clear cached edits on successful save
                         const current = state_store.get(file_path) as PerFileState;
                         const { pendingEdits: _, ...rest } = current;

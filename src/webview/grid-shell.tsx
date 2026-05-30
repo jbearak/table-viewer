@@ -817,7 +817,9 @@ export function GridShell({
             conflicted_keys,
         );
         prev_dirty_keys_ref.current = next_dirty;
-        prev_conflicted_keys_ref.current = new Set(conflicted_keys);
+        // conflicted_keys is a fresh useMemo Set (new identity each change, never
+        // mutated in place), so it can be stashed as the snapshot directly — no copy.
+        prev_conflicted_keys_ref.current = conflicted_keys;
         const grid = grid_ref.current;
         if (!grid || changed.size === 0) return;
         const r = visible_ref.current;
