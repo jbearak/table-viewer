@@ -67,7 +67,7 @@
       "editor/title": [
         {
           "command": "tableViewer.showCsvPreviewToSide",
-          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor",
           "group": "navigation",
           "alt": "tableViewer.showCsvPreview"
         },
