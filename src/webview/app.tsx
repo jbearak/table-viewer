@@ -228,6 +228,17 @@ export function App(): React.JSX.Element {
         set_edit_mode(false);
     }, []);
 
+    // A deferred exit completes once the save acked and no uncommitted work (dirty
+    // map or open overlay) remains. Shared by the saveResult handler and the
+    // editing-status effect so the predicate can't drift between them.
+    const can_finish_pending_exit = useCallback(
+        () =>
+            pending_exit_ref.current &&
+            pending_exit_save_succeeded_ref.current &&
+            !(editing_ref.current?.has_uncommitted_changes() ?? false),
+        [],
+    );
+
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
@@ -252,7 +263,7 @@ export function App(): React.JSX.Element {
                         // If everything is already clean, finish now; otherwise the
                         // editing-status effect completes the exit once the dirty
                         // map and any open overlay later go clean.
-                        if (!(editing_ref.current?.has_uncommitted_changes() ?? false)) {
+                        if (can_finish_pending_exit()) {
                             finish_pending_exit();
                         }
                     } else if (!pending_exit_save_succeeded_ref.current) {
@@ -283,11 +294,7 @@ export function App(): React.JSX.Element {
     // (has_live_uncommitted), so this effect re-runs on every transition that can
     // make editing clean — no polling interval needed.
     useEffect(() => {
-        if (
-            pending_exit_ref.current &&
-            pending_exit_save_succeeded_ref.current &&
-            !(editing_ref.current?.has_uncommitted_changes() ?? false)
-        ) {
+        if (can_finish_pending_exit()) {
             finish_pending_exit();
         }
     }, [editing_status?.is_dirty, editing_status?.has_live_uncommitted]);
