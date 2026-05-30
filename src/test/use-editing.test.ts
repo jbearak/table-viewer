@@ -4,7 +4,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { describe, it, expect, afterEach } from 'vitest';
 import type { CellData } from '../types';
-import { use_editing } from '../webview/use-editing';
+import { clear_saved_dirty_entries, use_editing } from '../webview/use-editing';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -163,6 +163,20 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.confirm_edit('X'); });
         const entry = hook_result!.dirty_cells.get('2:1');
         expect(entry).toEqual({ value: 'X', base: '' });
+    });
+});
+
+describe('clear_saved_dirty_entries', () => {
+    it('preserves and rebases a dirty entry changed after the saved snapshot', () => {
+        const current = new Map([
+            ['0:0', { value: 'newer', base: 'a', base_pending: true }],
+            ['0:1', { value: 'saved', base: 'b' }],
+        ]);
+
+        const next = clear_saved_dirty_entries(current, { '0:0': 'sent', '0:1': 'saved' });
+
+        expect(next.get('0:0')).toEqual({ value: 'newer', base: 'sent' });
+        expect(next.has('0:1')).toBe(false);
     });
 });
 

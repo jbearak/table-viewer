@@ -92,7 +92,7 @@ export interface EditingStatus {
  */
 export interface EditingHandle {
     /** Collect dirty + in-progress edits and post `saveCsv`; returns whether a
-     *  save was actually posted (false when there's nothing to save). */
+     *  save was actually posted (false when clean or already saving). */
     request_save(): boolean;
     /** Drop every dirty edit. */
     clear_dirty(): void;
@@ -189,6 +189,8 @@ export function GridShell({
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
 
     const { ensure_rows, get_row, sample_loaded_rows, version } = loader;
+    // Values posted in the in-flight save; edit bases use these before reload.
+    const saved_edits_ref = useRef<Record<string, string>>({});
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against get_row's per-render identity; `version` in the deps
@@ -197,6 +199,8 @@ export function GridShell({
     get_row_ref.current = get_row;
     const get_cell_raw = useCallback(
         (r: number, c: number): string | undefined => {
+            const saved = saved_edits_ref.current[`${r}:${c}`];
+            if (saved !== undefined) return saved;
             const row = get_row_ref.current(r);
             // Page not resident (evicted / not yet fetched): return undefined so
             // conflict detection treats it as unknown, never as a changed value.
@@ -213,6 +217,7 @@ export function GridShell({
         commit_edit,
         clear_dirty,
         clear_dirty_keys,
+        clear_dirty_saved_edits,
         discard_conflicted,
         save_in_flight_ref,
     } = use_editing(get_cell_raw, generation, initial_edits);
@@ -244,8 +249,6 @@ export function GridShell({
     dirty_cells_ref.current = dirty_cells;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
-    // Keys posted in the in-flight save, cleared from the dirty map on success.
-    const saved_keys_ref = useRef<Set<string>>(new Set());
 
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
@@ -268,10 +271,11 @@ export function GridShell({
     // Collect committed dirty edits + any in-progress editor and post saveCsv.
     // Returns false (no message sent) when there is nothing to save.
     const request_save = useCallback((): boolean => {
+        if (save_in_flight_ref.current) return false;
         const edits = collect_save_edits(dirty_cells_ref.current, read_live_edit());
         const keys = Object.keys(edits);
         if (keys.length === 0) return false;
-        saved_keys_ref.current = new Set(keys);
+        saved_edits_ref.current = edits;
         save_in_flight_ref.current = true;
         vscode_api.postMessage({ type: 'saveCsv', edits });
         return true;
@@ -303,15 +307,17 @@ export function GridShell({
         const handler = (e: MessageEvent) => {
             const msg = e.data;
             if (!msg || msg.type !== 'saveResult') return;
+            if (!save_in_flight_ref.current) return;
+            const saved_edits = saved_edits_ref.current;
+            saved_edits_ref.current = {};
             save_in_flight_ref.current = false;
             if (msg.success) {
-                clear_dirty_keys(saved_keys_ref.current);
-                saved_keys_ref.current = new Set();
+                clear_dirty_saved_edits(saved_edits);
             }
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [clear_dirty_keys, save_in_flight_ref]);
+    }, [clear_dirty_saved_edits, save_in_flight_ref]);
 
     // Expose the imperative actions to App through the ref it provides.
     useEffect(() => {

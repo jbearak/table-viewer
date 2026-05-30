@@ -27,6 +27,20 @@ export interface DirtyEntry {
  */
 export type GetCellRaw = (row: number, col: number) => string | undefined;
 
+export function clear_saved_dirty_entries(
+    dirty: ReadonlyMap<string, DirtyEntry>,
+    saved: Readonly<Record<string, string>>,
+): Map<string, DirtyEntry> {
+    const next = new Map(dirty);
+    for (const [key, value] of Object.entries(saved)) {
+        const entry = next.get(key);
+        if (!entry) continue;
+        if (entry.value === value) next.delete(key);
+        else next.set(key, { value: entry.value, base: value });
+    }
+    return next;
+}
+
 function is_entry_conflicted(
     key: string,
     entry: DirtyEntry,
@@ -197,6 +211,10 @@ export function use_editing(
         });
     }, []);
 
+    const clear_dirty_saved_edits = useCallback((edits: Record<string, string>) => {
+        set_dirty_cells((prev) => clear_saved_dirty_entries(prev, edits));
+    }, []);
+
     const get_display_value = useCallback(
         (row: number, col: number): string | null => {
             const entry = dirty_cells.get(`${row}:${col}`);
@@ -323,6 +341,7 @@ export function use_editing(
         cancel_edit,
         clear_dirty,
         clear_dirty_keys,
+        clear_dirty_saved_edits,
         save_in_flight_ref,
         get_display_value,
         get_active_editor_value,

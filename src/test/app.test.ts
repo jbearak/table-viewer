@@ -6,6 +6,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HostMessage } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 
+const grid_shell_mock = vi.hoisted(() => ({
+    is_dirty: false,
+    has_uncommitted_changes: false,
+    on_editing_change: null as null | ((status: { is_dirty: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
+    request_save: vi.fn(() => false),
+    clear_dirty: vi.fn(),
+    discard_conflicted: vi.fn(),
+}));
+
 // Glide's DataEditor renders to a <canvas>, which jsdom can't drive. Replace the
 // grid with a DOM stub that surfaces the props App feeds it (sheet index,
 // generation, formatting flag, preview flag, column widths) and exposes a button
@@ -19,12 +28,41 @@ vi.mock('../webview/grid-shell', () => ({
         column_widths: Record<number, number>;
         row_heights: Record<number, number>;
         merges: { startRow: number }[];
+        edit_mode?: boolean;
+        on_editing_change?: (status: { is_dirty: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
+        editing_ref?: {
+            current: {
+                request_save: () => boolean;
+                clear_dirty: () => void;
+                discard_conflicted: () => void;
+                has_uncommitted_changes: () => boolean;
+            } | null;
+        };
         on_column_resize: (col: number, width: number) => void;
         on_row_resize: (row: number, height: number) => void;
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
     }) => {
+        React.useEffect(() => {
+            grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: grid_shell_mock.is_dirty,
+                edits: grid_shell_mock.is_dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
+                conflicted: [],
+            });
+            return () => {
+                grid_shell_mock.on_editing_change = null;
+            };
+        }, [props.on_editing_change]);
+        if (props.editing_ref) {
+            props.editing_ref.current = {
+                request_save: grid_shell_mock.request_save,
+                clear_dirty: grid_shell_mock.clear_dirty,
+                discard_conflicted: grid_shell_mock.discard_conflicted,
+                has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
+            };
+        }
         // Mirror the real GridShell: publish a measure function into the ref so
         // App's auto-fit toggle has fitted widths to apply.
         if (props.auto_fit_ref) {
@@ -38,6 +76,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-generation': String(props.generation),
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
+                'data-edit-mode': String(props.edit_mode ?? false),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
                 'data-merges': String(props.merges?.length ?? 0),
@@ -123,6 +162,18 @@ async function click_button(label: string) {
     });
 }
 
+async function report_grid_editing(dirty: boolean, uncommitted = dirty) {
+    grid_shell_mock.is_dirty = dirty;
+    grid_shell_mock.has_uncommitted_changes = uncommitted;
+    await act(async () => {
+        grid_shell_mock.on_editing_change?.({
+            is_dirty: dirty,
+            edits: dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
+            conflicted: [],
+        });
+    });
+}
+
 function grid_stub(): HTMLDivElement {
     const stub = container!.querySelector('.grid-shell-stub');
     expect(stub).not.toBeNull();
@@ -163,6 +214,13 @@ function cleanup() {
     container?.remove();
     container = null;
     document.body.innerHTML = '';
+    grid_shell_mock.is_dirty = false;
+    grid_shell_mock.has_uncommitted_changes = false;
+    grid_shell_mock.on_editing_change = null;
+    grid_shell_mock.request_save.mockReset();
+    grid_shell_mock.request_save.mockReturnValue(false);
+    grid_shell_mock.clear_dirty.mockReset();
+    grid_shell_mock.discard_conflicted.mockReset();
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -417,6 +475,204 @@ describe('truncation banner', () => {
         expect(banner!.textContent).toBe(
             'Showing 10,000 of 50,000 rows. Editing is disabled for truncated files.'
         );
+    });
+});
+
+describe('edit mode save exit', () => {
+    it('stays in edit mode when save is requested while dirty work is already saving', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+        await dispatch_host_message({ type: 'saveResult', success: true });
+        await report_grid_editing(true);
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('exits edit mode after a busy save-on-exit succeeds with no remaining dirty work', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+
+        await dispatch_host_message({ type: 'saveResult', success: true });
+        await report_grid_editing(false);
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('stays in edit mode after save success when only a live editor remains uncommitted', async () => {
+        grid_shell_mock.is_dirty = false;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        await report_grid_editing(false, true);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+
+        await dispatch_host_message({ type: 'saveResult', success: true });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('exits after a successful save once live-editor-only work later becomes clean', async () => {
+        vi.useFakeTimers();
+        grid_shell_mock.is_dirty = false;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        await report_grid_editing(false, true);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await dispatch_host_message({ type: 'saveResult', success: true });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        grid_shell_mock.has_uncommitted_changes = false;
+        await act(async () => {
+            vi.advanceTimersByTime(250);
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('ignores stray failed save results after a pending exit save already succeeded', async () => {
+        vi.useFakeTimers();
+        grid_shell_mock.is_dirty = false;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        await report_grid_editing(false, true);
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await dispatch_host_message({ type: 'saveResult', success: true });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await dispatch_host_message({ type: 'saveResult', success: false });
+        grid_shell_mock.has_uncommitted_changes = false;
+        await act(async () => {
+            vi.advanceTimersByTime(250);
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('does not let stale pending-exit polling close a fresh document with restored edits', async () => {
+        vi.useFakeTimers();
+        grid_shell_mock.is_dirty = false;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(false);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+
+        await click_button('Edit');
+        await report_grid_editing(false, true);
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        await dispatch_host_message({ type: 'saveResult', success: true });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        grid_shell_mock.has_uncommitted_changes = false;
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Fresh'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+                state: { pendingEdits: { '0:0': { value: 'restored', base: 'base' } } },
+                generation: 2,
+            })
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await act(async () => {
+            vi.advanceTimersByTime(250);
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 });
 

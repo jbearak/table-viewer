@@ -91,6 +91,10 @@ function setup_preview(
     // always agree on row count and boundaries.
     let core: ViewerPanelCore | undefined;
     let source: CsvDataSource | undefined;
+    let reload_seq = 0;
+    let disposed = false;
+    let initial_meta_sent = false;
+    let ready_seen = false;
 
     // Scroll sync lockout state
     const editor_lockout: ScrollLockout = { locked: false, timer: undefined };
@@ -122,18 +126,26 @@ function setup_preview(
         assert_safe_file_size(raw.byteLength, max_file_size_mib);
         const delimiter = get_delimiter(file_path);
         const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-        const ds = await CsvDataSource.create(raw, delimiter, max_rows);
+        return CsvDataSource.create(raw, delimiter, max_rows);
+    }
+
+    function adopt_source(ds: CsvDataSource): void {
         core = adopt_source_into_core(core, panel, source, ds);
         source = ds;
         // Scroll sync needs row -> source-line; derive it from the same source
         // that backs the grid so row counts can never drift apart.
         line_map = ds.lineMap();
-        return ds;
     }
 
     async function send_initial_data(): Promise<void> {
+        const seq = ++reload_seq;
         try {
             const ds = await load();
+            if (disposed || seq !== reload_seq) {
+                ds.close();
+                return;
+            }
+            adopt_source(ds);
             const state = state_store.get(file_path);
 
             await core!.send_meta({
@@ -142,21 +154,44 @@ function setup_preview(
                 previewMode: true,
                 truncationMessage: ds.truncationMessage,
             });
+            initial_meta_sent = true;
         } catch (err) {
+            if (disposed) return;
             const message = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(message);
         }
     }
 
     async function send_reload(): Promise<void> {
+        const seq = ++reload_seq;
         try {
             const ds = await load();
+            // A newer reload superseded us while parsing: discard this result so
+            // stale data cannot roll back the source or scroll-sync line map.
+            if (disposed || seq !== reload_seq) {
+                ds.close();
+                return;
+            }
+            adopt_source(ds);
+            if (!initial_meta_sent) {
+                const state = state_store.get(file_path);
+                await core!.send_meta({
+                    state,
+                    defaultTabOrientation: get_default_orientation(),
+                    previewMode: true,
+                    truncationMessage: ds.truncationMessage,
+                });
+                if (ready_seen) initial_meta_sent = true;
+                consecutive_reload_failures = 0;
+                return;
+            }
             const delivered = await core!.send_meta_reload({
                 truncationMessage: ds.truncationMessage,
             });
             if (!delivered) return;
             consecutive_reload_failures = 0;
         } catch (err) {
+            if (disposed) return;
             const code = typeof err === 'object' && err !== null && 'code' in err
                 && typeof err.code === 'string' ? err.code : null;
             if (code === 'EBUSY' || code === 'EPERM') return;
@@ -245,6 +280,7 @@ function setup_preview(
 
     disposables.push(
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
+            if (disposed) return;
             if (preview_lockout.locked) return;
             if (e.textEditor.document.uri.toString() !== uri.toString()) return;
             if (e.visibleRanges.length === 0) return;
@@ -266,8 +302,10 @@ function setup_preview(
 
     disposables.push(
         panel.webview.onDidReceiveMessage((msg: WebviewMessage) => {
+            if (disposed) return;
             switch (msg.type) {
                 case 'ready':
+                    ready_seen = true;
                     send_initial_data();
                     break;
                 case 'stateChanged':
@@ -304,8 +342,14 @@ function setup_preview(
     const watcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), basename)
     );
-    disposables.push(watcher.onDidChange(() => send_reload()));
-    disposables.push(watcher.onDidCreate(() => send_reload()));
+    disposables.push(watcher.onDidChange(() => {
+        if (disposed) return;
+        return send_reload();
+    }));
+    disposables.push(watcher.onDidCreate(() => {
+        if (disposed) return;
+        return send_reload();
+    }));
     disposables.push(watcher);
 
     // When reusing an existing panel for a different file, rebuild the webview
@@ -320,6 +364,8 @@ function setup_preview(
     }
 
     return () => {
+        disposed = true;
+        reload_seq++;
         clear_lockout(editor_lockout);
         clear_lockout(preview_lockout);
         source?.close();

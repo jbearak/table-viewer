@@ -12,6 +12,8 @@ import {
 import { vscode_api, use_state_sync } from './use-state-sync';
 import './styles.css';
 
+const PENDING_EXIT_RECHECK_MS = 100;
+
 /**
  * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
  * protocol (structure only — cells stream in later via the row loader inside
@@ -46,6 +48,8 @@ export function App(): React.JSX.Element {
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     const [edit_mode, set_edit_mode] = useState(false);
+    const [pending_exit_waiting_for_clean, set_pending_exit_waiting_for_clean] =
+        useState(false);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
     // unsaved work survives a webview reload. CSV is single-sheet, so this flat map
@@ -68,6 +72,7 @@ export function App(): React.JSX.Element {
     // True between posting a save (from the exit dialog) and its saveResult, so a
     // successful save then completes the deferred exit from edit mode.
     const pending_exit_ref = useRef(false);
+    const pending_exit_save_succeeded_ref = useRef(false);
     const auto_fit_active_ref = useRef<boolean[]>([]);
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
@@ -124,6 +129,8 @@ export function App(): React.JSX.Element {
                 set_editing_status(null);
                 set_dismissed_conflict_signature(null);
                 pending_exit_ref.current = false;
+                pending_exit_save_succeeded_ref.current = false;
+                set_pending_exit_waiting_for_clean(false);
             }
 
             if (msg.type === 'metaReload') {
@@ -221,7 +228,10 @@ export function App(): React.JSX.Element {
             const msg = event.data as HostMessage;
             if (msg.type === 'saveDialogResult') {
                 if (msg.choice === 'save') {
-                    if (editing_ref.current?.request_save()) {
+                    const editing = editing_ref.current;
+                    if (editing?.request_save()) {
+                        pending_exit_ref.current = true;
+                    } else if (editing?.has_uncommitted_changes()) {
                         pending_exit_ref.current = true;
                     } else {
                         set_edit_mode(false);
@@ -233,8 +243,22 @@ export function App(): React.JSX.Element {
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
                 if (pending_exit_ref.current) {
-                    pending_exit_ref.current = false;
-                    if (msg.success) set_edit_mode(false);
+                    if (msg.success) {
+                        pending_exit_save_succeeded_ref.current = true;
+                        if (!(editing_ref.current?.has_uncommitted_changes() ?? false)) {
+                            pending_exit_ref.current = false;
+                            pending_exit_save_succeeded_ref.current = false;
+                            set_pending_exit_waiting_for_clean(false);
+                            set_edit_mode(false);
+                        } else {
+                            set_pending_exit_waiting_for_clean(true);
+                        }
+                    } else {
+                        if (!pending_exit_save_succeeded_ref.current) {
+                            pending_exit_ref.current = false;
+                            set_pending_exit_waiting_for_clean(false);
+                        }
+                    }
                 }
             }
         };
@@ -254,6 +278,38 @@ export function App(): React.JSX.Element {
     const handle_editing_change = useCallback((status: EditingStatus) => {
         set_editing_status(status);
     }, []);
+
+    useEffect(() => {
+        if (
+            pending_exit_ref.current &&
+            pending_exit_save_succeeded_ref.current &&
+            !(editing_ref.current?.has_uncommitted_changes() ?? false)
+        ) {
+            pending_exit_ref.current = false;
+            pending_exit_save_succeeded_ref.current = false;
+            set_pending_exit_waiting_for_clean(false);
+            set_edit_mode(false);
+        }
+    }, [editing_status?.is_dirty]);
+
+    useEffect(() => {
+        if (!pending_exit_waiting_for_clean) return;
+        const timer = window.setInterval(() => {
+            if (
+                !pending_exit_ref.current ||
+                !pending_exit_save_succeeded_ref.current
+            ) {
+                return;
+            }
+            if (!(editing_ref.current?.has_uncommitted_changes() ?? false)) {
+                pending_exit_ref.current = false;
+                pending_exit_save_succeeded_ref.current = false;
+                set_pending_exit_waiting_for_clean(false);
+                set_edit_mode(false);
+            }
+        }, PENDING_EXIT_RECHECK_MS);
+        return () => window.clearInterval(timer);
+    }, [pending_exit_waiting_for_clean]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {

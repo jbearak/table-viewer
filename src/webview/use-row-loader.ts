@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useReducer, useRef } from 'react';
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
 import { vscode_api } from './use-state-sync';
@@ -45,10 +45,14 @@ export function use_row_loader(
         return () => window.removeEventListener('message', handler);
     }, [loader]);
 
+    const ensure_rows = useCallback((s: number, en: number) => loader.ensure_rows(s, en), [loader]);
+    const get_row = useCallback((r: number) => loader.get_row(r), [loader]);
+    const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
+
     return {
-        ensure_rows: (s, en) => loader.ensure_rows(s, en),
-        get_row: (r) => loader.get_row(r),
-        sample_loaded_rows: (max) => loader.sample_loaded_rows(max),
+        ensure_rows,
+        get_row,
+        sample_loaded_rows,
         version,
     };
 }
