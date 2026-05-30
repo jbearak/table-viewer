@@ -228,7 +228,16 @@ export function attach_viewer(
                 row_windows(), get_delimiter(file_path), edits,
                 src.originalColumnCounts, src.lineEnding);
             await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-            await reparse_and_post();
+            // The write succeeded — the save is done. A failure to re-parse the
+            // just-written file (a transient read error, or an external delete in
+            // the TOCTOU window) must not be reported as a failed save: the bytes
+            // are on disk. last_mtime is only advanced by a successful reparse, so
+            // the watcher event from our own write still refreshes the grid here.
+            try {
+                await reparse_and_post();
+            } catch (reload_err) {
+                console.error('Post-save reload failed (file was written)', reload_err);
+            }
             const current = state_store.get(file_path) as PerFileState;
             const { pendingEdits: _drop, ...rest } = current;
             await state_store.set(file_path, rest);

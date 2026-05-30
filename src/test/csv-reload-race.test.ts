@@ -376,6 +376,33 @@ describe('CSV reload races', () => {
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 5)).toBe(true);
     });
 
+    it('reports save success even when the post-write reload fails', async () => {
+        // The write succeeded, so the bytes are on disk. If the follow-up
+        // re-parse throws (transient read error / external delete in the TOCTOU
+        // window), the save must still be reported as successful, not failed.
+        let call = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            call++;
+            if (call === 1) return enc.encode('a\n'); // initial ready
+            throw new Error('reload boom');           // save's re-parse fails
+        });
+
+        open_csv_table(uri('/tmp/save.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        const results = panel.__messages.filter(
+            (m): m is { type: string; success: boolean } => (
+                typeof m === 'object' && m !== null && 'type' in m
+                && (m as { type: string }).type === 'saveResult'
+            ),
+        );
+        expect(results).toEqual([{ type: 'saveResult', success: true }]);
+    });
+
     it('CSV preview reuse ignores an old reload that completes after the panel is reused', async () => {
         const old_reload = deferred<Uint8Array>();
         const new_load = deferred<Uint8Array>();

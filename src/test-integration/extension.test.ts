@@ -24,6 +24,7 @@ describe('extension activation', () => {
             'tableViewer.showCsvPreviewToSide',
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
+            'tableViewer.openAsText',
         ]) {
             assert.ok(commands.includes(id), `command ${id} not registered`);
         }
