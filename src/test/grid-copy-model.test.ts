@@ -29,7 +29,12 @@ describe('format_selection_tsv', () => {
             NO_MERGES,
             true,
         );
-        expect(out).toEqual({ text: 'b', rowCapped: false, nonResident: false });
+        expect(out).toEqual({
+            text: 'b',
+            rowCapped: false,
+            nonResident: false,
+            rowCap: 100_000,
+        });
     });
 
     it('joins columns with tabs and rows with newlines', () => {
@@ -195,7 +200,11 @@ describe('format_selection_tsv', () => {
 describe('copy_truncation_message', () => {
     it('returns null when nothing was clipped', () => {
         expect(
-            copy_truncation_message({ rowCapped: false, nonResident: false }),
+            copy_truncation_message({
+                rowCapped: false,
+                nonResident: false,
+                rowCap: 100_000,
+            }),
         ).toBeNull();
     });
 
@@ -203,6 +212,7 @@ describe('copy_truncation_message', () => {
         const msg = copy_truncation_message({
             rowCapped: false,
             nonResident: true,
+            rowCap: 100_000,
         });
         expect(msg).toMatch(/copied/i);
         expect(msg).toMatch(/loaded/i);
@@ -212,6 +222,7 @@ describe('copy_truncation_message', () => {
         const msg = copy_truncation_message({
             rowCapped: true,
             nonResident: false,
+            rowCap: 100_000,
         });
         expect(msg).toMatch(/copied/i);
         expect(msg).toMatch(/100,000/);
@@ -221,9 +232,24 @@ describe('copy_truncation_message', () => {
         const msg = copy_truncation_message({
             rowCapped: true,
             nonResident: true,
+            rowCap: 100_000,
         });
         expect(msg).toMatch(/100,000/);
         expect(msg).toMatch(/loaded/i);
+    });
+
+    it('names the effective cap, not the default, when a smaller cap was used', () => {
+        const get_row = loader({ 0: [cell('a')], 1: [cell('b')] });
+        const out = format_selection_tsv(
+            { x: 0, y: 0, width: 1, height: 2 },
+            get_row,
+            NO_MERGES,
+            true,
+            1,
+        );
+        const msg = copy_truncation_message(out);
+        expect(msg).toMatch(/first 1 rows/);
+        expect(msg).not.toMatch(/100,000/);
     });
 
     it('treats null cells as empty', () => {

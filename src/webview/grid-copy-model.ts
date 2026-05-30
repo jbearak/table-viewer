@@ -24,6 +24,11 @@ export interface TsvResult {
      * reported because they describe different damage to the clipboard data.
      */
     nonResident: boolean;
+    /**
+     * The effective row cap that was applied (the `max_rows` used). Travels with
+     * the result so the warning names the real limit rather than the default.
+     */
+    rowCap: number;
 }
 
 /** Default cap so a runaway "select all" copy can't blow up the clipboard. */
@@ -36,12 +41,12 @@ export const DEFAULT_MAX_ROWS = 100_000;
  * Pure so it can be unit-tested and reused by the host message-surfacing path.
  */
 export function copy_truncation_message(
-    result: Pick<TsvResult, 'rowCapped' | 'nonResident'>,
+    result: Pick<TsvResult, 'rowCapped' | 'nonResident' | 'rowCap'>,
 ): string | null {
     const clauses: string[] = [];
     if (result.rowCapped) {
         clauses.push(
-            `only the first ${DEFAULT_MAX_ROWS.toLocaleString(
+            `only the first ${result.rowCap.toLocaleString(
                 'en-US',
             )} rows of the selection were copied (copy limit)`,
         );
@@ -108,5 +113,6 @@ export function format_selection_tsv(
         text: lines.join('\n'),
         rowCapped: cap_truncated,
         nonResident: non_resident,
+        rowCap: max_rows,
     };
 }

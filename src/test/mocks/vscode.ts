@@ -125,6 +125,7 @@ function make_panel(title: string): MockWebviewPanel {
 function make_watcher(): MockWatcher {
     const change_handlers: WatchHandler[] = [];
     const create_handlers: WatchHandler[] = [];
+    let disposed = false;
     return {
         onDidChange(handler: WatchHandler): { dispose(): void } {
             change_handlers.push(handler);
@@ -134,11 +135,15 @@ function make_watcher(): MockWatcher {
             create_handlers.push(handler);
             return disposable(create_handlers, handler);
         },
-        dispose() {},
+        dispose() {
+            disposed = true;
+        },
         async __fireChange(): Promise<void> {
+            if (disposed) return;
             await Promise.all(change_handlers.map((handler) => handler()));
         },
         async __fireCreate(): Promise<void> {
+            if (disposed) return;
             await Promise.all(create_handlers.map((handler) => handler()));
         },
     };
