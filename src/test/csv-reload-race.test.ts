@@ -403,6 +403,39 @@ describe('CSV reload races', () => {
         expect(results).toEqual([{ type: 'saveResult', success: true }]);
     });
 
+    it('reports a save conflict cleanly even when the post-conflict reload fails', async () => {
+        // An external change is detected (mtime differs), so the save is refused.
+        // If the follow-up re-parse also throws, the user must see only the
+        // conflict result — not a spurious generic "Failed to save" error.
+        let call = 0;
+        let mtime = 1;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            call++;
+            if (call === 1) return enc.encode('a\n'); // initial ready (last_mtime = 1)
+            throw new Error('reload boom');           // post-conflict re-parse fails
+        });
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        open_csv_table(uri('/tmp/save.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        // External change bumps the mtime, so handle_save sees a conflict.
+        mtime = 2;
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        const results = panel.__messages.filter(
+            (m): m is { type: string; success: boolean } => (
+                typeof m === 'object' && m !== null && 'type' in m
+                && (m as { type: string }).type === 'saveResult'
+            ),
+        );
+        expect(results).toEqual([{ type: 'saveResult', success: false }]);
+        // Only the "modified externally" warning — no generic save-failure error.
+        expect(error_spy).not.toHaveBeenCalled();
+    });
+
     it('CSV preview reuse ignores an old reload that completes after the panel is reused', async () => {
         const old_reload = deferred<Uint8Array>();
         const new_load = deferred<Uint8Array>();

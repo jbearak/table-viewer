@@ -211,7 +211,15 @@ export function attach_viewer(
             if (current_stat.mtime !== last_mtime) {
                 vscode.window.showWarningMessage(
                     'File was modified externally. Please review the changes and try again.');
-                await reparse_and_post();
+                // The save is correctly refused (conflict). A failure to re-parse
+                // the externally-changed file must not turn this into a generic
+                // "Failed to save" error on top of the conflict warning — report
+                // the conflict result and return regardless of reload outcome.
+                try {
+                    await reparse_and_post();
+                } catch (reload_err) {
+                    console.error('Post-conflict reload failed', reload_err);
+                }
                 panel.webview.postMessage({ type: 'saveResult', success: false });
                 return;
             }

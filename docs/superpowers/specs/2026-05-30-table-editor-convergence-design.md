@@ -33,7 +33,7 @@ Collapse the divergence into a single editable-table editor that hosts every for
 
 Extract one **viewer controller** that owns the shared lifecycle, and drive it with a per-format **profile**. Make the custom editor the single host for all formats; reduce the CSV table panel to a `vscode.openWith` call; refactor the preview to consume the controller too.
 
-```
+```text
    editorAssociations ─┐
    "Reopen With…"     ─┤──►  tableViewer.excelViewer (xlsx/xls, priority "default")
    "Open as Table" cmd ┘     tableViewer.editor      (csv/tsv,  priority "option")
@@ -64,19 +64,19 @@ Extract one **viewer controller** that owns the shared lifecycle, and drive it w
 The extracted controller. Given a webview-panel-like host, a `uri`, the `state_store`, and a `ViewerProfile`, it owns:
 
 - **Source building** — read file, `assert_safe_file_size` (re-checked against bytes actually read), build the `DataSource` via the profile, return `{ source, mtime }`.
-- **Adoption** — `adopt_source_into_core(...)` into a `ViewerPanelCore`; calls `profile.onSourceAdopted(source)` for hosts that need post-adopt work (the preview rebuilds its row→line map here).
+- **Adoption** — `adopt_source_into_core(...)` into a `ViewerPanelCore`; calls `profile.on_source_adopted(source)` for hosts that need post-adopt work (the preview rebuilds its row→line map here).
 - **Initial data** — on `ready`, build + adopt + `send_meta(...)` with the profile's envelope flags (`csvEditable`, `csvEditingSupported`, `previewMode`, `truncationMessage`).
 - **Reload** — file watcher (`RelativePattern` on dir/basename, `onDidChange` + `onDidCreate`) with the monotonic `reload_seq` guard, the editable profile's `mtime`-equality dedup, `EBUSY`/`EPERM` swallow, and the 3-strikes error surface. This is the logic currently duplicated across all three hosts.
-- **Message dispatch** — `ready`, `stateChanged`, `showWarning`, and `default → core.handle_message` for every profile. For the **editable** profile it also handles `saveCsv` (mtime conflict check → streamed `serialize_csv` over 10k-row windows → `writeFile` → `reparse_and_post` → clear cached edits), `pendingEditsChanged`, and `showSaveDialog`, and uses the `pendingEdits`-preserving `stateChanged` merge. Messages the controller does not recognize fall through to an optional `profile.onMessage(msg)` hook (the preview uses this for `visibleRowChanged`).
+- **Message dispatch** — `ready`, `stateChanged`, `showWarning`, and `default → core.handle_message` for every profile. For the **editable** profile it also handles `saveCsv` (mtime conflict check → streamed `serialize_csv` over 10k-row windows → `writeFile` → `reparse_and_post` → clear cached edits), `pendingEditsChanged`, and `showSaveDialog`, and uses the `pendingEdits`-preserving `stateChanged` merge. Messages the controller does not recognize fall through to an optional `profile.on_message(msg)` hook (the preview uses this for `visibleRowChanged`).
 - **Dispose** — close the source, tear down disposables. Must be cleanly re-attachable so the preview can reuse one panel across files.
 
 ```ts
 interface ViewerProfile {
-    buildSource(raw: Uint8Array, uri, filePath): Promise<DataSource> | DataSource;
-    editing: boolean;          // → csvEditingSupported
+    build_source(raw: Uint8Array, file_path: string): Promise<DataSource>;
+    editing: boolean;          // drives the csvEditingSupported envelope flag
     previewMode?: boolean;
-    onSourceAdopted?(source: DataSource): void;
-    onMessage?(msg: WebviewMessage): boolean | Promise<boolean>;  // returns "handled"
+    on_source_adopted?(source: DataSource): void;
+    on_message?(msg: WebviewMessage): boolean | Promise<boolean>;  // returns "handled"
 }
 ```
 
