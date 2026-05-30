@@ -223,15 +223,25 @@ export function App(): React.JSX.Element {
     // React to the host's save-dialog choice (from the exit flow) and to the save
     // outcome. GridShell separately clears the dirty map on a successful save; here
     // we only complete a deferred exit from edit mode.
+    //
+    // Reset all pending-exit bookkeeping and leave edit mode. Called once a
+    // save-on-exit has succeeded and no uncommitted work remains. Refs and
+    // setters are stable, so this keeps one identity for the component's life.
+    const finish_pending_exit = useCallback(() => {
+        pending_exit_ref.current = false;
+        pending_exit_save_succeeded_ref.current = false;
+        set_pending_exit_waiting_for_clean(false);
+        set_edit_mode(false);
+    }, []);
+
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
             if (msg.type === 'saveDialogResult') {
                 if (msg.choice === 'save') {
                     const editing = editing_ref.current;
-                    if (editing?.request_save()) {
-                        pending_exit_ref.current = true;
-                    } else if (editing?.has_uncommitted_changes()) {
+                    // request_save() has side effects, so it must be evaluated first.
+                    if (editing?.request_save() || editing?.has_uncommitted_changes()) {
                         pending_exit_ref.current = true;
                     } else {
                         set_edit_mode(false);
@@ -246,18 +256,13 @@ export function App(): React.JSX.Element {
                     if (msg.success) {
                         pending_exit_save_succeeded_ref.current = true;
                         if (!(editing_ref.current?.has_uncommitted_changes() ?? false)) {
-                            pending_exit_ref.current = false;
-                            pending_exit_save_succeeded_ref.current = false;
-                            set_pending_exit_waiting_for_clean(false);
-                            set_edit_mode(false);
+                            finish_pending_exit();
                         } else {
                             set_pending_exit_waiting_for_clean(true);
                         }
-                    } else {
-                        if (!pending_exit_save_succeeded_ref.current) {
-                            pending_exit_ref.current = false;
-                            set_pending_exit_waiting_for_clean(false);
-                        }
+                    } else if (!pending_exit_save_succeeded_ref.current) {
+                        pending_exit_ref.current = false;
+                        set_pending_exit_waiting_for_clean(false);
                     }
                 }
             }
@@ -285,10 +290,7 @@ export function App(): React.JSX.Element {
             pending_exit_save_succeeded_ref.current &&
             !(editing_ref.current?.has_uncommitted_changes() ?? false)
         ) {
-            pending_exit_ref.current = false;
-            pending_exit_save_succeeded_ref.current = false;
-            set_pending_exit_waiting_for_clean(false);
-            set_edit_mode(false);
+            finish_pending_exit();
         }
     }, [editing_status?.is_dirty]);
 
@@ -302,10 +304,7 @@ export function App(): React.JSX.Element {
                 return;
             }
             if (!(editing_ref.current?.has_uncommitted_changes() ?? false)) {
-                pending_exit_ref.current = false;
-                pending_exit_save_succeeded_ref.current = false;
-                set_pending_exit_waiting_for_clean(false);
-                set_edit_mode(false);
+                finish_pending_exit();
             }
         }, PENDING_EXIT_RECHECK_MS);
         return () => window.clearInterval(timer);

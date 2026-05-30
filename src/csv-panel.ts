@@ -65,6 +65,17 @@ export function open_csv_table(
         last_mtime = mtime;
     }
 
+    // The first structural send (paginated protocol). Shared by the initial
+    // `ready` load and the first watcher reload that wins before `ready`.
+    function send_first_meta(ds: CsvDataSource): Promise<void> {
+        return core!.send_meta({
+            state: state_store.get(file_path),
+            defaultTabOrientation: get_default_orientation(),
+            csvEditable: !ds.truncationMessage,
+            csvEditingSupported: true,
+        });
+    }
+
     async function send_initial_data(): Promise<void> {
         const seq = ++reload_seq;
         try {
@@ -75,16 +86,7 @@ export function open_csv_table(
                 return;
             }
             adopt_source(ds, mtime);
-            const state = state_store.get(file_path);
-            const default_orientation = get_default_orientation();
-
-            // Paginated protocol.
-            await core!.send_meta({
-                state,
-                defaultTabOrientation: default_orientation,
-                csvEditable: !ds.truncationMessage,
-                csvEditingSupported: true,
-            });
+            await send_first_meta(ds);
             initial_meta_sent = true;
         } catch (err) {
             if (disposed) return;
@@ -118,13 +120,7 @@ export function open_csv_table(
             }
             adopt_source(ds, mtime);
             if (!initial_meta_sent) {
-                const state = state_store.get(file_path);
-                await core!.send_meta({
-                    state,
-                    defaultTabOrientation: get_default_orientation(),
-                    csvEditable: !ds.truncationMessage,
-                    csvEditingSupported: true,
-                });
+                await send_first_meta(ds);
                 if (ready_seen) initial_meta_sent = true;
                 consecutive_reload_failures = 0;
                 return;
@@ -274,14 +270,9 @@ export function open_csv_table(
     const watcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), file_basename)
     );
-    disposables.push(watcher.onDidChange(() => {
-        if (disposed) return;
-        return send_reload();
-    }));
-    disposables.push(watcher.onDidCreate(() => {
-        if (disposed) return;
-        return send_reload();
-    }));
+    // send_reload() already short-circuits when disposed.
+    disposables.push(watcher.onDidChange(() => send_reload()));
+    disposables.push(watcher.onDidCreate(() => send_reload()));
     disposables.push(watcher);
 
     const panel_disposable: vscode.Disposable = {

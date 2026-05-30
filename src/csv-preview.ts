@@ -137,6 +137,17 @@ function setup_preview(
         line_map = ds.lineMap();
     }
 
+    // The first structural send (paginated protocol). Shared by the initial
+    // `ready` load and the first watcher reload that wins before `ready`.
+    function send_first_meta(ds: CsvDataSource): Promise<void> {
+        return core!.send_meta({
+            state: state_store.get(file_path),
+            defaultTabOrientation: get_default_orientation(),
+            previewMode: true,
+            truncationMessage: ds.truncationMessage,
+        });
+    }
+
     async function send_initial_data(): Promise<void> {
         const seq = ++reload_seq;
         try {
@@ -146,14 +157,7 @@ function setup_preview(
                 return;
             }
             adopt_source(ds);
-            const state = state_store.get(file_path);
-
-            await core!.send_meta({
-                state,
-                defaultTabOrientation: get_default_orientation(),
-                previewMode: true,
-                truncationMessage: ds.truncationMessage,
-            });
+            await send_first_meta(ds);
             initial_meta_sent = true;
         } catch (err) {
             if (disposed) return;
@@ -163,6 +167,7 @@ function setup_preview(
     }
 
     async function send_reload(): Promise<void> {
+        if (disposed) return;
         const seq = ++reload_seq;
         try {
             const ds = await load();
@@ -174,13 +179,7 @@ function setup_preview(
             }
             adopt_source(ds);
             if (!initial_meta_sent) {
-                const state = state_store.get(file_path);
-                await core!.send_meta({
-                    state,
-                    defaultTabOrientation: get_default_orientation(),
-                    previewMode: true,
-                    truncationMessage: ds.truncationMessage,
-                });
+                await send_first_meta(ds);
                 if (ready_seen) initial_meta_sent = true;
                 consecutive_reload_failures = 0;
                 return;
@@ -342,14 +341,9 @@ function setup_preview(
     const watcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), basename)
     );
-    disposables.push(watcher.onDidChange(() => {
-        if (disposed) return;
-        return send_reload();
-    }));
-    disposables.push(watcher.onDidCreate(() => {
-        if (disposed) return;
-        return send_reload();
-    }));
+    // send_reload() already short-circuits when disposed.
+    disposables.push(watcher.onDidChange(() => send_reload()));
+    disposables.push(watcher.onDidCreate(() => send_reload()));
     disposables.push(watcher);
 
     // When reusing an existing panel for a different file, rebuild the webview
