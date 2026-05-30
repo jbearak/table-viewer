@@ -3,7 +3,8 @@ import * as vscode from 'vscode';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
 import type { DataSource } from './data-source/interface';
-import { ViewerPanelCore } from './panel-core';
+import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
+import { get_default_orientation, get_max_file_size_mib } from './viewer-config';
 import { assert_safe_file_size } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
@@ -142,8 +143,7 @@ class ViewerPanel implements vscode.Disposable {
 
     private async build_source(): Promise<DataSource> {
         const stat = await vscode.workspace.fs.stat(this.uri);
-        const max_mib = vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxFileSizeMiB', 256)!;
+        const max_mib = get_max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(this.uri);
         // Re-check against the bytes actually read: the file may have grown
@@ -157,20 +157,8 @@ class ViewerPanel implements vscode.Disposable {
     }
 
     private adopt_source(source: DataSource): void {
-        if (this.source && this.source !== source) {
-            this.source.close();
-        }
+        this.core = adopt_source_into_core(this.core, this.panel, this.source, source);
         this.source = source;
-        if (this.core) {
-            this.core.set_source(source);
-        } else {
-            this.core = new ViewerPanelCore(this.panel, source);
-        }
-    }
-
-    private get_default_orientation(): 'horizontal' | 'vertical' {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
     }
 
     private async send_initial_data(): Promise<void> {
@@ -178,7 +166,7 @@ class ViewerPanel implements vscode.Disposable {
             const source = await this.build_source();
             this.adopt_source(source);
             const state = this.state_store.get(this.file_path);
-            const default_orientation = this.get_default_orientation();
+            const default_orientation = get_default_orientation();
 
             // Paginated protocol.
             await this.core!.send_meta({ state, defaultTabOrientation: default_orientation });

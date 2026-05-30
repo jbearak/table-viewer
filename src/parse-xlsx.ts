@@ -567,8 +567,6 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
 
 // --- Streaming API (direct-to-builder; no densified intermediate) ---
 
-export type { CellSink, StreamingSheet, StreamingWorkbook } from './data-source/cell-fill';
-
 /**
  * Parse an .xlsx into per-sheet meta + a fill function, never materializing the
  * intermediate (CellData|null)[][]. Lets a consumer build its own columnar store

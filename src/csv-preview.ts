@@ -1,7 +1,8 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
-import { ViewerPanelCore } from './panel-core';
+import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
+import { get_csv_max_rows, get_delimiter, get_max_file_size_mib } from './viewer-config';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
@@ -92,20 +93,6 @@ function setup_preview(
     let editor_lockout_timer: ReturnType<typeof setTimeout> | undefined;
     let preview_lockout_timer: ReturnType<typeof setTimeout> | undefined;
 
-    function get_delimiter(): ',' | '\t' {
-        return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
-    }
-
-    function get_max_file_size_mib(): number {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxFileSizeMiB', 256)!;
-    }
-
-    function get_csv_max_rows(): number {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('csvMaxRows', 1_000_000)!;
-    }
-
     async function load(): Promise<CsvDataSource> {
         const max_file_size_mib = get_max_file_size_mib();
         const stat = await vscode.workspace.fs.stat(uri);
@@ -115,24 +102,15 @@ function setup_preview(
         // (this is a live-reload viewer, so concurrent writes are expected), and
         // raw.byteLength is the buffer we actually allocated.
         assert_safe_file_size(raw.byteLength, max_file_size_mib);
-        const delimiter = get_delimiter();
+        const delimiter = get_delimiter(file_path);
         const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
         const ds = await CsvDataSource.create(raw, delimiter, max_rows);
-        adopt(ds);
+        core = adopt_source_into_core(core, panel, source, ds);
+        source = ds;
         // Scroll sync needs row -> source-line; derive it from the same source
         // that backs the grid so row counts can never drift apart.
         line_map = ds.lineMap();
         return ds;
-    }
-
-    function adopt(ds: CsvDataSource): void {
-        if (source && source !== ds) source.close();
-        source = ds;
-        if (core) {
-            core.set_source(ds);
-        } else {
-            core = new ViewerPanelCore(panel, ds);
-        }
     }
 
     async function send_initial_data(): Promise<void> {

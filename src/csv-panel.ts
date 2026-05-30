@@ -2,7 +2,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import type { RenderedCell } from './data-source/interface';
-import { ViewerPanelCore } from './panel-core';
+import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
+import { get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib } from './viewer-config';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type { FileStateStore } from './state';
@@ -44,46 +45,20 @@ export function open_csv_table(
     // mtime of the file as of the last successful parse, for the save conflict check.
     let last_mtime = 0;
 
-    function get_delimiter(): ',' | '\t' {
-        return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
-    }
-
-    function get_max_file_size_mib(): number {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxFileSizeMiB', 256)!;
-    }
-
-    function get_csv_max_rows(): number {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('csvMaxRows', 1_000_000)!;
-    }
-
-    function get_default_orientation(): 'horizontal' | 'vertical' {
-        return vscode.workspace.getConfiguration('tableViewer')
-            .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
-    }
-
     async function build_source(): Promise<{ source: CsvDataSource; mtime: number }> {
         const stat = await vscode.workspace.fs.stat(uri);
         assert_safe_file_size(stat.size, get_max_file_size_mib());
         const raw = await vscode.workspace.fs.readFile(uri);
         // User config caps the row count, but MAX_CSV_ROWS is the hard ceiling.
         const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-        const ds = await CsvDataSource.create(raw, get_delimiter(), max_rows);
+        const ds = await CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
         return { source: ds, mtime: stat.mtime };
     }
 
     function adopt_source(ds: CsvDataSource, mtime: number): void {
-        if (source && source !== ds) {
-            source.close();
-        }
+        core = adopt_source_into_core(core, panel, source, ds);
         source = ds;
         last_mtime = mtime;
-        if (core) {
-            core.set_source(ds);
-        } else {
-            core = new ViewerPanelCore(panel, ds);
-        }
     }
 
     async function send_initial_data(): Promise<void> {
@@ -197,7 +172,7 @@ export function open_csv_table(
                         }
                         const content = serialize_csv(
                             row_windows(),
-                            get_delimiter(),
+                            get_delimiter(file_path),
                             msg.edits,
                             src.originalColumnCounts,
                             src.lineEnding

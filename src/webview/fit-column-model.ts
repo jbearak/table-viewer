@@ -7,9 +7,12 @@
  */
 import type { RenderedCell } from '../data-source/interface';
 import { font_shorthand } from './cell-renderer';
+import { MIN_COLUMN_WIDTH_PX } from './grid-model';
 
-/** Smallest width a fitted column may take (matches the old DOM measurer). */
-export const MIN_COLUMN_WIDTH = 40;
+/** Smallest width a fitted column may take. Aliases the grid's clamp floor
+ *  ({@link MIN_COLUMN_WIDTH_PX}) so the fit rule and manual-resize clamp share
+ *  one minimum. */
+export const MIN_COLUMN_WIDTH = MIN_COLUMN_WIDTH_PX;
 /** Slack added to the widest measured text so glyphs don't touch the border. */
 export const COLUMN_PADDING = 16;
 

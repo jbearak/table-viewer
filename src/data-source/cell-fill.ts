@@ -85,7 +85,7 @@ function cell_at(working: WorkingSet, r: number, c: number): CellData | null {
  * used. Never allocates the intermediate (CellData|null)[][], so the parse
  * working-set and the columnar store never co-exist as two full representations.
  */
-export function fill_store(working: WorkingSet, sink: CellSink): void {
+function fill_store(working: WorkingSet, sink: CellSink): void {
     for (let r = 0; r < working.row_count; r++) {
         for (let c = 0; c < working.col_count; c++) {
             const cell = cell_at(working, r, c);

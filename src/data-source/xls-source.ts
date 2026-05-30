@@ -25,7 +25,8 @@ interface SheetEntry {
 
 export class XlsDataSource implements DataSource {
     private readonly sheets: SheetEntry[];
-    private readonly _hasFormatting: boolean;
+    /** Structurally immutable after construction; built once (see constructor). */
+    private readonly _meta: WorkbookMeta;
     readonly warnings: string[];
 
     /**
@@ -41,7 +42,6 @@ export class XlsDataSource implements DataSource {
         const parsed = parse_xls_streaming(buf);
         const has_formatting = parsed.hasFormatting;
         this.warnings = parsed.warnings;
-        this._hasFormatting = has_formatting;
         this.sheets = parsed.sheets.map((s) => {
             // Fill the columnar store directly from the parse working-set; no
             // intermediate (CellData|null)[][] is ever allocated. The fill seam
@@ -59,11 +59,8 @@ export class XlsDataSource implements DataSource {
                 store: b.build(),
             };
         });
-    }
-
-    meta(): WorkbookMeta {
-        return {
-            hasFormatting: this._hasFormatting,
+        this._meta = {
+            hasFormatting: has_formatting,
             sheets: this.sheets.map((s) => ({
                 name: s.name,
                 rowCount: s.rowCount,
@@ -72,6 +69,10 @@ export class XlsDataSource implements DataSource {
                 hasFormatting: s.hasFormatting,
             })),
         };
+    }
+
+    meta(): WorkbookMeta {
+        return this._meta;
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {

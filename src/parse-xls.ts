@@ -1048,8 +1048,6 @@ export function parse_xls(buffer: Buffer): ParseResult {
 
 // --- Streaming API (direct-to-builder; no densified intermediate) ---
 
-export type { CellSink, StreamingSheet, StreamingWorkbook } from './data-source/cell-fill';
-
 /**
  * Parse an .xls into per-sheet meta + a fill function, never materializing the
  * intermediate (CellData|null)[][]. Lets a consumer build its own columnar store

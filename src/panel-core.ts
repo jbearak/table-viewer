@@ -6,7 +6,7 @@ import type { StoredPerFileState, WebviewMessage } from './types';
  * uses. Declared locally (rather than importing `vscode`) so the core stays a
  * pure module — unit-testable with a fake panel and no extension host.
  */
-export interface PanelLike {
+interface PanelLike {
     webview: {
         postMessage(message: unknown): Thenable<boolean> | Promise<boolean> | boolean;
     };
@@ -14,7 +14,7 @@ export interface PanelLike {
 
 /** Panel-specific fields bundled into each `sheetMeta` send. The panels own
  *  state/config; the core owns meta + generation + the page cache. */
-export interface MetaEnvelope {
+interface MetaEnvelope {
     state: StoredPerFileState;
     defaultTabOrientation: 'horizontal' | 'vertical';
     previewMode?: boolean;
@@ -24,7 +24,7 @@ export interface MetaEnvelope {
     truncationMessage?: string;
 }
 
-export interface ReloadEnvelope {
+interface ReloadEnvelope {
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
     truncationMessage?: string;
@@ -158,4 +158,25 @@ export class ViewerPanelCore {
     private post(message: unknown): Promise<boolean> {
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
+}
+
+/**
+ * Install a freshly-built source into a panel's core: close the previous source
+ * (when it is being replaced) and either swap it into the existing core or create
+ * one. Returns the core to assign back. Every panel (csv/preview/custom-editor)
+ * shares this close + create-or-swap dance, so it lives here rather than being
+ * re-implemented in each panel's `adopt`.
+ */
+export function adopt_source_into_core(
+    core: ViewerPanelCore | undefined,
+    panel: PanelLike,
+    previous: DataSource | undefined,
+    next: DataSource,
+): ViewerPanelCore {
+    if (previous && previous !== next) previous.close();
+    if (core) {
+        core.set_source(next);
+        return core;
+    }
+    return new ViewerPanelCore(panel, next);
 }

@@ -31,6 +31,11 @@ export class CsvDataSource implements DataSource {
     private readonly _colCount: number;
     /** Buffer with any leading UTF-8 BOM removed (see constructor). */
     private readonly buf: Uint8Array;
+    /** Reused across read_rows: decode() is stateless for non-streaming calls,
+     *  so one decoder serves every page request (this is a per-scroll hot path). */
+    private readonly decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+    /** Structurally immutable after construction; built once (see constructor). */
+    private readonly _meta: WorkbookMeta;
     /** Lazily-built row -> source-line map (preview scroll sync only). */
     private _lineMap?: number[];
 
@@ -87,10 +92,7 @@ export class CsvDataSource implements DataSource {
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
         this.lineEnding = detect_line_ending(this.buf);
-    }
-
-    meta(): WorkbookMeta {
-        return {
+        this._meta = {
             hasFormatting: false,
             sheets: [{
                 name: 'Sheet1',
@@ -100,6 +102,10 @@ export class CsvDataSource implements DataSource {
                 hasFormatting: false,
             }],
         };
+    }
+
+    meta(): WorkbookMeta {
+        return this._meta;
     }
 
     read_rows(_sheet: number, start_row: number, count: number): RowWindow {
@@ -117,7 +123,7 @@ export class CsvDataSource implements DataSource {
         // BOM was already removed at construction, and we need the string indices
         // to line up byte-for-byte with the index scan that produced the offsets.
         const fragment_bytes = this.buf.subarray(byteStart, byteEnd);
-        const fragment = new TextDecoder('utf-8', { ignoreBOM: true }).decode(fragment_bytes);
+        const fragment = this.decoder.decode(fragment_bytes);
 
         // Use the shared row parser so the cells here always match the per-row
         // field counts the index derived from the same model — no save-path drift.

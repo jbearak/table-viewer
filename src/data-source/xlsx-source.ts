@@ -24,13 +24,23 @@ interface SheetEntry {
 
 export class XlsxDataSource implements DataSource {
     private readonly sheets: SheetEntry[];
-    private readonly _hasFormatting: boolean;
+    /** Structurally immutable after construction; built once (see constructor). */
+    private readonly _meta: WorkbookMeta;
     readonly warnings: string[];
 
     private constructor(sheets: SheetEntry[], hasFormatting: boolean, warnings: string[]) {
         this.sheets = sheets;
-        this._hasFormatting = hasFormatting;
         this.warnings = warnings;
+        this._meta = {
+            hasFormatting,
+            sheets: sheets.map((s) => ({
+                name: s.name,
+                rowCount: s.rowCount,
+                columnCount: s.columnCount,
+                merges: s.merges,
+                hasFormatting: s.hasFormatting,
+            })),
+        };
     }
 
     static async create(buf: Uint8Array): Promise<XlsxDataSource> {
@@ -57,16 +67,7 @@ export class XlsxDataSource implements DataSource {
     }
 
     meta(): WorkbookMeta {
-        return {
-            hasFormatting: this._hasFormatting,
-            sheets: this.sheets.map((s) => ({
-                name: s.name,
-                rowCount: s.rowCount,
-                columnCount: s.columnCount,
-                merges: s.merges,
-                hasFormatting: s.hasFormatting,
-            })),
-        };
+        return this._meta;
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
