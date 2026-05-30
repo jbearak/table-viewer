@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import {
     activate_extension,
     close_all_editors,
-    has_webview_tab,
+    has_custom_tab,
     wait_for,
 } from './helpers';
 
@@ -58,7 +58,7 @@ describe('large CSV perf smoke', function () {
 
     afterEach(async () => {
         await close_all_editors();
-        await wait_for(() => has_webview_tab('tableViewer.csvTable') === false, 5000);
+        await wait_for(() => has_custom_tab('tableViewer.editor') === false, 5000);
     });
 
     it(`opens a ${ROWS.toLocaleString()}-row CSV within budget`, async () => {
@@ -68,7 +68,7 @@ describe('large CSV perf smoke', function () {
             vscode.Uri.file(tmp_file),
         );
         const opened = await wait_for(
-            () => has_webview_tab('tableViewer.csvTable'),
+            () => has_custom_tab('tableViewer.editor'),
             60_000,
         );
         const elapsed = Date.now() - started;
