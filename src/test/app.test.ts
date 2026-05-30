@@ -8,8 +8,9 @@ import type { WorkbookMeta } from '../data-source/interface';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
+    has_live_uncommitted: false,
     has_uncommitted_changes: false,
-    on_editing_change: null as null | ((status: { is_dirty: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
+    on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
@@ -29,7 +30,7 @@ vi.mock('../webview/grid-shell', () => ({
         row_heights: Record<number, number>;
         merges: { startRow: number }[];
         edit_mode?: boolean;
-        on_editing_change?: (status: { is_dirty: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
+        on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
             current: {
                 request_save: () => boolean;
@@ -48,6 +49,7 @@ vi.mock('../webview/grid-shell', () => ({
             grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
             grid_shell_mock.on_editing_change?.({
                 is_dirty: grid_shell_mock.is_dirty,
+                has_live_uncommitted: grid_shell_mock.has_live_uncommitted,
                 edits: grid_shell_mock.is_dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
                 conflicted: [],
             });
@@ -163,11 +165,16 @@ async function click_button(label: string) {
 }
 
 async function report_grid_editing(dirty: boolean, uncommitted = dirty) {
+    // The overlay-attributable part of "uncommitted" is whatever is uncommitted
+    // beyond the committed dirty map — i.e. an open overlay differing from base.
+    const has_live_uncommitted = uncommitted && !dirty;
     grid_shell_mock.is_dirty = dirty;
+    grid_shell_mock.has_live_uncommitted = has_live_uncommitted;
     grid_shell_mock.has_uncommitted_changes = uncommitted;
     await act(async () => {
         grid_shell_mock.on_editing_change?.({
             is_dirty: dirty,
+            has_live_uncommitted,
             edits: dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
             conflicted: [],
         });
@@ -215,6 +222,7 @@ function cleanup() {
     container = null;
     document.body.innerHTML = '';
     grid_shell_mock.is_dirty = false;
+    grid_shell_mock.has_live_uncommitted = false;
     grid_shell_mock.has_uncommitted_changes = false;
     grid_shell_mock.on_editing_change = null;
     grid_shell_mock.request_save.mockReset();
@@ -566,8 +574,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
-    it('exits after a successful save once live-editor-only work later becomes clean', async () => {
-        vi.useFakeTimers();
+    it('exits after a successful save once a still-open overlay later resolves clean (no timer)', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -590,18 +597,17 @@ describe('edit mode save exit', () => {
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         await dispatch_host_message({ type: 'saveResult', success: true });
+        // Overlay is still open and uncommitted: must stay in edit mode.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
-        grid_shell_mock.has_uncommitted_changes = false;
-        await act(async () => {
-            vi.advanceTimersByTime(250);
-        });
+        // The overlay commits/clears — GridShell reports the live-editor state
+        // going clean. The editing-status effect (not a timer) completes the exit.
+        await report_grid_editing(false, false);
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('ignores stray failed save results after a pending exit save already succeeded', async () => {
-        vi.useFakeTimers();
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -624,17 +630,15 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({ type: 'saveResult', success: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
+        // A stray failed save after success must not cancel the pending exit;
+        // when the overlay later resolves clean, the exit still completes.
         await dispatch_host_message({ type: 'saveResult', success: false });
-        grid_shell_mock.has_uncommitted_changes = false;
-        await act(async () => {
-            vi.advanceTimersByTime(250);
-        });
+        await report_grid_editing(false, false);
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('does not let stale pending-exit polling close a fresh document with restored edits', async () => {
-        vi.useFakeTimers();
+    it('does not let a stale pending exit close a fresh document with restored edits', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -657,7 +661,9 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({ type: 'saveResult', success: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
-        grid_shell_mock.has_uncommitted_changes = false;
+        // A fresh document arrives (resetting pending-exit bookkeeping) and brings
+        // restored edits, so edit mode re-engages. The earlier pending exit must
+        // not fire against this new document when its editing state goes clean.
         await dispatch_host_message(
             sheet_meta_message(make_meta(['Fresh'], false), {
                 csvEditable: true,
@@ -668,9 +674,7 @@ describe('edit mode save exit', () => {
         );
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
-        await act(async () => {
-            vi.advanceTimersByTime(250);
-        });
+        await report_grid_editing(false, false);
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });

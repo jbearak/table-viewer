@@ -43,7 +43,7 @@ import {
     measurable_from_rendered,
     type MeasurableCell,
 } from './fit-column-model';
-import { CsvCellEditor } from './csv-cell-editor';
+import { CsvCellEditor, type CsvCellEditorProps } from './csv-cell-editor';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
     RowResizeOverlay,
@@ -79,6 +79,10 @@ import '@glideapps/glide-data-grid/dist/index.css';
  */
 export interface EditingStatus {
     is_dirty: boolean;
+    /** True while an open overlay editor differs from its base — an in-progress
+     *  edit the user hasn't committed yet. Observable (state-driven) so App can
+     *  react to it without polling the DOM. */
+    has_live_uncommitted: boolean;
     /** Live `"row:col" → {value, base}` dirty map, for persistence + save. */
     edits: Record<string, DirtyEntry>;
     /** Keys whose underlying cell drifted since the edit (external change). */
@@ -223,15 +227,21 @@ export function GridShell({
     } = use_editing(get_cell_raw, generation, initial_edits);
     const editable_cells = edit_mode && csv_editable;
 
+    // Observable mirror of the open overlay's dirtiness (true when an open editor
+    // differs from its base). Declared here so the editing-status effect below can
+    // depend on it; driven by the tracking editor wrapper further down.
+    const [live_uncommitted, set_live_uncommitted] = useState(false);
+
     // Surface editing state to App (toolbar dot, pending-edit persistence,
     // conflict banner). Object.fromEntries snapshots the live Map per change.
     useEffect(() => {
         on_editing_change?.({
             is_dirty: dirty_cells.size > 0,
+            has_live_uncommitted: live_uncommitted,
             edits: Object.fromEntries(dirty_cells),
             conflicted: [...conflicted_keys],
         });
-    }, [dirty_cells, conflicted_keys, on_editing_change]);
+    }, [dirty_cells, conflicted_keys, live_uncommitted, on_editing_change]);
 
     // Persist the dirty map to the host so edits survive a webview reload. Posting
     // null clears the stored state. Runs on the initial render too: a restored map
@@ -267,6 +277,17 @@ export function GridShell({
             original: get_cell_raw(row, col) ?? '',
         };
     }, [get_cell_raw]);
+
+    // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
+    // open and on every keystroke and clears it on close, so the editing-status
+    // effect re-runs whenever the live editor's cleanliness changes — App reacts
+    // to that instead of polling.
+    const read_live_edit_ref = useRef(read_live_edit);
+    read_live_edit_ref.current = read_live_edit;
+    const refresh_live_uncommitted = useCallback(() => {
+        const live = read_live_edit_ref.current();
+        set_live_uncommitted(!!live && live.value !== live.original);
+    }, []);
 
     // Collect committed dirty edits + any in-progress editor and post saveCsv.
     // Returns false (no message sent) when there is nothing to save.
@@ -446,6 +467,26 @@ export function GridShell({
         [commit_edit, row_heights, on_row_resize, sheet_meta.columnCount],
     );
 
+    // Tracking wrapper around the custom CSV editor: it makes the open overlay's
+    // dirtiness observable (live_uncommitted) so App doesn't have to poll the DOM.
+    // Refreshes on open and on every keystroke, clears on close. Memoized so its
+    // identity is stable — Glide would otherwise remount (and unfocus) the editor
+    // on each parent render.
+    const tracking_editor = useMemo(() => {
+        function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
+            useEffect(() => {
+                refresh_live_uncommitted();
+                return () => set_live_uncommitted(false);
+            }, []);
+            const handle_change = (next: GridCell) => {
+                props.onChange(next);
+                refresh_live_uncommitted();
+            };
+            return <CsvCellEditor {...props} onChange={handle_change} />;
+        }
+        return TrackingCsvCellEditor;
+    }, [refresh_live_uncommitted]);
+
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Only consulted for editable Text cells.
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
@@ -453,9 +494,9 @@ export function GridShell({
             if (!editable_cells || cell.kind !== GridCellKind.Text) return undefined;
             // disablePadding/disableStyling: the editor carries its own
             // .cell-editor-input border + background, so suppress Glide's overlay box.
-            return { editor: CsvCellEditor, disablePadding: true, disableStyling: true };
+            return { editor: tracking_editor, disablePadding: true, disableStyling: true };
         },
-        [editable_cells],
+        [editable_cells, tracking_editor],
     );
 
     const get_row_height = useCallback(
