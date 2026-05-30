@@ -21,6 +21,11 @@ export interface SheetMeta {
     columnCount: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
+    /** Per-column header titles (CSV/TSV first row). Length === columnCount; a
+     *  blank entry means "no name" and the renderer falls back to the column
+     *  letter. Omitted entirely by formats without a header row (xlsx/xls), where
+     *  the renderer shows spreadsheet column letters. */
+    columnNames?: string[];
 }
 
 export interface WorkbookMeta {
@@ -45,6 +50,10 @@ export interface DataSource {
     warnings?: string[];
     /** CSV save path: per-row field counts before padding, capped to kept rows. */
     originalColumnCounts?: number[];
+    /** CSV save path: the verbatim first line (header), terminator stripped, when
+     *  the source consumed row 0 as column names. The save path re-prepends it so
+     *  the header survives a round-trip even though it is not a grid data row. */
+    headerLine?: string;
     /** CSV save path: detected line terminator, so re-serialization round-trips. */
     lineEnding?: '\r\n' | '\r' | '\n';
 }

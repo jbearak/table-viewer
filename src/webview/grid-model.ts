@@ -49,19 +49,23 @@ export function column_letter(index: number): string {
 }
 
 /**
- * Build Glide columns for a sheet. Table-viewer columns have no names, so the
- * title is the spreadsheet column letter. Persisted per-column widths (keyed by
- * column index) override the default and are clamped to the allowed range.
+ * Build Glide columns for a sheet. The title is the column's name when one is
+ * supplied (CSV/TSV header row) and non-blank; otherwise it falls back to the
+ * spreadsheet column letter (xlsx/xls, or a blank header cell). Persisted
+ * per-column widths (keyed by column index) override the default and are clamped
+ * to the allowed range.
  */
 export function build_grid_columns(
     column_count: number,
     widths: Record<number, number>,
+    names?: string[],
 ): SizedGridColumn[] {
     const cols: SizedGridColumn[] = [];
     for (let i = 0; i < column_count; i++) {
         const w = widths[i];
+        const name = names?.[i];
         cols.push({
-            title: column_letter(i),
+            title: name && name.length > 0 ? name : column_letter(i),
             id: String(i),
             width: clamp_column_width(w ?? DEFAULT_COLUMN_WIDTH_PX),
         });

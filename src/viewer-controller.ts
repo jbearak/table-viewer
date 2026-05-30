@@ -50,7 +50,11 @@ function excel_profile(): ViewerProfile {
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts. */
 export function build_csv_source(raw: Uint8Array, file_path: string): Promise<CsvDataSource> {
     const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
+    // CSV/TSV files conventionally carry column names in their first row, so the
+    // grid promotes it to the column header rather than showing letters.
+    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
+        firstRowIsHeader: true,
+    });
 }
 
 export function csv_table_profile(): ViewerProfile {
@@ -240,9 +244,12 @@ export function attach_viewer(
                     for (const row of rows) yield row;
                 }
             }
+            // serialize_csv re-prepends src.headerLine (when the source consumed
+            // row 0 as the column names) so the header survives the save even
+            // though it is never an editable grid cell.
             const content = serialize_csv(
                 row_windows(), get_delimiter(file_path), edits,
-                src.originalColumnCounts, src.lineEnding);
+                src.originalColumnCounts, src.lineEnding, src.headerLine);
             await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
             // The write succeeded — the save is done. A failure to re-parse the
             // just-written file (a transient read error, or an external delete in

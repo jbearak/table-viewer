@@ -188,8 +188,8 @@ export function GridShell({
     } | null>(null);
 
     const columns = useMemo<GridColumn[]>(
-        () => build_grid_columns(sheet_meta.columnCount, column_widths),
-        [sheet_meta.columnCount, column_widths],
+        () => build_grid_columns(sheet_meta.columnCount, column_widths, sheet_meta.columnNames),
+        [sheet_meta.columnCount, column_widths, sheet_meta.columnNames],
     );
 
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);

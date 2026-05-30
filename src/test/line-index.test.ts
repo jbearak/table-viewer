@@ -246,4 +246,12 @@ describe('build_line_map', () => {
         const map = build_line_map(buf, build_line_index(buf), 2);
         expect(map).toEqual([0, 1]);
     });
+    it('skips leading rows when given a first_row offset', () => {
+        // first_row=1 (CSV header consumed): output[0] is the source line of
+        // index row 1, accounting for any earlier multi-line quoted field.
+        const buf = enc('Name,Bio\nAlice,"L1\nL2"\nBob,x\n');
+        const idx = build_line_index(buf);
+        const map = build_line_map(buf, idx, idx.rowCount - 1, 1);
+        expect(map).toEqual([1, 3]);
+    });
 });

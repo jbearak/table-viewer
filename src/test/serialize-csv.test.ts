@@ -153,4 +153,32 @@ describe('serialize_csv', () => {
             expect(windowed).toBe('a,b\nc,d\ne,f\ng,EDITED\n');
         });
     });
+
+    describe('header_line', () => {
+        it('re-prepends a verbatim header line ahead of the data rows', () => {
+            const rows: (CellData | null)[][] = [[cell('1'), cell('2')]];
+            expect(serialize_csv(rows, ',', undefined, undefined, '\n', 'a,b'))
+                .toBe('a,b\n1,2\n');
+        });
+
+        it('emits a header-only file when there are no data rows', () => {
+            expect(serialize_csv([], ',', undefined, undefined, '\n', 'a,b'))
+                .toBe('a,b\n');
+        });
+
+        it('uses the given line ending between the header and the body', () => {
+            const rows: (CellData | null)[][] = [[cell('1')]];
+            expect(serialize_csv(rows, ',', undefined, undefined, '\r\n', 'h'))
+                .toBe('h\r\n1\r\n');
+        });
+
+        it('preserves an empty header line ("" is a real header row, not "no header")', () => {
+            // A source whose first row is blank yields headerLine === '' (distinct
+            // from undefined = no header consumed). Dropping it would delete the
+            // file's real empty first row, so it must be re-emitted verbatim.
+            const rows: (CellData | null)[][] = [[cell('a')]];
+            expect(serialize_csv(rows, ',', undefined, undefined, '\n', ''))
+                .toBe('\na\n');
+        });
+    });
 });

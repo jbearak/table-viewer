@@ -26,9 +26,15 @@ export class CsvDataSource implements DataSource {
     readonly originalColumnCounts: number[];
     /** Detected line terminator so re-serialization round-trips (save path). */
     readonly lineEnding: '\r\n' | '\r' | '\n';
+    /** Verbatim header line (terminator stripped) when row 0 was consumed as the
+     *  column names; undefined otherwise. The save path re-prepends it. */
+    readonly headerLine?: string;
     private readonly index: LineIndex;
     private readonly _rowCount: number;
     private readonly _colCount: number;
+    /** Absolute index row that grid row 0 maps to: 1 when the first row was
+     *  consumed as the header, else 0. */
+    private readonly _dataStart: number;
     /** Buffer with any leading UTF-8 BOM removed (see constructor). */
     private readonly buf: Uint8Array;
     /** Reused across read_rows: decode() is stateless for non-streaming calls,
@@ -48,14 +54,16 @@ export class CsvDataSource implements DataSource {
         buf: Uint8Array,
         delimiter: ',' | '\t',
         max_rows: number,
+        opts?: { firstRowIsHeader?: boolean },
     ): Promise<CsvDataSource> {
-        return new CsvDataSource(buf, delimiter, max_rows);
+        return new CsvDataSource(buf, delimiter, max_rows, opts);
     }
 
     constructor(
         buf: Uint8Array,
         private readonly delimiter: ',' | '\t',
         max_rows: number,
+        opts?: { firstRowIsHeader?: boolean },
     ) {
         // Strip a leading UTF-8 BOM (EF BB BF) up front so the byte scan and the
         // decoded fragments in read_rows operate on identical content. Otherwise
@@ -74,24 +82,49 @@ export class CsvDataSource implements DataSource {
         // skips the end-of-buffer boundary), matching the cell parser's rule.
         this.index = build_line_index(this.buf, delimiter.charCodeAt(0));
 
+        // When the first row is the header, grid row 0 is the second physical row
+        // (_dataStart = 1) and the header's cells become the column names. An empty
+        // buffer has no header row, so there is nothing to consume.
         const total = this.index.rowCount;
-        let kept = total;
-        if (total > max_rows) {
+        const header = (opts?.firstRowIsHeader ?? false) && total > 0;
+        this._dataStart = header ? 1 : 0;
+
+        const dataTotal = total - this._dataStart;
+        let kept = dataTotal;
+        if (dataTotal > max_rows) {
             kept = max_rows;
             this.truncationMessage =
-                `Showing ${max_rows.toLocaleString()} of ${total.toLocaleString()} rows`;
+                `Showing ${max_rows.toLocaleString()} of ${dataTotal.toLocaleString()} rows`;
         }
         this._rowCount = kept;
-        let colCount = 0;
+
+        // colCount spans the header row (when present) and the kept data rows, so a
+        // header wider than every data row still shows all of its columns.
+        let colCount = header ? this.index.fieldCountOf(0) : 0;
         const originalColumnCounts: number[] = new Array(kept);
         for (let i = 0; i < kept; i++) {
-            const len = this.index.fieldCountOf(i);
+            const len = this.index.fieldCountOf(i + this._dataStart);
             originalColumnCounts[i] = len;
             if (len > colCount) colCount = len;
         }
         this._colCount = colCount;
         this.originalColumnCounts = originalColumnCounts;
         this.lineEnding = detect_line_ending(this.buf, delimiter.charCodeAt(0));
+
+        let columnNames: string[] | undefined;
+        if (header) {
+            // The row-0 byte slice runs up to the next row's start, so it carries
+            // the line terminator; trim those bytes off so headerLine is the
+            // verbatim header text (quoting preserved) the save path re-prepends.
+            const start = this.index.offsetOf(0);
+            let end = this.index.endOffsetOf(0);
+            while (end > start && (this.buf[end - 1] === LF || this.buf[end - 1] === CR)) end--;
+            this.headerLine = this.decoder.decode(this.buf.subarray(start, end));
+            const fields = split_csv_rows(this.headerLine, delimiter)[0] ?? [];
+            columnNames = new Array(colCount);
+            for (let c = 0; c < colCount; c++) columnNames[c] = c < fields.length ? fields[c] : '';
+        }
+
         this._meta = {
             hasFormatting: false,
             sheets: [{
@@ -100,6 +133,7 @@ export class CsvDataSource implements DataSource {
                 columnCount: this._colCount,
                 merges: [],
                 hasFormatting: false,
+                columnNames,
             }],
         };
     }
@@ -113,8 +147,10 @@ export class CsvDataSource implements DataSource {
         const end = Math.min(start + count, this._rowCount);
         if (start >= end) return { startRow: start, rows: [] };
 
-        const byteStart = this.index.offsetOf(start);
-        const byteEnd = this.index.endOffsetOf(end - 1);
+        // Grid rows are offset past the consumed header row (_dataStart) when in
+        // header mode, so a grid row maps to index row (grid row + _dataStart).
+        const byteStart = this.index.offsetOf(start + this._dataStart);
+        const byteEnd = this.index.endOffsetOf(end - 1 + this._dataStart);
 
         // Slice the Uint8Array by byte offsets, then decode — correct for multibyte
         // characters. (String.prototype.slice uses UTF-16 char indices, which
@@ -143,7 +179,7 @@ export class CsvDataSource implements DataSource {
      */
     lineMap(): number[] {
         if (!this._lineMap) {
-            this._lineMap = build_line_map(this.buf, this.index, this._rowCount);
+            this._lineMap = build_line_map(this.buf, this.index, this._rowCount, this._dataStart);
         }
         return this._lineMap;
     }

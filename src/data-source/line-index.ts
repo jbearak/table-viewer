@@ -120,20 +120,27 @@ export function build_line_index(buf: Uint8Array, delimiter: number = COMMA): Li
  * and can never disagree with the grid's row count. Line counting here needs no
  * quote awareness: the editor treats every physical newline as a line break, and
  * the index already tells us where each row starts.
+ *
+ * `first_row` is the absolute index row that grid row 0 maps to: 0 normally, or 1
+ * when the CSV source consumed row 0 as the header (so the preview still scrolls
+ * to the correct source line for each data row). The returned map is indexed by
+ * grid row; its values are absolute source line numbers (the header line is just
+ * skipped over by the line counter, leaving the data rows correctly numbered).
  */
 export function build_line_map(
     buf: Uint8Array,
     index: LineIndex,
     rowCount: number = index.rowCount,
+    first_row: number = 0,
 ): number[] {
-    const n = Math.min(rowCount, index.rowCount);
+    const n = Math.min(rowCount, Math.max(0, index.rowCount - first_row));
     const line_map = new Array<number>(n);
     let line = 0;
-    let r = 0;
+    let r = 0; // grid row; the absolute index row is r + first_row
     for (let i = 0; i < buf.length && r < n; i++) {
         // Record the line for every row that starts at byte i (offsets are
         // strictly increasing, so at most one row matches per byte).
-        while (r < n && index.offsetOf(r) === i) {
+        while (r < n && index.offsetOf(r + first_row) === i) {
             line_map[r] = line;
             r++;
         }

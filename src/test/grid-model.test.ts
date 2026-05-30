@@ -73,4 +73,15 @@ describe('build_grid_columns', () => {
         expect(cols[0].width).toBe(200);
         expect(cols[1].width).toBe(MIN_COLUMN_WIDTH_PX); // 5 clamped up
     });
+
+    it('uses provided column names as titles when given', () => {
+        const cols = build_grid_columns(3, {}, ['Name', 'Age', 'City']);
+        expect(cols.map((c) => c.title)).toEqual(['Name', 'Age', 'City']);
+    });
+
+    it('falls back to the column letter for a blank or missing name', () => {
+        // col 0 blank, col 1 named, col 2 has no entry in the names array
+        const cols = build_grid_columns(3, {}, ['', 'Age']);
+        expect(cols.map((c) => c.title)).toEqual(['A', 'Age', 'C']);
+    });
 });

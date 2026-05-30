@@ -102,9 +102,9 @@ describe('CSV reload races', () => {
         const first_reload = watcher.__fireChange();
         const second_reload = watcher.__fireChange();
 
-        newer.resolve(enc.encode('n\n1\n2\n'));
+        newer.resolve(enc.encode('h\nn\n1\n2\n'));
         await second_reload;
-        older.resolve(enc.encode('old\n'));
+        older.resolve(enc.encode('h\nold\n'));
         await first_reload;
 
         const panel = vscode_mock.__getPanels()[0];
@@ -130,9 +130,9 @@ describe('CSV reload races', () => {
         const initial_ready = panel.__receive({ type: 'ready' });
         const reload_done = vscode_mock.__getWatchers()[0].__fireChange();
 
-        reload.resolve(enc.encode('n\n1\n2\n'));
+        reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await reload_done;
-        initial.resolve(enc.encode('old\n'));
+        initial.resolve(enc.encode('h\nold\n'));
         await initial_ready;
 
         const metas = sheet_meta(panel);
@@ -156,16 +156,16 @@ describe('CSV reload races', () => {
         const watcher = vscode_mock.__getWatchers()[0];
         const pre_ready_done = watcher.__fireChange();
 
-        pre_ready_reload.resolve(enc.encode('pre\n'));
+        pre_ready_reload.resolve(enc.encode('h\npre\n'));
         await pre_ready_done;
         panel.__messages.length = 0;
 
         const initial_ready = panel.__receive({ type: 'ready' });
         const post_ready_done = watcher.__fireChange();
 
-        post_ready_reload.resolve(enc.encode('n\n1\n2\n'));
+        post_ready_reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await post_ready_done;
-        initial.resolve(enc.encode('old\n'));
+        initial.resolve(enc.encode('h\nold\n'));
         await initial_ready;
 
         const metas = sheet_meta(panel);
@@ -186,7 +186,7 @@ describe('CSV reload races', () => {
         const initial_ready = panel.__receive({ type: 'ready' });
 
         panel.dispose();
-        initial.resolve(enc.encode('old\n'));
+        initial.resolve(enc.encode('h\nold\n'));
         await initial_ready;
 
         expect(sheet_meta(panel)).toHaveLength(0);
@@ -208,9 +208,9 @@ describe('CSV reload races', () => {
         const first_reload = watcher.__fireChange();
         const second_reload = watcher.__fireChange();
 
-        newer.resolve(enc.encode('n\n1\n2\n'));
+        newer.resolve(enc.encode('h\nn\n1\n2\n'));
         await second_reload;
-        older.resolve(enc.encode('old\n'));
+        older.resolve(enc.encode('h\nold\n'));
         await first_reload;
 
         const panel = vscode_mock.__getPanels()[0];
@@ -236,9 +236,9 @@ describe('CSV reload races', () => {
         void panel.__receive({ type: 'ready' });
         const reload_done = vscode_mock.__getWatchers()[0].__fireChange();
 
-        reload.resolve(enc.encode('n\n1\n2\n'));
+        reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await reload_done;
-        initial.resolve(enc.encode('old\n'));
+        initial.resolve(enc.encode('h\nold\n'));
         await flush_promises();
 
         const metas = sheet_meta(panel);
@@ -263,16 +263,16 @@ describe('CSV reload races', () => {
         const watcher = vscode_mock.__getWatchers()[0];
         const pre_ready_done = watcher.__fireChange();
 
-        pre_ready_reload.resolve(enc.encode('pre\n'));
+        pre_ready_reload.resolve(enc.encode('h\npre\n'));
         await pre_ready_done;
         panel.__messages.length = 0;
 
         void panel.__receive({ type: 'ready' });
         const post_ready_done = watcher.__fireChange();
 
-        post_ready_reload.resolve(enc.encode('n\n1\n2\n'));
+        post_ready_reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await post_ready_done;
-        initial.resolve(enc.encode('old\n'));
+        initial.resolve(enc.encode('h\nold\n'));
         await flush_promises();
 
         const metas = sheet_meta(panel);
@@ -299,9 +299,9 @@ describe('CSV reload races', () => {
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         void panel.__receive({ type: 'ready' });
 
-        new_load.resolve(enc.encode('n\n1\n2\n'));
+        new_load.resolve(enc.encode('h\nn\n1\n2\n'));
         await flush_promises();
-        old_load.resolve(enc.encode('old\n'));
+        old_load.resolve(enc.encode('h\nold\n'));
         await flush_promises();
 
         const metas = sheet_meta(panel);
@@ -322,9 +322,9 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('a\n');          // initial ready (rowCount 1)
+            if (call === 1) return enc.encode('h\na\n');          // initial ready (rowCount 1)
             if (call === 2) return stale.promise;        // in-flight reload (rowCount 3)
-            return enc.encode('a\nb\n');                        // save's re-parse (rowCount 2)
+            return enc.encode('h\na\nb\n');                        // save's re-parse (rowCount 2)
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -337,7 +337,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
 
         // The older reload resolves only after the save has adopted its result.
-        stale.resolve(enc.encode('x\ny\nz\n'));                  // rowCount 3
+        stale.resolve(enc.encode('h\nx\ny\nz\n'));                  // rowCount 3
         await reload_done;
 
         const reloads = meta_reloads(panel);
@@ -357,9 +357,9 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: current_mtime }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('a\n');            // ready (rowCount 1)
-            if (call === 2) return enc.encode('a\nb\n');         // save re-parse (rowCount 2)
-            return enc.encode('p\nq\nr\ns\nt\n');                // external edit (rowCount 5)
+            if (call === 1) return enc.encode('h\na\n');            // ready (rowCount 1)
+            if (call === 2) return enc.encode('h\na\nb\n');         // save re-parse (rowCount 2)
+            return enc.encode('h\np\nq\nr\ns\nt\n');                // external edit (rowCount 5)
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -384,7 +384,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('a\n'); // initial ready
+            if (call === 1) return enc.encode('h\na\n'); // initial ready
             throw new Error('reload boom');           // save's re-parse fails
         });
 
@@ -412,7 +412,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('a\n'); // initial ready (last_mtime = 1)
+            if (call === 1) return enc.encode('h\na\n'); // initial ready (last_mtime = 1)
             throw new Error('reload boom');           // post-conflict re-parse fails
         });
         const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
@@ -453,9 +453,9 @@ describe('CSV reload races', () => {
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         void panel.__receive({ type: 'ready' });
 
-        new_load.resolve(enc.encode('n\n1\n2\n'));
+        new_load.resolve(enc.encode('h\nn\n1\n2\n'));
         await flush_promises();
-        old_reload.resolve(enc.encode('old\n'));
+        old_reload.resolve(enc.encode('h\nold\n'));
         await old_reload_done;
         await flush_promises();
 

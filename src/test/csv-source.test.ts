@@ -188,6 +188,105 @@ describe('CsvDataSource', () => {
         });
     });
 
+    describe('firstRowIsHeader: first row becomes column names', () => {
+        const opts = { firstRowIsHeader: true } as const;
+
+        it('exposes the first row as columnNames and drops it from the data', () => {
+            const ds = new CsvDataSource(enc('Name,Age,City\nAlice,30,NYC\nBob,25,LA\n'), ',', 10000, opts);
+            const m = ds.meta().sheets[0];
+            expect(m.columnNames).toEqual(['Name', 'Age', 'City']);
+            expect(m.rowCount).toBe(2);
+            expect(m.columnCount).toBe(3);
+            // Row 0 of the grid is the first DATA row, not the header.
+            const w = ds.read_rows(0, 0, 2);
+            expect(w.rows[0].map((c) => c?.raw)).toEqual(['Alice', '30', 'NYC']);
+            expect(w.rows[1].map((c) => c?.raw)).toEqual(['Bob', '25', 'LA']);
+        });
+
+        it('exposes the verbatim header line for the save path', () => {
+            const ds = new CsvDataSource(enc('Name,"Full, Name"\nAlice,A B\n'), ',', 10000, opts);
+            expect(ds.headerLine).toBe('Name,"Full, Name"');
+        });
+
+        it('blank header cells leave an empty name (letter fallback is the renderer\'s job)', () => {
+            const ds = new CsvDataSource(enc('Name,,City\n1,2,3\n'), ',', 10000, opts);
+            expect(ds.meta().sheets[0].columnNames).toEqual(['Name', '', 'City']);
+        });
+
+        it('column count covers a header wider than every data row', () => {
+            const ds = new CsvDataSource(enc('a,b,c,d\n1,2\n'), ',', 10000, opts);
+            const m = ds.meta().sheets[0];
+            expect(m.columnCount).toBe(4);
+            expect(m.columnNames).toEqual(['a', 'b', 'c', 'd']);
+            expect(m.rowCount).toBe(1);
+        });
+
+        it('originalColumnCounts describes the data rows only', () => {
+            const ds = new CsvDataSource(enc('a,b,c\n1\n2,3\n'), ',', 10000, opts);
+            expect(ds.originalColumnCounts).toEqual([1, 2]);
+        });
+
+        it('truncation counts data rows, excluding the header', () => {
+            // 1 header + 3 data rows; max_rows = 2 data rows.
+            const ds = new CsvDataSource(enc('h\n1\n2\n3\n'), ',', 2, opts);
+            expect(ds.meta().sheets[0].rowCount).toBe(2);
+            expect(ds.truncationMessage).toMatch(/2 of 3/);
+        });
+
+        it('a header-only file has zero data rows but still names the columns', () => {
+            const ds = new CsvDataSource(enc('Name,Age\n'), ',', 10000, opts);
+            const m = ds.meta().sheets[0];
+            expect(m.rowCount).toBe(0);
+            expect(m.columnNames).toEqual(['Name', 'Age']);
+            expect(ds.read_rows(0, 0, 5).rows).toEqual([]);
+            expect(ds.headerLine).toBe('Name,Age');
+        });
+
+        it('an empty buffer yields no header and no rows', () => {
+            const ds = new CsvDataSource(enc(''), ',', 10000, opts);
+            const m = ds.meta().sheets[0];
+            expect(m.rowCount).toBe(0);
+            expect(m.columnCount).toBe(0);
+            expect(ds.headerLine).toBeUndefined();
+        });
+
+        it('an empty first row is a blank header that round-trips intact', () => {
+            // Regression: headerLine === '' (blank header) must not be treated as
+            // "no header" — the empty first line is preserved on save.
+            const ds = new CsvDataSource(enc('\nAlice,30\nBob,25\n'), ',', 10000, opts);
+            expect(ds.headerLine).toBe('');
+            expect(ds.meta().sheets[0].rowCount).toBe(2);
+            const rowCount = ds.meta().sheets[0].rowCount;
+            const text = serialize_csv(
+                ds.read_rows(0, 0, rowCount).rows as (CellData | null)[][],
+                ',', undefined, ds.originalColumnCounts, ds.lineEnding, ds.headerLine,
+            );
+            expect(text).toBe('\nAlice,30\nBob,25\n');
+        });
+
+        it('lineMap maps data rows to source lines past the header', () => {
+            const ds = new CsvDataSource(enc('Name,Bio\nAlice,"L1\nL2"\nBob,x\n'), ',', 10000, opts);
+            // Data row 0 (Alice) starts on source line 1; Bob on source line 3
+            // (the quoted field spans lines 1-2).
+            expect(ds.lineMap()).toEqual([1, 3]);
+        });
+
+        it('save round-trips the header verbatim and re-promotes it on reload', () => {
+            // Mirror the host save path: serialize_csv re-prepends the header line.
+            const ds = new CsvDataSource(enc('Name,Age\nAlice,30\nBob,25\n'), ',', 10000, opts);
+            const rowCount = ds.meta().sheets[0].rowCount;
+            const text = serialize_csv(
+                ds.read_rows(0, 0, rowCount).rows as (CellData | null)[][],
+                ',', undefined, ds.originalColumnCounts, ds.lineEnding, ds.headerLine,
+            );
+            expect(text).toBe('Name,Age\nAlice,30\nBob,25\n');
+            const reloaded = new CsvDataSource(enc(text), ',', 10000, opts);
+            expect(reloaded.meta().sheets[0].columnNames).toEqual(['Name', 'Age']);
+            expect(reloaded.read_rows(0, 0, 2).rows.map((r) => r.map((c) => c?.raw)))
+                .toEqual([['Alice', '30'], ['Bob', '25']]);
+        });
+    });
+
     describe('lineMap (preview scroll sync)', () => {
         it('maps rows to source lines, accounting for multi-line quoted fields', () => {
             const ds = new CsvDataSource(

@@ -16,7 +16,8 @@ export function serialize_csv(
     delimiter: ',' | '\t',
     edits?: Record<string, string>,
     original_column_counts?: number[],
-    line_ending: '\r\n' | '\r' | '\n' = '\n'
+    line_ending: '\r\n' | '\r' | '\n' = '\n',
+    header_line?: string,
 ): string {
     const lines: string[] = [];
 
@@ -72,7 +73,11 @@ export function serialize_csv(
     }
 
     // A logically empty sheet serializes to empty output, not a lone terminator.
-    return lines.length === 0 ? '' : lines.join(line_ending) + line_ending;
+    const body = lines.length === 0 ? '' : lines.join(line_ending) + line_ending;
+    // When the source consumed row 0 as the column header, the grid's data rows
+    // exclude it; re-prepend it verbatim so the saved file keeps its header. A
+    // header-only file (empty body) still re-emits the lone header line.
+    return header_line === undefined ? body : header_line + line_ending + body;
 }
 
 function quote_field(value: string, delimiter: string): string {
