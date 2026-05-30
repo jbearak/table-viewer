@@ -68,7 +68,9 @@ Table Viewer is the result.
 **CSV/TSV files** open in VS Code's built-in text editor. Two buttons appear in the editor title bar:
 
 - The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
-- The **table icon** opens the file as a standalone table view (use this if you want to edit)
+- The **table icon** opens the file as an editable table view
+
+When a CSV/TSV file is open in the table view, a **"Open in Text Editor"** button appears in the title bar to take you back to the text editor.
 
 ## Default editor behavior
 
@@ -76,7 +78,7 @@ Table Viewer registers as the default editor for Excel files (`.xlsx`, `.xls`) b
 
 For CSV and TSV files, Table Viewer does *not* register as the default editor. This preserves VS Code's normal text editing behavior — you can still edit CSV/TSV files as text, use find-and-replace, and so on. The table view is available via the toolbar buttons described above.
 
-If you'd prefer Table Viewer to open CSV/TSV files directly, add this to your `settings.json`:
+If you'd prefer Table Viewer to open CSV/TSV files directly as an editable table, add this to your `settings.json`:
 
 ```json
 "workbench.editorAssociations": {
@@ -84,6 +86,8 @@ If you'd prefer Table Viewer to open CSV/TSV files directly, add this to your `s
     "*.tsv": "tableViewer.editor"
 }
 ```
+
+You can also open a single CSV/TSV file as a table without changing the default by right-clicking it and choosing **Reopen Editor With… → Table Viewer**. Either way, the table is fully editable, and the **"Open in Text Editor"** button returns you to the text editor.
 
 ## Settings
 
