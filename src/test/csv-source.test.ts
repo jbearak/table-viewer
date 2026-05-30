@@ -21,7 +21,7 @@ function grid(ds: CsvDataSource): string[][] {
 function round_trip(buf: Uint8Array, delimiter: ',' | '\t' = ',') {
     const ds = new CsvDataSource(buf, delimiter, 10000);
     const before = grid(ds);
-    // Serialize via small (2-row) windows, mirroring the csv-panel save path and
+    // Serialize via small (2-row) windows, mirroring the CSV save path and
     // exercising the Iterable contract / chunk-boundary handling.
     const rowCount = ds.meta().sheets[0].rowCount;
     function* windows(): Generator<(CellData | null)[]> {

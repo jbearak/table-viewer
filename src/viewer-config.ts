@@ -1,6 +1,6 @@
-// Shared reads of the `tableViewer.*` workspace configuration. Each panel
-// (csv-panel, csv-preview, custom-editor) used to declare its own private copy
-// of these getters; centralizing them keeps the keys and defaults in one place.
+// Shared reads of the `tableViewer.*` workspace configuration. The viewer
+// hosts (viewer-controller and csv-preview) used to declare their own private
+// copies of these getters; centralizing them keeps keys and defaults in one place.
 import * as vscode from 'vscode';
 
 export function get_max_file_size_mib(): number {

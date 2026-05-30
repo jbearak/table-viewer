@@ -114,7 +114,7 @@ describe('serialize_csv', () => {
     describe('windowed (Iterable) serialization', () => {
         // A generator that yields the same rows in fixed-size windows. Proves
         // serialize_csv produces byte-identical output whether fed the whole
-        // array at once or row-by-row from windows — the csv-panel save path.
+        // array at once or row-by-row from windows — the CSV save path.
         function* chunked(
             rows: (CellData | null)[][],
             window: number,

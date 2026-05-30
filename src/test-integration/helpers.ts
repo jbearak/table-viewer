@@ -31,7 +31,7 @@ export function all_tabs(): readonly vscode.Tab[] {
 
 /**
  * True when a webview-panel tab whose viewType contains `fragment` is open.
- * VS Code prefixes panel viewTypes (e.g. `mainThreadWebview-tableViewer.csvTable`),
+ * VS Code prefixes panel viewTypes (e.g. `mainThreadWebview-tableViewer.csvPreview`),
  * so we substring-match rather than compare exactly.
  */
 export function has_webview_tab(fragment: string): boolean {
