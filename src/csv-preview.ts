@@ -11,6 +11,11 @@ import { build_webview_html, generate_nonce } from './webview-html';
 
 const SCROLL_LOCKOUT_MS = 150;
 
+interface ScrollLockout {
+    locked: boolean;
+    timer: ReturnType<typeof setTimeout> | undefined;
+}
+
 interface ActivePreview {
     panel: vscode.WebviewPanel;
     uri: vscode.Uri;
@@ -88,10 +93,16 @@ function setup_preview(
     let source: CsvDataSource | undefined;
 
     // Scroll sync lockout state
-    let editor_lockout = false;
-    let preview_lockout = false;
-    let editor_lockout_timer: ReturnType<typeof setTimeout> | undefined;
-    let preview_lockout_timer: ReturnType<typeof setTimeout> | undefined;
+    const editor_lockout: ScrollLockout = { locked: false, timer: undefined };
+    const preview_lockout: ScrollLockout = { locked: false, timer: undefined };
+
+    function start_lockout(lockout: ScrollLockout): void {
+        lockout.locked = true;
+        if (lockout.timer !== undefined) clearTimeout(lockout.timer);
+        lockout.timer = setTimeout(() => {
+            lockout.locked = false;
+        }, SCROLL_LOCKOUT_MS);
+    }
 
     async function load(): Promise<CsvDataSource> {
         const max_file_size_mib = get_max_file_size_mib();
@@ -117,11 +128,10 @@ function setup_preview(
         try {
             const ds = await load();
             const state = state_store.get(file_path);
-            const default_orientation = get_default_orientation();
 
             await core!.send_meta({
                 state,
-                defaultTabOrientation: default_orientation,
+                defaultTabOrientation: get_default_orientation(),
                 previewMode: true,
                 truncationMessage: ds.truncationMessage,
             });
@@ -228,7 +238,7 @@ function setup_preview(
 
     disposables.push(
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
-            if (preview_lockout) return;
+            if (preview_lockout.locked) return;
             if (e.textEditor.document.uri.toString() !== uri.toString()) return;
             if (e.visibleRanges.length === 0) return;
 
@@ -239,9 +249,7 @@ function setup_preview(
             const row = find_row_for_line(top_line);
 
             // Set lockout to prevent the webview's scroll response from bouncing back
-            editor_lockout = true;
-            if (editor_lockout_timer !== undefined) clearTimeout(editor_lockout_timer);
-            editor_lockout_timer = setTimeout(() => { editor_lockout = false; }, SCROLL_LOCKOUT_MS);
+            start_lockout(editor_lockout);
 
             panel.webview.postMessage({ type: 'scrollToRow', row });
         })
@@ -259,7 +267,7 @@ function setup_preview(
                     state_store.set(file_path, msg.state);
                     break;
                 case 'visibleRowChanged': {
-                    if (editor_lockout) return;
+                    if (editor_lockout.locked) return;
                     if (msg.row < 0 || msg.row >= line_map.length) return;
 
                     const source_line = line_map[msg.row];
@@ -267,9 +275,7 @@ function setup_preview(
                     if (!editor) return;
 
                     // Set lockout to prevent editor scroll from bouncing back
-                    preview_lockout = true;
-                    if (preview_lockout_timer !== undefined) clearTimeout(preview_lockout_timer);
-                    preview_lockout_timer = setTimeout(() => { preview_lockout = false; }, SCROLL_LOCKOUT_MS);
+                    start_lockout(preview_lockout);
 
                     void reveal_source_line(editor, source_line);
                     break;
@@ -307,8 +313,8 @@ function setup_preview(
     }
 
     return () => {
-        if (editor_lockout_timer !== undefined) clearTimeout(editor_lockout_timer);
-        if (preview_lockout_timer !== undefined) clearTimeout(preview_lockout_timer);
+        if (editor_lockout.timer !== undefined) clearTimeout(editor_lockout.timer);
+        if (preview_lockout.timer !== undefined) clearTimeout(preview_lockout.timer);
         source?.close();
         for (const d of disposables) d.dispose();
     };
