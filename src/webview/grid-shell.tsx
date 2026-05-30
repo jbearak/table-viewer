@@ -72,6 +72,7 @@ const CONFLICT_BG = 'rgba(229, 75, 75, 0.22)';
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
 import { vscode_api } from './use-state-sync';
+import { scroll_preview_to_row } from './preview-scroll';
 import '@glideapps/glide-data-grid/dist/index.css';
 
 /**
@@ -844,7 +845,7 @@ export function GridShell({
         const handler = (e: MessageEvent) => {
             const msg = e.data;
             if (msg && msg.type === 'scrollToRow' && typeof msg.row === 'number') {
-                grid_ref.current?.scrollTo(0, msg.row, 'vertical');
+                scroll_preview_to_row(grid_ref.current, msg.row);
             }
         };
         window.addEventListener('message', handler);
