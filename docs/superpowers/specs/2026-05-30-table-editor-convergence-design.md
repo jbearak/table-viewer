@@ -35,7 +35,7 @@ Extract one **viewer controller** that owns the shared lifecycle, and drive it w
 
 ```
    editorAssociations ─┐
-   "Reopen With…"     ─┤──►  tableViewer.editor      (xlsx/xls, priority "default")
+   "Reopen With…"     ─┤──►  tableViewer.excelViewer (xlsx/xls, priority "default")
    "Open as Table" cmd ┘     tableViewer.tableEditor (csv/tsv,  priority "option")
                                       │  (one provider class, two viewType registrations)
                                       ▼
@@ -86,10 +86,12 @@ Profile selection is by file extension: `.xlsx` → XLSX read-only, `.xls` → X
 
 `resolveCustomEditor` selects the profile by extension and hands off to the controller; `onDidDispose` disposes it. The Excel-only `build_source` branch and the inline `ViewerPanel` lifecycle are removed — the controller owns them. The provider stays `CustomReadonlyEditorProvider` (save is webview-driven). `register_table_viewer` registers the **same provider instance under two viewTypes**:
 
-- `tableViewer.editor` — the existing viewType (Excel selector, `priority: "default"`).
+- `tableViewer.excelViewer` — Excel selector, `priority: "default"`. **Renamed from the old `tableViewer.editor`** (see "Renaming `tableViewer.editor`" below).
 - `tableViewer.tableEditor` — new viewType (CSV/TSV selector, `priority: "option"`).
 
-Both keep `supportsMultipleEditorsPerDocument: true`. Because the controller picks its profile by file extension, **either viewType can host any format** — so a user who already set the old `editorAssociations` snippet (`*.csv → tableViewer.editor`) keeps working; their CSV simply opens editable instead of erroring.
+Both keep `supportsMultipleEditorsPerDocument: true`. Because the controller picks its profile by file extension, **either viewType can host any format** — e.g. a CSV routed at `tableViewer.excelViewer` still opens as an editable table, not an error.
+
+Constants in `custom-editor.ts`: replace the single `VIEW_TYPE` with `EXCEL_VIEW_TYPE = 'tableViewer.excelViewer'` and `TABLE_VIEW_TYPE = 'tableViewer.tableEditor'`.
 
 ### `src/csv-panel.ts`
 
@@ -114,13 +116,24 @@ Refactored to consume the controller for the common lifecycle (load / adopt / re
 
 ### `package.json`
 
+- Rename the existing `customEditors` contribution's `viewType` from `tableViewer.editor` to `tableViewer.excelViewer` (selector and `priority: "default"` unchanged).
 - Add a second `customEditors` contribution: `viewType: "tableViewer.tableEditor"`, selector `*.csv` / `*.tsv` (and their uppercase variants), `priority: "option"`. `"option"` never auto-opens, so the text editor stays the default for CSV/TSV — matching the README's stated intent — while the table becomes available in **"Reopen Editor With…"**.
 - Refine the `editor/title` `when` for `tableViewer.openCsvTable` so it hides when the active editor is already a table editor:
-  `resourceExtname =~ /\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor && activeCustomEditorId != tableViewer.tableEditor`
+  `resourceExtname =~ /\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.excelViewer && activeCustomEditorId != tableViewer.tableEditor`
 
 ### `README.md`
 
-Update the `editorAssociations` snippet to target `tableViewer.tableEditor` (the old `tableViewer.editor` mapping still works as a fallback), note that opening this way is **editable**, and mention "Reopen Editor With… → Table Viewer" as an alternative now that CSV/TSV appear in the picker.
+Update the `editorAssociations` snippet to target `tableViewer.tableEditor`, note that opening this way is **editable**, and mention "Reopen Editor With… → Table Viewer" as an alternative now that CSV/TSV appear in the picker. (The old `tableViewer.editor` id no longer exists — see the renaming note below.)
+
+## Renaming `tableViewer.editor` → `tableViewer.excelViewer`
+
+A hard rename, no compatibility alias. Rationale and blast radius:
+
+- The extension's own persisted layout state (`state.ts` `globalState`) is keyed by **file path, not viewType**, so the rename orphans nothing we store.
+- Excel auto-associates via the `priority: "default"` selector and is the sole default-priority editor for `.xlsx`/`.xls`, so it re-associates to the new id automatically on next open.
+- The only external references are (a) VS Code's internal memory of which editor last opened a file — self-healing on reopen — and (b) any manual `workbench.editorAssociations` entry a user wrote pointing at `tableViewer.editor`. The only documented such mapping was for CSV, and it **never worked** (it produced the "Not a valid .xls file" error this change fixes), so there are no working users to break.
+
+In-repo references to update: `package.json` (viewType), `src/custom-editor.ts` (`VIEW_TYPE` → `EXCEL_VIEW_TYPE`), `README.md` (snippet), and the `tableViewer.editor` assertions in `src/test-integration/open-formats.test.ts`.
 
 ## Data flow — CSV via the custom editor
 
@@ -147,7 +160,7 @@ Update the `editorAssociations` snippet to target `tableViewer.tableEditor` (the
 ## Testing
 
 - **Unit** — exercise the controller with a fake panel (as `panel-core` tests already do) for each profile: the reload monotonic guard, the `mtime` dedup, the `saveCsv` conflict path, and the `pendingEdits`-preserving `stateChanged` merge.
-- **Integration** (`src/test-integration/open-formats.test.ts`) — the custom editor opens CSV/TSV **editable** (rows render, `csvEditingSupported` true) and XLSX/XLS **read-only**; the `openWith` path from the command; a regression test that forcing the `editorAssociations` (both viewTypes) no longer errors.
+- **Integration** (`src/test-integration/open-formats.test.ts`) — update the existing `has_custom_tab('tableViewer.editor')` assertions to `tableViewer.excelViewer`; the custom editor opens CSV/TSV **editable** (rows render, `csvEditingSupported` true) and XLSX/XLS **read-only**; the `openWith` path from the command; a regression test that forcing the `editorAssociations` (both viewTypes) no longer errors.
 - **Preview** (`src/test-integration/preview.test.ts`) — must stay green after the refactor; scroll-sync and singleton reuse behave as before.
 
 ## Out of scope
