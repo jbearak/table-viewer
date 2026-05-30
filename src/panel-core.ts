@@ -6,7 +6,7 @@ import type { StoredPerFileState, WebviewMessage } from './types';
  * uses. Declared locally (rather than importing `vscode`) so the core stays a
  * pure module — unit-testable with a fake panel and no extension host.
  */
-interface PanelLike {
+export interface PanelLike {
     webview: {
         postMessage(message: unknown): Thenable<boolean> | Promise<boolean> | boolean;
     };

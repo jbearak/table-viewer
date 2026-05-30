@@ -4,7 +4,7 @@ import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
 import { CsvDataSource } from './data-source/csv-source';
 import type { DataSource, RenderedCell } from './data-source/interface';
-import { ViewerPanelCore, adopt_source_into_core } from './panel-core';
+import { ViewerPanelCore, adopt_source_into_core, type PanelLike } from './panel-core';
 import {
     get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib,
 } from './viewer-config';
@@ -13,11 +13,11 @@ import { serialize_csv } from './serialize-csv';
 import type { FileStateStore } from './state';
 import type { PerFileState, WebviewMessage } from './types';
 
-/** The host surface the controller needs. Both vscode.WebviewPanel and the
- *  unit-test mock panel satisfy it; html is set by the host before attaching. */
-export interface ViewerHostPanel {
-    webview: {
-        postMessage(message: unknown): Thenable<boolean> | Promise<boolean> | boolean;
+/** The host surface the controller needs: the core's `PanelLike` (postMessage)
+ *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
+ *  satisfy it; html is set by the host before attaching. */
+export interface ViewerHostPanel extends PanelLike {
+    webview: PanelLike['webview'] & {
         onDidReceiveMessage(handler: (msg: WebviewMessage) => unknown): vscode.Disposable;
     };
 }
@@ -36,7 +36,7 @@ export interface ViewerProfile {
     on_message?(msg: WebviewMessage): boolean | Promise<boolean>;
 }
 
-export function excel_profile(): ViewerProfile {
+function excel_profile(): ViewerProfile {
     return {
         editing: false,
         async build_source(raw, file_path) {
@@ -47,14 +47,14 @@ export function excel_profile(): ViewerProfile {
     };
 }
 
+/** Build the editable CSV/TSV DataSource shared by the table and preview hosts. */
+export function build_csv_source(raw: Uint8Array, file_path: string): Promise<CsvDataSource> {
+    const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
+    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
+}
+
 export function csv_table_profile(): ViewerProfile {
-    return {
-        editing: true,
-        async build_source(raw, file_path) {
-            const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-            return CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
-        },
-    };
+    return { editing: true, build_source: build_csv_source };
 }
 
 /** Profile for a uri, by extension: csv/tsv → editable table; else Excel viewer. */
@@ -90,8 +90,14 @@ export function attach_viewer(
     let last_mtime = 0;
     let consecutive_reload_failures = 0;
 
-    function csv_editable(ds: DataSource): boolean {
-        return profile.editing && !ds.truncationMessage;
+    // CSV editability flags for the meta/reload envelope. Non-editing profiles
+    // emit `undefined` (not `false`) deliberately: on the reload path the webview
+    // only applies these when they are defined, so `undefined` leaves the prior
+    // state untouched. Do not collapse to plain booleans.
+    function editing_flags(ds: DataSource): { csvEditingSupported: true | undefined; csvEditable: boolean | undefined } {
+        return profile.editing
+            ? { csvEditingSupported: true, csvEditable: !ds.truncationMessage }
+            : { csvEditingSupported: undefined, csvEditable: undefined };
     }
 
     async function build_source(): Promise<{ source: DataSource; mtime: number }> {
@@ -116,21 +122,23 @@ export function attach_viewer(
             state: state_store.get(file_path),
             defaultTabOrientation: get_default_orientation(),
             previewMode: profile.previewMode,
-            csvEditingSupported: profile.editing || undefined,
-            csvEditable: profile.editing ? csv_editable(ds) : undefined,
+            ...editing_flags(ds),
         });
     }
 
     function post_reload(ds: DataSource): Promise<boolean> {
-        return core!.send_meta_reload({
-            csvEditingSupported: profile.editing || undefined,
-            csvEditable: profile.editing ? csv_editable(ds) : undefined,
-        });
+        return core!.send_meta_reload(editing_flags(ds));
     }
 
     function surface_warnings(ds: DataSource): void {
         const warnings = ds.warnings ?? [];
         if (warnings.length > 0) vscode.window.showWarningMessage(warnings[0]);
+    }
+
+    // Drop any cached pendingEdits for this file, keeping the rest of the state.
+    function clear_pending_edits(): Promise<void> {
+        const { pendingEdits: _drop, ...rest } = state_store.get(file_path) as PerFileState;
+        return state_store.set(file_path, rest);
     }
 
     async function send_initial_data(): Promise<void> {
@@ -246,9 +254,7 @@ export function attach_viewer(
             } catch (reload_err) {
                 console.error('Post-save reload failed (file was written)', reload_err);
             }
-            const current = state_store.get(file_path) as PerFileState;
-            const { pendingEdits: _drop, ...rest } = current;
-            await state_store.set(file_path, rest);
+            await clear_pending_edits();
             panel.webview.postMessage({ type: 'saveResult', success: true });
         } catch (err) {
             vscode.window.showErrorMessage(
@@ -265,7 +271,12 @@ export function attach_viewer(
                 await send_initial_data();
                 return;
             case 'stateChanged': {
-                // Preserve pendingEdits the webview did not include in this snapshot.
+                if (!profile.editing) {
+                    await state_store.set(file_path, msg.state);
+                    return;
+                }
+                // Editable profile only: preserve pendingEdits the webview did not
+                // include in this snapshot.
                 const existing = state_store.get(file_path) as PerFileState;
                 const next = { ...msg.state };
                 if (existing.pendingEdits) next.pendingEdits = existing.pendingEdits;
@@ -280,12 +291,11 @@ export function attach_viewer(
                 return;
             case 'pendingEditsChanged': {
                 if (!profile.editing) return;
-                const current = state_store.get(file_path) as PerFileState;
                 if (msg.edits) {
+                    const current = state_store.get(file_path) as PerFileState;
                     await state_store.set(file_path, { ...current, pendingEdits: msg.edits });
                 } else {
-                    const { pendingEdits: _drop, ...rest } = current;
-                    await state_store.set(file_path, rest);
+                    await clear_pending_edits();
                 }
                 return;
             }

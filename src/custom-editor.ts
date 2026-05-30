@@ -3,7 +3,7 @@ import { attach_viewer, profile_for } from './viewer-controller';
 import type { FileStateStore } from './state';
 import { build_webview_html, generate_nonce } from './webview-html';
 
-export const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
+const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
 class TableViewerDocument implements vscode.CustomDocument {

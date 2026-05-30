@@ -1,10 +1,8 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
-import { attach_viewer, type ViewerProfile } from './viewer-controller';
-import { get_csv_max_rows, get_delimiter } from './viewer-config';
+import { attach_viewer, build_csv_source, type ViewerProfile } from './viewer-controller';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
-import { MAX_CSV_ROWS } from './spreadsheet-safety';
 import type { FileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
@@ -108,7 +106,7 @@ function setup_preview(
         }, SCROLL_LOCKOUT_MS);
     }
 
-    // --- Scroll sync: editor → preview ---
+    // --- Scroll-sync helpers (shared by both directions) ---
 
     function find_row_for_line(source_line: number): number {
         // Binary search for the last row whose source line ≤ source_line
@@ -184,10 +182,7 @@ function setup_preview(
     const profile: ViewerProfile = {
         editing: false,
         previewMode: true,
-        async build_source(raw, file_path) {
-            const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
-            return CsvDataSource.create(raw, get_delimiter(file_path), max_rows);
-        },
+        build_source: build_csv_source,
         on_source_adopted(ds) {
             line_map = (ds as CsvDataSource).lineMap();
         },
