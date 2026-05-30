@@ -20,14 +20,11 @@ interface MetaEnvelope {
     previewMode?: boolean;
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
-    /** Overrides the source's own truncationMessage when provided. */
-    truncationMessage?: string;
 }
 
 interface ReloadEnvelope {
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
-    truncationMessage?: string;
 }
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
@@ -79,7 +76,7 @@ export class ViewerPanelCore {
             previewMode: envelope.previewMode,
             csvEditable: envelope.csvEditable,
             csvEditingSupported: envelope.csvEditingSupported,
-            truncationMessage: envelope.truncationMessage ?? this.source.truncationMessage,
+            truncationMessage: this.source.truncationMessage,
             generation: this._generation,
         });
     }
@@ -93,7 +90,7 @@ export class ViewerPanelCore {
             meta: this.source.meta(),
             csvEditable: envelope?.csvEditable,
             csvEditingSupported: envelope?.csvEditingSupported,
-            truncationMessage: envelope?.truncationMessage ?? this.source.truncationMessage,
+            truncationMessage: this.source.truncationMessage,
             generation: this._generation,
         });
     }
