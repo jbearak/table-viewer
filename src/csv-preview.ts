@@ -96,11 +96,18 @@ function setup_preview(
     const editor_lockout: ScrollLockout = { locked: false, timer: undefined };
     const preview_lockout: ScrollLockout = { locked: false, timer: undefined };
 
+    function clear_lockout(lockout: ScrollLockout): void {
+        if (lockout.timer === undefined) return;
+        clearTimeout(lockout.timer);
+        lockout.timer = undefined;
+    }
+
     function start_lockout(lockout: ScrollLockout): void {
         lockout.locked = true;
-        if (lockout.timer !== undefined) clearTimeout(lockout.timer);
+        clear_lockout(lockout);
         lockout.timer = setTimeout(() => {
             lockout.locked = false;
+            lockout.timer = undefined;
         }, SCROLL_LOCKOUT_MS);
     }
 
@@ -313,8 +320,8 @@ function setup_preview(
     }
 
     return () => {
-        if (editor_lockout.timer !== undefined) clearTimeout(editor_lockout.timer);
-        if (preview_lockout.timer !== undefined) clearTimeout(preview_lockout.timer);
+        clear_lockout(editor_lockout);
+        clear_lockout(preview_lockout);
         source?.close();
         for (const d of disposables) d.dispose();
     };
