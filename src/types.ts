@@ -58,6 +58,7 @@ export type HostMessage =
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
+    | { type: 'editSessionResult'; granted: boolean; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' };
 
 /** Messages from webview to extension host */
@@ -66,6 +67,9 @@ export type WebviewMessage =
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState }
     | { type: 'visibleRowChanged'; row: number }
+    | { type: 'requestEditSession' }
+    | { type: 'releaseEditSession' }
+    | { type: 'discardEditSession' }
     | { type: 'saveCsv'; edits: Record<string, string> }
     | { type: 'showSaveDialog' }
     | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null }

@@ -10,6 +10,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
     has_live_uncommitted: false,
     has_uncommitted_changes: false,
+    mount_count: 0,
     on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
@@ -30,6 +31,7 @@ vi.mock('../webview/grid-shell', () => ({
         row_heights: Record<number, number>;
         merges: { startRow: number }[];
         edit_mode?: boolean;
+        initial_edits?: Record<string, string | { value: string; base: string }>;
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
             current: {
@@ -45,6 +47,7 @@ vi.mock('../webview/grid-shell', () => ({
             current: (() => Record<number, number> | null) | null;
         };
     }) => {
+        const mount_id = React.useRef(++grid_shell_mock.mount_count);
         React.useEffect(() => {
             grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
             grid_shell_mock.on_editing_change?.({
@@ -79,6 +82,8 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
+                'data-initial-edits': JSON.stringify(props.initial_edits ?? null),
+                'data-mount-id': String(mount_id.current),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
                 'data-merges': String(props.merges?.length ?? 0),
@@ -164,7 +169,17 @@ async function click_button(label: string) {
     });
 }
 
-async function report_grid_editing(dirty: boolean, uncommitted = dirty) {
+async function enter_edit_mode(post_message: ReturnType<typeof vi.fn>) {
+    await click_button('Edit');
+    expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+    await dispatch_host_message({ type: 'editSessionResult', granted: true });
+}
+
+async function report_grid_editing(
+    dirty: boolean,
+    uncommitted = dirty,
+    conflicted: string[] = [],
+) {
     // The overlay-attributable part of "uncommitted" is whatever is uncommitted
     // beyond the committed dirty map — i.e. an open overlay differing from base.
     const has_live_uncommitted = uncommitted && !dirty;
@@ -176,7 +191,7 @@ async function report_grid_editing(dirty: boolean, uncommitted = dirty) {
             is_dirty: dirty,
             has_live_uncommitted,
             edits: dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
-            conflicted: [],
+            conflicted,
         });
     });
 }
@@ -224,6 +239,7 @@ function cleanup() {
     grid_shell_mock.is_dirty = false;
     grid_shell_mock.has_live_uncommitted = false;
     grid_shell_mock.has_uncommitted_changes = false;
+    grid_shell_mock.mount_count = 0;
     grid_shell_mock.on_editing_change = null;
     grid_shell_mock.request_save.mockReset();
     grid_shell_mock.request_save.mockReturnValue(false);
@@ -487,6 +503,57 @@ describe('truncation banner', () => {
 });
 
 describe('edit mode save exit', () => {
+    it('discarding from the save dialog clears persisted edits before releasing edit ownership', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+        await enter_edit_mode(post_message);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+
+        expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
+        expect(post_message).toHaveBeenCalledWith({ type: 'discardEditSession' });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('enters edit mode with pending edits returned by the host session grant', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+        const first_mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+
+        const pendingEdits = { '0:0': { value: 'restored', base: 'base' } };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            pendingEdits,
+        } as HostMessage);
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
+            JSON.stringify(pendingEdits)
+        );
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
+    });
+
     it('stays in edit mode when save is requested while dirty work is already saving', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
@@ -500,7 +567,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
@@ -529,7 +596,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
@@ -558,7 +625,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
@@ -587,7 +654,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
@@ -620,7 +687,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
         post_message.mockClear();
         await click_button('Edit');
@@ -651,7 +718,7 @@ describe('edit mode save exit', () => {
             })
         );
 
-        await click_button('Edit');
+        await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
         post_message.mockClear();
         await click_button('Edit');
@@ -677,6 +744,28 @@ describe('edit mode save exit', () => {
         await report_grid_editing(false, false);
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('discard all from the conflict banner releases edit ownership', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0']);
+
+        post_message.mockClear();
+        await click_button('Discard All');
+
+        expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
+        expect(post_message).toHaveBeenCalledWith({ type: 'discardEditSession' });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 });
 
