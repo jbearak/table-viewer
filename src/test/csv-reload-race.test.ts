@@ -71,6 +71,7 @@ function sheet_meta(panel: { __messages: unknown[] }) {
 
 beforeEach(() => {
     dispose_csv_preview();
+    for (const panel of vscode_mock.__getPanels()) panel.dispose();
     vi.restoreAllMocks();
     vscode_mock.__reset();
 });
@@ -330,6 +331,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
 
         const watcher = vscode_mock.__getWatchers()[0];
         const reload_done = watcher.__fireChange();      // starts the in-flight reload
@@ -365,6 +367,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
 
         await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
 
@@ -391,6 +394,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
 
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
 
@@ -420,6 +424,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/save.csv'));
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
 
         // External change bumps the mtime, so handle_save sees a conflict.
         mtime = 2;

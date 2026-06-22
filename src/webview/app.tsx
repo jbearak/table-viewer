@@ -76,6 +76,20 @@ export function App(): React.JSX.Element {
 
     const { persist_immediate } = use_state_sync(state_ref);
 
+    const release_edit_session = useCallback(() => {
+        vscode_api.postMessage({ type: 'releaseEditSession' });
+    }, []);
+
+    const leave_edit_mode = useCallback(() => {
+        set_edit_mode(false);
+        release_edit_session();
+    }, [release_edit_session]);
+
+    const discard_edit_session = useCallback(() => {
+        set_edit_mode(false);
+        vscode_api.postMessage({ type: 'discardEditSession' });
+    }, []);
+
     useEffect(() => {
         auto_fit_active_ref.current = auto_fit_active;
     }, [auto_fit_active]);
@@ -183,6 +197,9 @@ export function App(): React.JSX.Element {
 
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
+        return () => {
+            release_edit_session();
+        };
     }, []);
 
     const handle_sheet_select = useCallback(
@@ -203,7 +220,7 @@ export function App(): React.JSX.Element {
 
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
-            set_edit_mode(true);
+            vscode_api.postMessage({ type: 'requestEditSession' });
             return;
         }
         // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
@@ -212,8 +229,8 @@ export function App(): React.JSX.Element {
             vscode_api.postMessage({ type: 'showSaveDialog' });
             return;
         }
-        set_edit_mode(false);
-    }, [edit_mode]);
+        leave_edit_mode();
+    }, [edit_mode, leave_edit_mode]);
 
     // React to the host's save-dialog choice (from the exit flow) and to the save
     // outcome. GridShell separately clears the dirty map on a successful save; here
@@ -225,8 +242,8 @@ export function App(): React.JSX.Element {
     const finish_pending_exit = useCallback(() => {
         pending_exit_ref.current = false;
         pending_exit_save_succeeded_ref.current = false;
-        set_edit_mode(false);
-    }, []);
+        leave_edit_mode();
+    }, [leave_edit_mode]);
 
     // A deferred exit completes once the save acked and no uncommitted work (dirty
     // map or open overlay) remains. Shared by the saveResult handler and the
@@ -242,18 +259,30 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
-            if (msg.type === 'saveDialogResult') {
+            if (msg.type === 'editSessionResult') {
+                if (msg.granted) {
+                    if (msg.pendingEdits) {
+                        set_initial_edits(msg.pendingEdits);
+                        set_load_epoch((n) => n + 1);
+                    }
+                    set_edit_mode(true);
+                } else {
+                    pending_exit_ref.current = false;
+                    pending_exit_save_succeeded_ref.current = false;
+                    set_edit_mode(false);
+                }
+            } else if (msg.type === 'saveDialogResult') {
                 if (msg.choice === 'save') {
                     const editing = editing_ref.current;
                     // request_save() has side effects, so it must be evaluated first.
                     if (editing?.request_save() || editing?.has_uncommitted_changes()) {
                         pending_exit_ref.current = true;
                     } else {
-                        set_edit_mode(false);
+                        leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
                     editing_ref.current?.clear_dirty();
-                    set_edit_mode(false);
+                    discard_edit_session();
                 }
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
@@ -274,13 +303,18 @@ export function App(): React.JSX.Element {
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, []);
+    }, [
+        can_finish_pending_exit,
+        discard_edit_session,
+        finish_pending_exit,
+        leave_edit_mode,
+    ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
     // edit mode so the toolbar/banner don't dangle.
     useEffect(() => {
-        if (edit_mode && !csv_editable) set_edit_mode(false);
-    }, [edit_mode, csv_editable]);
+        if (edit_mode && !csv_editable) leave_edit_mode();
+    }, [edit_mode, csv_editable, leave_edit_mode]);
 
     // GridShell owns the dirty map (next to the loader); it reports status up so
     // the toolbar dirty dot, pending-edit persistence, and conflict banner —
@@ -527,7 +561,7 @@ export function App(): React.JSX.Element {
                         <button
                             onClick={() => {
                                 editing_ref.current?.clear_dirty();
-                                set_edit_mode(false);
+                                discard_edit_session();
                             }}
                         >
                             Discard All

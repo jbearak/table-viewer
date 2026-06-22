@@ -1,6 +1,6 @@
 # Table Viewer
 
-Read-only viewer for Excel (`.xlsx`, `.xls`), CSV, and TSV files in VS Code.
+Viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files in VS Code.
 
 ## Why
 

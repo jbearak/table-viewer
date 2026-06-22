@@ -73,6 +73,11 @@ interface MockWatcher {
 
 const panels: MockWebviewPanel[] = [];
 const watchers: MockWatcher[] = [];
+const custom_editor_registrations: {
+    viewType: string;
+    provider: unknown;
+    options: unknown;
+}[] = [];
 
 let stat_impl: ((uri: UriLike) => Promise<{ size: number; mtime: number }>) | undefined;
 let read_file_impl: ((uri: UriLike) => Promise<Uint8Array>) | undefined;
@@ -150,6 +155,14 @@ function make_watcher(): MockWatcher {
 }
 
 export const window = {
+    registerCustomEditorProvider(
+        viewType: string,
+        provider: unknown,
+        options?: unknown,
+    ) {
+        custom_editor_registrations.push({ viewType, provider, options });
+        return disposable();
+    },
     createWebviewPanel(_viewType: string, title: string): MockWebviewPanel {
         const panel = make_panel(title);
         panels.push(panel);
@@ -210,6 +223,7 @@ export const extensions = {
 export function __reset(): void {
     panels.length = 0;
     watchers.length = 0;
+    custom_editor_registrations.length = 0;
     stat_impl = undefined;
     read_file_impl = undefined;
 }
@@ -232,4 +246,8 @@ export function __getPanels(): MockWebviewPanel[] {
 
 export function __getWatchers(): MockWatcher[] {
     return watchers;
+}
+
+export function __getCustomEditorRegistrations() {
+    return custom_editor_registrations;
 }

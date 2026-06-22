@@ -36,6 +36,8 @@ export interface ViewerProfile {
     on_message?(msg: WebviewMessage): boolean | Promise<boolean>;
 }
 
+const active_csv_edit_sessions = new Map<string, symbol>();
+
 function excel_profile(): ViewerProfile {
     return {
         editing: false,
@@ -93,6 +95,22 @@ export function attach_viewer(
     let ready_seen = false;
     let last_mtime = 0;
     let consecutive_reload_failures = 0;
+    const edit_session_token = Symbol(file_path);
+
+    function owns_edit_session(): boolean {
+        return active_csv_edit_sessions.get(file_path) === edit_session_token;
+    }
+
+    function try_claim_edit_session(): boolean {
+        const owner = active_csv_edit_sessions.get(file_path);
+        if (owner && owner !== edit_session_token) return false;
+        active_csv_edit_sessions.set(file_path, edit_session_token);
+        return true;
+    }
+
+    function release_edit_session(): void {
+        if (owns_edit_session()) active_csv_edit_sessions.delete(file_path);
+    }
 
     // CSV editability flags for the meta/reload envelope. Non-editing profiles
     // emit `undefined` (not `false`) deliberately: on the reload path the webview
@@ -121,9 +139,17 @@ export function attach_viewer(
         profile.on_source_adopted?.(ds);
     }
 
+    function state_for_first_meta(): PerFileState {
+        const state = state_store.get(file_path) as PerFileState;
+        if (!profile.editing || !state.pendingEdits) return state;
+        if (try_claim_edit_session()) return state;
+        const { pendingEdits: _drop, ...rest } = state;
+        return rest;
+    }
+
     function send_first_meta(ds: DataSource): Promise<void> {
         return core!.send_meta({
-            state: state_store.get(file_path),
+            state: state_for_first_meta(),
             defaultTabOrientation: get_default_orientation(),
             previewMode: profile.previewMode,
             ...editing_flags(ds),
@@ -290,14 +316,49 @@ export function attach_viewer(
                 await state_store.set(file_path, next);
                 return;
             }
+            case 'requestEditSession': {
+                const can_edit = profile.editing && !!source && !source.truncationMessage;
+                const owner = active_csv_edit_sessions.get(file_path);
+                const denied_by_owner = can_edit
+                    && owner !== undefined
+                    && owner !== edit_session_token;
+                const granted = can_edit && !denied_by_owner && try_claim_edit_session();
+                const pendingEdits = granted
+                    ? (state_store.get(file_path) as PerFileState).pendingEdits
+                    : undefined;
+                panel.webview.postMessage({
+                    type: 'editSessionResult',
+                    granted,
+                    ...(pendingEdits ? { pendingEdits } : {}),
+                });
+                if (denied_by_owner) {
+                    vscode.window.showWarningMessage(
+                        'This file is already being edited in another Table Viewer tab.');
+                }
+                return;
+            }
+            case 'releaseEditSession':
+                if (profile.editing) release_edit_session();
+                return;
+            case 'discardEditSession':
+                if (profile.editing && owns_edit_session()) {
+                    await clear_pending_edits();
+                    release_edit_session();
+                }
+                return;
             case 'showWarning':
                 vscode.window.showWarningMessage(msg.message);
                 return;
             case 'saveCsv':
-                if (profile.editing) await handle_save(msg.edits);
+                if (profile.editing && owns_edit_session()) {
+                    await handle_save(msg.edits);
+                } else if (profile.editing) {
+                    panel.webview.postMessage({ type: 'saveResult', success: false });
+                }
                 return;
             case 'pendingEditsChanged': {
                 if (!profile.editing) return;
+                if (!owns_edit_session()) return;
                 if (msg.edits) {
                     const current = state_store.get(file_path) as PerFileState;
                     await state_store.set(file_path, { ...current, pendingEdits: msg.edits });
@@ -307,7 +368,7 @@ export function attach_viewer(
                 return;
             }
             case 'showSaveDialog': {
-                if (!profile.editing) return;
+                if (!profile.editing || !owns_edit_session()) return;
                 const choice = await vscode.window.showWarningMessage(
                     'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
                 panel.webview.postMessage({
@@ -334,6 +395,7 @@ export function attach_viewer(
         dispose() {
             disposed = true;
             reload_seq++;
+            release_edit_session();
             source?.close();
             for (const d of disposables) d.dispose();
         },
