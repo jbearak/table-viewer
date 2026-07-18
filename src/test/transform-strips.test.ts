@@ -118,14 +118,68 @@ describe('Raven transform strips', () => {
         editor_control.remove();
     });
 
-    it('disables every chip mutation while a transform is pending', () => {
-        mount(React.createElement(SortStrip, {
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+    it('restores filter-menu focus to a guarded chip while pending', async () => {
+        const on_change = vi.fn();
+        const entry = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'x', caseSensitive: false, enabled: true,
+        };
+        const state = { sort: [], filters: [entry] };
+        mount(React.createElement(FilterStrip, {
+            state,
             column_names: ['A'],
-            disabled: true,
-            on_change: vi.fn(),
+            disabled: false,
+            on_edit: vi.fn(),
+            on_change: (next) => {
+                on_change(next);
+                root!.render(React.createElement(FilterStrip, {
+                    state,
+                    column_names: ['A'],
+                    disabled: true,
+                    on_edit: vi.fn(),
+                    on_change,
+                }));
+            },
         }));
-        expect((document.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(true);
+        const kebab = document.querySelector('.filter-chip-kebab') as HTMLButtonElement;
+        act(() => kebab.click());
+        await act(async () => button('Disable').click());
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        expect(document.activeElement).toBe(kebab);
+        expect(kebab.disabled).toBe(false);
+        expect(kebab.getAttribute('aria-disabled')).toBe('true');
+        act(() => kebab.click());
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(on_change).toHaveBeenCalledOnce();
+    });
+
+    it('keeps restoration-target chips focusable but guarded while pending', async () => {
+        const on_change = vi.fn();
+        const state = { sort: [{ colIndex: 0, direction: 'asc' as const }], filters: [] };
+        mount(React.createElement(SortStrip, {
+            state,
+            column_names: ['A'],
+            disabled: false,
+            on_change: (next) => {
+                on_change(next);
+                root!.render(React.createElement(SortStrip, {
+                    state,
+                    column_names: ['A'],
+                    disabled: true,
+                    on_change,
+                }));
+            },
+        }));
+        const chip = document.querySelector('.sort-chip') as HTMLButtonElement;
+        act(() => chip.click());
+        await act(async () => button('Flip direction').click());
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        expect(document.activeElement).toBe(chip);
+        expect(chip.disabled).toBe(false);
+        expect(chip.getAttribute('aria-disabled')).toBe('true');
+        act(() => chip.click());
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(on_change).toHaveBeenCalledOnce();
         expect((document.querySelector('[aria-label="Clear all sorts"]') as HTMLButtonElement).disabled)
             .toBe(true);
     });

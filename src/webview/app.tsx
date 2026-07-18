@@ -49,6 +49,37 @@ function column_visibility_equal(
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function transforms_semantically_equal(
+    left: SheetTransformState | undefined,
+    right: SheetTransformState | undefined,
+): boolean {
+    if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
+    if (!left || !right) return false;
+    if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
+    const semantic_filters = (filters: readonly FilterEntry[]) => filters
+        .map((entry) => {
+            const base = {
+                colIndex: entry.colIndex,
+                operator: entry.operator,
+                enabled: entry.enabled,
+            };
+            if (entry.operator === 'isEmpty' || entry.operator === 'isNotEmpty') {
+                return base;
+            }
+            return {
+                ...base,
+                value: entry.value ?? '',
+                secondValue: entry.operator === 'between'
+                    ? entry.secondValue ?? ''
+                    : undefined,
+                caseSensitive: entry.caseSensitive,
+            };
+        })
+        .sort((a, b) => a.colIndex - b.colIndex);
+    return JSON.stringify(semantic_filters(left.filters))
+        === JSON.stringify(semantic_filters(right.filters));
+}
+
 /**
  * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
  * protocol (structure only — cells stream in later via the row loader inside
@@ -131,6 +162,7 @@ export function App(): React.JSX.Element {
     >([]);
     const transform_request_seq_ref = useRef(0);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
+    const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
@@ -145,6 +177,7 @@ export function App(): React.JSX.Element {
     ) => {
         const request_id = `${sheet_index}:${++transform_request_seq_ref.current}`;
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
+        pending_transform_states_ref.current[sheet_index] = state;
         set_pending_transforms((prev) => {
             const next = [...prev];
             next[sheet_index] = true;
@@ -244,6 +277,7 @@ export function App(): React.JSX.Element {
                 set_pending_transforms([]);
                 set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
+                pending_transform_states_ref.current = [];
                 transform_applied_for_source_ref.current = [];
 
                 const tab_orient = s.tabOrientation ?? null;
@@ -310,6 +344,7 @@ export function App(): React.JSX.Element {
                 set_pending_transforms([]);
                 set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
+                pending_transform_states_ref.current = [];
                 transform_applied_for_source_ref.current = [];
                 const next_transforms = msg.meta.sheets.map((sheet, index) =>
                     sanitize_transform_state(
@@ -382,6 +417,7 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_states_ref.current[msg.sheetIndex] = undefined;
                 set_pending_transforms((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = false;
@@ -537,15 +573,23 @@ export function App(): React.JSX.Element {
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
+            const column_count = meta?.sheets[active_sheet_index]?.columnCount ?? 0;
             const sanitized = sanitize_transform_state(
                 { ...next_state, schema },
-                meta?.sheets[active_sheet_index]?.columnCount ?? 0,
+                column_count,
                 schema,
             ) ?? {
                 sort: [],
                 filters: [],
                 schema,
             };
+            const current = sanitize_transform_state(
+                pending_transform_states_ref.current[active_sheet_index]
+                    ?? state_ref.current.transforms?.[active_sheet_index],
+                column_count,
+                schema,
+            );
+            if (transforms_semantically_equal(current, sanitized)) return;
             request_transform(active_sheet_index, sanitized, 'user');
         },
         [
@@ -621,6 +665,9 @@ export function App(): React.JSX.Element {
                     ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                     : undefined,
             };
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? state_ref.current.transforms?.[active_sheet_index];
+        if (transforms_semantically_equal(current, previous)) return;
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
@@ -955,13 +1002,10 @@ export function App(): React.JSX.Element {
         { length: current_sheet?.columnCount ?? 0 },
         (_, index) => current_sheet?.columnNames?.[index] || column_letter(index),
     ), [current_schema]);
-    const column_options = useMemo(() => column_names.map(
-        (display_name, source_index) => ({
-            source_index,
-            display_name,
-            source_letter: column_letter(source_index),
-        }),
-    ), [column_names]);
+    const get_column_name = useCallback(
+        (source_index: number) => column_names[source_index] ?? column_letter(source_index),
+        [column_names],
+    );
 
     if (!meta) {
         return <div className="loading">Loading...</div>;
@@ -1064,7 +1108,8 @@ export function App(): React.JSX.Element {
                 on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
                 column_visibility={{
-                    options: column_options,
+                    column_count: current_sheet.columnCount,
+                    get_column_name,
                     is_visible: (source_index) =>
                         current_column_projection.source_to_visible[source_index] !== undefined,
                     hidden_count: current_column_projection.hidden_count,

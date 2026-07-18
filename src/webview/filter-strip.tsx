@@ -69,6 +69,7 @@ function FilterChip({
     const summary = filter_summary(entry, column_names);
     const close = () => set_coords(null);
     const edit = (trigger: HTMLElement | null, from_menu = false) => {
+        if (disabled) return;
         if (from_menu) suppress_restore_ref.current = true;
         close();
         if (trigger) on_edit(entry, trigger);
@@ -102,7 +103,7 @@ function FilterChip({
                     ref={body_ref}
                     type="button"
                     className="filter-chip-body"
-                    disabled={disabled}
+                    aria-disabled={disabled || undefined}
                     aria-label={`Filter: ${summary}. ${entry.enabled ? 'Enabled' : 'Disabled'}. Edit filter.`}
                     onClick={() => edit(body_ref.current)}
                 >
@@ -112,11 +113,12 @@ function FilterChip({
                     ref={menu_ref}
                     type="button"
                     className={coords ? 'filter-chip-kebab open' : 'filter-chip-kebab'}
-                    disabled={disabled}
+                    aria-disabled={disabled || undefined}
                     aria-label={`Filter actions for ${summary}`}
                     aria-haspopup="menu"
                     aria-expanded={coords !== null}
                     onClick={() => {
+                        if (disabled) return;
                         if (coords) return close();
                         suppress_restore_ref.current = false;
                         const rect = menu_ref.current?.getBoundingClientRect();

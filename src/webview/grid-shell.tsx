@@ -77,6 +77,11 @@ const ROW_RESIZE_TOLERANCE_PX = 5;
  *  on huge sheets; we only ever measure already-loaded text, never force a
  *  fetch). */
 const AUTO_FIT_SAMPLE_ROWS = 2000;
+/** Glide exposes its ref before the internal scroller is always ready. Retry a
+ * queued preview restore briefly, then leave it pending for the first visible
+ * region callback to finish. */
+const PREVIEW_RESTORE_MAX_ATTEMPTS = 8;
+const PREVIEW_RESTORE_RETRY_MS = 16;
 
 /** Canvas-drawn tint for a cell holding an unsaved edit (low-alpha warning
  *  amber). Concrete rgba — `themeOverride.bgCell` is painted on canvas and can't
@@ -221,6 +226,8 @@ export function GridShell({
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
     const pending_preview_row_ref = useRef<number | null>(null);
+    const preview_restore_timer_ref = useRef<number | null>(null);
+    const preview_restore_token_ref = useRef(0);
 
     // Controlled selection. We intercept every change to snap it onto whole
     // merges (a click/drag landing on a covered cell selects the merge block);
@@ -398,39 +405,91 @@ export function GridShell({
         overlay_ref.current?.repaint();
     }, [column_projection, display_column_count, visible_source_columns]);
 
+    const cancel_pending_preview_restore = useCallback(() => {
+        preview_restore_token_ref.current += 1;
+        if (preview_restore_timer_ref.current !== null) {
+            window.clearTimeout(preview_restore_timer_ref.current);
+            preview_restore_timer_ref.current = null;
+        }
+    }, []);
+
+    const restore_pending_preview_row = useCallback((): boolean => {
+        const pending_row = pending_preview_row_ref.current;
+        const grid = grid_ref.current;
+        if (
+            pending_row === null
+            || !grid
+            || display_column_count <= 0
+            || row_count <= 0
+        ) {
+            return false;
+        }
+        const column = Math.min(
+            Math.max(0, visible_ref.current.x),
+            display_column_count - 1,
+        );
+        const row = Math.min(Math.max(0, pending_row), row_count - 1);
+        const bounds = grid.getBounds(column, row);
+        if (!bounds || bounds.width <= 0 || bounds.height <= 0) return false;
+        cancel_pending_preview_restore();
+        pending_preview_row_ref.current = null;
+        scroll_preview_to_row(grid, row);
+        return true;
+    }, [cancel_pending_preview_restore, display_column_count, row_count]);
+
+    const schedule_pending_preview_restore = useCallback(() => {
+        cancel_pending_preview_restore();
+        const token = preview_restore_token_ref.current;
+        let attempt = 0;
+        const retry = () => {
+            if (preview_restore_token_ref.current !== token) return;
+            preview_restore_timer_ref.current = null;
+            if (restore_pending_preview_row()) return;
+            attempt += 1;
+            if (attempt >= PREVIEW_RESTORE_MAX_ATTEMPTS) return;
+            preview_restore_timer_ref.current = window.setTimeout(
+                retry,
+                PREVIEW_RESTORE_RETRY_MS,
+            );
+        };
+        retry();
+    }, [cancel_pending_preview_restore, restore_pending_preview_row]);
+
     // Hide-all removes only Glide's DataEditor, not GridShell. Preserve the last
     // visible display location and restore it when any columns become visible again.
     const previous_has_visible_columns_ref = useRef(has_visible_columns);
     useEffect(() => {
         const previously_visible = previous_has_visible_columns_ref.current;
         previous_has_visible_columns_ref.current = has_visible_columns;
+        if (!has_visible_columns || row_count <= 0) {
+            cancel_pending_preview_restore();
+            return;
+        }
+        if (pending_preview_row_ref.current !== null) {
+            schedule_pending_preview_restore();
+            return cancel_pending_preview_restore;
+        }
         if (
             previously_visible
-            || !has_visible_columns
-            || row_count <= 0
-            || (
-                pending_preview_row_ref.current === null
-                && (visible_ref.current.width <= 0 || visible_ref.current.height <= 0)
-            )
+            || visible_ref.current.width <= 0
+            || visible_ref.current.height <= 0
         ) {
             return;
         }
-        const pending_preview_row = pending_preview_row_ref.current;
         const column = Math.min(
             Math.max(0, visible_ref.current.x),
             display_column_count - 1,
         );
-        const row = Math.min(
-            Math.max(0, pending_preview_row ?? visible_ref.current.y),
-            row_count - 1,
-        );
-        if (pending_preview_row === null) {
-            grid_ref.current?.scrollTo(column, row);
-        } else {
-            grid_ref.current?.scrollTo(column, row, 'vertical', 0, 0, { vAlign: 'start' });
-            pending_preview_row_ref.current = null;
-        }
-    }, [display_column_count, has_visible_columns, row_count]);
+        const row = Math.min(Math.max(0, visible_ref.current.y), row_count - 1);
+        grid_ref.current?.scrollTo(column, row);
+    }, [
+        cancel_pending_preview_restore,
+        display_column_count,
+        generation,
+        has_visible_columns,
+        row_count,
+        schedule_pending_preview_restore,
+    ]);
 
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
@@ -797,51 +856,55 @@ export function GridShell({
         }
     }, []);
 
-    // Serialize a rectangle from the paged cache and write it to the clipboard.
-    // Reads via get_row_ref so the callback stays stable across page loads. When
-    // the copy is clipped (non-resident rows or the row cap) the available data
-    // is still copied, but the host surfaces a visible warning so the paste
-    // isn't silently incomplete.
+    // Serialize an ordered source-column/row selection from the paged cache and
+    // write it to the clipboard. Reads via get_row_ref so the callback stays stable
+    // across page loads. When the copy is clipped (non-resident rows or the row
+    // cap) the available data is still copied, but the host surfaces a warning.
+    const copy_source_selection = useCallback((
+        selection: Parameters<typeof format_selection_tsv>[0],
+        include_header = false,
+    ) => {
+        const result = format_selection_tsv(
+            selection,
+            get_row_ref.current,
+            merge_index,
+            show_formatting,
+        );
+        const warning = copy_truncation_message(result);
+        if (warning) {
+            vscode_api.postMessage({ type: 'showWarning', message: warning });
+        }
+        const header = include_header
+            ? selection.source_columns.map((source_column) =>
+                sheet_meta.columnNames?.[source_column]
+                || columns[display_column_for_source(source_column) ?? -1]?.title
+                || `Column ${source_column + 1}`,
+            ).join('\t')
+            : '';
+        void safe_write_to_clipboard(
+            header ? `${header}${result.text ? `\n${result.text}` : ''}` : result.text,
+        );
+    }, [
+        columns,
+        display_column_for_source,
+        merge_index,
+        sheet_meta.columnNames,
+        show_formatting,
+        safe_write_to_clipboard,
+    ]);
+
     const copy_rect = useCallback(
         (rect: Rectangle, include_header = false) => {
-            const source_columns = visible_source_columns.slice(
-                rect.x,
-                rect.x + rect.width,
-            );
-            const result = format_selection_tsv(
-                {
-                    y: rect.y,
-                    height: rect.height,
-                    source_columns,
-                },
-                get_row_ref.current,
-                merge_index,
-                show_formatting,
-            );
-            const warning = copy_truncation_message(result);
-            if (warning) {
-                vscode_api.postMessage({ type: 'showWarning', message: warning });
-            }
-            const header = include_header
-                ? source_columns.map((source_column) =>
-                    sheet_meta.columnNames?.[source_column]
-                    || columns[display_column_for_source(source_column) ?? -1]?.title
-                    || `Column ${source_column + 1}`,
-                ).join('\t')
-                : '';
-            void safe_write_to_clipboard(
-                header ? `${header}${result.text ? `\n${result.text}` : ''}` : result.text,
-            );
+            copy_source_selection({
+                y: rect.y,
+                height: rect.height,
+                source_columns: visible_source_columns.slice(
+                    rect.x,
+                    rect.x + rect.width,
+                ),
+            }, include_header);
         },
-        [
-            columns,
-            display_column_for_source,
-            merge_index,
-            sheet_meta.columnNames,
-            show_formatting,
-            safe_write_to_clipboard,
-            visible_source_columns,
-        ],
+        [copy_source_selection, visible_source_columns],
     );
 
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
@@ -1068,11 +1131,32 @@ export function GridShell({
                     alt: args.altKey,
                 })
             ) {
-                const sel = grid_selection_ref.current.current;
-                if (sel) {
+                const selection = grid_selection_ref.current;
+                if (selection.columns.length > 0) {
+                    const source_columns = Array.from(
+                        selection.columns,
+                        (display_column) => source_column_for_display(display_column),
+                    ).filter((source_column): source_column is number =>
+                        source_column !== undefined);
                     args.cancel();
                     args.preventDefault();
-                    copy_rect(sel.range);
+                    copy_source_selection({
+                        y: 0,
+                        height: row_count,
+                        source_columns,
+                    }, true);
+                } else if (selection.rows.length > 0) {
+                    args.cancel();
+                    args.preventDefault();
+                    copy_source_selection({
+                        row_indices: selection.rows,
+                        row_count: selection.rows.length,
+                        source_columns: visible_source_columns,
+                    });
+                } else if (selection.current) {
+                    args.cancel();
+                    args.preventDefault();
+                    copy_rect(selection.current.range);
                 }
                 return;
             }
@@ -1105,6 +1189,7 @@ export function GridShell({
                 { x: next.col, y: next.row, width: 1, height: 1 },
                 merges,
             );
+            focused_source_column_ref.current = source_column_for_display(cell[0]);
             set_grid_selection({
                 columns: CompactSelection.empty(),
                 rows: CompactSelection.empty(),
@@ -1116,6 +1201,7 @@ export function GridShell({
             apply_column_sort,
             clear_filter_on_column,
             copy_rect,
+            copy_source_selection,
             display_column_count,
             display_column_for_source,
             editable_cells,
@@ -1123,9 +1209,11 @@ export function GridShell({
             on_open_filter,
             on_transform_change,
             row_count,
+            source_column_for_display,
             transform_pending,
             transform_sections,
             transform_state,
+            visible_source_columns,
         ],
     );
 
@@ -1138,12 +1226,13 @@ export function GridShell({
             const start = range.y;
             const end = range.y + range.height - 1;
             ensure_rows(start, end);
-            if (preview_mode && last_preview_row.current !== start) {
+            const restored_preview = preview_mode && restore_pending_preview_row();
+            if (preview_mode && !restored_preview && last_preview_row.current !== start) {
                 last_preview_row.current = start;
                 vscode_api.postMessage({ type: 'visibleRowChanged', row: start });
             }
         },
-        [ensure_rows, preview_mode],
+        [ensure_rows, preview_mode, restore_pending_preview_row],
     );
 
     // Kick off the first page before the initial region callback arrives.
@@ -1222,6 +1311,7 @@ export function GridShell({
             const msg = e.data;
             if (msg && msg.type === 'scrollToRow' && typeof msg.row === 'number') {
                 if (has_visible_columns) {
+                    cancel_pending_preview_restore();
                     pending_preview_row_ref.current = null;
                     scroll_preview_to_row(
                         grid_ref.current,
@@ -1234,7 +1324,12 @@ export function GridShell({
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [has_visible_columns, preview_mode, row_count]);
+    }, [
+        cancel_pending_preview_restore,
+        has_visible_columns,
+        preview_mode,
+        row_count,
+    ]);
 
     const handle_column_resize = useCallback(
         (_column: GridColumn, new_size: number, display_column: number) => {
@@ -1287,7 +1382,9 @@ export function GridShell({
         return (
             <div className="grid-shell-root">
                 <div className="all-columns-hidden" role="status">
-                    All columns are hidden. Show one or more columns to resume the table.
+                    {sheet_meta.columnCount === 0
+                        ? 'This sheet contains no columns.'
+                        : 'All columns are hidden. Show one or more columns to resume the table.'}
                 </div>
             </div>
         );

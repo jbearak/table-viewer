@@ -633,7 +633,7 @@ body {
     line-height: 18px;
 }
 
-.sort-chip:hover:not(:disabled),
+.sort-chip:hover:not(:disabled):not([aria-disabled="true"]),
 .sort-chip.open {
     border-color: var(--vscode-focusBorder, #007acc);
 }
@@ -693,7 +693,7 @@ body {
     opacity: 0.65;
 }
 
-.filter-chip-kebab:hover:not(:disabled),
+.filter-chip-kebab:hover:not(:disabled):not([aria-disabled="true"]),
 .filter-chip-kebab.open {
     color: var(--vscode-focusBorder, #007acc);
     opacity: 1;
@@ -713,7 +713,9 @@ body {
 }
 
 .sort-chip:disabled,
+.sort-chip[aria-disabled="true"],
 .filter-chip button:disabled,
+.filter-chip button[aria-disabled="true"],
 .sort-strip-clear:disabled,
 .filter-strip-clear:disabled {
     cursor: default;

@@ -14,11 +14,7 @@ let container: HTMLDivElement | null = null;
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
 
-const options: ColumnVisibilityControlProps['options'] = [
-    { source_index: 0, display_name: 'Revenue', source_letter: 'A' },
-    { source_index: 1, display_name: 'Revenue', source_letter: 'B' },
-    { source_index: 2, display_name: '', source_letter: 'C' },
-];
+const column_names = ['Revenue', 'Revenue', ''];
 
 function render_control(
     overrides: Partial<ColumnVisibilityControlProps> = {},
@@ -27,7 +23,8 @@ function render_control(
     document.body.appendChild(container);
     root = createRoot(container);
     const props: ColumnVisibilityControlProps = {
-        options,
+        column_count: column_names.length,
+        get_column_name: (source_index) => column_names[source_index] ?? '',
         is_visible: (source_index) => source_index !== 1,
         hidden_count: 1,
         reset_key: 'sheet-1',
@@ -217,24 +214,26 @@ describe('ColumnVisibilityControl', () => {
         expect(search().value).toBe('');
     });
 
-    it('bounds initial DOM work for unusually wide CSV schemas while keeping search complete', () => {
-        const wide_options = Array.from({ length: 505 }, (_, source_index) => ({
-            source_index,
-            display_name: source_index === 504 ? 'Target column' : `Field ${source_index}`,
-            source_letter: `L${source_index}`,
-        }));
+    it('resolves wide-schema names lazily and stops after cap plus one match', () => {
+        const get_column_name = vi.fn((source_index: number) =>
+            source_index === 9_999 ? 'Target column' : `Field ${source_index}`);
         render_control({
-            options: wide_options,
+            column_count: 10_000,
+            get_column_name,
             is_visible: () => true,
             hidden_count: 0,
         });
-        act(() => trigger().click());
+        expect(get_column_name).not.toHaveBeenCalled();
 
+        act(() => trigger().click());
+        expect(get_column_name).toHaveBeenCalledTimes(501);
         expect(document.querySelectorAll('.column-visibility-item')).toHaveLength(500);
         expect(document.querySelector('.column-visibility-limit')?.textContent)
             .toContain('first 500 matches');
 
+        get_column_name.mockClear();
         set_input_value(search(), 'target column');
+        expect(get_column_name).toHaveBeenCalledTimes(10_000);
         expect(document.querySelectorAll('.column-visibility-item')).toHaveLength(1);
         expect(document.querySelector('.column-visibility-item')?.textContent)
             .toContain('Target column');
