@@ -7,15 +7,11 @@ import React, {
     useRef,
     useState,
 } from 'react';
-
-export interface ColumnVisibilityOption {
-    source_index: number;
-    display_name: string;
-    source_letter: string;
-}
+import { column_letter } from './grid-model';
 
 export interface ColumnVisibilityControlProps {
-    options: readonly ColumnVisibilityOption[];
+    column_count: number;
+    get_column_name: (source_index: number) => string;
     is_visible: (source_index: number) => boolean;
     hidden_count: number;
     reset_key: string;
@@ -27,13 +23,13 @@ export interface ColumnVisibilityControlProps {
 
 const VIEWPORT_MARGIN_PX = 8;
 const POPOVER_GAP_PX = 6;
-/** Bound synchronous DOM work for unusually wide CSV/TSV schemas. Search still
- * scans every option, so any source column remains directly reachable. */
+/** Bound synchronous search and DOM work for unusually wide CSV/TSV schemas. */
 const MAX_RENDERED_OPTIONS = 500;
 
 /** Searchable, source-indexed column visibility control for the main toolbar. */
 export function ColumnVisibilityControl({
-    options,
+    column_count,
+    get_column_name,
     is_visible,
     hidden_count,
     reset_key,
@@ -159,20 +155,26 @@ export function ColumnVisibilityControl({
     const { rendered_options, has_more_matches } = useMemo(() => {
         if (!open) return { rendered_options: [], has_more_matches: false };
         const needle = filter.trim().toLowerCase();
-        const matches: ColumnVisibilityOption[] = [];
-        for (const option of options) {
+        const matches: Array<{
+            source_index: number;
+            display_name: string;
+            source_letter: string;
+        }> = [];
+        for (let source_index = 0; source_index < column_count; source_index++) {
+            const display_name = get_column_name(source_index);
+            const source_letter = column_letter(source_index);
             if (
                 needle.length > 0
-                && !option.display_name.toLowerCase().includes(needle)
-                && !option.source_letter.toLowerCase().includes(needle)
+                && !display_name.toLowerCase().includes(needle)
+                && !source_letter.toLowerCase().includes(needle)
             ) continue;
             if (matches.length === MAX_RENDERED_OPTIONS) {
                 return { rendered_options: matches, has_more_matches: true };
             }
-            matches.push(option);
+            matches.push({ source_index, display_name, source_letter });
         }
         return { rendered_options: matches, has_more_matches: false };
-    }, [filter, open, options]);
+    }, [column_count, filter, get_column_name, open]);
     const trigger_label = hidden_count > 0
         ? `Choose visible columns. ${hidden_count} column${hidden_count === 1 ? '' : 's'} hidden.`
         : 'Choose visible columns.';

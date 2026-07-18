@@ -77,6 +77,44 @@ describe('format_selection_tsv', () => {
         expect(out.text).toBe('c\ta');
     });
 
+    it('copies explicit noncontiguous rows without expanding their bounding range', () => {
+        const get_row = loader({
+            0: [cell('row-0')],
+            1: [cell('row-1')],
+            3: [cell('row-3')],
+        });
+        const out = format_selection_tsv(
+            { row_indices: [0, 3], row_count: 2, source_columns: [0] },
+            get_row,
+            NO_MERGES,
+            true,
+        );
+        expect(out.text).toBe('row-0\nrow-3');
+        expect(out.nonResident).toBe(false);
+    });
+
+    it('caps explicit selected rows without materializing trailing rows', () => {
+        let yielded = 0;
+        const rows = {
+            *[Symbol.iterator]() {
+                for (let row = 0; row < 10; row++) {
+                    yielded += 1;
+                    yield row;
+                }
+            },
+        };
+        const out = format_selection_tsv(
+            { row_indices: rows, row_count: 10, source_columns: [0] },
+            (row) => [cell(`row-${row}`)],
+            NO_MERGES,
+            true,
+            3,
+        );
+        expect(out.text).toBe('row-0\nrow-1\nrow-2');
+        expect(out.rowCapped).toBe(true);
+        expect(yielded).toBe(3);
+    });
+
     it('copies raw text when formatting is off', () => {
         const get_row = loader({ 0: [cell('1000', '$1,000')] });
         const out = format_selection_tsv(

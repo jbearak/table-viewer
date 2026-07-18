@@ -63,6 +63,7 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
             transform.filters,
             row_count_text,
             props.transform_pending,
+            props.transform_progress,
             props.merges_flattened,
             props.column_visibility.hidden_count,
             props.show_formatting_button,

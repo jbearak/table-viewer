@@ -36,10 +36,8 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         on_toggle_tab_orientation,
         show_vertical_tabs_button: true,
         column_visibility: {
-            options: [
-                { source_index: 0, display_name: 'Name', source_letter: 'A' },
-                { source_index: 1, display_name: 'Value', source_letter: 'B' },
-            ],
+            column_count: 2,
+            get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
             is_visible: () => true,
             hidden_count: 0,
             reset_key: 'sheet-1',
@@ -211,10 +209,8 @@ describe('Toolbar', () => {
     it('renders the Columns trigger with dialog semantics and a hidden-count badge', () => {
         render_toolbar({
             column_visibility: {
-                options: [
-                    { source_index: 0, display_name: 'Name', source_letter: 'A' },
-                    { source_index: 1, display_name: 'Value', source_letter: 'B' },
-                ],
+                column_count: 2,
+                get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
                 is_visible: (source_index) => source_index !== 1,
                 hidden_count: 1,
                 reset_key: 'sheet-1',
@@ -344,8 +340,61 @@ describe('Toolbar', () => {
         expect(get_button('Cancel')).toBeDefined();
         act(() => get_button('Cancel').click());
         expect(on_cancel_transform).toHaveBeenCalledOnce();
-        expect((container.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(true);
-        expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(true);
+        expect((container.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(false);
+        expect(container.querySelector('.sort-chip')?.getAttribute('aria-disabled')).toBe('true');
+        expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(false);
+        expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled')).toBe('true');
+    });
+
+    it('remeasures wrapping when pending progress text changes', () => {
+        const scroll_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'scrollWidth',
+        );
+        const client_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'clientWidth',
+        );
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                if (this.classList.contains('toolbar-row-count')) return 50;
+                if (this.classList.contains('toolbar-progress')) {
+                    return this.textContent?.includes('A much longer pending progress label')
+                        ? 700
+                        : 100;
+                }
+                return 0;
+            },
+        });
+        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                return this.classList.contains('toolbar') ? 500 : 0;
+            },
+        });
+        const rendered = render_toolbar({
+            transform_pending: true,
+            transform_progress: 'Short',
+        });
+        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
+            .toBe(false);
+        rendered.rerender({
+            transform_pending: true,
+            transform_progress: 'A much longer pending progress label',
+        });
+        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
+            .toBe(true);
+        if (scroll_width) {
+            Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
+        } else {
+            Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+        }
+        if (client_width) {
+            Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
+        } else {
+            Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+        }
     });
 
     it('clamps tooltip positioning so it stays inside the viewport near the left edge', () => {

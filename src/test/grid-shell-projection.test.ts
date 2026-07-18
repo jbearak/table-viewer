@@ -10,17 +10,30 @@ const grid_mock = vi.hoisted(() => ({
     update_cells: vi.fn(),
     scroll_to: vi.fn(),
     focus: vi.fn(),
-    get_bounds: vi.fn(() => ({ x: 30, y: 10, width: 100, height: 36 })),
+    get_bounds: vi.fn((): { x: number; y: number; width: number; height: number } | undefined => ({
+        x: 30, y: 10, width: 100, height: 36,
+    })),
     loader_enabled: [] as boolean[],
     ensure_rows: vi.fn(),
+    post_message: vi.fn(),
+    get_row: vi.fn((_row?: number) => [
+        { raw: 'source-a', formatted: 'source-a', bold: false, italic: false },
+        { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+        { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+    ] as any),
 }));
 
 vi.mock('@glideapps/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
     return {
         CompactSelection: {
-            empty: () => ({}),
-            fromSingleSelection: (value: number) => ({ selected: value }),
+            empty: () => ({ length: 0, toArray: () => [], *[Symbol.iterator]() {} }),
+            fromSingleSelection: (value: number) => ({
+                selected: value,
+                length: 1,
+                toArray: () => [value],
+                *[Symbol.iterator]() { yield value; },
+            }),
         },
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as Record<string, unknown>;
@@ -46,11 +59,7 @@ vi.mock('../webview/use-row-loader', () => ({
         grid_mock.loader_enabled.push(enabled);
         return {
             ensure_rows: grid_mock.ensure_rows,
-            get_row: () => [
-                { raw: 'source-a', formatted: 'source-a', bold: false, italic: false },
-                { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
-                { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
-            ],
+            get_row: grid_mock.get_row,
             sample_loaded_rows: () => [],
             version: 0,
         };
@@ -80,6 +89,14 @@ let container: HTMLDivElement | null = null;
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
+
+function compact(values: number[]) {
+    return {
+        length: values.length,
+        toArray: () => [...values],
+        *[Symbol.iterator]() { yield* values; },
+    };
+}
 
 function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
     return {
@@ -111,7 +128,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
 async function render_grid(initial: GridShellProps) {
     vi.resetModules();
     vi.stubGlobal('acquireVsCodeApi', () => ({
-        postMessage: vi.fn(),
+        postMessage: grid_mock.post_message,
         getState: vi.fn(),
         setState: vi.fn(),
     }));
@@ -135,11 +152,22 @@ afterEach(() => {
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
     grid_mock.focus.mockReset();
-    grid_mock.get_bounds.mockClear();
+    grid_mock.get_bounds.mockReset();
+    grid_mock.get_bounds.mockImplementation(() => ({
+        x: 30, y: 10, width: 100, height: 36,
+    }));
     grid_mock.ensure_rows.mockReset();
+    grid_mock.post_message.mockReset();
+    grid_mock.get_row.mockReset();
+    grid_mock.get_row.mockImplementation(() => [
+        { raw: 'source-a', formatted: 'source-a', bold: false, italic: false },
+        { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+        { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+    ] as any);
     grid_mock.loader_enabled = [];
     vi.unstubAllGlobals();
     Reflect.deleteProperty(navigator, 'clipboard');
+    vi.useRealTimers();
 });
 
 describe('GridShell column projection', () => {
@@ -243,6 +271,58 @@ describe('GridShell column projection', () => {
         expect(on_transform_change).toHaveBeenCalledWith({
             sort: [{ colIndex: 0, direction: 'asc' }],
             filters: [],
+        });
+    });
+
+    it('retargets shortcuts after programmatic vim and merge-aware navigation', async () => {
+        const on_transform_change = vi.fn();
+        await render_grid(props({
+            row_count: 2,
+            merges: [{ startRow: 0, startCol: 0, endRow: 0, endCol: 0 }],
+            transform_sections: true,
+            on_transform_change,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        const key_args = (key: string, code = '') => ({
+            key, altKey: false, shiftKey: false, ctrlKey: false, metaKey: false,
+            rawEvent: { code, target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        });
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => on_key_down(key_args('l', 'KeyL')));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+        on_key_down({
+            ...key_args('A', 'KeyA'), altKey: true, shiftKey: true,
+        });
+        expect(on_transform_change).toHaveBeenLastCalledWith({
+            sort: [{ colIndex: 2, direction: 'asc' }], filters: [],
+        });
+
+        on_transform_change.mockClear();
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => on_key_down(key_args('ArrowRight')));
+        on_key_down({
+            ...key_args('D', 'KeyD'), altKey: true, shiftKey: true,
+        });
+        expect(on_transform_change).toHaveBeenLastCalledWith({
+            sort: [{ colIndex: 2, direction: 'desc' }], filters: [],
         });
     });
 
@@ -358,6 +438,44 @@ describe('GridShell column projection', () => {
         );
     });
 
+    it('retries queued preview recovery until the remounted Glide scroller is ready', async () => {
+        vi.useFakeTimers();
+        const GridShell = await render_grid(props({ row_count: 200, preview_mode: true }));
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            row_count: 200,
+            preview_mode: true,
+            column_projection: { visible_to_source: [], source_to_visible: [], hidden_count: 3 },
+        }))));
+        await act(async () => window.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'scrollToRow', row: 150 },
+        })));
+        grid_mock.get_bounds
+            .mockReturnValueOnce(undefined)
+            .mockReturnValueOnce(undefined)
+            .mockReturnValue({ x: 30, y: 10, width: 100, height: 36 });
+
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            row_count: 200,
+            preview_mode: true,
+        }))));
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(16);
+        });
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(16);
+        });
+        expect(grid_mock.scroll_to).toHaveBeenCalledOnce();
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(
+            0, 150, 'vertical', 0, 0, { vAlign: 'start' },
+        );
+        await act(async () => {
+            await vi.runAllTimersAsync();
+        });
+        expect(grid_mock.scroll_to).toHaveBeenCalledOnce();
+    });
+
     it('header clicks only update focus and preserve Glide multi-column selection', async () => {
         await render_grid(props());
         const selection = { columns: { native: 'multi' }, rows: {} };
@@ -452,6 +570,65 @@ describe('GridShell column projection', () => {
         expect(write_text).toHaveBeenCalledWith('C name\nsource-c');
     });
 
+    it('guards keyboard header copy with projected source order and headers', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([0, 1]), rows: compact([]),
+        }));
+        const cancel = vi.fn();
+        const prevent_default = vi.fn();
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_key_down({
+            key: 'c', ctrlKey: true, metaKey: false, shiftKey: false, altKey: false,
+            rawEvent: { code: 'KeyC', target: document.createElement('canvas') },
+            cancel, preventDefault: prevent_default,
+        }));
+        expect(cancel).toHaveBeenCalledOnce();
+        expect(prevent_default).toHaveBeenCalledOnce();
+        expect(write_text).toHaveBeenCalledWith('A name\tC name\nsource-a\tsource-c');
+    });
+
+    it('guards noncontiguous row copy and warns for nonresident rows', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.get_row.mockImplementation((row?: number) => row === 0
+            ? [
+                { raw: 'r0-a', formatted: 'r0-a', bold: false, italic: false },
+                null,
+                { raw: 'r0-c', formatted: 'r0-c', bold: false, italic: false },
+            ] as any
+            : undefined);
+        await render_grid(props({ row_count: 3 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([0, 2]),
+        }));
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_key_down({
+            key: 'C', ctrlKey: false, metaKey: true, shiftKey: false, altKey: false,
+            rawEvent: { code: 'KeyC', target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        }));
+        expect(write_text).toHaveBeenCalledWith('r0-a\tr0-c\n\t');
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: expect.stringMatching(/loaded range/),
+        });
+    });
+
     it('draws acknowledged source-indexed sort glyphs after normal header content', async () => {
         await render_grid(props({
             transform_state: {
@@ -494,6 +671,25 @@ describe('GridShell column projection', () => {
         expect(document.body.textContent).toContain('Select column');
         expect(document.body.textContent).toContain('Select all');
         expect(document.body.textContent).not.toContain('Sort ascending');
+    });
+
+    it('renders an unrecoverable message for a genuine zero-column sheet', async () => {
+        await render_grid(props({
+            sheet_meta: {
+                name: 'Empty', rowCount: 0, columnCount: 0,
+                columnNames: [], merges: [], hasFormatting: false,
+            },
+            row_count: 0,
+            column_projection: {
+                visible_to_source: [], source_to_visible: [], hidden_count: 0,
+            },
+        }));
+        const status = container!.querySelector('[role="status"]');
+        expect(status?.textContent).toContain('This sheet contains no columns.');
+        expect(status?.textContent).not.toContain('Show one or more columns');
+        expect(container!.querySelector('.data-editor-stub')).toBeNull();
+        expect(grid_mock.loader_enabled.at(-1)).toBe(false);
+        expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
     });
 
     it('renders a recoverable all-hidden status without grid overlays or row requests', async () => {

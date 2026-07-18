@@ -1206,6 +1206,128 @@ describe('sorting and filtering', () => {
         expect(cancel.state.filters).toEqual([disabled]);
     });
 
+    it('suppresses semantically unchanged transform requests without remounting', async () => {
+        const { post_message } = await render_app();
+        const schema = '["Sheet1",1,null]';
+        const filter = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'x', caseSensitive: false, enabled: true,
+        };
+        const filter_state = { sort: [], filters: [filter], schema };
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: { transforms: [filter_state] },
+        }));
+        const restore = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: restore.state,
+            rowCount: 1, requestId: restore.requestId, generation: 2,
+            sourceGeneration: 1, intent: restore.intent,
+        });
+        post_message.mockClear();
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+        const on_transform_change = grid_shell_mock.latest_props?.on_transform_change as
+            (state: typeof filter_state) => void;
+
+        await act(async () => on_transform_change({ ...filter_state, sort: [] }));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+
+        await act(async () => (
+            document.querySelector('.filter-chip-body') as HTMLButtonElement
+        ).click());
+        await click_button('Apply');
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: { transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema,
+            }] },
+        }));
+        const sort_restore = post_message.mock.calls.map((call) => call[0])
+            .filter((message) => message.type === 'setTransform').at(-1);
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: sort_restore.state,
+            rowCount: 1, requestId: sort_restore.requestId, generation: 2,
+            sourceGeneration: 1, intent: sort_restore.intent,
+        });
+        post_message.mockClear();
+        const sort_mount_id = grid_stub().getAttribute('data-mount-id');
+        const change_sort = grid_shell_mock.latest_props?.on_transform_change as
+            (state: { sort: Array<{ colIndex: number; direction: 'asc' }>; filters: []; schema?: string }) => void;
+        await act(async () => change_sort({
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema,
+        }));
+        await act(async () => change_sort({
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema,
+        }));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(sort_mount_id);
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        const empty_mount_id = grid_stub().getAttribute('data-mount-id');
+        const clear_empty = grid_shell_mock.latest_props?.on_transform_change as
+            (state: { sort: []; filters: [] }) => void;
+        await act(async () => clear_empty({ sort: [], filters: [] }));
+        await act(async () => clear_empty({ sort: [], filters: [] }));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(empty_mount_id);
+    });
+
+    it('keeps a keyboard filter opener focused while Apply is pending and after ack', async () => {
+        const { post_message } = await render_app();
+        const schema = '["Sheet1",1,null]';
+        const filter = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'old', caseSensitive: false, enabled: true,
+        };
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: { transforms: [{ sort: [], filters: [filter], schema }] },
+        }));
+        const restore = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: restore.state,
+            rowCount: 1, requestId: restore.requestId, generation: 2,
+            sourceGeneration: 1, intent: restore.intent,
+        });
+        const chip = document.querySelector('.filter-chip-body') as HTMLButtonElement;
+        chip.focus();
+        await act(async () => chip.click());
+        const input = document.querySelector('[aria-label="Filter value"]') as HTMLInputElement;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                .set!.call(input, 'new');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        post_message.mockClear();
+        await click_button('Apply');
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        const request = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(request).toBeDefined();
+        expect(document.activeElement).toBe(chip);
+        expect(chip.disabled).toBe(false);
+        expect(chip.getAttribute('aria-disabled')).toBe('true');
+
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: request.state,
+            rowCount: 1, requestId: request.requestId, generation: 3,
+            sourceGeneration: 1, intent: request.intent,
+        });
+        expect(document.activeElement).toBe(chip);
+        expect(chip.getAttribute('aria-disabled')).toBeNull();
+        await act(async () => chip.click());
+        expect(document.querySelector('.filter-popover')).not.toBeNull();
+    });
+
     it('keeps persisted transforms unapplied until the fresh source acknowledges them', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -1280,6 +1402,10 @@ describe('sorting and filtering', () => {
             .find((message) => message.type === 'setTransform');
         expect(cancel_request.state.sort).toEqual([]);
         expect(cancel_request.state.filters).toEqual([]);
+        post_message.mockClear();
+        await click_button('Cancel');
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
 
         await dispatch_host_message({
             type: 'transformApplied',

@@ -16,6 +16,8 @@ afterEach(() => {
     container?.remove();
     root = null;
     container = null;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
 });
 
 function render_popover(filters: FilterEntry[] = []) {
@@ -77,6 +79,49 @@ describe('FilterPopover', () => {
         const style = (document.querySelector('.filter-popover') as HTMLElement).style;
         expect(Number.parseFloat(style.left)).toBeLessThan(10_000);
         expect(Number.parseFloat(style.top)).toBeLessThan(10_000);
+    });
+
+    it('reclamps after isEmpty expands to between near the viewport edge', () => {
+        const resize_callbacks: ResizeObserverCallback[] = [];
+        vi.stubGlobal('ResizeObserver', class {
+            constructor(callback: ResizeObserverCallback) {
+                resize_callbacks.push(callback);
+            }
+            observe() {}
+            disconnect() {}
+            unobserve() {}
+        });
+        Object.defineProperty(window, 'innerHeight', { configurable: true, value: 300 });
+        Object.defineProperty(window, 'innerWidth', { configurable: true, value: 400 });
+        vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (this.classList.contains('filter-popover')) {
+                    const expanded = this.querySelector(
+                        '[aria-label="Second filter value"]',
+                    ) !== null;
+                    return {
+                        left: 0, top: 0, width: 200, height: expanded ? 220 : 100,
+                        right: 200, bottom: expanded ? 220 : 100, x: 0, y: 0,
+                        toJSON: () => '',
+                    } as DOMRect;
+                }
+                return new DOMRect();
+            });
+        render_popover([{
+            id: 'f', colIndex: 1, operator: 'isEmpty', caseSensitive: false, enabled: true,
+        }]);
+        const popover = document.querySelector('.filter-popover') as HTMLElement;
+        expect(popover.style.top).toBe('192px');
+
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'between';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            resize_callbacks.at(-1)?.([], {} as ResizeObserver);
+        });
+        expect(document.querySelector('[aria-label="Second filter value"]')).not.toBeNull();
+        expect(popover.style.top).toBe('72px');
+        expect(Number.parseFloat(popover.style.top) + 220).toBeLessThanOrEqual(292);
     });
 
     it('lets keyboard activation of Cancel dismiss instead of applying', () => {

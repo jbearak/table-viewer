@@ -2,11 +2,19 @@ import type { RenderedCell } from '../data-source/interface';
 import type { MergeIndex } from './merge-index';
 
 /** Display-row selection paired with its ordered canonical source columns. */
-export interface CopySelection {
+export type CopySelection = ({
     y: number;
     height: number;
+    row_indices?: never;
+    row_count?: never;
+} | {
+    y?: never;
+    height?: never;
+    row_indices: Iterable<number>;
+    row_count: number;
+}) & {
     source_columns: readonly number[];
-}
+};
 
 export interface TsvResult {
     /** Tab/newline-joined cell text for the clipboard. */
@@ -78,12 +86,19 @@ export function format_selection_tsv(
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
     let non_resident = false;
-    const row_limit = Math.min(selection.height, max_rows);
-    const cap_truncated = row_limit < selection.height;
+    const explicit_rows = selection.row_indices;
+    const selected_row_count = explicit_rows === undefined
+        ? selection.height
+        : selection.row_count;
+    const row_limit = Math.min(selected_row_count, max_rows);
+    const cap_truncated = row_limit < selected_row_count;
+    const row_iterator = explicit_rows?.[Symbol.iterator]();
 
     const lines: string[] = [];
     for (let r = 0; r < row_limit; r++) {
-        const abs_row = selection.y + r;
+        const next_row = row_iterator?.next();
+        if (next_row?.done) break;
+        const abs_row = next_row ? next_row.value : selection.y! + r;
         const row = get_row(abs_row);
         const cells: string[] = [];
         for (const source_column of selection.source_columns) {

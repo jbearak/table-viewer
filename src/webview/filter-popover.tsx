@@ -33,7 +33,7 @@ export function FilterPopover({
             if (!element) return;
             const margin = 8;
             const rect = element.getBoundingClientRect();
-            set_coords({
+            const next = {
                 left: Math.min(
                     Math.max(margin, anchor.left),
                     Math.max(margin, window.innerWidth - rect.width - margin),
@@ -42,16 +42,24 @@ export function FilterPopover({
                     Math.max(margin, anchor.top),
                     Math.max(margin, window.innerHeight - rect.height - margin),
                 ),
-            });
+            };
+            set_coords((current) => current.left === next.left && current.top === next.top
+                ? current
+                : next);
         };
         update_position();
+        const observer = typeof ResizeObserver === 'undefined'
+            ? null
+            : new ResizeObserver(update_position);
+        if (popover_ref.current) observer?.observe(popover_ref.current);
         window.addEventListener('resize', update_position);
         window.visualViewport?.addEventListener('resize', update_position);
         return () => {
+            observer?.disconnect();
             window.removeEventListener('resize', update_position);
             window.visualViewport?.removeEventListener('resize', update_position);
         };
-    }, [anchor.left, anchor.top]);
+    }, [anchor.left, anchor.top, draft.operator]);
 
     useEffect(() => {
         first_control_ref.current?.focus();

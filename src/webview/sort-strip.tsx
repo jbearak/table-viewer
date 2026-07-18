@@ -79,6 +79,7 @@ function SortChip({
         });
     }
     const toggle = () => {
+        if (disabled) return;
         if (open) return set_coords(null);
         const rect = trigger_ref.current?.getBoundingClientRect();
         if (rect) set_coords({ x: rect.left, y: rect.bottom + 4 });
@@ -89,7 +90,7 @@ function SortChip({
                 ref={trigger_ref}
                 type="button"
                 className={open ? 'sort-chip open' : 'sort-chip'}
-                disabled={disabled}
+                aria-disabled={disabled || undefined}
                 aria-haspopup="menu"
                 aria-expanded={open}
                 aria-label={`Sort key ${index + 1}: ${column_name}, ${key.direction === 'asc' ? 'ascending' : 'descending'}. Open actions.`}
