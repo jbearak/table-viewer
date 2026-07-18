@@ -220,6 +220,7 @@ export function GridShell({
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
+    const pending_preview_row_ref = useRef<number | null>(null);
 
     // Controlled selection. We intercept every change to snap it onto whole
     // merges (a click/drag landing on a covered cell selects the merge block);
@@ -407,18 +408,28 @@ export function GridShell({
             previously_visible
             || !has_visible_columns
             || row_count <= 0
-            || visible_ref.current.width <= 0
-            || visible_ref.current.height <= 0
+            || (
+                pending_preview_row_ref.current === null
+                && (visible_ref.current.width <= 0 || visible_ref.current.height <= 0)
+            )
         ) {
             return;
         }
-        grid_ref.current?.scrollTo(
-            Math.min(
-                Math.max(0, visible_ref.current.x),
-                display_column_count - 1,
-            ),
-            Math.min(Math.max(0, visible_ref.current.y), row_count - 1),
+        const pending_preview_row = pending_preview_row_ref.current;
+        const column = Math.min(
+            Math.max(0, visible_ref.current.x),
+            display_column_count - 1,
         );
+        const row = Math.min(
+            Math.max(0, pending_preview_row ?? visible_ref.current.y),
+            row_count - 1,
+        );
+        if (pending_preview_row === null) {
+            grid_ref.current?.scrollTo(column, row);
+        } else {
+            grid_ref.current?.scrollTo(column, row, 'vertical', 0, 0, { vAlign: 'start' });
+            pending_preview_row_ref.current = null;
+        }
     }, [display_column_count, has_visible_columns, row_count]);
 
     // Read the value + location of an open Glide overlay editor. Glide owns the
@@ -919,6 +930,11 @@ export function GridShell({
         transform_state,
     ]);
 
+    const focus_header_column = useCallback((display_column: number) => {
+        const source_column = source_column_for_display(display_column);
+        if (source_column !== undefined) focused_source_column_ref.current = source_column;
+    }, [source_column_for_display]);
+
     const select_header_column = useCallback((display_column: number) => {
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
@@ -1205,12 +1221,20 @@ export function GridShell({
         const handler = (e: MessageEvent) => {
             const msg = e.data;
             if (msg && msg.type === 'scrollToRow' && typeof msg.row === 'number') {
-                scroll_preview_to_row(grid_ref.current, msg.row);
+                if (has_visible_columns) {
+                    pending_preview_row_ref.current = null;
+                    scroll_preview_to_row(
+                        grid_ref.current,
+                        Math.min(Math.max(0, msg.row), Math.max(0, row_count - 1)),
+                    );
+                } else {
+                    pending_preview_row_ref.current = msg.row;
+                }
             }
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [preview_mode]);
+    }, [has_visible_columns, preview_mode, row_count]);
 
     const handle_column_resize = useCallback(
         (_column: GridColumn, new_size: number, display_column: number) => {
@@ -1288,7 +1312,7 @@ export function GridShell({
                 gridSelection={grid_selection}
                 onGridSelectionChange={on_grid_selection_change}
                 drawHeader={draw_header}
-                onHeaderClicked={select_header_column}
+                onHeaderClicked={focus_header_column}
                 onHeaderContextMenu={on_header_context_menu}
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}

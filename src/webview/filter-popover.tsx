@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FilterEntry, FilterOperator } from '../types';
 import { FILTER_OPTIONS, filter_draft_for_column } from './transform-ui-model';
-import { use_dismiss } from './use-dismiss';
+import { use_dismiss, type DismissReason } from './use-dismiss';
 
 export interface FilterPopoverProps {
     column_index: number;
@@ -9,7 +9,7 @@ export interface FilterPopoverProps {
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
     on_apply: (entry: FilterEntry) => void;
-    on_cancel: () => void;
+    on_cancel: (reason: DismissReason | 'explicit') => void;
 }
 
 export function FilterPopover({
@@ -64,11 +64,7 @@ export function FilterPopover({
             && (!needs_second || (draft.secondValue ?? '').length > 0));
     const apply = () => {
         if (!can_apply) return;
-        on_apply({
-            ...draft,
-            value: needs_value ? draft.value : undefined,
-            secondValue: needs_second ? draft.secondValue : undefined,
-        });
+        on_apply({ ...draft });
     };
 
     return (
@@ -164,7 +160,7 @@ export function FilterPopover({
                 >
                     Apply
                 </button>
-                <button type="button" className="filter-popover-btn" onClick={on_cancel}>
+                <button type="button" className="filter-popover-btn" onClick={() => on_cancel('explicit')}>
                     Cancel
                 </button>
             </div>

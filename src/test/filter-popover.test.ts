@@ -100,6 +100,23 @@ describe('FilterPopover', () => {
         expect(on_apply).not.toHaveBeenCalled();
     });
 
+    it('preserves inactive draft operands when applying another operator', () => {
+        const existing: FilterEntry = {
+            id: 'draft', colIndex: 1, operator: 'between', value: 'low',
+            secondValue: 'high', caseSensitive: false, enabled: true,
+        };
+        const { on_apply } = render_popover([existing]);
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'isEmpty';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'isEmpty', value: 'low', secondValue: 'high',
+        }));
+    });
+
     it('dismisses on Escape and outside pointer-down without applying', () => {
         const { on_apply, on_cancel } = render_popover();
         act(() => document.dispatchEvent(new KeyboardEvent('keydown', {

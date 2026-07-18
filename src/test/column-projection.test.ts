@@ -23,6 +23,7 @@ describe('column projection helpers', () => {
         expect(create_column_projection(4)).toEqual({
             visible_to_source: [0, 1, 2, 3],
             source_to_visible: [0, 1, 2, 3],
+            hidden_count: 0,
         });
         expect(sanitize_column_visibility_state({
             hiddenColumns: [],
@@ -44,6 +45,7 @@ describe('column projection helpers', () => {
             undefined,
             2,
         ]);
+        expect(projection.hidden_count).toBe(2);
         for (const [visible_column, source_column] of projection.visible_to_source.entries()) {
             expect(projection.source_to_visible[source_column]).toBe(visible_column);
         }
@@ -52,13 +54,11 @@ describe('column projection helpers', () => {
     it('keeps an all-hidden projection valid', () => {
         const state = hide_all_columns(3, SCHEMA);
 
-        expect(state).toEqual({
-            hiddenColumns: [0, 1, 2],
-            schema: SCHEMA,
-        });
+        expect(state).toEqual({ visibleColumns: [], schema: SCHEMA });
         expect(create_column_projection(3, state, SCHEMA)).toEqual({
             visible_to_source: [],
-            source_to_visible: [undefined, undefined, undefined],
+            source_to_visible: [],
+            hidden_count: 3,
         });
     });
 
@@ -67,7 +67,7 @@ describe('column projection helpers', () => {
             hiddenColumns: [3, 1, 1, -1, 2.5, 4, Number.NaN, '2', 0],
             schema: SCHEMA,
         }, 4, SCHEMA)).toEqual({
-            hiddenColumns: [0, 1, 3],
+            visibleColumns: [2],
             schema: SCHEMA,
         });
         expect(sanitize_column_visibility_state(Object.create({
@@ -110,5 +110,24 @@ describe('column projection helpers', () => {
         });
         expect(toggle_source_column(hidden, 2, 4, SCHEMA)).toBeUndefined();
         expect(show_all_columns()).toBeUndefined();
+    });
+});
+
+
+describe('compact visibility state', () => {
+    it('canonicalizes visible-side and both-side descriptors to the smaller side', () => {
+        expect(sanitize_column_visibility_state({ visibleColumns: [0], schema: SCHEMA }, 5, SCHEMA))
+            .toEqual({ visibleColumns: [0], schema: SCHEMA });
+        expect(sanitize_column_visibility_state({ hiddenColumns: [4], visibleColumns: [], schema: SCHEMA }, 5, SCHEMA))
+            .toEqual({ hiddenColumns: [4], schema: SCHEMA });
+    });
+
+    it('keeps hide-all sparse for a very wide schema', () => {
+        const state = hide_all_columns(1_000_000, SCHEMA);
+        const projection = create_column_projection(1_000_000, state, SCHEMA);
+        expect(state).toEqual({ visibleColumns: [], schema: SCHEMA });
+        expect(projection.visible_to_source).toHaveLength(0);
+        expect(projection.source_to_visible).toHaveLength(0);
+        expect(projection.hidden_count).toBe(1_000_000);
     });
 });

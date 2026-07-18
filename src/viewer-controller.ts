@@ -19,6 +19,7 @@ import {
     type WebviewMessage,
 } from './types';
 import { sanitize_transform_state } from './webview/sheet-state';
+import { sanitize_column_visibility_state } from './webview/column-projection';
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
  *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
@@ -367,6 +368,15 @@ export function attach_viewer(
                                 transform_schema_for_sheet(sheet),
                             ))
                         : current_transforms;
+                    const current_visibility = current.columnVisibility;
+                    next.columnVisibility = source
+                        ? source.meta().sheets.map((sheet, index) =>
+                            sanitize_column_visibility_state(
+                                current_visibility?.[index],
+                                sheet.columnCount,
+                                transform_schema_for_sheet(sheet),
+                            ))
+                        : current_visibility;
                     // Pending edits are host-owned for editable profiles. Preserve
                     // the current map when present, and delete stale snapshots after
                     // save/discard has durably cleared it.
@@ -378,6 +388,21 @@ export function attach_viewer(
                         }
                     }
                     return next;
+                });
+                return;
+            }
+            case 'setColumnVisibility': {
+                await update_file_state((current) => {
+                    if (!source) return current;
+                    const sheet = source.meta().sheets[msg.sheetIndex];
+                    if (!sheet) return current;
+                    const columnVisibility = [...(current.columnVisibility ?? [])];
+                    columnVisibility[msg.sheetIndex] = sanitize_column_visibility_state(
+                        msg.state,
+                        sheet.columnCount,
+                        transform_schema_for_sheet(sheet),
+                    );
+                    return { ...current, columnVisibility };
                 });
                 return;
             }

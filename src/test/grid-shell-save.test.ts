@@ -67,6 +67,7 @@ async function render_grid(
     column_projection = {
         visible_to_source: [0],
         source_to_visible: [0, undefined, undefined],
+        hidden_count: 2,
     },
 ) {
     vi.resetModules();
@@ -147,6 +148,7 @@ describe('GridShell CSV save', () => {
         const { post_message, editing_ref } = await render_grid({
             visible_to_source: [2],
             source_to_visible: [undefined, undefined, 0],
+            hidden_count: 2,
         });
 
         await edit_cell('projected');

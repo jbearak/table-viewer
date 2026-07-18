@@ -394,4 +394,39 @@ describe('ViewerPanelCore', () => {
             message.type === 'transformApplied'
             && message.requestId === 'old-source')).toBe(false);
     });
+
+    it('fast-paths Cancel when the complete rollback state is already installed', async () => {
+        const { panel, posted } = make_panel();
+        const source = new StubSource(5);
+        const commits: string[] = [];
+        const core = new ViewerPanelCore(panel, source, {
+            onTransformCommit: async (message) => { commits.push(message.requestId); },
+        });
+        const state = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        };
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'install',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state,
+        });
+        const generation = core.generation;
+        const reads = source.read_rows_calls;
+        posted.length = 0;
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'cancel-fast',
+            generation, sourceGeneration: core.source_generation,
+            intent: 'cancel', state,
+        });
+        expect(source.read_rows_calls).toBe(reads);
+        expect(core.generation).toBe(generation);
+        expect(commits).toContain('cancel-fast');
+        expect(posted).toContainEqual(expect.objectContaining({
+            type: 'transformApplied', requestId: 'cancel-fast', rowCount: 5,
+            generation,
+        }));
+    });
+
 });

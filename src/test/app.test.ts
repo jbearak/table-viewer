@@ -1176,6 +1176,36 @@ describe('sorting and filtering', () => {
             .some((message) => message.type === 'setTransform')).toBe(false);
     });
 
+    it('uses an acknowledged disabled filter as the rollback baseline', async () => {
+        const { post_message } = await render_app();
+        const disabled = {
+            id: 'disabled-filter', colIndex: 0, operator: 'between' as const,
+            value: 'low', secondValue: 'high', caseSensitive: false, enabled: false,
+        };
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: { transforms: [{
+                sort: [], filters: [disabled], schema: '["Sheet1",1,null]',
+            }] },
+        }));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+
+        post_message.mockClear();
+        await act(async () => (
+            document.querySelector('.filter-chip-kebab') as HTMLButtonElement
+        ).click());
+        await click_button('Enable');
+        expect(post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform')?.state.filters[0].enabled)
+            .toBe(true);
+
+        post_message.mockClear();
+        await click_button('Cancel');
+        const cancel = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(cancel.state.filters).toEqual([disabled]);
+    });
+
     it('keeps persisted transforms unapplied until the fresh source acknowledges them', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -1408,6 +1438,27 @@ describe('sorting and filtering', () => {
             meta.sheets[0].merges,
         );
         expect(get_button('Edit').disabled).toBe(false);
+    });
+
+    it('does not restore an old filter opener when outside-clicking into another popover', async () => {
+        await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        const first_restore = vi.fn();
+        const second_restore = vi.fn();
+        const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
+            source_column: number,
+            anchor: { left: number; top: number },
+            restore_focus: () => void,
+        ) => void;
+        await act(async () => open_filter(0, { left: 10, top: 10 }, first_restore));
+        await act(async () => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
+        await act(async () => open_filter(0, { left: 20, top: 20 }, second_restore));
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        expect(first_restore).not.toHaveBeenCalled();
+        expect(document.querySelector('.filter-popover')).not.toBeNull();
+        await click_button('Cancel');
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        expect(second_restore).toHaveBeenCalledOnce();
     });
 
     it('disables transforms in synchronized preview mode', async () => {

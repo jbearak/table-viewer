@@ -207,6 +207,53 @@ export class ViewerPanelCore {
             return;
         }
 
+        const installed_state = this.transform_states.get(msg.sheetIndex);
+        if (
+            msg.intent === 'cancel'
+            && installed_state
+            && transform_states_equal(installed_state, msg.state)
+        ) {
+            const sequence = (this.transform_sequences.get(msg.sheetIndex) ?? 0) + 1;
+            this.transform_sequences.set(msg.sheetIndex, sequence);
+            const source_epoch = this.source_epoch;
+            this.transforms_in_flight.add(msg.sheetIndex);
+            const is_cancelled = () =>
+                this.source_epoch !== source_epoch
+                || this.transform_sequences.get(msg.sheetIndex) !== sequence;
+            try {
+                await this.on_transform_commit?.(msg, clone_transform(msg.state));
+                if (is_cancelled()) return;
+                await this.post({
+                    type: 'transformApplied',
+                    sheetIndex: msg.sheetIndex,
+                    state: clone_transform(installed_state),
+                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
+                    requestId: msg.requestId,
+                    generation: this._generation,
+                    sourceGeneration: this._source_generation,
+                    intent: msg.intent,
+                });
+            } catch (error) {
+                if (is_cancelled()) return;
+                await this.post({
+                    type: 'transformApplied',
+                    sheetIndex: msg.sheetIndex,
+                    state: clone_transform(installed_state),
+                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
+                    requestId: msg.requestId,
+                    generation: this._generation,
+                    sourceGeneration: this._source_generation,
+                    intent: msg.intent,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            } finally {
+                if (this.transform_sequences.get(msg.sheetIndex) === sequence) {
+                    this.transforms_in_flight.delete(msg.sheetIndex);
+                }
+            }
+            return;
+        }
+
         const sequence = (this.transform_sequences.get(msg.sheetIndex) ?? 0) + 1;
         this.transform_sequences.set(msg.sheetIndex, sequence);
         const source_epoch = this.source_epoch;
@@ -397,4 +444,24 @@ export function adopt_source_into_core(
     }
     if (previous && previous !== next) previous.close();
     return new ViewerPanelCore(panel, next, opts);
+}
+
+function transform_states_equal(left: SheetTransformState, right: SheetTransformState): boolean {
+    return left.schema === right.schema
+        && left.sort.length === right.sort.length
+        && left.sort.every((key, index) => (
+            key.colIndex === right.sort[index].colIndex
+            && key.direction === right.sort[index].direction
+        ))
+        && left.filters.length === right.filters.length
+        && left.filters.every((entry, index) => {
+            const candidate = right.filters[index];
+            return entry.id === candidate.id
+                && entry.colIndex === candidate.colIndex
+                && entry.operator === candidate.operator
+                && entry.value === candidate.value
+                && entry.secondValue === candidate.secondValue
+                && entry.caseSensitive === candidate.caseSensitive
+                && entry.enabled === candidate.enabled;
+        });
 }
