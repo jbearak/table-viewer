@@ -24,10 +24,31 @@ import {
 import { column_letter } from './grid-model';
 import {
     create_column_projection,
+    hide_all_columns,
     sanitize_column_visibility_state,
+    show_all_columns,
+    toggle_source_column,
 } from './column-projection';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import './styles.css';
+
+type ColumnVisibilityUpdater = (
+    current: SheetColumnVisibilityState | undefined,
+    column_count: number,
+    schema: string,
+) => SheetColumnVisibilityState | undefined;
+
+function column_visibility_equal(
+    left: SheetColumnVisibilityState | undefined,
+    right: SheetColumnVisibilityState | undefined,
+): boolean {
+    if (left === right) return true;
+    if (!left || !right || left.schema !== right.schema) return false;
+    return left.hiddenColumns.length === right.hiddenColumns.length
+        && left.hiddenColumns.every((column, index) => (
+            column === right.hiddenColumns[index]
+        ));
+}
 
 /**
  * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
@@ -644,6 +665,62 @@ export function App(): React.JSX.Element {
         }
     }, []);
 
+    const update_column_visibility = useCallback((
+        updater: ColumnVisibilityUpdater,
+    ) => {
+        const sheet = meta?.sheets[active_sheet_index];
+        if (!sheet) return;
+        const schema = transform_schema_for_sheet(sheet);
+        const current = sanitize_column_visibility_state(
+            state_ref.current.columnVisibility?.[active_sheet_index],
+            sheet.columnCount,
+            schema,
+        );
+        const next_sheet_visibility = updater(
+            current,
+            sheet.columnCount,
+            schema,
+        );
+        if (column_visibility_equal(current, next_sheet_visibility)) return;
+
+        // Glide's overlay editor is portalled outside the grid. Capture its live
+        // source-coordinate value before changing the displayed-column projection.
+        editing_ref.current?.commit_live_edit();
+        deactivate_auto_fit_for_sheet(active_sheet_index);
+
+        const next_visibility = [
+            ...(state_ref.current.columnVisibility ?? []),
+        ];
+        next_visibility[active_sheet_index] = next_sheet_visibility;
+        state_ref.current = {
+            ...state_ref.current,
+            columnVisibility: next_visibility,
+        };
+        set_column_visibility(next_visibility);
+        persist_immediate();
+    }, [
+        active_sheet_index,
+        deactivate_auto_fit_for_sheet,
+        meta,
+        persist_immediate,
+    ]);
+
+    const handle_toggle_column = useCallback((source_index: number) => {
+        update_column_visibility((current, column_count, schema) => (
+            toggle_source_column(current, source_index, column_count, schema)
+        ));
+    }, [update_column_visibility]);
+
+    const handle_show_all_columns = useCallback(() => {
+        update_column_visibility(() => show_all_columns());
+    }, [update_column_visibility]);
+
+    const handle_hide_all_columns = useCallback(() => {
+        update_column_visibility((_current, column_count, schema) => (
+            hide_all_columns(column_count, schema)
+        ));
+    }, [update_column_visibility]);
+
     const handle_column_resize = useCallback(
         (col: number, width: number) => {
             set_column_widths((prev) => {
@@ -790,6 +867,18 @@ export function App(): React.JSX.Element {
         { length: current_sheet.columnCount },
         (_, index) => current_sheet.columnNames?.[index] || column_letter(index),
     );
+    const column_options = column_names.map((display_name, source_index) => ({
+        source_index,
+        display_name,
+        source_letter: column_letter(source_index),
+    }));
+    const visibility_reset_key = [
+        load_epoch,
+        active_sheet_index,
+        transform_schema_for_sheet(current_sheet),
+    ].join(':');
+    const no_visible_columns =
+        current_column_projection.visible_to_source.length === 0;
 
     // Conflict banner: a stable signature of the conflicted cell set, so dismissing
     // it ("Keep All") sticks until a *different* set of cells drifts.
@@ -834,10 +923,26 @@ export function App(): React.JSX.Element {
                 vertical_tabs={vertical_tabs}
                 on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
+                column_visibility={{
+                    options: column_options,
+                    hidden_columns:
+                        column_visibility[active_sheet_index]?.hiddenColumns ?? [],
+                    reset_key: visibility_reset_key,
+                    on_toggle: handle_toggle_column,
+                    on_show_all: handle_show_all_columns,
+                    on_hide_all: handle_hide_all_columns,
+                    disabled: current_sheet.columnCount === 0,
+                }}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
-                auto_fit_disabled={transform_pending}
-                auto_fit_disabled_reason="Wait for sorting and filtering to finish."
+                auto_fit_disabled={no_visible_columns || transform_pending}
+                auto_fit_disabled_reason={
+                    no_visible_columns
+                        ? current_sheet.columnCount === 0
+                            ? 'No columns are available to auto-fit.'
+                            : 'Show at least one column before using auto-fit.'
+                        : 'Wait for sorting and filtering to finish.'
+                }
                 edit_mode={edit_mode}
                 is_dirty={editing_status?.is_dirty ?? false}
                 on_toggle_edit_mode={handle_toggle_edit_mode}

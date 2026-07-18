@@ -367,10 +367,15 @@ export function attach_viewer(
                                 transform_schema_for_sheet(sheet),
                             ))
                         : current_transforms;
-                    // Editable profiles likewise preserve pending edits omitted
-                    // from this UI snapshot.
-                    if (profile.editing && current.pendingEdits) {
-                        next.pendingEdits = current.pendingEdits;
+                    // Pending edits are host-owned for editable profiles. Preserve
+                    // the current map when present, and delete stale snapshots after
+                    // save/discard has durably cleared it.
+                    if (profile.editing) {
+                        if (current.pendingEdits) {
+                            next.pendingEdits = current.pendingEdits;
+                        } else {
+                            delete next.pendingEdits;
+                        }
                     }
                     return next;
                 });
