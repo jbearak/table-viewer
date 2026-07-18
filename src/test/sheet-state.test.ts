@@ -46,12 +46,18 @@ describe('sheet-state helpers', () => {
             top: 20,
             left: 10,
         });
+        expect(normalized.columnVisibility).toEqual([]);
     });
 
     it('preserves already-indexed state and trims removed sheets', () => {
         const indexed_state: PerFileState = {
             activeSheetIndex: 2,
             columnWidths: [{ 0: 120 }, undefined, { 1: 90 }],
+            columnVisibility: [
+                { hiddenColumns: [2, 0, 2, -1, 1.5], schema: 'first' },
+                { hiddenColumns: [] },
+                { hiddenColumns: [1], schema: 'removed' },
+            ],
         };
 
         const normalized = normalize_per_file_state(indexed_state, [
@@ -61,6 +67,10 @@ describe('sheet-state helpers', () => {
 
         expect(normalized.activeSheetIndex).toBe(1);
         expect(normalized.columnWidths).toEqual([{ 0: 120 }, undefined]);
+        expect(normalized.columnVisibility).toEqual([
+            { hiddenColumns: [0, 2], schema: 'first' },
+            undefined,
+        ]);
     });
 
     it('trims index-keyed arrays without re-keying by sheet name', () => {
