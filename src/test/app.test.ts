@@ -15,6 +15,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
+    auto_fit_result: { 0: 120 } as Record<number, number> | null,
 }));
 
 // Glide's DataEditor renders to a <canvas>, which jsdom can't drive. Replace the
@@ -29,6 +30,10 @@ vi.mock('../webview/grid-shell', () => ({
         transformed?: boolean;
         show_formatting: boolean;
         preview_mode?: boolean;
+        column_projection: {
+            visible_to_source: number[];
+            source_to_visible: (number | undefined)[];
+        };
         column_widths: Record<number, number>;
         row_heights: Record<number, number>;
         merges: { startRow: number }[];
@@ -73,7 +78,7 @@ vi.mock('../webview/grid-shell', () => ({
         // Mirror the real GridShell: publish a measure function into the ref so
         // App's auto-fit toggle has fitted widths to apply.
         if (props.auto_fit_ref) {
-            props.auto_fit_ref.current = () => ({ 0: 120 });
+            props.auto_fit_ref.current = () => grid_shell_mock.auto_fit_result;
         }
         return React.createElement(
             'div',
@@ -88,6 +93,8 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-edit-mode': String(props.edit_mode ?? false),
                 'data-initial-edits': JSON.stringify(props.initial_edits ?? null),
                 'data-mount-id': String(mount_id.current),
+                'data-projection': JSON.stringify(props.column_projection.visible_to_source),
+                'data-source-to-visible': JSON.stringify(props.column_projection.source_to_visible),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
                 'data-merges': String(props.merges?.length ?? 0),
@@ -252,6 +259,7 @@ function cleanup() {
     grid_shell_mock.request_save.mockReturnValue(false);
     grid_shell_mock.clear_dirty.mockReset();
     grid_shell_mock.discard_conflicted.mockReset();
+    grid_shell_mock.auto_fit_result = { 0: 120 };
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -376,6 +384,111 @@ describe('column width persistence', () => {
     });
 });
 
+describe('column visibility projection', () => {
+    it('hydrates a schema-safe non-contiguous projection', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 5;
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnVisibility: [{
+                    hiddenColumns: [3, 1],
+                    schema: '["Sheet1",5,null]',
+                }],
+            },
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 2, 4]);
+        expect(JSON.parse(grid_stub().getAttribute('data-source-to-visible')!))
+            .toEqual([0, null, 1, null, 2]);
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'stateChanged')?.state.columnVisibility)
+            .toEqual([{
+                hiddenColumns: [1, 3],
+                schema: '["Sheet1",5,null]',
+            }]);
+    });
+
+    it('sanitizes invalid columns and persists the corrected descriptor', async () => {
+        const { post_message } = await render_app();
+        post_message.mockClear();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 3;
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnVisibility: [{
+                    hiddenColumns: [2, 9, -1, 2],
+                    schema: '["Sheet1",3,null]',
+                }],
+            },
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 1]);
+        const persisted = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'stateChanged');
+        expect(persisted.state.columnVisibility).toEqual([{
+            hiddenColumns: [2],
+            schema: '["Sheet1",3,null]',
+        }]);
+    });
+
+    it('drops stale visibility on load and reload', async () => {
+        const { post_message } = await render_app();
+        const initial = make_meta(['Sheet1']);
+        initial.sheets[0].columnCount = 3;
+        await dispatch_host_message(sheet_meta_message(initial, {
+            state: {
+                columnVisibility: [{
+                    hiddenColumns: [1],
+                    schema: '["Old",3,null]',
+                }],
+            },
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 1, 2]);
+
+        await dispatch_host_message(sheet_meta_message(initial, {
+            state: {
+                columnVisibility: [{
+                    hiddenColumns: [1],
+                    schema: '["Sheet1",3,null]',
+                }],
+            },
+            generation: 2,
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 2]);
+
+        post_message.mockClear();
+        const reloaded = make_meta(['Renamed']);
+        reloaded.sheets[0].columnCount = 3;
+        await dispatch_host_message(meta_reload_message(reloaded));
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 1, 2]);
+        const persisted = post_message.mock.calls.at(-1)![0];
+        expect(persisted.state.columnVisibility).toEqual([undefined]);
+    });
+
+    it('supports an all-hidden projection', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 2;
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnVisibility: [{
+                    hiddenColumns: [0, 1],
+                    schema: '["Sheet1",2,null]',
+                }],
+            },
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([]);
+    });
+});
+
 describe('row height persistence', () => {
     it('stores a row resize per sheet and persists it', async () => {
         const { post_message } = await render_app();
@@ -418,6 +531,29 @@ describe('merges', () => {
         await dispatch_host_message(sheet_meta_message(meta));
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
     });
+
+    it('flattens every merge when any column is hidden but preserves row heights', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 4;
+        meta.sheets[0].merges = [
+            { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+        ];
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                rowHeights: [{ 0: 48 }],
+                columnVisibility: [{
+                    hiddenColumns: [3],
+                    schema: '["Sheet1",4,null]',
+                }],
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 0: 48 });
+        expect(document.body.textContent).toContain('Merged cells shown unmerged');
+    });
 });
 
 describe('auto-fit state', () => {
@@ -444,6 +580,29 @@ describe('auto-fit state', () => {
 
         await dispatch_host_message(meta_reload_message(make_meta(['Reloaded'])));
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('merges fitted visible widths without deleting hidden source widths', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 120, 2: 220 };
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 3;
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnWidths: [{ 0: 80, 1: 160, 2: 180 }],
+                columnVisibility: [{
+                    hiddenColumns: [1],
+                    schema: '["Sheet1",3,null]',
+                }],
+            },
+        }));
+
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({
+            0: 120,
+            1: 160,
+            2: 220,
+        });
     });
 });
 

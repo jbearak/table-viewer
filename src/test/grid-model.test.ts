@@ -62,26 +62,43 @@ describe('column_letter', () => {
 
 describe('build_grid_columns', () => {
     it('builds one SizedGridColumn per column with lettered titles', () => {
-        const cols = build_grid_columns(3, {});
+        const cols = build_grid_columns([0, 1, 2], {});
         expect(cols.length).toBe(3);
         expect(cols.map((c) => c.title)).toEqual(['A', 'B', 'C']);
         expect(cols.every((c) => c.width === DEFAULT_COLUMN_WIDTH_PX)).toBe(true);
     });
 
     it('applies persisted widths (clamped) by column index', () => {
-        const cols = build_grid_columns(2, { 0: 200, 1: 5 });
+        const cols = build_grid_columns([0, 1], { 0: 200, 1: 5 });
         expect(cols[0].width).toBe(200);
         expect(cols[1].width).toBe(MIN_COLUMN_WIDTH_PX); // 5 clamped up
     });
 
     it('uses provided column names as titles when given', () => {
-        const cols = build_grid_columns(3, {}, ['Name', 'Age', 'City']);
+        const cols = build_grid_columns([0, 1, 2], {}, ['Name', 'Age', 'City']);
         expect(cols.map((c) => c.title)).toEqual(['Name', 'Age', 'City']);
     });
 
     it('falls back to the column letter for a blank or missing name', () => {
         // col 0 blank, col 1 named, col 2 has no entry in the names array
-        const cols = build_grid_columns(3, {}, ['', 'Age']);
+        const cols = build_grid_columns([0, 1, 2], {}, ['', 'Age']);
         expect(cols.map((c) => c.title)).toEqual(['A', 'Age', 'C']);
+    });
+
+    it('preserves source titles, IDs, and widths for a non-contiguous projection', () => {
+        const cols = build_grid_columns(
+            [0, 2, 4],
+            { 0: 90, 1: 999, 2: 140, 4: 200 },
+            ['A-name', 'B-name', 'C-name', 'D-name', 'E-name'],
+        );
+        expect(cols.map((c) => c.title)).toEqual(['A-name', 'C-name', 'E-name']);
+        expect(cols.map((c) => c.id)).toEqual(['0', '2', '4']);
+        expect(cols.map((c) => c.width)).toEqual([90, 140, 200]);
+    });
+
+    it('uses source letters and supports an all-hidden projection', () => {
+        expect(build_grid_columns([0, 2], {}, ['', '', '']).map((c) => c.title))
+            .toEqual(['A', 'C']);
+        expect(build_grid_columns([], {})).toEqual([]);
     });
 });

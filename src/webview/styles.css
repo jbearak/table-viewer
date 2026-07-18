@@ -277,6 +277,16 @@ div.transform-chip button {
     overflow: hidden;
 }
 
+.all-columns-hidden {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 24px;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
+    text-align: center;
+}
+
 .data-table {
     border-collapse: collapse;
     font-family: var(--vscode-editor-font-family, monospace);

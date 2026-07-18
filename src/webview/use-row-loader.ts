@@ -27,6 +27,7 @@ export function use_row_loader(
     sheet_index: number,
     row_count: number,
     generation: number,
+    enabled = true,
 ): UseRowLoader {
     const [version, bump] = useReducer((n: number) => n + 1, 0);
     const ref = useRef<RowLoader | null>(null);
@@ -34,7 +35,10 @@ export function use_row_loader(
         ref.current = new RowLoader((m) => vscode_api.postMessage(m), bump);
     }
     const loader = ref.current;
-    loader.configure(sheet_index, row_count, generation);
+
+    useEffect(() => {
+        loader.configure(sheet_index, row_count, generation, enabled);
+    }, [loader, sheet_index, row_count, generation, enabled]);
 
     useEffect(() => {
         const handler = (e: MessageEvent) => {

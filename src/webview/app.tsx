@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
     EMPTY_TRANSFORM,
     transform_has_entries,
@@ -7,6 +7,7 @@ import {
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
+    type SheetColumnVisibilityState,
     type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
@@ -21,6 +22,10 @@ import {
     sanitize_transform_state,
 } from './sheet-state';
 import { column_letter } from './grid-model';
+import {
+    create_column_projection,
+    sanitize_column_visibility_state,
+} from './column-projection';
 import { vscode_api, use_state_sync } from './use-state-sync';
 import './styles.css';
 
@@ -45,6 +50,9 @@ export function App(): React.JSX.Element {
     const [vertical_tabs, set_vertical_tabs] = useState(false);
     const [column_widths, set_column_widths] = useState<
         (Record<number, number> | undefined)[]
+    >([]);
+    const [column_visibility, set_column_visibility] = useState<
+        (SheetColumnVisibilityState | undefined)[]
     >([]);
     const [row_heights, set_row_heights] = useState<
         (Record<number, number> | undefined)[]
@@ -177,8 +185,19 @@ export function App(): React.JSX.Element {
                 const transforms_were_sanitized =
                     JSON.stringify(normalized_transforms ?? [])
                     !== JSON.stringify(s.transforms);
+                const normalized_visibility = s.columnVisibility;
+                s.columnVisibility = msg.meta.sheets.map((sheet, index) =>
+                    sanitize_column_visibility_state(
+                        normalized_visibility?.[index],
+                        sheet.columnCount,
+                        transform_schema_for_sheet(sheet),
+                    ));
+                const visibility_was_sanitized =
+                    JSON.stringify(normalized_visibility ?? [])
+                    !== JSON.stringify(s.columnVisibility);
                 set_active_sheet_index(s.activeSheetIndex ?? 0);
                 set_column_widths(s.columnWidths ?? []);
+                set_column_visibility(s.columnVisibility ?? []);
                 set_row_heights(s.rowHeights ?? []);
                 set_transforms(s.transforms ?? []);
                 set_applied_transforms([]);
@@ -194,7 +213,9 @@ export function App(): React.JSX.Element {
                         : msg.defaultTabOrientation === 'vertical'
                 );
                 state_ref.current = s;
-                if (transforms_were_sanitized) persist_immediate();
+                if (transforms_were_sanitized || visibility_was_sanitized) {
+                    persist_immediate();
+                }
                 set_truncation_message(msg.truncationMessage ?? null);
                 set_preview_mode(msg.previewMode ?? false);
                 const can_edit = msg.csvEditable ?? false;
@@ -242,7 +263,14 @@ export function App(): React.JSX.Element {
                         sheet.columnCount,
                         transform_schema_for_sheet(sheet),
                     ));
+                const next_column_visibility = msg.meta.sheets.map((sheet, index) =>
+                    sanitize_column_visibility_state(
+                        state_ref.current.columnVisibility?.[index],
+                        sheet.columnCount,
+                        transform_schema_for_sheet(sheet),
+                    ));
                 set_transforms(next_transforms);
+                set_column_visibility(next_column_visibility);
                 set_applied_transforms([]);
 
                 const next_active_sheet_index = clamp_sheet_index(
@@ -266,6 +294,7 @@ export function App(): React.JSX.Element {
                         sheet_count
                     ),
                     transforms: next_transforms,
+                    columnVisibility: next_column_visibility,
                     activeSheetIndex: next_active_sheet_index,
                 };
                 set_truncation_message(msg.truncationMessage ?? null);
@@ -696,7 +725,10 @@ export function App(): React.JSX.Element {
             });
             set_column_widths((prev) => {
                 const next = [...prev];
-                next[active_sheet_index] = fitted;
+                next[active_sheet_index] = {
+                    ...(next[active_sheet_index] ?? {}),
+                    ...fitted,
+                };
                 state_ref.current = {
                     ...state_ref.current,
                     columnWidths: [...next],
@@ -719,10 +751,19 @@ export function App(): React.JSX.Element {
         persist_immediate,
     ]);
 
+    const current_sheet = meta?.sheets[active_sheet_index];
+    const current_column_projection = useMemo(
+        () => create_column_projection(
+            current_sheet?.columnCount ?? 0,
+            column_visibility[active_sheet_index],
+            current_sheet ? transform_schema_for_sheet(current_sheet) : undefined,
+        ),
+        [current_sheet, column_visibility, active_sheet_index],
+    );
+
     if (!meta) {
         return <div className="loading">Loading...</div>;
     }
-    const current_sheet = meta.sheets[active_sheet_index];
 
     if (!current_sheet) {
         return <div className="loading">No sheets found</div>;
@@ -736,6 +777,12 @@ export function App(): React.JSX.Element {
         edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
     const applied_transform = applied_transforms[active_sheet_index];
     const transform_active = transform_is_active(applied_transform);
+    const has_hidden_columns =
+        current_column_projection.visible_to_source.length
+        < current_sheet.columnCount;
+    const merges_flattened =
+        current_sheet.merges.length > 0
+        && (transform_active || has_hidden_columns);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
     const effective_row_count =
         effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
@@ -762,11 +809,12 @@ export function App(): React.JSX.Element {
             row_count={effective_row_count}
             transformed={transform_active}
             show_formatting={show_formatting}
+            column_projection={current_column_projection}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
             row_heights={transform_active ? {} : (row_heights[active_sheet_index] ?? {})}
             on_row_resize={handle_row_resize}
-            merges={transform_active ? [] : current_sheet.merges}
+            merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode}
             csv_editable={csv_editable}
@@ -823,7 +871,7 @@ export function App(): React.JSX.Element {
                 pending={transform_pending}
                 row_count={effective_row_count}
                 source_row_count={current_sheet.rowCount}
-                has_merges={current_sheet.merges.length > 0}
+                merges_flattened={merges_flattened}
                 on_change={handle_transform_change}
                 on_cancel_pending={handle_cancel_transform}
             />

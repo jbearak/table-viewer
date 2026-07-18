@@ -30,6 +30,7 @@ export class RowLoader {
     private req_seq = 0;
     private viewport = { start: 0, end: 0 };
     private viewport_set = false;
+    private enabled = true;
 
     constructor(
         private readonly post: PostFn,
@@ -60,16 +61,23 @@ export class RowLoader {
      * established viewport yet, so nothing is re-requested — the grid's mount
      * effect drives the initial load.
      */
-    configure(sheet_index: number, row_count: number, generation: number): void {
-        const changed = sheet_index !== this.sheet_index || generation !== this._generation;
+    configure(
+        sheet_index: number,
+        row_count: number,
+        generation: number,
+        enabled = true,
+    ): void {
+        const source_changed =
+            sheet_index !== this.sheet_index || generation !== this._generation;
         this.sheet_index = sheet_index;
         this.row_count = row_count;
         this._generation = generation;
-        if (changed) {
+        this.enabled = enabled;
+        if (source_changed) {
             this.clear();
-            if (this.viewport_set) {
-                this.ensure_rows(this.viewport.start, this.viewport.end);
-            }
+        }
+        if (source_changed && this.viewport_set && enabled) {
+            this.ensure_rows(this.viewport.start, this.viewport.end);
         }
     }
 
@@ -77,7 +85,7 @@ export class RowLoader {
     ensure_rows(start_row: number, end_row: number): void {
         this.viewport = { start: start_row, end: end_row };
         this.viewport_set = true;
-        if (this.row_count <= 0) return;
+        if (!this.enabled || this.row_count <= 0) return;
         for (const start of get_needed_page_starts(start_row, end_row)) {
             if (start >= this.row_count) continue;
             if (this.pages.has(start)) {

@@ -58,25 +58,25 @@ export function fit_column_width(
 }
 
 /**
- * Fit every column `0..column_count` against a sample of loaded rows (each a
- * possibly-sparse array of {@link MeasurableCell}). Columns with no sampled
- * content get the minimum width.
+ * Fit an ordered set of source columns against source-shaped loaded rows.
+ * Output remains keyed by source column so callers can merge the visible-width
+ * patch without disturbing widths for hidden columns.
  */
 export function fit_column_widths(
-    sample: readonly (MeasurableCell | null)[][],
-    column_count: number,
+    sample: readonly Readonly<Partial<Record<number, MeasurableCell | null>>>[],
+    source_columns: readonly number[],
     measure: (cell: MeasurableCell) => number,
     min_width: number = MIN_COLUMN_WIDTH,
     padding: number = COLUMN_PADDING,
 ): Record<number, number> {
     const widths: Record<number, number> = {};
-    for (let col = 0; col < column_count; col++) {
+    for (const source_column of source_columns) {
         const cells: MeasurableCell[] = [];
         for (const row of sample) {
-            const cell = row[col];
+            const cell = row[source_column];
             if (cell) cells.push(cell);
         }
-        widths[col] = fit_column_width(cells, measure, min_width, padding);
+        widths[source_column] = fit_column_width(cells, measure, min_width, padding);
     }
     return widths;
 }

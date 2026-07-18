@@ -49,26 +49,23 @@ export function column_letter(index: number): string {
 }
 
 /**
- * Build Glide columns for a sheet. The title is the column's name when one is
- * supplied (CSV/TSV header row) and non-blank; otherwise it falls back to the
- * spreadsheet column letter (xlsx/xls, or a blank header cell). Persisted
- * per-column widths (keyed by column index) override the default and are clamped
- * to the allowed range.
+ * Build Glide columns for an ordered projection of source columns. Titles, IDs,
+ * and persisted widths retain source-column identity even when the display list
+ * is non-contiguous. A blank/missing name falls back to the source spreadsheet
+ * letter. Persisted widths are clamped to the allowed range.
  */
 export function build_grid_columns(
-    column_count: number,
+    visible_source_columns: readonly number[],
     widths: Record<number, number>,
     names?: string[],
 ): SizedGridColumn[] {
-    const cols: SizedGridColumn[] = [];
-    for (let i = 0; i < column_count; i++) {
-        const w = widths[i];
-        const name = names?.[i];
-        cols.push({
-            title: name && name.length > 0 ? name : column_letter(i),
-            id: String(i),
-            width: clamp_column_width(w ?? DEFAULT_COLUMN_WIDTH_PX),
-        });
-    }
-    return cols;
+    return visible_source_columns.map((source_column) => {
+        const width = widths[source_column];
+        const name = names?.[source_column];
+        return {
+            title: name && name.length > 0 ? name : column_letter(source_column),
+            id: String(source_column),
+            width: clamp_column_width(width ?? DEFAULT_COLUMN_WIDTH_PX),
+        };
+    });
 }

@@ -1,12 +1,11 @@
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeIndex } from './merge-index';
 
-/** Rectangular selection in grid coordinates (Glide's Rectangle shape). */
-export interface SelectionRect {
-    x: number;
+/** Display-row selection paired with its ordered canonical source columns. */
+export interface CopySelection {
     y: number;
-    width: number;
     height: number;
+    source_columns: readonly number[];
 }
 
 export interface TsvResult {
@@ -63,8 +62,8 @@ export function copy_truncation_message(
 }
 
 /**
- * Serializes a rectangular selection to TSV (tabs between columns, newlines
- * between rows) by reading cells from the paged loader.
+ * Serializes selected display rows and an explicit ordered source-column list to
+ * TSV. The source list may be non-contiguous; its order is the clipboard order.
  *
  * - Merge-hidden cells emit empty strings; the merge anchor keeps its text.
  * - Rows whose page isn't resident (`get_row` returns undefined) emit blank
@@ -72,33 +71,32 @@ export function copy_truncation_message(
  * - The row count is capped at `max_rows`; exceeding it sets `rowCapped`.
  */
 export function format_selection_tsv(
-    rect: SelectionRect,
+    selection: CopySelection,
     get_row: (row: number) => (RenderedCell | null)[] | undefined,
     merge_index: MergeIndex,
     show_formatting: boolean,
     max_rows: number = DEFAULT_MAX_ROWS,
 ): TsvResult {
     let non_resident = false;
-    const row_limit = Math.min(rect.height, max_rows);
-    const cap_truncated = row_limit < rect.height;
+    const row_limit = Math.min(selection.height, max_rows);
+    const cap_truncated = row_limit < selection.height;
 
     const lines: string[] = [];
     for (let r = 0; r < row_limit; r++) {
-        const abs_row = rect.y + r;
+        const abs_row = selection.y + r;
         const row = get_row(abs_row);
         const cells: string[] = [];
-        for (let c = 0; c < rect.width; c++) {
-            const abs_col = rect.x + c;
+        for (const source_column of selection.source_columns) {
             if (row === undefined) {
                 non_resident = true;
                 cells.push('');
                 continue;
             }
-            if (merge_index.is_covered(abs_row, abs_col)) {
+            if (merge_index.is_covered(abs_row, source_column)) {
                 cells.push('');
                 continue;
             }
-            const cell = row[abs_col] ?? null;
+            const cell = row[source_column] ?? null;
             if (cell === null) {
                 cells.push('');
                 continue;

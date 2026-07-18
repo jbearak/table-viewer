@@ -34,7 +34,7 @@ async function render_controls(
                 pending: false,
                 row_count: 4,
                 source_row_count: 4,
-                has_merges: false,
+                merges_flattened: false,
                 on_change,
                 on_cancel_pending: vi.fn(),
                 ...props,
@@ -182,6 +182,11 @@ describe('TransformControls', () => {
         });
     });
 
+    it('shows the merge warning whenever the rendered grid is flattened', async () => {
+        await render_controls(EMPTY_STATE, { merges_flattened: true });
+        expect(document.body.textContent).toContain('Merged cells shown unmerged');
+    });
+
     it('selects the first unsorted column and associates disabled reasons', async () => {
         const state: SheetTransformState = {
             ...EMPTY_STATE,
@@ -207,7 +212,7 @@ describe('TransformControls', () => {
                     pending: false,
                     row_count: 1,
                     source_row_count: 1,
-                    has_merges: false,
+                    merges_flattened: false,
                     on_change: vi.fn(),
                     on_cancel_pending: vi.fn(),
                 }),

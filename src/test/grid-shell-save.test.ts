@@ -32,6 +32,8 @@ vi.mock('../webview/use-row-loader', () => ({
         ensure_rows: vi.fn(),
         get_row: (row: number) => [
             { raw: row === 0 ? 'base' : '', formatted: row === 0 ? 'base' : '', bold: false, italic: false },
+            { raw: row === 0 ? 'middle' : '', formatted: row === 0 ? 'middle' : '', bold: false, italic: false },
+            { raw: row === 0 ? 'source-two' : '', formatted: row === 0 ? 'source-two' : '', bold: false, italic: false },
         ],
         sample_loaded_rows: () => [],
         version: 0,
@@ -61,7 +63,12 @@ let container: HTMLDivElement | null = null;
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function render_grid() {
+async function render_grid(
+    column_projection = {
+        visible_to_source: [0],
+        source_to_visible: [0, undefined, undefined],
+    },
+) {
     vi.resetModules();
     const post_message = vi.fn();
     const editing_ref = React.createRef<EditingHandle | null>();
@@ -83,13 +90,14 @@ async function render_grid() {
             sheet_meta: {
                 name: 'Sheet1',
                 rowCount: 1,
-                columnCount: 1,
+                columnCount: 3,
                 merges: [],
                 hasFormatting: false,
             },
             sheet_index: 0,
             generation: 1,
             show_formatting: false,
+            column_projection,
             column_widths: {},
             on_column_resize: vi.fn(),
             row_heights: {},
@@ -135,6 +143,22 @@ afterEach(() => {
 });
 
 describe('GridShell CSV save', () => {
+    it('saves a projected display edit under its source-column key', async () => {
+        const { post_message, editing_ref } = await render_grid({
+            visible_to_source: [2],
+            source_to_visible: [undefined, undefined, 0],
+        });
+
+        await edit_cell('projected');
+        post_message.mockClear();
+
+        expect(editing_ref.current!.request_save()).toBe(true);
+        expect(save_messages(post_message)).toEqual([{
+            type: 'saveCsv',
+            edits: { '0:2': 'projected' },
+        }]);
+    });
+
     it('blocks overlapping saves and preserves edits newer than the in-flight save', async () => {
         const { post_message, editing_ref } = await render_grid();
 
