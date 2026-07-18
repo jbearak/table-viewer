@@ -97,6 +97,7 @@ export function sanitize_transform_state(
 
     const filters: FilterEntry[] = [];
     const seen_filter_columns = new Set<number>();
+    const seen_filter_ids = new Set<string>();
     const operators = new Set([
         'contains', 'notContains', 'equals', 'notEquals', 'startsWith',
         'endsWith', 'greaterThan', 'greaterThanOrEqual', 'lessThan',
@@ -116,6 +117,7 @@ export function sanitize_transform_state(
             || !operators.has(entry.operator)
             || typeof entry.caseSensitive !== 'boolean'
             || typeof entry.enabled !== 'boolean'
+            || seen_filter_ids.has(entry.id)
             || seen_filter_columns.has(entry.colIndex)
         ) {
             continue;
@@ -126,6 +128,7 @@ export function sanitize_transform_state(
         if (entry.operator === 'between' && typeof entry.secondValue !== 'string') {
             continue;
         }
+        seen_filter_ids.add(entry.id);
         seen_filter_columns.add(entry.colIndex);
         filters.push({
             id: entry.id,

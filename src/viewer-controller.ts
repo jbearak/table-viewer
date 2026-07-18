@@ -359,12 +359,14 @@ export function attach_viewer(
                     // Re-sanitize the host-owned value, though, so the webview's
                     // intentional cleanup after a schema change is durable.
                     const current_transforms = current.transforms;
-                    next.transforms = source?.meta().sheets.map((sheet, index) =>
-                        sanitize_transform_state(
-                            current_transforms?.[index],
-                            sheet.columnCount,
-                            transform_schema_for_sheet(sheet),
-                        ));
+                    next.transforms = source
+                        ? source.meta().sheets.map((sheet, index) =>
+                            sanitize_transform_state(
+                                current_transforms?.[index],
+                                sheet.columnCount,
+                                transform_schema_for_sheet(sheet),
+                            ))
+                        : current_transforms;
                     // Editable profiles likewise preserve pending edits omitted
                     // from this UI snapshot.
                     if (profile.editing && current.pendingEdits) {

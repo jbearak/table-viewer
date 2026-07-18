@@ -249,7 +249,7 @@ export class ViewerPanelCore {
                 intent: msg.intent,
             });
         } catch (error) {
-            if (is_cancelled() || (error as { name?: unknown })?.name === 'AbortError') {
+            if (is_cancelled()) {
                 return;
             }
             const previous = this.transform_states.get(msg.sheetIndex)

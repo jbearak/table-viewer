@@ -323,13 +323,11 @@ export function App(): React.JSX.Element {
                 set_auto_fit_active((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = false;
-                    auto_fit_active_ref.current = next;
                     return next;
                 });
                 set_auto_fit_snapshot((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = undefined;
-                    auto_fit_snapshot_ref.current = next;
                     return next;
                 });
                 if (msg.error) {

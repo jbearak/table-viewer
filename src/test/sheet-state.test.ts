@@ -120,6 +120,14 @@ describe('sheet-state helpers', () => {
                     enabled: true,
                 },
                 {
+                    id: 'ok',
+                    colIndex: 1,
+                    operator: 'contains',
+                    value: 'duplicate id',
+                    caseSensitive: false,
+                    enabled: true,
+                },
+                {
                     id: 'missing-upper',
                     colIndex: 1,
                     operator: 'between',

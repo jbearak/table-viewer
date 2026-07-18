@@ -35,6 +35,14 @@ class CloseAwareSource extends StubSource {
     }
 }
 
+class UnrelatedAbortErrorSource extends StubSource {
+    override read_rows(): RowWindow {
+        const error = new Error('source aborted unexpectedly');
+        error.name = 'AbortError';
+        throw error;
+    }
+}
+
 function make_panel() {
     const posted: any[] = [];
     const postMessage = vi.fn((m: any) => { posted.push(m); return Promise.resolve(true); });
@@ -323,6 +331,31 @@ describe('ViewerPanelCore', () => {
         await work;
         expect(posted.some((message) => message.type === 'transformApplied'))
             .toBe(false);
+    });
+
+    it('terminally acknowledges an unrelated AbortError from the source', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new UnrelatedAbortErrorSource(5));
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'source-abort',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        expect(posted).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'source-abort',
+            error: 'source aborted unexpectedly',
+        }));
+        expect(core.has_transform_work).toBe(false);
     });
 
     it('cancels source work before closing a replaced source', async () => {
