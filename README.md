@@ -35,7 +35,8 @@ Table Viewer is the result.
 - Drag column and row borders to resize
 - Double-click a column border to auto-fit to content
 - Select multiple columns and resize or auto-fit them together
-- All layout state is persisted per file across VS Code sessions
+- Use the searchable **Columns** menu to show, hide, restore, or hide all columns
+- Column visibility and sizing are persisted per file and sheet across VS Code sessions
 
 **Formatting toggle**
 - Switch between formatted and raw cell values with one click
@@ -52,12 +53,14 @@ Table Viewer is the result.
 - Right-click context menu for copy, select row, select column, select all
 
 **Sorting and filtering**
-- Use **Sort** to add one or more sort keys; click an active key to flip its direction
-- Use **Filter** to add one condition per column; multiple enabled filters are combined
+- Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
+- Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules
+- Keyboard shortcuts operate on the focused column: `Shift+Alt+A` / `D` sort, `Shift+Alt+F` filters, `Shift+Alt+X` clears its filter, and `Shift+Alt+0` / `9` clear all sorts or filters
+- Multiple enabled filters are combined, while disabled filters remain available for later reuse
 - Sorts and filters are view-only, persist per file and sheet, and are recomputed after reloads
 - Empty values sort last in both directions
-- When a sorted or filtered sheet contains merged cells, the transformed view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Clearing all transforms restores the exact merge layout.
-- Sorting and filtering are disabled during CSV/TSV edit mode and in synchronized preview panes so row-based edits and source scrolling cannot target the wrong record
+- When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
+- Sorting and filtering are unavailable during CSV/TSV edit mode and in synchronized preview panes; column visibility remains available in every mode
 
 **Editing (CSV/TSV only)**
 - Click the **Edit** button in the toolbar to enter edit mode
