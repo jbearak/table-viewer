@@ -2,10 +2,12 @@ import type {
     FilterEntry,
     PerFileState,
     ScrollPosition,
+    SheetColumnVisibilityState,
     SheetTransformState,
     SortKey,
     StoredPerFileState,
 } from '../types';
+import { sanitize_column_visibility_state } from './column-projection';
 
 export function clamp_sheet_index(
     sheet_index: number | undefined,
@@ -51,6 +53,12 @@ export function normalize_per_file_state(
         ),
         transforms: normalize_transforms(
             'transforms' in state ? (state as PerFileState).transforms : undefined,
+            sheet_names.length,
+        ),
+        columnVisibility: normalize_column_visibility(
+            'columnVisibility' in state
+                ? (state as PerFileState).columnVisibility
+                : undefined,
             sheet_names.length,
         ),
     };
@@ -232,4 +240,14 @@ function normalize_transforms(
     return value
         .slice(0, sheet_count)
         .map((item) => sanitize_transform_state(item));
+}
+
+function normalize_column_visibility(
+    value: unknown,
+    sheet_count: number,
+): (SheetColumnVisibilityState | undefined)[] {
+    if (!Array.isArray(value)) return [];
+    return value
+        .slice(0, sheet_count)
+        .map((item) => sanitize_column_visibility_state(item));
 }

@@ -69,6 +69,13 @@ export interface SheetTransformState {
     schema?: string;
 }
 
+export interface SheetColumnVisibilityState {
+    /** Source-column indexes hidden from the projected display. */
+    hiddenColumns: number[];
+    /** Uses the same sheet identity fingerprint as transform descriptors. */
+    schema?: string;
+}
+
 export const EMPTY_TRANSFORM: SheetTransformState = {
     sort: [],
     filters: [],
@@ -109,6 +116,9 @@ export interface PerFileState {
     /** Per-sheet view-only sort/filter descriptors. Computed row permutations
      *  are deliberately never persisted. */
     transforms?: (SheetTransformState | undefined)[];
+    /** Per-sheet hidden source columns. Display projections are derived and are
+     *  deliberately never persisted. */
+    columnVisibility?: (SheetColumnVisibilityState | undefined)[];
 }
 
 export interface LegacyPerFileState {
