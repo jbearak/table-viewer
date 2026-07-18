@@ -12,9 +12,11 @@ import {
     GridCellKind,
     type CellClickedEventArgs,
     type DataEditorRef,
+    type DrawHeaderCallback,
     type EditableGridCell,
     type GridCell,
     type GridColumn,
+    type HeaderClickedEventArgs,
     type GridKeyEventArgs,
     type GridMouseEventArgs,
     type GridSelection,
@@ -23,10 +25,23 @@ import {
     type Rectangle,
 } from '@glideapps/glide-data-grid';
 import type { SheetMeta } from '../data-source/interface';
-import type { MergeRange } from '../types';
+import {
+    EMPTY_TRANSFORM,
+    type MergeRange,
+    type SheetTransformState,
+    type SortDirection,
+} from '../types';
 import type { ColumnProjection } from './column-projection';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu, type MenuItem } from './context-menu';
+import { ColumnContextMenu } from './column-context-menu';
+import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
+import {
+    append_sort,
+    is_editable_target,
+    replace_sort,
+    transform_shortcut,
+} from './transform-ui-model';
 import {
     format_selection_tsv,
     copy_truncation_message,
@@ -143,6 +158,16 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
+    transform_state?: SheetTransformState;
+    transform_sections?: boolean;
+    transform_pending?: boolean;
+    on_transform_change?: (state: SheetTransformState) => void;
+    on_open_filter?: (
+        source_column: number,
+        anchor: { left: number; top: number },
+        restore_focus: () => void,
+    ) => void;
+    on_hide_column?: (source_column: number) => void;
 }
 
 /**
@@ -173,6 +198,12 @@ export function GridShell({
     on_editing_change,
     editing_ref,
     auto_fit_ref,
+    transform_state = EMPTY_TRANSFORM,
+    transform_sections = false,
+    transform_pending = false,
+    on_transform_change = () => {},
+    on_open_filter = () => {},
+    on_hide_column = () => {},
 }: GridShellProps): React.JSX.Element {
     const visible_source_columns = column_projection.visible_to_source;
     const display_column_count = visible_source_columns.length;
@@ -200,13 +231,21 @@ export function GridShell({
 
     // Right-click context menu, anchored at client coords with the cell that was
     // clicked (merge-snapped). Null when closed.
-    const [context_menu, set_context_menu] = useState<{
+    const suppress_menu_restore_ref = useRef(false);
+    const [context_menu, set_context_menu] = useState<({
+        kind: 'cell';
         x: number;
         y: number;
         row: number;
         display_col: number;
         source_col: number;
-    } | null>(null);
+    } | {
+        kind: 'header';
+        x: number;
+        y: number;
+        display_col: number;
+        source_col: number;
+    }) | null>(null);
 
     const columns = useMemo<GridColumn[]>(
         () => build_grid_columns(
@@ -216,6 +255,28 @@ export function GridShell({
         ),
         [visible_source_columns, column_widths, sheet_meta.columnNames],
     );
+
+    const sort_metadata = useMemo(
+        () => header_sort_metadata(transform_state.sort),
+        [transform_state.sort],
+    );
+    const show_sort_priority = transform_state.sort.length > 1;
+    const draw_header: DrawHeaderCallback = useCallback((args, draw_content) => {
+        draw_content();
+        const source_column = visible_source_columns[args.columnIndex];
+        const entry = source_column === undefined
+            ? undefined
+            : sort_metadata.get(source_column);
+        if (entry) {
+            draw_sort_glyphs(
+                args.ctx,
+                args.rect,
+                args.theme,
+                entry,
+                show_sort_priority,
+            );
+        }
+    }, [show_sort_priority, sort_metadata, visible_source_columns]);
 
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
     const source_column_for_display = useCallback(
@@ -300,10 +361,18 @@ export function GridShell({
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
+    const focused_source_column_ref = useRef<number | undefined>(
+        visible_source_columns[0],
+    );
     const previous_projection_ref = useRef(column_projection);
     useEffect(() => {
         if (previous_projection_ref.current === column_projection) return;
         previous_projection_ref.current = column_projection;
+        const focused_source = focused_source_column_ref.current;
+        focused_source_column_ref.current = focused_source !== undefined
+            && visible_source_columns.includes(focused_source)
+            ? focused_source
+            : visible_source_columns[0];
         set_grid_selection({
             columns: CompactSelection.empty(),
             rows: CompactSelection.empty(),
@@ -326,7 +395,7 @@ export function GridShell({
             if (cells.length > 0) grid.updateCells(cells);
         }
         overlay_ref.current?.repaint();
-    }, [column_projection, display_column_count]);
+    }, [column_projection, display_column_count, visible_source_columns]);
 
     // Hide-all removes only Glide's DataEditor, not GridShell. Preserve the last
     // visible display location and restore it when any columns become visible again.
@@ -698,13 +767,14 @@ export function GridShell({
                 sel.current.range,
                 merges,
             );
+            focused_source_column_ref.current = source_column_for_display(cell[0]);
             set_grid_selection({
                 columns: sel.columns,
                 rows: sel.rows,
                 current: { cell, range, rangeStack: sel.current.rangeStack },
             });
         },
-        [merges],
+        [merges, source_column_for_display],
     );
 
     // --- Context menu: copy + select actions over the paged cache -------------
@@ -722,15 +792,16 @@ export function GridShell({
     // is still copied, but the host surfaces a visible warning so the paste
     // isn't silently incomplete.
     const copy_rect = useCallback(
-        (rect: Rectangle) => {
+        (rect: Rectangle, include_header = false) => {
+            const source_columns = visible_source_columns.slice(
+                rect.x,
+                rect.x + rect.width,
+            );
             const result = format_selection_tsv(
                 {
                     y: rect.y,
                     height: rect.height,
-                    source_columns: visible_source_columns.slice(
-                        rect.x,
-                        rect.x + rect.width,
-                    ),
+                    source_columns,
                 },
                 get_row_ref.current,
                 merge_index,
@@ -740,10 +811,22 @@ export function GridShell({
             if (warning) {
                 vscode_api.postMessage({ type: 'showWarning', message: warning });
             }
-            void safe_write_to_clipboard(result.text);
+            const header = include_header
+                ? source_columns.map((source_column) =>
+                    sheet_meta.columnNames?.[source_column]
+                    || columns[display_column_for_source(source_column) ?? -1]?.title
+                    || `Column ${source_column + 1}`,
+                ).join('\t')
+                : '';
+            void safe_write_to_clipboard(
+                header ? `${header}${result.text ? `\n${result.text}` : ''}` : result.text,
+            );
         },
         [
+            columns,
+            display_column_for_source,
             merge_index,
+            sheet_meta.columnNames,
             show_formatting,
             safe_write_to_clipboard,
             visible_source_columns,
@@ -751,12 +834,13 @@ export function GridShell({
     );
 
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
+        focused_source_column_ref.current = source_column_for_display(anchor[0]);
         set_grid_selection({
             columns: CompactSelection.empty(),
             rows: CompactSelection.empty(),
             current: { cell: anchor, range, rangeStack: [] },
         });
-    }, []);
+    }, [source_column_for_display]);
 
     const select_row = useCallback(
         (row: number) => {
@@ -802,6 +886,67 @@ export function GridShell({
         [clear_dirty_keys],
     );
 
+    const apply_column_sort = useCallback((
+        source_column: number,
+        direction: SortDirection,
+        append: boolean,
+    ) => {
+        if (!transform_sections || transform_pending) return;
+        on_transform_change({
+            ...transform_state,
+            sort: append
+                ? append_sort(transform_state.sort, source_column, direction)
+                : replace_sort(source_column, direction),
+        });
+    }, [
+        on_transform_change,
+        transform_pending,
+        transform_sections,
+        transform_state,
+    ]);
+
+    const clear_filter_on_column = useCallback((source_column: number) => {
+        if (!transform_sections || transform_pending) return;
+        on_transform_change({
+            ...transform_state,
+            filters: transform_state.filters.filter((entry) =>
+                entry.colIndex !== source_column),
+        });
+    }, [
+        on_transform_change,
+        transform_pending,
+        transform_sections,
+        transform_state,
+    ]);
+
+    const select_header_column = useCallback((display_column: number) => {
+        const source_column = source_column_for_display(display_column);
+        if (source_column === undefined) return;
+        focused_source_column_ref.current = source_column;
+        set_grid_selection({
+            columns: CompactSelection.fromSingleSelection(display_column),
+            rows: CompactSelection.empty(),
+        });
+    }, [source_column_for_display]);
+
+    const on_header_context_menu = useCallback((
+        display_column: number,
+        event: HeaderClickedEventArgs,
+    ) => {
+        event.preventDefault();
+        const source_column = source_column_for_display(display_column);
+        if (source_column === undefined) return;
+        select_header_column(display_column);
+        suppress_menu_restore_ref.current = false;
+        set_context_menu({
+            kind: 'header',
+            x: event.bounds.x + event.localEventX,
+            y: event.bounds.y + event.localEventY,
+            display_col: display_column,
+            source_col: source_column,
+        });
+    }, [select_header_column, source_column_for_display]);
+
     // Glide gives no clientX/clientY — derive them from the cell bounds plus the
     // in-cell offset. Right-clicking outside the current selection collapses it to
     // the clicked cell (merge-snapped), matching native grid behavior.
@@ -832,6 +977,7 @@ export function GridShell({
             const source_column = source_column_for_display(anchor_col);
             if (source_column === undefined) return;
             set_context_menu({
+                kind: 'cell',
                 x: event.bounds.x + event.localEventX,
                 y: event.bounds.y + event.localEventY,
                 row: anchor_row,
@@ -851,6 +997,47 @@ export function GridShell({
     // past a merge to its far edge so navigation never stalls.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
+            const shortcut = transform_shortcut({
+                shiftKey: args.shiftKey,
+                altKey: args.altKey,
+                metaKey: args.metaKey,
+                ctrlKey: args.ctrlKey,
+                key: args.key,
+                code: args.rawEvent?.code ?? '',
+            });
+            if (
+                shortcut
+                && transform_sections
+                && !transform_pending
+                && !is_editable_target(args.rawEvent?.target ?? null)
+            ) {
+                const source_column = focused_source_column_ref.current;
+                args.cancel();
+                args.preventDefault();
+                if (shortcut.kind === 'sort' && source_column !== undefined) {
+                    apply_column_sort(source_column, shortcut.direction, false);
+                } else if (shortcut.kind === 'clearSorts') {
+                    on_transform_change({ ...transform_state, sort: [] });
+                } else if (shortcut.kind === 'editFilter' && source_column !== undefined) {
+                    const display_column = display_column_for_source(source_column);
+                    const bounds = display_column === undefined
+                        ? undefined
+                        : grid_ref.current?.getBounds(display_column, -1);
+                    on_open_filter(
+                        source_column,
+                        {
+                            left: bounds?.x ?? 100,
+                            top: bounds ? bounds.y + bounds.height : 100,
+                        },
+                        () => grid_ref.current?.focus(),
+                    );
+                } else if (shortcut.kind === 'clearFilter' && source_column !== undefined) {
+                    clear_filter_on_column(source_column);
+                } else if (shortcut.kind === 'clearFilters') {
+                    on_transform_change({ ...transform_state, filters: [] });
+                }
+                return;
+            }
             // Route Ctrl/Cmd+C through the guarded copy path so a large or
             // partly-scrolled selection can't be silently copied as blank cells
             // by Glide's native copy. copy_rect caps the row count and surfaces a
@@ -909,7 +1096,21 @@ export function GridShell({
             });
             grid_ref.current?.scrollTo(cell[0], cell[1]);
         },
-        [editable_cells, merges, row_count, display_column_count, copy_rect],
+        [
+            apply_column_sort,
+            clear_filter_on_column,
+            copy_rect,
+            display_column_count,
+            display_column_for_source,
+            editable_cells,
+            merges,
+            on_open_filter,
+            on_transform_change,
+            row_count,
+            transform_pending,
+            transform_sections,
+            transform_state,
+        ],
     );
 
     const on_visible_region_changed = useCallback(
@@ -1025,7 +1226,7 @@ export function GridShell({
     // for a multi-cell selection; "Discard edit" only when the clicked cell is
     // dirty. Editing the cell isn't offered (no clean Glide open-overlay API).
     const menu_items: MenuItem[] = [];
-    if (context_menu) {
+    if (context_menu?.kind === 'cell') {
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
         const is_multi_cell = !!range && range.width * range.height > 1;
@@ -1086,6 +1287,9 @@ export function GridShell({
                 getCellsForSelection={true}
                 gridSelection={grid_selection}
                 onGridSelectionChange={on_grid_selection_change}
+                drawHeader={draw_header}
+                onHeaderClicked={select_header_column}
+                onHeaderContextMenu={on_header_context_menu}
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
@@ -1109,14 +1313,75 @@ export function GridShell({
                     on_resize={handle_row_resize_drag}
                 />
             )}
-            {context_menu && (
+            {context_menu?.kind === 'cell' && (
                 <ContextMenu
                     x={context_menu.x}
                     y={context_menu.y}
                     items={menu_items}
                     on_dismiss={dismiss_context_menu}
+                    restore_focus={() => grid_ref.current?.focus()}
                 />
             )}
+            {context_menu?.kind === 'header' && (() => {
+                const source_column = context_menu.source_col;
+                const active_sort = transform_state.sort.find((key) =>
+                    key.colIndex === source_column);
+                const existing_filter = transform_state.filters.find((entry) =>
+                    entry.colIndex === source_column);
+                return (
+                    <ColumnContextMenu
+                        x={context_menu.x}
+                        y={context_menu.y}
+                        column_name={columns[context_menu.display_col]?.title
+                            ?? `Column ${source_column + 1}`}
+                        transform_sections={transform_sections}
+                        transform_disabled={transform_pending}
+                        active_direction={active_sort?.direction ?? null}
+                        any_sorted={transform_state.sort.length > 0}
+                        other_columns_sorted={transform_state.sort.some((key) =>
+                            key.colIndex !== source_column)}
+                        has_filter={existing_filter !== undefined}
+                        any_filtered={transform_state.filters.length > 0}
+                        on_copy={() => copy_rect({
+                            x: context_menu.display_col,
+                            y: 0,
+                            width: 1,
+                            height: row_count,
+                        }, true)}
+                        on_hide={() => on_hide_column(source_column)}
+                        on_sort={(direction, append) =>
+                            apply_column_sort(source_column, direction, append)}
+                        on_clear_column_sort={() => on_transform_change({
+                            ...transform_state,
+                            sort: transform_state.sort.filter((key) =>
+                                key.colIndex !== source_column),
+                        })}
+                        on_clear_all_sorts={() => on_transform_change({
+                            ...transform_state,
+                            sort: [],
+                        })}
+                        on_edit_filter={() => {
+                            suppress_menu_restore_ref.current = true;
+                            on_open_filter(
+                                source_column,
+                                { left: context_menu.x, top: context_menu.y },
+                                () => grid_ref.current?.focus(),
+                            );
+                        }}
+                        on_clear_column_filter={() => clear_filter_on_column(source_column)}
+                        on_clear_all_filters={() => on_transform_change({
+                            ...transform_state,
+                            filters: [],
+                        })}
+                        on_dismiss={dismiss_context_menu}
+                        restore_focus={() => {
+                            if (!suppress_menu_restore_ref.current) {
+                                grid_ref.current?.focus();
+                            }
+                        }}
+                    />
+                );
+            })()}
         </div>
     );
 }

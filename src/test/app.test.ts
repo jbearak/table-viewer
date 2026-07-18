@@ -17,6 +17,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     commit_live_edit: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
+    latest_props: null as Record<string, unknown> | null,
 }));
 
 // Glide's DataEditor renders to a <canvas>, which jsdom can't drive. Replace the
@@ -55,7 +56,11 @@ vi.mock('../webview/grid-shell', () => ({
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
+        transform_sections: boolean;
+        transform_pending: boolean;
+        on_open_filter: (source_column: number, anchor: { left: number; top: number }, restore_focus: () => void) => void;
     }) => {
+        grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
         const mount_id = React.useRef(++grid_shell_mock.mount_count);
         React.useEffect(() => {
             grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
@@ -1142,8 +1147,7 @@ describe('sorting and filtering', () => {
         post_message.mockClear();
         await click_button('Edit');
         expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
-        expect(get_button('Sort').disabled).toBe(true);
-        expect(get_button('Filter').disabled).toBe(true);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
@@ -1281,7 +1285,14 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
 
         post_message.mockClear();
-        await click_button('Filter');
+        await act(async () => {
+            const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
+                source_column: number,
+                anchor: { left: number; top: number },
+                restore_focus: () => void,
+            ) => void;
+            open_filter(0, { left: 20, top: 20 }, vi.fn());
+        });
         const input = document.querySelector(
             'input[aria-label="Filter value"]',
         ) as HTMLInputElement;
@@ -1326,10 +1337,10 @@ describe('sorting and filtering', () => {
         // Disabling the only filter restores natural rows but keeps the chip so
         // it can be re-enabled (Sight behavior; avoids losing saved intent).
         post_message.mockClear();
-        const filter_chip_button = document.querySelector(
-            'div.transform-chip button',
-        ) as HTMLButtonElement;
-        await act(async () => filter_chip_button.click());
+        await act(async () => (
+            document.querySelector('.filter-chip-kebab') as HTMLButtonElement
+        ).click());
+        await click_button('Disable');
         const disable_request = post_message.mock.calls
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
@@ -1350,8 +1361,9 @@ describe('sorting and filtering', () => {
 
         post_message.mockClear();
         await act(async () => (
-            document.querySelector('div.transform-chip button') as HTMLButtonElement
+            document.querySelector('.filter-chip-kebab') as HTMLButtonElement
         ).click());
+        await click_button('Enable');
         const enable_request = post_message.mock.calls
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
@@ -1368,7 +1380,9 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
 
         post_message.mockClear();
-        await click_button('Clear filters');
+        await act(async () => (
+            document.querySelector('button[aria-label="Clear all filters"]') as HTMLButtonElement
+        ).click());
         const clear_request = post_message.mock.calls
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
@@ -1401,7 +1415,6 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             sheet_meta_message(make_meta(['Sheet1']), { previewMode: true }),
         );
-        expect(get_button('Sort').disabled).toBe(true);
-        expect(get_button('Filter').disabled).toBe(true);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
     });
 });

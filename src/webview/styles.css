@@ -35,12 +35,13 @@ body {
 .toolbar {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    gap: 8px;
+    min-width: 0;
+    padding: 6px 8px;
     border-bottom: 1px solid var(--vscode-panel-border, #444);
     background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
-    flex-shrink: 0;
-    flex-wrap: wrap;
 }
 
 .toolbar-item {
@@ -218,113 +219,6 @@ body {
     border-top: 1px solid var(--vscode-panel-border, #444);
     font-size: 11px;
     line-height: 1.35;
-}
-
-.transform-controls {
-    flex-shrink: 0;
-    border-bottom: 1px solid var(--vscode-panel-border, #444);
-    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
-}
-
-.transform-controls-row,
-.transform-strip,
-.transform-editor {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
-    flex-wrap: wrap;
-}
-
-.transform-strip {
-    padding-top: 0;
-    font-size: 12px;
-}
-
-.transform-pending,
-.transform-row-count,
-.transform-merge-notice,
-.transform-disabled-reason {
-    font-size: 12px;
-    opacity: 0.75;
-}
-
-.transform-merge-notice {
-    color: var(--vscode-editorWarning-foreground, #cca700);
-}
-
-.transform-chip,
-.transform-chip button,
-.transform-clear,
-.transform-editor button,
-.transform-editor select,
-.transform-editor input {
-    border: 1px solid var(--vscode-panel-border, #444);
-    border-radius: 3px;
-    background: var(--vscode-input-background, transparent);
-    color: var(--vscode-input-foreground, var(--vscode-foreground, #ccc));
-    font: inherit;
-    font-size: 12px;
-}
-
-button.transform-chip,
-.transform-clear,
-.transform-editor button {
-    cursor: pointer;
-    padding: 3px 7px;
-}
-
-div.transform-chip {
-    display: inline-flex;
-    overflow: hidden;
-}
-
-div.transform-chip button {
-    border: 0;
-    border-radius: 0;
-    padding: 3px 6px;
-    cursor: pointer;
-}
-
-.transform-chip.disabled {
-    opacity: 0.55;
-}
-
-.transform-chip-remove {
-    margin-left: 6px;
-    font-weight: bold;
-}
-
-.transform-editor {
-    border-top: 1px solid var(--vscode-panel-border, #444);
-}
-
-.transform-editor label {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-}
-
-.transform-editor select,
-.transform-editor input {
-    padding: 3px 5px;
-}
-
-.transform-controls button:focus-visible,
-.transform-controls select:focus-visible,
-.transform-controls input:focus-visible {
-    outline: 2px solid var(--vscode-focusBorder, #007acc);
-    outline-offset: 2px;
-}
-
-.transform-chip button:focus-visible {
-    position: relative;
-    z-index: 1;
-    outline-offset: -2px;
-}
-
-.transform-checkbox input {
-    accent-color: var(--vscode-button-background, #0e639c);
 }
 
 .toolbar-tooltip {
@@ -534,6 +428,8 @@ div.transform-chip button {
     position: fixed;
     z-index: 50;
     min-width: 160px;
+    max-height: calc(100vh - 8px);
+    overflow-y: auto;
     background: var(--vscode-menu-background, #252526);
     border: 1px solid var(--vscode-menu-border, #454545);
     border-radius: 4px;
@@ -649,4 +545,325 @@ div.transform-chip button {
     background: var(--vscode-editorWarning-foreground, #cca700);
     border-color: var(--vscode-editorWarning-foreground, #cca700);
     color: var(--vscode-button-foreground, #fff);
+}
+
+/* Raven-style integrated table controls. */
+.toolbar-row-count {
+    flex: 0 1 auto;
+    min-width: 72px;
+    overflow: hidden;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.toolbar-chips {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.toolbar-actions {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 6px;
+    margin-left: auto;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.toolbar.is-wrapped {
+    flex-wrap: wrap;
+}
+
+.toolbar.is-wrapped .toolbar-chips {
+    order: 1;
+    flex-basis: 100%;
+}
+
+.sort-strip,
+.filter-strip {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 6px;
+    padding: 0 4px;
+    border-left: 1px solid var(--vscode-panel-border, #444);
+    border-right: 1px solid var(--vscode-panel-border, #444);
+}
+
+.sort-strip-label,
+.filter-strip-label {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.sort-strip-chips,
+.filter-strip-chips {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.sort-chip {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 5px;
+    padding: 2px 10px;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 12px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    line-height: 18px;
+}
+
+.sort-chip:hover:not(:disabled),
+.sort-chip.open {
+    border-color: var(--vscode-focusBorder, #007acc);
+}
+
+.sort-chip-name {
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sort-chip-arrow,
+.filter-chip-toggle {
+    flex: 0 0 auto;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007acc));
+    font-size: 11px;
+}
+
+.filter-chip {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 3px;
+    padding: 2px 4px 2px 8px;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 12px;
+    background: transparent;
+    line-height: 18px;
+}
+
+.filter-chip.disabled {
+    opacity: 0.55;
+}
+
+.filter-chip-body,
+.filter-chip-kebab,
+.sort-strip-clear,
+.filter-strip-clear,
+.toolbar-cancel {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+
+.filter-chip-body {
+    max-width: 18ch;
+    overflow: hidden;
+    padding: 0;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.filter-chip-kebab {
+    padding: 0 4px;
+    opacity: 0.65;
+}
+
+.filter-chip-kebab:hover:not(:disabled),
+.filter-chip-kebab.open {
+    color: var(--vscode-focusBorder, #007acc);
+    opacity: 1;
+}
+
+.sort-strip-clear,
+.filter-strip-clear {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    font-size: 13px;
+    opacity: 0.65;
+}
+
+.sort-strip-clear:hover:not(:disabled),
+.filter-strip-clear:hover:not(:disabled) {
+    opacity: 1;
+}
+
+.sort-chip:disabled,
+.filter-chip button:disabled,
+.sort-strip-clear:disabled,
+.filter-strip-clear:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+.toolbar-progress {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--vscode-badge-background, #4d4d4d);
+    color: var(--vscode-badge-foreground, #fff);
+    font-size: 11px;
+}
+
+.toolbar-cancel {
+    flex: 0 0 auto;
+    padding: 2px 6px;
+    color: var(--vscode-textLink-foreground, inherit);
+}
+
+.toolbar-merge-notice {
+    flex: 0 0 auto;
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    font-size: 11px;
+}
+
+.filter-popover {
+    position: fixed;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    width: min(300px, calc(100vw - 16px));
+    max-height: min(520px, calc(100vh - 16px));
+    overflow: hidden;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, #444));
+    border-radius: 4px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.32);
+    font-size: 12px;
+}
+
+.filter-popover-header {
+    padding: 8px 12px 6px;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+}
+
+.filter-popover-colname {
+    display: block;
+    overflow: hidden;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.filter-popover-body {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    overflow-y: auto;
+}
+
+.filter-popover-field-label {
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.filter-popover-select,
+.filter-popover-input {
+    width: 100%;
+    padding: 4px 6px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, #444));
+    border-radius: 3px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-input-foreground, inherit);
+    font: inherit;
+}
+
+.filter-popover-check-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.filter-popover-footer {
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--vscode-panel-border, #444);
+}
+
+.filter-popover-btn {
+    padding: 4px 14px;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+
+.filter-popover-btn-primary {
+    border-color: var(--vscode-button-background, #0e639c);
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.filter-popover-btn:disabled {
+    cursor: default;
+    opacity: 0.4;
+}
+
+.context-menu-divider {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border, #444));
+}
+
+.context-menu-item[role='menuitemcheckbox'] {
+    display: grid;
+    grid-template-columns: 14px 1fr auto;
+    align-items: center;
+    gap: 6px;
+}
+
+.context-menu-item:not([role='menuitemcheckbox']) {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.context-menu-shortcut {
+    margin-left: auto;
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 11px;
+    opacity: 0.75;
+}
+
+.context-menu-item:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+.toolbar.is-wrapped .toolbar-actions {
+    flex: 1 1 0;
 }
