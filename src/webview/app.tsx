@@ -46,10 +46,7 @@ function column_visibility_equal(
 ): boolean {
     if (left === right) return true;
     if (!left || !right || left.schema !== right.schema) return false;
-    return left.hiddenColumns.length === right.hiddenColumns.length
-        && left.hiddenColumns.every((column, index) => (
-            column === right.hiddenColumns[index]
-        ));
+    return JSON.stringify(left) === JSON.stringify(right);
 }
 
 /**
@@ -137,6 +134,7 @@ export function App(): React.JSX.Element {
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    const filter_restore_timer_ref = useRef<number | undefined>(undefined);
 
     const { persist_immediate } = use_state_sync(state_ref);
 
@@ -239,7 +237,9 @@ export function App(): React.JSX.Element {
                 set_column_visibility(s.columnVisibility ?? []);
                 set_row_heights(s.rowHeights ?? []);
                 set_transforms(s.transforms ?? []);
-                set_applied_transforms([]);
+                set_applied_transforms((s.transforms ?? []).map((state) => (
+                    state && !transform_is_active(state) ? state : undefined
+                )));
                 set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
                 set_pending_transforms([]);
                 set_pending_transform_labels([]);
@@ -253,6 +253,18 @@ export function App(): React.JSX.Element {
                         : msg.defaultTabOrientation === 'vertical'
                 );
                 state_ref.current = s;
+                if (visibility_was_sanitized) {
+                    msg.meta.sheets.forEach((_sheet, index) => {
+                        if (JSON.stringify(normalized_visibility?.[index])
+                            !== JSON.stringify(s.columnVisibility?.[index])) {
+                            vscode_api.postMessage({
+                                type: 'setColumnVisibility',
+                                sheetIndex: index,
+                                state: s.columnVisibility?.[index],
+                            });
+                        }
+                    });
+                }
                 if (transforms_were_sanitized || visibility_was_sanitized) {
                     persist_immediate();
                 }
@@ -313,7 +325,9 @@ export function App(): React.JSX.Element {
                     ));
                 set_transforms(next_transforms);
                 set_column_visibility(next_column_visibility);
-                set_applied_transforms([]);
+                set_applied_transforms(next_transforms.map((state) => (
+                    state && !transform_is_active(state) ? state : undefined
+                )));
 
                 const next_active_sheet_index = clamp_sheet_index(
                     active_sheet_index,
@@ -321,6 +335,7 @@ export function App(): React.JSX.Element {
                 );
                 set_active_sheet_index(next_active_sheet_index);
 
+                const previous_column_visibility = state_ref.current.columnVisibility;
                 state_ref.current = {
                     ...state_ref.current,
                     columnWidths: trim_sheet_state_array(
@@ -339,6 +354,16 @@ export function App(): React.JSX.Element {
                     columnVisibility: next_column_visibility,
                     activeSheetIndex: next_active_sheet_index,
                 };
+                msg.meta.sheets.forEach((_sheet, index) => {
+                    if (JSON.stringify(previous_column_visibility?.[index])
+                        !== JSON.stringify(next_column_visibility[index])) {
+                        vscode_api.postMessage({
+                            type: 'setColumnVisibility',
+                            sheetIndex: index,
+                            state: next_column_visibility[index],
+                        });
+                    }
+                });
                 set_truncation_message(msg.truncationMessage ?? null);
                 if (msg.csvEditable !== undefined) {
                     set_csv_editable(msg.csvEditable);
@@ -388,7 +413,7 @@ export function App(): React.JSX.Element {
                 set_transforms(next_transforms);
                 set_applied_transforms((prev) => {
                     const next = [...prev];
-                    next[msg.sheetIndex] = transform_is_active(msg.state)
+                    next[msg.sheetIndex] = transform_has_entries(msg.state)
                         ? msg.state
                         : undefined;
                     return next;
@@ -538,6 +563,10 @@ export function App(): React.JSX.Element {
         anchor: { left: number; top: number },
         restore_focus: () => void,
     ) => {
+        if (filter_restore_timer_ref.current !== undefined) {
+            window.clearTimeout(filter_restore_timer_ref.current);
+            filter_restore_timer_ref.current = undefined;
+        }
         if (
             edit_mode
             || edit_session_pending
@@ -553,10 +582,20 @@ export function App(): React.JSX.Element {
         preview_mode,
     ]);
 
-    const close_filter_editor = useCallback(() => {
+    const close_filter_editor = useCallback((restore_focus = true) => {
         const restore = filter_editor?.restore_focus;
         set_filter_editor(null);
-        window.setTimeout(() => restore?.(), 0);
+        if (filter_restore_timer_ref.current !== undefined) {
+            window.clearTimeout(filter_restore_timer_ref.current);
+        }
+        if (restore_focus) {
+            filter_restore_timer_ref.current = window.setTimeout(() => {
+                filter_restore_timer_ref.current = undefined;
+                restore?.();
+            }, 0);
+        } else {
+            filter_restore_timer_ref.current = undefined;
+        }
     }, [filter_editor]);
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
@@ -565,7 +604,7 @@ export function App(): React.JSX.Element {
             ...current,
             filters: upsert_filter(current.filters, entry),
         });
-        close_filter_editor();
+        close_filter_editor(true);
     }, [
         active_sheet_index,
         close_filter_editor,
@@ -764,6 +803,11 @@ export function App(): React.JSX.Element {
             columnVisibility: next_visibility,
         };
         set_column_visibility(next_visibility);
+        vscode_api.postMessage({
+            type: 'setColumnVisibility',
+            sheetIndex: active_sheet_index,
+            state: next_sheet_visibility,
+        });
         persist_immediate();
     }, [
         active_sheet_index,
@@ -904,6 +948,20 @@ export function App(): React.JSX.Element {
         ),
         [current_sheet, column_visibility, active_sheet_index],
     );
+    const current_schema = current_sheet
+        ? transform_schema_for_sheet(current_sheet)
+        : '';
+    const column_names = useMemo(() => Array.from(
+        { length: current_sheet?.columnCount ?? 0 },
+        (_, index) => current_sheet?.columnNames?.[index] || column_letter(index),
+    ), [current_schema]);
+    const column_options = useMemo(() => column_names.map(
+        (display_name, source_index) => ({
+            source_index,
+            display_name,
+            source_letter: column_letter(source_index),
+        }),
+    ), [column_names]);
 
     if (!meta) {
         return <div className="loading">Loading...</div>;
@@ -930,15 +988,6 @@ export function App(): React.JSX.Element {
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
     const effective_row_count =
         effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
-    const column_names = Array.from(
-        { length: current_sheet.columnCount },
-        (_, index) => current_sheet.columnNames?.[index] || column_letter(index),
-    );
-    const column_options = column_names.map((display_name, source_index) => ({
-        source_index,
-        display_name,
-        source_letter: column_letter(source_index),
-    }));
     const visibility_reset_key = [
         load_epoch,
         active_sheet_index,
@@ -1016,8 +1065,9 @@ export function App(): React.JSX.Element {
                 show_vertical_tabs_button={has_multiple_sheets}
                 column_visibility={{
                     options: column_options,
-                    hidden_columns:
-                        column_visibility[active_sheet_index]?.hiddenColumns ?? [],
+                    is_visible: (source_index) =>
+                        current_column_projection.source_to_visible[source_index] !== undefined,
+                    hidden_count: current_column_projection.hidden_count,
                     reset_key: visibility_reset_key,
                     on_toggle: handle_toggle_column,
                     on_show_all: handle_show_all_columns,
@@ -1062,7 +1112,7 @@ export function App(): React.JSX.Element {
                     filters={visible_transform.filters}
                     anchor={filter_editor.anchor}
                     on_apply={apply_filter_editor}
-                    on_cancel={close_filter_editor}
+                    on_cancel={(reason) => close_filter_editor(reason !== 'outside')}
                 />
             )}
             {truncation_message && (

@@ -64,7 +64,7 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
             row_count_text,
             props.transform_pending,
             props.merges_flattened,
-            props.column_visibility.hidden_columns.length,
+            props.column_visibility.hidden_count,
             props.show_formatting_button,
             props.show_vertical_tabs_button,
             props.show_edit_button,

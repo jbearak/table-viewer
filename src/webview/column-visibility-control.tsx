@@ -16,7 +16,8 @@ export interface ColumnVisibilityOption {
 
 export interface ColumnVisibilityControlProps {
     options: readonly ColumnVisibilityOption[];
-    hidden_columns: readonly number[];
+    is_visible: (source_index: number) => boolean;
+    hidden_count: number;
     reset_key: string;
     on_toggle: (source_index: number) => void;
     on_show_all: () => void;
@@ -33,7 +34,8 @@ const MAX_RENDERED_OPTIONS = 500;
 /** Searchable, source-indexed column visibility control for the main toolbar. */
 export function ColumnVisibilityControl({
     options,
-    hidden_columns,
+    is_visible,
+    hidden_count,
     reset_key,
     on_toggle,
     on_show_all,
@@ -48,7 +50,6 @@ export function ColumnVisibilityControl({
     const popover_ref = useRef<HTMLDivElement | null>(null);
     const search_ref = useRef<HTMLInputElement | null>(null);
     const popover_id = useId();
-    const hidden = useMemo(() => new Set(hidden_columns), [hidden_columns]);
 
     const close = useCallback((restore_focus: boolean) => {
         set_open(false);
@@ -154,14 +155,24 @@ export function ColumnVisibilityControl({
         };
     }, [open]);
 
-    const needle = filter.trim().toLowerCase();
-    const filtered_options = options.filter((option) => (
-        needle.length === 0
-        || option.display_name.toLowerCase().includes(needle)
-        || option.source_letter.toLowerCase().includes(needle)
-    ));
-    const rendered_options = filtered_options.slice(0, MAX_RENDERED_OPTIONS);
-    const hidden_count = hidden_columns.length;
+    const option_is_visible = is_visible;
+    const { rendered_options, has_more_matches } = useMemo(() => {
+        if (!open) return { rendered_options: [], has_more_matches: false };
+        const needle = filter.trim().toLowerCase();
+        const matches: ColumnVisibilityOption[] = [];
+        for (const option of options) {
+            if (
+                needle.length > 0
+                && !option.display_name.toLowerCase().includes(needle)
+                && !option.source_letter.toLowerCase().includes(needle)
+            ) continue;
+            if (matches.length === MAX_RENDERED_OPTIONS) {
+                return { rendered_options: matches, has_more_matches: true };
+            }
+            matches.push(option);
+        }
+        return { rendered_options: matches, has_more_matches: false };
+    }, [filter, open, options]);
     const trigger_label = hidden_count > 0
         ? `Choose visible columns. ${hidden_count} column${hidden_count === 1 ? '' : 's'} hidden.`
         : 'Choose visible columns.';
@@ -229,7 +240,7 @@ export function ColumnVisibilityControl({
                     </div>
                     <div className="column-visibility-list">
                         {rendered_options.map((option) => {
-                            const is_visible = !hidden.has(option.source_index);
+                            const visible = option_is_visible(option.source_index);
                             const primary = option.display_name.length > 0
                                 ? option.display_name
                                 : '(blank)';
@@ -244,8 +255,8 @@ export function ColumnVisibilityControl({
                                 >
                                     <input
                                         type="checkbox"
-                                        checked={is_visible}
-                                        aria-label={`${is_visible ? 'Hide' : 'Show'} ${accessible_name}; ${source_description}`}
+                                        checked={visible}
+                                        aria-label={`${visible ? 'Hide' : 'Show'} ${accessible_name}; ${source_description}`}
                                         onChange={() => on_toggle(option.source_index)}
                                     />
                                     <span className="column-visibility-name">
@@ -257,16 +268,15 @@ export function ColumnVisibilityControl({
                                 </label>
                             );
                         })}
-                        {filtered_options.length === 0 && (
+                        {rendered_options.length === 0 && (
                             <div className="column-visibility-empty">
                                 No matching columns
                             </div>
                         )}
-                        {filtered_options.length > rendered_options.length && (
+                        {has_more_matches && (
                             <div className="column-visibility-limit" role="status">
-                                Showing the first {rendered_options.length} of{' '}
-                                {filtered_options.length} matches. Refine your search
-                                to find other columns.
+                                Showing the first {rendered_options.length} matches.
+                                Refine your search to find other columns.
                             </div>
                         )}
                     </div>

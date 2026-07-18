@@ -28,7 +28,8 @@ function render_control(
     root = createRoot(container);
     const props: ColumnVisibilityControlProps = {
         options,
-        hidden_columns: [1],
+        is_visible: (source_index) => source_index !== 1,
+        hidden_count: 1,
         reset_key: 'sheet-1',
         on_toggle: vi.fn(),
         on_show_all: vi.fn(),
@@ -222,12 +223,16 @@ describe('ColumnVisibilityControl', () => {
             display_name: source_index === 504 ? 'Target column' : `Field ${source_index}`,
             source_letter: `L${source_index}`,
         }));
-        render_control({ options: wide_options, hidden_columns: [] });
+        render_control({
+            options: wide_options,
+            is_visible: () => true,
+            hidden_count: 0,
+        });
         act(() => trigger().click());
 
         expect(document.querySelectorAll('.column-visibility-item')).toHaveLength(500);
         expect(document.querySelector('.column-visibility-limit')?.textContent)
-            .toContain('first 500 of 505 matches');
+            .toContain('first 500 matches');
 
         set_input_value(search(), 'target column');
         expect(document.querySelectorAll('.column-visibility-item')).toHaveLength(1);

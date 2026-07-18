@@ -86,4 +86,35 @@ describe('ContextMenu keyboard behavior', () => {
         act(() => vi.runAllTimers());
         expect(restore_focus).toHaveBeenCalledOnce();
     });
+
+    it('uses roving tabIndex and dismisses on Tab without restoring focus', () => {
+        const { on_dismiss, restore_focus } = render_menu([
+            { label: 'First', on_click: vi.fn() },
+            { label: 'Disabled', disabled: true, on_click: vi.fn() },
+            { label: 'Last', on_click: vi.fn() },
+        ]);
+        const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]'));
+        expect(buttons.map((button) => button.tabIndex)).toEqual([0, -1, -1]);
+        act(() => buttons[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+        expect(buttons.map((button) => button.tabIndex)).toEqual([-1, -1, 0]);
+        act(() => buttons[2].dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })));
+        expect(on_dismiss).toHaveBeenCalledOnce();
+        expect(restore_focus).not.toHaveBeenCalled();
+    });
+
+    it('ignores menu-internal scroll and outside dismissal does not restore focus', () => {
+        vi.useFakeTimers();
+        const { on_dismiss, restore_focus } = render_menu([
+            { label: 'Copy', on_click: vi.fn() },
+        ]);
+        act(() => vi.runOnlyPendingTimers());
+        const menu = document.querySelector('.context-menu')!;
+        act(() => menu.dispatchEvent(new Event('scroll', { bubbles: true })));
+        expect(on_dismiss).not.toHaveBeenCalled();
+        act(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
+        expect(on_dismiss).toHaveBeenCalledOnce();
+        act(() => vi.runAllTimers());
+        expect(restore_focus).not.toHaveBeenCalled();
+    });
+
 });

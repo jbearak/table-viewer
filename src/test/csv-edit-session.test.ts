@@ -123,21 +123,54 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits).toBeUndefined();
 
         await panel.__receive({
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            state: { visibleColumns: [], schema: '["Sheet1",1,["h"]]' },
+        } as never);
+        await panel.__receive({
             type: 'stateChanged',
             state: {
                 pendingEdits: restored,
-                columnVisibility: [{
-                    hiddenColumns: [0],
-                    schema: '["Sheet1",1,null]',
-                }],
+                columnVisibility: [undefined],
             },
         } as never);
 
         expect(state.get_state(file_path).pendingEdits).toBeUndefined();
         expect(state.get_state(file_path).columnVisibility).toEqual([{
-            hiddenColumns: [0],
-            schema: '["Sheet1",1,null]',
+            visibleColumns: [],
+            schema: '["Sheet1",1,["h"]]',
         }]);
+    });
+
+    it('preserves newer visibility across two panels with stale generic snapshots', async () => {
+        const file_path = '/tmp/two-panel-visibility.csv';
+        const state = state_store();
+        const first = open_csv_table(uri(file_path), state.store);
+        const second = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const schema = '["Sheet1",1,["h"]]';
+
+        await first.__receive({
+            type: 'setColumnVisibility', sheetIndex: 0,
+            state: { visibleColumns: [], schema },
+        } as never);
+        await second.__receive({
+            type: 'stateChanged', state: { columnVisibility: [undefined], activeSheetIndex: 0 },
+        } as never);
+        expect(state.get_state(file_path).columnVisibility).toEqual([{
+            visibleColumns: [], schema,
+        }]);
+
+        await first.__receive({
+            type: 'setColumnVisibility', sheetIndex: 0, state: undefined,
+        } as never);
+        await second.__receive({
+            type: 'stateChanged', state: {
+                columnVisibility: [{ visibleColumns: [], schema }], activeSheetIndex: 0,
+            },
+        } as never);
+        expect(state.get_state(file_path).columnVisibility).toEqual([undefined]);
     });
 
     it('durably removes host-owned transforms that no longer match the source schema', async () => {

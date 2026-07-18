@@ -1,19 +1,21 @@
 import { useEffect, type RefObject } from 'react';
 
+export type DismissReason = 'outside' | 'escape';
+
 export function use_dismiss(
     ref: RefObject<HTMLElement>,
-    on_dismiss: () => void,
+    on_dismiss: (reason: DismissReason) => void,
 ): void {
     useEffect(() => {
         const on_pointer_down = (event: PointerEvent): void => {
             const element = ref.current;
             if (!element || element.contains(event.target as Node)) return;
-            on_dismiss();
+            on_dismiss('outside');
         };
         const on_key_down = (event: KeyboardEvent): void => {
             if (event.key === 'Escape') {
                 event.preventDefault();
-                on_dismiss();
+                on_dismiss('escape');
             }
         };
         document.addEventListener('pointerdown', on_pointer_down, true);

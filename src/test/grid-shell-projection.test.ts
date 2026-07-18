@@ -97,6 +97,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
         column_projection: {
             visible_to_source: [0, 2],
             source_to_visible: [0, undefined, 1],
+            hidden_count: 1,
         },
         column_widths: { 0: 100, 1: 150, 2: 200 },
         on_column_resize: vi.fn(),
@@ -198,6 +199,7 @@ describe('GridShell column projection', () => {
                 column_projection: {
                     visible_to_source: [2],
                     source_to_visible: [undefined, undefined, 0],
+                    hidden_count: 2,
                 },
             })));
         });
@@ -229,6 +231,7 @@ describe('GridShell column projection', () => {
             column_projection: {
                 visible_to_source: [0],
                 source_to_visible: [0, undefined, undefined],
+                hidden_count: 2,
             },
         }))));
         const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
@@ -288,6 +291,7 @@ describe('GridShell column projection', () => {
                 column_projection: {
                     visible_to_source: [],
                     source_to_visible: [undefined, undefined, undefined],
+                    hidden_count: 3,
                 },
             })));
         });
@@ -323,6 +327,7 @@ describe('GridShell column projection', () => {
                 column_projection: {
                     visible_to_source: [],
                     source_to_visible: [undefined, undefined, undefined],
+                    hidden_count: 3,
                 },
             })));
         });
@@ -332,6 +337,36 @@ describe('GridShell column projection', () => {
             root!.render(React.createElement(GridShell, props({ row_count: 200 })));
         });
         expect(grid_mock.scroll_to).toHaveBeenCalledWith(1, 75);
+    });
+
+    it('retains the latest preview scroll target while all columns are hidden', async () => {
+        const GridShell = await render_grid(props({ row_count: 200, preview_mode: true }));
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            row_count: 200,
+            preview_mode: true,
+            column_projection: { visible_to_source: [], source_to_visible: [], hidden_count: 3 },
+        }))));
+        await act(async () => window.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'scrollToRow', row: 150 },
+        })));
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            row_count: 200,
+            preview_mode: true,
+        }))));
+        expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(
+            0, 150, 'vertical', 0, 0, { vAlign: 'start' },
+        );
+    });
+
+    it('header clicks only update focus and preserve Glide multi-column selection', async () => {
+        await render_grid(props());
+        const selection = { columns: { native: 'multi' }, rows: {} };
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (value: unknown) => void;
+        await act(async () => on_selection_change(selection));
+        const before = grid_mock.props!.gridSelection;
+        const on_header_clicked = grid_mock.props!.onHeaderClicked as (column: number) => void;
+        await act(async () => on_header_clicked(1));
+        expect(grid_mock.props!.gridSelection).toBe(before);
     });
 
     it('maps header menus and shortcuts from displayed columns to source columns', async () => {
@@ -471,6 +506,7 @@ describe('GridShell column projection', () => {
             column_projection: {
                 visible_to_source: [],
                 source_to_visible: [undefined, undefined, undefined],
+                hidden_count: 3,
             },
         }));
 

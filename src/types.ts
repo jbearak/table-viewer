@@ -70,8 +70,9 @@ export interface SheetTransformState {
 }
 
 export interface SheetColumnVisibilityState {
-    /** Source-column indexes hidden from the projected display. */
-    hiddenColumns: number[];
+    /** Canonical visibility stores exactly one side, choosing the smaller list. */
+    hiddenColumns?: number[];
+    visibleColumns?: number[];
     /** Uses the same sheet identity fingerprint as transform descriptors. */
     schema?: string;
 }
@@ -158,4 +159,5 @@ export type WebviewMessage =
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
-    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent };
+    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
+    | { type: 'setColumnVisibility'; sheetIndex: number; state: SheetColumnVisibilityState | undefined };
