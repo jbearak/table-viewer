@@ -11,7 +11,14 @@ import {
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type { FileStateStore } from './state';
-import type { PerFileState, WebviewMessage } from './types';
+import {
+    transform_has_entries,
+    transform_schema_for_sheet,
+    type PerFileState,
+    type SheetTransformState,
+    type WebviewMessage,
+} from './types';
+import { sanitize_transform_state } from './webview/sheet-state';
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
  *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
@@ -122,6 +129,43 @@ export function attach_viewer(
             : { csvEditingSupported: undefined, csvEditable: undefined };
     }
 
+    async function update_file_state(
+        updater: (current: PerFileState) => PerFileState,
+    ): Promise<void> {
+        if (state_store.update) {
+            await state_store.update(
+                file_path,
+                (current) => updater(current as PerFileState),
+            );
+            return;
+        }
+        await state_store.set(
+            file_path,
+            updater(state_store.get(file_path) as PerFileState),
+        );
+    }
+
+    async function persist_transform_commit(
+        message: Extract<WebviewMessage, { type: 'setTransform' }>,
+        state: SheetTransformState,
+    ): Promise<void> {
+        // Restores merely recompute host-owned preferences. Only explicit user
+        // actions can replace those preferences, and the core awaits this write
+        // before posting its terminal acknowledgement.
+        if (message.intent === 'restore') return;
+        await update_file_state((current) => {
+            const transforms = [...(current.transforms ?? [])];
+            transforms[message.sheetIndex] = transform_has_entries(state)
+                ? {
+                    ...state,
+                    sort: state.sort.map((key) => ({ ...key })),
+                    filters: state.filters.map((entry) => ({ ...entry })),
+                }
+                : undefined;
+            return { ...current, transforms };
+        });
+    }
+
     async function build_source(): Promise<{ source: DataSource; mtime: number }> {
         const stat = await vscode.workspace.fs.stat(uri);
         const max_mib = get_max_file_size_mib();
@@ -133,7 +177,9 @@ export function attach_viewer(
     }
 
     function adopt(ds: DataSource, mtime: number): void {
-        core = adopt_source_into_core(core, panel, source, ds);
+        core = adopt_source_into_core(core, panel, source, ds, {
+            onTransformCommit: persist_transform_commit,
+        });
         source = ds;
         last_mtime = mtime;
         profile.on_source_adopted?.(ds);
@@ -167,8 +213,10 @@ export function attach_viewer(
 
     // Drop any cached pendingEdits for this file, keeping the rest of the state.
     function clear_pending_edits(): Promise<void> {
-        const { pendingEdits: _drop, ...rest } = state_store.get(file_path) as PerFileState;
-        return state_store.set(file_path, rest);
+        return update_file_state((current) => {
+            const { pendingEdits: _drop, ...rest } = current;
+            return rest;
+        });
     }
 
     async function send_initial_data(): Promise<void> {
@@ -304,16 +352,26 @@ export function attach_viewer(
                 await send_initial_data();
                 return;
             case 'stateChanged': {
-                if (!profile.editing) {
-                    await state_store.set(file_path, msg.state);
-                    return;
-                }
-                // Editable profile only: preserve pendingEdits the webview did not
-                // include in this snapshot.
-                const existing = state_store.get(file_path) as PerFileState;
-                const next = { ...msg.state };
-                if (existing.pendingEdits) next.pendingEdits = existing.pendingEdits;
-                await state_store.set(file_path, next);
+                await update_file_state((current) => {
+                    const next = { ...msg.state };
+                    // Transform preferences are host-owned. A delayed debounced
+                    // snapshot must never resurrect a durable Cancel tombstone.
+                    // Re-sanitize the host-owned value, though, so the webview's
+                    // intentional cleanup after a schema change is durable.
+                    const current_transforms = current.transforms;
+                    next.transforms = source?.meta().sheets.map((sheet, index) =>
+                        sanitize_transform_state(
+                            current_transforms?.[index],
+                            sheet.columnCount,
+                            transform_schema_for_sheet(sheet),
+                        ));
+                    // Editable profiles likewise preserve pending edits omitted
+                    // from this UI snapshot.
+                    if (profile.editing && current.pendingEdits) {
+                        next.pendingEdits = current.pendingEdits;
+                    }
+                    return next;
+                });
                 return;
             }
             case 'requestEditSession': {
@@ -380,8 +438,11 @@ export function attach_viewer(
                 if (!profile.editing) return;
                 if (!owns_edit_session()) return;
                 if (msg.edits) {
-                    const current = state_store.get(file_path) as PerFileState;
-                    await state_store.set(file_path, { ...current, pendingEdits: msg.edits });
+                    const edits = msg.edits;
+                    await update_file_state((current) => ({
+                        ...current,
+                        pendingEdits: edits,
+                    }));
                 } else {
                     await clear_pending_edits();
                 }
@@ -416,6 +477,7 @@ export function attach_viewer(
             disposed = true;
             reload_seq++;
             release_edit_session();
+            core?.dispose();
             source?.close();
             for (const d of disposables) d.dispose();
         },

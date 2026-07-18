@@ -9,6 +9,11 @@ type StoredStateMap = Record<string, StoredPerFileState>;
 export interface FileStateStore {
     get(file_path: string): StoredPerFileState;
     set(file_path: string, state: PerFileState): Promise<void>;
+    /** Serialized read-modify-write used when several panels own disjoint fields. */
+    update?(
+        file_path: string,
+        updater: (current: StoredPerFileState) => PerFileState,
+    ): Promise<void>;
 }
 
 function get_all_state(
@@ -38,29 +43,50 @@ export function create_file_state_store(
         ?? (() => DEFAULT_MAX_STORED_FILES);
     let pending_write: Promise<void> = Promise.resolve();
 
+    const enqueue = (operation: () => Promise<void>): Promise<void> => {
+        pending_write = pending_write.catch(() => {}).then(operation);
+        return pending_write;
+    };
+
+    const update = (
+        file_path: string,
+        updater: (current: StoredPerFileState) => PerFileState,
+    ): Promise<void> => enqueue(async () => {
+        const all = get_all_state(context);
+        const next = updater(all[file_path] ?? {});
+        delete all[file_path];
+        all[file_path] = next;
+        evict_excess(all, get_max());
+        await context.globalState.update(STATE_KEY, all);
+    });
+
     return {
         get(file_path: string): StoredPerFileState {
             const all = get_all_state(context);
-            return all[file_path] ?? {};
+            const value = all[file_path];
+            if (value !== undefined) {
+                // Touch recency on every successful read. Re-read inside the
+                // serialized operation so a queued write cannot be overwritten
+                // by the snapshot returned synchronously to this caller.
+                void enqueue(async () => {
+                    const latest = get_all_state(context);
+                    const current = latest[file_path];
+                    if (current === undefined) return;
+                    delete latest[file_path];
+                    latest[file_path] = current;
+                    await context.globalState.update(STATE_KEY, latest);
+                }).catch(() => {});
+            }
+            return value ?? {};
         },
 
         async set(
             file_path: string,
             state: PerFileState
         ): Promise<void> {
-            pending_write = pending_write
-                .catch(() => {})
-                .then(async () => {
-                    const all = get_all_state(context);
-                    delete all[file_path];
-                    all[file_path] = state;
-                    evict_excess(all, get_max());
-                    await context.globalState.update(
-                        STATE_KEY,
-                        all
-                    );
-                });
-            await pending_write;
+            await update(file_path, () => state);
         },
+
+        update,
     };
 }

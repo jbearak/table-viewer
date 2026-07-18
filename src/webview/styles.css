@@ -163,6 +163,19 @@ div.transform-chip button {
     padding: 3px 5px;
 }
 
+.transform-controls button:focus-visible,
+.transform-controls select:focus-visible,
+.transform-controls input:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: 2px;
+}
+
+.transform-chip button:focus-visible {
+    position: relative;
+    z-index: 1;
+    outline-offset: -2px;
+}
+
 .transform-checkbox input {
     accent-color: var(--vscode-button-background, #0e639c);
 }

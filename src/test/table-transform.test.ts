@@ -25,6 +25,8 @@ const cell = (
 });
 
 class Source implements DataSource {
+    read_calls = 0;
+
     constructor(
         readonly rows: (RenderedCell | null)[][],
         readonly merges: WorkbookMeta['sheets'][number]['merges'] = [],
@@ -44,6 +46,7 @@ class Source implements DataSource {
     }
 
     read_rows(_sheet: number, start: number, count: number): RowWindow {
+        this.read_calls += 1;
         return {
             startRow: start,
             rows: this.rows.slice(start, start + count),
@@ -65,6 +68,13 @@ const filter = (
     caseSensitive: false,
     enabled: true,
 });
+
+function cancel_at_checkpoint(checkpoint: number): () => boolean {
+    let checks = 0;
+    // A completed checkpoint checks once before and once after yielding. The
+    // target checkpoint returns true on its first (pre-yield) check.
+    return () => ++checks >= checkpoint * 2 - 1;
+}
 
 describe('table transforms', () => {
     it('sorts numeric values stably and keeps missing values last in both directions', () => {
@@ -129,6 +139,50 @@ describe('table transforms', () => {
         expect([...identifier_result.indices!]).toEqual([2, 0, 1]);
     });
 
+    it('compares and sorts canonical text integers exactly beyond safe 64-bit ranges', async () => {
+        const safe_boundary = cell('9007199254740992');
+        const just_over = cell('9007199254740993');
+        expect(compare_cells(just_over, safe_boundary, 'asc', true)).toBeGreaterThan(0);
+        expect(compare_cells(just_over, safe_boundary, 'desc', true)).toBeLessThan(0);
+
+        const source = new Source([
+            [cell('9223372036854775808')],
+            [cell('-9223372036854775809')],
+            [cell('9007199254740993')],
+            [cell('9223372036854775807')],
+            [cell('9007199254740992')],
+        ]);
+        const result = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
+        expect([...result.indices!]).toEqual([1, 4, 2, 3, 0]);
+    });
+
+    it('uses exact canonical integers for numeric equality, relations, and ranges', async () => {
+        const source = new Source([
+            [cell('9007199254740992')],
+            [cell('9007199254740993')],
+            [cell('9223372036854775807')],
+            [cell('9223372036854775808')],
+        ]);
+        const apply = (entry: FilterEntry) => compute_transform(source, 0, {
+            sort: [],
+            filters: [entry],
+        });
+
+        await expect(apply(filter('equals', '9007199254740993')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([1]) });
+        await expect(apply(filter('notEquals', '9007199254740993')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([0, 2, 3]) });
+        await expect(apply(filter('greaterThan', '9223372036854775807')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([3]) });
+        await expect(apply({
+            ...filter('between', '9007199254740993'),
+            secondValue: '9223372036854775807',
+        })).resolves.toMatchObject({ indices: Uint32Array.from([1, 2]) });
+    });
+
     it('treats empty strings and nulls consistently as missing', () => {
         const empty_string = cell('', 'string');
         expect(matches_filter(empty_string, filter('isEmpty'))).toBe(true);
@@ -156,6 +210,81 @@ describe('table transforms', () => {
             sort: [],
             filters: [filter('greaterThan', 'not-a-number')],
         })).rejects.toThrow('finite numbers');
+    });
+
+    it('cancels cooperatively during allocation and source acquisition', async () => {
+        const rows = Array.from(
+            { length: 3000 },
+            (_, index) => [cell(String(3000 - index))],
+        );
+        const setup_source = new Source(rows);
+        await expect(compute_transform(setup_source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        }, cancel_at_checkpoint(1))).rejects.toMatchObject({ name: 'AbortError' });
+        expect(setup_source.read_calls).toBe(0);
+
+        const scan_source = new Source(rows);
+        await expect(compute_transform(scan_source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        }, cancel_at_checkpoint(3))).rejects.toMatchObject({ name: 'AbortError' });
+        expect(scan_source.read_calls).toBe(1);
+    });
+
+    it('cancels cooperatively during filtering, sorting, and compaction', async () => {
+        const rows = Array.from(
+            { length: 3000 },
+            (_, index) => [cell(String(3000 - index))],
+        );
+        const state: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('greaterThanOrEqual', '1')],
+        };
+
+        // Checkpoints: setup 1-2, three source chunks 3-5, filter start 6,
+        // filter chunks 7-9, two bounded sort runs 10-11, merge/copy 12-13,
+        // compaction allocation/copy 14-15.
+        await expect(compute_transform(
+            new Source(rows),
+            0,
+            state,
+            cancel_at_checkpoint(7),
+        )).rejects.toMatchObject({ name: 'AbortError' });
+        await expect(compute_transform(
+            new Source(rows),
+            0,
+            state,
+            cancel_at_checkpoint(10),
+        )).rejects.toMatchObject({ name: 'AbortError' });
+        await expect(compute_transform(
+            new Source(rows),
+            0,
+            state,
+            cancel_at_checkpoint(15),
+        )).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('keeps stable source-row tie breaks across cooperative sort runs', async () => {
+        const source = new Source(Array.from(
+            { length: 5000 },
+            (_, index) => [cell(String(index % 3)), cell(String(index))],
+        ));
+        const result = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
+        const indices = [...result.indices!];
+        for (const remainder of [0, 1, 2]) {
+            expect(indices.filter((index) => index % 3 === remainder))
+                .toEqual(Array.from(
+                    { length: Math.ceil((5000 - remainder) / 3) },
+                    (_, position) => remainder + position * 3,
+                ).filter((index) => index < 5000));
+        }
+        expect(indices.slice(0, 1667).every((index) => index % 3 === 0)).toBe(true);
+        expect(indices.slice(1667, 3334).every((index) => index % 3 === 1)).toBe(true);
+        expect(indices.slice(3334).every((index) => index % 3 === 2)).toBe(true);
     });
 
     it('serves transformed windows in display order', () => {

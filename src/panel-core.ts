@@ -5,6 +5,7 @@ import {
     transform_schema_for_sheet,
     type SheetTransformState,
     type StoredPerFileState,
+    type TransformIntent,
     type WebviewMessage,
 } from './types';
 
@@ -34,6 +35,12 @@ interface ReloadEnvelope {
     csvEditingSupported?: boolean;
 }
 
+type SetTransformMessage = Extract<WebviewMessage, { type: 'setTransform' }>;
+type TransformCommit = (
+    message: SetTransformMessage,
+    state: SheetTransformState,
+) => Promise<void>;
+
 const DEFAULT_MAX_CACHED_PAGES = 64;
 
 /**
@@ -59,17 +66,28 @@ export class ViewerPanelCore {
     private readonly transform_sequences = new Map<number, number>();
     private readonly transforms_in_flight = new Set<number>();
     private source_epoch = 0;
+    private _source_generation = 1;
+    private disposed = false;
+    private readonly on_transform_commit?: TransformCommit;
 
     constructor(
         private readonly panel: PanelLike,
         private source: DataSource,
-        opts?: { maxCachedPages?: number },
+        opts?: {
+            maxCachedPages?: number;
+            onTransformCommit?: TransformCommit;
+        },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
+        this.on_transform_commit = opts?.onTransformCommit;
     }
 
     get generation(): number {
         return this._generation;
+    }
+
+    get source_generation(): number {
+        return this._source_generation;
     }
 
     get has_transform_work(): boolean {
@@ -79,8 +97,10 @@ export class ViewerPanelCore {
 
     /** Swap in a freshly-parsed source (reload) without sending a message. */
     set_source(source: DataSource): void {
+        if (this.disposed) return;
         this.source = source;
         this.source_epoch += 1;
+        this._source_generation += 1;
         this.transform_indices.clear();
         this.transform_states.clear();
         this.transform_sequences.clear();
@@ -88,9 +108,27 @@ export class ViewerPanelCore {
         this.cache.clear();
     }
 
+    /** Cancel asynchronous work before its source is closed or replaced. */
+    cancel_pending(): void {
+        this.source_epoch += 1;
+        this.transform_sequences.clear();
+        this.transforms_in_flight.clear();
+    }
+
+    /** Permanently stop work and suppress all later protocol messages. */
+    dispose(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.cancel_pending();
+        this.transform_indices.clear();
+        this.transform_states.clear();
+        this.cache.clear();
+    }
+
     /** Initial structure send. Generation is left as-is (a fresh panel starts
      *  at generation 1; subsequent reloads bump it via send_meta_reload). */
     async send_meta(envelope: MetaEnvelope): Promise<void> {
+        if (this.disposed) return;
         await this.post({
             type: 'sheetMeta',
             meta: this.source.meta(),
@@ -101,11 +139,13 @@ export class ViewerPanelCore {
             csvEditingSupported: envelope.csvEditingSupported,
             truncationMessage: this.source.truncationMessage,
             generation: this._generation,
+            sourceGeneration: this._source_generation,
         });
     }
 
     /** Reload send: bump generation, drop cached windows, post metaReload. */
     async send_meta_reload(envelope?: ReloadEnvelope): Promise<boolean> {
+        if (this.disposed) return false;
         this._generation += 1;
         this.cache.clear();
         return this.post({
@@ -115,11 +155,13 @@ export class ViewerPanelCore {
             csvEditingSupported: envelope?.csvEditingSupported,
             truncationMessage: this.source.truncationMessage,
             generation: this._generation,
+            sourceGeneration: this._source_generation,
         });
     }
 
     /** Entry point for webview->host messages the core is responsible for. */
     async handle_message(msg: WebviewMessage): Promise<void> {
+        if (this.disposed) return;
         if (msg.type === 'requestRows') {
             await this.handle_row_request(msg);
         } else if (msg.type === 'setTransform') {
@@ -128,7 +170,7 @@ export class ViewerPanelCore {
     }
 
     private async handle_set_transform(
-        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+        msg: SetTransformMessage,
     ): Promise<void> {
         const sheet = this.source.meta().sheets[msg.sheetIndex];
         if (!sheet) {
@@ -139,11 +181,13 @@ export class ViewerPanelCore {
                 rowCount: 0,
                 requestId: msg.requestId,
                 generation: this._generation,
+                sourceGeneration: this._source_generation,
+                intent: msg.intent,
                 error: `Sheet index ${msg.sheetIndex} is out of range.`,
             });
             return;
         }
-        if (msg.generation !== this._generation) {
+        if (msg.sourceGeneration !== this._source_generation) {
             await this.post_transform_error(
                 msg,
                 sheet.rowCount,
@@ -180,6 +224,12 @@ export class ViewerPanelCore {
             );
             if (is_cancelled()) return;
 
+            // Transform preferences are host-owned. In particular, an explicit
+            // Cancel must be durably recorded before its terminal acknowledgement
+            // so close/reopen cannot resurrect the cancelled restore.
+            await this.on_transform_commit?.(msg, clone_transform(msg.state));
+            if (is_cancelled()) return;
+
             if (result.indices) {
                 this.transform_indices.set(msg.sheetIndex, result.indices);
             } else {
@@ -195,6 +245,8 @@ export class ViewerPanelCore {
                 rowCount: result.rowCount,
                 requestId: msg.requestId,
                 generation: this._generation,
+                sourceGeneration: this._source_generation,
+                intent: msg.intent,
             });
         } catch (error) {
             if (is_cancelled() || (error as { name?: unknown })?.name === 'AbortError') {
@@ -211,6 +263,8 @@ export class ViewerPanelCore {
                 rowCount: previous_count,
                 requestId: msg.requestId,
                 generation: this._generation,
+                sourceGeneration: this._source_generation,
+                intent: msg.intent,
                 error: error instanceof Error ? error.message : String(error),
             });
         } finally {
@@ -221,7 +275,7 @@ export class ViewerPanelCore {
     }
 
     reject_transform(
-        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+        msg: SetTransformMessage,
         error: string,
     ): Promise<boolean> {
         const natural_count =
@@ -230,7 +284,7 @@ export class ViewerPanelCore {
     }
 
     private post_transform_error(
-        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+        msg: SetTransformMessage,
         natural_row_count: number,
         error: string,
     ): Promise<boolean> {
@@ -244,6 +298,8 @@ export class ViewerPanelCore {
                 ?? natural_row_count,
             requestId: msg.requestId,
             generation: this._generation,
+            sourceGeneration: this._source_generation,
+            intent: msg.intent,
             error,
         });
     }
@@ -305,6 +361,7 @@ export class ViewerPanelCore {
     }
 
     private post(message: unknown): Promise<boolean> {
+        if (this.disposed) return Promise.resolve(false);
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
 }
@@ -330,11 +387,14 @@ export function adopt_source_into_core(
     panel: PanelLike,
     previous: DataSource | undefined,
     next: DataSource,
+    opts?: { onTransformCommit?: TransformCommit },
 ): ViewerPanelCore {
-    if (previous && previous !== next) previous.close();
     if (core) {
+        core.cancel_pending();
+        if (previous && previous !== next) previous.close();
         core.set_source(next);
         return core;
     }
-    return new ViewerPanelCore(panel, next);
+    if (previous && previous !== next) previous.close();
+    return new ViewerPanelCore(panel, next, opts);
 }

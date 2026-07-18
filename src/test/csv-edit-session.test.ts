@@ -8,6 +8,12 @@ import * as vscode_mock from './mocks/vscode';
 
 const enc = new TextEncoder();
 
+function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+}
+
 function state_store(initial: PerFileState = {}) {
     const states: Record<string, PerFileState> = {};
     return {
@@ -45,6 +51,12 @@ class StubSource implements DataSource {
         return { startRow: 0, rows: [[{ raw: 'a', formatted: 'a', bold: false, italic: false }]] };
     }
     close(): void {}
+}
+
+class FailingTransformSource extends StubSource {
+    override read_rows(): RowWindow {
+        throw new Error('column read failed');
+    }
 }
 
 function open_csv_table(
@@ -98,6 +110,196 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    it('durably removes host-owned transforms that no longer match the source schema', async () => {
+        const file_path = '/tmp/stale-transform-schema.csv';
+        const stale_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Old sheet",99,null]',
+        };
+        const state = state_store({ transforms: [stale_transform] });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+
+        // This is the snapshot the webview posts after sanitizing sheetMeta.
+        await panel.__receive({
+            type: 'stateChanged',
+            state: { transforms: [undefined], activeSheetIndex: 0 },
+        } as never);
+
+        expect(state.get_state(file_path).transforms).toEqual([undefined]);
+    });
+
+    it('durably clears a cancelled restore and ignores a late stale snapshot', async () => {
+        const file_path = '/tmp/cancelled-restore.csv';
+        const saved_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const state = state_store({ transforms: [saved_transform] });
+        const first = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        const meta = first.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'sheetMeta',
+        ) as { generation: number; sourceGeneration: number };
+
+        await first.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore',
+            generation: meta.generation,
+            sourceGeneration: meta.sourceGeneration,
+            intent: 'restore',
+            state: saved_transform,
+        } as never);
+        expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
+
+        const restore_ack = first.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied',
+        ) as { generation: number };
+        await first.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'cancel',
+            // Deliberately use the pre-ack view generation: source identity,
+            // not cache generation, authorizes this Cancel.
+            generation: meta.generation,
+            sourceGeneration: meta.sourceGeneration,
+            intent: 'cancel',
+            state: {
+                sort: [],
+                filters: [],
+                schema: saved_transform.schema,
+            },
+        } as never);
+        expect(restore_ack.generation).toBeGreaterThan(meta.generation);
+        expect(state.get_state(file_path).transforms).toEqual([undefined]);
+
+        // A debounced snapshot captured before Cancel must not resurrect it.
+        await first.__receive({
+            type: 'stateChanged',
+            state: { transforms: [saved_transform], activeSheetIndex: 0 },
+        } as never);
+        expect(state.get_state(file_path).transforms).toEqual([undefined]);
+
+        first.dispose();
+        const reopened = open_csv_table(uri(file_path), state.store);
+        await reopened.__receive({ type: 'ready' });
+        const reopened_meta = reopened.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'sheetMeta',
+        ) as { state: PerFileState };
+        expect(reopened_meta.state.transforms).toEqual([undefined]);
+    });
+
+    it('does not acknowledge Cancel until its durable clear completes', async () => {
+        const file_path = '/tmp/durable-cancel.csv';
+        const gate = deferred();
+        let current: PerFileState = {
+            transforms: [{
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            }],
+        };
+        const store: FileStateStore = {
+            get: () => current,
+            set: async (_path, next) => {
+                await gate.promise;
+                current = next;
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const meta = panel.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'sheetMeta',
+        ) as { generation: number; sourceGeneration: number };
+
+        const cancel = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'cancel',
+            generation: meta.generation,
+            sourceGeneration: meta.sourceGeneration,
+            intent: 'cancel',
+            state: {
+                sort: [],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+        await Promise.resolve();
+        expect(panel.__messages.some((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied')).toBe(false);
+
+        gate.resolve();
+        await cancel;
+        expect(current.transforms).toEqual([undefined]);
+        expect(panel.__messages.some((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied')).toBe(true);
+    });
+
+    it('keeps host-owned restore preferences after a restore read failure', async () => {
+        const file_path = '/tmp/restore-failure.csv';
+        const saved_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        };
+        const state = state_store({ transforms: [saved_transform] });
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new FailingTransformSource();
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state.store, profile);
+        await panel.__receive({ type: 'ready' });
+        const meta = panel.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'sheetMeta',
+        ) as { generation: number; sourceGeneration: number };
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore',
+            generation: meta.generation,
+            sourceGeneration: meta.sourceGeneration,
+            intent: 'restore',
+            state: saved_transform,
+        } as never);
+
+        const ack = panel.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied',
+        ) as { error?: string };
+        expect(ack.error).toContain('column read failed');
+        expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
+    });
+
     it('rejects transforms while an edit session is owned', async () => {
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
         await panel.__receive({ type: 'ready' });
@@ -108,6 +310,8 @@ describe('CSV edit sessions', () => {
             sheetIndex: 0,
             requestId: 'during-edit',
             generation: 1,
+            sourceGeneration: 1,
+            intent: 'user',
             state: {
                 sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],
@@ -133,6 +337,8 @@ describe('CSV edit sessions', () => {
             sheetIndex: 0,
             requestId: 'pending',
             generation: 1,
+            sourceGeneration: 1,
+            intent: 'user',
             state: {
                 sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],

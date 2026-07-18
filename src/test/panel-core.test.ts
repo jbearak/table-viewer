@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ViewerPanelCore } from '../panel-core';
+import { ViewerPanelCore, adopt_source_into_core } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
 
 class StubSource implements DataSource {
@@ -24,10 +24,27 @@ class StubSource implements DataSource {
     close(): void {}
 }
 
+class CloseAwareSource extends StubSource {
+    closed = false;
+    override read_rows(sheet: number, start: number, count: number): RowWindow {
+        if (this.closed) throw new Error('read after close');
+        return super.read_rows(sheet, start, count);
+    }
+    override close(): void {
+        this.closed = true;
+    }
+}
+
 function make_panel() {
     const posted: any[] = [];
     const postMessage = vi.fn((m: any) => { posted.push(m); return Promise.resolve(true); });
     return { panel: { webview: { postMessage } }, posted, postMessage };
+}
+
+function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
 }
 
 const ENVELOPE = { state: {}, defaultTabOrientation: 'horizontal' as const };
@@ -140,6 +157,8 @@ describe('ViewerPanelCore', () => {
             sheetIndex: 0,
             requestId: 'sort-1',
             generation: old_generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
             state: {
                 sort: [{ colIndex: 0, direction: 'desc' }],
                 filters: [],
@@ -177,6 +196,8 @@ describe('ViewerPanelCore', () => {
             sheetIndex: 0,
             requestId: 'bad',
             generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
             state: {
                 sort: [{ colIndex: 99, direction: 'asc' }],
                 filters: [],
@@ -195,6 +216,8 @@ describe('ViewerPanelCore', () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource(5));
         const stale_generation = core.generation;
+        const stale_source_generation = core.source_generation;
+        core.set_source(new StubSource(5));
         await core.send_meta_reload();
 
         await core.handle_message({
@@ -202,6 +225,8 @@ describe('ViewerPanelCore', () => {
             sheetIndex: 0,
             requestId: 'stale',
             generation: stale_generation,
+            sourceGeneration: stale_source_generation,
+            intent: 'user',
             state: {
                 sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],
@@ -214,5 +239,126 @@ describe('ViewerPanelCore', () => {
         expect(applied.error).toContain('source changed');
         expect(applied.state).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(stale_generation + 1);
+    });
+
+    it('accepts Cancel in the transform commit/ack gap for the same source', async () => {
+        const { panel, posted } = make_panel();
+        const persist_started = deferred();
+        const release_persist = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'restore') {
+                    persist_started.resolve();
+                    await release_persist.promise;
+                }
+            },
+        });
+        const source_generation = core.source_generation;
+        const restore = core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore',
+            generation: core.generation,
+            sourceGeneration: source_generation,
+            intent: 'restore',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        await persist_started.promise;
+
+        // The restore has computed but has not acknowledged/bumped the view
+        // generation. Cancel carries that old view generation but the same
+        // source identity and must remain authoritative.
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'cancel',
+            generation: 1,
+            sourceGeneration: source_generation,
+            intent: 'cancel',
+            state: {
+                sort: [],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        release_persist.resolve();
+        await restore;
+
+        expect(posted.filter((message) =>
+            message.type === 'transformApplied').map((message) => message.requestId))
+            .toEqual(['cancel']);
+        expect(core.generation).toBe(2);
+    });
+
+    it('cancels work and suppresses messages after disposal', async () => {
+        const { panel, posted } = make_panel();
+        const persist_started = deferred();
+        const release_persist = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async () => {
+                persist_started.resolve();
+                await release_persist.promise;
+            },
+        });
+        const work = core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'late',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        await persist_started.promise;
+        core.dispose();
+        release_persist.resolve();
+        await work;
+        expect(posted.some((message) => message.type === 'transformApplied'))
+            .toBe(false);
+    });
+
+    it('cancels source work before closing a replaced source', async () => {
+        const { panel, posted } = make_panel();
+        const previous = new CloseAwareSource(2_001);
+        const core = new ViewerPanelCore(panel, previous);
+        const work = core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'old-source',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        while (previous.read_rows_calls === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        expect(previous.read_rows_calls).toBe(1);
+
+        adopt_source_into_core(
+            core,
+            panel,
+            previous,
+            new StubSource(5),
+        );
+        await work;
+
+        expect(previous.closed).toBe(true);
+        expect(previous.read_rows_calls).toBe(1);
+        expect(posted.some((message) =>
+            message.type === 'transformApplied'
+            && message.requestId === 'old-source')).toBe(false);
     });
 });

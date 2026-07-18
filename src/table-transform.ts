@@ -7,6 +7,10 @@ import type {
 import { transform_is_active } from './types';
 
 const SCAN_ROWS = 1000;
+const FILTER_ROWS_PER_CHECKPOINT = 1000;
+const SORT_CHUNK_ROWS = 2048;
+const SORT_OPERATIONS_PER_CHECKPOINT = 4096;
+const COMPACT_ROWS_PER_CHECKPOINT = 4096;
 const COLLATOR = new Intl.Collator(undefined, {
     sensitivity: 'variant',
     numeric: true,
@@ -19,7 +23,7 @@ export interface TransformResult {
 }
 
 interface TransformColumn {
-    values: (string | null)[];
+    values: (string | null | undefined)[];
     numeric: boolean;
     foundValue: boolean;
 }
@@ -39,17 +43,20 @@ export async function compute_transform(
     }
 
     const columns = needed_columns(state, sheet.columnCount);
+    await cancellation_checkpoint(is_cancelled);
     const values = new Map<number, TransformColumn>();
     for (const col of columns) {
         values.set(col, {
-            values: new Array(sheet.rowCount).fill(null),
+            // Sparse allocation avoids an eager, uncancellable O(rows × columns)
+            // null-fill. Every source row is assigned during the scan below.
+            values: new Array(sheet.rowCount),
             numeric: true,
             foundValue: false,
         });
     }
+    await cancellation_checkpoint(is_cancelled);
 
     for (let start = 0; start < sheet.rowCount; start += SCAN_ROWS) {
-        if (is_cancelled()) throw cancelled_error();
         const rows = source.read_rows(
             sheet_index,
             start,
@@ -80,15 +87,14 @@ export async function compute_transform(
                 }
             }
         }
-        // Yield so a newer transform or reload can cancel a long scan.
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        await cancellation_checkpoint(is_cancelled);
     }
 
-    if (is_cancelled()) throw cancelled_error();
     validate_filter_operands(state, values);
     const survivors: number[] = [];
-    row_loop:
+    await cancellation_checkpoint(is_cancelled);
     for (let row = 0; row < sheet.rowCount; row++) {
+        let matches = true;
         for (const filter of state.filters) {
             if (!filter.enabled) continue;
             const column = values.get(filter.colIndex);
@@ -97,30 +103,43 @@ export async function compute_transform(
                 filter,
                 !!column?.numeric && column.foundValue,
             )) {
-                continue row_loop;
+                matches = false;
+                break;
             }
         }
-        survivors.push(row);
+        if (matches) survivors.push(row);
+        if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+            await cancellation_checkpoint(is_cancelled);
+        }
+    }
+    if (sheet.rowCount % FILTER_ROWS_PER_CHECKPOINT !== 0) {
+        await cancellation_checkpoint(is_cancelled);
     }
 
     if (state.sort.length > 0) {
-        survivors.sort((a, b) => {
+        const compare_rows = (a: number, b: number): number => {
             for (const key of state.sort) {
                 const column = values.get(key.colIndex)!;
                 const result = compare_values(
-                    column.values[a],
-                    column.values[b],
+                    column.values[a] ?? null,
+                    column.values[b] ?? null,
                     key.direction,
                     column.numeric && column.foundValue,
                 );
                 if (result !== 0) return result;
             }
             return a - b;
-        });
+        };
+        await cooperative_stable_sort(
+            survivors,
+            compare_rows,
+            is_cancelled,
+        );
     }
 
+    const indices = await compact_indices(survivors, is_cancelled);
     return {
-        indices: Uint32Array.from(survivors),
+        indices,
         rowCount: survivors.length,
     };
 }
@@ -154,7 +173,7 @@ function compare_values(
     if (b_missing) return -1;
 
     const ascending = numeric
-        ? Math.sign(Number(a) - Number(b))
+        ? compare_numeric_text(a, b)
         : COLLATOR.compare(a, b);
     return direction === 'asc' ? ascending : -ascending;
 }
@@ -194,12 +213,12 @@ function matches_filter_value(
             return !lhs.includes(rhs);
         case 'equals':
             if (numeric_column && Number.isFinite(Number(raw_rhs))) {
-                return Number(value) === Number(raw_rhs);
+                return compare_numeric_text(value, raw_rhs) === 0;
             }
             return lhs === rhs;
         case 'notEquals':
             if (numeric_column && Number.isFinite(Number(raw_rhs))) {
-                return Number(value) !== Number(raw_rhs);
+                return compare_numeric_text(value, raw_rhs) !== 0;
             }
             return lhs !== rhs;
         case 'startsWith':
@@ -295,9 +314,22 @@ function compare_filter_values(
 ): number {
     const rhs_number = Number(rhs);
     if (numeric_column && Number.isFinite(rhs_number)) {
-        return Math.sign(Number(value) - rhs_number);
+        return compare_numeric_text(value, rhs);
     }
     return COLLATOR.compare(value, rhs);
+}
+
+function compare_numeric_text(a: string, b: string): number {
+    if (canonical_integer_string(a) && canonical_integer_string(b)) {
+        const a_integer = BigInt(a);
+        const b_integer = BigInt(b);
+        return a_integer < b_integer ? -1 : a_integer > b_integer ? 1 : 0;
+    }
+    return Math.sign(Number(a) - Number(b));
+}
+
+function canonical_integer_string(value: string): boolean {
+    return /^[+-]?(?:0|[1-9]\d*)$/.test(value);
 }
 
 function validate_filter_operands(
@@ -355,6 +387,110 @@ function canonical_numeric_string(value: string): boolean {
         return false;
     }
     return Number.isFinite(Number(value));
+}
+
+async function cooperative_stable_sort(
+    rows: number[],
+    compare: (a: number, b: number) => number,
+    is_cancelled: () => boolean,
+): Promise<void> {
+    if (rows.length < 2) {
+        await cancellation_checkpoint(is_cancelled);
+        return;
+    }
+
+    // Native sort remains useful for small bounded runs. Global ordering is then
+    // produced by cooperative merge passes, avoiding one monolithic event-loop
+    // block for a large sheet.
+    for (let start = 0; start < rows.length; start += SORT_CHUNK_ROWS) {
+        const end = Math.min(start + SORT_CHUNK_ROWS, rows.length);
+        const sorted_chunk = rows.slice(start, end).sort(compare);
+        for (let offset = 0; offset < sorted_chunk.length; offset++) {
+            rows[start + offset] = sorted_chunk[offset];
+        }
+        await cancellation_checkpoint(is_cancelled);
+    }
+
+    if (rows.length <= SORT_CHUNK_ROWS) return;
+
+    let source = rows;
+    let target = new Array<number>(rows.length);
+    for (
+        let width = SORT_CHUNK_ROWS;
+        width < rows.length;
+        width *= 2
+    ) {
+        let operations = 0;
+        for (let left = 0; left < rows.length; left += width * 2) {
+            const middle = Math.min(left + width, rows.length);
+            const right = Math.min(left + width * 2, rows.length);
+            let a = left;
+            let b = middle;
+            let out = left;
+            while (a < middle && b < right) {
+                target[out++] = compare(source[a], source[b]) <= 0
+                    ? source[a++]
+                    : source[b++];
+                operations += 1;
+                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                    operations = 0;
+                    await cancellation_checkpoint(is_cancelled);
+                }
+            }
+            while (a < middle) {
+                target[out++] = source[a++];
+                operations += 1;
+                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                    operations = 0;
+                    await cancellation_checkpoint(is_cancelled);
+                }
+            }
+            while (b < right) {
+                target[out++] = source[b++];
+                operations += 1;
+                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                    operations = 0;
+                    await cancellation_checkpoint(is_cancelled);
+                }
+            }
+        }
+        if (operations > 0) await cancellation_checkpoint(is_cancelled);
+        [source, target] = [target, source];
+    }
+
+    if (source !== rows) {
+        for (let start = 0; start < rows.length; start += COMPACT_ROWS_PER_CHECKPOINT) {
+            const end = Math.min(start + COMPACT_ROWS_PER_CHECKPOINT, rows.length);
+            for (let index = start; index < end; index++) {
+                rows[index] = source[index];
+            }
+            await cancellation_checkpoint(is_cancelled);
+        }
+    }
+}
+
+async function compact_indices(
+    rows: number[],
+    is_cancelled: () => boolean,
+): Promise<Uint32Array> {
+    await cancellation_checkpoint(is_cancelled);
+    const indices = new Uint32Array(rows.length);
+    for (let start = 0; start < rows.length; start += COMPACT_ROWS_PER_CHECKPOINT) {
+        const end = Math.min(start + COMPACT_ROWS_PER_CHECKPOINT, rows.length);
+        for (let index = start; index < end; index++) {
+            indices[index] = rows[index];
+        }
+        await cancellation_checkpoint(is_cancelled);
+    }
+    return indices;
+}
+
+async function cancellation_checkpoint(
+    is_cancelled: () => boolean,
+): Promise<void> {
+    if (is_cancelled()) throw cancelled_error();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (is_cancelled()) throw cancelled_error();
 }
 
 function cancelled_error(): Error {

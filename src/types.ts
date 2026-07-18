@@ -29,6 +29,7 @@ export interface MergeRange {
 }
 
 export type SortDirection = 'asc' | 'desc';
+export type TransformIntent = 'restore' | 'user' | 'cancel';
 
 export interface SortKey {
     colIndex: number;
@@ -123,14 +124,14 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 export type HostMessage =
     // Paginated protocol (Phase B+). `generation` rises on every (re)load so the
     // webview can drop row windows that belong to a superseded document version.
-    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
-    | { type: 'metaReload'; meta: WorkbookMeta; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number }
+    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number }
+    | { type: 'metaReload'; meta: WorkbookMeta; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
     | { type: 'editSessionResult'; granted: boolean; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' }
-    | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; error?: string };
+    | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
@@ -147,4 +148,4 @@ export type WebviewMessage =
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
-    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number };
+    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent };

@@ -7,6 +7,7 @@ import {
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
+    type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { Toolbar } from './toolbar';
@@ -98,12 +99,14 @@ export function App(): React.JSX.Element {
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
+    const source_generation_ref = useRef(1);
 
     const { persist_immediate } = use_state_sync(state_ref);
 
     const request_transform = useCallback((
         sheet_index: number,
         state: SheetTransformState,
+        intent: TransformIntent,
     ) => {
         const request_id = `${sheet_index}:${++transform_request_seq_ref.current}`;
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
@@ -118,6 +121,8 @@ export function App(): React.JSX.Element {
             state,
             requestId: request_id,
             generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+            intent,
         });
     }, []);
 
@@ -151,6 +156,7 @@ export function App(): React.JSX.Element {
                 set_meta(msg.meta);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
+                source_generation_ref.current = msg.sourceGeneration;
                 set_load_epoch((n) => n + 1);
                 set_source_epoch((n) => n + 1);
                 auto_fit_active_ref.current = [];
@@ -211,6 +217,7 @@ export function App(): React.JSX.Element {
                 set_meta(msg.meta);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
+                source_generation_ref.current = msg.sourceGeneration;
                 set_edit_session_pending(false);
                 set_source_epoch((n) => n + 1);
                 auto_fit_active_ref.current = [];
@@ -325,7 +332,6 @@ export function App(): React.JSX.Element {
                     auto_fit_snapshot_ref.current = next;
                     return next;
                 });
-                persist_immediate();
                 if (msg.error) {
                     vscode_api.postMessage({
                         type: 'showWarning',
@@ -365,7 +371,7 @@ export function App(): React.JSX.Element {
             transform_schema_for_sheet(sheet),
         );
         if (state && transform_is_active(state)) {
-            request_transform(active_sheet_index, state);
+            request_transform(active_sheet_index, state, 'restore');
         }
     }, [
         source_epoch,
@@ -440,7 +446,7 @@ export function App(): React.JSX.Element {
                 filters: [],
                 schema,
             };
-            request_transform(active_sheet_index, sanitized);
+            request_transform(active_sheet_index, sanitized, 'user');
         },
         [
             active_sheet_index,
@@ -461,7 +467,7 @@ export function App(): React.JSX.Element {
                     ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                     : undefined,
             };
-        request_transform(active_sheet_index, previous);
+        request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
         applied_transforms,

@@ -15,6 +15,7 @@ describe('paginated protocol message shapes', () => {
             state: {},
             defaultTabOrientation: 'horizontal',
             generation: 1,
+            sourceGeneration: 1,
         };
         expect(msg.type).toBe('sheetMeta');
         if (msg.type === 'sheetMeta') {
@@ -28,6 +29,7 @@ describe('paginated protocol message shapes', () => {
             type: 'metaReload',
             meta,
             generation: 2,
+            sourceGeneration: 2,
         };
         expect(msg.type).toBe('metaReload');
         if (msg.type === 'metaReload') expect(msg.generation).toBe(2);

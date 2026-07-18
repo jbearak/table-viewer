@@ -51,6 +51,9 @@ export function TransformControls({
     const active = state.sort.length > 0
         || state.filters.some((entry) => entry.enabled);
     const controls_disabled = disabled || pending || column_names.length === 0;
+    const disabled_reason_id = disabled && disabled_reason
+        ? 'transform-disabled-reason'
+        : undefined;
 
     return (
         <div className="transform-controls">
@@ -60,6 +63,9 @@ export function TransformControls({
                     className={`toggle ${state.sort.length > 0 ? 'active' : ''}`}
                     disabled={controls_disabled}
                     title={disabled ? disabled_reason : undefined}
+                    aria-expanded={editor === 'sort'}
+                    aria-controls="transform-sort-editor"
+                    aria-describedby={disabled_reason_id}
                     onClick={() => set_editor(editor === 'sort' ? null : 'sort')}
                 >
                     Sort
@@ -69,6 +75,9 @@ export function TransformControls({
                     className={`toggle ${state.filters.some((entry) => entry.enabled) ? 'active' : ''}`}
                     disabled={controls_disabled}
                     title={disabled ? disabled_reason : undefined}
+                    aria-expanded={editor === 'filter'}
+                    aria-controls="transform-filter-editor"
+                    aria-describedby={disabled_reason_id}
                     onClick={() => set_editor(editor === 'filter' ? null : 'filter')}
                 >
                     Filter
@@ -86,7 +95,10 @@ export function TransformControls({
                     </>
                 )}
                 {disabled && disabled_reason && (
-                    <span className="transform-disabled-reason">
+                    <span
+                        id="transform-disabled-reason"
+                        className="transform-disabled-reason"
+                    >
                         {disabled_reason}
                     </span>
                 )}
@@ -116,6 +128,7 @@ export function TransformControls({
                                 type="button"
                                 disabled={pending}
                                 title="Flip direction"
+                                aria-label={`Sort priority ${index + 1} on ${column_names[key.colIndex]}, ${key.direction === 'asc' ? 'ascending' : 'descending'}; change to ${key.direction === 'asc' ? 'descending' : 'ascending'}`}
                                 onClick={() => on_change({
                                     ...state,
                                     sort: state.sort.map((candidate, i) => i === index
@@ -165,6 +178,8 @@ export function TransformControls({
                             <button
                                 type="button"
                                 disabled={pending}
+                                aria-pressed={entry.enabled}
+                                aria-label={`Toggle filter: ${filter_summary(entry, column_names)}`}
                                 onClick={() => on_change({
                                     ...state,
                                     filters: state.filters.map((candidate) =>
@@ -218,6 +233,7 @@ export function TransformControls({
             {editor === 'filter' && !controls_disabled && (
                 <FilterEditor
                     column_names={column_names}
+                    filters={state.filters}
                     on_apply={(entry) => {
                         on_change({
                             ...state,
@@ -247,12 +263,21 @@ function SortEditor({
     on_apply: (colIndex: number, direction: SortDirection) => void;
     on_cancel: () => void;
 }): React.JSX.Element {
+    const sorted_columns = useMemo(
+        () => new Set(state.sort.map((key) => key.colIndex)),
+        [state.sort],
+    );
     const first_available = column_names.findIndex((_, index) =>
-        !state.sort.some((key) => key.colIndex === index));
+        !sorted_columns.has(index));
     const [column, set_column] = useState(first_available >= 0 ? first_available : 0);
     const [direction, set_direction] = useState<SortDirection>('asc');
     return (
-        <div className="transform-editor" role="dialog" aria-label="Add sort key">
+        <div
+            id="transform-sort-editor"
+            className="transform-editor"
+            role="dialog"
+            aria-label="Add sort key"
+        >
             <label>
                 Column
                 <select value={column} onChange={(event) => set_column(Number(event.target.value))}>
@@ -279,27 +304,38 @@ function SortEditor({
 
 function FilterEditor({
     column_names,
+    filters,
     on_apply,
     on_cancel,
 }: {
     column_names: string[];
+    filters: FilterEntry[];
     on_apply: (entry: FilterEntry) => void;
     on_cancel: () => void;
 }): React.JSX.Element {
-    const [column, set_column] = useState(0);
-    const [operator, set_operator] = useState<FilterOperator>('contains');
-    const [value, set_value] = useState('');
-    const [second_value, set_second_value] = useState('');
-    const [case_sensitive, set_case_sensitive] = useState(false);
-    const needs_value = operator !== 'isEmpty' && operator !== 'isNotEmpty';
-    const can_apply = !needs_value || value.length > 0;
-    const id = useMemo(() => new_filter_id(), []);
+    const [draft, set_draft] = useState<FilterEntry>(
+        () => filter_draft_for_column(0, filters),
+    );
+    const needs_value = draft.operator !== 'isEmpty'
+        && draft.operator !== 'isNotEmpty';
+    const can_apply = !needs_value || (draft.value ?? '').length > 0;
 
     return (
-        <div className="transform-editor" role="dialog" aria-label="Add filter">
+        <div
+            id="transform-filter-editor"
+            className="transform-editor"
+            role="dialog"
+            aria-label="Add filter"
+        >
             <label>
                 Column
-                <select value={column} onChange={(event) => set_column(Number(event.target.value))}>
+                <select
+                    value={draft.colIndex}
+                    onChange={(event) => {
+                        const colIndex = Number(event.target.value);
+                        set_draft(filter_draft_for_column(colIndex, filters));
+                    }}
+                >
                     {column_names.map((name, index) => (
                         <option value={index} key={index}>{name}</option>
                     ))}
@@ -308,8 +344,11 @@ function FilterEditor({
             <label>
                 Condition
                 <select
-                    value={operator}
-                    onChange={(event) => set_operator(event.target.value as FilterOperator)}
+                    value={draft.operator}
+                    onChange={(event) => set_draft({
+                        ...draft,
+                        operator: event.target.value as FilterOperator,
+                    })}
                 >
                     {FILTER_OPTIONS.map((option) => (
                         <option value={option.value} key={option.value}>{option.label}</option>
@@ -319,40 +358,53 @@ function FilterEditor({
             {needs_value && (
                 <input
                     aria-label="Filter value"
-                    value={value}
+                    value={draft.value ?? ''}
                     placeholder="Value"
-                    onChange={(event) => set_value(event.target.value)}
+                    onChange={(event) => set_draft({
+                        ...draft,
+                        value: event.target.value,
+                    })}
                 />
             )}
-            {operator === 'between' && (
+            {draft.operator === 'between' && (
                 <input
                     aria-label="Second filter value"
-                    value={second_value}
+                    value={draft.secondValue ?? ''}
                     placeholder="Upper value"
-                    onChange={(event) => set_second_value(event.target.value)}
+                    onChange={(event) => set_draft({
+                        ...draft,
+                        secondValue: event.target.value,
+                    })}
                 />
             )}
             {needs_value && (
                 <label className="transform-checkbox">
                     <input
                         type="checkbox"
-                        checked={case_sensitive}
-                        onChange={(event) => set_case_sensitive(event.target.checked)}
+                        checked={draft.caseSensitive}
+                        onChange={(event) => set_draft({
+                            ...draft,
+                            caseSensitive: event.target.checked,
+                        })}
                     />
                     Case sensitive
                 </label>
             )}
             <button
                 type="button"
-                disabled={!can_apply || (operator === 'between' && second_value.length === 0)}
+                disabled={
+                    !can_apply
+                    || (
+                        draft.operator === 'between'
+                        && (draft.secondValue ?? '').length === 0
+                    )
+                }
                 onClick={() => on_apply({
-                    id,
-                    colIndex: column,
-                    operator,
-                    value: needs_value ? value : undefined,
-                    secondValue: operator === 'between' ? second_value : undefined,
-                    caseSensitive: case_sensitive,
-                    enabled: true,
+                    ...draft,
+                    value: needs_value ? draft.value : undefined,
+                    secondValue: draft.operator === 'between'
+                        ? draft.secondValue
+                        : undefined,
                 })}
             >
                 Apply
@@ -360,6 +412,29 @@ function FilterEditor({
             <button type="button" onClick={on_cancel}>Cancel</button>
         </div>
     );
+}
+
+function filter_draft_for_column(
+    colIndex: number,
+    filters: FilterEntry[],
+): FilterEntry {
+    const existing = filters.find((entry) => entry.colIndex === colIndex);
+    if (existing) {
+        return {
+            ...existing,
+            value: existing.value ?? '',
+            secondValue: existing.secondValue ?? '',
+        };
+    }
+    return {
+        id: new_filter_id(),
+        colIndex,
+        operator: 'contains',
+        value: '',
+        secondValue: '',
+        caseSensitive: false,
+        enabled: true,
+    };
 }
 
 function filter_summary(entry: FilterEntry, names: string[]): string {

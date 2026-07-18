@@ -15,8 +15,39 @@ function make_page(start: number, count: number, cols = 2): (RenderedCell | null
     );
 }
 
-function row_data(sheetIndex: number, startRow: number, generation: number, count = PAGE_SIZE): RowData {
-    return { type: 'rowData', sheetIndex, startRow, rows: make_page(startRow, count), requestId: 'x', generation };
+function row_data(
+    sheetIndex: number,
+    startRow: number,
+    generation: number,
+    requestId: string,
+    count = PAGE_SIZE,
+): RowData {
+    return { type: 'rowData', sheetIndex, startRow, rows: make_page(startRow, count), requestId, generation };
+}
+
+function last_request(post: ReturnType<typeof vi.fn>, startRow?: number): RequestRows {
+    const requests = post.mock.calls.map((call) => call[0] as RequestRows);
+    const request = startRow === undefined
+        ? requests.at(-1)
+        : [...requests].reverse().find((candidate) => candidate.startRow === startRow);
+    if (!request) throw new Error(`No row request${startRow === undefined ? '' : ` for ${startRow}`}`);
+    return request;
+}
+
+function reply_for(
+    post: ReturnType<typeof vi.fn>,
+    sheetIndex: number,
+    startRow: number,
+    generation: number,
+    count = PAGE_SIZE,
+): RowData {
+    return row_data(
+        sheetIndex,
+        startRow,
+        generation,
+        last_request(post, startRow).requestId,
+        count,
+    );
 }
 
 describe('RowLoader', () => {
@@ -57,7 +88,7 @@ describe('RowLoader', () => {
         const loader = new RowLoader(post, on_change);
         loader.configure(0, 1000, 1);
         loader.ensure_rows(0, 10);
-        expect(loader.on_row_data(row_data(0, 0, 1))).toBe(true);
+        expect(loader.on_row_data(reply_for(post, 0, 0, 1))).toBe(true);
         expect(on_change).toHaveBeenCalledTimes(1);
         expect(loader.get_row(5)?.[1]?.raw).toBe('r5c1');
         // Already cached: a repeat ensure must not post again.
@@ -71,7 +102,7 @@ describe('RowLoader', () => {
         const loader = new RowLoader(post, on_change);
         loader.configure(0, 1000, 2);
         loader.ensure_rows(0, 10);
-        expect(loader.on_row_data(row_data(0, 0, 1))).toBe(false); // gen 1 != 2
+        expect(loader.on_row_data(row_data(0, 0, 1, last_request(post).requestId))).toBe(false); // gen 1 != 2
         expect(on_change).not.toHaveBeenCalled();
         expect(loader.get_row(0)).toBeUndefined();
     });
@@ -80,7 +111,8 @@ describe('RowLoader', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});
         loader.configure(1, 1000, 1);
-        expect(loader.on_row_data(row_data(0, 0, 1))).toBe(false);
+        loader.ensure_rows(0, 10);
+        expect(loader.on_row_data(row_data(0, 0, 1, last_request(post).requestId))).toBe(false);
         expect(loader.get_row(0)).toBeUndefined();
     });
 
@@ -89,7 +121,7 @@ describe('RowLoader', () => {
         const loader = new RowLoader(post, () => {});
         loader.configure(0, 1000, 1);
         loader.ensure_rows(0, 10);
-        loader.on_row_data(row_data(0, 0, 1));
+        loader.on_row_data(reply_for(post, 0, 0, 1));
         expect(loader.get_row(0)).toBeDefined();
 
         loader.configure(1, 1000, 1); // sheet switch
@@ -104,7 +136,7 @@ describe('RowLoader', () => {
         const loader = new RowLoader(post, () => {});
         loader.configure(0, 1000, 1);
         loader.ensure_rows(0, 10);
-        loader.on_row_data(row_data(0, 0, 1));
+        loader.on_row_data(reply_for(post, 0, 0, 1));
         expect(loader.get_row(0)).toBeDefined();
 
         loader.configure(0, 1000, 2); // reload bumps generation
@@ -117,7 +149,7 @@ describe('RowLoader', () => {
         loader.configure(0, 10_000, 1);
         // User scrolled past page 0: the visible region sits on rows ~500-540.
         loader.ensure_rows(500, 540);
-        loader.on_row_data(row_data(0, 500, 1));
+        loader.on_row_data(reply_for(post, 0, 500, 1));
         expect(loader.get_row(510)).toBeDefined();
         post.mockClear();
 
@@ -147,7 +179,7 @@ describe('RowLoader', () => {
         // Load pages 0,100,200,300 while keeping the viewport on the last one.
         for (const start of [0, 100, 200, 300]) {
             loader.ensure_rows(start, start + 10);
-            loader.on_row_data(row_data(0, start, 1));
+            loader.on_row_data(reply_for(post, 0, start, 1));
         }
         expect(loader.page_count).toBe(3);
         // Page 0 (oldest, not in viewport) was evicted.
@@ -167,10 +199,11 @@ describe('RowLoader', () => {
 
     describe('sample_loaded_rows', () => {
         it('returns resident rows, capped at max', () => {
-            const loader = new RowLoader(vi.fn(), () => {});
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
             loader.configure(0, 1000, 1);
             loader.ensure_rows(0, 10);
-            loader.on_row_data(row_data(0, 0, 1));
+            loader.on_row_data(reply_for(post, 0, 0, 1));
             const sample = loader.sample_loaded_rows(5);
             expect(sample.length).toBe(5);
             expect(sample[0]?.[0]?.raw).toBe('r0c0');
@@ -183,23 +216,70 @@ describe('RowLoader', () => {
         });
 
         it('excludes rows past row_count in a partial final page', () => {
-            const loader = new RowLoader(vi.fn(), () => {});
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
             loader.configure(0, 3, 1); // only 3 rows, but a full page is delivered
             loader.ensure_rows(0, 2);
-            loader.on_row_data(row_data(0, 0, 1));
+            loader.on_row_data(reply_for(post, 0, 0, 1));
             expect(loader.sample_loaded_rows(100).length).toBe(3);
         });
 
         it('draws from multiple resident pages', () => {
-            const loader = new RowLoader(vi.fn(), () => {});
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
             loader.configure(0, 100_000, 1);
             loader.ensure_rows(0, 10);
-            loader.on_row_data(row_data(0, 0, 1));
+            loader.on_row_data(reply_for(post, 0, 0, 1));
             loader.ensure_rows(PAGE_SIZE, PAGE_SIZE + 10);
-            loader.on_row_data(row_data(0, PAGE_SIZE, 1));
+            loader.on_row_data(reply_for(post, 0, PAGE_SIZE, 1));
             // Ask for more than one page's worth so the second page contributes.
             const sample = loader.sample_loaded_rows(PAGE_SIZE + 5);
             expect(sample.length).toBe(PAGE_SIZE + 5);
         });
+    });
+
+    it('rejects a stale same-generation reply after clear and re-request', () => {
+        const post = vi.fn();
+        const on_change = vi.fn();
+        const loader = new RowLoader(post, on_change);
+        loader.configure(0, 1000, 1);
+        loader.ensure_rows(0, 10);
+        const stale = last_request(post);
+
+        loader.clear();
+        loader.ensure_rows(0, 10);
+        const current = last_request(post);
+        expect(current.requestId).not.toBe(stale.requestId);
+
+        expect(loader.on_row_data(row_data(0, 0, 1, stale.requestId))).toBe(false);
+        expect(loader.get_row(0)).toBeUndefined();
+        expect(on_change).not.toHaveBeenCalled();
+
+        expect(loader.on_row_data(row_data(0, 0, 1, current.requestId))).toBe(true);
+        expect(loader.get_row(0)).toBeDefined();
+    });
+
+    it('uses request identities unique across loader instances', () => {
+        const first_post = vi.fn();
+        const first = new RowLoader(first_post, vi.fn());
+        first.configure(0, 1000, 1);
+        first.ensure_rows(0, 10);
+        const first_request = last_request(first_post);
+
+        const second_post = vi.fn();
+        const second = new RowLoader(second_post, vi.fn());
+        second.configure(0, 1000, 1);
+        second.ensure_rows(0, 10);
+        const second_request = last_request(second_post);
+
+        expect(second_request.requestId).not.toBe(first_request.requestId);
+        expect(second.on_row_data(row_data(0, 0, 1, first_request.requestId))).toBe(false);
+        expect(second.on_row_data(row_data(0, 0, 1, second_request.requestId))).toBe(true);
+    });
+
+    it('rejects unsolicited same-sheet same-generation row data', () => {
+        const loader = new RowLoader(vi.fn(), vi.fn());
+        loader.configure(0, 1000, 1);
+        expect(loader.on_row_data(row_data(0, 0, 1, 'unsolicited'))).toBe(false);
     });
 });

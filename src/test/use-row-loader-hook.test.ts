@@ -4,7 +4,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PAGE_SIZE } from '../webview/grid-model';
-import type { HostMessage } from '../types';
+import type { HostMessage, WebviewMessage } from '../types';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -13,22 +13,27 @@ let container: HTMLDivElement | null = null;
 let hook_result: Awaited<ReturnType<typeof load_hook>>['result'] | null = null;
 
 async function load_hook() {
+    const postMessage = vi.fn();
     vi.stubGlobal('acquireVsCodeApi', () => ({
-        postMessage: vi.fn(),
+        postMessage,
         getState: vi.fn(),
         setState: vi.fn(),
     }));
     const { use_row_loader } = await import('../webview/use-row-loader');
-    return { use_row_loader, result: null as ReturnType<typeof use_row_loader> | null };
+    return {
+        use_row_loader,
+        postMessage,
+        result: null as ReturnType<typeof use_row_loader> | null,
+    };
 }
 
-function row_data(startRow: number, generation: number): HostMessage {
+function row_data(startRow: number, generation: number, requestId: string): HostMessage {
     return {
         type: 'rowData',
         sheetIndex: 0,
         startRow,
         rows: Array.from({ length: PAGE_SIZE }, () => []),
-        requestId: 'x',
+        requestId,
         generation,
     };
 }
@@ -47,7 +52,7 @@ afterEach(() => {
 
 describe('use_row_loader', () => {
     it('keeps row access callback identities stable across page-load re-renders', async () => {
-        const { use_row_loader } = await load_hook();
+        const { use_row_loader, postMessage } = await load_hook();
 
         function Harness() {
             hook_result = use_row_loader(0, 10_000, 1);
@@ -64,9 +69,15 @@ describe('use_row_loader', () => {
 
         const first = hook_result!;
         first.ensure_rows(500, 540);
+        const request = postMessage.mock.calls.at(-1)?.[0] as
+            | Extract<WebviewMessage, { type: 'requestRows' }>
+            | undefined;
+        expect(request?.type).toBe('requestRows');
 
         await act(async () => {
-            window.dispatchEvent(new MessageEvent('message', { data: row_data(500, 1) }));
+            window.dispatchEvent(new MessageEvent('message', {
+                data: row_data(500, 1, request!.requestId),
+            }));
         });
 
         expect(hook_result!.version).toBeGreaterThan(first.version);

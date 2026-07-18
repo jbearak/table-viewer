@@ -5,6 +5,8 @@ import { PAGE_SIZE, get_needed_page_starts } from './grid-model';
 type PostFn = (msg: WebviewMessage) => void;
 type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
 
+let next_loader_id = 0;
+
 /**
  * Demand-paged row store for the Glide grid. Pure (no React, no vscode import):
  * `post` and `on_change` are injected, so the whole fetch/cache/generation/LRU
@@ -20,7 +22,8 @@ type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
  */
 export class RowLoader {
     private readonly pages = new Map<number, (RenderedCell | null)[][]>();
-    private readonly pending = new Set<number>();
+    private readonly pending = new Map<number, string>();
+    private readonly loader_id = ++next_loader_id;
     private _generation = 1;
     private sheet_index = 0;
     private row_count = 0;
@@ -82,13 +85,14 @@ export class RowLoader {
                 continue;
             }
             if (this.pending.has(start)) continue;
-            this.pending.add(start);
+            const request_id = `${this.loader_id}:${this.sheet_index}:${start}:${++this.req_seq}`;
+            this.pending.set(start, request_id);
             this.post({
                 type: 'requestRows',
                 sheetIndex: this.sheet_index,
                 startRow: start,
                 count: PAGE_SIZE,
-                requestId: `${this.sheet_index}:${start}:${++this.req_seq}`,
+                requestId: request_id,
                 generation: this._generation,
             });
         }
@@ -99,6 +103,7 @@ export class RowLoader {
         if (msg.generation !== this._generation) return false;
         if (msg.sheetIndex !== this.sheet_index) return false;
         const start = msg.startRow;
+        if (this.pending.get(start) !== msg.requestId) return false;
         this.pending.delete(start);
         this.pages.delete(start); // re-insert to mark most-recently-used
         this.pages.set(start, msg.rows);

@@ -217,6 +217,7 @@ function sheet_meta_message(
         state: {},
         defaultTabOrientation: 'horizontal',
         generation: 1,
+        sourceGeneration: 1,
         ...extra,
     };
 }
@@ -229,6 +230,7 @@ function meta_reload_message(
         type: 'metaReload',
         meta,
         generation: 2,
+        sourceGeneration: 2,
         ...extra,
     };
 }
@@ -860,6 +862,7 @@ describe('sorting and filtering', () => {
             .find((message) => message.type === 'setTransform');
         expect(request).toBeDefined();
 
+        post_message.mockClear();
         await dispatch_host_message({
             type: 'transformApplied',
             sheetIndex: 0,
@@ -867,9 +870,14 @@ describe('sorting and filtering', () => {
             rowCount: 2,
             requestId: request.requestId,
             generation: 2,
+            sourceGeneration: 1,
+            intent: request.intent,
         });
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .some((message) => message.type === 'stateChanged')).toBe(false);
     });
 
     it('lets the user cancel a pending saved transform and forgets it', async () => {
@@ -903,6 +911,8 @@ describe('sorting and filtering', () => {
             rowCount: 1,
             requestId: cancel_request.requestId,
             generation: 2,
+            sourceGeneration: 1,
+            intent: cancel_request.intent,
         });
         expect(document.body.textContent).not.toContain('Sort:');
     });
@@ -962,6 +972,8 @@ describe('sorting and filtering', () => {
             rowCount: 2,
             requestId: request.requestId,
             generation: 2,
+            sourceGeneration: 1,
+            intent: request.intent,
         });
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
@@ -986,6 +998,8 @@ describe('sorting and filtering', () => {
             rowCount: 3,
             requestId: disable_request.requestId,
             generation: 3,
+            sourceGeneration: 1,
+            intent: disable_request.intent,
         });
         expect(document.body.textContent).toContain('✗');
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
@@ -1005,6 +1019,8 @@ describe('sorting and filtering', () => {
             rowCount: 2,
             requestId: enable_request.requestId,
             generation: 4,
+            sourceGeneration: 1,
+            intent: enable_request.intent,
         });
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
 
@@ -1026,6 +1042,8 @@ describe('sorting and filtering', () => {
             rowCount: 3,
             requestId: clear_request.requestId,
             generation: 5,
+            sourceGeneration: 1,
+            intent: clear_request.intent,
         });
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
