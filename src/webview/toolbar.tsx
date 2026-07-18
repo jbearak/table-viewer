@@ -4,6 +4,10 @@ import React, {
     useRef,
     useState,
 } from 'react';
+import {
+    ColumnVisibilityControl,
+    type ColumnVisibilityControlProps,
+} from './column-visibility-control';
 
 interface ToolbarProps {
     show_formatting: boolean;
@@ -12,6 +16,7 @@ interface ToolbarProps {
     vertical_tabs: boolean;
     on_toggle_tab_orientation: () => void;
     show_vertical_tabs_button: boolean;
+    column_visibility: ColumnVisibilityControlProps;
     auto_fit_active: boolean;
     on_toggle_auto_fit: () => void;
     auto_fit_disabled?: boolean;
@@ -31,6 +36,7 @@ export function Toolbar({
     vertical_tabs,
     on_toggle_tab_orientation,
     show_vertical_tabs_button,
+    column_visibility,
     auto_fit_active,
     on_toggle_auto_fit,
     auto_fit_disabled = false,
@@ -69,6 +75,7 @@ export function Toolbar({
                     onClick={on_toggle_tab_orientation}
                 />
             )}
+            <ColumnVisibilityControl {...column_visibility} />
             <ToolbarButton
                 label="Auto-fit Columns"
                 active={auto_fit_active}
@@ -177,18 +184,25 @@ function ToolbarButton({
     }, [show_tooltip]);
 
     return (
-        <div className="toolbar-item">
+        <div
+            className="toolbar-item"
+            tabIndex={disabled ? 0 : undefined}
+            role={disabled ? 'group' : undefined}
+            aria-label={disabled ? label : undefined}
+            aria-disabled={disabled || undefined}
+            aria-describedby={disabled && show_tooltip ? tooltip_id : undefined}
+            onMouseEnter={() => set_is_hovered(true)}
+            onMouseLeave={() => set_is_hovered(false)}
+            onFocus={() => set_is_focused(true)}
+            onBlur={() => set_is_focused(false)}
+        >
             <button
                 ref={button_ref}
                 type="button"
                 className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
                 disabled={disabled}
                 onClick={(e) => { set_is_hovered(false); if (e.nativeEvent instanceof PointerEvent) button_ref.current?.blur(); onClick(); }}
-                onMouseOver={() => set_is_hovered(true)}
-                onMouseOut={() => set_is_hovered(false)}
-                onFocus={() => set_is_focused(true)}
-                onBlur={() => set_is_focused(false)}
-                aria-describedby={show_tooltip ? tooltip_id : undefined}
+                aria-describedby={!disabled && show_tooltip ? tooltip_id : undefined}
             >
                 {label}
             </button>

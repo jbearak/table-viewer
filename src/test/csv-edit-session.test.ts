@@ -110,6 +110,36 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    it('does not resurrect cleared pending edits from a later visibility snapshot', async () => {
+        const file_path = '/tmp/cleared-edits-visibility.csv';
+        const restored = { '0:0': { value: 'draft', base: 'a' } };
+        const state = state_store({ pendingEdits: restored });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(panel).at(-1)?.granted).toBe(true);
+
+        await panel.__receive({ type: 'pendingEditsChanged', edits: null } as never);
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        await panel.__receive({
+            type: 'stateChanged',
+            state: {
+                pendingEdits: restored,
+                columnVisibility: [{
+                    hiddenColumns: [0],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        } as never);
+
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(state.get_state(file_path).columnVisibility).toEqual([{
+            hiddenColumns: [0],
+            schema: '["Sheet1",1,null]',
+        }]);
+    });
+
     it('durably removes host-owned transforms that no longer match the source schema', async () => {
         const file_path = '/tmp/stale-transform-schema.csv';
         const stale_transform = {

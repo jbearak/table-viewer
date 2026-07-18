@@ -25,6 +25,17 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         vertical_tabs: false,
         on_toggle_tab_orientation,
         show_vertical_tabs_button: true,
+        column_visibility: {
+            options: [
+                { source_index: 0, display_name: 'Name', source_letter: 'A' },
+                { source_index: 1, display_name: 'Value', source_letter: 'B' },
+            ],
+            hidden_columns: [],
+            reset_key: 'sheet-1',
+            on_toggle: vi.fn(),
+            on_show_all: vi.fn(),
+            on_hide_all: vi.fn(),
+        },
         auto_fit_active: false,
         on_toggle_auto_fit: vi.fn(),
         edit_mode: false,
@@ -186,6 +197,30 @@ describe('Toolbar', () => {
         expect(get_tooltip()).toBeNull();
     });
 
+    it('renders the Columns trigger with dialog semantics and a hidden-count badge', () => {
+        render_toolbar({
+            column_visibility: {
+                options: [
+                    { source_index: 0, display_name: 'Name', source_letter: 'A' },
+                    { source_index: 1, display_name: 'Value', source_letter: 'B' },
+                ],
+                hidden_columns: [1],
+                reset_key: 'sheet-1',
+                on_toggle: vi.fn(),
+                on_show_all: vi.fn(),
+                on_hide_all: vi.fn(),
+            },
+        });
+
+        const columns = document.querySelector<HTMLButtonElement>(
+            '.column-visibility-trigger',
+        )!;
+        expect(columns.getAttribute('aria-haspopup')).toBe('dialog');
+        expect(columns.getAttribute('aria-expanded')).toBe('false');
+        expect(columns.getAttribute('aria-label')).toContain('1 column hidden');
+        expect(columns.querySelector('.hidden-count-badge')?.textContent).toBe('1');
+    });
+
     it('renders the Auto-fit Columns button and calls on_toggle_auto_fit on click', () => {
         const on_toggle_auto_fit = vi.fn();
         render_toolbar({
@@ -226,6 +261,31 @@ describe('Toolbar', () => {
         dispatch_mouse_event(auto_fit, 'mouseover');
         expect(get_tooltip()?.textContent).toBe(
             'Auto-fit all columns to their content.'
+        );
+    });
+
+    it('shows the disabled Auto-fit recovery reason from the toolbar wrapper', () => {
+        render_toolbar({
+            auto_fit_disabled: true,
+            auto_fit_disabled_reason: 'Show at least one column before using auto-fit.',
+        });
+
+        const auto_fit = get_button('Auto-fit Columns');
+        const wrapper = auto_fit.closest<HTMLElement>('.toolbar-item')!;
+        expect(auto_fit.disabled).toBe(true);
+        expect(wrapper.tabIndex).toBe(0);
+        expect(wrapper.getAttribute('aria-disabled')).toBe('true');
+        dispatch_mouse_event(auto_fit, 'mouseover');
+        expect(get_tooltip()?.textContent).toBe(
+            'Show at least one column before using auto-fit.',
+        );
+        dispatch_mouse_event(auto_fit, 'mouseout');
+        act(() => wrapper.focus());
+        expect(get_tooltip()?.textContent).toBe(
+            'Show at least one column before using auto-fit.',
+        );
+        expect(wrapper.getAttribute('aria-describedby')).toBe(
+            get_tooltip()?.id,
         );
     });
 

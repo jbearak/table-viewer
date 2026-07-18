@@ -15,6 +15,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
+    commit_live_edit: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
 }));
 
@@ -45,6 +46,7 @@ vi.mock('../webview/grid-shell', () => ({
                 request_save: () => boolean;
                 clear_dirty: () => void;
                 discard_conflicted: () => void;
+                commit_live_edit: () => void;
                 has_uncommitted_changes: () => boolean;
             } | null;
         };
@@ -72,6 +74,7 @@ vi.mock('../webview/grid-shell', () => ({
                 request_save: grid_shell_mock.request_save,
                 clear_dirty: grid_shell_mock.clear_dirty,
                 discard_conflicted: grid_shell_mock.discard_conflicted,
+                commit_live_edit: grid_shell_mock.commit_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
         }
@@ -181,6 +184,20 @@ async function click_button(label: string) {
     });
 }
 
+function columns_trigger(): HTMLButtonElement {
+    const trigger = document.querySelector<HTMLButtonElement>(
+        '.column-visibility-trigger',
+    );
+    expect(trigger).not.toBeNull();
+    return trigger!;
+}
+
+async function open_columns() {
+    await act(async () => columns_trigger().click());
+    expect(document.querySelector('[role="dialog"][aria-label="Choose visible columns"]'))
+        .not.toBeNull();
+}
+
 async function enter_edit_mode(post_message: ReturnType<typeof vi.fn>) {
     await click_button('Edit');
     expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
@@ -259,6 +276,7 @@ function cleanup() {
     grid_shell_mock.request_save.mockReturnValue(false);
     grid_shell_mock.clear_dirty.mockReset();
     grid_shell_mock.discard_conflicted.mockReset();
+    grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -487,6 +505,148 @@ describe('column visibility projection', () => {
         }));
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([]);
     });
+
+    it('toggles and restores source columns with immediate per-sheet persistence only', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1', 'Sheet2']);
+        meta.sheets[0].columnCount = 3;
+        meta.sheets[0].columnNames = ['Name', 'Value', 'Notes'];
+        meta.sheets[1].columnCount = 2;
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnVisibility: [undefined, {
+                    hiddenColumns: [1],
+                    schema: '["Sheet2",2,null]',
+                }],
+            },
+        }));
+        post_message.mockClear();
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+        const generation = grid_stub().getAttribute('data-generation');
+
+        await open_columns();
+        const value_checkbox = document.querySelector<HTMLInputElement>(
+            'input[aria-label^="Hide Value;"]',
+        )!;
+        await act(async () => value_checkbox.click());
+
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 2]);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation);
+        expect(columns_trigger().querySelector('.hidden-count-badge')?.textContent)
+            .toBe('1');
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        const state_messages = post_message.mock.calls
+            .map((call) => call[0])
+            .filter((message) => message.type === 'stateChanged');
+        expect(state_messages).toHaveLength(1);
+        expect(state_messages[0].state.columnVisibility).toEqual([
+            {
+                hiddenColumns: [1],
+                schema: '["Sheet1",3,["Name","Value","Notes"]]',
+            },
+            {
+                hiddenColumns: [1],
+                schema: '["Sheet2",2,null]',
+            },
+        ]);
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder.at(-1))
+            .toBeLessThan(post_message.mock.invocationCallOrder.at(-1)!);
+
+        post_message.mockClear();
+        await click_button('Show all');
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 1, 2]);
+        expect(columns_trigger().querySelector('.hidden-count-badge')).toBeNull();
+        const restored = post_message.mock.calls.at(-1)![0];
+        expect(restored.type).toBe('stateChanged');
+        expect(restored.state.columnVisibility).toEqual([
+            undefined,
+            {
+                hiddenColumns: [1],
+                schema: '["Sheet2",2,null]',
+            },
+        ]);
+    });
+
+    it('hides every column, preserves fitted widths, and disables auto-fit until recovery', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 120, 1: 220 };
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 2;
+        meta.sheets[0].columnNames = ['First', 'Second'];
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: { columnWidths: [{ 0: 80, 1: 90 }] },
+        }));
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({
+            0: 120,
+            1: 220,
+        });
+
+        post_message.mockClear();
+        await open_columns();
+        await click_button('Hide all');
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([]);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({
+            0: 120,
+            1: 220,
+        });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(get_button('Auto-fit Columns').disabled).toBe(true);
+        expect(columns_trigger().disabled).toBe(false);
+        expect(columns_trigger().querySelector('.hidden-count-badge')?.textContent)
+            .toBe('2');
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+
+        await click_button('Show all');
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
+            .toEqual([0, 1]);
+        expect(get_button('Auto-fit Columns').disabled).toBe(false);
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('keeps Columns available in preview, edit-session pending, edit, and transform-pending states', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Preview']), {
+            previewMode: true,
+        }));
+        expect(columns_trigger().disabled).toBe(false);
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Editable'], false), {
+            csvEditable: true,
+            csvEditingSupported: true,
+            generation: 2,
+        }));
+        expect(columns_trigger().disabled).toBe(false);
+        await click_button('Edit');
+        expect(columns_trigger().disabled).toBe(false);
+        await dispatch_host_message({ type: 'editSessionResult', granted: true });
+        expect(columns_trigger().disabled).toBe(false);
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Pending']), {
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Pending",1,null]',
+                }],
+            },
+            generation: 3,
+        }));
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(true);
+        expect(columns_trigger().disabled).toBe(false);
+    });
 });
 
 describe('row height persistence', () => {
@@ -553,6 +713,30 @@ describe('merges', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
             .toEqual({ 0: 48 });
         expect(document.body.textContent).toContain('Merged cells shown unmerged');
+    });
+
+    it('flattens merges on hide and restores them on Show all', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 2;
+        meta.sheets[0].columnNames = ['Left', 'Right'];
+        meta.sheets[0].merges = [
+            { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+        ];
+        await dispatch_host_message(sheet_meta_message(meta));
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+
+        await open_columns();
+        const right = document.querySelector<HTMLInputElement>(
+            'input[aria-label^="Hide Right;"]',
+        )!;
+        await act(async () => right.click());
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
+        expect(document.body.textContent).toContain('Merged cells shown unmerged');
+
+        await click_button('Show all');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(document.body.textContent).not.toContain('Merged cells shown unmerged');
     });
 });
 

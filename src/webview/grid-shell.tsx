@@ -105,6 +105,8 @@ export interface EditingHandle {
     clear_dirty(): void;
     /** Drop only edits whose underlying cell drifted (conflict resolution). */
     discard_conflicted(): void;
+    /** Snapshot the current Glide overlay into the source-keyed dirty map. */
+    commit_live_edit(): void;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
 }
@@ -326,6 +328,30 @@ export function GridShell({
         overlay_ref.current?.repaint();
     }, [column_projection, display_column_count]);
 
+    // Hide-all removes only Glide's DataEditor, not GridShell. Preserve the last
+    // visible display location and restore it when any columns become visible again.
+    const previous_has_visible_columns_ref = useRef(has_visible_columns);
+    useEffect(() => {
+        const previously_visible = previous_has_visible_columns_ref.current;
+        previous_has_visible_columns_ref.current = has_visible_columns;
+        if (
+            previously_visible
+            || !has_visible_columns
+            || row_count <= 0
+            || visible_ref.current.width <= 0
+            || visible_ref.current.height <= 0
+        ) {
+            return;
+        }
+        grid_ref.current?.scrollTo(
+            Math.min(
+                Math.max(0, visible_ref.current.x),
+                display_column_count - 1,
+            ),
+            Math.min(Math.max(0, visible_ref.current.y), row_count - 1),
+        );
+    }, [display_column_count, has_visible_columns, row_count]);
+
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
     // selected cell and the live text from the portalled .gdg-clip-region input.
@@ -367,6 +393,15 @@ export function GridShell({
         vscode_api.postMessage({ type: 'saveCsv', edits });
         return true;
     }, [read_live_edit, save_in_flight_ref]);
+
+    const commit_live_edit = useCallback((): void => {
+        const live = read_live_edit();
+        if (!live) return;
+        const [row, source_column] = live.key.split(':').map(Number);
+        if (!Number.isInteger(row) || !Number.isInteger(source_column)) return;
+        commit_edit(row, source_column, live.value);
+        set_live_uncommitted(false);
+    }, [commit_edit, read_live_edit]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
         if (dirty_cells_ref.current.size > 0) return true;
@@ -413,6 +448,7 @@ export function GridShell({
             request_save,
             clear_dirty,
             discard_conflicted,
+            commit_live_edit,
             has_uncommitted_changes,
         };
         return () => {
@@ -423,6 +459,7 @@ export function GridShell({
         request_save,
         clear_dirty,
         discard_conflicted,
+        commit_live_edit,
         has_uncommitted_changes,
     ]);
 
