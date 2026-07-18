@@ -172,6 +172,39 @@ describe('RowLoader', () => {
         expect(post).not.toHaveBeenCalled();
     });
 
+    it('records the viewport without requesting rows while disabled', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 10_000, 1, false);
+        loader.ensure_rows(500, 540);
+        expect(post).not.toHaveBeenCalled();
+
+        loader.configure(0, 10_000, 2, false);
+        expect(post).not.toHaveBeenCalled();
+
+        loader.configure(0, 10_000, 2, true);
+        expect(post).not.toHaveBeenCalled();
+
+        loader.ensure_rows(0, 40);
+        expect(last_request(post).startRow).toBe(0);
+        expect(last_request(post).generation).toBe(2);
+    });
+
+    it('preserves resident rows across disable and re-enable', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 1000, 1);
+        loader.ensure_rows(0, 10);
+        loader.on_row_data(reply_for(post, 0, 0, 1));
+        post.mockClear();
+
+        loader.configure(0, 1000, 1, false);
+        expect(loader.get_row(0)).toBeDefined();
+        loader.configure(0, 1000, 1, true);
+        expect(loader.get_row(0)).toBeDefined();
+        expect(post).not.toHaveBeenCalled();
+    });
+
     it('evicts least-recently-used pages beyond the cap, protecting the viewport', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {}, 3); // cap = 3

@@ -24,12 +24,12 @@ import {
 } from '@glideapps/glide-data-grid';
 import type { SheetMeta } from '../data-source/interface';
 import type { MergeRange } from '../types';
+import type { ColumnProjection } from './column-projection';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     format_selection_tsv,
     copy_truncation_message,
-    type SelectionRect,
 } from './grid-copy-model';
 import { resolve_nav, is_copy_key } from './grid-nav-model';
 import { move_active_cell } from './selection';
@@ -118,6 +118,8 @@ export interface GridShellProps {
     /** True while display rows are a view-only permutation of source rows. */
     transformed?: boolean;
     show_formatting: boolean;
+    column_projection: ColumnProjection;
+    /** Persisted widths keyed by canonical source column. */
     column_widths: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
     row_heights: RowHeightOverrides;
@@ -156,6 +158,7 @@ export function GridShell({
     row_count = sheet_meta.rowCount,
     transformed = false,
     show_formatting,
+    column_projection,
     column_widths,
     on_column_resize,
     row_heights,
@@ -169,7 +172,15 @@ export function GridShell({
     editing_ref,
     auto_fit_ref,
 }: GridShellProps): React.JSX.Element {
-    const loader = use_row_loader(sheet_index, row_count, generation);
+    const visible_source_columns = column_projection.visible_to_source;
+    const display_column_count = visible_source_columns.length;
+    const has_visible_columns = display_column_count > 0;
+    const loader = use_row_loader(
+        sheet_index,
+        row_count,
+        generation,
+        has_visible_columns,
+    );
     const theme = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
@@ -191,15 +202,28 @@ export function GridShell({
         x: number;
         y: number;
         row: number;
-        col: number;
+        display_col: number;
+        source_col: number;
     } | null>(null);
 
     const columns = useMemo<GridColumn[]>(
-        () => build_grid_columns(sheet_meta.columnCount, column_widths, sheet_meta.columnNames),
-        [sheet_meta.columnCount, column_widths, sheet_meta.columnNames],
+        () => build_grid_columns(
+            visible_source_columns,
+            column_widths,
+            sheet_meta.columnNames,
+        ),
+        [visible_source_columns, column_widths, sheet_meta.columnNames],
     );
 
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
+    const source_column_for_display = useCallback(
+        (display_column: number) => visible_source_columns[display_column],
+        [visible_source_columns],
+    );
+    const display_column_for_source = useCallback(
+        (source_column: number) => column_projection.source_to_visible[source_column],
+        [column_projection.source_to_visible],
+    );
 
     const { ensure_rows, get_row, sample_loaded_rows, version } = loader;
     // Values posted in the in-flight save; edit bases use these before reload.
@@ -274,6 +298,33 @@ export function GridShell({
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
+    const previous_projection_ref = useRef(column_projection);
+    useEffect(() => {
+        if (previous_projection_ref.current === column_projection) return;
+        previous_projection_ref.current = column_projection;
+        set_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+        });
+        set_context_menu(null);
+        row_resize_ref.current?.set_target(null);
+        const grid = grid_ref.current;
+        const visible = visible_ref.current;
+        if (grid && visible.width > 0 && visible.height > 0) {
+            const cells: { cell: Item }[] = [];
+            const end_column = Math.min(
+                visible.x + visible.width,
+                display_column_count,
+            );
+            for (let row = visible.y; row < visible.y + visible.height; row++) {
+                for (let col = visible.x; col < end_column; col++) {
+                    cells.push({ cell: [col, row] });
+                }
+            }
+            if (cells.length > 0) grid.updateCells(cells);
+        }
+        overlay_ref.current?.repaint();
+    }, [column_projection, display_column_count]);
 
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
@@ -283,13 +334,15 @@ export function GridShell({
         if (value === null) return null;
         const loc = grid_selection_ref.current.current?.cell;
         if (!loc) return null;
-        const [col, row] = loc;
+        const [display_column, row] = loc;
+        const source_column = source_column_for_display(display_column);
+        if (source_column === undefined) return null;
         return {
-            key: `${row}:${col}`,
+            key: `${row}:${source_column}`,
             value,
-            original: get_cell_raw(row, col) ?? '',
+            original: get_cell_raw(row, source_column) ?? '',
         };
-    }, [get_cell_raw]);
+    }, [get_cell_raw, source_column_for_display]);
 
     // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
     // open and on every keystroke and clears it on close, so the editing-status
@@ -384,6 +437,7 @@ export function GridShell({
     sample_loaded_rows_ref.current = sample_loaded_rows;
 
     const compute_auto_fit = useCallback((): Record<number, number> | null => {
+        if (!has_visible_columns) return null;
         if (!measure_ctx_ref.current) {
             measure_ctx_ref.current = document
                 .createElement('canvas')
@@ -393,15 +447,27 @@ export function GridShell({
         if (!ctx) return null;
         const sample = sample_loaded_rows_ref.current(AUTO_FIT_SAMPLE_ROWS);
         if (sample.length === 0) return null;
-        const cells = sample.map((row) =>
-            row.map((c) => measurable_from_rendered(c, show_formatting)),
-        );
+        const cells = sample.map((row) => {
+            const visible_cells: Partial<Record<number, MeasurableCell | null>> = {};
+            for (const source_column of visible_source_columns) {
+                visible_cells[source_column] = measurable_from_rendered(
+                    row[source_column] ?? null,
+                    show_formatting,
+                );
+            }
+            return visible_cells;
+        });
         const measure = (cell: MeasurableCell): number => {
             ctx.font = canvas_font(cell.bold, cell.italic, font_family);
             return ctx.measureText(cell.text).width;
         };
-        return fit_column_widths(cells, sheet_meta.columnCount, measure);
-    }, [show_formatting, font_family, sheet_meta.columnCount]);
+        return fit_column_widths(cells, visible_source_columns, measure);
+    }, [
+        has_visible_columns,
+        show_formatting,
+        font_family,
+        visible_source_columns,
+    ]);
 
     useEffect(() => {
         if (!auto_fit_ref) return;
@@ -413,8 +479,17 @@ export function GridShell({
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
-            const [col, row] = cell;
-            const key = `${row}:${col}`;
+            const [display_column, row] = cell;
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) {
+                return {
+                    kind: GridCellKind.Text,
+                    data: '',
+                    displayData: '',
+                    allowOverlay: false,
+                };
+            }
+            const key = `${row}:${source_column}`;
             const dirty = dirty_cells_ref.current.get(key);
             // Tint + dirty text whenever an edit exists; open the overlay only in
             // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
@@ -435,7 +510,7 @@ export function GridShell({
             }
             return build_grid_cell(
                 row,
-                col,
+                source_column,
                 get_row(row),
                 merge_index,
                 show_formatting,
@@ -443,17 +518,26 @@ export function GridShell({
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
-        [get_row, show_formatting, version, merge_index, editable_cells],
+        [
+            get_row,
+            show_formatting,
+            version,
+            merge_index,
+            editable_cells,
+            source_column_for_display,
+        ],
     );
 
     // Glide opens its own overlay editor; it reports the committed value here
     // with the cell location, which we fold into the dirty map.
     const on_cell_edited = useCallback(
         (cell: Item, new_value: EditableGridCell) => {
-            const [col, row] = cell;
+            const [display_column, row] = cell;
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return;
             const text =
                 new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
-            commit_edit(row, col, text);
+            commit_edit(row, source_column, text);
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
@@ -462,17 +546,23 @@ export function GridShell({
                 if (needed > row_height(row_heights, row)) {
                     on_row_resize(row, needed);
                     const cells: { cell: Item }[] = [];
-                    for (let c = 0; c < sheet_meta.columnCount; c++) {
-                        cells.push({ cell: [c, row] });
+                    for (let display_column = 0; display_column < display_column_count; display_column++) {
+                        cells.push({ cell: [display_column, row] });
                     }
                     grid_ref.current?.updateCells(cells);
                     overlay_ref.current?.repaint();
                     return;
                 }
             }
-            grid_ref.current?.updateCells([{ cell: [col, row] }]);
+            grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
-        [commit_edit, row_heights, on_row_resize, sheet_meta.columnCount],
+        [
+            commit_edit,
+            row_heights,
+            on_row_resize,
+            display_column_count,
+            source_column_for_display,
+        ],
     );
 
     // Tracking wrapper around the custom CSV editor: it makes the open overlay's
@@ -551,13 +641,13 @@ export function GridShell({
         (row: number, height: number) => {
             on_row_resize(row, height);
             const cells: { cell: Item }[] = [];
-            for (let c = 0; c < sheet_meta.columnCount; c++) {
-                cells.push({ cell: [c, row] });
+            for (let display_column = 0; display_column < display_column_count; display_column++) {
+                cells.push({ cell: [display_column, row] });
             }
             grid_ref.current?.updateCells(cells);
             overlay_ref.current?.repaint();
         },
-        [on_row_resize, sheet_meta.columnCount],
+        [on_row_resize, display_column_count],
     );
 
     const on_grid_selection_change = useCallback(
@@ -595,9 +685,16 @@ export function GridShell({
     // is still copied, but the host surfaces a visible warning so the paste
     // isn't silently incomplete.
     const copy_rect = useCallback(
-        (rect: SelectionRect) => {
+        (rect: Rectangle) => {
             const result = format_selection_tsv(
-                rect,
+                {
+                    y: rect.y,
+                    height: rect.height,
+                    source_columns: visible_source_columns.slice(
+                        rect.x,
+                        rect.x + rect.width,
+                    ),
+                },
                 get_row_ref.current,
                 merge_index,
                 show_formatting,
@@ -608,7 +705,12 @@ export function GridShell({
             }
             void safe_write_to_clipboard(result.text);
         },
-        [merge_index, show_formatting, safe_write_to_clipboard],
+        [
+            merge_index,
+            show_formatting,
+            safe_write_to_clipboard,
+            visible_source_columns,
+        ],
     );
 
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
@@ -621,15 +723,15 @@ export function GridShell({
 
     const select_row = useCallback(
         (row: number) => {
-            if (sheet_meta.columnCount === 0) return;
+            if (display_column_count === 0) return;
             select_rect([0, row], {
                 x: 0,
                 y: row,
-                width: sheet_meta.columnCount,
+                width: display_column_count,
                 height: 1,
             });
         },
-        [sheet_meta.columnCount, select_rect],
+        [display_column_count, select_rect],
     );
 
     const select_column = useCallback(
@@ -646,19 +748,19 @@ export function GridShell({
     );
 
     const select_all = useCallback(() => {
-        if (row_count === 0 || sheet_meta.columnCount === 0) return;
+        if (row_count === 0 || display_column_count === 0) return;
         select_rect([0, 0], {
             x: 0,
             y: 0,
-            width: sheet_meta.columnCount,
+            width: display_column_count,
             height: row_count,
         });
-    }, [row_count, sheet_meta.columnCount, select_rect]);
+    }, [row_count, display_column_count, select_rect]);
 
     const discard_edit = useCallback(
-        (row: number, col: number) => {
-            clear_dirty_keys(new Set([`${row}:${col}`]));
-            grid_ref.current?.updateCells([{ cell: [col, row] }]);
+        (row: number, display_column: number, source_column: number) => {
+            clear_dirty_keys(new Set([`${row}:${source_column}`]));
+            grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
         [clear_dirty_keys],
     );
@@ -690,14 +792,17 @@ export function GridShell({
                 select_rect(anchor, anchor_range);
             }
 
+            const source_column = source_column_for_display(anchor_col);
+            if (source_column === undefined) return;
             set_context_menu({
                 x: event.bounds.x + event.localEventX,
                 y: event.bounds.y + event.localEventY,
                 row: anchor_row,
-                col: anchor_col,
+                display_col: anchor_col,
+                source_col: source_column,
             });
         },
-        [merges, select_rect],
+        [merges, select_rect, source_column_for_display],
     );
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
@@ -743,13 +848,14 @@ export function GridShell({
             if (!decision) return;
             const cur = grid_selection_ref.current.current?.cell;
             if (!cur) return;
+            if (display_column_count === 0) return;
             const [cur_col, cur_row] = cur;
             const next = move_active_cell(
                 cur_row,
                 cur_col,
                 decision.direction,
                 row_count,
-                sheet_meta.columnCount,
+                display_column_count,
                 merges,
             );
             args.cancel();
@@ -766,7 +872,7 @@ export function GridShell({
             });
             grid_ref.current?.scrollTo(cell[0], cell[1]);
         },
-        [editable_cells, merges, row_count, sheet_meta.columnCount, copy_rect],
+        [editable_cells, merges, row_count, display_column_count, copy_rect],
     );
 
     const on_visible_region_changed = useCallback(
@@ -788,8 +894,8 @@ export function GridShell({
 
     // Kick off the first page before the initial region callback arrives.
     useEffect(() => {
-        ensure_rows(0, 40);
-    }, [ensure_rows]);
+        if (has_visible_columns) ensure_rows(0, 40);
+    }, [ensure_rows, has_visible_columns]);
 
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version
@@ -804,12 +910,16 @@ export function GridShell({
         if (r.width === 0 || r.height === 0) return;
         const cells: { cell: Item }[] = [];
         for (let row = r.y; row < r.y + r.height; row++) {
-            for (let col = r.x; col < r.x + r.width; col++) {
+            const end_column = Math.min(
+                r.x + r.width,
+                display_column_count,
+            );
+            for (let col = r.x; col < end_column; col++) {
                 cells.push({ cell: [col, row] });
             }
         }
-        grid.updateCells(cells);
-    }, [version, show_formatting, editable_cells]);
+        if (cells.length > 0) grid.updateCells(cells);
+    }, [version, show_formatting, editable_cells, display_column_count]);
 
     // Targeted tint repaint: damage only the cells whose dirty/conflict tint
     // actually changed, not the whole viewport. Single-cell edits/discards
@@ -836,18 +946,20 @@ export function GridShell({
         const r = visible_ref.current;
         const cells: { cell: Item }[] = [];
         for (const key of changed) {
-            const [row, col] = key.split(':').map(Number);
+            const [row, source_column] = key.split(':').map(Number);
+            const display_column = display_column_for_source(source_column);
             if (
-                col >= r.x &&
-                col < r.x + r.width &&
+                display_column !== undefined &&
+                display_column >= r.x &&
+                display_column < r.x + r.width &&
                 row >= r.y &&
                 row < r.y + r.height
             ) {
-                cells.push({ cell: [col, row] });
+                cells.push({ cell: [display_column, row] });
             }
         }
         if (cells.length > 0) grid.updateCells(cells);
-    }, [dirty_cells, conflicted_keys]);
+    }, [dirty_cells, conflicted_keys, display_column_for_source]);
 
     // Preview mode: host asks us to scroll a specific row into view.
     useEffect(() => {
@@ -863,10 +975,13 @@ export function GridShell({
     }, [preview_mode]);
 
     const handle_column_resize = useCallback(
-        (_column: GridColumn, new_size: number, col_index: number) => {
-            on_column_resize(col_index, new_size);
+        (_column: GridColumn, new_size: number, display_column: number) => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column !== undefined) {
+                on_column_resize(source_column, new_size);
+            }
         },
-        [on_column_resize],
+        [on_column_resize, source_column_for_display],
     );
 
     // Build menu items for the open context menu. "Copy selection" appears only
@@ -874,18 +989,23 @@ export function GridShell({
     // dirty. Editing the cell isn't offered (no clean Glide open-overlay API).
     const menu_items: MenuItem[] = [];
     if (context_menu) {
-        const { row, col } = context_menu;
+        const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
         const is_multi_cell = !!range && range.width * range.height > 1;
-        if (dirty_cells.has(`${row}:${col}`)) {
+        if (dirty_cells.has(`${row}:${source_col}`)) {
             menu_items.push({
                 label: 'Discard edit',
-                on_click: () => discard_edit(row, col),
+                on_click: () => discard_edit(row, display_col, source_col),
             });
         }
         menu_items.push({
             label: 'Copy cell',
-            on_click: () => copy_rect({ x: col, y: row, width: 1, height: 1 }),
+            on_click: () => copy_rect({
+                x: display_col,
+                y: row,
+                width: 1,
+                height: 1,
+            }),
         });
         if (is_multi_cell && range) {
             menu_items.push({
@@ -896,9 +1016,19 @@ export function GridShell({
         menu_items.push({ label: 'Select row', on_click: () => select_row(row) });
         menu_items.push({
             label: 'Select column',
-            on_click: () => select_column(col),
+            on_click: () => select_column(display_col),
         });
         menu_items.push({ label: 'Select all', on_click: select_all });
+    }
+
+    if (!has_visible_columns) {
+        return (
+            <div className="grid-shell-root">
+                <div className="all-columns-hidden" role="status">
+                    All columns are hidden. Show one or more columns to resume the table.
+                </div>
+            </div>
+        );
     }
 
     return (

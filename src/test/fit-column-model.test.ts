@@ -82,7 +82,7 @@ describe('fit_column_widths', () => {
             [cell('a'), cell('longer value')],
             [cell('bb'), cell('x')],
         ];
-        const out = fit_column_widths(sample, 2, fake_measure);
+        const out = fit_column_widths(sample, [0, 1], fake_measure);
         expect(out).toEqual({
             0: MIN_COLUMN_WIDTH, // widest is "bb" (20px) → below min
             1: 'longer value'.length * 10 + COLUMN_PADDING,
@@ -94,19 +94,39 @@ describe('fit_column_widths', () => {
             [null, cell('present')],
             [cell('abc'), null],
         ];
-        const out = fit_column_widths(sample, 2, fake_measure);
+        const out = fit_column_widths(sample, [0, 1], fake_measure);
         expect(out[1]).toBe('present'.length * 10 + COLUMN_PADDING);
     });
 
     it('gives a column with no sampled content the minimum width', () => {
         const sample: (MeasurableCell | null)[][] = [[cell('a'), null]];
-        const out = fit_column_widths(sample, 2, fake_measure);
+        const out = fit_column_widths(sample, [0, 1], fake_measure);
         expect(out[1]).toBe(MIN_COLUMN_WIDTH);
     });
 
-    it('returns an entry for every column up to column_count', () => {
-        const out = fit_column_widths([[cell('a')]], 3, fake_measure);
+    it('returns an entry for every requested source column', () => {
+        const out = fit_column_widths([[cell('a')]], [0, 1, 2], fake_measure);
         expect(Object.keys(out).sort()).toEqual(['0', '1', '2']);
+    });
+
+    it('measures visible source columns and returns source-keyed widths', () => {
+        const measured: string[] = [];
+        const measure = (value: MeasurableCell) => {
+            measured.push(value.text);
+            return fake_measure(value);
+        };
+        const out = fit_column_widths(
+            [[cell('a'), cell('hidden widest value'), cell('visible c')]],
+            [0, 2],
+            measure,
+        );
+        expect(Object.keys(out).sort()).toEqual(['0', '2']);
+        expect(measured).toEqual(['a', 'visible c']);
+        expect(out[2]).toBe('visible c'.length * 10 + COLUMN_PADDING);
+    });
+
+    it('returns no widths when all columns are hidden', () => {
+        expect(fit_column_widths([[cell('a')]], [], fake_measure)).toEqual({});
     });
 });
 

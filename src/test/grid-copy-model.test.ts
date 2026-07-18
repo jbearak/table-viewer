@@ -24,7 +24,7 @@ describe('format_selection_tsv', () => {
     it('copies a single cell', () => {
         const get_row = loader({ 0: [cell('a'), cell('b')] });
         const out = format_selection_tsv(
-            { x: 1, y: 0, width: 1, height: 1 },
+            { y: 0, height: 1, source_columns: [1] },
             get_row,
             NO_MERGES,
             true,
@@ -43,7 +43,7 @@ describe('format_selection_tsv', () => {
             1: [cell('d'), cell('e'), cell('f')],
         });
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 3, height: 2 },
+            { y: 0, height: 2, source_columns: [0, 1, 2] },
             get_row,
             NO_MERGES,
             true,
@@ -53,10 +53,34 @@ describe('format_selection_tsv', () => {
         expect(out.nonResident).toBe(false);
     });
 
+    it('copies an ordered non-contiguous source-column list', () => {
+        const get_row = loader({
+            0: [cell('a'), cell('hidden-b'), cell('c'), cell('hidden-d'), cell('e')],
+        });
+        const out = format_selection_tsv(
+            { y: 0, height: 1, source_columns: [0, 2, 4] },
+            get_row,
+            NO_MERGES,
+            true,
+        );
+        expect(out.text).toBe('a\tc\te');
+    });
+
+    it('preserves the supplied source-column order', () => {
+        const get_row = loader({ 0: [cell('a'), cell('b'), cell('c')] });
+        const out = format_selection_tsv(
+            { y: 0, height: 1, source_columns: [2, 0] },
+            get_row,
+            NO_MERGES,
+            true,
+        );
+        expect(out.text).toBe('c\ta');
+    });
+
     it('copies raw text when formatting is off', () => {
         const get_row = loader({ 0: [cell('1000', '$1,000')] });
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 1 },
+            { y: 0, height: 1, source_columns: [0] },
             get_row,
             NO_MERGES,
             false,
@@ -67,7 +91,7 @@ describe('format_selection_tsv', () => {
     it('copies formatted text when formatting is on', () => {
         const get_row = loader({ 0: [cell('1000', '$1,000')] });
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 1 },
+            { y: 0, height: 1, source_columns: [0] },
             get_row,
             NO_MERGES,
             true,
@@ -82,7 +106,7 @@ describe('format_selection_tsv', () => {
             { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
         ];
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 3, height: 1 },
+            { y: 0, height: 1, source_columns: [0, 1, 2] },
             get_row,
             new MergeIndex(merges),
             true,
@@ -101,7 +125,7 @@ describe('format_selection_tsv', () => {
             { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
         ];
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 2, height: 2 },
+            { y: 0, height: 2, source_columns: [0, 1] },
             get_row,
             new MergeIndex(merges),
             true,
@@ -120,7 +144,7 @@ describe('format_selection_tsv', () => {
             { startRow: 5, startCol: 5, endRow: 6, endCol: 6 },
         ];
         const out = format_selection_tsv(
-            { x: 6, y: 6, width: 1, height: 1 },
+            { y: 6, height: 1, source_columns: [6] },
             get_row,
             new MergeIndex(merges),
             true,
@@ -131,7 +155,7 @@ describe('format_selection_tsv', () => {
     it('emits blanks and flags truncated when a row is not loaded', () => {
         const get_row = loader({ 0: [cell('a'), cell('b')] }); // row 1 missing
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 2, height: 2 },
+            { y: 0, height: 2, source_columns: [0, 1] },
             get_row,
             NO_MERGES,
             true,
@@ -145,7 +169,7 @@ describe('format_selection_tsv', () => {
         const grid: Record<number, (RenderedCell | null)[]> = {};
         for (let r = 0; r < 10; r++) grid[r] = [cell(`r${r}`)];
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 10 },
+            { y: 0, height: 10, source_columns: [0] },
             loader(grid),
             NO_MERGES,
             true,
@@ -158,7 +182,7 @@ describe('format_selection_tsv', () => {
 
     it('reports no truncation reason for a complete copy', () => {
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 1 },
+            { y: 0, height: 1, source_columns: [0] },
             loader({ 0: [cell('a')] }),
             NO_MERGES,
             true,
@@ -171,7 +195,7 @@ describe('format_selection_tsv', () => {
         // height 5 > cap 2, and both copied rows (0, 1) are loaded, so no
         // emitted row is blank: the cap is the only applicable condition.
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 5 },
+            { y: 0, height: 5, source_columns: [0] },
             loader({ 0: [cell('a')], 1: [cell('b')] }),
             NO_MERGES,
             true,
@@ -185,7 +209,7 @@ describe('format_selection_tsv', () => {
         // height 5 > cap 2, and copied row 1 is non-resident (blank in the TSV).
         // Both conditions are independently true and both are reported.
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 5 },
+            { y: 0, height: 5, source_columns: [0] },
             loader({ 0: [cell('a')] }), // row 1 missing
             NO_MERGES,
             true,
@@ -241,7 +265,7 @@ describe('copy_truncation_message', () => {
     it('names the effective cap, not the default, when a smaller cap was used', () => {
         const get_row = loader({ 0: [cell('a')], 1: [cell('b')] });
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 1, height: 2 },
+            { y: 0, height: 2, source_columns: [0] },
             get_row,
             NO_MERGES,
             true,
@@ -255,7 +279,7 @@ describe('copy_truncation_message', () => {
     it('treats null cells as empty', () => {
         const get_row = loader({ 0: [cell('a'), null] });
         const out = format_selection_tsv(
-            { x: 0, y: 0, width: 2, height: 1 },
+            { y: 0, height: 1, source_columns: [0, 1] },
             get_row,
             NO_MERGES,
             true,

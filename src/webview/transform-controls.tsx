@@ -14,7 +14,7 @@ interface TransformControlsProps {
     pending: boolean;
     row_count: number;
     source_row_count: number;
-    has_merges: boolean;
+    merges_flattened: boolean;
     on_change: (state: SheetTransformState) => void;
     on_cancel_pending: () => void;
 }
@@ -43,7 +43,7 @@ export function TransformControls({
     pending,
     row_count,
     source_row_count,
-    has_merges,
+    merges_flattened,
     on_change,
     on_cancel_pending,
 }: TransformControlsProps): React.JSX.Element {
@@ -107,7 +107,7 @@ export function TransformControls({
                         {row_count.toLocaleString()} of {source_row_count.toLocaleString()} rows
                     </span>
                 )}
-                {active && has_merges && (
+                {merges_flattened && (
                     <span
                         className="transform-merge-notice"
                         title="Merged values remain only in their original top-left cells."
