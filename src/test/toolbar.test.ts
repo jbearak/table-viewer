@@ -19,6 +19,16 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     root = createRoot(container);
 
     const merged_props: React.ComponentProps<typeof Toolbar> = {
+        row_count: 3,
+        source_row_count: 3,
+        transform: { sort: [], filters: [] },
+        transform_disabled: false,
+        transform_pending: false,
+        column_names: ['Name', 'Value'],
+        merges_flattened: false,
+        on_transform_change: vi.fn(),
+        on_edit_filter: vi.fn(),
+        on_cancel_transform: vi.fn(),
         show_formatting: true,
         on_toggle_formatting,
         show_formatting_button: true,
@@ -300,6 +310,40 @@ describe('Toolbar', () => {
             formatting.click();
         });
         expect(get_tooltip()).toBeNull();
+    });
+
+    it('composes row count, hidden-column transform chips, progress, cancel, and actions', () => {
+        const on_cancel_transform = vi.fn();
+        const { container } = render_toolbar({
+            row_count: 2,
+            source_row_count: 5,
+            column_names: ['Visible', 'Hidden active'],
+            transform: {
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [{
+                    id: 'f',
+                    colIndex: 1,
+                    operator: 'equals',
+                    value: '0',
+                    caseSensitive: false,
+                    enabled: false,
+                }],
+            },
+            transform_pending: true,
+            transform_progress: 'Applying saved…',
+            merges_flattened: true,
+            on_cancel_transform,
+        });
+        expect(container.textContent).toContain('2 of 5 rows');
+        expect(container.textContent).toContain('Hidden active');
+        expect(container.textContent).toContain('Applying saved…');
+        expect(container.textContent).toContain('Merged cells shown unmerged');
+        expect(get_button('Formatting')).toBeDefined();
+        expect(get_button('Cancel')).toBeDefined();
+        act(() => get_button('Cancel').click());
+        expect(on_cancel_transform).toHaveBeenCalledOnce();
+        expect((container.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(true);
+        expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(true);
     });
 
     it('clamps tooltip positioning so it stays inside the viewport near the left edge', () => {

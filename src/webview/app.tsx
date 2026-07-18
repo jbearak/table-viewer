@@ -7,12 +7,14 @@ import {
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
+    type FilterEntry,
     type SheetColumnVisibilityState,
     type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { Toolbar } from './toolbar';
-import { TransformControls } from './transform-controls';
+import { FilterPopover } from './filter-popover';
+import { transform_progress_label, upsert_filter } from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
 import { GridShell, type EditingStatus, type EditingHandle } from './grid-shell';
 import {
@@ -96,6 +98,12 @@ export function App(): React.JSX.Element {
     >([]);
     const [effective_row_counts, set_effective_row_counts] = useState<number[]>([]);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
+    const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
+    const [filter_editor, set_filter_editor] = useState<{
+        column_index: number;
+        anchor: { left: number; top: number };
+        restore_focus: () => void;
+    } | null>(null);
     const [source_epoch, set_source_epoch] = useState(0);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
@@ -144,6 +152,15 @@ export function App(): React.JSX.Element {
             next[sheet_index] = true;
             return next;
         });
+        set_pending_transform_labels((prev) => {
+            const next = [...prev];
+            next[sheet_index] = transform_progress_label(
+                state_ref.current.transforms?.[sheet_index] ?? EMPTY_TRANSFORM,
+                state,
+                intent,
+            );
+            return next;
+        });
         vscode_api.postMessage({
             type: 'setTransform',
             sheetIndex: sheet_index,
@@ -183,6 +200,7 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'sheetMeta') {
                 set_meta(msg.meta);
+                set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
                 source_generation_ref.current = msg.sourceGeneration;
@@ -224,6 +242,7 @@ export function App(): React.JSX.Element {
                 set_applied_transforms([]);
                 set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
                 set_pending_transforms([]);
+                set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
                 transform_applied_for_source_ref.current = [];
 
@@ -257,6 +276,7 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'metaReload') {
                 set_meta(msg.meta);
+                set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
                 source_generation_ref.current = msg.sourceGeneration;
@@ -276,6 +296,7 @@ export function App(): React.JSX.Element {
                 );
                 set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
                 set_pending_transforms([]);
+                set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
                 transform_applied_for_source_ref.current = [];
                 const next_transforms = msg.meta.sheets.map((sheet, index) =>
@@ -339,6 +360,11 @@ export function App(): React.JSX.Element {
                 set_pending_transforms((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = false;
+                    return next;
+                });
+                set_pending_transform_labels((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = '';
                     return next;
                 });
                 set_generation(msg.generation);
@@ -432,6 +458,7 @@ export function App(): React.JSX.Element {
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
+            set_filter_editor(null);
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -505,6 +532,46 @@ export function App(): React.JSX.Element {
             request_transform,
         ],
     );
+
+    const open_filter_editor = useCallback((
+        column_index: number,
+        anchor: { left: number; top: number },
+        restore_focus: () => void,
+    ) => {
+        if (
+            edit_mode
+            || edit_session_pending
+            || preview_mode
+            || pending_transforms[active_sheet_index]
+        ) return;
+        set_filter_editor({ column_index, anchor, restore_focus });
+    }, [
+        active_sheet_index,
+        edit_mode,
+        edit_session_pending,
+        pending_transforms,
+        preview_mode,
+    ]);
+
+    const close_filter_editor = useCallback(() => {
+        const restore = filter_editor?.restore_focus;
+        set_filter_editor(null);
+        window.setTimeout(() => restore?.(), 0);
+    }, [filter_editor]);
+
+    const apply_filter_editor = useCallback((entry: FilterEntry) => {
+        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        handle_transform_change({
+            ...current,
+            filters: upsert_filter(current.filters, entry),
+        });
+        close_filter_editor();
+    }, [
+        active_sheet_index,
+        close_filter_editor,
+        handle_transform_change,
+        transforms,
+    ]);
 
     const handle_cancel_transform = useCallback(() => {
         const previous = applied_transforms[active_sheet_index]
@@ -911,12 +978,36 @@ export function App(): React.JSX.Element {
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
+            transform_state={visible_transform}
+            transform_sections={!edit_mode && !edit_session_pending && !preview_mode}
+            transform_pending={transform_pending}
+            on_transform_change={handle_transform_change}
+            on_open_filter={open_filter_editor}
+            on_hide_column={handle_toggle_column}
         />
     );
 
     return (
         <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
+                row_count={effective_row_count}
+                source_row_count={current_sheet.rowCount}
+                transform={visible_transform}
+                transform_disabled={edit_mode || edit_session_pending || preview_mode}
+                transform_pending={transform_pending}
+                transform_progress={pending_transform_labels[active_sheet_index]}
+                column_names={column_names}
+                merges_flattened={merges_flattened}
+                on_transform_change={handle_transform_change}
+                on_edit_filter={(entry, trigger) => {
+                    const rect = trigger.getBoundingClientRect();
+                    open_filter_editor(
+                        entry.colIndex,
+                        { left: rect.left, top: rect.bottom + 4 },
+                        () => trigger.focus(),
+                    );
+                }}
+                on_cancel_transform={handle_cancel_transform}
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
@@ -962,24 +1053,18 @@ export function App(): React.JSX.Element {
                         : 'Clear sorting and filters before editing.'
                 }
             />
-            <TransformControls
-                state={visible_transform}
-                column_names={column_names}
-                disabled={edit_mode || edit_session_pending || preview_mode}
-                disabled_reason={
-                    preview_mode
-                        ? 'Sorting and filtering are unavailable in synchronized preview panes.'
-                        : edit_session_pending
-                            ? 'Waiting to enter edit mode.'
-                        : 'Exit edit mode before sorting or filtering.'
-                }
-                pending={transform_pending}
-                row_count={effective_row_count}
-                source_row_count={current_sheet.rowCount}
-                merges_flattened={merges_flattened}
-                on_change={handle_transform_change}
-                on_cancel_pending={handle_cancel_transform}
-            />
+            {filter_editor && (
+                <FilterPopover
+                    key={filter_editor.column_index}
+                    column_index={filter_editor.column_index}
+                    column_name={column_names[filter_editor.column_index]
+                        ?? `Column ${filter_editor.column_index + 1}`}
+                    filters={visible_transform.filters}
+                    anchor={filter_editor.anchor}
+                    on_apply={apply_filter_editor}
+                    on_cancel={close_filter_editor}
+                />
+            )}
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
             )}

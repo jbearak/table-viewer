@@ -1,15 +1,25 @@
-import React, {
-    useId,
-    useLayoutEffect,
-    useRef,
-    useState,
-} from 'react';
+import React, { useId, useLayoutEffect, useRef, useState } from 'react';
+import type { FilterEntry, SheetTransformState } from '../types';
 import {
     ColumnVisibilityControl,
     type ColumnVisibilityControlProps,
 } from './column-visibility-control';
+import { FilterStrip } from './filter-strip';
+import { SortStrip } from './sort-strip';
+import { use_toolbar_wrap } from './use-toolbar-wrap';
 
-interface ToolbarProps {
+export interface ToolbarProps {
+    row_count: number;
+    source_row_count: number;
+    transform: SheetTransformState;
+    transform_disabled: boolean;
+    transform_pending: boolean;
+    transform_progress?: string;
+    column_names: readonly string[];
+    merges_flattened: boolean;
+    on_transform_change: (state: SheetTransformState) => void;
+    on_edit_filter: (entry: FilterEntry, trigger: HTMLElement) => void;
+    on_cancel_transform: () => void;
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
@@ -29,82 +39,127 @@ interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
-export function Toolbar({
-    show_formatting,
-    on_toggle_formatting,
-    show_formatting_button,
-    vertical_tabs,
-    on_toggle_tab_orientation,
-    show_vertical_tabs_button,
-    column_visibility,
-    auto_fit_active,
-    on_toggle_auto_fit,
-    auto_fit_disabled = false,
-    auto_fit_disabled_reason,
-    edit_mode,
-    is_dirty,
-    on_toggle_edit_mode,
-    show_edit_button,
-    edit_disabled = false,
-    edit_disabled_reason,
-}: ToolbarProps): React.JSX.Element {
+export function Toolbar(props: ToolbarProps): React.JSX.Element {
+    const {
+        transform,
+        row_count,
+        source_row_count,
+        column_names,
+        on_transform_change,
+        on_edit_filter,
+        on_cancel_transform,
+    } = props;
+    const toolbar_ref = useRef<HTMLDivElement>(null);
+    const lead_ref = useRef<HTMLSpanElement>(null);
+    const chips_ref = useRef<HTMLDivElement>(null);
+    const actions_ref = useRef<HTMLDivElement>(null);
+    const row_count_text = row_count === source_row_count
+        ? `${row_count.toLocaleString()} rows`
+        : `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
+    const wrapped = use_toolbar_wrap(
+        { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
+        [
+            transform.sort,
+            transform.filters,
+            row_count_text,
+            props.transform_pending,
+            props.merges_flattened,
+            props.column_visibility.hidden_columns.length,
+            props.show_formatting_button,
+            props.show_vertical_tabs_button,
+            props.show_edit_button,
+        ],
+    );
+    const controls_disabled = !!(props.transform_disabled || props.transform_pending);
 
     return (
-        <div className="toolbar">
-            {show_formatting_button && (
-                <ToolbarButton
-                    label="Formatting"
-                    active={show_formatting}
-                    tooltip_text={
-                        show_formatting
+        <div ref={toolbar_ref} className={wrapped ? 'toolbar is-wrapped' : 'toolbar'}>
+            <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
+            <div ref={chips_ref} className="toolbar-chips">
+                <SortStrip
+                    state={transform}
+                    column_names={column_names}
+                    disabled={controls_disabled}
+                    on_change={on_transform_change}
+                />
+                <FilterStrip
+                    state={transform}
+                    column_names={column_names}
+                    disabled={controls_disabled}
+                    on_change={on_transform_change}
+                    on_edit={on_edit_filter}
+                />
+                {props.transform_pending && (
+                    <span className="toolbar-progress" role="status" aria-live="polite">
+                        {props.transform_progress ?? 'Applying sort & filters…'}
+                    </span>
+                )}
+                {props.transform_pending && (
+                    <button
+                        type="button"
+                        className="toolbar-cancel"
+                        onClick={on_cancel_transform}
+                    >
+                        Cancel
+                    </button>
+                )}
+                {props.merges_flattened && (
+                    <span
+                        className="toolbar-merge-notice"
+                        title="Merged values remain only in their original top-left cells."
+                    >
+                        Merged cells shown unmerged; only top-left cells contain values
+                    </span>
+                )}
+            </div>
+            <div ref={actions_ref} className="toolbar-actions">
+                {props.show_formatting_button && (
+                    <ToolbarButton
+                        label="Formatting"
+                        active={props.show_formatting}
+                        tooltip_text={props.show_formatting
                             ? 'Show raw cell values.'
-                            : 'Show formatted cell values.'
-                    }
-                    onClick={on_toggle_formatting}
-                />
-            )}
-            {show_vertical_tabs_button && (
-                <ToolbarButton
-                    label="Vertical Tabs"
-                    active={vertical_tabs}
-                    tooltip_text={
-                        vertical_tabs
+                            : 'Show formatted cell values.'}
+                        onClick={props.on_toggle_formatting}
+                    />
+                )}
+                {props.show_vertical_tabs_button && (
+                    <ToolbarButton
+                        label="Vertical Tabs"
+                        active={props.vertical_tabs}
+                        tooltip_text={props.vertical_tabs
                             ? 'Move sheet tabs above the table.'
-                            : 'Move sheet tabs to the left of the table.'
-                    }
-                    onClick={on_toggle_tab_orientation}
-                />
-            )}
-            <ColumnVisibilityControl {...column_visibility} />
-            <ToolbarButton
-                label="Auto-fit Columns"
-                active={auto_fit_active}
-                tooltip_text={
-                    auto_fit_disabled
-                        ? (auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
-                        : auto_fit_active
-                        ? 'Restore original column widths.'
-                        : 'Auto-fit all columns to their content.'
-                }
-                onClick={on_toggle_auto_fit}
-                disabled={auto_fit_disabled}
-            />
-            {show_edit_button && (
+                            : 'Move sheet tabs to the left of the table.'}
+                        onClick={props.on_toggle_tab_orientation}
+                    />
+                )}
+                <ColumnVisibilityControl {...props.column_visibility} />
                 <ToolbarButton
-                    label="Edit"
-                    active={edit_mode}
-                    tooltip_text={
-                        edit_disabled
-                            ? (edit_disabled_reason ?? 'Editing is unavailable.')
-                            : edit_mode
-                            ? 'Exit edit mode.'
-                            : 'Enter edit mode to modify cell values.'
-                    }
-                    onClick={on_toggle_edit_mode}
-                    extra_class={is_dirty ? 'has-unsaved' : undefined}
-                    disabled={edit_disabled}
+                    label="Auto-fit Columns"
+                    active={props.auto_fit_active}
+                    tooltip_text={props.auto_fit_disabled
+                        ? (props.auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
+                        : props.auto_fit_active
+                        ? 'Restore original column widths.'
+                        : 'Auto-fit all columns to their content.'}
+                    onClick={props.on_toggle_auto_fit}
+                    disabled={props.auto_fit_disabled}
                 />
-            )}
+                {props.show_edit_button && (
+                    <ToolbarButton
+                        label="Edit"
+                        active={props.edit_mode}
+                        tooltip_text={props.edit_disabled
+                            ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
+                            : props.edit_mode
+                            ? 'Exit edit mode.'
+                            : 'Enter edit mode to modify cell values.'}
+                        onClick={props.on_toggle_edit_mode}
+                        extra_class={props.is_dirty ? 'has-unsaved' : undefined}
+                        disabled={props.edit_disabled}
+                    />
+                )}
+            </div>
         </div>
     );
 }
@@ -126,61 +181,33 @@ function ToolbarButton({
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
-    const [tooltip_style, set_tooltip_style] = useState<
-        React.CSSProperties | undefined
-    >(undefined);
+    const [tooltip_style, set_tooltip_style] = useState<React.CSSProperties>();
     const tooltip_id = useId();
-    const button_ref = useRef<HTMLButtonElement | null>(null);
-    const tooltip_ref = useRef<HTMLDivElement | null>(null);
+    const button_ref = useRef<HTMLButtonElement>(null);
+    const tooltip_ref = useRef<HTMLDivElement>(null);
     const show_tooltip = is_hovered || is_focused;
 
     useLayoutEffect(() => {
-        if (!show_tooltip) {
-            set_tooltip_style(undefined);
-            return;
-        }
-
-        const update_tooltip_position = () => {
+        if (!show_tooltip) return set_tooltip_style(undefined);
+        const update = () => {
             const button = button_ref.current;
             const tooltip = tooltip_ref.current;
             if (!button || !tooltip) return;
-
-            const viewport_margin = 8;
-            const tooltip_gap = 6;
             const button_rect = button.getBoundingClientRect();
-            const tooltip_rect = tooltip.getBoundingClientRect();
-            const tooltip_width = tooltip_rect.width;
-            const viewport_width = window.innerWidth;
-            const desired_left =
-                button_rect.left + (button_rect.width / 2) - (tooltip_width / 2);
-            const max_left = Math.max(
-                viewport_margin,
-                viewport_width - tooltip_width - viewport_margin
-            );
+            const tooltip_width = tooltip.getBoundingClientRect().width;
             const left = Math.min(
-                Math.max(desired_left, viewport_margin),
-                max_left
+                Math.max(button_rect.left + button_rect.width / 2 - tooltip_width / 2, 8),
+                Math.max(8, window.innerWidth - tooltip_width - 8),
             );
-            const anchor_center = button_rect.left + (button_rect.width / 2);
-            const arrow_left = Math.min(
-                Math.max(anchor_center - left, 10),
-                tooltip_width - 10
-            );
-
             set_tooltip_style({
-                left: `${left}px`,
-                top: `${button_rect.bottom + tooltip_gap}px`,
-                // CSS custom property — not part of React's CSSProperties type,
-                // so the object literal is cast rather than the (ineffective) key.
-                '--toolbar-tooltip-arrow-left': `${arrow_left}px`,
+                left,
+                top: button_rect.bottom + 6,
+                '--toolbar-tooltip-arrow-left': `${Math.min(Math.max(button_rect.left + button_rect.width / 2 - left, 10), tooltip_width - 10)}px`,
             } as React.CSSProperties);
         };
-
-        update_tooltip_position();
-        window.addEventListener('resize', update_tooltip_position);
-        return () => {
-            window.removeEventListener('resize', update_tooltip_position);
-        };
+        update();
+        window.addEventListener('resize', update);
+        return () => window.removeEventListener('resize', update);
     }, [show_tooltip]);
 
     return (
@@ -201,7 +228,11 @@ function ToolbarButton({
                 type="button"
                 className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
                 disabled={disabled}
-                onClick={(e) => { set_is_hovered(false); if (e.nativeEvent instanceof PointerEvent) button_ref.current?.blur(); onClick(); }}
+                onClick={(event) => {
+                    set_is_hovered(false);
+                    if (event.nativeEvent instanceof PointerEvent) button_ref.current?.blur();
+                    onClick();
+                }}
                 aria-describedby={!disabled && show_tooltip ? tooltip_id : undefined}
             >
                 {label}

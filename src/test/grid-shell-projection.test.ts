@@ -9,6 +9,8 @@ const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
     update_cells: vi.fn(),
     scroll_to: vi.fn(),
+    focus: vi.fn(),
+    get_bounds: vi.fn(() => ({ x: 30, y: 10, width: 100, height: 36 })),
     loader_enabled: [] as boolean[],
     ensure_rows: vi.fn(),
 }));
@@ -16,12 +18,17 @@ const grid_mock = vi.hoisted(() => ({
 vi.mock('@glideapps/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
     return {
-        CompactSelection: { empty: () => ({}) },
+        CompactSelection: {
+            empty: () => ({}),
+            fromSingleSelection: (value: number) => ({ selected: value }),
+        },
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as Record<string, unknown>;
             React.useImperativeHandle(ref, () => ({
                 updateCells: grid_mock.update_cells,
                 scrollTo: grid_mock.scroll_to,
+                focus: grid_mock.focus,
+                getBounds: grid_mock.get_bounds,
             }));
             return React.createElement('div', { className: 'data-editor-stub' });
         }),
@@ -126,9 +133,12 @@ afterEach(() => {
     grid_mock.props = null;
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
+    grid_mock.focus.mockReset();
+    grid_mock.get_bounds.mockClear();
     grid_mock.ensure_rows.mockReset();
     grid_mock.loader_enabled = [];
     vi.unstubAllGlobals();
+    Reflect.deleteProperty(navigator, 'clipboard');
 });
 
 describe('GridShell column projection', () => {
@@ -195,6 +205,42 @@ describe('GridShell column projection', () => {
         const selection = grid_mock.props!.gridSelection as { current?: unknown };
         expect(selection.current).toBeUndefined();
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('retargets shortcuts when the previously focused source column is hidden', async () => {
+        const on_transform_change = vi.fn();
+        const GridShell = await render_grid(props({
+            transform_sections: true,
+            on_transform_change,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: {}, rows: {},
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            transform_sections: true,
+            on_transform_change,
+            column_projection: {
+                visible_to_source: [0],
+                source_to_visible: [0, undefined, undefined],
+            },
+        }))));
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        on_key_down({
+            key: 'A', altKey: true, shiftKey: true, ctrlKey: false, metaKey: false,
+            rawEvent: { code: 'KeyA', target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        });
+        expect(on_transform_change).toHaveBeenCalledWith({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
     });
 
     it('commits a live overlay to the source-keyed dirty map before hiding its column', async () => {
@@ -286,6 +332,133 @@ describe('GridShell column projection', () => {
             root!.render(React.createElement(GridShell, props({ row_count: 200 })));
         });
         expect(grid_mock.scroll_to).toHaveBeenCalledWith(1, 75);
+    });
+
+    it('maps header menus and shortcuts from displayed columns to source columns', async () => {
+        const on_transform_change = vi.fn();
+        const on_open_filter = vi.fn();
+        const on_hide_column = vi.fn();
+        await render_grid(props({
+            transform_state: { sort: [{ colIndex: 0, direction: 'desc' }], filters: [] },
+            transform_sections: true,
+            on_transform_change,
+            on_open_filter,
+            on_hide_column,
+        }));
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        expect(document.body.textContent).toContain('Copy Column');
+        expect(document.body.textContent).toContain('Add ascending to sort');
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent?.includes('Sort ascending'))!.click());
+        expect(on_transform_change).toHaveBeenCalledWith({
+            sort: [{ colIndex: 2, direction: 'asc' }],
+            filters: [],
+        });
+
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: {},
+            rows: {},
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        on_transform_change.mockClear();
+        const on_key_down = grid_mock.props!.onKeyDown as (args: Record<string, unknown>) => void;
+        on_key_down({
+            key: 'A', altKey: true, shiftKey: true, ctrlKey: false, metaKey: false,
+            rawEvent: { code: 'KeyA', target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        });
+        expect(on_transform_change).toHaveBeenCalledWith({
+            sort: [{ colIndex: 2, direction: 'asc' }],
+            filters: [],
+        });
+        on_key_down({
+            key: 'F', altKey: true, shiftKey: true, ctrlKey: false, metaKey: false,
+            rawEvent: { code: 'KeyF', target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        });
+        expect(on_open_filter).toHaveBeenCalledWith(
+            2,
+            { left: 30, top: 46 },
+            expect.any(Function),
+        );
+        expect(on_hide_column).not.toHaveBeenCalled();
+    });
+
+    it('copies a projected source column with its visible header title', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props());
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy Column')!.click());
+        expect(write_text).toHaveBeenCalledWith('C name\nsource-c');
+    });
+
+    it('draws acknowledged source-indexed sort glyphs after normal header content', async () => {
+        await render_grid(props({
+            transform_state: {
+                sort: [
+                    { colIndex: 0, direction: 'asc' },
+                    { colIndex: 2, direction: 'desc' },
+                ],
+                filters: [],
+            },
+        }));
+        const draw_header = grid_mock.props!.drawHeader as Function;
+        const draw_content = vi.fn();
+        const ctx = {
+            save: vi.fn(), beginPath: vi.fn(), rect: vi.fn(), clip: vi.fn(),
+            moveTo: vi.fn(), lineTo: vi.fn(), closePath: vi.fn(), fill: vi.fn(),
+            arc: vi.fn(), fillText: vi.fn(), restore: vi.fn(),
+        } as unknown as CanvasRenderingContext2D;
+        draw_header({
+            ctx,
+            columnIndex: 1,
+            rect: { x: 0, y: 0, width: 100, height: 36 },
+            theme: { textHeader: '#fff', bgHeader: '#222', bgCell: '#111', fontFamily: 'sans' },
+        }, draw_content);
+        expect(draw_content).toHaveBeenCalledOnce();
+        expect(ctx.fillText).toHaveBeenCalledWith('2', expect.any(Number), expect.any(Number));
+    });
+
+    it('keeps existing cell context-menu actions intact', async () => {
+        await render_grid(props());
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(document.body.textContent).toContain('Copy cell');
+        expect(document.body.textContent).toContain('Select row');
+        expect(document.body.textContent).toContain('Select column');
+        expect(document.body.textContent).toContain('Select all');
+        expect(document.body.textContent).not.toContain('Sort ascending');
     });
 
     it('renders a recoverable all-hidden status without grid overlays or row requests', async () => {
