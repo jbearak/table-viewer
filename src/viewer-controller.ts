@@ -317,11 +317,18 @@ export function attach_viewer(
                 return;
             }
             case 'requestEditSession': {
-                const can_edit = profile.editing && !!source && !source.truncationMessage;
+                const can_edit = profile.editing
+                    && !!source
+                    && !source.truncationMessage
+                    && !(core?.has_transform_work ?? false);
                 const owner = active_csv_edit_sessions.get(file_path);
                 const denied_by_owner = can_edit
                     && owner !== undefined
                     && owner !== edit_session_token;
+                const denied_by_transform = profile.editing
+                    && !!source
+                    && !source.truncationMessage
+                    && (core?.has_transform_work ?? false);
                 const granted = can_edit && !denied_by_owner && try_claim_edit_session();
                 const pendingEdits = granted
                     ? (state_store.get(file_path) as PerFileState).pendingEdits
@@ -334,9 +341,22 @@ export function attach_viewer(
                 if (denied_by_owner) {
                     vscode.window.showWarningMessage(
                         'This file is already being edited in another Table Viewer tab.');
+                } else if (denied_by_transform) {
+                    vscode.window.showWarningMessage(
+                        'Clear sorting and filters before entering edit mode.');
                 }
                 return;
             }
+            case 'setTransform':
+                if (profile.editing && owns_edit_session()) {
+                    await core?.reject_transform(
+                        msg,
+                        'Exit edit mode before sorting or filtering.',
+                    );
+                    return;
+                }
+                await core?.handle_message(msg);
+                return;
             case 'releaseEditSession':
                 if (profile.editing) release_edit_session();
                 return;

@@ -94,6 +94,13 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
                 formatted: cell.formatted,
                 bold: cell.bold,
                 italic: cell.italic,
+                rawType: cell.raw === null
+                    ? 'empty'
+                    : typeof cell.raw === 'number'
+                        ? 'number'
+                        : typeof cell.raw === 'boolean'
+                            ? 'boolean'
+                            : 'string',
             });
         }
     }

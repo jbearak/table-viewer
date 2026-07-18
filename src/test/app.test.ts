@@ -25,6 +25,8 @@ vi.mock('../webview/grid-shell', () => ({
     GridShell: (props: {
         sheet_index: number;
         generation: number;
+        row_count?: number;
+        transformed?: boolean;
         show_formatting: boolean;
         preview_mode?: boolean;
         column_widths: Record<number, number>;
@@ -79,6 +81,8 @@ vi.mock('../webview/grid-shell', () => ({
                 className: 'grid-shell-stub',
                 'data-sheet-index': String(props.sheet_index),
                 'data-generation': String(props.generation),
+                'data-row-count': String(props.row_count ?? ''),
+                'data-transformed': String(props.transformed ?? false),
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
@@ -87,6 +91,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
                 'data-merges': String(props.merges?.length ?? 0),
+                'data-merges-json': JSON.stringify(props.merges ?? []),
             },
             React.createElement(
                 'button',
@@ -776,5 +781,266 @@ describe('preview mode', () => {
             sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
         );
         expect(grid_stub().getAttribute('data-preview')).toBe('true');
+    });
+});
+
+describe('sorting and filtering', () => {
+    it('disables transform controls while an edit-session request is pending', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            }),
+        );
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+        expect(get_button('Sort').disabled).toBe(true);
+        expect(get_button('Filter').disabled).toBe(true);
+
+        await dispatch_host_message({ type: 'editSessionResult', granted: true });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('drops and persists invalid saved transforms on initial load', async () => {
+        const { post_message } = await render_app();
+        post_message.mockClear();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 9, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+
+        expect(document.body.textContent).not.toContain('9.');
+        const persisted = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'stateChanged');
+        expect(persisted.state.transforms).toEqual([undefined]);
+        expect(post_message.mock.calls
+            .map((call) => call[0])
+            .some((message) => message.type === 'setTransform')).toBe(false);
+    });
+
+    it('keeps persisted transforms unapplied until the fresh source acknowledges them', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0] = {
+            ...meta.sheets[0],
+            rowCount: 2,
+            merges: [{
+                startRow: 0,
+                startCol: 0,
+                endRow: 1,
+                endCol: 0,
+            }],
+        };
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
+            meta.sheets[0].merges,
+        );
+        const request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(request).toBeDefined();
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: request.state,
+            rowCount: 2,
+            requestId: request.requestId,
+            generation: 2,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
+    });
+
+    it('lets the user cancel a pending saved transform and forgets it', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+        const restore_request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(restore_request).toBeDefined();
+
+        post_message.mockClear();
+        await click_button('Cancel');
+        const cancel_request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(cancel_request.state.sort).toEqual([]);
+        expect(cancel_request.state.filters).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: cancel_request.state,
+            rowCount: 1,
+            requestId: cancel_request.requestId,
+            generation: 2,
+        });
+        expect(document.body.textContent).not.toContain('Sort:');
+    });
+
+    it('waits for host acknowledgement, flattens merges, and restores them on clear', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0] = {
+            ...meta.sheets[0],
+            rowCount: 3,
+            columnCount: 1,
+            merges: [{
+                startRow: 0,
+                startCol: 0,
+                endRow: 1,
+                endCol: 0,
+            }],
+        };
+        await dispatch_host_message(sheet_meta_message(meta, {
+            csvEditable: true,
+            csvEditingSupported: true,
+        }));
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+
+        post_message.mockClear();
+        await click_button('Filter');
+        const input = document.querySelector(
+            'input[aria-label="Filter value"]',
+        ) as HTMLInputElement;
+        expect(input).not.toBeNull();
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!.call(input, 'group');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        await click_button('Apply');
+
+        const request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(request).toBeDefined();
+        expect(request.state.filters[0]).toMatchObject({
+            colIndex: 0,
+            operator: 'contains',
+            value: 'group',
+        });
+        // Old rows/merges remain authoritative while the host computes.
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(get_button('Edit').disabled).toBe(true);
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: request.state,
+            rowCount: 2,
+            requestId: request.requestId,
+            generation: 2,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('2');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
+        expect(document.body.textContent).toContain('Merged cells shown unmerged');
+
+        // Disabling the only filter restores natural rows but keeps the chip so
+        // it can be re-enabled (Sight behavior; avoids losing saved intent).
+        post_message.mockClear();
+        const filter_chip_button = document.querySelector(
+            'div.transform-chip button',
+        ) as HTMLButtonElement;
+        await act(async () => filter_chip_button.click());
+        const disable_request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(disable_request.state.filters[0].enabled).toBe(false);
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: disable_request.state,
+            rowCount: 3,
+            requestId: disable_request.requestId,
+            generation: 3,
+        });
+        expect(document.body.textContent).toContain('✗');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+
+        post_message.mockClear();
+        await act(async () => (
+            document.querySelector('div.transform-chip button') as HTMLButtonElement
+        ).click());
+        const enable_request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: enable_request.state,
+            rowCount: 2,
+            requestId: enable_request.requestId,
+            generation: 4,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Clear filters');
+        const clear_request = post_message.mock.calls
+            .map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(clear_request.state).toEqual({
+            sort: [],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        });
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: clear_request.state,
+            rowCount: 3,
+            requestId: clear_request.requestId,
+            generation: 5,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
+            meta.sheets[0].merges,
+        );
+        expect(get_button('Edit').disabled).toBe(false);
+    });
+
+    it('disables transforms in synchronized preview mode', async () => {
+        await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true }),
+        );
+        expect(get_button('Sort').disabled).toBe(true);
+        expect(get_button('Filter').disabled).toBe(true);
     });
 });

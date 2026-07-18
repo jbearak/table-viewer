@@ -1,6 +1,9 @@
 import type {
+    FilterEntry,
     PerFileState,
     ScrollPosition,
+    SheetTransformState,
+    SortKey,
     StoredPerFileState,
 } from '../types';
 
@@ -46,7 +49,101 @@ export function normalize_per_file_state(
         pendingEdits: normalize_pending_edits(
             'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined
         ),
+        transforms: normalize_transforms(
+            'transforms' in state ? (state as PerFileState).transforms : undefined,
+            sheet_names.length,
+        ),
     };
+}
+
+export function sanitize_transform_state(
+    value: unknown,
+    column_count = Number.MAX_SAFE_INTEGER,
+    expected_schema?: string,
+): SheetTransformState | undefined {
+    if (!value || typeof value !== 'object') return undefined;
+    const candidate = value as { sort?: unknown; filters?: unknown };
+    if (!Array.isArray(candidate.sort) || !Array.isArray(candidate.filters)) {
+        return undefined;
+    }
+    const schema = typeof (candidate as { schema?: unknown }).schema === 'string'
+        ? (candidate as { schema: string }).schema
+        : undefined;
+    if (expected_schema !== undefined && schema !== expected_schema) {
+        return undefined;
+    }
+
+    const sort: SortKey[] = [];
+    const seen_sort = new Set<number>();
+    for (const item of candidate.sort) {
+        if (!item || typeof item !== 'object') continue;
+        const key = item as Record<string, unknown>;
+        if (
+            typeof key.colIndex !== 'number'
+            || !Number.isInteger(key.colIndex)
+            || key.colIndex < 0
+            || key.colIndex >= column_count
+            || (key.direction !== 'asc' && key.direction !== 'desc')
+            || seen_sort.has(key.colIndex)
+        ) {
+            continue;
+        }
+        seen_sort.add(key.colIndex);
+        sort.push({
+            colIndex: key.colIndex,
+            direction: key.direction,
+        });
+    }
+
+    const filters: FilterEntry[] = [];
+    const seen_filter_columns = new Set<number>();
+    const operators = new Set([
+        'contains', 'notContains', 'equals', 'notEquals', 'startsWith',
+        'endsWith', 'greaterThan', 'greaterThanOrEqual', 'lessThan',
+        'lessThanOrEqual', 'between', 'isEmpty', 'isNotEmpty',
+    ]);
+    for (const item of candidate.filters) {
+        if (!item || typeof item !== 'object') continue;
+        const entry = item as Record<string, unknown>;
+        if (
+            typeof entry.id !== 'string'
+            || entry.id.length === 0
+            || typeof entry.colIndex !== 'number'
+            || !Number.isInteger(entry.colIndex)
+            || entry.colIndex < 0
+            || entry.colIndex >= column_count
+            || typeof entry.operator !== 'string'
+            || !operators.has(entry.operator)
+            || typeof entry.caseSensitive !== 'boolean'
+            || typeof entry.enabled !== 'boolean'
+            || seen_filter_columns.has(entry.colIndex)
+        ) {
+            continue;
+        }
+        const needs_value = entry.operator !== 'isEmpty'
+            && entry.operator !== 'isNotEmpty';
+        if (needs_value && typeof entry.value !== 'string') continue;
+        if (entry.operator === 'between' && typeof entry.secondValue !== 'string') {
+            continue;
+        }
+        seen_filter_columns.add(entry.colIndex);
+        filters.push({
+            id: entry.id,
+            colIndex: entry.colIndex,
+            operator: entry.operator as FilterEntry['operator'],
+            value: typeof entry.value === 'string' ? entry.value : undefined,
+            secondValue: typeof entry.secondValue === 'string'
+                ? entry.secondValue
+                : undefined,
+            caseSensitive: entry.caseSensitive,
+            enabled: entry.enabled,
+        });
+    }
+
+    if (sort.length === 0 && filters.length === 0) return undefined;
+    const result: SheetTransformState = { sort, filters };
+    if (schema !== undefined) result.schema = schema;
+    return result;
 }
 
 export function trim_sheet_state_array<T>(
@@ -122,4 +219,14 @@ function normalize_sheet_state_array<T>(
         }
     }
     return result;
+}
+
+function normalize_transforms(
+    value: unknown,
+    sheet_count: number,
+): (SheetTransformState | undefined)[] {
+    if (!Array.isArray(value)) return [];
+    return value
+        .slice(0, sheet_count)
+        .map((item) => sanitize_transform_state(item));
 }

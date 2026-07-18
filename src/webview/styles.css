@@ -62,10 +62,109 @@ body {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
+.toggle:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
 .toggle.active {
     background: var(--vscode-button-background, #0e639c);
     color: var(--vscode-button-foreground, #fff);
     border-color: var(--vscode-button-background, #0e639c);
+}
+
+.transform-controls {
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+}
+
+.transform-controls-row,
+.transform-strip,
+.transform-editor {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    flex-wrap: wrap;
+}
+
+.transform-strip {
+    padding-top: 0;
+    font-size: 12px;
+}
+
+.transform-pending,
+.transform-row-count,
+.transform-merge-notice,
+.transform-disabled-reason {
+    font-size: 12px;
+    opacity: 0.75;
+}
+
+.transform-merge-notice {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.transform-chip,
+.transform-chip button,
+.transform-clear,
+.transform-editor button,
+.transform-editor select,
+.transform-editor input {
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    background: var(--vscode-input-background, transparent);
+    color: var(--vscode-input-foreground, var(--vscode-foreground, #ccc));
+    font: inherit;
+    font-size: 12px;
+}
+
+button.transform-chip,
+.transform-clear,
+.transform-editor button {
+    cursor: pointer;
+    padding: 3px 7px;
+}
+
+div.transform-chip {
+    display: inline-flex;
+    overflow: hidden;
+}
+
+div.transform-chip button {
+    border: 0;
+    border-radius: 0;
+    padding: 3px 6px;
+    cursor: pointer;
+}
+
+.transform-chip.disabled {
+    opacity: 0.55;
+}
+
+.transform-chip-remove {
+    margin-left: 6px;
+    font-weight: bold;
+}
+
+.transform-editor {
+    border-top: 1px solid var(--vscode-panel-border, #444);
+}
+
+.transform-editor label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.transform-editor select,
+.transform-editor input {
+    padding: 3px 5px;
+}
+
+.transform-checkbox input {
+    accent-color: var(--vscode-button-background, #0e639c);
 }
 
 .toolbar-tooltip {

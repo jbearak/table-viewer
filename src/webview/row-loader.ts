@@ -74,8 +74,9 @@ export class RowLoader {
     ensure_rows(start_row: number, end_row: number): void {
         this.viewport = { start: start_row, end: end_row };
         this.viewport_set = true;
+        if (this.row_count <= 0) return;
         for (const start of get_needed_page_starts(start_row, end_row)) {
-            if (this.row_count > 0 && start >= this.row_count) continue;
+            if (start >= this.row_count) continue;
             if (this.pages.has(start)) {
                 this.touch(start);
                 continue;

@@ -20,6 +20,14 @@ function row_data(sheetIndex: number, startRow: number, generation: number, coun
 }
 
 describe('RowLoader', () => {
+    it('does not request a page when the effective row count is zero', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn());
+        loader.configure(0, 0, 1);
+        loader.ensure_rows(0, 40);
+        expect(post).not.toHaveBeenCalled();
+    });
+
     it('requests the first page when the viewport opens', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});

@@ -8,6 +8,8 @@ export interface RenderedCell {
     formatted: string;        // display text (== raw for CSV)
     bold: boolean;
     italic: boolean;
+    /** Original scalar category retained for correct numeric sorting. */
+    rawType?: 'string' | 'number' | 'boolean' | 'empty';
 }
 
 export interface RowWindow {

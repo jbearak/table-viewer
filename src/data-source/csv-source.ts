@@ -190,7 +190,13 @@ export class CsvDataSource implements DataSource {
         const cells: (RenderedCell | null)[] = [];
         for (let c = 0; c < this._colCount; c++) {
             const v = c < row.length ? row[c] : '';
-            cells.push(v === '' ? null : { raw: v, formatted: v, bold: false, italic: false });
+            cells.push(v === '' ? null : {
+                raw: v,
+                formatted: v,
+                bold: false,
+                italic: false,
+                rawType: 'string',
+            });
         }
         return cells;
     }

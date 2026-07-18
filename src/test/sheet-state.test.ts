@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     clamp_sheet_index,
     normalize_per_file_state,
+    sanitize_transform_state,
     trim_sheet_state_array,
 } from '../webview/sheet-state';
 import type { LegacyPerFileState, PerFileState } from '../types';
@@ -91,5 +92,63 @@ describe('sheet-state helpers', () => {
             '1:2': 'good',
             '0:0': { value: 'v', base: 'b' },
         });
+    });
+
+    it('sanitizes persisted transforms and drops duplicate or out-of-range columns', () => {
+        const sanitized = sanitize_transform_state({
+            sort: [
+                { colIndex: 1, direction: 'desc' },
+                { colIndex: 1, direction: 'asc' },
+                { colIndex: 9, direction: 'asc' },
+            ],
+            filters: [
+                {
+                    id: 'ok',
+                    colIndex: 0,
+                    operator: 'between',
+                    value: '1',
+                    secondValue: '2',
+                    caseSensitive: false,
+                    enabled: true,
+                },
+                {
+                    id: 'duplicate-column',
+                    colIndex: 0,
+                    operator: 'contains',
+                    value: 'x',
+                    caseSensitive: false,
+                    enabled: true,
+                },
+                {
+                    id: 'missing-upper',
+                    colIndex: 1,
+                    operator: 'between',
+                    value: '1',
+                    caseSensitive: false,
+                    enabled: true,
+                },
+            ],
+        }, 2);
+
+        expect(sanitized).toEqual({
+            sort: [{ colIndex: 1, direction: 'desc' }],
+            filters: [{
+                id: 'ok',
+                colIndex: 0,
+                operator: 'between',
+                value: '1',
+                secondValue: '2',
+                caseSensitive: false,
+                enabled: true,
+            }],
+        });
+    });
+
+    it('drops a persisted transform when its sheet schema fingerprint changes', () => {
+        expect(sanitize_transform_state({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: 'old-schema',
+        }, 1, 'new-schema')).toBeUndefined();
     });
 });

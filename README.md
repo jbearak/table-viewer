@@ -24,6 +24,8 @@ Table Viewer is the result.
 - Multi-sheet workbooks with horizontal or vertical tab orientation
 - Merged cells with correct colspan/rowspan rendering
 - Bold and italic text styling from Excel formatting
+- Stable, multi-column sorting with missing values kept last
+- Per-column filters for text, comparisons, ranges, and empty/non-empty values
 
 **Auto-refresh**
 - Watches the file on disk and reloads automatically when it changes
@@ -48,6 +50,14 @@ Table Viewer is the result.
 - Arrow keys and `h`/`j`/`k`/`l` to navigate
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menu for copy, select row, select column, select all
+
+**Sorting and filtering**
+- Use **Sort** to add one or more sort keys; click an active key to flip its direction
+- Use **Filter** to add one condition per column; multiple enabled filters are combined
+- Sorts and filters are view-only, persist per file and sheet, and are recomputed after reloads
+- Empty values sort last in both directions
+- When a sorted or filtered sheet contains merged cells, the transformed view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Clearing all transforms restores the exact merge layout.
+- Sorting and filtering are disabled during CSV/TSV edit mode and in synchronized preview panes so row-based edits and source scrolling cannot target the wrong record
 
 **Editing (CSV/TSV only)**
 - Click the **Edit** button in the toolbar to enter edit mode

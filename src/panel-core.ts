@@ -1,5 +1,12 @@
 import type { DataSource, RowWindow } from './data-source/interface';
-import type { StoredPerFileState, WebviewMessage } from './types';
+import { compute_transform, transformed_window } from './table-transform';
+import {
+    EMPTY_TRANSFORM,
+    transform_schema_for_sheet,
+    type SheetTransformState,
+    type StoredPerFileState,
+    type WebviewMessage,
+} from './types';
 
 /**
  * Minimal structural view of the parts of vscode.WebviewPanel that the core
@@ -47,6 +54,11 @@ export class ViewerPanelCore {
     private _generation = 1;
     private readonly cache = new Map<string, RowWindow>();
     private readonly max_cached_pages: number;
+    private readonly transform_indices = new Map<number, Uint32Array>();
+    private readonly transform_states = new Map<number, SheetTransformState>();
+    private readonly transform_sequences = new Map<number, number>();
+    private readonly transforms_in_flight = new Set<number>();
+    private source_epoch = 0;
 
     constructor(
         private readonly panel: PanelLike,
@@ -60,9 +72,20 @@ export class ViewerPanelCore {
         return this._generation;
     }
 
+    get has_transform_work(): boolean {
+        return this.transforms_in_flight.size > 0
+            || this.transform_indices.size > 0;
+    }
+
     /** Swap in a freshly-parsed source (reload) without sending a message. */
     set_source(source: DataSource): void {
         this.source = source;
+        this.source_epoch += 1;
+        this.transform_indices.clear();
+        this.transform_states.clear();
+        this.transform_sequences.clear();
+        this.transforms_in_flight.clear();
+        this.cache.clear();
     }
 
     /** Initial structure send. Generation is left as-is (a fresh panel starts
@@ -99,7 +122,130 @@ export class ViewerPanelCore {
     async handle_message(msg: WebviewMessage): Promise<void> {
         if (msg.type === 'requestRows') {
             await this.handle_row_request(msg);
+        } else if (msg.type === 'setTransform') {
+            await this.handle_set_transform(msg);
         }
+    }
+
+    private async handle_set_transform(
+        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+    ): Promise<void> {
+        const sheet = this.source.meta().sheets[msg.sheetIndex];
+        if (!sheet) {
+            await this.post({
+                type: 'transformApplied',
+                sheetIndex: msg.sheetIndex,
+                state: this.transform_states.get(msg.sheetIndex) ?? EMPTY_TRANSFORM,
+                rowCount: 0,
+                requestId: msg.requestId,
+                generation: this._generation,
+                error: `Sheet index ${msg.sheetIndex} is out of range.`,
+            });
+            return;
+        }
+        if (msg.generation !== this._generation) {
+            await this.post_transform_error(
+                msg,
+                sheet.rowCount,
+                'The source changed before this sort/filter request arrived.',
+            );
+            return;
+        }
+        if (
+            (msg.state.sort.length > 0 || msg.state.filters.length > 0)
+            && msg.state.schema !== transform_schema_for_sheet(sheet)
+        ) {
+            await this.post_transform_error(
+                msg,
+                sheet.rowCount,
+                'The saved sort/filter no longer matches this sheet.',
+            );
+            return;
+        }
+
+        const sequence = (this.transform_sequences.get(msg.sheetIndex) ?? 0) + 1;
+        this.transform_sequences.set(msg.sheetIndex, sequence);
+        const source_epoch = this.source_epoch;
+        this.transforms_in_flight.add(msg.sheetIndex);
+        const is_cancelled = () =>
+            this.source_epoch !== source_epoch
+            || this.transform_sequences.get(msg.sheetIndex) !== sequence;
+
+        try {
+            const result = await compute_transform(
+                this.source,
+                msg.sheetIndex,
+                msg.state,
+                is_cancelled,
+            );
+            if (is_cancelled()) return;
+
+            if (result.indices) {
+                this.transform_indices.set(msg.sheetIndex, result.indices);
+            } else {
+                this.transform_indices.delete(msg.sheetIndex);
+            }
+            this.transform_states.set(msg.sheetIndex, clone_transform(msg.state));
+            this._generation += 1;
+            this.cache.clear();
+            await this.post({
+                type: 'transformApplied',
+                sheetIndex: msg.sheetIndex,
+                state: clone_transform(msg.state),
+                rowCount: result.rowCount,
+                requestId: msg.requestId,
+                generation: this._generation,
+            });
+        } catch (error) {
+            if (is_cancelled() || (error as { name?: unknown })?.name === 'AbortError') {
+                return;
+            }
+            const previous = this.transform_states.get(msg.sheetIndex)
+                ?? EMPTY_TRANSFORM;
+            const previous_count = this.transform_indices.get(msg.sheetIndex)?.length
+                ?? sheet.rowCount;
+            await this.post({
+                type: 'transformApplied',
+                sheetIndex: msg.sheetIndex,
+                state: clone_transform(previous),
+                rowCount: previous_count,
+                requestId: msg.requestId,
+                generation: this._generation,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        } finally {
+            if (this.transform_sequences.get(msg.sheetIndex) === sequence) {
+                this.transforms_in_flight.delete(msg.sheetIndex);
+            }
+        }
+    }
+
+    reject_transform(
+        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+        error: string,
+    ): Promise<boolean> {
+        const natural_count =
+            this.source.meta().sheets[msg.sheetIndex]?.rowCount ?? 0;
+        return this.post_transform_error(msg, natural_count, error);
+    }
+
+    private post_transform_error(
+        msg: Extract<WebviewMessage, { type: 'setTransform' }>,
+        natural_row_count: number,
+        error: string,
+    ): Promise<boolean> {
+        const previous = this.transform_states.get(msg.sheetIndex)
+            ?? EMPTY_TRANSFORM;
+        return this.post({
+            type: 'transformApplied',
+            sheetIndex: msg.sheetIndex,
+            state: clone_transform(previous),
+            rowCount: this.transform_indices.get(msg.sheetIndex)?.length
+                ?? natural_row_count,
+            requestId: msg.requestId,
+            generation: this._generation,
+            error,
+        });
     }
 
     private async handle_row_request(
@@ -121,7 +267,13 @@ export class ViewerPanelCore {
             this.cache.set(key, window);
         } else {
             try {
-                window = this.source.read_rows(msg.sheetIndex, start_row, msg.count);
+                window = transformed_window(
+                    this.source,
+                    msg.sheetIndex,
+                    start_row,
+                    msg.count,
+                    this.transform_indices.get(msg.sheetIndex),
+                );
             } catch {
                 // A source can throw (e.g. RangeError for an out-of-range
                 // sheetIndex). Answer with an empty window instead of leaving the
@@ -155,6 +307,15 @@ export class ViewerPanelCore {
     private post(message: unknown): Promise<boolean> {
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
+}
+
+function clone_transform(state: SheetTransformState): SheetTransformState {
+    const clone: SheetTransformState = {
+        sort: state.sort.map((key) => ({ ...key })),
+        filters: state.filters.map((entry) => ({ ...entry })),
+    };
+    if (state.schema !== undefined) clone.schema = state.schema;
+    return clone;
 }
 
 /**

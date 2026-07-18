@@ -113,6 +113,10 @@ export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
     generation: number;
+    /** Effective displayed row count (may be filtered). */
+    row_count?: number;
+    /** True while display rows are a view-only permutation of source rows. */
+    transformed?: boolean;
     show_formatting: boolean;
     column_widths: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
@@ -149,6 +153,8 @@ export function GridShell({
     sheet_meta,
     sheet_index,
     generation,
+    row_count = sheet_meta.rowCount,
+    transformed = false,
     show_formatting,
     column_widths,
     on_column_resize,
@@ -163,7 +169,7 @@ export function GridShell({
     editing_ref,
     auto_fit_ref,
 }: GridShellProps): React.JSX.Element {
-    const loader = use_row_loader(sheet_index, sheet_meta.rowCount, generation);
+    const loader = use_row_loader(sheet_index, row_count, generation);
     const theme = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
@@ -510,6 +516,10 @@ export function GridShell({
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
+            if (transformed) {
+                row_resize_ref.current?.set_target(null);
+                return;
+            }
             if (args.kind !== 'cell') {
                 row_resize_ref.current?.set_target(null);
                 return;
@@ -532,7 +542,7 @@ export function GridShell({
                     : null,
             );
         },
-        [row_heights],
+        [row_heights, transformed],
     );
 
     // Live drag: persist the new height (mirrors column resize) and nudge Glide +
@@ -624,26 +634,26 @@ export function GridShell({
 
     const select_column = useCallback(
         (col: number) => {
-            if (sheet_meta.rowCount === 0) return;
+            if (row_count === 0) return;
             select_rect([col, 0], {
                 x: col,
                 y: 0,
                 width: 1,
-                height: sheet_meta.rowCount,
+                height: row_count,
             });
         },
-        [sheet_meta.rowCount, select_rect],
+        [row_count, select_rect],
     );
 
     const select_all = useCallback(() => {
-        if (sheet_meta.rowCount === 0 || sheet_meta.columnCount === 0) return;
+        if (row_count === 0 || sheet_meta.columnCount === 0) return;
         select_rect([0, 0], {
             x: 0,
             y: 0,
             width: sheet_meta.columnCount,
-            height: sheet_meta.rowCount,
+            height: row_count,
         });
-    }, [sheet_meta.rowCount, sheet_meta.columnCount, select_rect]);
+    }, [row_count, sheet_meta.columnCount, select_rect]);
 
     const discard_edit = useCallback(
         (row: number, col: number) => {
@@ -738,7 +748,7 @@ export function GridShell({
                 cur_row,
                 cur_col,
                 decision.direction,
-                sheet_meta.rowCount,
+                row_count,
                 sheet_meta.columnCount,
                 merges,
             );
@@ -756,7 +766,7 @@ export function GridShell({
             });
             grid_ref.current?.scrollTo(cell[0], cell[1]);
         },
-        [editable_cells, merges, sheet_meta.rowCount, sheet_meta.columnCount, copy_rect],
+        [editable_cells, merges, row_count, sheet_meta.columnCount, copy_rect],
     );
 
     const on_visible_region_changed = useCallback(
@@ -898,7 +908,7 @@ export function GridShell({
                 className="glide-grid"
                 width="100%"
                 height="100%"
-                rows={sheet_meta.rowCount}
+                rows={row_count}
                 columns={columns}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
@@ -926,10 +936,12 @@ export function GridShell({
                 get_row={get_row}
                 version={version}
             />
-            <RowResizeOverlay
-                ref={row_resize_ref}
-                on_resize={handle_row_resize_drag}
-            />
+            {!transformed && (
+                <RowResizeOverlay
+                    ref={row_resize_ref}
+                    on_resize={handle_row_resize_drag}
+                />
+            )}
             {context_menu && (
                 <ContextMenu
                     x={context_menu.x}

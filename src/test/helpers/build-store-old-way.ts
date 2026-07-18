@@ -23,6 +23,13 @@ export function build_store_old_way(
                 formatted: cell.formatted,
                 bold: cell.bold,
                 italic: cell.italic,
+                rawType: cell.raw === null
+                    ? 'empty'
+                    : typeof cell.raw === 'number'
+                        ? 'number'
+                        : typeof cell.raw === 'boolean'
+                            ? 'boolean'
+                            : 'string',
             });
         }
     }

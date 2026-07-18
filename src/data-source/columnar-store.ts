@@ -2,6 +2,7 @@ import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
 const BOLD = 1, ITALIC = 2;
+const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4;
 
 export class ColumnarStore {
     private constructor(
@@ -11,6 +12,7 @@ export class ColumnarStore {
         private readonly rawIdx: Int32Array,
         private readonly fmtIdx: Int32Array,
         private readonly flags: Uint8Array,
+        private readonly types: Uint8Array,
     ) {}
 
     get poolSize(): number { return this.pool.length; }
@@ -32,6 +34,7 @@ export class ColumnarStore {
                     formatted: this.pool[this.fmtIdx[i]],
                     bold: (f & BOLD) !== 0,
                     italic: (f & ITALIC) !== 0,
+                    rawType: decode_type(this.types[i]),
                 });
             }
             out.push(row);
@@ -45,12 +48,14 @@ export class ColumnarStore {
         private readonly rawIdx: Int32Array;
         private readonly fmtIdx: Int32Array;
         private readonly flags: Uint8Array;
+        private readonly types: Uint8Array;
 
         constructor(private readonly rows: number, private readonly cols: number) {
             const n = rows * cols;
             this.rawIdx = new Int32Array(n).fill(NULL_IDX);
             this.fmtIdx = new Int32Array(n).fill(NULL_IDX);
             this.flags = new Uint8Array(n);
+            this.types = new Uint8Array(n);
         }
 
         private intern(s: string): number {
@@ -69,10 +74,31 @@ export class ColumnarStore {
             this.rawIdx[i] = this.intern(cell.raw ?? '');
             this.fmtIdx[i] = this.intern(cell.formatted);
             this.flags[i] = (cell.bold ? BOLD : 0) | (cell.italic ? ITALIC : 0);
+            this.types[i] = encode_type(cell.rawType);
         }
 
         build(): ColumnarStore {
-            return new ColumnarStore(this.rows, this.cols, this.pool, this.rawIdx, this.fmtIdx, this.flags);
+            return new ColumnarStore(this.rows, this.cols, this.pool, this.rawIdx, this.fmtIdx, this.flags, this.types);
         }
     };
+}
+
+function encode_type(type: RenderedCell['rawType']): number {
+    switch (type) {
+        case 'string': return TYPE_STRING;
+        case 'number': return TYPE_NUMBER;
+        case 'boolean': return TYPE_BOOLEAN;
+        case 'empty': return TYPE_EMPTY;
+        default: return 0;
+    }
+}
+
+function decode_type(type: number): RenderedCell['rawType'] {
+    switch (type) {
+        case TYPE_STRING: return 'string';
+        case TYPE_NUMBER: return 'number';
+        case TYPE_BOOLEAN: return 'boolean';
+        case TYPE_EMPTY: return 'empty';
+        default: return undefined;
+    }
 }

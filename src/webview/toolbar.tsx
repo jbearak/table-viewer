@@ -14,10 +14,14 @@ interface ToolbarProps {
     show_vertical_tabs_button: boolean;
     auto_fit_active: boolean;
     on_toggle_auto_fit: () => void;
+    auto_fit_disabled?: boolean;
+    auto_fit_disabled_reason?: string;
     edit_mode: boolean;
     is_dirty: boolean;
     on_toggle_edit_mode: () => void;
     show_edit_button: boolean;
+    edit_disabled?: boolean;
+    edit_disabled_reason?: string;
 }
 
 export function Toolbar({
@@ -29,10 +33,14 @@ export function Toolbar({
     show_vertical_tabs_button,
     auto_fit_active,
     on_toggle_auto_fit,
+    auto_fit_disabled = false,
+    auto_fit_disabled_reason,
     edit_mode,
     is_dirty,
     on_toggle_edit_mode,
     show_edit_button,
+    edit_disabled = false,
+    edit_disabled_reason,
 }: ToolbarProps): React.JSX.Element {
 
     return (
@@ -65,23 +73,29 @@ export function Toolbar({
                 label="Auto-fit Columns"
                 active={auto_fit_active}
                 tooltip_text={
-                    auto_fit_active
+                    auto_fit_disabled
+                        ? (auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
+                        : auto_fit_active
                         ? 'Restore original column widths.'
                         : 'Auto-fit all columns to their content.'
                 }
                 onClick={on_toggle_auto_fit}
+                disabled={auto_fit_disabled}
             />
             {show_edit_button && (
                 <ToolbarButton
                     label="Edit"
                     active={edit_mode}
                     tooltip_text={
-                        edit_mode
+                        edit_disabled
+                            ? (edit_disabled_reason ?? 'Editing is unavailable.')
+                            : edit_mode
                             ? 'Exit edit mode.'
                             : 'Enter edit mode to modify cell values.'
                     }
                     onClick={on_toggle_edit_mode}
                     extra_class={is_dirty ? 'has-unsaved' : undefined}
+                    disabled={edit_disabled}
                 />
             )}
         </div>
@@ -94,12 +108,14 @@ function ToolbarButton({
     tooltip_text,
     onClick,
     extra_class,
+    disabled = false,
 }: {
     label: string;
     active: boolean;
     tooltip_text: string;
     onClick: () => void;
     extra_class?: string;
+    disabled?: boolean;
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
@@ -166,6 +182,7 @@ function ToolbarButton({
                 ref={button_ref}
                 type="button"
                 className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
+                disabled={disabled}
                 onClick={(e) => { set_is_hovered(false); if (e.nativeEvent instanceof PointerEvent) button_ref.current?.blur(); onClick(); }}
                 onMouseOver={() => set_is_hovered(true)}
                 onMouseOut={() => set_is_hovered(false)}

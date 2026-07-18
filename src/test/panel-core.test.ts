@@ -129,4 +129,90 @@ describe('ViewerPanelCore', () => {
         await req(0);   // 0 was evicted -> read again
         expect(src.read_rows_calls).toBe(4);
     });
+
+    it('applies a transform atomically, bumps generation, and serves display order', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const old_generation = core.generation;
+
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-1',
+            generation: old_generation,
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        const applied = posted.find((message) => message.type === 'transformApplied');
+        expect(applied).toMatchObject({
+            requestId: 'sort-1',
+            rowCount: 5,
+        });
+        expect(core.generation).toBe(old_generation + 1);
+
+        await core.handle_message({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'page',
+            generation: core.generation,
+        });
+        const page = posted.find((message) => message.type === 'rowData');
+        expect(page.rows.map((row: RenderedCell[]) => row[0].raw))
+            .toEqual(['4', '3', '2']);
+    });
+
+    it('rolls back a failed transform without bumping generation', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const generation = core.generation;
+
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'bad',
+            generation,
+            state: {
+                sort: [{ colIndex: 99, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        const applied = posted.find((message) => message.type === 'transformApplied');
+        expect(applied.requestId).toBe('bad');
+        expect(applied.error).toContain('column index 99 out of range');
+        expect(applied.state).toEqual({ sort: [], filters: [] });
+        expect(core.generation).toBe(generation);
+    });
+
+    it('rejects a stale transform request after the source generation changes', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const stale_generation = core.generation;
+        await core.send_meta_reload();
+
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'stale',
+            generation: stale_generation,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        const applied = posted.find((message) =>
+            message.type === 'transformApplied');
+        expect(applied.error).toContain('source changed');
+        expect(applied.state).toEqual({ sort: [], filters: [] });
+        expect(core.generation).toBe(stale_generation + 1);
+    });
 });

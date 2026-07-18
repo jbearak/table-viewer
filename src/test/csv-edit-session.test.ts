@@ -98,6 +98,55 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    it('rejects transforms while an edit session is owned', async () => {
+        const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'during-edit',
+            generation: 1,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+
+        const response = panel.__messages.find((message) =>
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied',
+        ) as { error?: string } | undefined;
+        expect(response?.error).toContain('Exit edit mode');
+    });
+
+    it('does not grant edit mode while a transform is computing', async () => {
+        const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
+        await panel.__receive({ type: 'ready' });
+
+        const transform = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'pending',
+            generation: 1,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } as never);
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        await transform;
+
+        expect(edit_session_results(panel)).toEqual([
+            { type: 'editSessionResult', granted: false },
+        ]);
+    });
+
     it('allows multiple viewers for one CSV file but grants edit mode to only one', async () => {
         const file_uri = uri('/tmp/session.csv');
         const state = state_store();
