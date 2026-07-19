@@ -414,6 +414,9 @@ describe('Toolbar', () => {
             expect(getComputedStyle(notice).overflowWrap).toBe('anywhere');
             expect(getComputedStyle(actions).maxWidth).toBe('100%');
             expect(getComputedStyle(actions).overflowX).toBe('auto');
+            expect(getComputedStyle(actions.firstElementChild as HTMLElement).marginLeft)
+                .toBe('auto');
+            expect(getComputedStyle(actions).justifyContent).toBe('');
             expect(container.querySelector('.sort-chip')).not.toBeNull();
             expect(container.querySelector('.filter-chip-body')).not.toBeNull();
             expect(get_button('Formatting')).toBeDefined();

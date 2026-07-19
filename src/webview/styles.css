@@ -570,6 +570,10 @@ body {
     scrollbar-width: thin;
 }
 
+.toolbar-actions > :first-child {
+    margin-left: auto;
+}
+
 .toolbar.is-wrapped {
     flex-wrap: wrap;
 }
