@@ -1,4 +1,11 @@
-import React, { useId, useLayoutEffect, useRef, useState } from 'react';
+import React, {
+    forwardRef,
+    useId,
+    useImperativeHandle,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from 'react';
 import type { FilterEntry, SheetTransformState } from '../types';
 import {
     ColumnVisibilityControl,
@@ -7,6 +14,10 @@ import {
 import { FilterStrip } from './filter-strip';
 import { SortStrip } from './sort-strip';
 import { use_toolbar_wrap } from './use-toolbar-wrap';
+
+export interface ToolbarFocusHandle {
+    focus(): boolean;
+}
 
 export interface ToolbarProps {
     row_count: number;
@@ -39,7 +50,10 @@ export interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
-export function Toolbar(props: ToolbarProps): React.JSX.Element {
+export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
+    props,
+    focus_ref,
+): React.JSX.Element {
     const {
         transform,
         row_count,
@@ -53,6 +67,14 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
     const lead_ref = useRef<HTMLSpanElement>(null);
     const chips_ref = useRef<HTMLDivElement>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
+    useImperativeHandle(focus_ref, () => ({
+        focus: () => {
+            const toolbar = toolbar_ref.current;
+            if (!toolbar) return false;
+            toolbar.focus({ preventScroll: true });
+            return document.activeElement === toolbar;
+        },
+    }), []);
     const row_count_text = row_count === source_row_count
         ? `${row_count.toLocaleString()} rows`
         : `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
@@ -74,7 +96,13 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
     const controls_disabled = !!(props.transform_disabled || props.transform_pending);
 
     return (
-        <div ref={toolbar_ref} className={wrapped ? 'toolbar is-wrapped' : 'toolbar'}>
+        <div
+            ref={toolbar_ref}
+            className={wrapped ? 'toolbar is-wrapped' : 'toolbar'}
+            role="toolbar"
+            tabIndex={-1}
+            aria-label="Table controls"
+        >
             <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
             <div ref={chips_ref} className="toolbar-chips">
                 <SortStrip
@@ -163,7 +191,7 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
             </div>
         </div>
     );
-}
+});
 
 function ToolbarButton({
     label,
@@ -207,8 +235,21 @@ function ToolbarButton({
             } as React.CSSProperties);
         };
         update();
+        const toolbar = button_ref.current?.closest<HTMLElement>('.toolbar');
+        const observer = typeof ResizeObserver === 'undefined'
+            ? undefined
+            : new ResizeObserver(update);
+        if (button_ref.current) observer?.observe(button_ref.current);
+        if (toolbar) observer?.observe(toolbar);
+        document.addEventListener('scroll', update, true);
         window.addEventListener('resize', update);
-        return () => window.removeEventListener('resize', update);
+        window.visualViewport?.addEventListener('resize', update);
+        return () => {
+            observer?.disconnect();
+            document.removeEventListener('scroll', update, true);
+            window.removeEventListener('resize', update);
+            window.visualViewport?.removeEventListener('resize', update);
+        };
     }, [show_tooltip]);
 
     return (
