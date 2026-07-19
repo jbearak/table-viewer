@@ -184,7 +184,7 @@
     "@types/vscode": "^1.110.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
-    "@vscode/vsce": "^2.26.0",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.0",
     "jsdom": "^29.0.1",
     "mocha": "^11.7.6",
