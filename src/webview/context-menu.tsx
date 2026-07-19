@@ -26,6 +26,7 @@ export function ContextMenu({ x, y, items, on_dismiss, restore_focus, aria_label
     const enabled_indexes = items.flatMap((item, index) =>
         item.kind !== 'separator' && !item.disabled ? [index] : []);
     const [active_index, set_active_index] = useState(enabled_indexes[0] ?? -1);
+    const [position, set_position] = useState({ left: x, top: y });
 
     const dismiss = useCallback((reason: DismissReason) => {
         if (dismissed_ref.current) return;
@@ -50,8 +51,17 @@ export function ContextMenu({ x, y, items, on_dismiss, restore_focus, aria_label
         if (!el) return;
         const rect = el.getBoundingClientRect();
         const margin = 4;
-        el.style.left = `${Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - rect.width - margin))}px`;
-        el.style.top = `${Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - rect.height - margin))}px`;
+        const left = Math.min(
+            Math.max(margin, x),
+            Math.max(margin, window.innerWidth - rect.width - margin),
+        );
+        const top = Math.min(
+            Math.max(margin, y),
+            Math.max(margin, window.innerHeight - rect.height - margin),
+        );
+        set_position((current) => (
+            current.left === left && current.top === top ? current : { left, top }
+        ));
     }, [x, y]);
 
     useEffect(() => {
@@ -90,7 +100,7 @@ export function ContextMenu({ x, y, items, on_dismiss, restore_focus, aria_label
     };
 
     return (
-        <div ref={menu_ref} className="context-menu" style={{ left: x, top: y }} role="menu" aria-label={aria_label} onKeyDown={on_key_down}>
+        <div ref={menu_ref} className="context-menu" style={position} role="menu" aria-label={aria_label} onKeyDown={on_key_down}>
             {items.map((item, index) => item.kind === 'separator' ? (
                 <div key={`separator-${index}`} className="context-menu-divider" role="separator" />
             ) : (

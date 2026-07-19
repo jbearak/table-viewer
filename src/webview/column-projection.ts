@@ -171,7 +171,7 @@ function canonical_visibility_from_visible(
 ): SheetColumnVisibilityState | undefined {
     const visible = sanitize_indexes(Array.from(visible_columns), column_count);
     if (visible.length === column_count) return undefined;
-    if (visible.length <= column_count - visible.length) {
+    if (visible.length < column_count - visible.length) {
         return schema === undefined
             ? { visibleColumns: visible }
             : { visibleColumns: visible, schema };

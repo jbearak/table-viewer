@@ -665,7 +665,7 @@ describe('GridShell column projection', () => {
             localEventX: 20,
             localEventY: 10,
         }));
-        expect(document.body.textContent).toContain('Copy Column');
+        expect(document.body.textContent).toContain('Copy column');
         expect(document.body.textContent).toContain('Add ascending to sort');
         await act(async () => Array.from(document.querySelectorAll('button'))
             .find((button) => button.textContent?.includes('Sort ascending'))!.click());
@@ -784,7 +784,7 @@ describe('GridShell column projection', () => {
             localEventY: 10,
         }));
         await act(async () => Array.from(document.querySelectorAll('button'))
-            .find((button) => button.textContent === 'Copy Column')!.click());
+            .find((button) => button.textContent === 'Copy column')!.click());
         expect(write_text).toHaveBeenCalledWith('C name\nsource-c');
     });
 
@@ -874,7 +874,7 @@ describe('GridShell column projection', () => {
             localEventY: 10,
         }));
         await act(async () => Array.from(document.querySelectorAll('button'))
-            .find((button) => button.textContent === 'Copy Column')!.click());
+            .find((button) => button.textContent === 'Copy column')!.click());
         expect(write_text).toHaveBeenCalledWith('C name\nprojected-edit');
     });
 
