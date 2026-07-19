@@ -10,6 +10,7 @@ import type { FilterEntry, SheetTransformState } from '../types';
 import {
     ColumnVisibilityControl,
     type ColumnVisibilityControlProps,
+    type ColumnVisibilityFocusHandle,
 } from './column-visibility-control';
 import { FilterStrip } from './filter-strip';
 import { SortStrip } from './sort-strip';
@@ -17,6 +18,8 @@ import { use_toolbar_wrap } from './use-toolbar-wrap';
 
 export interface ToolbarFocusHandle {
     focus(): boolean;
+    /** Focus the stable Columns trigger used to recover an all-hidden grid. */
+    focus_columns(): boolean;
 }
 
 export interface ToolbarProps {
@@ -64,6 +67,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         on_cancel_transform,
     } = props;
     const toolbar_ref = useRef<HTMLDivElement>(null);
+    const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
     const lead_ref = useRef<HTMLSpanElement>(null);
     const chips_ref = useRef<HTMLDivElement>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
@@ -74,6 +78,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             toolbar.focus({ preventScroll: true });
             return document.activeElement === toolbar;
         },
+        focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
     const row_count_text = row_count === source_row_count
         ? `${row_count.toLocaleString()} rows`
@@ -162,7 +167,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                         onClick={props.on_toggle_tab_orientation}
                     />
                 )}
-                <ColumnVisibilityControl {...props.column_visibility} />
+                <ColumnVisibilityControl
+                    ref={columns_ref}
+                    {...props.column_visibility}
+                />
                 <ToolbarButton
                     label="Auto-fit Columns"
                     active={props.auto_fit_active}

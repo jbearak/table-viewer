@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     ColumnVisibilityControl,
     type ColumnVisibilityControlProps,
+    type ColumnVisibilityFocusHandle,
 } from '../webview/column-visibility-control';
 
 let root: Root | null = null;
@@ -18,6 +19,7 @@ const column_names = ['Revenue', 'Revenue', ''];
 
 function render_control(
     overrides: Partial<ColumnVisibilityControlProps> = {},
+    focus_ref?: React.Ref<ColumnVisibilityFocusHandle>,
 ) {
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -34,7 +36,7 @@ function render_control(
         ...overrides,
     };
     act(() => {
-        root!.render(React.createElement(ColumnVisibilityControl, props));
+        root!.render(React.createElement(ColumnVisibilityControl, { ...props, ref: focus_ref }));
     });
     return {
         props,
@@ -43,6 +45,7 @@ function render_control(
                 root!.render(React.createElement(ColumnVisibilityControl, {
                     ...props,
                     ...next,
+                    ref: focus_ref,
                 }));
             });
         },
@@ -191,6 +194,22 @@ describe('ColumnVisibilityControl', () => {
         expect(document.querySelector('[role="dialog"]')).toBeNull();
         expect(document.activeElement).toBe(trigger());
         expect(trigger().getAttribute('aria-expanded')).toBe('false');
+    });
+
+    it('exposes a safe imperative focus target for the Columns trigger', () => {
+        const focus_ref = React.createRef<ColumnVisibilityFocusHandle>();
+        const rendered = render_control({}, focus_ref);
+        const other = document.createElement('button');
+        document.body.appendChild(other);
+        other.focus();
+
+        expect(focus_ref.current?.focus()).toBe(true);
+        expect(document.activeElement).toBe(trigger());
+
+        rendered.rerender({ disabled: true });
+        other.focus();
+        expect(focus_ref.current?.focus()).toBe(false);
+        expect(document.activeElement).toBe(other);
     });
 
     it('dismisses on an outside pointer press and resets when the sheet changes', () => {

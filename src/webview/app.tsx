@@ -200,6 +200,8 @@ export function App(): React.JSX.Element {
     const document_epoch_ref = useRef(0);
     const preview_mode_ref = useRef(false);
     const preview_scroll_sequence_ref = useRef(0);
+    const pending_preview_scroll_ref = useRef<PendingPreviewScroll | null>(null);
+    const last_preview_visible_row_ref = useRef<number | null>(null);
     const filter_restore_timer_ref = useRef<number | undefined>(undefined);
     const grid_focus_ref = useRef<GridFocusHandle | null>(null);
     const toolbar_focus_ref = useRef<ToolbarFocusHandle | null>(null);
@@ -263,10 +265,27 @@ export function App(): React.JSX.Element {
         auto_fit_snapshot_ref.current = auto_fit_snapshot;
     }, [auto_fit_snapshot]);
 
+    const clear_pending_preview_scroll = useCallback(() => {
+        pending_preview_scroll_ref.current = null;
+        set_pending_preview_scroll(null);
+    }, []);
+
+    const queue_preview_scroll = useCallback((row: number) => {
+        const pending = {
+            row,
+            sequence: ++preview_scroll_sequence_ref.current,
+        };
+        pending_preview_scroll_ref.current = pending;
+        set_pending_preview_scroll(pending);
+    }, []);
+
     useEffect(() => {
         preview_mode_ref.current = preview_mode;
-        if (!preview_mode) set_pending_preview_scroll(null);
-    }, [preview_mode]);
+        if (!preview_mode) {
+            last_preview_visible_row_ref.current = null;
+            clear_pending_preview_scroll();
+        }
+    }, [clear_pending_preview_scroll, preview_mode]);
 
     useEffect(() => {
         const handler = (event: MessageEvent) => {
@@ -276,7 +295,8 @@ export function App(): React.JSX.Element {
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
                 set_toolbar_focus_restore(null);
-                set_pending_preview_scroll(null);
+                last_preview_visible_row_ref.current = null;
+                clear_pending_preview_scroll();
                 preview_mode_ref.current = msg.previewMode ?? false;
                 set_meta(msg.meta);
                 set_filter_editor(null);
@@ -361,6 +381,13 @@ export function App(): React.JSX.Element {
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
                 set_toolbar_focus_restore(null);
+                if (
+                    preview_mode_ref.current
+                    && pending_preview_scroll_ref.current === null
+                    && last_preview_visible_row_ref.current !== null
+                ) {
+                    queue_preview_scroll(last_preview_visible_row_ref.current);
+                }
                 set_meta(msg.meta);
                 set_filter_editor(null);
                 set_generation(msg.generation);
@@ -444,10 +471,7 @@ export function App(): React.JSX.Element {
                 && preview_mode_ref.current
                 && Number.isFinite(msg.row)
             ) {
-                set_pending_preview_scroll({
-                    row: msg.row,
-                    sequence: ++preview_scroll_sequence_ref.current,
-                });
+                queue_preview_scroll(msg.row);
             }
 
             if (msg.type === 'transformApplied') {
@@ -533,7 +557,12 @@ export function App(): React.JSX.Element {
 
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [active_sheet_index, persist_immediate]);
+    }, [
+        active_sheet_index,
+        clear_pending_preview_scroll,
+        persist_immediate,
+        queue_preview_scroll,
+    ]);
 
     useEffect(() => {
         if (!grid_focus_restore) return;
@@ -551,7 +580,6 @@ export function App(): React.JSX.Element {
         let timer: number | undefined;
         let attempt = 0;
         const restore = () => {
-            const handle = grid_focus_ref.current;
             if (
                 grid_focus_restore.document_epoch !== document_epoch_ref.current
                 || grid_focus_restore.sheet_index !== active_sheet_index
@@ -561,6 +589,13 @@ export function App(): React.JSX.Element {
                 ));
                 return;
             }
+            if (!document.hasFocus()) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
+            const handle = grid_focus_ref.current;
             if (
                 handle?.generation === grid_focus_restore.generation
                 && handle.focus()
@@ -1173,9 +1208,20 @@ export function App(): React.JSX.Element {
         [column_names],
     );
     const handle_preview_scroll_applied = useCallback((sequence: number) => {
-        set_pending_preview_scroll((current) => (
-            current?.sequence === sequence ? null : current
-        ));
+        set_pending_preview_scroll((current) => {
+            if (
+                current?.sequence !== sequence
+                || pending_preview_scroll_ref.current?.sequence !== sequence
+            ) return current;
+            pending_preview_scroll_ref.current = null;
+            return null;
+        });
+    }, []);
+    const handle_preview_visible_row_change = useCallback((row: number) => {
+        if (preview_mode_ref.current) last_preview_visible_row_ref.current = row;
+    }, []);
+    const focus_columns_trigger = useCallback(() => {
+        toolbar_focus_ref.current?.focus_columns();
     }, []);
 
     if (!meta) {
@@ -1245,12 +1291,14 @@ export function App(): React.JSX.Element {
             grid_focus_ref={grid_focus_ref}
             pending_preview_scroll={pending_preview_scroll}
             on_preview_scroll_applied={handle_preview_scroll_applied}
+            on_preview_visible_row_change={handle_preview_visible_row_change}
             transform_state={visible_transform}
             transform_sections={!edit_mode && !edit_session_pending && !preview_mode}
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
+            on_focus_columns={focus_columns_trigger}
         />
     );
 

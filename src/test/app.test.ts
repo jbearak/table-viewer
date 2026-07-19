@@ -62,10 +62,12 @@ vi.mock('../webview/grid-shell', () => ({
         };
         pending_preview_scroll?: { row: number; sequence: number } | null;
         on_preview_scroll_applied?: (sequence: number) => void;
+        on_preview_visible_row_change?: (row: number) => void;
         transform_sections: boolean;
         transform_pending: boolean;
         on_transform_change: (state: { sort: Array<{ colIndex: number; direction: 'asc' | 'desc' }>; filters: unknown[] }) => void;
         on_open_filter: (source_column: number, anchor: { left: number; top: number }, restore_focus: () => void) => void;
+        on_focus_columns?: () => void;
     }) => {
         grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
         const mount_id = React.useRef(++grid_shell_mock.mount_count);
@@ -615,6 +617,20 @@ describe('column visibility projection', () => {
             },
         }));
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([]);
+    });
+
+    it('exposes the stable Columns trigger as grid focus recovery', async () => {
+        await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        const other = document.createElement('button');
+        document.body.appendChild(other);
+        other.focus();
+
+        const recover_columns = grid_shell_mock.latest_props
+            ?.on_focus_columns as (() => void) | undefined;
+        await act(async () => recover_columns?.());
+
+        expect(document.activeElement).toBe(columns_trigger());
     });
 
     it('toggles and restores source columns with immediate per-sheet persistence only', async () => {
@@ -1276,6 +1292,28 @@ describe('preview mode', () => {
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
     });
 
+    it('queues the last visible preview row across metaReload when no host scroll is pending', async () => {
+        await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
+        );
+        const report_visible = grid_shell_mock.latest_props
+            ?.on_preview_visible_row_change as ((row: number) => void) | undefined;
+        await act(async () => report_visible?.(75));
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
+
+        await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
+        const retained = JSON.parse(
+            grid_stub().getAttribute('data-pending-preview-scroll')!,
+        );
+        expect(retained).toMatchObject({ row: 75 });
+
+        await act(async () => (
+            container!.querySelector('.stub-ack-preview-scroll') as HTMLButtonElement
+        ).click());
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
+    });
+
     it('drops queued preview scrolls on a fresh document or when preview mode ends', async () => {
         await render_app();
         await dispatch_host_message(
@@ -1450,6 +1488,7 @@ describe('sorting and filtering', () => {
         ['grid shortcut', '.stub-shortcut-transform'],
         ['header menu', '.stub-header-transform'],
     ])('restores grid focus after a %s transform acknowledgement remount', async (_label, selector) => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
         await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
         post_message.mockClear();
@@ -1477,6 +1516,25 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
         expect(toolbar_focus).not.toHaveBeenCalled();
+    });
+
+    it('does not restore grid focus after the webview loses focus before acknowledgement', async () => {
+        const has_focus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 2);
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+        has_focus.mockReturnValue(true);
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 160)));
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
     });
 
     it('restores grid focus after a grid-opened filter applies and remounts', async () => {

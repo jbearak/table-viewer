@@ -527,6 +527,114 @@ describe('GridShell column projection', () => {
         expect(grid_mock.scroll_to).toHaveBeenCalledOnce();
     });
 
+    it('restores the last visible preview row through hidden meta reload without a row-zero echo', async () => {
+        vi.useFakeTimers();
+        const on_applied = vi.fn();
+        const on_visible_row = vi.fn();
+        const hidden_projection = {
+            visible_to_source: [], source_to_visible: [], hidden_count: 3,
+        };
+        const GridShell = await render_grid(props({
+            row_count: 200,
+            preview_mode: true,
+            on_preview_visible_row_change: on_visible_row,
+        }));
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (range: { x: number; y: number; width: number; height: number }) => void;
+        await act(async () => on_visible_region_changed({
+            x: 0, y: 75, width: 1, height: 10,
+        }));
+        expect(on_visible_row).toHaveBeenCalledWith(75);
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'visibleRowChanged', row: 75,
+        });
+
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            row_count: 200,
+            preview_mode: true,
+            on_preview_visible_row_change: on_visible_row,
+            column_projection: hidden_projection,
+        }))));
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...props({
+                generation: 2,
+                row_count: 200,
+                preview_mode: true,
+                pending_preview_scroll: { row: 75, sequence: 1 },
+                on_preview_scroll_applied: on_applied,
+                on_preview_visible_row_change: on_visible_row,
+                column_projection: hidden_projection,
+            }),
+            key: 'preview-generation-2',
+        })));
+
+        grid_mock.post_message.mockClear();
+        on_visible_row.mockClear();
+        grid_mock.get_bounds
+            .mockReturnValueOnce(undefined)
+            .mockReturnValueOnce(undefined)
+            .mockReturnValue({ x: 30, y: 10, width: 100, height: 36 });
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...props({
+                generation: 2,
+                row_count: 200,
+                preview_mode: true,
+                pending_preview_scroll: { row: 75, sequence: 1 },
+                on_preview_scroll_applied: on_applied,
+                on_preview_visible_row_change: on_visible_row,
+            }),
+            key: 'preview-generation-2',
+        })));
+        const initial_after_show = grid_mock.props!.onVisibleRegionChanged as
+            (range: { x: number; y: number; width: number; height: number }) => void;
+        await act(async () => initial_after_show({
+            x: 0, y: 0, width: 1, height: 10,
+        }));
+        expect(grid_mock.post_message).not.toHaveBeenCalledWith({
+            type: 'visibleRowChanged', row: 0,
+        });
+        expect(on_visible_row).not.toHaveBeenCalledWith(0);
+
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(32);
+            await vi.advanceTimersByTimeAsync(16);
+            await vi.advanceTimersByTimeAsync(16);
+        });
+        expect(grid_mock.scroll_to).toHaveBeenCalledOnce();
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(
+            0, 75, 'vertical', 0, 0, { vAlign: 'start' },
+        );
+        expect(on_applied).toHaveBeenCalledOnce();
+        expect(on_applied).toHaveBeenCalledWith(1);
+
+        // App clears the acknowledged sequence before Glide may report the final
+        // viewport. That matching callback is part of the programmatic restore,
+        // not a user scroll, so it must not echo the target row to the host either.
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...props({
+                generation: 2,
+                row_count: 200,
+                preview_mode: true,
+                on_preview_scroll_applied: on_applied,
+                on_preview_visible_row_change: on_visible_row,
+            }),
+            key: 'preview-generation-2',
+        })));
+        const confirmed_region = grid_mock.props!.onVisibleRegionChanged as
+            (range: { x: number; y: number; width: number; height: number }) => void;
+        await act(async () => confirmed_region({
+            x: 0, y: 75, width: 1, height: 10,
+        }));
+        await act(async () => vi.runAllTimersAsync());
+        expect(grid_mock.scroll_to).toHaveBeenCalledOnce();
+        expect(grid_mock.post_message).not.toHaveBeenCalledWith({
+            type: 'visibleRowChanged', row: 0,
+        });
+        expect(grid_mock.post_message).not.toHaveBeenCalledWith({
+            type: 'visibleRowChanged', row: 75,
+        });
+    });
+
     it('header clicks only update focus and preserve Glide multi-column selection', async () => {
         await render_grid(props());
         const selection = { columns: { native: 'multi' }, rows: {} };
@@ -601,6 +709,65 @@ describe('GridShell column projection', () => {
         expect(on_hide_column).not.toHaveBeenCalled();
     });
 
+    it('focuses the Columns trigger after keyboard-hiding the final visible header', async () => {
+        const GridShell = await render_grid(props({
+            column_projection: {
+                visible_to_source: [2],
+                source_to_visible: [undefined, undefined, 0],
+                hidden_count: 2,
+            },
+        }));
+        const columns_trigger = document.createElement('button');
+        columns_trigger.textContent = 'Columns';
+        document.body.appendChild(columns_trigger);
+        const hidden_props = props({
+            column_projection: {
+                visible_to_source: [],
+                source_to_visible: [undefined, undefined, undefined],
+                hidden_count: 3,
+            },
+        });
+        const on_hide_column = vi.fn(() => {
+            root!.render(React.createElement(GridShell, hidden_props));
+        });
+        const on_focus_columns = vi.fn(() => columns_trigger.focus());
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            column_projection: {
+                visible_to_source: [2],
+                source_to_visible: [undefined, undefined, 0],
+                hidden_count: 2,
+            },
+            on_hide_column,
+            on_focus_columns,
+        }))));
+
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(0, {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        const hide = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Hide column') as HTMLButtonElement;
+        await act(async () => {
+            hide.focus();
+            hide.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                detail: 0,
+            }));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+
+        expect(on_hide_column).toHaveBeenCalledWith(2);
+        expect(container!.querySelector('[role="status"]')).not.toBeNull();
+        expect(on_focus_columns).toHaveBeenCalledOnce();
+        expect(document.activeElement).toBe(columns_trigger);
+        expect(grid_mock.focus).not.toHaveBeenCalled();
+    });
+
     it('copies a projected source column with its visible header title', async () => {
         const write_text = vi.fn(async () => {});
         Object.defineProperty(navigator, 'clipboard', {
@@ -619,6 +786,125 @@ describe('GridShell column projection', () => {
         await act(async () => Array.from(document.querySelectorAll('button'))
             .find((button) => button.textContent === 'Copy Column')!.click());
         expect(write_text).toHaveBeenCalledWith('C name\nsource-c');
+    });
+
+    it('copies a committed dirty edit instead of the resident source value', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '0:2': { value: 'edited-c', base: 'source-c' } },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy cell')!.click());
+        expect(write_text).toHaveBeenCalledWith('edited-c');
+    });
+
+    it('copies the still-open editor value ahead of dirty and source values', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '0:2': { value: 'dirty-c', base: 'source-c' } },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = 'live-c';
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_key_down({
+            key: 'c', ctrlKey: true, metaKey: false, shiftKey: false, altKey: false,
+            rawEvent: { code: 'KeyC', target: document.createElement('canvas') },
+            cancel: vi.fn(), preventDefault: vi.fn(),
+        }));
+        expect(write_text).toHaveBeenCalledWith('live-c');
+    });
+
+    it('copies source-keyed edits through a projection with a hidden leading column', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '0:2': { value: 'projected-edit', base: 'source-c' } },
+            column_projection: {
+                visible_to_source: [1, 2],
+                source_to_visible: [undefined, 0, 1],
+                hidden_count: 1,
+            },
+        }));
+        const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+            (column: number, event: Record<string, unknown>) => void;
+        await act(async () => on_header_context_menu(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 0, width: 100, height: 36 },
+            localEventX: 20,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy Column')!.click());
+        expect(write_text).toHaveBeenCalledWith('C name\nprojected-edit');
+    });
+
+    it('keeps dirty-only nonresident rows blank and warns during copy', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.get_row.mockReturnValue(undefined);
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '0:2': { value: 'known-dirty', base: 'source-c' } },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy cell')!.click());
+        expect(write_text).toHaveBeenCalledWith('');
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: expect.stringMatching(/loaded range/),
+        });
     });
 
     it('guards keyboard header copy with projected source order and headers', async () => {
