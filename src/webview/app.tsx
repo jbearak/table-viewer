@@ -1312,7 +1312,9 @@ export function App(): React.JSX.Element {
                     filters={visible_transform.filters}
                     anchor={filter_editor.anchor}
                     on_apply={apply_filter_editor}
-                    on_cancel={(reason) => close_filter_editor(reason !== 'outside')}
+                    on_cancel={(reason) => close_filter_editor(
+                        reason === 'escape' || reason === 'explicit',
+                    )}
                 />
             )}
             {truncation_message && (

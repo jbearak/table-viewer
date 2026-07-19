@@ -561,8 +561,12 @@ body {
 .toolbar-chips {
     display: flex;
     align-items: center;
+    flex: 1 1 auto;
+    flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
+    max-width: 100%;
+    overflow: visible;
 }
 
 .toolbar-actions {
@@ -570,6 +574,7 @@ body {
     align-items: center;
     flex: 0 1 auto;
     min-width: 0;
+    max-width: 100%;
     gap: 6px;
     margin-left: auto;
     overflow-x: auto;
@@ -589,8 +594,9 @@ body {
 .filter-strip {
     display: flex;
     align-items: center;
-    flex: 0 1 auto;
-    min-width: 0;
+    flex: 1 1 12rem;
+    min-width: min(100%, 12rem);
+    max-width: 100%;
     gap: 6px;
     padding: 0 4px;
     border-left: 1px solid var(--vscode-panel-border, #444);
@@ -738,9 +744,17 @@ body {
 }
 
 .toolbar-merge-notice {
-    flex: 0 0 auto;
+    flex: 1 1 18rem;
+    min-width: min(100%, 12rem);
+    max-width: 100%;
     color: var(--vscode-editorWarning-foreground, #cca700);
     font-size: 11px;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.toolbar.is-wrapped .toolbar-merge-notice {
+    flex-basis: 100%;
 }
 
 .filter-popover {

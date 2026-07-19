@@ -1469,6 +1469,58 @@ describe('sorting and filtering', () => {
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
+    it('restores filter focus only for Escape and explicit Cancel', async () => {
+        await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
+            source_column: number,
+            anchor: { left: number; top: number },
+            restore_focus: () => void,
+        ) => void;
+        const open = async (restore_focus: () => void) => {
+            await act(async () => open_filter(0, { left: 20, top: 20 }, restore_focus));
+            expect(document.querySelector('.filter-popover')).not.toBeNull();
+        };
+
+        const restore_after_scroll = vi.fn();
+        await open(restore_after_scroll);
+        await act(async () => {
+            grid_stub().dispatchEvent(new Event('scroll'));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(document.querySelector('.filter-popover')).toBeNull();
+        expect(restore_after_scroll).not.toHaveBeenCalled();
+
+        const restore_after_outside = vi.fn();
+        await open(restore_after_outside);
+        await act(async () => {
+            document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(document.querySelector('.filter-popover')).toBeNull();
+        expect(restore_after_outside).not.toHaveBeenCalled();
+
+        const restore_after_escape = vi.fn();
+        await open(restore_after_escape);
+        await act(async () => {
+            document.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Escape', bubbles: true,
+            }));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(restore_after_escape).toHaveBeenCalledOnce();
+
+        const restore_after_cancel = vi.fn();
+        await open(restore_after_cancel);
+        await act(async () => {
+            const cancel = Array.from(document.querySelectorAll('button'))
+                .find((button) => button.textContent === 'Cancel') as HTMLButtonElement;
+            cancel.click();
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(restore_after_cancel).toHaveBeenCalledOnce();
+    });
+
     it('keeps a keyboard filter opener focused while Apply is pending and after ack', async () => {
         const { post_message } = await render_app();
         const schema = '["Sheet1",1,null]';
