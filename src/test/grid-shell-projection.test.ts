@@ -3,7 +3,11 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { EditingHandle, GridShellProps } from '../webview/grid-shell';
+import type {
+    EditingHandle,
+    GridFocusHandle,
+    GridShellProps,
+} from '../webview/grid-shell';
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
@@ -43,7 +47,10 @@ vi.mock('@glideapps/glide-data-grid', () => {
                 focus: grid_mock.focus,
                 getBounds: grid_mock.get_bounds,
             }));
-            return React.createElement('div', { className: 'data-editor-stub' });
+            return React.createElement('div', {
+                className: 'data-editor-stub',
+                tabIndex: 0,
+            });
         }),
         GridCellKind: { Text: 'text' },
     };
@@ -193,6 +200,16 @@ describe('GridShell column projection', () => {
             (column: unknown, size: number, display_column: number) => void;
         on_column_resize_grid({}, 222, 1);
         expect(on_column_resize).toHaveBeenCalledWith(2, 222);
+    });
+
+    it('exposes an imperative focus handle for the mounted Glide grid', async () => {
+        const grid_focus_ref = React.createRef<GridFocusHandle | null>();
+        await render_grid(props({ grid_focus_ref }));
+
+        expect(grid_focus_ref.current?.focus()).toBe(true);
+        expect(document.activeElement).toBe(
+            container!.querySelector('.data-editor-stub'),
+        );
     });
 
     it('clears display selection when projection changes without remounting editing state', async () => {
@@ -419,45 +436,77 @@ describe('GridShell column projection', () => {
         expect(grid_mock.scroll_to).toHaveBeenCalledWith(1, 75);
     });
 
-    it('retains the latest preview scroll target while all columns are hidden', async () => {
-        const GridShell = await render_grid(props({ row_count: 200, preview_mode: true }));
-        await act(async () => root!.render(React.createElement(GridShell, props({
+    it('retains an App-owned preview scroll target while all columns are hidden', async () => {
+        const on_applied = vi.fn();
+        const GridShell = await render_grid(props({
             row_count: 200,
             preview_mode: true,
+            pending_preview_scroll: { row: 150, sequence: 1 },
+            on_preview_scroll_applied: on_applied,
             column_projection: { visible_to_source: [], source_to_visible: [], hidden_count: 3 },
-        }))));
-        await act(async () => window.dispatchEvent(new MessageEvent('message', {
-            data: { type: 'scrollToRow', row: 150 },
-        })));
+        }));
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+
         await act(async () => root!.render(React.createElement(GridShell, props({
             row_count: 200,
             preview_mode: true,
+            pending_preview_scroll: { row: 150, sequence: 1 },
+            on_preview_scroll_applied: on_applied,
         }))));
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
         expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(
             0, 150, 'vertical', 0, 0, { vAlign: 'start' },
         );
+        expect(on_applied).toHaveBeenCalledWith(1);
     });
 
-    it('retries queued preview recovery until the remounted Glide scroller is ready', async () => {
+    it('survives a generation remount hidden, then applies only the latest row after delayed Glide readiness', async () => {
         vi.useFakeTimers();
-        const GridShell = await render_grid(props({ row_count: 200, preview_mode: true }));
-        await act(async () => root!.render(React.createElement(GridShell, props({
+        const on_applied = vi.fn();
+        const hidden_projection = {
+            visible_to_source: [], source_to_visible: [], hidden_count: 3,
+        };
+        const GridShell = await render_grid(props({
             row_count: 200,
             preview_mode: true,
-            column_projection: { visible_to_source: [], source_to_visible: [], hidden_count: 3 },
-        }))));
-        await act(async () => window.dispatchEvent(new MessageEvent('message', {
-            data: { type: 'scrollToRow', row: 150 },
+            pending_preview_scroll: { row: 100, sequence: 1 },
+            on_preview_scroll_applied: on_applied,
+            column_projection: hidden_projection,
+        }));
+
+        // metaReload changes the generation key while hidden. App supplies the
+        // latest sequence to the replacement GridShell.
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...props({
+                generation: 2,
+                row_count: 200,
+                preview_mode: true,
+                pending_preview_scroll: { row: 150, sequence: 2 },
+                on_preview_scroll_applied: on_applied,
+                column_projection: hidden_projection,
+            }),
+            key: 'generation-2',
         })));
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+
         grid_mock.get_bounds
             .mockReturnValueOnce(undefined)
             .mockReturnValueOnce(undefined)
             .mockReturnValue({ x: 30, y: 10, width: 100, height: 36 });
-
-        await act(async () => root!.render(React.createElement(GridShell, props({
-            row_count: 200,
-            preview_mode: true,
-        }))));
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...props({
+                generation: 2,
+                row_count: 200,
+                preview_mode: true,
+                pending_preview_scroll: { row: 150, sequence: 2 },
+                on_preview_scroll_applied: on_applied,
+            }),
+            key: 'generation-2',
+        })));
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(32);
+        });
         expect(grid_mock.scroll_to).not.toHaveBeenCalled();
         await act(async () => {
             await vi.advanceTimersByTimeAsync(16);
@@ -470,6 +519,8 @@ describe('GridShell column projection', () => {
         expect(grid_mock.scroll_to).toHaveBeenCalledWith(
             0, 150, 'vertical', 0, 0, { vAlign: 'start' },
         );
+        expect(on_applied).toHaveBeenCalledOnce();
+        expect(on_applied).toHaveBeenCalledWith(2);
         await act(async () => {
             await vi.runAllTimersAsync();
         });
