@@ -65,6 +65,25 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
+    it('carries Excel first-row header request and result variants', () => {
+        const request: WebviewMessage = {
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 1,
+            sheetName: 'People',
+            enabled: true,
+            requestId: 'header:1',
+            generation: 2,
+            sourceGeneration: 3,
+        };
+        const result: HostMessage = {
+            type: 'excelFirstRowHeaderError',
+            requestId: 'header:1',
+            error: 'The worksheet changed.',
+        };
+        expect(request.type).toBe('setExcelFirstRowHeader');
+        expect(result.type).toBe('excelFirstRowHeaderError');
+    });
+
     it('WebviewMessage carries a requestRows variant', () => {
         const msg: WebviewMessage = {
             type: 'requestRows',

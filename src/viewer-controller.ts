@@ -3,7 +3,12 @@ import * as vscode from 'vscode';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
 import { CsvDataSource } from './data-source/csv-source';
-import type { DataSource, RenderedCell } from './data-source/interface';
+import { ExcelHeaderDataSource } from './data-source/excel-header-source';
+import type {
+    DataSource,
+    ExcelHeaderOverride,
+    RenderedCell,
+} from './data-source/interface';
 import { ViewerPanelCore, adopt_source_into_core, type PanelLike } from './panel-core';
 import {
     get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib,
@@ -12,13 +17,19 @@ import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type { FileStateStore } from './state';
 import {
+    sanitize_excel_header_active,
+    sanitize_excel_header_overrides,
     transform_has_entries,
     transform_schema_for_sheet,
     type PerFileState,
     type SheetTransformState,
+    type StoredPerFileState,
     type WebviewMessage,
 } from './types';
-import { sanitize_transform_state } from './webview/sheet-state';
+import {
+    normalize_per_file_state,
+    sanitize_transform_state,
+} from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
@@ -32,7 +43,11 @@ export interface ViewerHostPanel extends PanelLike {
 
 export interface ViewerProfile {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
-    build_source(raw: Uint8Array, file_path: string): Promise<DataSource>;
+    build_source(
+        raw: Uint8Array,
+        file_path: string,
+        state: PerFileState,
+    ): Promise<DataSource>;
     /** Enables csvEditingSupported + saveCsv/pendingEdits/showSaveDialog handling. */
     editing: boolean;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
@@ -46,13 +61,66 @@ export interface ViewerProfile {
 
 const active_csv_edit_sessions = new Map<string, symbol>();
 
+type ExcelHeaderSubscriber = (
+    sheet_name: string,
+    override: ExcelHeaderOverride,
+) => Promise<void>;
+const excel_header_subscribers = new Map<string, Set<ExcelHeaderSubscriber>>();
+
+function subscribe_excel_headers(
+    file_path: string,
+    subscriber: ExcelHeaderSubscriber,
+): vscode.Disposable {
+    const subscribers = excel_header_subscribers.get(file_path) ?? new Set();
+    subscribers.add(subscriber);
+    excel_header_subscribers.set(file_path, subscribers);
+    return {
+        dispose() {
+            subscribers.delete(subscriber);
+            if (subscribers.size === 0) excel_header_subscribers.delete(file_path);
+        },
+    };
+}
+
+function excel_header_maps_equal(
+    left: Record<string, boolean>,
+    right: Record<string, boolean>,
+): boolean {
+    const left_entries = Object.entries(left);
+    const right_entries = Object.entries(right);
+    return left_entries.length === right_entries.length
+        && left_entries.every(([name, active]) => (
+            Object.prototype.hasOwnProperty.call(right, name)
+            && right[name] === active
+        ));
+}
+
+async function broadcast_excel_header(
+    file_path: string,
+    sheet_name: string,
+    override: ExcelHeaderOverride,
+): Promise<void> {
+    const subscribers = [...(excel_header_subscribers.get(file_path) ?? [])];
+    await Promise.all(subscribers.map(async (subscriber) => {
+        try {
+            await subscriber(sheet_name, override);
+        } catch (error) {
+            console.error('Failed to refresh an Excel header view', error);
+        }
+    }));
+}
+
 function excel_profile(): ViewerProfile {
     return {
         editing: false,
-        async build_source(raw, file_path) {
-            return file_path.toLowerCase().endsWith('.xlsx')
-                ? XlsxDataSource.create(raw)
-                : XlsDataSource.create(Buffer.from(raw));
+        async build_source(raw, file_path, state) {
+            const physical = file_path.toLowerCase().endsWith('.xlsx')
+                ? await XlsxDataSource.create(raw)
+                : await XlsDataSource.create(Buffer.from(raw));
+            return new ExcelHeaderDataSource(
+                physical,
+                sanitize_excel_header_overrides(state.excelFirstRowHeaders),
+            );
         },
     };
 }
@@ -132,17 +200,38 @@ export function attach_viewer(
 
     async function update_file_state(
         updater: (current: PerFileState) => PerFileState,
+        sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
     ): Promise<void> {
+        const normalize_host_state = (stored: StoredPerFileState): PerFileState => {
+            const normalized = normalize_per_file_state(stored, sheet_names);
+            if ('excelFirstRowHeaders' in stored) {
+                normalized.excelFirstRowHeaders = sanitize_excel_header_overrides(
+                    stored.excelFirstRowHeaders,
+                );
+            }
+            if ('excelFirstRowHeaderActive' in stored) {
+                normalized.excelFirstRowHeaderActive = sanitize_excel_header_active(
+                    stored.excelFirstRowHeaderActive,
+                );
+            }
+            if (
+                'excelFirstRowHeaderVersion' in stored
+                && stored.excelFirstRowHeaderVersion === 1
+            ) {
+                normalized.excelFirstRowHeaderVersion = 1;
+            }
+            return normalized;
+        };
         if (state_store.update) {
             await state_store.update(
                 file_path,
-                (current) => updater(current as PerFileState),
+                (current) => updater(normalize_host_state(current)),
             );
             return;
         }
         await state_store.set(
             file_path,
-            updater(state_store.get(file_path) as PerFileState),
+            updater(normalize_host_state(state_store.get(file_path))),
         );
     }
 
@@ -168,12 +257,58 @@ export function attach_viewer(
     }
 
     async function build_source(): Promise<{ source: DataSource; mtime: number }> {
+        const state = state_store.get(file_path) as PerFileState;
         const stat = await vscode.workspace.fs.stat(uri);
         const max_mib = get_max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(uri);
         assert_safe_file_size(raw.byteLength, max_mib);
-        const ds = await profile.build_source(raw, file_path);
+        const ds = await profile.build_source(raw, file_path, state);
+        if (ds instanceof ExcelHeaderDataSource) {
+            // A long parse can overlap a header change from another open tab. Apply
+            // the latest durable overrides immediately before this source is adopted.
+            const latest = state_store.get(file_path) as PerFileState;
+            ds.replace_overrides(latest.excelFirstRowHeaders);
+            const sheet_names = ds.meta().sheets.map((sheet) => sheet.name);
+            const previous_active = sanitize_excel_header_active(
+                latest.excelFirstRowHeaderActive,
+            );
+            const next_active = Object.create(null) as Record<string, boolean>;
+            const changed_indices = new Set<number>();
+            ds.meta().sheets.forEach((sheet, index) => {
+                const active = sheet.excelFirstRowHeader?.active ?? false;
+                next_active[sheet.name] = active;
+                if (latest.excelFirstRowHeaderVersion !== 1) {
+                    if (active) changed_indices.add(index);
+                } else if (
+                    !Object.prototype.hasOwnProperty.call(previous_active, sheet.name)
+                        ? active
+                        : previous_active[sheet.name] !== active
+                ) {
+                    changed_indices.add(index);
+                }
+            });
+            if (
+                latest.excelFirstRowHeaderVersion !== 1
+                || !excel_header_maps_equal(previous_active, next_active)
+            ) {
+                await update_file_state((current) => {
+                    const rowHeights = [...(current.rowHeights ?? [])];
+                    const scrollPosition = [...(current.scrollPosition ?? [])];
+                    for (const index of changed_indices) {
+                        rowHeights[index] = undefined;
+                        scrollPosition[index] = undefined;
+                    }
+                    return {
+                        ...current,
+                        rowHeights,
+                        scrollPosition,
+                        excelFirstRowHeaderActive: next_active,
+                        excelFirstRowHeaderVersion: 1,
+                    };
+                }, sheet_names);
+            }
+        }
         return { source: ds, mtime: stat.mtime };
     }
 
@@ -206,6 +341,26 @@ export function attach_viewer(
     function post_reload(ds: DataSource): Promise<boolean> {
         return core!.send_meta_reload(editing_flags(ds));
     }
+
+    async function apply_excel_header_override(
+        sheet_name: string,
+        override: ExcelHeaderOverride,
+    ): Promise<void> {
+        if (
+            disposed
+            || !core
+            || !(source instanceof ExcelHeaderDataSource)
+            || !source.set_override(sheet_name, override)
+        ) {
+            return;
+        }
+        // The projected source object is intentionally reused. set_source still
+        // invalidates source generations, transforms, and row-window caches.
+        core.set_source(source);
+        await post_reload(source);
+    }
+
+    disposables.push(subscribe_excel_headers(file_path, apply_excel_header_override));
 
     function surface_warnings(ds: DataSource): void {
         const warnings = ds.warnings ?? [];
@@ -387,8 +542,88 @@ export function attach_viewer(
                             delete next.pendingEdits;
                         }
                     }
+                    // Excel header overrides are host-owned. A delayed debounced
+                    // layout snapshot from this or another tab must not undo one.
+                    if (current.excelFirstRowHeaders) {
+                        next.excelFirstRowHeaders = current.excelFirstRowHeaders;
+                    } else {
+                        delete next.excelFirstRowHeaders;
+                    }
+                    if (current.excelFirstRowHeaderActive) {
+                        next.excelFirstRowHeaderActive = current.excelFirstRowHeaderActive;
+                    } else {
+                        delete next.excelFirstRowHeaderActive;
+                    }
+                    if (current.excelFirstRowHeaderVersion === 1) {
+                        next.excelFirstRowHeaderVersion = 1;
+                    } else {
+                        delete next.excelFirstRowHeaderVersion;
+                    }
                     return next;
                 });
+                return;
+            }
+            case 'setExcelFirstRowHeader': {
+                const fail = async (error: string) => {
+                    await panel.webview.postMessage({
+                        type: 'excelFirstRowHeaderError',
+                        requestId: msg.requestId,
+                        error,
+                    });
+                };
+                if (!(source instanceof ExcelHeaderDataSource) || !core) {
+                    await fail('First-row headers are only available for Excel worksheets.');
+                    return;
+                }
+                if (
+                    msg.generation !== core.generation
+                    || msg.sourceGeneration !== core.source_generation
+                ) {
+                    await fail('The worksheet changed before the header request arrived.');
+                    return;
+                }
+                const sheet = source.meta().sheets[msg.sheetIndex];
+                if (!sheet || sheet.name !== msg.sheetName) {
+                    await fail('The selected worksheet no longer matches this request.');
+                    return;
+                }
+                if (!sheet.excelFirstRowHeader?.available) {
+                    await fail('This worksheet has no first row to use as column names.');
+                    return;
+                }
+                if (core.has_transform_work) {
+                    await fail('Clear sorting and filters before changing the header row.');
+                    return;
+                }
+
+                const override: ExcelHeaderOverride = msg.enabled ? 'on' : 'off';
+                try {
+                    await update_file_state((current) => {
+                        const excelFirstRowHeaders = sanitize_excel_header_overrides(
+                            current.excelFirstRowHeaders,
+                        );
+                        excelFirstRowHeaders[msg.sheetName] = override;
+                        const excelFirstRowHeaderActive = sanitize_excel_header_active(
+                            current.excelFirstRowHeaderActive,
+                        );
+                        excelFirstRowHeaderActive[msg.sheetName] = msg.enabled;
+                        const rowHeights = [...(current.rowHeights ?? [])];
+                        const scrollPosition = [...(current.scrollPosition ?? [])];
+                        rowHeights[msg.sheetIndex] = undefined;
+                        scrollPosition[msg.sheetIndex] = undefined;
+                        return {
+                            ...current,
+                            excelFirstRowHeaders,
+                            excelFirstRowHeaderActive,
+                            excelFirstRowHeaderVersion: 1,
+                            rowHeights,
+                            scrollPosition,
+                        };
+                    });
+                    await broadcast_excel_header(file_path, msg.sheetName, override);
+                } catch (error) {
+                    await fail(error instanceof Error ? error.message : String(error));
+                }
                 return;
             }
             case 'setColumnVisibility': {

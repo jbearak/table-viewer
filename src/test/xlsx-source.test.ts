@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { XlsxDataSource } from '../data-source/xlsx-source';
+import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
 import { parse_xlsx } from '../parse-xlsx';
 import type { RenderedCell } from '../data-source/interface';
 
@@ -36,5 +37,19 @@ describe('XlsxDataSource', () => {
         const w = ds.read_rows(0, 0, 50);
         const anyStyled = w.rows.flat().some((c: RenderedCell | null) => c != null && (c.bold || c.italic));
         expect(anyStyled).toBe(true);
+    });
+    it('auto-promotes the basic workbook headers through the shared decorator', async () => {
+        const physical = await XlsxDataSource.create(load('basic.xlsx'));
+        const ds = new ExcelHeaderDataSource(physical);
+        const people = ds.meta().sheets[0];
+        const inventory = ds.meta().sheets[1];
+        expect(people.columnNames).toEqual(['Name', 'Age', 'Active', 'Joined']);
+        expect(people.rowCount).toBe(2);
+        expect(inventory.columnNames).toEqual(['Product', 'Price', 'Quantity']);
+        expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Alice');
+
+        ds.set_override('People', 'off');
+        expect(ds.meta().sheets[0].rowCount).toBe(3);
+        expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Name');
     });
 });

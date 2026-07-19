@@ -17,17 +17,28 @@ export interface RowWindow {
     rows: (RenderedCell | null)[][];  // rows[i][col]; outer length <= requested count
 }
 
+export type ExcelHeaderOverride = 'on' | 'off';
+
+export interface ExcelFirstRowHeaderMeta {
+    /** `auto` means the detector decides; explicit modes are persisted overrides. */
+    mode: 'auto' | ExcelHeaderOverride;
+    detected: boolean;
+    active: boolean;
+    /** Whether the physical sheet currently has a first row that can be promoted. */
+    available: boolean;
+}
+
 export interface SheetMeta {
     name: string;
     rowCount: number;
     columnCount: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
-    /** Per-column header titles (CSV/TSV first row). Length === columnCount; a
-     *  blank entry means "no name" and the renderer falls back to the column
-     *  letter. Omitted entirely by formats without a header row (xlsx/xls), where
-     *  the renderer shows spreadsheet column letters. */
+    /** Per-column header titles. Length === columnCount; a blank entry means
+     *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];
+    /** Present only for Excel sheets that support first-row header projection. */
+    excelFirstRowHeader?: ExcelFirstRowHeaderMeta;
 }
 
 export interface WorkbookMeta {

@@ -34,6 +34,10 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         show_formatting: true,
         on_toggle_formatting,
         show_formatting_button: true,
+        show_excel_header_button: false,
+        excel_header_active: false,
+        excel_header_automatic: false,
+        on_toggle_excel_header: vi.fn(),
         vertical_tabs: false,
         on_toggle_tab_orientation,
         show_vertical_tabs_button: true,
@@ -209,6 +213,40 @@ describe('Toolbar', () => {
             formatting.blur();
         });
         expect(get_tooltip()).toBeNull();
+    });
+
+    it('renders an accessible Excel first-row header toggle', () => {
+        const on_toggle_excel_header = vi.fn();
+        render_toolbar({
+            show_excel_header_button: true,
+            excel_header_active: true,
+            excel_header_automatic: true,
+            on_toggle_excel_header,
+        });
+
+        const button = get_button('First Row as Header');
+        expect(button.classList.contains('active')).toBe(true);
+        expect(button.getAttribute('aria-pressed')).toBe('true');
+        dispatch_mouse_event(button, 'mouseover');
+        expect(get_tooltip()?.textContent).toContain('Automatically using');
+        act(() => button.click());
+        expect(on_toggle_excel_header).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows the disabled reason for the Excel header toggle', () => {
+        render_toolbar({
+            show_excel_header_button: true,
+            excel_header_active: false,
+            excel_header_automatic: false,
+            excel_header_disabled: true,
+            excel_header_disabled_reason: 'Clear sorting and filters first.',
+        });
+
+        const button = get_button('First Row as Header');
+        expect(button.disabled).toBe(true);
+        const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
+        act(() => wrapper.focus());
+        expect(get_tooltip()?.textContent).toBe('Clear sorting and filters first.');
     });
 
     it('renders the Columns trigger with dialog semantics and a hidden-count badge', () => {

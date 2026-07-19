@@ -145,6 +145,7 @@ export function App(): React.JSX.Element {
     const [effective_row_counts, set_effective_row_counts] = useState<number[]>([]);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
+    const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -191,6 +192,9 @@ export function App(): React.JSX.Element {
         (Record<number, number> | undefined)[]
     >([]);
     const transform_request_seq_ref = useRef(0);
+    const excel_header_request_seq_ref = useRef(0);
+    const pending_excel_header_ref = useRef<string | null>(null);
+    const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
@@ -298,7 +302,10 @@ export function App(): React.JSX.Element {
                 last_preview_visible_row_ref.current = null;
                 clear_pending_preview_scroll();
                 preview_mode_ref.current = msg.previewMode ?? false;
+                meta_ref.current = msg.meta;
                 set_meta(msg.meta);
+                pending_excel_header_ref.current = null;
+                set_pending_excel_header(null);
                 set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
@@ -378,6 +385,20 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'metaReload') {
+                const previous_sheets = new Map(
+                    (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
+                );
+                const header_changed = new Set<number>();
+                msg.meta.sheets.forEach((sheet, index) => {
+                    const previous = previous_sheets.get(sheet.name);
+                    if (
+                        previous
+                        && previous.excelFirstRowHeader?.active
+                            !== sheet.excelFirstRowHeader?.active
+                    ) {
+                        header_changed.add(index);
+                    }
+                });
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
                 set_toolbar_focus_restore(null);
@@ -388,7 +409,10 @@ export function App(): React.JSX.Element {
                 ) {
                     queue_preview_scroll(last_preview_visible_row_ref.current);
                 }
+                meta_ref.current = msg.meta;
                 set_meta(msg.meta);
+                pending_excel_header_ref.current = null;
+                set_pending_excel_header(null);
                 set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
@@ -405,7 +429,9 @@ export function App(): React.JSX.Element {
                     trim_sheet_state_array(prev, sheet_count)
                 );
                 set_row_heights((prev) =>
-                    trim_sheet_state_array(prev, sheet_count)
+                    trim_sheet_state_array(prev, sheet_count).map((value, index) => (
+                        header_changed.has(index) ? undefined : value
+                    ))
                 );
                 set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
                 set_pending_transforms([]);
@@ -447,11 +473,15 @@ export function App(): React.JSX.Element {
                     rowHeights: trim_sheet_state_array(
                         state_ref.current.rowHeights,
                         sheet_count
-                    ),
+                    ).map((value, index) => (
+                        header_changed.has(index) ? undefined : value
+                    )),
                     scrollPosition: trim_sheet_state_array(
                         state_ref.current.scrollPosition,
                         sheet_count
-                    ),
+                    ).map((value, index) => (
+                        header_changed.has(index) ? undefined : value
+                    )),
                     transforms: next_transforms,
                     columnVisibility: next_column_visibility,
                     activeSheetIndex: next_active_sheet_index,
@@ -464,6 +494,16 @@ export function App(): React.JSX.Element {
                     set_csv_editing_supported(msg.csvEditingSupported);
                 }
                 persist_immediate();
+            }
+
+            if (msg.type === 'excelFirstRowHeaderError') {
+                if (pending_excel_header_ref.current !== msg.requestId) return;
+                pending_excel_header_ref.current = null;
+                set_pending_excel_header(null);
+                vscode_api.postMessage({
+                    type: 'showWarning',
+                    message: `Could not change the header row: ${msg.error}`,
+                });
             }
 
             if (
@@ -709,6 +749,24 @@ export function App(): React.JSX.Element {
     const handle_toggle_formatting = useCallback(() => {
         set_show_formatting((prev) => !prev);
     }, []);
+
+    const handle_toggle_excel_header = useCallback(() => {
+        const sheet = meta?.sheets[active_sheet_index];
+        const header = sheet?.excelFirstRowHeader;
+        if (!sheet || !header?.available || pending_excel_header_ref.current) return;
+        const request_id = `header:${++excel_header_request_seq_ref.current}`;
+        pending_excel_header_ref.current = request_id;
+        set_pending_excel_header(request_id);
+        vscode_api.postMessage({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: active_sheet_index,
+            sheetName: sheet.name,
+            enabled: !header.active,
+            requestId: request_id,
+            generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+        });
+    }, [active_sheet_index, meta]);
 
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
@@ -1249,6 +1307,8 @@ export function App(): React.JSX.Element {
         edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
     const applied_transform = applied_transforms[active_sheet_index];
     const transform_active = transform_is_active(applied_transform);
+    const any_transform_active = applied_transforms.some(transform_is_active);
+    const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
         < current_sheet.columnCount;
@@ -1256,6 +1316,21 @@ export function App(): React.JSX.Element {
         current_sheet.merges.length > 0
         && (transform_active || has_hidden_columns);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
+    const excel_header = current_sheet.excelFirstRowHeader;
+    const excel_header_pending = pending_excel_header !== null;
+    const excel_header_disabled = !!excel_header && (
+        !excel_header.available
+        || any_transform_active
+        || any_transform_pending
+        || excel_header_pending
+    );
+    const excel_header_disabled_reason = !excel_header?.available
+        ? 'This sheet has no first row to use as column names.'
+        : excel_header_pending
+        ? 'Updating column names…'
+        : any_transform_pending
+        ? 'Wait for sorting and filtering to finish.'
+        : 'Clear sorting and filters in every sheet before changing the header row.';
     const effective_row_count =
         effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
     const visibility_reset_key = [
@@ -1337,6 +1412,12 @@ export function App(): React.JSX.Element {
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
+                show_excel_header_button={excel_header !== undefined}
+                excel_header_active={excel_header?.active ?? false}
+                excel_header_automatic={excel_header?.mode === 'auto'}
+                on_toggle_excel_header={handle_toggle_excel_header}
+                excel_header_disabled={excel_header_disabled}
+                excel_header_disabled_reason={excel_header_disabled_reason}
                 vertical_tabs={vertical_tabs}
                 on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}

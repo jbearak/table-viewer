@@ -447,6 +447,135 @@ describe('formatting toggle', () => {
     });
 });
 
+describe('Excel first-row header toggle', () => {
+    function excel_meta(active: boolean, mode: 'auto' | 'on' | 'off' = 'auto') {
+        const meta = make_meta(['People'], false);
+        meta.sheets[0] = {
+            ...meta.sheets[0],
+            rowCount: active ? 2 : 3,
+            columnCount: 2,
+            columnNames: active ? ['Name', 'Age'] : undefined,
+            excelFirstRowHeader: {
+                mode,
+                detected: true,
+                active,
+                available: true,
+            },
+        };
+        return meta;
+    }
+
+    it('is shown only for Excel-capable sheet metadata', async () => {
+        await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'], false)));
+        expect(Array.from(document.querySelectorAll('button')).some(
+            (button) => button.textContent === 'First Row as Header',
+        )).toBe(false);
+
+        await dispatch_host_message(sheet_meta_message(excel_meta(true)));
+        const button = get_button('First Row as Header');
+        expect(button.getAttribute('aria-pressed')).toBe('true');
+    });
+
+    it('requests an authoritative toggle and waits for metaReload', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+            state: { rowHeights: [{ 0: 44 }] },
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        const old_mount = grid_stub().getAttribute('data-mount-id');
+
+        await click_button('First Row as Header');
+
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'header:1',
+            generation: 4,
+            sourceGeneration: 7,
+        });
+        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
+        expect(get_button('First Row as Header').disabled).toBe(true);
+        expect(grid_stub().getAttribute('data-row-count')).toBe('2');
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
+        expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+    });
+
+    it('tracks the header state independently per active sheet', async () => {
+        await render_app();
+        const meta = make_meta(['People', 'Notes'], false);
+        meta.sheets[0].excelFirstRowHeader = {
+            mode: 'auto', detected: true, active: true, available: true,
+        };
+        meta.sheets[0].columnNames = ['Name'];
+        meta.sheets[1].excelFirstRowHeader = {
+            mode: 'off', detected: false, active: false, available: true,
+        };
+        await dispatch_host_message(sheet_meta_message(meta));
+        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
+        await click_button('Notes');
+        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
+    });
+
+    it('disables the toggle while any worksheet has an active transform', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['People', 'Notes'], false);
+        for (const sheet of meta.sheets) {
+            sheet.excelFirstRowHeader = {
+                mode: 'auto', detected: true, active: true, available: true,
+            };
+            sheet.columnNames = ['Name'];
+        }
+        const transform: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["People",1,["Name"]]',
+        };
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: { transforms: [transform] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await acknowledge_transform(restore, 2);
+        await click_button('Notes');
+
+        const button = get_button('First Row as Header');
+        expect(button.disabled).toBe(true);
+        const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
+        await act(async () => wrapper.focus());
+        expect(document.querySelector('[role="tooltip"]')?.textContent)
+            .toContain('every sheet');
+    });
+
+    it('clears pending state and surfaces a rejected request', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(excel_meta(false)));
+        post_message.mockClear();
+        await click_button('First Row as Header');
+        await dispatch_host_message({
+            type: 'excelFirstRowHeaderError',
+            requestId: 'header:1',
+            error: 'The worksheet changed.',
+        });
+        expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Could not change the header row: The worksheet changed.',
+        });
+    });
+});
+
 describe('sheet tabs', () => {
     it('hides tabs and the vertical-tabs button for a single sheet', async () => {
         await render_app();

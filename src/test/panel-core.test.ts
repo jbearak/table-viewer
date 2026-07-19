@@ -132,6 +132,29 @@ describe('ViewerPanelCore', () => {
         expect(src.read_rows_calls).toBe(2);
     });
 
+    it('invalidates source and view generations when the same mutable source is reused', async () => {
+        const { panel } = make_panel();
+        const src = new StubSource();
+        const core = new ViewerPanelCore(panel, src);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'before', generation: core.generation,
+        });
+        const view_generation = core.generation;
+        const source_generation = core.source_generation;
+
+        core.set_source(src);
+        await core.send_meta_reload();
+
+        expect(core.source_generation).toBe(source_generation + 1);
+        expect(core.generation).toBe(view_generation + 1);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'after', generation: core.generation,
+        });
+        expect(src.read_rows_calls).toBe(2);
+    });
+
     it('clamps a negative startRow to 0 before reading (boundary validation)', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource());

@@ -24,6 +24,7 @@ Table Viewer is the result.
 - Multi-sheet workbooks with horizontal or vertical tab orientation
 - Merged cells with correct colspan/rowspan rendering
 - Bold and italic text styling from Excel formatting
+- Conservatively detects Excel column-name rows, with a per-sheet **First Row as Header** override remembered for each file
 - Stable, multi-column sorting with missing values kept last
 - Per-column filters for text, comparisons, ranges, and empty/non-empty values
 
@@ -76,7 +77,7 @@ Table Viewer is the result.
 
 ## Usage
 
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file.
+**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; the override is remembered for that file and worksheet.
 
 **CSV/TSV files** open in VS Code's built-in text editor. Two buttons appear in the editor title bar:
 

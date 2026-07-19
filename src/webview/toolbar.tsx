@@ -37,6 +37,12 @@ export interface ToolbarProps {
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
+    show_excel_header_button: boolean;
+    excel_header_active: boolean;
+    excel_header_automatic: boolean;
+    on_toggle_excel_header: () => void;
+    excel_header_disabled?: boolean;
+    excel_header_disabled_reason?: string;
     vertical_tabs: boolean;
     on_toggle_tab_orientation: () => void;
     show_vertical_tabs_button: boolean;
@@ -94,6 +100,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             props.merges_flattened,
             props.column_visibility.hidden_count,
             props.show_formatting_button,
+            props.show_excel_header_button,
+            props.excel_header_active,
+            props.excel_header_disabled,
             props.show_vertical_tabs_button,
             props.show_edit_button,
         ],
@@ -155,6 +164,22 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                             ? 'Show raw cell values.'
                             : 'Show formatted cell values.'}
                         onClick={props.on_toggle_formatting}
+                    />
+                )}
+                {props.show_excel_header_button && (
+                    <ToolbarButton
+                        label="First Row as Header"
+                        active={props.excel_header_active}
+                        tooltip_text={props.excel_header_disabled
+                            ? (props.excel_header_disabled_reason
+                                ?? 'First-row headers are unavailable.')
+                            : props.excel_header_active
+                            ? props.excel_header_automatic
+                                ? 'Automatically using the first row as column names. Click to show it as data.'
+                                : 'Show the first row as data.'
+                            : 'Use the first row as column names.'}
+                        onClick={props.on_toggle_excel_header}
+                        disabled={props.excel_header_disabled}
                     />
                 )}
                 {props.show_vertical_tabs_button && (
@@ -284,6 +309,7 @@ function ToolbarButton({
                     onClick();
                 }}
                 aria-describedby={!disabled && show_tooltip ? tooltip_id : undefined}
+                aria-pressed={active}
             >
                 {label}
             </button>
