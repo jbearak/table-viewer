@@ -1203,6 +1203,16 @@ export function App(): React.JSX.Element {
         { length: current_sheet?.columnCount ?? 0 },
         (_, index) => current_sheet?.columnNames?.[index] || column_letter(index),
     ), [current_schema]);
+    const duplicate_column_names = useMemo(() => {
+        const seen = new Set<string>();
+        const duplicates = new Set<string>();
+        for (const name of column_names) {
+            const label = name.length > 0 ? name : '(blank)';
+            if (seen.has(label)) duplicates.add(label);
+            else seen.add(label);
+        }
+        return duplicates;
+    }, [column_names]);
     const get_column_name = useCallback(
         (source_index: number) => column_names[source_index] ?? column_letter(source_index),
         [column_names],
@@ -1333,6 +1343,7 @@ export function App(): React.JSX.Element {
                 column_visibility={{
                     column_count: current_sheet.columnCount,
                     get_column_name,
+                    duplicate_names: duplicate_column_names,
                     is_visible: (source_index) =>
                         current_column_projection.source_to_visible[source_index] !== undefined,
                     hidden_count: current_column_projection.hidden_count,

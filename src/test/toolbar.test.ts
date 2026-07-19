@@ -40,6 +40,7 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         column_visibility: {
             column_count: 2,
             get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
+            duplicate_names: new Set(),
             is_visible: () => true,
             hidden_count: 0,
             reset_key: 'sheet-1',
@@ -215,6 +216,7 @@ describe('Toolbar', () => {
             column_visibility: {
                 column_count: 2,
                 get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
+                duplicate_names: new Set(),
                 is_visible: (source_index) => source_index !== 1,
                 hidden_count: 1,
                 reset_key: 'sheet-1',

@@ -633,6 +633,24 @@ describe('column visibility projection', () => {
         expect(document.activeElement).toBe(columns_trigger());
     });
 
+    it('adds column letters only to duplicate names', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 3;
+        meta.sheets[0].columnNames = ['Revenue', 'Revenue', 'Region'];
+        await dispatch_host_message(sheet_meta_message(meta));
+
+        await open_columns();
+        const labels = Array.from(document.querySelectorAll(
+            '.column-visibility-item',
+        )).map((row) => row.textContent);
+        expect(labels).toEqual([
+            'Revenue (column A)',
+            'Revenue (column B)',
+            'Region',
+        ]);
+    });
+
     it('toggles and restores source columns with immediate per-sheet persistence only', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1', 'Sheet2']);
@@ -653,7 +671,7 @@ describe('column visibility projection', () => {
 
         await open_columns();
         const value_checkbox = document.querySelector<HTMLInputElement>(
-            'input[aria-label^="Hide Value;"]',
+            'input[aria-label="Hide Value"]',
         )!;
         await act(async () => value_checkbox.click());
 
@@ -870,7 +888,7 @@ describe('merges', () => {
 
         await open_columns();
         const right = document.querySelector<HTMLInputElement>(
-            'input[aria-label^="Hide Right;"]',
+            'input[aria-label="Hide Right"]',
         )!;
         await act(async () => right.click());
         expect(grid_stub().getAttribute('data-merges')).toBe('0');

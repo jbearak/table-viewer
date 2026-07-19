@@ -175,9 +175,7 @@ body {
 .column-visibility-item {
     display: grid;
     grid-template-columns: auto minmax(80px, 1fr);
-    grid-template-areas:
-        "check name"
-        "check source";
+    grid-template-areas: "check name";
     column-gap: 7px;
     align-items: center;
     padding: 5px 10px;
@@ -198,15 +196,6 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-
-.column-visibility-source {
-    grid-area: source;
-    overflow: hidden;
-    color: var(--vscode-descriptionForeground, inherit);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    opacity: 0.8;
 }
 
 .column-visibility-empty,

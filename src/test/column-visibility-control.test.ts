@@ -15,7 +15,7 @@ let container: HTMLDivElement | null = null;
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
 
-const column_names = ['Revenue', 'Revenue', ''];
+const column_names = ['Revenue', 'Revenue', '', ''];
 
 function render_control(
     overrides: Partial<ColumnVisibilityControlProps> = {},
@@ -27,6 +27,7 @@ function render_control(
     const props: ColumnVisibilityControlProps = {
         column_count: column_names.length,
         get_column_name: (source_index) => column_names[source_index] ?? '',
+        duplicate_names: new Set(['Revenue', '(blank)']),
         is_visible: (source_index) => source_index !== 1,
         hidden_count: 1,
         reset_key: 'sheet-1',
@@ -131,28 +132,31 @@ describe('ColumnVisibilityControl', () => {
         const matches = document.querySelectorAll('.column-visibility-item');
         expect(matches).toHaveLength(1);
         expect(matches[0].textContent).toContain('(blank)');
-        expect(matches[0].textContent).toContain('Column C');
 
         set_input_value(search(), 'not present');
         expect(document.querySelector('.column-visibility-empty')?.textContent)
             .toBe('No matching columns');
     });
 
-    it('keeps duplicate and blank names distinct in secondary text and accessible labels', () => {
+    it('adds column letters only when displayed names need disambiguation', () => {
         render_control();
         act(() => trigger().click());
 
         const rows = Array.from(document.querySelectorAll('.column-visibility-item'));
-        expect(rows[0].textContent).toContain('Column A · source 1');
-        expect(rows[1].textContent).toContain('Column B · source 2');
-        expect(rows[2].textContent).toContain('(blank)');
+        expect(rows.map((row) => row.textContent)).toEqual([
+            'Revenue (column A)',
+            'Revenue (column B)',
+            '(blank) (column C)',
+            '(blank) (column D)',
+        ]);
         const labels = Array.from(document.querySelectorAll<HTMLInputElement>(
             '.column-visibility-item input',
         )).map((input) => input.getAttribute('aria-label'));
         expect(labels).toEqual([
-            'Hide Revenue; Column A · source 1',
-            'Show Revenue; Column B · source 2',
-            'Hide blank column; Column C · source 3',
+            'Hide Revenue (column A)',
+            'Show Revenue (column B)',
+            'Hide blank column (column C)',
+            'Hide blank column (column D)',
         ]);
     });
 
@@ -167,7 +171,7 @@ describe('ColumnVisibilityControl', () => {
             '.column-visibility-item input',
         );
         expect(Array.from(checkboxes).map((input) => input.checked))
-            .toEqual([true, false, true]);
+            .toEqual([true, false, true, true]);
         act(() => checkboxes[1].click());
         expect(on_toggle).toHaveBeenCalledWith(1);
 
@@ -255,7 +259,7 @@ describe('ColumnVisibilityControl', () => {
         expect(get_column_name).toHaveBeenCalledTimes(10_000);
         expect(document.querySelectorAll('.column-visibility-item')).toHaveLength(1);
         expect(document.querySelector('.column-visibility-item')?.textContent)
-            .toContain('Target column');
+            .toBe('Target column');
         expect(document.querySelector('.column-visibility-limit')).toBeNull();
     });
 
