@@ -2,13 +2,11 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import type * as vscode from 'vscode';
 import { register_table_viewer } from '../custom-editor';
 import type { FileStateStore } from '../state';
+import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 
 function state_store(): FileStateStore {
-    return {
-        get: () => ({}),
-        set: async () => {},
-    };
+    return versioned_state_store().store;
 }
 
 function context(): vscode.ExtensionContext {

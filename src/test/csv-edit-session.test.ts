@@ -4,6 +4,7 @@ import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-
 import type { FileStateStore } from '../state';
 import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
+import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 
 const enc = new TextEncoder();
@@ -15,18 +16,7 @@ function deferred<T = void>() {
 }
 
 function state_store(initial: PerFileState = {}) {
-    const states: Record<string, PerFileState> = {};
-    return {
-        store: {
-            get: (file_path: string) => states[file_path] ?? initial,
-            set: async (file_path: string, state: PerFileState) => {
-                states[file_path] = state;
-            },
-        } satisfies FileStateStore,
-        get_state(file_path: string) {
-            return states[file_path] ?? initial;
-        },
-    };
+    return versioned_state_store(initial);
 }
 
 function uri(path: string): vscode.Uri {
@@ -285,12 +275,27 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             }],
         };
+        let revision = 0;
         const store: FileStateStore = {
-            get: () => current,
-            set: async (_path, next) => {
-                await gate.promise;
-                current = next;
+            async read() {
+                return { state: structuredClone(current), revision };
             },
+            async compare_and_set(_path, expected, next) {
+                await gate.promise;
+                if (expected !== revision) {
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(current), revision },
+                    };
+                }
+                current = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(current), revision },
+                };
+            },
+            async touch() {},
         };
         const panel = open_csv_table(uri(file_path), store);
         await panel.__receive({ type: 'ready' });

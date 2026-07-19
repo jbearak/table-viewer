@@ -4,6 +4,7 @@ import { attach_viewer, csv_table_profile } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
 import type { FileStateStore } from '../state';
+import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 
 /**
@@ -37,10 +38,7 @@ async function flush_promises(): Promise<void> {
 }
 
 function state_store(): FileStateStore {
-    return {
-        get: () => ({}),
-        set: async () => {},
-    };
+    return versioned_state_store().store;
 }
 
 function uri(path: string): vscode.Uri {
@@ -568,6 +566,7 @@ describe('CSV reload races', () => {
 
         const watcher = vscode_mock.__getWatchers()[0];
         const reload_done = watcher.__fireChange();      // starts the in-flight reload
+        await flush_promises();
 
         await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
 
@@ -677,6 +676,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' });
         const watcher_done = vscode_mock.__getWatchers()[0].__fireChange();
+        await flush_promises();
         const save_done = panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
         await first_reparse_failed.promise;
 

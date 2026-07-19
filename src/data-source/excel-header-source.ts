@@ -20,6 +20,31 @@ interface SheetProjection {
     override?: ExcelHeaderOverride;
 }
 
+export interface ExcelHeaderOverridePlan {
+    sheetIndex: number;
+    sheet: SheetMeta;
+    previousMode: ExcelHeaderOverride | 'auto';
+    nextMode: ExcelHeaderOverride | 'auto';
+    previousActive: boolean;
+    nextActive: boolean;
+}
+
+export interface ExcelHeaderPlanningSheet {
+    readonly name: string;
+    readonly rowCount: number;
+    readonly columnCount: number;
+    readonly merges: readonly Readonly<MergeRange>[];
+    readonly hasFormatting: boolean;
+    readonly columnNames: readonly string[];
+    readonly detected: boolean;
+    readonly override?: ExcelHeaderOverride;
+}
+
+export interface ExcelHeaderPlanningInput {
+    readonly hasFormatting: boolean;
+    readonly sheets: readonly ExcelHeaderPlanningSheet[];
+}
+
 /**
  * Projects an already-parsed Excel workbook without changing its physical data.
  * The first row can become column names independently for each worksheet, while
@@ -72,6 +97,25 @@ export class ExcelHeaderDataSource implements DataSource {
         return this._meta;
     }
 
+    /** Immutable facts used by pure state planning and CAS conflict retries. */
+    planning_input(): ExcelHeaderPlanningInput {
+        return Object.freeze({
+            hasFormatting: this.base.meta().hasFormatting,
+            sheets: Object.freeze(this.sheets.map((sheet) => Object.freeze({
+                name: sheet.physical.name,
+                rowCount: sheet.physical.rowCount,
+                columnCount: sheet.physical.columnCount,
+                merges: Object.freeze(
+                    sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
+                ),
+                hasFormatting: sheet.physical.hasFormatting,
+                columnNames: Object.freeze([...sheet.columnNames]),
+                detected: sheet.detected,
+                override: sheet.override,
+            }))),
+        });
+    }
+
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
         const projection = this.sheets[sheet_index];
         if (!projection) {
@@ -79,7 +123,7 @@ export class ExcelHeaderDataSource implements DataSource {
                 `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
             );
         }
-        if (!header_active(projection)) {
+        if (!header_active(projection, projection.override)) {
             return this.base.read_rows(sheet_index, start_row, count);
         }
 
@@ -95,6 +139,27 @@ export class ExcelHeaderDataSource implements DataSource {
             available,
         );
         return { startRow: start, rows: physical.rows.slice(0, available) };
+    }
+
+    /** Predict one sheet's projected metadata without changing live row behavior. */
+    plan_override(
+        sheet_name: string,
+        override: ExcelHeaderOverride | 'auto',
+    ): ExcelHeaderOverridePlan | undefined {
+        const sheet_index = this.sheets.findIndex(
+            (entry) => entry.physical.name === sheet_name,
+        );
+        const projection = this.sheets[sheet_index];
+        if (!projection) return undefined;
+        const next_override = override === 'auto' ? undefined : override;
+        return {
+            sheetIndex: sheet_index,
+            sheet: project_sheet(projection, next_override),
+            previousMode: projection.override ?? 'auto',
+            nextMode: override,
+            previousActive: header_active(projection, projection.override),
+            nextActive: header_active(projection, next_override),
+        };
     }
 
     set_override(sheet_name: string, override: ExcelHeaderOverride | 'auto'): boolean {
@@ -122,26 +187,7 @@ export class ExcelHeaderDataSource implements DataSource {
     private build_meta(): WorkbookMeta {
         return {
             hasFormatting: this.base.meta().hasFormatting,
-            sheets: this.sheets.map((sheet) => {
-                const active = header_active(sheet);
-                const physical = sheet.physical;
-                return {
-                    ...physical,
-                    rowCount: active
-                        ? Math.max(0, physical.rowCount - 1)
-                        : physical.rowCount,
-                    merges: active
-                        ? project_header_merges(physical.merges)
-                        : physical.merges,
-                    columnNames: active ? sheet.columnNames : undefined,
-                    excelFirstRowHeader: {
-                        mode: sheet.override ?? 'auto',
-                        detected: sheet.detected,
-                        active,
-                        available: physical.rowCount > 0 && physical.columnCount > 0,
-                    },
-                };
-            }),
+            sheets: this.sheets.map((sheet) => project_sheet(sheet, sheet.override)),
         };
     }
 }
@@ -155,10 +201,69 @@ function override_for(
         : undefined;
 }
 
-function header_active(sheet: SheetProjection): boolean {
-    if (sheet.override === 'on') return true;
-    if (sheet.override === 'off') return false;
+function header_active(
+    sheet: SheetProjection,
+    override: ExcelHeaderOverride | undefined,
+): boolean {
+    if (override === 'on') return true;
+    if (override === 'off') return false;
     return sheet.detected;
+}
+
+function project_sheet(
+    sheet: SheetProjection,
+    override: ExcelHeaderOverride | undefined,
+): SheetMeta {
+    return project_excel_header_sheet({
+        name: sheet.physical.name,
+        rowCount: sheet.physical.rowCount,
+        columnCount: sheet.physical.columnCount,
+        merges: sheet.physical.merges,
+        hasFormatting: sheet.physical.hasFormatting,
+        columnNames: sheet.columnNames,
+        detected: sheet.detected,
+        override: sheet.override,
+    }, override);
+}
+
+export function project_excel_header_sheet(
+    sheet: ExcelHeaderPlanningSheet,
+    override: ExcelHeaderOverride | undefined,
+): SheetMeta {
+    const active = override === 'on'
+        ? true
+        : override === 'off'
+        ? false
+        : sheet.detected;
+    return {
+        name: sheet.name,
+        rowCount: active ? Math.max(0, sheet.rowCount - 1) : sheet.rowCount,
+        columnCount: sheet.columnCount,
+        merges: active
+            ? project_header_merges(sheet.merges)
+            : sheet.merges.map((merge) => ({ ...merge })),
+        hasFormatting: sheet.hasFormatting,
+        columnNames: active ? [...sheet.columnNames] : undefined,
+        excelFirstRowHeader: {
+            mode: override ?? 'auto',
+            detected: sheet.detected,
+            active,
+            available: sheet.rowCount > 0 && sheet.columnCount > 0,
+        },
+    };
+}
+
+export function project_excel_header_workbook(
+    input: ExcelHeaderPlanningInput,
+    overrides: Record<string, ExcelHeaderOverride> | undefined,
+): WorkbookMeta {
+    return {
+        hasFormatting: input.hasFormatting,
+        sheets: input.sheets.map((sheet) => project_excel_header_sheet(
+            sheet,
+            overrides === undefined ? sheet.override : override_for(overrides, sheet.name),
+        )),
+    };
 }
 
 export function project_header_merges(merges: readonly MergeRange[]): MergeRange[] {

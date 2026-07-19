@@ -193,6 +193,82 @@ describe('ExcelHeaderDataSource', () => {
         });
     });
 
+    it('plans an override without exposing it to metadata or row requests', () => {
+        const base = new StubSource([
+            [cell('Name'), cell('Age')],
+            [cell('Alice'), cell(30)],
+        ], [{ startRow: 1, startCol: 0, endRow: 1, endCol: 1 }]);
+        const ds = new ExcelHeaderDataSource(base, { Sheet1: 'off' });
+        const before_meta = ds.meta();
+        const reads_before = base.read_requests.length;
+
+        const plan = ds.plan_override('Sheet1', 'on');
+
+        expect(plan).toMatchObject({
+            sheetIndex: 0,
+            previousMode: 'off',
+            nextMode: 'on',
+            previousActive: false,
+            nextActive: true,
+            sheet: {
+                rowCount: 1,
+                columnNames: ['Name', 'Age'],
+                excelFirstRowHeader: { mode: 'on', active: true },
+            },
+        });
+        expect(ds.meta()).toBe(before_meta);
+        expect(base.read_requests).toHaveLength(reads_before);
+        expect(ds.meta().sheets[0].excelFirstRowHeader?.mode).toBe('off');
+        expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Name');
+        expect(base.read_requests).toHaveLength(reads_before + 1);
+
+        ds.set_override('Sheet1', 'on');
+        expect(ds.meta().sheets[0]).toEqual(plan?.sheet);
+
+        const inactive = ds.plan_override('Sheet1', 'off')!;
+        inactive.sheet.merges[0].startRow = 99;
+        expect(ds.plan_override('Sheet1', 'off')?.sheet.merges[0].startRow).toBe(1);
+    });
+
+    it('plans authoritative auto consistently from explicit modes', () => {
+        const detected = new ExcelHeaderDataSource(new StubSource([
+            [cell('Name'), cell('Age')],
+            [cell('Alice'), cell(30)],
+        ]), { Sheet1: 'off' });
+        const detected_auto = detected.plan_override('Sheet1', 'auto')!;
+        expect(detected_auto).toMatchObject({
+            previousMode: 'off',
+            previousActive: false,
+            nextMode: 'auto',
+            nextActive: true,
+            sheet: {
+                columnNames: ['Name', 'Age'],
+                excelFirstRowHeader: { mode: 'auto', detected: true, active: true },
+            },
+        });
+        expect(detected_auto.sheet.excelFirstRowHeader?.active)
+            .toBe(detected_auto.nextActive);
+
+        const ambiguous = new ExcelHeaderDataSource(new StubSource([
+            [cell('Name'), cell('City')],
+            [cell('Alice'), cell('London')],
+            [cell('Bob'), cell('Paris')],
+        ]), { Sheet1: 'on' });
+        const ambiguous_auto = ambiguous.plan_override('Sheet1', 'auto')!;
+        expect(ambiguous_auto).toMatchObject({
+            previousMode: 'on',
+            previousActive: true,
+            nextMode: 'auto',
+            nextActive: false,
+            sheet: {
+                columnNames: undefined,
+                excelFirstRowHeader: { mode: 'auto', detected: false, active: false },
+            },
+        });
+        expect(ambiguous_auto.sheet.excelFirstRowHeader?.active)
+            .toBe(ambiguous_auto.nextActive);
+    });
+
     it('manual overrides switch projection without rebuilding the base source', () => {
         const base = new StubSource([
             [cell('Name'), null],

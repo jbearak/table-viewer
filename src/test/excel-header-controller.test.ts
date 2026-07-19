@@ -63,36 +63,42 @@ function number(raw: number): RenderedCell {
 
 function mutable_state_store(initial: StoredPerFileState = {}) {
     let state: StoredPerFileState = structuredClone(initial);
+    let revision = 0;
     const store: FileStateStore = {
-        get: () => structuredClone(state),
-        set: async (_path, next) => { state = structuredClone(next); },
-        update: async (_path, updater) => {
-            state = structuredClone(updater(structuredClone(state) as StoredPerFileState));
+        async read() {
+            return { state: structuredClone(state), revision };
         },
-        transaction: async (_path, decide) => {
-            const decision = await decide(structuredClone(state));
-            if (decision.type === 'commit') {
-                state = structuredClone(decision.state);
+        async compare_and_set(_path, expected, next) {
+            if (expected !== revision) {
+                return {
+                    type: 'conflict',
+                    snapshot: { state: structuredClone(state), revision },
+                };
             }
-            return decision.type;
+            state = structuredClone(next);
+            revision += 1;
+            return {
+                type: 'committed',
+                snapshot: { state: structuredClone(state), revision },
+            };
         },
+        async touch() {},
     };
     return { store, value: () => state };
 }
 
 function gated_state_store(initial: StoredPerFileState = {}) {
     let state: StoredPerFileState = structuredClone(initial);
+    let revision = 0;
     let release_next: (() => void) | undefined;
     let notify_started: (() => void) | undefined;
     let wait_next: Promise<void> | undefined;
     let transaction_commits = 0;
     const store: FileStateStore = {
-        get: () => structuredClone(state),
-        set: async (_path, next) => { state = structuredClone(next); },
-        update: async (_path, updater) => {
-            const next = structuredClone(
-                updater(structuredClone(state) as StoredPerFileState),
-            );
+        async read() {
+            return { state: structuredClone(state), revision };
+        },
+        async compare_and_set(_path, expected, next) {
             const pending = wait_next;
             wait_next = undefined;
             if (pending) {
@@ -100,23 +106,21 @@ function gated_state_store(initial: StoredPerFileState = {}) {
                 notify_started = undefined;
                 await pending;
             }
-            state = next;
-        },
-        transaction: async (_path, decide) => {
-            const pending = wait_next;
-            wait_next = undefined;
-            if (pending) {
-                notify_started?.();
-                notify_started = undefined;
-                await pending;
+            if (expected !== revision) {
+                return {
+                    type: 'conflict',
+                    snapshot: { state: structuredClone(state), revision },
+                };
             }
-            const decision = await decide(structuredClone(state));
-            if (decision.type === 'commit') {
-                state = structuredClone(decision.state);
-                transaction_commits += 1;
-            }
-            return decision.type;
+            state = structuredClone(next);
+            revision += 1;
+            transaction_commits += 1;
+            return {
+                type: 'committed',
+                snapshot: { state: structuredClone(state), revision },
+            };
         },
+        async touch() {},
     };
     return {
         store,
@@ -279,21 +283,28 @@ describe('Excel first-row header controller', () => {
         const commit_gate = new Promise<void>((resolve) => {
             release_commit = resolve;
         });
+        let revision = 0;
         const store: FileStateStore = {
-            get: () => structuredClone(persisted),
-            set: async (_path, next) => { persisted = structuredClone(next); },
-            update: async (_path, updater) => {
-                persisted = structuredClone(updater(structuredClone(persisted)));
+            async read() {
+                return { state: structuredClone(persisted), revision };
             },
-            transaction: async (_path, decide) => {
-                const decision = await decide(structuredClone(persisted));
+            async compare_and_set(_path, expected, next) {
                 resolve_decision();
                 await commit_gate;
-                if (decision.type === 'commit') {
-                    persisted = structuredClone(decision.state);
+                if (expected !== revision) {
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(persisted), revision },
+                    };
                 }
-                return decision.type;
+                persisted = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(persisted), revision },
+                };
             },
+            async touch() {},
         };
         const close_spy = vi.spyOn(PhysicalExcelSource.prototype, 'close');
         const panel = open_excel(
@@ -313,6 +324,120 @@ describe('Excel first-row header controller', () => {
         expect(messages_of(panel, 'metaReload')).toHaveLength(0);
         expect((persisted as PerFileState).excelFirstRowHeaderVersion).toBe(1);
         expect((persisted as PerFileState).rowHeights).toEqual([undefined]);
+    });
+
+    it('rebases candidate migration after a CAS conflict without losing newer fields', async () => {
+        const input_spy = vi.spyOn(ExcelHeaderDataSource.prototype, 'planning_input');
+        const live_plan_spy = vi.spyOn(ExcelHeaderDataSource.prototype, 'plan_override');
+        let persisted: StoredPerFileState = {
+            rowHeights: [{ 0: 44 }],
+            scrollPosition: [{ top: 12, left: 3 }],
+        };
+        let revision = 0;
+        let conflicts = 0;
+        const store: FileStateStore = {
+            async read() {
+                return { state: structuredClone(persisted), revision };
+            },
+            async compare_and_set(_path, expected, next) {
+                if (conflicts === 0) {
+                    conflicts += 1;
+                    persisted = {
+                        ...(persisted as PerFileState),
+                        columnWidths: [{ 0: 123 }],
+                        pendingEdits: { '0:0': 'newer' },
+                        transforms: [undefined],
+                        columnVisibility: [undefined],
+                    };
+                    revision += 1;
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(persisted), revision },
+                    };
+                }
+                expect(expected).toBe(revision);
+                persisted = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(persisted), revision },
+                };
+            },
+            async touch() {},
+        };
+        const panel = open_excel(
+            '/tmp/candidate-cas-conflict.xlsx',
+            store,
+            excel_profile({ count: 0 }),
+        );
+
+        await panel.__receive({ type: 'ready' });
+
+        expect(conflicts).toBe(1);
+        expect(input_spy).toHaveBeenCalledTimes(1);
+        expect(live_plan_spy).not.toHaveBeenCalled();
+        expect(persisted).toMatchObject({
+            columnWidths: [{ 0: 123 }],
+            pendingEdits: { '0:0': 'newer' },
+            transforms: [undefined],
+            columnVisibility: [undefined],
+            rowHeights: [undefined],
+            scrollPosition: [undefined],
+            excelFirstRowHeaderActive: { People: true },
+            excelFirstRowHeaderVersion: 1,
+        });
+    });
+
+    it('rebases a candidate to auto when a CAS conflict removes its captured override', async () => {
+        let persisted: StoredPerFileState = {
+            excelFirstRowHeaders: { People: 'off' },
+            excelFirstRowHeaderActive: { People: false },
+        };
+        let revision = 0;
+        let conflicted = false;
+        const store: FileStateStore = {
+            async read() {
+                return { state: structuredClone(persisted), revision };
+            },
+            async compare_and_set(_path, expected, next) {
+                if (!conflicted) {
+                    conflicted = true;
+                    persisted = {
+                        excelFirstRowHeaderActive: { People: false },
+                    };
+                    revision += 1;
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(persisted), revision },
+                    };
+                }
+                expect(expected).toBe(revision);
+                persisted = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(persisted), revision },
+                };
+            },
+            async touch() {},
+        };
+        const panel = open_excel(
+            '/tmp/candidate-auto-rebase.xlsx',
+            store,
+            excel_profile({ count: 0 }),
+        );
+
+        await panel.__receive({ type: 'ready' });
+
+        const meta = messages_of(panel, 'sheetMeta')[0];
+        expect(conflicted).toBe(true);
+        expect((persisted as PerFileState).excelFirstRowHeaders).toBeUndefined();
+        expect((persisted as PerFileState).excelFirstRowHeaderActive)
+            .toEqual({ People: true });
+        expect(meta.meta.sheets[0].excelFirstRowHeader).toMatchObject({
+            mode: 'auto', detected: true, active: true,
+        });
+        expect(meta.meta.sheets[0].columnNames).toEqual(['Name', 'Age']);
     });
 
     it('normalizes legacy name-keyed layout state during the first migration', async () => {
@@ -406,14 +531,32 @@ describe('Excel first-row header controller', () => {
         const file_path = '/tmp/transactional-migration.xlsx';
         const panel = open_excel(file_path, state.store, profile);
         await panel.__receive({ type: 'ready' });
-        await state.store.set(file_path, structuredClone(original_state));
+        const reset_snapshot = await state.store.read(file_path);
+        await state.store.compare_and_set(
+            file_path,
+            reset_snapshot.revision,
+            structuredClone(original_state),
+        );
         const commits_before_stale_candidate = state.commit_count();
 
         vscode_mock.__setStatImplementation(async () => ({ size: 10, mtime: 2 }));
-        vscode_mock.__setReadFileImplementation(async () => new Uint8Array([2]));
-        const update_started = state.block_next_update();
+        let resolve_stale_verify!: (bytes: Uint8Array) => void;
+        let stale_verify_started!: () => void;
+        const stale_verify = new Promise<Uint8Array>((resolve) => {
+            resolve_stale_verify = resolve;
+        });
+        const stale_verify_ready = new Promise<void>((resolve) => {
+            stale_verify_started = resolve;
+        });
+        let stale_reads = 0;
+        vscode_mock.__setReadFileImplementation(async () => {
+            stale_reads += 1;
+            if (stale_reads === 1) return new Uint8Array([2]);
+            stale_verify_started();
+            return stale_verify;
+        });
         const stale_reload = vscode_mock.__getWatchers()[0].__fireChange();
-        await update_started;
+        await stale_verify_ready;
 
         let resolve_current_read!: (bytes: Uint8Array) => void;
         const current_read = new Promise<Uint8Array>((resolve) => {
@@ -427,7 +570,7 @@ describe('Excel first-row header controller', () => {
             return new Uint8Array([3]);
         });
         const current_reload = vscode_mock.__getWatchers()[0].__fireChange();
-        state.release_update();
+        resolve_stale_verify(new Uint8Array([3]));
         await stale_reload;
 
         expect(state.value()).toMatchObject(original_state);

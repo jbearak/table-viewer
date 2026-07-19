@@ -16,15 +16,18 @@ import {
 } from './viewer-config';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
-import type { FileStateStore, FileStateTransactionDecision } from './state';
+import type { FileStateSnapshot, FileStateStore } from './state';
 import {
-    sanitize_excel_header_active,
+    normalize_host_state,
+    plan_excel_candidate_state,
+    plan_excel_override_state,
+} from './excel-header-plan';
+import {
     sanitize_excel_header_overrides,
     transform_has_entries,
     transform_schema_for_sheet,
     type PerFileState,
     type SheetTransformState,
-    type StoredPerFileState,
     type WebviewMessage,
 } from './types';
 import {
@@ -208,40 +211,6 @@ function subscribe_excel_headers(
     };
 }
 
-/**
- * Re-fingerprint one sheet's persisted view descriptor (transform or column
- * visibility) after a header toggle. Column indices are unchanged by the
- * toggle, so a descriptor that matched the old schema is rewritten to the new
- * one; anything else is left for the ordinary schema check to discard.
- */
-function migrate_sheet_schema<T extends { schema?: string }>(
-    entries: (T | undefined)[] | undefined,
-    sheet_index: number,
-    old_schema: string,
-    new_schema: string | undefined,
-): (T | undefined)[] | undefined {
-    const entry = entries?.[sheet_index];
-    if (!entries || !entry || entry.schema !== old_schema) return entries;
-    const next = [...entries];
-    next[sheet_index] = new_schema === undefined
-        ? { ...entry, schema: undefined }
-        : { ...entry, schema: new_schema };
-    return next;
-}
-
-function excel_header_maps_equal(
-    left: Record<string, boolean>,
-    right: Record<string, boolean>,
-): boolean {
-    const left_entries = Object.entries(left);
-    const right_entries = Object.entries(right);
-    return left_entries.length === right_entries.length
-        && left_entries.every(([name, active]) => (
-            Object.prototype.hasOwnProperty.call(right, name)
-            && right[name] === active
-        ));
-}
-
 async function broadcast_excel_header(
     file_path: string,
     sheet_name: string,
@@ -382,63 +351,29 @@ export function attach_viewer(
             : { csvEditingSupported: undefined, csvEditable: undefined };
     }
 
-    function normalize_host_state(
-        stored: StoredPerFileState,
-        sheet_names: string[],
-    ): PerFileState {
-        const normalized = normalize_per_file_state(stored, sheet_names);
-        if ('excelFirstRowHeaders' in stored) {
-            normalized.excelFirstRowHeaders = sanitize_excel_header_overrides(
-                stored.excelFirstRowHeaders,
-            );
-        }
-        if ('excelFirstRowHeaderActive' in stored) {
-            normalized.excelFirstRowHeaderActive = sanitize_excel_header_active(
-                stored.excelFirstRowHeaderActive,
-            );
-        }
-        if (
-            'excelFirstRowHeaderVersion' in stored
-            && stored.excelFirstRowHeaderVersion === 1
-        ) {
-            normalized.excelFirstRowHeaderVersion = 1;
-        }
-        return normalized;
+    async function read_file_state(touch = true): Promise<FileStateSnapshot> {
+        const snapshot = await state_store.read(file_path);
+        if (touch) await state_store.touch(file_path);
+        return snapshot;
     }
 
     async function update_file_state(
         updater: (current: PerFileState) => PerFileState,
         sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
-    ): Promise<void> {
-        if (state_store.update) {
-            await state_store.update(
+    ): Promise<boolean> {
+        let snapshot = await read_file_state();
+        for (;;) {
+            const current = normalize_host_state(snapshot.state, sheet_names);
+            const next = updater(current);
+            if (next === current) return false;
+            const result = await state_store.compare_and_set(
                 file_path,
-                (current) => updater(normalize_host_state(current, sheet_names)),
+                snapshot.revision,
+                next,
             );
-            return;
+            if (result.type === 'committed') return true;
+            snapshot = result.snapshot;
         }
-        await state_store.set(
-            file_path,
-            updater(normalize_host_state(state_store.get(file_path), sheet_names)),
-        );
-    }
-
-    async function transact_file_state(
-        decide: (current: PerFileState) => Promise<FileStateTransactionDecision>,
-        sheet_names: string[],
-    ): Promise<FileStateTransactionDecision['type']> {
-        if (state_store.transaction) {
-            return state_store.transaction(file_path, (current) =>
-                decide(normalize_host_state(current, sheet_names)));
-        }
-        const decision = await decide(normalize_host_state(
-            state_store.get(file_path),
-            sheet_names,
-        ));
-        if (decision.type === 'commit') {
-            await update_file_state(() => decision.state, sheet_names);
-        }
-        return decision.type;
     }
 
     async function persist_transform_commit(
@@ -452,8 +387,7 @@ export function attach_viewer(
         const expected_file_epoch = transform_file_epochs.get(message.requestId);
         if (expected_file_epoch === undefined) return;
         await run_file_mutation(file_path, async () => {
-            let committed = false;
-            await update_file_state((current) => {
+            const committed = await update_file_state((current) => {
                 const sheet = source?.meta().sheets[message.sheetIndex];
                 if (
                     disposed
@@ -467,7 +401,6 @@ export function attach_viewer(
                 ) {
                     return current;
                 }
-                committed = true;
                 const transforms = [...(current.transforms ?? [])];
                 transforms[message.sheetIndex] = transform_has_entries(state)
                     ? {
@@ -489,7 +422,7 @@ export function attach_viewer(
         digest: string;
         snapshot: string;
     }> {
-        const state = state_store.get(file_path) as PerFileState;
+        const state = (await read_file_state()).state as PerFileState;
         const stat = await vscode.workspace.fs.stat(uri);
         const max_mib = get_max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
@@ -543,86 +476,39 @@ export function attach_viewer(
         if (!(ds instanceof ExcelHeaderDataSource)) {
             return built_source_is_current(seq, snapshot, digest);
         }
-        const sheet_names = ds.meta().sheets.map((sheet) => sheet.name);
-        const decision = await transact_file_state(async (current) => {
-            // Rebase the candidate and derive migration from the exact state held
-            // by this conditional transaction, not from its parse-time snapshot.
-            ds.replace_overrides(current.excelFirstRowHeaders);
-            const sheets = ds.meta().sheets;
-            const previous_active = sanitize_excel_header_active(
-                current.excelFirstRowHeaderActive,
+        const planning_input = ds.planning_input();
+        const sheet_names = planning_input.sheets.map((sheet) => sheet.name);
+        let state_snapshot = await read_file_state();
+        for (;;) {
+            const current = normalize_host_state(state_snapshot.state, sheet_names);
+            const plan = plan_excel_candidate_state(current, planning_input);
+
+            // Physical verification is deliberately outside the state-store queue.
+            // A stale candidate therefore performs no durable migration write.
+            if (!await built_source_is_current(seq, snapshot, digest)) return false;
+
+            if (!plan.changed) {
+                const latest = await read_file_state(false);
+                if (latest.revision === state_snapshot.revision) {
+                    // Candidate-only application occurs once the exact state basis
+                    // used by the immutable plan is known to remain authoritative.
+                    ds.replace_overrides(plan.overrides);
+                    return true;
+                }
+                state_snapshot = latest;
+                continue;
+            }
+            const result = await state_store.compare_and_set(
+                file_path,
+                state_snapshot.revision,
+                plan.state,
             );
-            const next_active = Object.create(null) as Record<string, boolean>;
-            const changed_indices = new Set<number>();
-            sheets.forEach((sheet, index) => {
-                const active = sheet.excelFirstRowHeader?.active ?? false;
-                next_active[sheet.name] = active;
-                if (current.excelFirstRowHeaderVersion !== 1) {
-                    if (active) changed_indices.add(index);
-                } else if (
-                    !Object.prototype.hasOwnProperty.call(previous_active, sheet.name)
-                        ? active
-                        : previous_active[sheet.name] !== active
-                ) {
-                    changed_indices.add(index);
-                }
-            });
-            // This is the adoption transaction's linearization point. A rejection
-            // here performs no durable state write; a later file change belongs to
-            // the next watcher revision and does not retroactively abort this one.
-            if (!await built_source_is_current(seq, snapshot, digest)) {
-                return { type: 'abort' };
+            if (result.type === 'committed') {
+                ds.replace_overrides(plan.overrides);
+                return true;
             }
-            if (
-                current.excelFirstRowHeaderVersion === 1
-                && excel_header_maps_equal(previous_active, next_active)
-            ) {
-                return { type: 'accept' };
-            }
-            const rowHeights = [...(current.rowHeights ?? [])];
-            const scrollPosition = [...(current.scrollPosition ?? [])];
-            let transforms = current.transforms;
-            let columnVisibility = current.columnVisibility;
-            for (const index of changed_indices) {
-                rowHeights[index] = undefined;
-                scrollPosition[index] = undefined;
-                if (current.excelFirstRowHeaderVersion !== 1) {
-                    const sheet = sheets[index];
-                    if (!sheet) continue;
-                    const physical_schema = JSON.stringify([
-                        sheet.name,
-                        sheet.columnCount,
-                        null,
-                    ]);
-                    const projected_schema = transform_schema_for_sheet(sheet);
-                    transforms = migrate_sheet_schema(
-                        transforms,
-                        index,
-                        physical_schema,
-                        projected_schema,
-                    );
-                    columnVisibility = migrate_sheet_schema(
-                        columnVisibility,
-                        index,
-                        physical_schema,
-                        projected_schema,
-                    );
-                }
-            }
-            return {
-                type: 'commit',
-                state: {
-                    ...current,
-                    rowHeights,
-                    scrollPosition,
-                    transforms,
-                    columnVisibility,
-                    excelFirstRowHeaderActive: next_active,
-                    excelFirstRowHeaderVersion: 1,
-                },
-            };
-        }, sheet_names);
-        return decision !== 'abort';
+            state_snapshot = result.snapshot;
+        }
     }
 
     function prepare_built_source_for_adoption(
@@ -681,15 +567,15 @@ export function attach_viewer(
         if (seq !== undefined && seq === reload_seq) reset_reload_retry();
     }
 
-    function state_for_reload(ds: DataSource): PerFileState {
+    async function state_for_reload(ds: DataSource): Promise<PerFileState> {
         return normalize_per_file_state(
-            state_store.get(file_path),
+            (await read_file_state()).state,
             ds.meta().sheets.map((sheet) => sheet.name),
         );
     }
 
-    function state_for_first_meta(): PerFileState {
-        const state = state_store.get(file_path) as PerFileState;
+    async function state_for_first_meta(): Promise<PerFileState> {
+        const state = (await read_file_state()).state as PerFileState;
         if (!profile.editing || !state.pendingEdits) return state;
         if (try_claim_edit_session()) return state;
         const { pendingEdits: _drop, ...rest } = state;
@@ -699,7 +585,7 @@ export function attach_viewer(
     async function send_first_meta(ds: DataSource): Promise<boolean> {
         const settlement = outstanding_header_settlement;
         const delivered = await core!.send_meta({
-            state: state_for_first_meta(),
+            state: await state_for_first_meta(),
             defaultTabOrientation: get_default_orientation(),
             previewMode: profile.previewMode,
             ...editing_flags(ds),
@@ -728,7 +614,7 @@ export function attach_viewer(
             ...editing_flags(ds),
             projectionChange: settlement ? 'excelHeader' : projectionChange,
             headerRequestId: settlement?.requestId ?? headerRequestId,
-            state: settlement ? state_for_reload(ds) : state,
+            state: settlement ? await state_for_reload(ds) : state,
         });
         if (delivered && settlement === outstanding_header_settlement) {
             outstanding_header_settlement = undefined;
@@ -749,7 +635,7 @@ export function attach_viewer(
             ds,
             'excelHeader',
             request_id,
-            state_for_reload(ds),
+            await state_for_reload(ds),
         );
     }
 
@@ -812,8 +698,8 @@ export function attach_viewer(
     }
 
     // Drop any cached pendingEdits for this file, keeping the rest of the state.
-    function clear_pending_edits(): Promise<void> {
-        return update_file_state((current) => {
+    async function clear_pending_edits(): Promise<void> {
+        await update_file_state((current) => {
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
         });
@@ -1026,7 +912,7 @@ export function attach_viewer(
                     ds,
                     header_recovery ? 'excelHeader' : undefined,
                     header_recovery?.requestId,
-                    header_recovery ? state_for_reload(ds) : undefined,
+                    header_recovery ? await state_for_reload(ds) : undefined,
                 );
                 if (!delivered) {
                     if (!header_recovery) schedule_reload_retry(force, seq);
@@ -1133,7 +1019,7 @@ export function attach_viewer(
                         if (delivered && ready_seen) initial_meta_sent = true;
                     } else {
                         delivered = await core.send_meta_recovery({
-                            state: state_for_reload(source),
+                            state: await state_for_reload(source),
                             ...editing_flags(source),
                             headerRequestId: tracked_settlement.requestId,
                             error: tracked_settlement.error,
@@ -1390,54 +1276,22 @@ export function attach_viewer(
                             return;
                         }
                         const override: ExcelHeaderOverride = msg.enabled ? 'on' : 'off';
-                        // Sorting and filtering survive a header toggle: the sheet's
-                        // columns keep their indices (only row 0 moves in or out of the
-                        // body), so persisted descriptors stay valid once their schema
-                        // fingerprint is migrated to the projected sheet's new one.
-                        const previous_mode = header.mode;
-                        const old_schema = transform_schema_for_sheet(sheet);
-                        source.set_override(msg.sheetName, override);
-                        const projected = source.meta().sheets[msg.sheetIndex];
-                        const new_schema = projected
-                            ? transform_schema_for_sheet(projected)
-                            : undefined;
-                        source.set_override(msg.sheetName, previous_mode);
-                        await update_file_state((current) => {
-                            const excelFirstRowHeaders = sanitize_excel_header_overrides(
-                                current.excelFirstRowHeaders,
-                            );
-                            excelFirstRowHeaders[msg.sheetName] = override;
-                            const excelFirstRowHeaderActive = sanitize_excel_header_active(
-                                current.excelFirstRowHeaderActive,
-                            );
-                            excelFirstRowHeaderActive[msg.sheetName] = msg.enabled;
-                            const rowHeights = [...(current.rowHeights ?? [])];
-                            const scrollPosition = [...(current.scrollPosition ?? [])];
-                            rowHeights[msg.sheetIndex] = undefined;
-                            scrollPosition[msg.sheetIndex] = undefined;
-                            const transforms = migrate_sheet_schema(
-                                current.transforms,
+                        const planning_input = source.planning_input();
+                        // Planning is pure: the live source remains on the old row
+                        // projection until the durable state CAS has committed.
+                        const committed = await update_file_state((current) => (
+                            plan_excel_override_state(
+                                current,
+                                planning_input,
                                 msg.sheetIndex,
-                                old_schema,
-                                new_schema,
-                            );
-                            const columnVisibility = migrate_sheet_schema(
-                                current.columnVisibility,
-                                msg.sheetIndex,
-                                old_schema,
-                                new_schema,
-                            );
-                            return {
-                                ...current,
-                                excelFirstRowHeaders,
-                                excelFirstRowHeaderActive,
-                                excelFirstRowHeaderVersion: 1,
-                                rowHeights,
-                                scrollPosition,
-                                transforms,
-                                columnVisibility,
-                            };
-                        });
+                                msg.sheetName,
+                                override,
+                            )?.state ?? current
+                        ));
+                        if (!committed) {
+                            failure = 'The worksheet changed before the header setting could be saved.';
+                            return;
+                        }
                         const previous_file_epoch = current_file_epoch(file_path);
                         const file_epoch = advance_file_epoch(file_path);
                         committed_settlement = publish_header_settlement(
@@ -1514,7 +1368,7 @@ export function attach_viewer(
                     && (core?.has_transform_work ?? false);
                 const granted = can_edit && !denied_by_owner && try_claim_edit_session();
                 const pendingEdits = granted
-                    ? (state_store.get(file_path) as PerFileState).pendingEdits
+                    ? ((await read_file_state()).state as PerFileState).pendingEdits
                     : undefined;
                 panel.webview.postMessage({
                     type: 'editSessionResult',
