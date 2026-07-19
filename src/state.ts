@@ -6,6 +6,11 @@ export const DEFAULT_MAX_STORED_FILES = 10_000;
 
 type StoredStateMap = Record<string, StoredPerFileState>;
 
+export type FileStateTransactionDecision =
+    | { type: 'abort' }
+    | { type: 'accept' }
+    | { type: 'commit'; state: PerFileState };
+
 export interface FileStateStore {
     get(file_path: string): StoredPerFileState;
     set(file_path: string, state: PerFileState): Promise<void>;
@@ -14,6 +19,14 @@ export interface FileStateStore {
         file_path: string,
         updater: (current: StoredPerFileState) => PerFileState,
     ): Promise<void>;
+    /** Serialized asynchronous conditional update. An abort/accept decision does
+     *  not write global state; commit writes exactly the returned state. */
+    transaction?(
+        file_path: string,
+        decide: (
+            current: StoredPerFileState,
+        ) => Promise<FileStateTransactionDecision>,
+    ): Promise<FileStateTransactionDecision['type']>;
 }
 
 function get_all_state(
@@ -60,6 +73,26 @@ export function create_file_state_store(
         await context.globalState.update(STATE_KEY, all);
     });
 
+    const transaction = async (
+        file_path: string,
+        decide: (
+            current: StoredPerFileState,
+        ) => Promise<FileStateTransactionDecision>,
+    ): Promise<FileStateTransactionDecision['type']> => {
+        let result: FileStateTransactionDecision['type'] = 'abort';
+        await enqueue(async () => {
+            const all = get_all_state(context);
+            const decision = await decide(all[file_path] ?? {});
+            result = decision.type;
+            if (decision.type !== 'commit') return;
+            delete all[file_path];
+            all[file_path] = decision.state;
+            evict_excess(all, get_max());
+            await context.globalState.update(STATE_KEY, all);
+        });
+        return result;
+    };
+
     return {
         get(file_path: string): StoredPerFileState {
             const all = get_all_state(context);
@@ -88,5 +121,6 @@ export function create_file_state_store(
         },
 
         update,
+        transaction,
     };
 }

@@ -36,6 +36,30 @@ describe('FileStateStore recency', () => {
         expect(backing.update).toHaveBeenCalledTimes(2);
     });
 
+    it('aborts an asynchronous transaction without a durable write', async () => {
+        const backing = context_with({ '/a': { activeSheetIndex: 2 } });
+        const store = create_file_state_store(backing.context);
+
+        const result = await store.transaction!('/a', async () => ({ type: 'abort' }));
+
+        expect(result).toBe('abort');
+        expect(backing.value()['/a']).toEqual({ activeSheetIndex: 2 });
+        expect(backing.update).not.toHaveBeenCalled();
+    });
+
+    it('commits an asynchronous transaction from the latest queued state', async () => {
+        const backing = context_with({ '/a': { activeSheetIndex: 1 } });
+        const store = create_file_state_store(backing.context);
+        const result = await store.transaction!('/a', async (current) => ({
+            type: 'commit',
+            state: { ...(current as PerFileState), activeSheetIndex: 4 },
+        }));
+
+        expect(result).toBe('commit');
+        expect(backing.value()['/a']).toMatchObject({ activeSheetIndex: 4 });
+        expect(backing.update).toHaveBeenCalledTimes(1);
+    });
+
     it('runs atomic updates after a queued recency touch', async () => {
         const backing = context_with({
             '/a': { transforms: [{ sort: [], filters: [] }] },

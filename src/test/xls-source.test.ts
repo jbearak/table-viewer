@@ -69,6 +69,7 @@ describe('XlsDataSource', () => {
         expect(people.rowCount).toBe(2);
         expect(inventory.columnNames).toEqual(['Product', 'Price', 'Quantity']);
         expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Alice');
+        expect(ds.read_rows(0, 0, 1).rows[0][3]?.rawType).toBe('date');
 
         ds.set_override('People', 'off');
         expect(ds.meta().sheets[0].rowCount).toBe(3);

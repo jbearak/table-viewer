@@ -25,6 +25,8 @@ export function build_store_old_way(
                 italic: cell.italic,
                 rawType: cell.raw === null
                     ? 'empty'
+                    : cell.rawType === 'date'
+                        ? 'date'
                     : typeof cell.raw === 'number'
                         ? 'number'
                         : typeof cell.raw === 'boolean'

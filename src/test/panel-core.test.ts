@@ -121,15 +121,49 @@ describe('ViewerPanelCore', () => {
         expect(src.read_rows_calls).toBe(1);
 
         const g0 = core.generation;
-        await core.send_meta_reload();
+        await core.send_meta_reload({
+            state: { transforms: [] },
+            projectionChange: 'excelHeader',
+            headerRequestId: 'header:1',
+        });
         expect(core.generation).toBe(g0 + 1);
         const last = posted[posted.length - 1];
         expect(last.type).toBe('metaReload');
         expect(last.generation).toBe(g0 + 1);
+        expect(last.projectionChange).toBe('excelHeader');
+        expect(last.headerRequestId).toBe('header:1');
+        expect(last.state).toEqual({ transforms: [] });
 
         // Same window, new generation: cache was cleared, so read_rows runs again.
         await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'c', generation: core.generation });
         expect(src.read_rows_calls).toBe(2);
+    });
+
+    it('posts terminal metadata recovery without advancing generations', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource());
+        core.set_source(new StubSource(3));
+        await core.send_meta_reload();
+        const generation = core.generation;
+        const source_generation = core.source_generation;
+
+        await core.send_meta_recovery({
+            state: { transforms: [] },
+            headerRequestId: 'header:terminal',
+            error: 'Delivery retries were exhausted.',
+        });
+
+        expect(core.generation).toBe(generation);
+        expect(core.source_generation).toBe(source_generation);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'metaReloadRecovery',
+            generation,
+            sourceGeneration: source_generation,
+            projectionChange: 'excelHeader',
+            headerRequestId: 'header:terminal',
+            error: 'Delivery retries were exhausted.',
+            meta: { sheets: [{ rowCount: 3 }] },
+        });
     });
 
     it('invalidates source and view generations when the same mutable source is reused', async () => {

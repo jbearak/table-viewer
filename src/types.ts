@@ -22,7 +22,7 @@ export interface CellData {
     formatted: string;
     bold: boolean;
     italic: boolean;
-    rawType?: 'string' | 'number' | 'boolean' | 'empty';
+    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
 }
 
 export interface MergeRange {
@@ -169,8 +169,9 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 export type HostMessage =
     // Paginated protocol (Phase B+). `generation` rises on every (re)load so the
     // webview can drop row windows that belong to a superseded document version.
-    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number }
-    | { type: 'metaReload'; meta: WorkbookMeta; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number }
+    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number; projectionChange?: 'excelHeader'; headerRequestId?: string; error?: string }
+    | { type: 'metaReloadRecovery'; meta: WorkbookMeta; state: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange: 'excelHeader'; headerRequestId: string; generation: number; sourceGeneration: number; error?: string }
+    | { type: 'metaReload'; meta: WorkbookMeta; state?: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange?: 'excelHeader'; headerRequestId?: string; generation: number; sourceGeneration: number }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
@@ -183,7 +184,7 @@ export type HostMessage =
 export type WebviewMessage =
     | { type: 'ready' }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
-    | { type: 'stateChanged'; state: PerFileState }
+    | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number }
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'requestEditSession' }
     | { type: 'releaseEditSession' }
@@ -196,4 +197,4 @@ export type WebviewMessage =
     | { type: 'showWarning'; message: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
-    | { type: 'setColumnVisibility'; sheetIndex: number; state: SheetColumnVisibilityState | undefined };
+    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number };

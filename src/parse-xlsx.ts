@@ -341,6 +341,7 @@ function parse_worksheet_core(
 
                 let raw: string | number | boolean | null = null;
                 let formatted = '';
+                let rawType: CellData['rawType'];
 
                 if (t === 's') {
                     // Shared string (already decoded during SST parsing)
@@ -381,6 +382,7 @@ function parse_worksheet_core(
                     if (v_text !== null && v_text !== '') {
                         raw = v_text;
                         formatted = v_text;
+                        rawType = 'date';
                     }
                 } else {
                     // Numeric (default) — includes dates, formulas with numeric results
@@ -392,6 +394,7 @@ function parse_worksheet_core(
                             raw = is_valid_excel_date_serial(num, datemode)
                                 ? serial_to_iso(num, datemode)
                                 : num;
+                            if (typeof raw === 'string') rawType = 'date';
                             formatted = format_value(num, xf_index, xfs, format_map, datemode);
                         } else {
                             raw = num;
@@ -400,7 +403,7 @@ function parse_worksheet_core(
                     }
                 }
 
-                cells.set(`${row}:${col}`, { raw, formatted, ...style });
+                cells.set(`${row}:${col}`, { raw, formatted, rawType, ...style });
                 // Defensive pre-check: bound the in-progress cell map during
                 // streaming parse so a single pathological sheet can't exhaust
                 // memory before the cumulative budget is enforced below. A lone

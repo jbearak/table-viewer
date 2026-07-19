@@ -125,10 +125,13 @@ describe('CSV edit sessions', () => {
         await panel.__receive({
             type: 'setColumnVisibility',
             sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: 1,
             state: { visibleColumns: [], schema: '["Sheet1",1,["h"]]' },
         } as never);
         await panel.__receive({
             type: 'stateChanged',
+            sourceGeneration: 1,
             state: {
                 pendingEdits: restored,
                 columnVisibility: [undefined],
@@ -155,11 +158,11 @@ describe('CSV edit sessions', () => {
         // persistence reaches the host only after the first tab's direct user choice.
         const cleanup_gate = deferred();
         const delayed_cleanup = cleanup_gate.promise.then(() => second.__receive({
-            type: 'stateChanged', state: { columnVisibility: [undefined], activeSheetIndex: 0 },
+            type: 'stateChanged', sourceGeneration: 1, state: { columnVisibility: [undefined], activeSheetIndex: 0 },
         } as never));
         await first.__receive({
-            type: 'setColumnVisibility', sheetIndex: 0,
-            state: { visibleColumns: [], schema },
+            type: 'setColumnVisibility', sheetIndex: 0, sheetName: 'Sheet1',
+            sourceGeneration: 1, state: { visibleColumns: [], schema },
         } as never);
         cleanup_gate.resolve();
         await delayed_cleanup;
@@ -168,10 +171,11 @@ describe('CSV edit sessions', () => {
         }]);
 
         await first.__receive({
-            type: 'setColumnVisibility', sheetIndex: 0, state: undefined,
+            type: 'setColumnVisibility', sheetIndex: 0, sheetName: 'Sheet1',
+            sourceGeneration: 1, state: undefined,
         } as never);
         await second.__receive({
-            type: 'stateChanged', state: {
+            type: 'stateChanged', sourceGeneration: 1, state: {
                 columnVisibility: [{ visibleColumns: [], schema }], activeSheetIndex: 0,
             },
         } as never);
@@ -192,6 +196,7 @@ describe('CSV edit sessions', () => {
         // This is the snapshot the webview posts after sanitizing sheetMeta.
         await panel.__receive({
             type: 'stateChanged',
+            sourceGeneration: 1,
             state: { transforms: [undefined], activeSheetIndex: 0 },
         } as never);
 
@@ -253,6 +258,7 @@ describe('CSV edit sessions', () => {
         // A debounced snapshot captured before Cancel must not resurrect it.
         await first.__receive({
             type: 'stateChanged',
+            sourceGeneration: 1,
             state: { transforms: [saved_transform], activeSheetIndex: 0 },
         } as never);
         expect(state.get_state(file_path).transforms).toEqual([undefined]);
@@ -377,7 +383,6 @@ describe('CSV edit sessions', () => {
             type: 'setTransform',
             sheetIndex: 0,
             requestId: 'during-edit',
-            generation: 1,
             sourceGeneration: 1,
             intent: 'user',
             state: {
@@ -404,7 +409,6 @@ describe('CSV edit sessions', () => {
             type: 'setTransform',
             sheetIndex: 0,
             requestId: 'pending',
-            generation: 1,
             sourceGeneration: 1,
             intent: 'user',
             state: {

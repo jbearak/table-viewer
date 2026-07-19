@@ -2,7 +2,7 @@ import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
 const BOLD = 1, ITALIC = 2;
-const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4;
+const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
 
 export class ColumnarStore {
     private constructor(
@@ -88,6 +88,7 @@ function encode_type(type: RenderedCell['rawType']): number {
         case 'string': return TYPE_STRING;
         case 'number': return TYPE_NUMBER;
         case 'boolean': return TYPE_BOOLEAN;
+        case 'date': return TYPE_DATE;
         case 'empty': return TYPE_EMPTY;
         default: return 0;
     }
@@ -98,6 +99,7 @@ function decode_type(type: number): RenderedCell['rawType'] {
         case TYPE_STRING: return 'string';
         case TYPE_NUMBER: return 'number';
         case TYPE_BOOLEAN: return 'boolean';
+        case TYPE_DATE: return 'date';
         case TYPE_EMPTY: return 'empty';
         default: return undefined;
     }

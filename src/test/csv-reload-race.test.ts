@@ -91,11 +91,13 @@ describe('CSV reload races', () => {
     it('CSV table ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
         const older = deferred<Uint8Array>();
         const newer = deferred<Uint8Array>();
-        const reads = [older, newer];
+        // Each candidate is read once to parse and once immediately before
+        // adoption. The newer candidate completes verification first.
+        const reads = [older, newer, newer, older];
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let mtime = 0;
 
-        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: Math.min(++mtime, 2) }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
 
         open_csv_table(uri('/tmp/race.csv'));
@@ -116,14 +118,226 @@ describe('CSV reload races', () => {
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
+    it('reloads changed bytes even when stat metadata is unchanged', async () => {
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return reads <= 2
+                ? enc.encode('h\na\n')
+                : enc.encode('h\nb\nc\n');
+        });
+
+        open_csv_table(uri('/tmp/same-stat.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
+    });
+
+    it('retries a failed initial metadata post without stranding generations', async () => {
+        vi.useFakeTimers();
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        open_csv_table(uri('/tmp/initial-delivery.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        let sheet_meta_attempts = 0;
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: unknown) => {
+            if (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'sheetMeta'
+            ) {
+                sheet_meta_attempts += 1;
+                if (sheet_meta_attempts === 1) return false;
+            }
+            return original_post(message);
+        });
+
+        await panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(50);
+
+        expect(sheet_meta_attempts).toBe(2);
+        expect(sheet_meta(panel)).toMatchObject([{
+            sourceGeneration: 2,
+            generation: 1,
+        }]);
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        expect(sheet_meta_attempts).toBe(2);
+        vi.useRealTimers();
+    });
+
+    it('does not deduplicate a same-digest watcher after failed reload delivery', async () => {
+        let current = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => current);
+        open_csv_table(uri('/tmp/reload-delivery.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        current = enc.encode('h\nb\nc\n');
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        let reload_attempts = 0;
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: unknown) => {
+            if (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'metaReload'
+            ) {
+                reload_attempts += 1;
+                if (reload_attempts === 1) return false;
+            }
+            return original_post(message);
+        });
+
+        const watcher = vscode_mock.__getWatchers()[0];
+        await watcher.__fireChange();
+        await watcher.__fireChange();
+
+        expect(reload_attempts).toBe(2);
+        expect(meta_reloads(panel)).toMatchObject([{
+            sourceGeneration: 3,
+            generation: 3,
+            meta: { sheets: [{ rowCount: 2 }] },
+        }]);
+    });
+
+    it('rejects stale same-stat parsed bytes and retries the current snapshot', async () => {
+        vi.useFakeTimers();
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads <= 2) return enc.encode('h\na\n');
+            if (reads === 3) return enc.encode('h\nstale\n');
+            return enc.encode('h\n1\n2\n3\n');
+        });
+        open_csv_table(uri('/tmp/same-stat-snapshot.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(50);
+
+        expect(meta_reloads(panel)).toMatchObject([{
+            meta: { sheets: [{ rowCount: 3 }] },
+        }]);
+        vi.useRealTimers();
+    });
+
+    it('shares one retry budget across locked and unstable reload failures', async () => {
+        vi.useFakeTimers();
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        open_csv_table(uri('/tmp/mixed-retry.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        let stat_calls = 0;
+        vscode_mock.__setStatImplementation(async () => {
+            stat_calls += 1;
+            if (stat_calls === 1) {
+                throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+            }
+            if (stat_calls === 4) {
+                throw Object.assign(new Error('denied'), { code: 'EPERM' });
+            }
+            return { size: 100, mtime: stat_calls };
+        });
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(500);
+
+        expect(stat_calls).toBe(6);
+        expect(meta_reloads(panel)).toHaveLength(0);
+        vi.useRealTimers();
+    });
+
+    it('closes a parsed candidate when final snapshot verification throws', async () => {
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads <= 2) return enc.encode('h\na\n');
+            if (reads === 3) return enc.encode('h\nb\n');
+            throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+        });
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        open_csv_table(uri('/tmp/verification-cleanup.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        expect(meta_reloads(panel)).toHaveLength(0);
+    });
+
+    it('retries transient locked-file reload failures', async () => {
+        vi.useFakeTimers();
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        open_csv_table(uri('/tmp/locked-retry.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        let attempts = 0;
+        vscode_mock.__setStatImplementation(async () => {
+            attempts += 1;
+            if (attempts <= 2) {
+                throw Object.assign(new Error('locked'), { code: 'EBUSY' });
+            }
+            return { size: 100, mtime: 2 };
+        });
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nb\nc\n'));
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.advanceTimersByTimeAsync(50);
+
+        expect(attempts).toBeGreaterThanOrEqual(3);
+        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
+        vi.useRealTimers();
+    });
+
+    it('bounds retries for continuously unstable file snapshots', async () => {
+        vi.useFakeTimers();
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
+        open_csv_table(uri('/tmp/unstable-retry.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        let mtime = 1;
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 100,
+            mtime: ++mtime,
+        }));
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(200);
+        vi.useRealTimers();
+
+        // Initial parse+verification, then four bounded watcher attempts that
+        // are rejected by the first validation stat before another read.
+        expect(reads).toBe(6);
+        expect(meta_reloads(panel)).toHaveLength(0);
+    });
+
     it('CSV table sends sheetMeta when a watcher reload wins before initial ready completes', async () => {
         const initial = deferred<Uint8Array>();
         const reload = deferred<Uint8Array>();
-        const reads = [initial, reload];
+        const reads = [initial, reload, reload, initial];
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let mtime = 0;
 
-        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: Math.min(++mtime, 2) }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
 
         open_csv_table(uri('/tmp/race.csv'));
@@ -147,7 +361,14 @@ describe('CSV reload races', () => {
         const pre_ready_reload = deferred<Uint8Array>();
         const initial = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
-        const reads = [pre_ready_reload, initial, post_ready_reload];
+        const reads = [
+            pre_ready_reload,
+            pre_ready_reload,
+            initial,
+            post_ready_reload,
+            post_ready_reload,
+            initial,
+        ];
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
@@ -198,7 +419,9 @@ describe('CSV reload races', () => {
     it('CSV preview ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
         const older = deferred<Uint8Array>();
         const newer = deferred<Uint8Array>();
-        const reads = [older, newer];
+        // Each candidate is read once to parse and once immediately before
+        // adoption. The newer candidate completes verification first.
+        const reads = [older, newer, newer, older];
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 0 }));
@@ -226,7 +449,7 @@ describe('CSV reload races', () => {
     it('CSV preview sends sheetMeta with previewMode when a watcher reload wins before initial ready completes', async () => {
         const initial = deferred<Uint8Array>();
         const reload = deferred<Uint8Array>();
-        const reads = [initial, reload];
+        const reads = [initial, reload, reload, initial];
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 0 }));
@@ -254,7 +477,14 @@ describe('CSV reload races', () => {
         const pre_ready_reload = deferred<Uint8Array>();
         const initial = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
-        const reads = [pre_ready_reload, initial, post_ready_reload];
+        const reads = [
+            pre_ready_reload,
+            pre_ready_reload,
+            initial,
+            post_ready_reload,
+            post_ready_reload,
+            initial,
+        ];
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 0 }));
         vscode_mock.__setReadFileImplementation(async () => reads.shift()!.promise);
@@ -295,15 +525,15 @@ describe('CSV reload races', () => {
 
         show_csv_preview(uri('/tmp/old.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         const panel = vscode_mock.__getPanels()[0];
-        void panel.__receive({ type: 'ready' });
+        const old_ready = panel.__receive({ type: 'ready' });
 
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
-        void panel.__receive({ type: 'ready' });
+        const new_ready = panel.__receive({ type: 'ready' });
 
         new_load.resolve(enc.encode('h\nn\n1\n2\n'));
-        await flush_promises();
+        await new_ready;
         old_load.resolve(enc.encode('h\nold\n'));
-        await flush_promises();
+        await old_ready;
 
         const metas = sheet_meta(panel);
         expect(metas).toHaveLength(1);
@@ -323,9 +553,12 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('h\na\n');          // initial ready (rowCount 1)
-            if (call === 2) return stale.promise;        // in-flight reload (rowCount 3)
-            return enc.encode('h\na\nb\n');                        // save's re-parse (rowCount 2)
+            if (call <= 2) return enc.encode('h\na\n'); // initial parse + verification
+            if (call === 3) return stale.promise; // in-flight watcher parse
+            if (call === 4) return enc.encode('h\na\n'); // save conflict check
+            // Save reparse and the stale candidate's final verification see the
+            // bytes that were written, so the stale candidate must be rejected.
+            return enc.encode('h\na\nb\n');
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -359,9 +592,9 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: current_mtime }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('h\na\n');            // ready (rowCount 1)
-            if (call === 2) return enc.encode('h\na\nb\n');         // save re-parse (rowCount 2)
-            return enc.encode('h\np\nq\nr\ns\nt\n');                // external edit (rowCount 5)
+            if (call <= 3) return enc.encode('h\na\n'); // ready + save conflict check
+            if (call <= 5) return enc.encode('h\na\nb\n'); // save parse + verification
+            return enc.encode('h\np\nq\nr\ns\nt\n'); // external parse + verification
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -379,6 +612,86 @@ describe('CSV reload races', () => {
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 5)).toBe(true);
     });
 
+    it('retries failed post-save metadata delivery and then deduplicates safely', async () => {
+        vi.useFakeTimers();
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return reads <= 3
+                ? enc.encode('h\na\n')
+                : enc.encode('h\nb\n');
+        });
+        open_csv_table(uri('/tmp/save-delivery.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        let reload_attempts = 0;
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: unknown) => {
+            if (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'metaReload'
+            ) {
+                reload_attempts += 1;
+                if (reload_attempts === 1) return false;
+            }
+            return original_post(message);
+        });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+        await vi.advanceTimersByTimeAsync(50);
+
+        expect(reload_attempts).toBe(2);
+        expect(meta_reloads(panel)).toMatchObject([{
+            sourceGeneration: 3,
+            generation: 3,
+        }]);
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        expect(reload_attempts).toBe(2);
+        vi.useRealTimers();
+    });
+
+    it('keeps an in-flight watcher viable when the post-save reparse cannot build', async () => {
+        vi.useFakeTimers();
+        const watcher_bytes = deferred<Uint8Array>();
+        const first_reparse_failed = deferred<void>();
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads <= 2) return enc.encode('h\na\n');
+            if (reads === 3) return watcher_bytes.promise;
+            if (reads === 4) return enc.encode('h\na\n');
+            if (reads === 5) {
+                first_reparse_failed.resolve();
+                throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+            }
+            if (reads === 6) return enc.encode('h\na\nb\n');
+            throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+        });
+        open_csv_table(uri('/tmp/save-watcher-fallback.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const watcher_done = vscode_mock.__getWatchers()[0].__fireChange();
+        const save_done = panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
+        await first_reparse_failed.promise;
+
+        watcher_bytes.resolve(enc.encode('h\na\nb\n'));
+        await watcher_done;
+        expect(meta_reloads(panel)).toMatchObject([{
+            meta: { sheets: [{ rowCount: 2 }] },
+        }]);
+
+        await vi.advanceTimersByTimeAsync(500);
+        await save_done;
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        vi.useRealTimers();
+    });
+
     it('reports save success even when the post-write reload fails', async () => {
         // The write succeeded, so the bytes are on disk. If the follow-up
         // re-parse throws (transient read error / external delete in the TOCTOU
@@ -387,8 +700,8 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('h\na\n'); // initial ready
-            throw new Error('reload boom');           // save's re-parse fails
+            if (call <= 3) return enc.encode('h\na\n'); // ready + conflict digest check
+            throw new Error('reload boom'); // bounded post-save reparses fail
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -407,6 +720,53 @@ describe('CSV reload races', () => {
         expect(results).toEqual([{ type: 'saveResult', success: true }]);
     });
 
+    it('refuses a same-size same-mtime external edit before saving', async () => {
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return reads <= 2
+                ? enc.encode('h\na\n')
+                : enc.encode('h\nx\n');
+        });
+        const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+
+        open_csv_table(uri('/tmp/digest-conflict.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: false });
+        expect(warning_spy).toHaveBeenCalledWith(
+            expect.stringContaining('modified externally'),
+        );
+    });
+
+    it('detects an external edit that lands during CSV serialization', async () => {
+        let external_changed = false;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => external_changed
+            ? enc.encode('h\nx\n')
+            : enc.encode('h\na\n'));
+        const original_read_rows = CsvDataSource.prototype.read_rows;
+        vi.spyOn(CsvDataSource.prototype, 'read_rows').mockImplementation(function (
+            this: CsvDataSource,
+            ...args: Parameters<CsvDataSource['read_rows']>
+        ) {
+            external_changed = true;
+            return original_read_rows.apply(this, args);
+        });
+
+        open_csv_table(uri('/tmp/serialization-conflict.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: false });
+    });
+
     it('reports a save conflict cleanly even when the post-conflict reload fails', async () => {
         // An external change is detected (mtime differs), so the save is refused.
         // If the follow-up re-parse also throws, the user must see only the
@@ -416,8 +776,9 @@ describe('CSV reload races', () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call === 1) return enc.encode('h\na\n'); // initial ready (last_mtime = 1)
-            throw new Error('reload boom');           // post-conflict re-parse fails
+            if (call <= 2) return enc.encode('h\na\n'); // initial parse + verification
+            if (call === 3) return enc.encode('h\nx\n'); // conflict digest check
+            throw new Error('reload boom'); // bounded post-conflict reparses fail
         });
         const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
 

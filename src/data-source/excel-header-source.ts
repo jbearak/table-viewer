@@ -37,17 +37,27 @@ export class ExcelHeaderDataSource implements DataSource {
         const sanitized = sanitize_excel_header_overrides(overrides);
         const physical_meta = base.meta();
         this.sheets = physical_meta.sheets.map((sheet, sheet_index) => {
-            const sample_count = Math.min(
-                sheet.rowCount,
-                DETECTION_DATA_ROWS + 1,
-            );
-            const sample = sample_count > 0
-                ? base.read_rows(sheet_index, 0, sample_count).rows
-                : [];
+            const first_row = sheet.rowCount > 0
+                ? base.read_rows(sheet_index, 0, 1).rows[0]
+                : undefined;
+            let detected = false;
+            if (detection_structure_is_eligible(sheet)) {
+                const body_count = Math.min(
+                    sheet.rowCount - 1,
+                    DETECTION_DATA_ROWS,
+                );
+                const body_rows = body_count > 0
+                    ? base.read_rows(sheet_index, 1, body_count).rows
+                    : [];
+                detected = detect_first_row_as_header(
+                    sheet,
+                    [first_row ?? [], ...body_rows],
+                );
+            }
             return {
                 physical: sheet,
-                columnNames: first_row_names(sheet, sample[0]),
-                detected: detect_first_row_as_header(sheet, sample),
+                columnNames: first_row_names(sheet, first_row),
+                detected,
                 override: override_for(sanitized, sheet.name),
             };
         });
@@ -164,17 +174,21 @@ export function project_header_merges(merges: readonly MergeRange[]): MergeRange
     return projected;
 }
 
+function detection_structure_is_eligible(sheet: SheetMeta): boolean {
+    return sheet.rowCount >= 2
+        && sheet.columnCount >= 2
+        && sheet.columnCount <= DETECTION_MAX_COLUMNS
+        && !sheet.merges.some((merge) => merge.startRow === 0);
+}
+
 /** Conservative, bounded detector: ambiguous sheets deliberately remain data. */
 export function detect_first_row_as_header(
     sheet: SheetMeta,
     sampled_rows: readonly (readonly (RenderedCell | null)[])[],
 ): boolean {
     if (
-        sheet.rowCount < 2
-        || sheet.columnCount < 2
-        || sheet.columnCount > DETECTION_MAX_COLUMNS
+        !detection_structure_is_eligible(sheet)
         || sampled_rows.length < 2
-        || sheet.merges.some((merge) => merge.startRow === 0)
     ) {
         return false;
     }
@@ -189,6 +203,7 @@ export function detect_first_row_as_header(
             || text.length > HEADER_MAX_LENGTH
             || /[\r\n]/.test(text)
             || !cell_is_string(cell)
+            || (cell !== null && cell_is_excel_date(cell))
         ) {
             return false;
         }
@@ -217,7 +232,7 @@ export function detect_first_row_as_header(
             if (
                 cell?.rawType === 'number'
                 || cell?.rawType === 'boolean'
-                || (cell !== null && is_formatted_excel_date(cell))
+                || (cell !== null && cell_is_excel_date(cell))
             ) {
                 typed_body_evidence = true;
             }
@@ -261,7 +276,8 @@ function cell_is_string(cell: RenderedCell | null | undefined): boolean {
         && (cell?.rawType === 'string' || cell?.rawType === undefined);
 }
 
-function is_formatted_excel_date(cell: RenderedCell): boolean {
+function cell_is_excel_date(cell: RenderedCell): boolean {
+    if (cell.rawType === 'date') return true;
     if (cell.rawType !== 'string' || cell.raw === null) return false;
     return /^\d{4}-\d{2}-\d{2}(?:T|$)/.test(cell.raw)
         && cell.formatted !== cell.raw;

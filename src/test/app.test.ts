@@ -477,6 +477,56 @@ describe('Excel first-row header toggle', () => {
         expect(button.getAttribute('aria-pressed')).toBe('true');
     });
 
+    it('keeps an active unavailable header override disable-able', async () => {
+        const { post_message } = await render_app();
+        const active_empty = excel_meta(true, 'on');
+        active_empty.sheets[0].rowCount = 0;
+        active_empty.sheets[0].excelFirstRowHeader = {
+            mode: 'on',
+            detected: false,
+            active: true,
+            available: false,
+        };
+        await dispatch_host_message(sheet_meta_message(active_empty));
+        post_message.mockClear();
+
+        const button = get_button('First Row as Header');
+        expect(button.getAttribute('aria-pressed')).toBe('true');
+        expect(button.getAttribute('aria-disabled')).toBeNull();
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        expect(request.enabled).toBe(false);
+
+        const inactive_empty = excel_meta(false, 'off');
+        inactive_empty.sheets[0].rowCount = 0;
+        inactive_empty.sheets[0].excelFirstRowHeader = {
+            mode: 'off',
+            detected: false,
+            active: false,
+            available: false,
+        };
+        await dispatch_host_message(meta_reload_message(inactive_empty, {
+            projectionChange: 'excelHeader',
+            headerRequestId: request.requestId,
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        const request_count = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader').length;
+        await click_button('First Row as Header');
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader')).toHaveLength(
+                request_count,
+            );
+    });
+
     it('requests an authoritative toggle and waits for metaReload', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(sheet_meta_message(excel_meta(true), {
@@ -487,30 +537,91 @@ describe('Excel first-row header toggle', () => {
         post_message.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
-        await click_button('First Row as Header');
+        const header_button = get_button('First Row as Header');
+        await act(async () => {
+            header_button.focus();
+            header_button.click();
+        });
 
-        expect(post_message).toHaveBeenCalledWith({
-            type: 'setExcelFirstRowHeader',
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        expect(request).toMatchObject({
             sheetIndex: 0,
             sheetName: 'People',
             enabled: false,
-            requestId: 'header:1',
             generation: 4,
             sourceGeneration: 7,
         });
+        expect(request.requestId).toMatch(/^header:[a-z0-9]+-[a-z0-9]+:1$/);
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
-        expect(get_button('First Row as Header').disabled).toBe(true);
+        expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(document.activeElement).toBe(get_button('First Row as Header'));
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Updating column names…');
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+        await act(async () => {
+            (container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement)
+                .click();
+            const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
+                column_index: number,
+                anchor: { left: number; top: number },
+                restore_focus: () => void,
+            ) => void;
+            open_filter(0, { left: 10, top: 20 }, vi.fn());
+        });
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(document.querySelector('.filter-popover')).toBeNull();
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
 
         await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
+            projectionChange: 'excelHeader',
+            headerRequestId: request.requestId,
             generation: 5,
             sourceGeneration: 8,
         }));
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
         expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(document.activeElement).toBe(get_button('First Row as Header'));
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+    });
+
+    it('does not restore another sheet transform while a header request is pending', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['People', 'Notes'], false);
+        for (const sheet of meta.sheets) {
+            sheet.excelFirstRowHeader = {
+                mode: 'auto', detected: true, active: true, available: true,
+            };
+            sheet.columnNames = ['Name'];
+        }
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Notes",1,["Name"]]',
+                }],
+            },
+        }));
+        await click_button('First Row as Header');
+        post_message.mockClear();
+
+        await click_button('Notes');
+
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setTransform')).toBe(false);
     });
 
     it('tracks the header state independently per active sheet', async () => {
@@ -557,9 +668,9 @@ describe('Excel first-row header toggle', () => {
 
         await click_button('Notes');
         const button = get_button('First Row as Header');
-        expect(button.disabled).toBe(true);
-        const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
-        await act(async () => wrapper.focus());
+        expect(button.disabled).toBe(false);
+        expect(button.getAttribute('aria-disabled')).toBe('true');
+        await act(async () => button.focus());
         expect(document.querySelector('[role="tooltip"]')?.textContent)
             .toBe('Wait for sorting and filtering to finish.');
     });
@@ -580,6 +691,18 @@ describe('Excel first-row header toggle', () => {
         post_message.mockClear();
 
         await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 1, direction: 'asc' }],
+                    filters: [],
+                    schema: '["People",2,null]',
+                }],
+                columnVisibility: [{
+                    hiddenColumns: [1],
+                    schema: '["People",2,null]',
+                }],
+            },
+            projectionChange: 'excelHeader',
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -595,6 +718,260 @@ describe('Excel first-row header toggle', () => {
             sourceGeneration: 8,
             intent: 'restore',
         });
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([0]);
+    });
+
+    it('hydrates authoritative unrelated-sheet layout on a header reload', async () => {
+        const { post_message } = await render_app();
+        const initial = make_meta(['People', 'Other']);
+        initial.sheets[0] = excel_meta(true).sheets[0];
+        await dispatch_host_message(sheet_meta_message(initial, {
+            state: {
+                columnWidths: [undefined, { 0: 120 }],
+                rowHeights: [undefined, { 2: 40 }],
+                scrollPosition: [undefined, { top: 20, left: 5 }],
+                activeSheetIndex: 0,
+                tabOrientation: 'horizontal',
+            },
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+
+        const reloaded = make_meta(['People', 'Other']);
+        reloaded.sheets[0] = excel_meta(false).sheets[0];
+        await dispatch_host_message(meta_reload_message(reloaded, {
+            state: {
+                columnWidths: [undefined, { 0: 222 }],
+                rowHeights: [undefined, { 2: 77 }],
+                scrollPosition: [undefined, { top: 300, left: 25 }],
+                activeSheetIndex: 1,
+                tabOrientation: 'vertical',
+                transforms: [undefined, undefined],
+                columnVisibility: [undefined, undefined],
+            },
+            projectionChange: 'excelHeader',
+            headerRequestId: 'other-tab-header',
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'stateChanged')).toBe(false);
+        // Active sheet and tab orientation remain local view choices, but the
+        // persisted snapshot is authoritative until this tab changes them.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        await act(async () => {
+            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
+        });
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'stateChanged')
+            .at(-1)).toMatchObject({
+                sourceGeneration: 8,
+                state: {
+                    activeSheetIndex: 1,
+                    tabOrientation: 'vertical',
+                    columnWidths: [{ 2: 222 }, { 0: 222 }],
+                    rowHeights: [undefined, { 2: 77 }],
+                    scrollPosition: [undefined, { top: 300, left: 25 }],
+                },
+            });
+        await click_button('Other');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 222 });
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 2: 77 });
+    });
+
+    it('does not persist a clean reload that has no authoritative state', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['People']);
+        await dispatch_host_message(sheet_meta_message(meta, {
+            state: {
+                columnWidths: [{ 0: 140 }],
+                rowHeights: [{ 2: 44 }],
+                scrollPosition: [{ top: 30, left: 5 }],
+                activeSheetIndex: 0,
+                tabOrientation: 'horizontal',
+            },
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+
+        await dispatch_host_message(meta_reload_message(meta, {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'stateChanged')).toBe(false);
+    });
+
+    it('does not migrate view descriptors for an ordinary detection change', async () => {
+        const { post_message } = await render_app();
+        const old_schema = '["People",2,["Name","Age"]]';
+        const transform: SheetTransformState = {
+            sort: [{ colIndex: 1, direction: 'asc' }],
+            filters: [],
+            schema: old_schema,
+        };
+        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+            state: {
+                transforms: [transform],
+                columnVisibility: [{ hiddenColumns: [1], schema: old_schema }],
+            },
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 4);
+        post_message.mockClear();
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+
+        const messages = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage);
+        expect(messages.some((message) => message.type === 'setTransform')).toBe(false);
+        expect(messages.filter((message) => message.type === 'stateChanged').at(-1))
+            .toMatchObject({
+                state: {
+                    transforms: [undefined],
+                    columnVisibility: [undefined],
+                },
+            });
+    });
+
+    it('applies terminal header recovery before clearing the request', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+            state: {
+                rowHeights: [{ 0: 44 }],
+                scrollPosition: [{ top: 100, left: 20 }],
+            },
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+        post_message.mockClear();
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+            generation: 7,
+            sourceGeneration: 5,
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+
+        await dispatch_host_message({
+            type: 'metaReloadRecovery',
+            meta: excel_meta(false),
+            state: {
+                rowHeights: [undefined],
+                scrollPosition: [undefined],
+                transforms: [undefined],
+                columnVisibility: [undefined],
+            },
+            projectionChange: 'excelHeader',
+            headerRequestId: request.requestId,
+            generation: 8,
+            sourceGeneration: 6,
+            error: 'The normal metadata delivery retries were exhausted.',
+        });
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('8');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({});
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names were updated, but recovery was required.');
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: expect.stringContaining('saved after recovery'),
+        });
+
+        await act(async () => {
+            (container!.querySelector('.stub-header-transform') as HTMLButtonElement).click();
+        });
+        const transform_request = latest_transform_request(post_message);
+        expect(transform_request).toMatchObject({
+            generation: 8,
+            sourceGeneration: 6,
+        });
+        await acknowledge_transform(transform_request, 9);
+
+        await click_button('First Row as Header');
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader')
+            .at(-1)).toMatchObject({
+                generation: 9,
+                sourceGeneration: 6,
+            });
+    });
+
+    it('settles a dormant header request on a later correlated reload', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+        post_message.mockClear();
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+            generation: 8,
+            sourceGeneration: 6,
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+            state: {
+                rowHeights: [undefined],
+                scrollPosition: [undefined],
+                transforms: [undefined],
+                columnVisibility: [undefined],
+            },
+            projectionChange: 'excelHeader',
+            headerRequestId: request.requestId,
+            generation: 9,
+            sourceGeneration: 7,
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names updated.');
+
+        await act(async () => {
+            (container!.querySelector('.stub-header-transform') as HTMLButtonElement).click();
+        });
+        const transform_request = latest_transform_request(post_message);
+        expect(transform_request).toMatchObject({
+            generation: 9,
+            sourceGeneration: 7,
+        });
+        await acknowledge_transform(transform_request, 10);
+        await click_button('First Row as Header');
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader')
+            .at(-1)).toMatchObject({
+                generation: 10,
+                sourceGeneration: 7,
+            });
     });
 
     it('clears pending state and surfaces a rejected request', async () => {
@@ -602,12 +979,27 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(sheet_meta_message(excel_meta(false)));
         post_message.mockClear();
         await click_button('First Row as Header');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+        expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
         await dispatch_host_message({
             type: 'excelFirstRowHeaderError',
-            requestId: 'header:1',
+            requestId: request.requestId,
             error: 'The worksheet changed.',
         });
         expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names were not updated.');
         expect(post_message).toHaveBeenCalledWith({
             type: 'showWarning',
             message: 'Could not change the header row: The worksheet changed.',
@@ -858,6 +1250,8 @@ describe('column visibility projection', () => {
         expect(targeted_messages).toEqual([{
             type: 'setColumnVisibility',
             sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: 1,
             state: {
                 hiddenColumns: [1],
                 schema: '["Sheet1",3,["Name","Value","Notes"]]',
@@ -888,7 +1282,11 @@ describe('column visibility projection', () => {
             .toEqual([0, 1, 2]);
         expect(columns_trigger().querySelector('.hidden-count-badge')).toBeNull();
         expect(post_message.mock.calls.map((call) => call[0])).toContainEqual({
-            type: 'setColumnVisibility', sheetIndex: 0, state: undefined,
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            state: undefined,
+            sourceGeneration: 1,
         });
         const restored = post_message.mock.calls.at(-1)![0];
         expect(restored.type).toBe('stateChanged');
@@ -980,7 +1378,9 @@ describe('column visibility projection', () => {
 describe('row height persistence', () => {
     it('stores a row resize per sheet and persists it', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            sourceGeneration: 7,
+        }));
         post_message.mockClear();
 
         await act(async () => {
@@ -993,6 +1393,7 @@ describe('row height persistence', () => {
         });
         const last = post_message.mock.calls.at(-1)![0];
         expect(last.type).toBe('stateChanged');
+        expect(last.sourceGeneration).toBe(7);
         expect(last.state.rowHeights[0]).toEqual({ 3: 50 });
     });
 

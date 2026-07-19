@@ -12,7 +12,8 @@ export const vscode_api = acquireVsCodeApi();
 const DEBOUNCE_MS = 150;
 
 export function use_state_sync(
-    current_state: React.MutableRefObject<PerFileState>
+    current_state: React.MutableRefObject<PerFileState>,
+    source_generation: React.MutableRefObject<number>,
 ) {
     const timer_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -28,8 +29,9 @@ export function use_state_sync(
         vscode_api.postMessage({
             type: 'stateChanged',
             state: current_state.current,
+            sourceGeneration: source_generation.current,
         });
-    }, [current_state]);
+    }, [current_state, source_generation]);
 
     const persist_debounced = useCallback(() => {
         if (timer_ref.current) {

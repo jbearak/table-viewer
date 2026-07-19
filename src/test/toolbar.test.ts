@@ -37,6 +37,7 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         show_excel_header_button: false,
         excel_header_active: false,
         excel_header_automatic: false,
+        excel_header_pending: false,
         on_toggle_excel_header: vi.fn(),
         vertical_tabs: false,
         on_toggle_tab_orientation,
@@ -233,6 +234,31 @@ describe('Toolbar', () => {
         expect(on_toggle_excel_header).toHaveBeenCalledTimes(1);
     });
 
+    it('keeps the pending Excel header toggle focusable and announces status', () => {
+        const on_toggle_excel_header = vi.fn();
+        render_toolbar({
+            show_excel_header_button: true,
+            excel_header_active: true,
+            excel_header_automatic: false,
+            excel_header_pending: true,
+            excel_header_status: 'Updating column names…',
+            excel_header_disabled: true,
+            excel_header_disabled_reason: 'Updating column names…',
+            on_toggle_excel_header,
+        });
+
+        const button = get_button('First Row as Header');
+        act(() => button.focus());
+        expect(document.activeElement).toBe(button);
+        expect(button.disabled).toBe(false);
+        expect(button.getAttribute('aria-disabled')).toBe('true');
+        expect(button.getAttribute('aria-pressed')).toBe('true');
+        act(() => button.click());
+        expect(on_toggle_excel_header).not.toHaveBeenCalled();
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Updating column names…');
+    });
+
     it('shows the disabled reason for the Excel header toggle', () => {
         render_toolbar({
             show_excel_header_button: true,
@@ -243,9 +269,12 @@ describe('Toolbar', () => {
         });
 
         const button = get_button('First Row as Header');
-        expect(button.disabled).toBe(true);
+        expect(button.disabled).toBe(false);
+        expect(button.getAttribute('aria-disabled')).toBe('true');
         const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
-        act(() => wrapper.focus());
+        expect(wrapper.getAttribute('role')).toBeNull();
+        expect(wrapper.getAttribute('tabindex')).toBeNull();
+        act(() => button.focus());
         expect(get_tooltip()?.textContent).toBe('Clear sorting and filters first.');
     });
 

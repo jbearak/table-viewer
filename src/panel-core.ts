@@ -27,11 +27,25 @@ interface MetaEnvelope {
     previewMode?: boolean;
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
+    projectionChange?: 'excelHeader';
+    headerRequestId?: string;
+    error?: string;
 }
 
 interface ReloadEnvelope {
+    state?: StoredPerFileState;
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
+    projectionChange?: 'excelHeader';
+    headerRequestId?: string;
+}
+
+interface MetaRecoveryEnvelope {
+    state: StoredPerFileState;
+    csvEditable?: boolean;
+    csvEditingSupported?: boolean;
+    headerRequestId: string;
+    error?: string;
 }
 
 type SetTransformMessage = Extract<WebviewMessage, { type: 'setTransform' }>;
@@ -126,9 +140,9 @@ export class ViewerPanelCore {
 
     /** Initial structure send. Generation is left as-is (a fresh panel starts
      *  at generation 1; subsequent reloads bump it via send_meta_reload). */
-    async send_meta(envelope: MetaEnvelope): Promise<void> {
-        if (this.disposed) return;
-        await this.post({
+    async send_meta(envelope: MetaEnvelope): Promise<boolean> {
+        if (this.disposed) return false;
+        return this.post({
             type: 'sheetMeta',
             meta: this.source.meta(),
             state: envelope.state,
@@ -136,9 +150,30 @@ export class ViewerPanelCore {
             previewMode: envelope.previewMode,
             csvEditable: envelope.csvEditable,
             csvEditingSupported: envelope.csvEditingSupported,
+            projectionChange: envelope.projectionChange,
+            headerRequestId: envelope.headerRequestId,
+            error: envelope.error,
             truncationMessage: this.source.truncationMessage,
             generation: this._generation,
             sourceGeneration: this._source_generation,
+        });
+    }
+
+    /** Full authoritative metadata recovery without changing core generations. */
+    async send_meta_recovery(envelope: MetaRecoveryEnvelope): Promise<boolean> {
+        if (this.disposed) return false;
+        return this.post({
+            type: 'metaReloadRecovery',
+            meta: this.source.meta(),
+            state: envelope.state,
+            csvEditable: envelope.csvEditable,
+            csvEditingSupported: envelope.csvEditingSupported,
+            projectionChange: 'excelHeader',
+            truncationMessage: this.source.truncationMessage,
+            generation: this._generation,
+            sourceGeneration: this._source_generation,
+            headerRequestId: envelope.headerRequestId,
+            error: envelope.error,
         });
     }
 
@@ -150,8 +185,11 @@ export class ViewerPanelCore {
         return this.post({
             type: 'metaReload',
             meta: this.source.meta(),
+            state: envelope?.state,
             csvEditable: envelope?.csvEditable,
             csvEditingSupported: envelope?.csvEditingSupported,
+            projectionChange: envelope?.projectionChange,
+            headerRequestId: envelope?.headerRequestId,
             truncationMessage: this.source.truncationMessage,
             generation: this._generation,
             sourceGeneration: this._source_generation,

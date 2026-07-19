@@ -9,7 +9,7 @@ export interface RenderedCell {
     bold: boolean;
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */
-    rawType?: 'string' | 'number' | 'boolean' | 'empty';
+    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
 }
 
 export interface RowWindow {

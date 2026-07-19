@@ -184,6 +184,21 @@ describe('parse_xlsx', () => {
             const joined = people.rows[1][3]?.raw;
             expect(typeof joined).toBe('string');
             expect(String(joined)).toContain('2024-01-15');
+            expect(people.rows[1][3]?.rawType).toBe('date');
+        });
+
+        it('preserves native OOXML date typing', async () => {
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData><row r="1"><c r="A1" t="d"><v>2024-03-01T00:00:00Z</v></c></row></sheetData>
+</worksheet>`;
+            const { data } = await parse_xlsx(build_test_xlsx(sheet));
+
+            expect(data.sheets[0].rows[0][0]).toMatchObject({
+                raw: '2024-03-01T00:00:00Z',
+                rawType: 'date',
+            });
         });
 
         it('returns correct row and column counts', async () => {

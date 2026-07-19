@@ -29,6 +29,7 @@ function cell(
 
 class StubSource implements DataSource {
     closed = false;
+    readonly read_requests: Array<{ start: number; count: number }> = [];
 
     constructor(
         private readonly rows: (RenderedCell | null)[][],
@@ -53,6 +54,7 @@ class StubSource implements DataSource {
     }
 
     read_rows(_sheet: number, start: number, count: number): RowWindow {
+        this.read_requests.push({ start, count });
         const clamped = Math.max(0, Math.min(start, this.rows.length));
         return {
             startRow: clamped,
@@ -103,6 +105,43 @@ describe('ExcelHeaderDataSource', () => {
         expect(sheet.rowCount).toBe(4);
     });
 
+    it('keeps formatted Excel dates in the first row as data', () => {
+        const ds = new ExcelHeaderDataSource(new StubSource([
+            [
+                cell('2024-01-01', { formatted: 'Jan 1, 2024' }),
+                cell('2024-02-01', { formatted: 'Feb 1, 2024' }),
+            ],
+            [cell(10), cell(20)],
+            [cell(30), cell(40)],
+        ]));
+
+        expect(ds.meta().sheets[0].excelFirstRowHeader?.detected).toBe(false);
+        expect(ds.meta().sheets[0].excelFirstRowHeader?.active).toBe(false);
+    });
+
+    it('keeps native OOXML date cells in the first row as data', () => {
+        const ds = new ExcelHeaderDataSource(new StubSource([
+            [
+                cell('2024-01-01', { rawType: 'date' }),
+                cell('2024-02-01', { rawType: 'date' }),
+            ],
+            [cell(10), cell(20)],
+            [cell(30), cell(40)],
+        ]));
+
+        expect(ds.meta().sheets[0].excelFirstRowHeader?.detected).toBe(false);
+    });
+
+    it('uses native date cells as typed body evidence', () => {
+        const ds = new ExcelHeaderDataSource(new StubSource([
+            [cell('Name'), cell('When')],
+            [cell('Alpha'), cell('2024-01-01', { rawType: 'date' })],
+            [cell('Beta'), cell('2024-02-01', { rawType: 'date' })],
+        ]));
+
+        expect(ds.meta().sheets[0].excelFirstRowHeader?.detected).toBe(true);
+    });
+
     it('detects a distinctly bold all-text header', () => {
         const ds = new ExcelHeaderDataSource(new StubSource([
             [cell('Name', { bold: true }), cell('City', { bold: true })],
@@ -136,6 +175,22 @@ describe('ExcelHeaderDataSource', () => {
             [cell('Alice'), cell(30)],
         ], [{ startRow: 0, startCol: 0, endRow: 0, endCol: 1 }]));
         expect(merged.meta().sheets[0].excelFirstRowHeader?.detected).toBe(false);
+    });
+
+    it('does not sample body rows for structurally ineligible wide sheets', () => {
+        const base = new StubSource([
+            Array.from({ length: 300 }, (_, index) => cell(`Header ${index}`)),
+            Array.from({ length: 300 }, (_, index) => cell(index)),
+        ]);
+
+        const ds = new ExcelHeaderDataSource(base);
+
+        expect(base.read_requests).toEqual([{ start: 0, count: 1 }]);
+        expect(ds.meta().sheets[0]).toMatchObject({
+            rowCount: 2,
+            columnCount: 300,
+            excelFirstRowHeader: { detected: false, active: false },
+        });
     });
 
     it('manual overrides switch projection without rebuilding the base source', () => {

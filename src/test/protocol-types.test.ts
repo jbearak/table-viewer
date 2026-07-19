@@ -28,11 +28,34 @@ describe('paginated protocol message shapes', () => {
         const msg: HostMessage = {
             type: 'metaReload',
             meta,
+            state: { transforms: [] },
+            projectionChange: 'excelHeader',
+            headerRequestId: 'header:1',
             generation: 2,
             sourceGeneration: 2,
         };
         expect(msg.type).toBe('metaReload');
-        if (msg.type === 'metaReload') expect(msg.generation).toBe(2);
+        if (msg.type === 'metaReload') {
+            expect(msg.generation).toBe(2);
+            expect(msg.projectionChange).toBe('excelHeader');
+            expect(msg.headerRequestId).toBe('header:1');
+            expect(msg.state?.transforms).toEqual([]);
+        }
+    });
+
+    it('HostMessage carries terminal header metadata recovery', () => {
+        const msg: HostMessage = {
+            type: 'metaReloadRecovery',
+            meta,
+            state: {},
+            projectionChange: 'excelHeader',
+            headerRequestId: 'header:terminal',
+            generation: 8,
+            sourceGeneration: 6,
+            error: 'Delivery retries were exhausted.',
+        };
+        expect(msg.generation).toBe(8);
+        expect(msg.sourceGeneration).toBe(6);
     });
 
     it('HostMessage carries a rowData variant addressed by sheet/start/requestId', () => {
@@ -52,6 +75,18 @@ describe('paginated protocol message shapes', () => {
             expect(msg.rows[0][1]).toBeNull();
             expect(msg.requestId).toBe('req-1');
         }
+    });
+
+    it('WebviewMessage fences state snapshots by source generation', () => {
+        const msg: WebviewMessage = {
+            type: 'stateChanged',
+            sourceGeneration: 3,
+            state: {
+                rowHeights: [{ 0: 44 }],
+                scrollPosition: [{ top: 100, left: 20 }],
+            },
+        };
+        expect(msg.sourceGeneration).toBe(3);
     });
 
     it('WebviewMessage carries a showWarning variant with a message', () => {
@@ -80,8 +115,16 @@ describe('paginated protocol message shapes', () => {
             requestId: 'header:1',
             error: 'The worksheet changed.',
         };
+        const visibility: WebviewMessage = {
+            type: 'setColumnVisibility',
+            sheetIndex: 1,
+            sheetName: 'People',
+            state: undefined,
+            sourceGeneration: 3,
+        };
         expect(request.type).toBe('setExcelFirstRowHeader');
         expect(result.type).toBe('excelFirstRowHeaderError');
+        expect(visibility.type).toBe('setColumnVisibility');
     });
 
     it('WebviewMessage carries a requestRows variant', () => {

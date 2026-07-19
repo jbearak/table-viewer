@@ -146,6 +146,7 @@ export function App(): React.JSX.Element {
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
     const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
+    const [excel_header_status, set_excel_header_status] = useState('');
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -193,6 +194,10 @@ export function App(): React.JSX.Element {
     >([]);
     const transform_request_seq_ref = useRef(0);
     const excel_header_request_seq_ref = useRef(0);
+    const excel_header_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
     const pending_excel_header_ref = useRef<string | null>(null);
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
@@ -210,7 +215,10 @@ export function App(): React.JSX.Element {
     const grid_focus_ref = useRef<GridFocusHandle | null>(null);
     const toolbar_focus_ref = useRef<ToolbarFocusHandle | null>(null);
 
-    const { persist_immediate } = use_state_sync(state_ref);
+    const { persist_immediate } = use_state_sync(
+        state_ref,
+        source_generation_ref,
+    );
 
     const request_transform = useCallback((
         sheet_index: number,
@@ -296,6 +304,10 @@ export function App(): React.JSX.Element {
             const msg = event.data as HostMessage;
 
             if (msg.type === 'sheetMeta') {
+                const recovery_error = pending_excel_header_ref.current
+                    === msg.headerRequestId
+                    ? msg.error
+                    : undefined;
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
                 set_toolbar_focus_restore(null);
@@ -306,6 +318,7 @@ export function App(): React.JSX.Element {
                 set_meta(msg.meta);
                 pending_excel_header_ref.current = null;
                 set_pending_excel_header(null);
+                set_excel_header_status('');
                 set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
@@ -382,9 +395,20 @@ export function App(): React.JSX.Element {
                 set_dismissed_conflict_signature(null);
                 pending_exit_ref.current = false;
                 pending_exit_save_succeeded_ref.current = false;
+                if (recovery_error) {
+                    set_excel_header_status('Column names were updated, but recovery was required.');
+                    vscode_api.postMessage({
+                        type: 'showWarning',
+                        message: `The header setting was saved after recovery: ${recovery_error}`,
+                    });
+                }
             }
 
-            if (msg.type === 'metaReload') {
+            if (msg.type === 'metaReload' || msg.type === 'metaReloadRecovery') {
+                const recovery_error = msg.type === 'metaReloadRecovery'
+                    && pending_excel_header_ref.current === msg.headerRequestId
+                    ? msg.error
+                    : undefined;
                 const previous_sheets = new Map(
                     (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
                 );
@@ -411,8 +435,19 @@ export function App(): React.JSX.Element {
                 }
                 meta_ref.current = msg.meta;
                 set_meta(msg.meta);
-                pending_excel_header_ref.current = null;
-                set_pending_excel_header(null);
+                if (
+                    pending_excel_header_ref.current === null
+                    || (
+                        msg.projectionChange === 'excelHeader'
+                        && msg.headerRequestId === pending_excel_header_ref.current
+                    )
+                ) {
+                    pending_excel_header_ref.current = null;
+                    set_pending_excel_header(null);
+                    if (msg.projectionChange === 'excelHeader') {
+                        set_excel_header_status('Column names updated.');
+                    }
+                }
                 set_filter_editor(null);
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
@@ -424,15 +459,37 @@ export function App(): React.JSX.Element {
                 set_auto_fit_active([]);
                 set_auto_fit_snapshot([]);
                 const sheet_count = msg.meta.sheets.length;
+                const authoritative_state = msg.state
+                    ? normalize_per_file_state(
+                        msg.state,
+                        msg.meta.sheets.map((sheet) => sheet.name),
+                    )
+                    : undefined;
+                const next_column_widths = trim_sheet_state_array(
+                    authoritative_state
+                        ? authoritative_state.columnWidths
+                        : state_ref.current.columnWidths,
+                    sheet_count,
+                );
+                const next_row_heights = trim_sheet_state_array(
+                    authoritative_state
+                        ? authoritative_state.rowHeights
+                        : state_ref.current.rowHeights,
+                    sheet_count,
+                ).map((value, index) => (
+                    header_changed.has(index) ? undefined : value
+                ));
+                const next_scroll_position = trim_sheet_state_array(
+                    authoritative_state
+                        ? authoritative_state.scrollPosition
+                        : state_ref.current.scrollPosition,
+                    sheet_count,
+                ).map((value, index) => (
+                    header_changed.has(index) ? undefined : value
+                ));
 
-                set_column_widths((prev) =>
-                    trim_sheet_state_array(prev, sheet_count)
-                );
-                set_row_heights((prev) =>
-                    trim_sheet_state_array(prev, sheet_count).map((value, index) => (
-                        header_changed.has(index) ? undefined : value
-                    ))
-                );
+                set_column_widths(next_column_widths);
+                set_row_heights(next_row_heights);
                 set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
                 set_pending_transforms([]);
                 set_pending_transform_labels([]);
@@ -448,7 +505,11 @@ export function App(): React.JSX.Element {
                     sheet: (typeof msg.meta.sheets)[number],
                     index: number,
                 ): T | undefined => {
-                    if (!value || !header_changed.has(index)) return value;
+                    if (
+                        !value
+                        || msg.projectionChange !== 'excelHeader'
+                        || !header_changed.has(index)
+                    ) return value;
                     const previous = previous_sheets.get(sheet.name);
                     if (
                         !previous
@@ -460,21 +521,25 @@ export function App(): React.JSX.Element {
                 };
                 const next_transforms = msg.meta.sheets.map((sheet, index) =>
                     sanitize_transform_state(
-                        migrate_schema(
-                            state_ref.current.transforms?.[index],
-                            sheet,
-                            index,
-                        ),
+                        authoritative_state
+                            ? authoritative_state.transforms?.[index]
+                            : migrate_schema(
+                                state_ref.current.transforms?.[index],
+                                sheet,
+                                index,
+                            ),
                         sheet.columnCount,
                         transform_schema_for_sheet(sheet),
                     ));
                 const next_column_visibility = msg.meta.sheets.map((sheet, index) =>
                     sanitize_column_visibility_state(
-                        migrate_schema(
-                            state_ref.current.columnVisibility?.[index],
-                            sheet,
-                            index,
-                        ),
+                        authoritative_state
+                            ? authoritative_state.columnVisibility?.[index]
+                            : migrate_schema(
+                                state_ref.current.columnVisibility?.[index],
+                                sheet,
+                                index,
+                            ),
                         sheet.columnCount,
                         transform_schema_for_sheet(sheet),
                     ));
@@ -490,27 +555,46 @@ export function App(): React.JSX.Element {
                 );
                 set_active_sheet_index(next_active_sheet_index);
 
+                const authoritative_requires_correction = authoritative_state
+                    ? JSON.stringify({
+                        rowHeights: authoritative_state.rowHeights ?? [],
+                        scrollPosition: authoritative_state.scrollPosition ?? [],
+                        transforms: authoritative_state.transforms ?? [],
+                        columnVisibility: authoritative_state.columnVisibility ?? [],
+                    }) !== JSON.stringify({
+                        rowHeights: next_row_heights,
+                        scrollPosition: next_scroll_position,
+                        transforms: next_transforms,
+                        columnVisibility: next_column_visibility,
+                    })
+                    : false;
+                const local_requires_correction = !authoritative_state
+                    && JSON.stringify({
+                        columnWidths: state_ref.current.columnWidths ?? [],
+                        rowHeights: state_ref.current.rowHeights ?? [],
+                        scrollPosition: state_ref.current.scrollPosition ?? [],
+                        transforms: state_ref.current.transforms ?? [],
+                        columnVisibility: state_ref.current.columnVisibility ?? [],
+                        activeSheetIndex: state_ref.current.activeSheetIndex ?? 0,
+                    }) !== JSON.stringify({
+                        columnWidths: next_column_widths,
+                        rowHeights: next_row_heights,
+                        scrollPosition: next_scroll_position,
+                        transforms: next_transforms,
+                        columnVisibility: next_column_visibility,
+                        activeSheetIndex: next_active_sheet_index,
+                    });
                 state_ref.current = {
                     ...state_ref.current,
-                    columnWidths: trim_sheet_state_array(
-                        state_ref.current.columnWidths,
-                        sheet_count
-                    ),
-                    rowHeights: trim_sheet_state_array(
-                        state_ref.current.rowHeights,
-                        sheet_count
-                    ).map((value, index) => (
-                        header_changed.has(index) ? undefined : value
-                    )),
-                    scrollPosition: trim_sheet_state_array(
-                        state_ref.current.scrollPosition,
-                        sheet_count
-                    ).map((value, index) => (
-                        header_changed.has(index) ? undefined : value
-                    )),
+                    ...(authoritative_state ?? {}),
+                    columnWidths: next_column_widths,
+                    rowHeights: next_row_heights,
+                    scrollPosition: next_scroll_position,
                     transforms: next_transforms,
                     columnVisibility: next_column_visibility,
-                    activeSheetIndex: next_active_sheet_index,
+                    activeSheetIndex: authoritative_state
+                        ? authoritative_state.activeSheetIndex
+                        : next_active_sheet_index,
                 };
                 set_truncation_message(msg.truncationMessage ?? null);
                 if (msg.csvEditable !== undefined) {
@@ -519,13 +603,23 @@ export function App(): React.JSX.Element {
                 if (msg.csvEditingSupported !== undefined) {
                     set_csv_editing_supported(msg.csvEditingSupported);
                 }
-                persist_immediate();
+                if (authoritative_requires_correction || local_requires_correction) {
+                    persist_immediate();
+                }
+                if (recovery_error) {
+                    set_excel_header_status('Column names were updated, but recovery was required.');
+                    vscode_api.postMessage({
+                        type: 'showWarning',
+                        message: `The header setting was saved after recovery: ${recovery_error}`,
+                    });
+                }
             }
 
             if (msg.type === 'excelFirstRowHeaderError') {
                 if (pending_excel_header_ref.current !== msg.requestId) return;
                 pending_excel_header_ref.current = null;
                 set_pending_excel_header(null);
+                set_excel_header_status('Column names were not updated.');
                 vscode_api.postMessage({
                     type: 'showWarning',
                     message: `Could not change the header row: ${msg.error}`,
@@ -731,7 +825,7 @@ export function App(): React.JSX.Element {
     // host intentionally drops permutations on reload because matching schema
     // does not imply matching values.
     useEffect(() => {
-        if (!meta || preview_mode || edit_mode) return;
+        if (!meta || preview_mode || edit_mode || pending_excel_header !== null) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -753,6 +847,7 @@ export function App(): React.JSX.Element {
         meta,
         preview_mode,
         edit_mode,
+        pending_excel_header,
         active_sheet_index,
         request_transform,
     ]);
@@ -779,15 +874,20 @@ export function App(): React.JSX.Element {
     const handle_toggle_excel_header = useCallback(() => {
         const sheet = meta?.sheets[active_sheet_index];
         const header = sheet?.excelFirstRowHeader;
-        if (!sheet || !header?.available || pending_excel_header_ref.current) return;
-        const request_id = `header:${++excel_header_request_seq_ref.current}`;
+        if (!sheet || !header || pending_excel_header_ref.current) return;
+        const enabled = !header.active;
+        if (enabled && !header.available) return;
+        const request_id = `header:${excel_header_request_prefix_ref.current}:${
+            ++excel_header_request_seq_ref.current
+        }`;
         pending_excel_header_ref.current = request_id;
         set_pending_excel_header(request_id);
+        set_excel_header_status('Updating column names…');
         vscode_api.postMessage({
             type: 'setExcelFirstRowHeader',
             sheetIndex: active_sheet_index,
             sheetName: sheet.name,
-            enabled: !header.active,
+            enabled,
             requestId: request_id,
             generation: generation_ref.current,
             sourceGeneration: source_generation_ref.current,
@@ -829,7 +929,12 @@ export function App(): React.JSX.Element {
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            if (edit_mode || edit_session_pending || preview_mode) return false;
+            if (
+                edit_mode
+                || edit_session_pending
+                || preview_mode
+                || pending_excel_header_ref.current !== null
+            ) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -890,6 +995,7 @@ export function App(): React.JSX.Element {
             edit_mode
             || edit_session_pending
             || preview_mode
+            || pending_excel_header_ref.current !== null
             || pending_transforms[active_sheet_index]
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
@@ -1138,7 +1244,9 @@ export function App(): React.JSX.Element {
         vscode_api.postMessage({
             type: 'setColumnVisibility',
             sheetIndex: active_sheet_index,
+            sheetName: sheet.name,
             state: next_sheet_visibility,
+            sourceGeneration: source_generation_ref.current,
         });
         persist_immediate();
     }, [
@@ -1344,11 +1452,12 @@ export function App(): React.JSX.Element {
     const excel_header = current_sheet.excelFirstRowHeader;
     const excel_header_pending = pending_excel_header !== null;
     const excel_header_disabled = !!excel_header && (
-        !excel_header.available
+        (!excel_header.available && !excel_header.active)
         || any_transform_pending
         || excel_header_pending
     );
     const excel_header_disabled_reason = !excel_header?.available
+        && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
         : excel_header_pending
         ? 'Updating column names…'
@@ -1399,7 +1508,12 @@ export function App(): React.JSX.Element {
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
             transform_state={visible_transform}
-            transform_sections={!edit_mode && !edit_session_pending && !preview_mode}
+            transform_sections={
+                !edit_mode
+                && !edit_session_pending
+                && !preview_mode
+                && !excel_header_pending
+            }
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -1415,7 +1529,12 @@ export function App(): React.JSX.Element {
                 row_count={effective_row_count}
                 source_row_count={current_sheet.rowCount}
                 transform={visible_transform}
-                transform_disabled={edit_mode || edit_session_pending || preview_mode}
+                transform_disabled={
+                    edit_mode
+                    || edit_session_pending
+                    || preview_mode
+                    || excel_header_pending
+                }
                 transform_pending={transform_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 column_names={column_names}
@@ -1437,6 +1556,8 @@ export function App(): React.JSX.Element {
                 show_excel_header_button={excel_header !== undefined}
                 excel_header_active={excel_header?.active ?? false}
                 excel_header_automatic={excel_header?.mode === 'auto'}
+                excel_header_pending={excel_header_pending}
+                excel_header_status={excel_header_status}
                 on_toggle_excel_header={handle_toggle_excel_header}
                 excel_header_disabled={excel_header_disabled}
                 excel_header_disabled_reason={excel_header_disabled_reason}
