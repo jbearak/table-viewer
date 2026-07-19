@@ -1,13 +1,20 @@
 import React, {
+    forwardRef,
     useCallback,
     useEffect,
     useId,
+    useImperativeHandle,
     useLayoutEffect,
     useMemo,
     useRef,
     useState,
 } from 'react';
 import { column_letter } from './grid-model';
+
+export interface ColumnVisibilityFocusHandle {
+    /** Focus the stable Columns trigger; false when it cannot receive focus. */
+    focus(): boolean;
+}
 
 export interface ColumnVisibilityControlProps {
     column_count: number;
@@ -27,7 +34,10 @@ const POPOVER_GAP_PX = 6;
 const MAX_RENDERED_OPTIONS = 500;
 
 /** Searchable, source-indexed column visibility control for the main toolbar. */
-export function ColumnVisibilityControl({
+export const ColumnVisibilityControl = forwardRef<
+    ColumnVisibilityFocusHandle,
+    ColumnVisibilityControlProps
+>(function ColumnVisibilityControl({
     column_count,
     get_column_name,
     is_visible,
@@ -37,7 +47,7 @@ export function ColumnVisibilityControl({
     on_show_all,
     on_hide_all,
     disabled = false,
-}: ColumnVisibilityControlProps): React.JSX.Element {
+}, focus_ref): React.JSX.Element {
     const [open, set_open] = useState(false);
     const [filter, set_filter] = useState('');
     const [popover_style, set_popover_style] = useState<React.CSSProperties>();
@@ -46,6 +56,15 @@ export function ColumnVisibilityControl({
     const popover_ref = useRef<HTMLDivElement | null>(null);
     const search_ref = useRef<HTMLInputElement | null>(null);
     const popover_id = useId();
+
+    useImperativeHandle(focus_ref, () => ({
+        focus: () => {
+            const trigger = trigger_ref.current;
+            if (!trigger || !trigger.isConnected || trigger.disabled) return false;
+            trigger.focus({ preventScroll: true });
+            return document.activeElement === trigger;
+        },
+    }), [disabled]);
 
     const close = useCallback((restore_focus: boolean) => {
         set_open(false);
@@ -320,4 +339,4 @@ export function ColumnVisibilityControl({
             )}
         </div>
     );
-}
+});

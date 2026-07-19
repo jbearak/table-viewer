@@ -25,7 +25,7 @@ import {
     type ProvideEditorCallback,
     type Rectangle,
 } from '@glideapps/glide-data-grid';
-import type { SheetMeta } from '../data-source/interface';
+import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
     type MergeRange,
@@ -184,6 +184,8 @@ export interface GridShellProps {
     pending_preview_scroll?: PendingPreviewScroll | null;
     /** Clears the App-owned request only after Glide accepts the scroll. */
     on_preview_scroll_applied?: (sequence: number) => void;
+    /** Reports the latest user-visible preview row to App across remounts. */
+    on_preview_visible_row_change?: (row: number) => void;
     transform_state?: SheetTransformState;
     transform_sections?: boolean;
     transform_pending?: boolean;
@@ -194,6 +196,8 @@ export interface GridShellProps {
         restore_focus: () => void,
     ) => void;
     on_hide_column?: (source_column: number) => void;
+    /** Focus recovery target when hiding the final visible header removes Glide. */
+    on_focus_columns?: () => void;
 }
 
 /**
@@ -227,12 +231,14 @@ export function GridShell({
     grid_focus_ref,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
+    on_preview_visible_row_change = () => {},
     transform_state = EMPTY_TRANSFORM,
     transform_sections = false,
     transform_pending = false,
     on_transform_change = () => {},
     on_open_filter = () => {},
     on_hide_column = () => {},
+    on_focus_columns = () => {},
 }: GridShellProps): React.JSX.Element {
     const visible_source_columns = column_projection.visible_to_source;
     const display_column_count = visible_source_columns.length;
@@ -489,13 +495,18 @@ export function GridShell({
         if (!bounds || bounds.width <= 0 || bounds.height <= 0) return false;
         cancel_pending_preview_restore();
         applied_preview_sequence_ref.current = pending.sequence;
+        // Consume Glide's matching visible-region callback locally. Programmatic
+        // editor/meta restores must not echo the restored row back to the host.
+        last_preview_row.current = row;
         scroll_preview_to_row(grid, row);
+        on_preview_visible_row_change(row);
         on_preview_scroll_applied(pending.sequence);
         return true;
     }, [
         cancel_pending_preview_restore,
         display_column_count,
         on_preview_scroll_applied,
+        on_preview_visible_row_change,
         pending_preview_scroll,
         preview_mode,
         row_count,
@@ -934,9 +945,38 @@ export function GridShell({
         selection: Parameters<typeof format_selection_tsv>[0],
         include_header = false,
     ) => {
+        // Snapshot the displayed edit layers once per copy. A row must still be
+        // resident before edits are overlaid: one known dirty cell must not make an
+        // otherwise-unloaded row look complete or suppress the nonresident warning.
+        const dirty = dirty_cells_ref.current;
+        const live = read_live_edit();
+        const get_displayed_row = (
+            row_index: number,
+        ): (RenderedCell | null)[] | undefined => {
+            const source_row = get_row_ref.current(row_index);
+            if (source_row === undefined) return undefined;
+            let displayed_row: (RenderedCell | null)[] | undefined;
+            for (const source_column of selection.source_columns) {
+                const key = `${row_index}:${source_column}`;
+                const displayed_value = live?.key === key
+                    ? live.value
+                    : dirty.get(key)?.value;
+                if (displayed_value === undefined) continue;
+                displayed_row ??= [...source_row];
+                const source_cell = source_row[source_column];
+                displayed_row[source_column] = {
+                    raw: displayed_value,
+                    formatted: displayed_value,
+                    bold: source_cell?.bold ?? false,
+                    italic: source_cell?.italic ?? false,
+                    rawType: 'string',
+                };
+            }
+            return displayed_row ?? source_row;
+        };
         const result = format_selection_tsv(
             selection,
-            get_row_ref.current,
+            get_displayed_row,
             merge_index,
             show_formatting,
         );
@@ -958,6 +998,7 @@ export function GridShell({
         columns,
         display_column_for_source,
         merge_index,
+        read_live_edit,
         sheet_meta.columnNames,
         show_formatting,
         safe_write_to_clipboard,
@@ -1297,12 +1338,27 @@ export function GridShell({
             const end = range.y + range.height - 1;
             ensure_rows(start, end);
             const restored_preview = preview_mode && restore_pending_preview_row();
-            if (preview_mode && !restored_preview && last_preview_row.current !== start) {
+            // While a retained target is waiting for Glide readiness, its remount
+            // callback commonly reports row 0. Keep that bootstrap viewport local;
+            // the pending sequence is the authoritative preview position.
+            if (
+                preview_mode
+                && !restored_preview
+                && !pending_preview_scroll
+                && last_preview_row.current !== start
+            ) {
                 last_preview_row.current = start;
+                on_preview_visible_row_change(start);
                 vscode_api.postMessage({ type: 'visibleRowChanged', row: start });
             }
         },
-        [ensure_rows, preview_mode, restore_pending_preview_row],
+        [
+            ensure_rows,
+            on_preview_visible_row_change,
+            pending_preview_scroll,
+            preview_mode,
+            restore_pending_preview_row,
+        ],
     );
 
     // Kick off the first page before the initial region callback arrives.
@@ -1512,7 +1568,17 @@ export function GridShell({
                             width: 1,
                             height: row_count,
                         }, true)}
-                        on_hide={() => on_hide_column(source_column)}
+                        on_hide={() => {
+                            if (display_column_count === 1) {
+                                // The projection update removes Glide entirely, so
+                                // ContextMenu's normal grid restoration has no target.
+                                suppress_menu_restore_ref.current = true;
+                                on_hide_column(source_column);
+                                window.setTimeout(on_focus_columns, 0);
+                                return;
+                            }
+                            on_hide_column(source_column);
+                        }}
                         on_sort={(direction, append) =>
                             apply_column_sort(source_column, direction, append)}
                         on_clear_column_sort={() => on_transform_change({
