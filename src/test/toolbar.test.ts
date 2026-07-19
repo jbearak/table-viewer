@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -344,6 +346,87 @@ describe('Toolbar', () => {
         expect(container.querySelector('.sort-chip')?.getAttribute('aria-disabled')).toBe('true');
         expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(false);
         expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled')).toBe('true');
+    });
+
+    it('keeps sort, filter, merge notice, and actions reachable in a narrow wrap', () => {
+        const scroll_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'scrollWidth',
+        );
+        const client_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'clientWidth',
+        );
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                if (this.classList.contains('toolbar-row-count')) return 70;
+                if (this.classList.contains('sort-strip')) return 210;
+                if (this.classList.contains('filter-strip')) return 240;
+                if (this.classList.contains('toolbar-merge-notice')) return 360;
+                if (this.classList.contains('toolbar-item')) return 90;
+                return 0;
+            },
+        });
+        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                return this.classList.contains('toolbar') ? 420 : 0;
+            },
+        });
+        const style = document.createElement('style');
+        style.textContent = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+        document.head.appendChild(style);
+        try {
+            const { container } = render_toolbar({
+                transform: {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [{
+                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
+                        caseSensitive: false, enabled: true,
+                    }],
+                },
+                merges_flattened: true,
+            });
+            const toolbar = container.querySelector('.toolbar') as HTMLElement;
+            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
+            const sort = container.querySelector('.sort-strip') as HTMLElement;
+            const filter = container.querySelector('.filter-strip') as HTMLElement;
+            const notice = container.querySelector('.toolbar-merge-notice') as HTMLElement;
+            const actions = container.querySelector('.toolbar-actions') as HTMLElement;
+
+            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
+            expect(getComputedStyle(chips).flexWrap).toBe('wrap');
+            expect(getComputedStyle(chips).overflow).toBe('visible');
+            expect(getComputedStyle(sort).flexShrink).toBe('1');
+            expect(getComputedStyle(filter).flexShrink).toBe('1');
+            expect(getComputedStyle(sort).minWidth).not.toBe('0px');
+            expect(getComputedStyle(filter).minWidth).not.toBe('0px');
+            expect(getComputedStyle(notice).flexShrink).toBe('1');
+            expect(getComputedStyle(notice).whiteSpace).toBe('normal');
+            expect(getComputedStyle(notice).overflowWrap).toBe('anywhere');
+            expect(getComputedStyle(actions).maxWidth).toBe('100%');
+            expect(getComputedStyle(actions).overflowX).toBe('auto');
+            expect(container.querySelector('.sort-chip')).not.toBeNull();
+            expect(container.querySelector('.filter-chip-body')).not.toBeNull();
+            expect(get_button('Formatting')).toBeDefined();
+            expect(get_button('Auto-fit Columns')).toBeDefined();
+        } finally {
+            style.remove();
+            if (scroll_width) {
+                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+            }
+            if (client_width) {
+                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+            }
+        }
     });
 
     it('remeasures wrapping when pending progress text changes', () => {

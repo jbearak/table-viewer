@@ -3,13 +3,15 @@ import type { FilterEntry, FilterOperator } from '../types';
 import { FILTER_OPTIONS, filter_draft_for_column } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
+export type FilterPopoverDismissReason = DismissReason | 'explicit' | 'layout';
+
 export interface FilterPopoverProps {
     column_index: number;
     column_name: string;
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
     on_apply: (entry: FilterEntry) => void;
-    on_cancel: (reason: DismissReason | 'explicit') => void;
+    on_cancel: (reason: FilterPopoverDismissReason) => void;
 }
 
 export function FilterPopover({
@@ -25,6 +27,7 @@ export function FilterPopover({
     const [coords, set_coords] = useState(anchor);
     const popover_ref = useRef<HTMLDivElement>(null);
     const first_control_ref = useRef<HTMLSelectElement>(null);
+    const layout_dismissed_ref = useRef(false);
     use_dismiss(popover_ref, on_cancel);
 
     useLayoutEffect(() => {
@@ -52,14 +55,31 @@ export function FilterPopover({
             ? null
             : new ResizeObserver(update_position);
         if (popover_ref.current) observer?.observe(popover_ref.current);
-        window.addEventListener('resize', update_position);
-        window.visualViewport?.addEventListener('resize', update_position);
-        return () => {
-            observer?.disconnect();
-            window.removeEventListener('resize', update_position);
-            window.visualViewport?.removeEventListener('resize', update_position);
-        };
+        return () => observer?.disconnect();
     }, [anchor.left, anchor.top, draft.operator]);
+
+    useEffect(() => {
+        const dismiss_for_layout = (event: Event) => {
+            if (
+                event.type === 'scroll'
+                && event.target instanceof Node
+                && popover_ref.current?.contains(event.target)
+            ) return;
+            if (layout_dismissed_ref.current) return;
+            layout_dismissed_ref.current = true;
+            on_cancel('layout');
+        };
+        window.addEventListener('resize', dismiss_for_layout);
+        window.addEventListener('scroll', dismiss_for_layout, true);
+        document.addEventListener('scroll', dismiss_for_layout, true);
+        window.visualViewport?.addEventListener('resize', dismiss_for_layout);
+        return () => {
+            window.removeEventListener('resize', dismiss_for_layout);
+            window.removeEventListener('scroll', dismiss_for_layout, true);
+            document.removeEventListener('scroll', dismiss_for_layout, true);
+            window.visualViewport?.removeEventListener('resize', dismiss_for_layout);
+        };
+    }, [on_cancel]);
 
     useEffect(() => {
         first_control_ref.current?.focus();

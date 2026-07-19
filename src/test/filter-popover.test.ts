@@ -142,6 +142,7 @@ describe('FilterPopover', () => {
         })));
         act(() => cancel.click());
         expect(on_cancel).toHaveBeenCalledOnce();
+        expect(on_cancel).toHaveBeenCalledWith('explicit');
         expect(on_apply).not.toHaveBeenCalled();
     });
 
@@ -162,14 +163,42 @@ describe('FilterPopover', () => {
         }));
     });
 
+    it('dismisses on external scroll but ignores internal popover scrolling', () => {
+        const { on_cancel } = render_popover();
+        const body = document.querySelector('.filter-popover-body') as HTMLElement;
+        act(() => body.dispatchEvent(new Event('scroll')));
+        expect(on_cancel).not.toHaveBeenCalled();
+
+        const grid = document.createElement('div');
+        document.body.appendChild(grid);
+        act(() => grid.dispatchEvent(new Event('scroll')));
+        expect(on_cancel).toHaveBeenCalledOnce();
+        expect(on_cancel).toHaveBeenCalledWith('layout');
+    });
+
+    it.each(['window', 'visual viewport'] as const)(
+        'dismisses on %s resize instead of retaining stale coordinates',
+        (viewport) => {
+            const visual_viewport = new EventTarget();
+            vi.stubGlobal('visualViewport', visual_viewport);
+            const { on_cancel } = render_popover();
+            act(() => {
+                (viewport === 'window' ? window : visual_viewport)
+                    .dispatchEvent(new Event('resize'));
+            });
+            expect(on_cancel).toHaveBeenCalledOnce();
+            expect(on_cancel).toHaveBeenCalledWith('layout');
+        },
+    );
+
     it('dismisses on Escape and outside pointer-down without applying', () => {
         const { on_apply, on_cancel } = render_popover();
         act(() => document.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'Escape', bubbles: true,
         })));
-        expect(on_cancel).toHaveBeenCalledOnce();
+        expect(on_cancel).toHaveBeenNthCalledWith(1, 'escape');
         act(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
-        expect(on_cancel).toHaveBeenCalledTimes(2);
+        expect(on_cancel).toHaveBeenNthCalledWith(2, 'outside');
         expect(on_apply).not.toHaveBeenCalled();
     });
 });
