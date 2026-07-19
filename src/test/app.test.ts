@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { HostMessage } from '../types';
+import type { HostMessage, SheetTransformState, WebviewMessage } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 
 const grid_shell_mock = vi.hoisted(() => ({
@@ -243,6 +243,49 @@ async function click_button(label: string) {
     await act(async () => {
         get_button(label).click();
     });
+}
+
+function latest_transform_request(post_message: ReturnType<typeof vi.fn>) {
+    const request = post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<WebviewMessage, { type: 'setTransform' }> => (
+            message.type === 'setTransform'
+        ))
+        .at(-1);
+    expect(request).toBeDefined();
+    return request!;
+}
+
+async function acknowledge_transform(
+    request: Extract<WebviewMessage, { type: 'setTransform' }>,
+    generation: number,
+) {
+    await dispatch_host_message({
+        type: 'transformApplied',
+        sheetIndex: request.sheetIndex,
+        state: request.state,
+        rowCount: 1,
+        requestId: request.requestId,
+        generation,
+        sourceGeneration: request.sourceGeneration,
+        intent: request.intent,
+    });
+}
+
+async function flush_focus_restore() {
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+}
+
+async function load_acknowledged_transform(
+    post_message: ReturnType<typeof vi.fn>,
+    state: SheetTransformState,
+) {
+    await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        state: { transforms: [state] },
+    }));
+    const restore = latest_transform_request(post_message);
+    await acknowledge_transform(restore, 2);
+    post_message.mockClear();
 }
 
 function columns_trigger(): HTMLButtonElement {
@@ -507,13 +550,14 @@ describe('column visibility projection', () => {
 
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1]);
-        const persisted = post_message.mock.calls
-            .map((call) => call[0])
-            .find((message) => message.type === 'stateChanged');
+        const messages = post_message.mock.calls.map((call) => call[0]);
+        const persisted = messages.find((message) => message.type === 'stateChanged');
         expect(persisted.state.columnVisibility).toEqual([{
             hiddenColumns: [2],
             schema: '["Sheet1",3,null]',
         }]);
+        expect(messages.some((message) => message.type === 'setColumnVisibility'))
+            .toBe(false);
     });
 
     it('drops stale visibility on load and reload', async () => {
@@ -530,6 +574,8 @@ describe('column visibility projection', () => {
         }));
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1, 2]);
+        expect(post_message.mock.calls.map((call) => call[0])
+            .some((message) => message.type === 'setColumnVisibility')).toBe(false);
 
         await dispatch_host_message(sheet_meta_message(initial, {
             state: {
@@ -549,8 +595,11 @@ describe('column visibility projection', () => {
         await dispatch_host_message(meta_reload_message(reloaded));
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1, 2]);
-        const persisted = post_message.mock.calls.at(-1)![0];
+        const reload_messages = post_message.mock.calls.map((call) => call[0]);
+        const persisted = reload_messages.find((message) => message.type === 'stateChanged');
         expect(persisted.state.columnVisibility).toEqual([undefined]);
+        expect(reload_messages.some((message) => message.type === 'setColumnVisibility'))
+            .toBe(false);
     });
 
     it('supports an all-hidden projection', async () => {
@@ -599,10 +648,22 @@ describe('column visibility projection', () => {
         expect(columns_trigger().querySelector('.hidden-count-badge')?.textContent)
             .toBe('1');
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
-        const state_messages = post_message.mock.calls
-            .map((call) => call[0])
+        const visibility_messages = post_message.mock.calls.map((call) => call[0]);
+        const targeted_messages = visibility_messages
+            .filter((message) => message.type === 'setColumnVisibility');
+        const state_messages = visibility_messages
             .filter((message) => message.type === 'stateChanged');
+        expect(targeted_messages).toEqual([{
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            state: {
+                hiddenColumns: [1],
+                schema: '["Sheet1",3,["Name","Value","Notes"]]',
+            },
+        }]);
         expect(state_messages).toHaveLength(1);
+        expect(visibility_messages.indexOf(targeted_messages[0]))
+            .toBeLessThan(visibility_messages.indexOf(state_messages[0]));
         expect(state_messages[0].state.columnVisibility).toEqual([
             {
                 hiddenColumns: [1],
@@ -624,6 +685,9 @@ describe('column visibility projection', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1, 2]);
         expect(columns_trigger().querySelector('.hidden-count-badge')).toBeNull();
+        expect(post_message.mock.calls.map((call) => call[0])).toContainEqual({
+            type: 'setColumnVisibility', sheetIndex: 0, state: undefined,
+        });
         const restored = post_message.mock.calls.at(-1)![0];
         expect(restored.type).toBe('stateChanged');
         expect(restored.state.columnVisibility).toEqual([
@@ -1390,6 +1454,10 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
         post_message.mockClear();
         const previous_mount = grid_stub().getAttribute('data-mount-id');
+        const toolbar_focus = vi.spyOn(
+            container!.querySelector('.toolbar') as HTMLElement,
+            'focus',
+        );
 
         await act(async () => (
             container!.querySelector(selector) as HTMLButtonElement
@@ -1408,6 +1476,7 @@ describe('sorting and filtering', () => {
 
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        expect(toolbar_focus).not.toHaveBeenCalled();
     });
 
     it('restores grid focus after a grid-opened filter applies and remounts', async () => {
@@ -1567,6 +1636,195 @@ describe('sorting and filtering', () => {
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
         await act(async () => chip.click());
         expect(document.querySelector('.filter-popover')).not.toBeNull();
+    });
+
+    it('focuses the toolbar root after Remove acknowledgement unmounts its filter chip', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        const schema = '["Sheet1",1,null]';
+        await load_acknowledged_transform(post_message, {
+            sort: [],
+            filters: [{
+                id: 'remove-me', colIndex: 0, operator: 'equals', value: 'x',
+                caseSensitive: false, enabled: true,
+            }],
+            schema,
+        });
+        const toolbar = document.querySelector('.toolbar') as HTMLElement;
+        const toolbar_focus = vi.spyOn(toolbar, 'focus');
+
+        await act(async () => (
+            document.querySelector('.filter-chip-kebab') as HTMLButtonElement
+        ).click());
+        const remove = get_button('Remove');
+        await act(async () => {
+            remove.focus();
+            remove.click();
+        });
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        await flush_focus_restore();
+
+        expect(document.querySelector('.filter-strip')).toBeNull();
+        expect(document.activeElement).toBe(toolbar);
+        expect(toolbar_focus).toHaveBeenCalledOnce();
+        await flush_focus_restore();
+        expect(toolbar_focus).toHaveBeenCalledOnce();
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+    });
+
+    it('focuses the toolbar root after Clear all acknowledgement removes its strip', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await load_acknowledged_transform(post_message, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        });
+        const toolbar = document.querySelector('.toolbar') as HTMLElement;
+        const toolbar_focus = vi.spyOn(toolbar, 'focus');
+
+        const clear = document.querySelector('.sort-strip-clear') as HTMLButtonElement;
+        await act(async () => {
+            clear.focus();
+            clear.click();
+        });
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        await flush_focus_restore();
+
+        expect(document.querySelector('.sort-strip')).toBeNull();
+        expect(document.activeElement).toBe(toolbar);
+        expect(toolbar_focus).toHaveBeenCalledOnce();
+    });
+
+    it('does not pull focus back after the webview loses focus before acknowledgement', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+        const { post_message } = await render_app();
+        await load_acknowledged_transform(post_message, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        });
+        const toolbar = document.querySelector('.toolbar') as HTMLElement;
+        const toolbar_focus = vi.spyOn(toolbar, 'focus');
+        const clear = document.querySelector('.sort-strip-clear') as HTMLButtonElement;
+        await act(async () => {
+            clear.focus();
+            clear.click();
+        });
+
+        await acknowledge_transform(latest_transform_request(post_message), 3);
+        await flush_focus_restore();
+
+        expect(document.activeElement).toBe(document.body);
+        expect(toolbar_focus).not.toHaveBeenCalled();
+    });
+
+    it('focuses the toolbar root after Cancel acknowledgement removes the pending control', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await load_acknowledged_transform(post_message, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        });
+
+        await act(async () => (
+            document.querySelector('.sort-chip') as HTMLButtonElement
+        ).click());
+        const flip = get_button('Flip direction');
+        await act(async () => {
+            flip.focus();
+            flip.click();
+        });
+        await flush_focus_restore();
+        post_message.mockClear();
+        const toolbar = document.querySelector('.toolbar') as HTMLElement;
+        const toolbar_focus = vi.spyOn(toolbar, 'focus');
+        const cancel = get_button('Cancel');
+        await act(async () => {
+            cancel.focus();
+            cancel.click();
+        });
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        await flush_focus_restore();
+
+        expect(Array.from(document.querySelectorAll('button'))
+            .some((button) => button.textContent === 'Cancel')).toBe(false);
+        expect(document.activeElement).toBe(toolbar);
+        expect(toolbar_focus).toHaveBeenCalledOnce();
+        expect(document.querySelector('.sort-chip')).not.toBeNull();
+    });
+
+    it('preserves a surviving sort chip across Flip acknowledgement', async () => {
+        const { post_message } = await render_app();
+        await load_acknowledged_transform(post_message, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        });
+        const toolbar_focus = vi.spyOn(
+            document.querySelector('.toolbar') as HTMLElement,
+            'focus',
+        );
+        const chip = document.querySelector('.sort-chip') as HTMLButtonElement;
+        await act(async () => chip.click());
+        const flip = get_button('Flip direction');
+        await act(async () => {
+            flip.focus();
+            flip.click();
+        });
+        await flush_focus_restore();
+        expect(document.activeElement).toBe(chip);
+
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        await flush_focus_restore();
+
+        expect(chip.isConnected).toBe(true);
+        expect(document.activeElement).toBe(chip);
+        expect(toolbar_focus).not.toHaveBeenCalled();
+        expect(document.querySelector('.sort-chip-arrow')?.textContent).toBe('▼');
+    });
+
+    it('preserves a surviving filter chip across Enable acknowledgement', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+            state: { transforms: [{
+                sort: [],
+                filters: [{
+                    id: 'enable-me', colIndex: 0, operator: 'equals', value: 'x',
+                    caseSensitive: false, enabled: false,
+                }],
+                schema: '["Sheet1",1,null]',
+            }] },
+        }));
+        post_message.mockClear();
+        const toolbar_focus = vi.spyOn(
+            document.querySelector('.toolbar') as HTMLElement,
+            'focus',
+        );
+        const kebab = document.querySelector('.filter-chip-kebab') as HTMLButtonElement;
+        await act(async () => kebab.click());
+        const enable = get_button('Enable');
+        await act(async () => {
+            enable.focus();
+            enable.click();
+        });
+        await flush_focus_restore();
+        expect(document.activeElement).toBe(kebab);
+
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        await flush_focus_restore();
+
+        expect(kebab.isConnected).toBe(true);
+        expect(document.activeElement).toBe(kebab);
+        expect(toolbar_focus).not.toHaveBeenCalled();
+        expect(document.querySelector('.filter-chip')?.classList.contains('disabled'))
+            .toBe(false);
     });
 
     it('keeps persisted transforms unapplied until the fresh source acknowledges them', async () => {

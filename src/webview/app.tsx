@@ -4,6 +4,7 @@ import React, {
     useRef,
     useCallback,
     useMemo,
+    useLayoutEffect,
 } from 'react';
 import {
     EMPTY_TRANSFORM,
@@ -18,7 +19,7 @@ import {
     type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
-import { Toolbar } from './toolbar';
+import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import { transform_progress_label, upsert_filter } from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
@@ -157,6 +158,10 @@ export function App(): React.JSX.Element {
         generation: number;
         document_epoch: number;
     } | null>(null);
+    const [toolbar_focus_restore, set_toolbar_focus_restore] = useState<{
+        sheet_index: number;
+        document_epoch: number;
+    } | null>(null);
     const [source_epoch, set_source_epoch] = useState(0);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
@@ -197,6 +202,7 @@ export function App(): React.JSX.Element {
     const preview_scroll_sequence_ref = useRef(0);
     const filter_restore_timer_ref = useRef<number | undefined>(undefined);
     const grid_focus_ref = useRef<GridFocusHandle | null>(null);
+    const toolbar_focus_ref = useRef<ToolbarFocusHandle | null>(null);
 
     const { persist_immediate } = use_state_sync(state_ref);
 
@@ -269,6 +275,7 @@ export function App(): React.JSX.Element {
             if (msg.type === 'sheetMeta') {
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
+                set_toolbar_focus_restore(null);
                 set_pending_preview_scroll(null);
                 preview_mode_ref.current = msg.previewMode ?? false;
                 set_meta(msg.meta);
@@ -329,18 +336,6 @@ export function App(): React.JSX.Element {
                         : msg.defaultTabOrientation === 'vertical'
                 );
                 state_ref.current = s;
-                if (visibility_was_sanitized) {
-                    msg.meta.sheets.forEach((_sheet, index) => {
-                        if (JSON.stringify(normalized_visibility?.[index])
-                            !== JSON.stringify(s.columnVisibility?.[index])) {
-                            vscode_api.postMessage({
-                                type: 'setColumnVisibility',
-                                sheetIndex: index,
-                                state: s.columnVisibility?.[index],
-                            });
-                        }
-                    });
-                }
                 if (transforms_were_sanitized || visibility_was_sanitized) {
                     persist_immediate();
                 }
@@ -365,6 +360,7 @@ export function App(): React.JSX.Element {
             if (msg.type === 'metaReload') {
                 document_epoch_ref.current += 1;
                 set_grid_focus_restore(null);
+                set_toolbar_focus_restore(null);
                 set_meta(msg.meta);
                 set_filter_editor(null);
                 set_generation(msg.generation);
@@ -415,7 +411,6 @@ export function App(): React.JSX.Element {
                 );
                 set_active_sheet_index(next_active_sheet_index);
 
-                const previous_column_visibility = state_ref.current.columnVisibility;
                 state_ref.current = {
                     ...state_ref.current,
                     columnWidths: trim_sheet_state_array(
@@ -434,16 +429,6 @@ export function App(): React.JSX.Element {
                     columnVisibility: next_column_visibility,
                     activeSheetIndex: next_active_sheet_index,
                 };
-                msg.meta.sheets.forEach((_sheet, index) => {
-                    if (JSON.stringify(previous_column_visibility?.[index])
-                        !== JSON.stringify(next_column_visibility[index])) {
-                        vscode_api.postMessage({
-                            type: 'setColumnVisibility',
-                            sheetIndex: index,
-                            state: next_column_visibility[index],
-                        });
-                    }
-                });
                 set_truncation_message(msg.truncationMessage ?? null);
                 if (msg.csvEditable !== undefined) {
                     set_csv_editable(msg.csvEditable);
@@ -480,6 +465,11 @@ export function App(): React.JSX.Element {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
                         generation: msg.generation,
+                        document_epoch: document_epoch_ref.current,
+                    });
+                } else if (origin === 'toolbar') {
+                    set_toolbar_focus_restore({
+                        sheet_index: msg.sheetIndex,
                         document_epoch: document_epoch_ref.current,
                     });
                 }
@@ -600,6 +590,35 @@ export function App(): React.JSX.Element {
         };
     }, [active_sheet_index, generation, grid_focus_restore]);
 
+    useLayoutEffect(() => {
+        if (!toolbar_focus_restore) return;
+        if (
+            toolbar_focus_restore.sheet_index !== active_sheet_index
+            || toolbar_focus_restore.document_epoch !== document_epoch_ref.current
+        ) {
+            set_toolbar_focus_restore(null);
+            return;
+        }
+
+        // Menu activation restores a surviving chip on a zero-delay timer. Wait one
+        // turn before deciding that acknowledgement removed the initiating control;
+        // this preserves that chip while still catching Remove/Clear/Cancel teardown.
+        const timer = window.setTimeout(() => {
+            const active = document.activeElement;
+            const focus_survived = active instanceof HTMLElement
+                && active !== document.body
+                && active !== document.documentElement
+                && active.isConnected;
+            if (!focus_survived && document.hasFocus()) {
+                toolbar_focus_ref.current?.focus();
+            }
+            set_toolbar_focus_restore((current) => (
+                current === toolbar_focus_restore ? null : current
+            ));
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, [active_sheet_index, toolbar_focus_restore]);
+
     useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
         return () => {
@@ -641,6 +660,7 @@ export function App(): React.JSX.Element {
         (sheet_index: number) => {
             set_filter_editor(null);
             set_grid_focus_restore(null);
+            set_toolbar_focus_restore(null);
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -1237,6 +1257,7 @@ export function App(): React.JSX.Element {
     return (
         <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
+                ref={toolbar_focus_ref}
                 row_count={effective_row_count}
                 source_row_count={current_sheet.rowCount}
                 transform={visible_transform}

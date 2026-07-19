@@ -83,6 +83,8 @@ function cleanup() {
     container?.remove();
     container = null;
     document.body.innerHTML = '';
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
 }
 
 function dispatch_mouse_event(target: EventTarget, type: string) {
@@ -478,6 +480,90 @@ describe('Toolbar', () => {
         } else {
             Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
         }
+    });
+
+    it('repositions a visible tooltip when a captured ancestor scroll moves its button', () => {
+        let button_left = 40;
+        vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (
+                    this instanceof HTMLButtonElement
+                    && this.textContent === 'Formatting'
+                ) {
+                    return make_rect({
+                        left: button_left,
+                        top: 10,
+                        width: 80,
+                        height: 24,
+                    });
+                }
+                if (this.getAttribute('role') === 'tooltip') {
+                    return make_rect({ width: 100, height: 30 });
+                }
+                return make_rect({});
+            });
+
+        const { container } = render_toolbar();
+        const formatting = get_button('Formatting');
+        dispatch_mouse_event(formatting, 'mouseover');
+        expect(get_tooltip()?.style.left).toBe('30px');
+        expect(get_tooltip()?.style.top).toBe('40px');
+
+        button_left = 100;
+        act(() => {
+            container.dispatchEvent(new Event('scroll'));
+        });
+        expect(get_tooltip()?.style.left).toBe('90px');
+        expect(get_tooltip()?.style.top).toBe('40px');
+    });
+
+    it('repositions a visible tooltip after toolbar layout reflow', () => {
+        let resize_callback: ResizeObserverCallback | undefined;
+        const disconnect = vi.fn();
+        const observe = vi.fn();
+        vi.stubGlobal('ResizeObserver', class {
+            constructor(callback: ResizeObserverCallback) {
+                resize_callback = callback;
+            }
+            observe = observe;
+            disconnect = disconnect;
+            unobserve() {}
+        });
+        let button_left = 20;
+        vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (
+                    this instanceof HTMLButtonElement
+                    && this.textContent === 'Formatting'
+                ) {
+                    return make_rect({
+                        left: button_left,
+                        top: 5,
+                        width: 60,
+                        height: 20,
+                    });
+                }
+                if (this.getAttribute('role') === 'tooltip') {
+                    return make_rect({ width: 80, height: 30 });
+                }
+                return make_rect({});
+            });
+
+        render_toolbar();
+        const formatting = get_button('Formatting');
+        dispatch_mouse_event(formatting, 'mouseover');
+        expect(observe).toHaveBeenCalledWith(formatting);
+        expect(observe.mock.calls.some(([element]) => (
+            (element as HTMLElement).classList.contains('toolbar')
+        ))).toBe(true);
+        expect(get_tooltip()?.style.left).toBe('10px');
+
+        button_left = 140;
+        act(() => resize_callback?.([], {} as ResizeObserver));
+        expect(get_tooltip()?.style.left).toBe('130px');
+
+        dispatch_mouse_event(formatting, 'mouseout');
+        expect(disconnect).toHaveBeenCalledOnce();
     });
 
     it('clamps tooltip positioning so it stays inside the viewport near the left edge', () => {

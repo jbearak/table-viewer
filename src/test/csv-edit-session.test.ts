@@ -142,7 +142,7 @@ describe('CSV edit sessions', () => {
         }]);
     });
 
-    it('preserves newer visibility across two panels with stale generic snapshots', async () => {
+    it('preserves a newer direct visibility choice after another panel posts delayed reload cleanup', async () => {
         const file_path = '/tmp/two-panel-visibility.csv';
         const state = state_store();
         const first = open_csv_table(uri(file_path), state.store);
@@ -151,13 +151,18 @@ describe('CSV edit sessions', () => {
         await second.__receive({ type: 'ready' });
         const schema = '["Sheet1",1,["h"]]';
 
+        // The second tab captures stale state for metaReload cleanup, but its generic
+        // persistence reaches the host only after the first tab's direct user choice.
+        const cleanup_gate = deferred();
+        const delayed_cleanup = cleanup_gate.promise.then(() => second.__receive({
+            type: 'stateChanged', state: { columnVisibility: [undefined], activeSheetIndex: 0 },
+        } as never));
         await first.__receive({
             type: 'setColumnVisibility', sheetIndex: 0,
             state: { visibleColumns: [], schema },
         } as never);
-        await second.__receive({
-            type: 'stateChanged', state: { columnVisibility: [undefined], activeSheetIndex: 0 },
-        } as never);
+        cleanup_gate.resolve();
+        await delayed_cleanup;
         expect(state.get_state(file_path).columnVisibility).toEqual([{
             visibleColumns: [], schema,
         }]);
