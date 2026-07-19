@@ -529,7 +529,7 @@ describe('Excel first-row header toggle', () => {
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
     });
 
-    it('disables the toggle while any worksheet has an active transform', async () => {
+    it('keeps the toggle enabled for active transforms but disables it while one is pending', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['People', 'Notes'], false);
         for (const sheet of meta.sheets) {
@@ -538,24 +538,63 @@ describe('Excel first-row header toggle', () => {
             };
             sheet.columnNames = ['Name'];
         }
-        const transform: SheetTransformState = {
+        const people_transform: SheetTransformState = {
             sort: [{ colIndex: 0, direction: 'asc' }],
             filters: [],
             schema: '["People",1,["Name"]]',
         };
+        const notes_transform: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Notes",1,["Name"]]',
+        };
         await dispatch_host_message(sheet_meta_message(meta, {
-            state: { transforms: [transform] },
+            state: { transforms: [people_transform, notes_transform] },
         }));
-        const restore = latest_transform_request(post_message);
-        await acknowledge_transform(restore, 2);
-        await click_button('Notes');
+        await acknowledge_transform(latest_transform_request(post_message), 2);
 
+        expect(get_button('First Row as Header').disabled).toBe(false);
+
+        await click_button('Notes');
         const button = get_button('First Row as Header');
         expect(button.disabled).toBe(true);
         const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
         await act(async () => wrapper.focus());
         expect(document.querySelector('[role="tooltip"]')?.textContent)
-            .toContain('every sheet');
+            .toBe('Wait for sorting and filtering to finish.');
+    });
+
+    it('restores a saved transform after a header-changing metaReload', async () => {
+        const { post_message } = await render_app();
+        const transform: SheetTransformState = {
+            sort: [{ colIndex: 1, direction: 'asc' }],
+            filters: [],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+            state: { transforms: [transform] },
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 4);
+        post_message.mockClear();
+
+        await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+
+        expect(latest_transform_request(post_message)).toMatchObject({
+            sheetIndex: 0,
+            state: {
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [],
+                schema: '["People",2,null]',
+            },
+            generation: 5,
+            sourceGeneration: 8,
+            intent: 'restore',
+        });
     });
 
     it('clears pending state and surfaces a rejected request', async () => {

@@ -82,6 +82,27 @@ function subscribe_excel_headers(
     };
 }
 
+/**
+ * Re-fingerprint one sheet's persisted view descriptor (transform or column
+ * visibility) after a header toggle. Column indices are unchanged by the
+ * toggle, so a descriptor that matched the old schema is rewritten to the new
+ * one; anything else is left for the ordinary schema check to discard.
+ */
+function migrate_sheet_schema<T extends { schema?: string }>(
+    entries: (T | undefined)[] | undefined,
+    sheet_index: number,
+    old_schema: string,
+    new_schema: string | undefined,
+): (T | undefined)[] | undefined {
+    const entry = entries?.[sheet_index];
+    if (!entries || !entry || entry.schema !== old_schema) return entries;
+    const next = [...entries];
+    next[sheet_index] = new_schema === undefined
+        ? { ...entry, schema: undefined }
+        : { ...entry, schema: new_schema };
+    return next;
+}
+
 function excel_header_maps_equal(
     left: Record<string, boolean>,
     right: Record<string, boolean>,
@@ -591,12 +612,24 @@ export function attach_viewer(
                     await fail('This worksheet has no first row to use as column names.');
                     return;
                 }
-                if (core.has_transform_work) {
-                    await fail('Clear sorting and filters before changing the header row.');
-                    return;
-                }
-
                 const override: ExcelHeaderOverride = msg.enabled ? 'on' : 'off';
+                // Sorting and filtering survive a header toggle: the sheet's
+                // columns keep their indices (only row 0 moves in or out of the
+                // body), so persisted descriptors stay valid once their schema
+                // fingerprint is migrated to the projected sheet's new one. The
+                // webview then re-requests the transform against the new
+                // projection, recomputing numeric inference without the header.
+                const previous_mode = sheet.excelFirstRowHeader.mode;
+                const old_schema = transform_schema_for_sheet(sheet);
+                // Peek at the projected schema synchronously (no awaits between
+                // the toggle and the revert), leaving the live source untouched
+                // until the broadcast below applies the override for real.
+                source.set_override(msg.sheetName, override);
+                const projected = source.meta().sheets[msg.sheetIndex];
+                const new_schema = projected
+                    ? transform_schema_for_sheet(projected)
+                    : undefined;
+                source.set_override(msg.sheetName, previous_mode);
                 try {
                     await update_file_state((current) => {
                         const excelFirstRowHeaders = sanitize_excel_header_overrides(
@@ -611,6 +644,18 @@ export function attach_viewer(
                         const scrollPosition = [...(current.scrollPosition ?? [])];
                         rowHeights[msg.sheetIndex] = undefined;
                         scrollPosition[msg.sheetIndex] = undefined;
+                        const transforms = migrate_sheet_schema(
+                            current.transforms,
+                            msg.sheetIndex,
+                            old_schema,
+                            new_schema,
+                        );
+                        const columnVisibility = migrate_sheet_schema(
+                            current.columnVisibility,
+                            msg.sheetIndex,
+                            old_schema,
+                            new_schema,
+                        );
                         return {
                             ...current,
                             excelFirstRowHeaders,
@@ -618,6 +663,8 @@ export function attach_viewer(
                             excelFirstRowHeaderVersion: 1,
                             rowHeights,
                             scrollPosition,
+                            transforms,
+                            columnVisibility,
                         };
                     });
                     await broadcast_excel_header(file_path, msg.sheetName, override);

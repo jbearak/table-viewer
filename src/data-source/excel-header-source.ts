@@ -87,10 +87,10 @@ export class ExcelHeaderDataSource implements DataSource {
         return { startRow: start, rows: physical.rows.slice(0, available) };
     }
 
-    set_override(sheet_name: string, override: ExcelHeaderOverride): boolean {
+    set_override(sheet_name: string, override: ExcelHeaderOverride | 'auto'): boolean {
         const sheet = this.sheets.find((entry) => entry.physical.name === sheet_name);
         if (!sheet) return false;
-        sheet.override = override;
+        sheet.override = override === 'auto' ? undefined : override;
         this._meta = this.build_meta();
         return true;
     }

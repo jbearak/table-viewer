@@ -5,7 +5,6 @@ import {
     transform_schema_for_sheet,
     type SheetTransformState,
     type StoredPerFileState,
-    type TransformIntent,
     type WebviewMessage,
 } from './types';
 

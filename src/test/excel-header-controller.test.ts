@@ -238,6 +238,54 @@ describe('Excel first-row header controller', () => {
         expect(reload.sourceGeneration).toBe(initial.sourceGeneration + 1);
     });
 
+    it('migrates a persisted active transform to the toggled header schema', async () => {
+        const old_schema = '["People",2,["Name","Age"]]';
+        const state = mutable_state_store({
+            transforms: [{
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [],
+                schema: old_schema,
+            }],
+            excelFirstRowHeaderVersion: 1,
+        });
+        const panel = open_excel(
+            '/tmp/transformed.xlsx',
+            state.store,
+            excel_profile({ count: 0 }),
+        );
+        await panel.__receive({ type: 'ready' });
+        const initial = messages_of(panel, 'sheetMeta')[0];
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: (state.value() as PerFileState).transforms![0]!,
+            requestId: 'sort',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'restore',
+        });
+        const applied = messages_of(panel, 'transformApplied')[0];
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            requestId: 'header:1',
+            generation: applied.generation,
+            sourceGeneration: applied.sourceGeneration,
+        });
+
+        expect((state.value() as PerFileState).transforms?.[0]).toEqual({
+            sort: [{ colIndex: 1, direction: 'asc' }],
+            filters: [],
+            schema: '["People",2,null]',
+        });
+        expect(messages_of(panel, 'excelFirstRowHeaderError')).toHaveLength(0);
+        expect(messages_of(panel, 'metaReload')).toHaveLength(1);
+    });
+
     it('rejects stale or mismatched header requests', async () => {
         const state = mutable_state_store({ excelFirstRowHeaderVersion: 1 });
         const panel = open_excel(

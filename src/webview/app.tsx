@@ -440,15 +440,41 @@ export function App(): React.JSX.Element {
                 pending_transform_states_ref.current = [];
                 pending_transform_origins_ref.current = [];
                 transform_applied_for_source_ref.current = [];
+                // A header toggle only moves row 0 in or out of the body; column
+                // indices are stable, so descriptors saved under the sheet's old
+                // fingerprint are migrated to the new one instead of discarded.
+                const migrate_schema = <T extends { schema?: string }>(
+                    value: T | undefined,
+                    sheet: (typeof msg.meta.sheets)[number],
+                    index: number,
+                ): T | undefined => {
+                    if (!value || !header_changed.has(index)) return value;
+                    const previous = previous_sheets.get(sheet.name);
+                    if (
+                        !previous
+                        || value.schema !== transform_schema_for_sheet(previous)
+                    ) {
+                        return value;
+                    }
+                    return { ...value, schema: transform_schema_for_sheet(sheet) };
+                };
                 const next_transforms = msg.meta.sheets.map((sheet, index) =>
                     sanitize_transform_state(
-                        state_ref.current.transforms?.[index],
+                        migrate_schema(
+                            state_ref.current.transforms?.[index],
+                            sheet,
+                            index,
+                        ),
                         sheet.columnCount,
                         transform_schema_for_sheet(sheet),
                     ));
                 const next_column_visibility = msg.meta.sheets.map((sheet, index) =>
                     sanitize_column_visibility_state(
-                        state_ref.current.columnVisibility?.[index],
+                        migrate_schema(
+                            state_ref.current.columnVisibility?.[index],
+                            sheet,
+                            index,
+                        ),
                         sheet.columnCount,
                         transform_schema_for_sheet(sheet),
                     ));
@@ -1307,7 +1333,6 @@ export function App(): React.JSX.Element {
         edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
     const applied_transform = applied_transforms[active_sheet_index];
     const transform_active = transform_is_active(applied_transform);
-    const any_transform_active = applied_transforms.some(transform_is_active);
     const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
@@ -1320,7 +1345,6 @@ export function App(): React.JSX.Element {
     const excel_header_pending = pending_excel_header !== null;
     const excel_header_disabled = !!excel_header && (
         !excel_header.available
-        || any_transform_active
         || any_transform_pending
         || excel_header_pending
     );
@@ -1328,9 +1352,7 @@ export function App(): React.JSX.Element {
         ? 'This sheet has no first row to use as column names.'
         : excel_header_pending
         ? 'Updating column names…'
-        : any_transform_pending
-        ? 'Wait for sorting and filtering to finish.'
-        : 'Clear sorting and filters in every sheet before changing the header row.';
+        : 'Wait for sorting and filtering to finish.';
     const effective_row_count =
         effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
     const visibility_reset_key = [
