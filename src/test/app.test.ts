@@ -16,6 +16,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
     commit_live_edit: vi.fn(),
+    focus_grid: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
 }));
@@ -56,12 +57,34 @@ vi.mock('../webview/grid-shell', () => ({
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
+        grid_focus_ref?: {
+            current: { generation: number; focus: () => boolean } | null;
+        };
+        pending_preview_scroll?: { row: number; sequence: number } | null;
+        on_preview_scroll_applied?: (sequence: number) => void;
         transform_sections: boolean;
         transform_pending: boolean;
+        on_transform_change: (state: { sort: Array<{ colIndex: number; direction: 'asc' | 'desc' }>; filters: unknown[] }) => void;
         on_open_filter: (source_column: number, anchor: { left: number; top: number }, restore_focus: () => void) => void;
     }) => {
         grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
         const mount_id = React.useRef(++grid_shell_mock.mount_count);
+        React.useLayoutEffect(() => {
+            if (!props.grid_focus_ref) return;
+            const handle = {
+                generation: props.generation,
+                focus: () => {
+                    grid_shell_mock.focus_grid();
+                    return true;
+                },
+            };
+            props.grid_focus_ref.current = handle;
+            return () => {
+                if (props.grid_focus_ref?.current === handle) {
+                    props.grid_focus_ref.current = null;
+                }
+            };
+        }, [props.generation, props.grid_focus_ref]);
         React.useEffect(() => {
             grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
             grid_shell_mock.on_editing_change?.({
@@ -105,6 +128,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-source-to-visible': JSON.stringify(props.column_projection.source_to_visible),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
+                'data-pending-preview-scroll': JSON.stringify(props.pending_preview_scroll ?? null),
                 'data-merges': String(props.merges?.length ?? 0),
                 'data-merges-json': JSON.stringify(props.merges ?? []),
             },
@@ -123,6 +147,38 @@ vi.mock('../webview/grid-shell', () => ({
                     onClick: () => props.on_row_resize(3, 50),
                 },
                 'row-resize'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-shortcut-transform',
+                    onClick: () => props.on_transform_change({
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                    }),
+                },
+                'grid-shortcut-transform'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-header-transform',
+                    onClick: () => props.on_transform_change({
+                        sort: [{ colIndex: 0, direction: 'desc' }],
+                        filters: [],
+                    }),
+                },
+                'grid-header-transform'
+            ),
+            props.pending_preview_scroll && React.createElement(
+                'button',
+                {
+                    className: 'stub-ack-preview-scroll',
+                    onClick: () => props.on_preview_scroll_applied?.(
+                        props.pending_preview_scroll!.sequence,
+                    ),
+                },
+                'ack-preview-scroll'
             )
         );
     },
@@ -282,6 +338,7 @@ function cleanup() {
     grid_shell_mock.clear_dirty.mockReset();
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
+    grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -1132,6 +1189,50 @@ describe('preview mode', () => {
         );
         expect(grid_stub().getAttribute('data-preview')).toBe('true');
     });
+
+    it('retains the latest queued scroll across metaReload until GridShell acknowledges it', async () => {
+        await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
+        );
+        await dispatch_host_message({ type: 'scrollToRow', row: 40 });
+        await dispatch_host_message({ type: 'scrollToRow', row: 80 });
+        const pending_before = JSON.parse(
+            grid_stub().getAttribute('data-pending-preview-scroll')!,
+        );
+        expect(pending_before).toMatchObject({ row: 80 });
+
+        await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
+        expect(JSON.parse(grid_stub().getAttribute('data-pending-preview-scroll')!))
+            .toEqual(pending_before);
+
+        await act(async () => (
+            container!.querySelector('.stub-ack-preview-scroll') as HTMLButtonElement
+        ).click());
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
+    });
+
+    it('drops queued preview scrolls on a fresh document or when preview mode ends', async () => {
+        await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Preview']), { previewMode: true })
+        );
+        await dispatch_host_message({ type: 'scrollToRow', row: 25 });
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).not.toBe('null');
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Fresh']), {
+            previewMode: true,
+            generation: 2,
+        }));
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
+
+        await dispatch_host_message({ type: 'scrollToRow', row: 30 });
+        await dispatch_host_message(sheet_meta_message(make_meta(['Editor']), {
+            previewMode: false,
+            generation: 3,
+        }));
+        expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
+    });
 });
 
 describe('sorting and filtering', () => {
@@ -1281,6 +1382,93 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(empty_mount_id);
     });
 
+    it.each([
+        ['grid shortcut', '.stub-shortcut-transform'],
+        ['header menu', '.stub-header-transform'],
+    ])('restores grid focus after a %s transform acknowledgement remount', async (_label, selector) => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        const previous_mount = grid_stub().getAttribute('data-mount-id');
+
+        await act(async () => (
+            container!.querySelector(selector) as HTMLButtonElement
+        ).click());
+        const request = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(request).toBeDefined();
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: request.state,
+            rowCount: 1, requestId: request.requestId, generation: 2,
+            sourceGeneration: 1, intent: request.intent,
+        });
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
+    it('restores grid focus after a grid-opened filter applies and remounts', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        const restore_old_grid = vi.fn();
+        const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
+            source_column: number,
+            anchor: { left: number; top: number },
+            restore_focus: () => void,
+        ) => void;
+        await act(async () => open_filter(0, { left: 20, top: 20 }, restore_old_grid));
+        const input = document.querySelector(
+            'input[aria-label="Filter value"]',
+        ) as HTMLInputElement;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                .set!.call(input, 'group');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        post_message.mockClear();
+        await click_button('Apply');
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+        const request = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+        expect(request).toBeDefined();
+        expect(restore_old_grid).not.toHaveBeenCalled();
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0, state: request.state,
+            rowCount: 1, requestId: request.requestId, generation: 2,
+            sourceGeneration: 1, intent: request.intent,
+        });
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
+    it('restores grid focus when a grid transform fails without a generation bump', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        const previous_mount = grid_stub().getAttribute('data-mount-id');
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = post_message.mock.calls.map((call) => call[0])
+            .find((message) => message.type === 'setTransform');
+
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0,
+            state: { sort: [], filters: [] }, rowCount: 1,
+            requestId: request.requestId, generation: 1,
+            sourceGeneration: 1, intent: request.intent, error: 'failed',
+        });
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(previous_mount);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
     it('keeps a keyboard filter opener focused while Apply is pending and after ack', async () => {
         const { post_message } = await render_app();
         const schema = '["Sheet1",1,null]';
@@ -1324,6 +1512,7 @@ describe('sorting and filtering', () => {
         });
         expect(document.activeElement).toBe(chip);
         expect(chip.getAttribute('aria-disabled')).toBeNull();
+        expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
         await act(async () => chip.click());
         expect(document.querySelector('.filter-popover')).not.toBeNull();
     });

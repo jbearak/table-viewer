@@ -1,6 +1,7 @@
 import React, {
     useCallback,
     useEffect,
+    useLayoutEffect,
     useMemo,
     useRef,
     useState,
@@ -82,6 +83,7 @@ const AUTO_FIT_SAMPLE_ROWS = 2000;
  * region callback to finish. */
 const PREVIEW_RESTORE_MAX_ATTEMPTS = 8;
 const PREVIEW_RESTORE_RETRY_MS = 16;
+const PREVIEW_RESTORE_SETTLE_MS = 32;
 
 /** Canvas-drawn tint for a cell holding an unsaved edit (low-alpha warning
  *  amber). Concrete rgba — `themeOverride.bgCell` is painted on canvas and can't
@@ -131,6 +133,19 @@ export interface EditingHandle {
     has_uncommitted_changes(): boolean;
 }
 
+/** Imperative focus bridge used by App after generation-keyed remounts. */
+export interface GridFocusHandle {
+    /** Generation owned by the GridShell instance exposing this handle. */
+    generation: number;
+    /** Focus the mounted Glide grid; false while no DataEditor is available. */
+    focus(): boolean;
+}
+
+export interface PendingPreviewScroll {
+    row: number;
+    sequence: number;
+}
+
 export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
@@ -163,6 +178,12 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
+    /** App-owned bridge for restoring focus after generation-keyed remounts. */
+    grid_focus_ref?: MutableRefObject<GridFocusHandle | null>;
+    /** Latest preview scroll request, retained by App across GridShell remounts. */
+    pending_preview_scroll?: PendingPreviewScroll | null;
+    /** Clears the App-owned request only after Glide accepts the scroll. */
+    on_preview_scroll_applied?: (sequence: number) => void;
     transform_state?: SheetTransformState;
     transform_sections?: boolean;
     transform_pending?: boolean;
@@ -203,6 +224,9 @@ export function GridShell({
     on_editing_change,
     editing_ref,
     auto_fit_ref,
+    grid_focus_ref,
+    pending_preview_scroll = null,
+    on_preview_scroll_applied = () => {},
     transform_state = EMPTY_TRANSFORM,
     transform_sections = false,
     transform_pending = false,
@@ -221,13 +245,42 @@ export function GridShell({
     );
     const theme = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
+    const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
-    const pending_preview_row_ref = useRef<number | null>(null);
+    const applied_preview_sequence_ref = useRef<number | null>(null);
+    const preview_restore_not_before_ref = useRef(0);
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
+
+    useLayoutEffect(() => {
+        if (!grid_focus_ref) return;
+        const handle: GridFocusHandle = {
+            generation,
+            focus: () => {
+                // Glide's ref can exist before its internal focus target is wired
+                // after a remount. Prefer the mounted tabbable element itself.
+                const target = grid_root_ref.current?.querySelector<HTMLElement>(
+                    '[tabindex="0"]',
+                );
+                if (target) {
+                    target.focus();
+                    if (document.activeElement === target) return true;
+                }
+                const grid = grid_ref.current;
+                if (!grid) return false;
+                grid.focus();
+                const active = document.activeElement;
+                return !!active && !!grid_root_ref.current?.contains(active);
+            },
+        };
+        grid_focus_ref.current = handle;
+        return () => {
+            if (grid_focus_ref.current === handle) grid_focus_ref.current = null;
+        };
+    }, [generation, grid_focus_ref, has_visible_columns]);
 
     // Controlled selection. We intercept every change to snap it onto whole
     // merges (a click/drag landing on a covered cell selects the merge block);
@@ -414,10 +467,13 @@ export function GridShell({
     }, []);
 
     const restore_pending_preview_row = useCallback((): boolean => {
-        const pending_row = pending_preview_row_ref.current;
+        const pending = pending_preview_scroll;
         const grid = grid_ref.current;
         if (
-            pending_row === null
+            !preview_mode
+            || !pending
+            || applied_preview_sequence_ref.current === pending.sequence
+            || Date.now() < preview_restore_not_before_ref.current
             || !grid
             || display_column_count <= 0
             || row_count <= 0
@@ -428,14 +484,22 @@ export function GridShell({
             Math.max(0, visible_ref.current.x),
             display_column_count - 1,
         );
-        const row = Math.min(Math.max(0, pending_row), row_count - 1);
+        const row = Math.min(Math.max(0, pending.row), row_count - 1);
         const bounds = grid.getBounds(column, row);
         if (!bounds || bounds.width <= 0 || bounds.height <= 0) return false;
         cancel_pending_preview_restore();
-        pending_preview_row_ref.current = null;
+        applied_preview_sequence_ref.current = pending.sequence;
         scroll_preview_to_row(grid, row);
+        on_preview_scroll_applied(pending.sequence);
         return true;
-    }, [cancel_pending_preview_restore, display_column_count, row_count]);
+    }, [
+        cancel_pending_preview_restore,
+        display_column_count,
+        on_preview_scroll_applied,
+        pending_preview_scroll,
+        preview_mode,
+        row_count,
+    ]);
 
     const schedule_pending_preview_restore = useCallback(() => {
         cancel_pending_preview_restore();
@@ -452,7 +516,10 @@ export function GridShell({
                 PREVIEW_RESTORE_RETRY_MS,
             );
         };
-        retry();
+        preview_restore_timer_ref.current = window.setTimeout(
+            retry,
+            PREVIEW_RESTORE_SETTLE_MS,
+        );
     }, [cancel_pending_preview_restore, restore_pending_preview_row]);
 
     // Hide-all removes only Glide's DataEditor, not GridShell. Preserve the last
@@ -465,7 +532,9 @@ export function GridShell({
             cancel_pending_preview_restore();
             return;
         }
-        if (pending_preview_row_ref.current !== null) {
+        if (pending_preview_scroll) {
+            preview_restore_not_before_ref.current = Date.now()
+                + PREVIEW_RESTORE_SETTLE_MS;
             schedule_pending_preview_restore();
             return cancel_pending_preview_restore;
         }
@@ -487,6 +556,7 @@ export function GridShell({
         display_column_count,
         generation,
         has_visible_columns,
+        pending_preview_scroll,
         row_count,
         schedule_pending_preview_restore,
     ]);
@@ -1304,33 +1374,6 @@ export function GridShell({
         if (cells.length > 0) grid.updateCells(cells);
     }, [dirty_cells, conflicted_keys, display_column_for_source]);
 
-    // Preview mode: host asks us to scroll a specific row into view.
-    useEffect(() => {
-        if (!preview_mode) return;
-        const handler = (e: MessageEvent) => {
-            const msg = e.data;
-            if (msg && msg.type === 'scrollToRow' && typeof msg.row === 'number') {
-                if (has_visible_columns) {
-                    cancel_pending_preview_restore();
-                    pending_preview_row_ref.current = null;
-                    scroll_preview_to_row(
-                        grid_ref.current,
-                        Math.min(Math.max(0, msg.row), Math.max(0, row_count - 1)),
-                    );
-                } else {
-                    pending_preview_row_ref.current = msg.row;
-                }
-            }
-        };
-        window.addEventListener('message', handler);
-        return () => window.removeEventListener('message', handler);
-    }, [
-        cancel_pending_preview_restore,
-        has_visible_columns,
-        preview_mode,
-        row_count,
-    ]);
-
     const handle_column_resize = useCallback(
         (_column: GridColumn, new_size: number, display_column: number) => {
             const source_column = source_column_for_display(display_column);
@@ -1380,7 +1423,7 @@ export function GridShell({
 
     if (!has_visible_columns) {
         return (
-            <div className="grid-shell-root">
+            <div ref={grid_root_ref} className="grid-shell-root">
                 <div className="all-columns-hidden" role="status">
                     {sheet_meta.columnCount === 0
                         ? 'This sheet contains no columns.'
@@ -1391,7 +1434,7 @@ export function GridShell({
     }
 
     return (
-        <div className="grid-shell-root">
+        <div ref={grid_root_ref} className="grid-shell-root">
             <DataEditor
                 ref={grid_ref}
                 className="glide-grid"

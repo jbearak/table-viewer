@@ -135,21 +135,55 @@ export function ColumnVisibilityControl({
                     : { left: next_left, top: next_top }
             ));
         };
+
+        let animation_frame: number | null = null;
+        let fallback_timer: number | null = null;
+        const schedule_position = () => {
+            if (animation_frame !== null || fallback_timer !== null) return;
+            if (typeof window.requestAnimationFrame === 'function') {
+                animation_frame = window.requestAnimationFrame(() => {
+                    animation_frame = null;
+                    update_position();
+                });
+            } else {
+                fallback_timer = window.setTimeout(() => {
+                    fallback_timer = null;
+                    update_position();
+                }, 0);
+            }
+        };
         const handle_scroll = (event: Event) => {
             if (popover_ref.current?.contains(event.target as Node)) return;
-            update_position();
+            schedule_position();
         };
 
+        // Measure immediately for first paint, then once more after badge/layout
+        // changes have completed their toolbar reflow.
         update_position();
-        window.addEventListener('resize', update_position);
+        schedule_position();
+        const observer = typeof ResizeObserver === 'undefined'
+            ? null
+            : new ResizeObserver(schedule_position);
+        const boundary = boundary_ref.current;
+        const trigger = trigger_ref.current;
+        const popover = popover_ref.current;
+        const toolbar = boundary?.closest('.toolbar');
+        if (boundary) observer?.observe(boundary);
+        if (trigger) observer?.observe(trigger);
+        if (popover) observer?.observe(popover);
+        if (toolbar) observer?.observe(toolbar);
+        window.addEventListener('resize', schedule_position);
         document.addEventListener('scroll', handle_scroll, true);
-        window.visualViewport?.addEventListener('resize', update_position);
+        window.visualViewport?.addEventListener('resize', schedule_position);
         return () => {
-            window.removeEventListener('resize', update_position);
+            observer?.disconnect();
+            if (animation_frame !== null) window.cancelAnimationFrame(animation_frame);
+            if (fallback_timer !== null) window.clearTimeout(fallback_timer);
+            window.removeEventListener('resize', schedule_position);
             document.removeEventListener('scroll', handle_scroll, true);
-            window.visualViewport?.removeEventListener('resize', update_position);
+            window.visualViewport?.removeEventListener('resize', schedule_position);
         };
-    }, [open]);
+    }, [hidden_count, open]);
 
     const option_is_visible = is_visible;
     const { rendered_options, has_more_matches } = useMemo(() => {

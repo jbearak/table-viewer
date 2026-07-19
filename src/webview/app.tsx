@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, {
+    useState,
+    useEffect,
+    useRef,
+    useCallback,
+    useMemo,
+} from 'react';
 import {
     EMPTY_TRANSFORM,
     transform_has_entries,
@@ -16,7 +22,13 @@ import { Toolbar } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import { transform_progress_label, upsert_filter } from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
-import { GridShell, type EditingStatus, type EditingHandle } from './grid-shell';
+import {
+    GridShell,
+    type EditingStatus,
+    type EditingHandle,
+    type GridFocusHandle,
+    type PendingPreviewScroll,
+} from './grid-shell';
 import {
     clamp_sheet_index,
     normalize_per_file_state,
@@ -39,6 +51,11 @@ type ColumnVisibilityUpdater = (
     column_count: number,
     schema: string,
 ) => SheetColumnVisibilityState | undefined;
+
+type TransformOrigin = 'grid' | 'toolbar' | 'restore';
+
+const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
+const GRID_FOCUS_RESTORE_RETRY_MS = 16;
 
 function column_visibility_equal(
     left: SheetColumnVisibilityState | undefined,
@@ -131,6 +148,14 @@ export function App(): React.JSX.Element {
         column_index: number;
         anchor: { left: number; top: number };
         restore_focus: () => void;
+        origin: Exclude<TransformOrigin, 'restore'>;
+    } | null>(null);
+    const [pending_preview_scroll, set_pending_preview_scroll] =
+        useState<PendingPreviewScroll | null>(null);
+    const [grid_focus_restore, set_grid_focus_restore] = useState<{
+        sheet_index: number;
+        generation: number;
+        document_epoch: number;
     } | null>(null);
     const [source_epoch, set_source_epoch] = useState(0);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
@@ -163,10 +188,15 @@ export function App(): React.JSX.Element {
     const transform_request_seq_ref = useRef(0);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
+    const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    const document_epoch_ref = useRef(0);
+    const preview_mode_ref = useRef(false);
+    const preview_scroll_sequence_ref = useRef(0);
     const filter_restore_timer_ref = useRef<number | undefined>(undefined);
+    const grid_focus_ref = useRef<GridFocusHandle | null>(null);
 
     const { persist_immediate } = use_state_sync(state_ref);
 
@@ -174,10 +204,12 @@ export function App(): React.JSX.Element {
         sheet_index: number,
         state: SheetTransformState,
         intent: TransformIntent,
+        origin: TransformOrigin = 'toolbar',
     ) => {
         const request_id = `${sheet_index}:${++transform_request_seq_ref.current}`;
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
+        pending_transform_origins_ref.current[sheet_index] = origin;
         set_pending_transforms((prev) => {
             const next = [...prev];
             next[sheet_index] = true;
@@ -226,10 +258,19 @@ export function App(): React.JSX.Element {
     }, [auto_fit_snapshot]);
 
     useEffect(() => {
+        preview_mode_ref.current = preview_mode;
+        if (!preview_mode) set_pending_preview_scroll(null);
+    }, [preview_mode]);
+
+    useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
             if (msg.type === 'sheetMeta') {
+                document_epoch_ref.current += 1;
+                set_grid_focus_restore(null);
+                set_pending_preview_scroll(null);
+                preview_mode_ref.current = msg.previewMode ?? false;
                 set_meta(msg.meta);
                 set_filter_editor(null);
                 set_generation(msg.generation);
@@ -278,6 +319,7 @@ export function App(): React.JSX.Element {
                 set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
                 pending_transform_states_ref.current = [];
+                pending_transform_origins_ref.current = [];
                 transform_applied_for_source_ref.current = [];
 
                 const tab_orient = s.tabOrientation ?? null;
@@ -321,6 +363,8 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'metaReload') {
+                document_epoch_ref.current += 1;
+                set_grid_focus_restore(null);
                 set_meta(msg.meta);
                 set_filter_editor(null);
                 set_generation(msg.generation);
@@ -345,6 +389,7 @@ export function App(): React.JSX.Element {
                 set_pending_transform_labels([]);
                 pending_transform_request_ids_ref.current = [];
                 pending_transform_states_ref.current = [];
+                pending_transform_origins_ref.current = [];
                 transform_applied_for_source_ref.current = [];
                 const next_transforms = msg.meta.sheets.map((sheet, index) =>
                     sanitize_transform_state(
@@ -409,6 +454,17 @@ export function App(): React.JSX.Element {
                 persist_immediate();
             }
 
+            if (
+                msg.type === 'scrollToRow'
+                && preview_mode_ref.current
+                && Number.isFinite(msg.row)
+            ) {
+                set_pending_preview_scroll({
+                    row: msg.row,
+                    sequence: ++preview_scroll_sequence_ref.current,
+                });
+            }
+
             if (msg.type === 'transformApplied') {
                 if (
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
@@ -416,8 +472,17 @@ export function App(): React.JSX.Element {
                 ) {
                     return;
                 }
+                const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                if (origin === 'grid') {
+                    set_grid_focus_restore({
+                        sheet_index: msg.sheetIndex,
+                        generation: msg.generation,
+                        document_epoch: document_epoch_ref.current,
+                    });
+                }
                 set_pending_transforms((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = false;
@@ -481,6 +546,61 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, persist_immediate]);
 
     useEffect(() => {
+        if (!grid_focus_restore) return;
+        if (
+            grid_focus_restore.sheet_index !== active_sheet_index
+            || grid_focus_restore.document_epoch !== document_epoch_ref.current
+        ) {
+            set_grid_focus_restore(null);
+            return;
+        }
+        // Native host-message updates are not guaranteed to batch. If the focus
+        // token renders before the generation update, retain it for that next commit.
+        if (grid_focus_restore.generation !== generation) return;
+
+        let timer: number | undefined;
+        let attempt = 0;
+        const restore = () => {
+            const handle = grid_focus_ref.current;
+            if (
+                grid_focus_restore.document_epoch !== document_epoch_ref.current
+                || grid_focus_restore.sheet_index !== active_sheet_index
+            ) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
+            if (
+                handle?.generation === grid_focus_restore.generation
+                && handle.focus()
+            ) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
+            attempt += 1;
+            if (attempt >= GRID_FOCUS_RESTORE_MAX_ATTEMPTS) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
+            timer = window.setTimeout(restore, GRID_FOCUS_RESTORE_RETRY_MS);
+        };
+        // Let Glide complete its post-mount canvas replacement before focusing;
+        // an immediately focused bootstrap canvas is removed on the next frame.
+        timer = window.setTimeout(
+            restore,
+            GRID_FOCUS_RESTORE_RETRY_MS * 2,
+        );
+        return () => {
+            if (timer !== undefined) window.clearTimeout(timer);
+        };
+    }, [active_sheet_index, generation, grid_focus_restore]);
+
+    useEffect(() => {
         vscode_api.postMessage({ type: 'ready' });
         return () => {
             release_edit_session();
@@ -506,7 +626,7 @@ export function App(): React.JSX.Element {
             transform_schema_for_sheet(sheet),
         );
         if (state && transform_is_active(state)) {
-            request_transform(active_sheet_index, state, 'restore');
+            request_transform(active_sheet_index, state, 'restore', 'restore');
         }
     }, [
         source_epoch,
@@ -520,6 +640,7 @@ export function App(): React.JSX.Element {
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
             set_filter_editor(null);
+            set_grid_focus_restore(null);
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -568,8 +689,8 @@ export function App(): React.JSX.Element {
     ]);
 
     const handle_transform_change = useCallback(
-        (next_state: SheetTransformState) => {
-            if (edit_mode || edit_session_pending || preview_mode) return;
+        (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
+            if (edit_mode || edit_session_pending || preview_mode) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -589,8 +710,9 @@ export function App(): React.JSX.Element {
                 column_count,
                 schema,
             );
-            if (transforms_semantically_equal(current, sanitized)) return;
-            request_transform(active_sheet_index, sanitized, 'user');
+            if (transforms_semantically_equal(current, sanitized)) return false;
+            request_transform(active_sheet_index, sanitized, 'user', origin);
+            return true;
         },
         [
             active_sheet_index,
@@ -602,10 +724,24 @@ export function App(): React.JSX.Element {
         ],
     );
 
+    const handle_grid_transform_change = useCallback(
+        (next_state: SheetTransformState) => {
+            handle_transform_change(next_state, 'grid');
+        },
+        [handle_transform_change],
+    );
+    const handle_toolbar_transform_change = useCallback(
+        (next_state: SheetTransformState) => {
+            handle_transform_change(next_state, 'toolbar');
+        },
+        [handle_transform_change],
+    );
+
     const open_filter_editor = useCallback((
         column_index: number,
         anchor: { left: number; top: number },
         restore_focus: () => void,
+        origin: Exclude<TransformOrigin, 'restore'>,
     ) => {
         if (filter_restore_timer_ref.current !== undefined) {
             window.clearTimeout(filter_restore_timer_ref.current);
@@ -617,7 +753,7 @@ export function App(): React.JSX.Element {
             || preview_mode
             || pending_transforms[active_sheet_index]
         ) return;
-        set_filter_editor({ column_index, anchor, restore_focus });
+        set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
         edit_mode,
@@ -625,6 +761,14 @@ export function App(): React.JSX.Element {
         pending_transforms,
         preview_mode,
     ]);
+
+    const open_grid_filter_editor = useCallback((
+        column_index: number,
+        anchor: { left: number; top: number },
+        restore_focus: () => void,
+    ) => {
+        open_filter_editor(column_index, anchor, restore_focus, 'grid');
+    }, [open_filter_editor]);
 
     const close_filter_editor = useCallback((restore_focus = true) => {
         const restore = filter_editor?.restore_focus;
@@ -643,15 +787,17 @@ export function App(): React.JSX.Element {
     }, [filter_editor]);
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
+        if (!filter_editor) return;
         const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
-        handle_transform_change({
+        const requested = handle_transform_change({
             ...current,
             filters: upsert_filter(current.filters, entry),
-        });
-        close_filter_editor(true);
+        }, filter_editor.origin);
+        close_filter_editor(!requested || filter_editor.origin === 'toolbar');
     }, [
         active_sheet_index,
         close_filter_editor,
+        filter_editor,
         handle_transform_change,
         transforms,
     ]);
@@ -1006,6 +1152,11 @@ export function App(): React.JSX.Element {
         (source_index: number) => column_names[source_index] ?? column_letter(source_index),
         [column_names],
     );
+    const handle_preview_scroll_applied = useCallback((sequence: number) => {
+        set_pending_preview_scroll((current) => (
+            current?.sequence === sequence ? null : current
+        ));
+    }, []);
 
     if (!meta) {
         return <div className="loading">Loading...</div>;
@@ -1071,11 +1222,14 @@ export function App(): React.JSX.Element {
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
+            grid_focus_ref={grid_focus_ref}
+            pending_preview_scroll={pending_preview_scroll}
+            on_preview_scroll_applied={handle_preview_scroll_applied}
             transform_state={visible_transform}
             transform_sections={!edit_mode && !edit_session_pending && !preview_mode}
             transform_pending={transform_pending}
-            on_transform_change={handle_transform_change}
-            on_open_filter={open_filter_editor}
+            on_transform_change={handle_grid_transform_change}
+            on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
         />
     );
@@ -1091,13 +1245,14 @@ export function App(): React.JSX.Element {
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 column_names={column_names}
                 merges_flattened={merges_flattened}
-                on_transform_change={handle_transform_change}
+                on_transform_change={handle_toolbar_transform_change}
                 on_edit_filter={(entry, trigger) => {
                     const rect = trigger.getBoundingClientRect();
                     open_filter_editor(
                         entry.colIndex,
                         { left: rect.left, top: rect.bottom + 4 },
                         () => trigger.focus(),
+                        'toolbar',
                     );
                 }}
                 on_cancel_transform={handle_cancel_transform}

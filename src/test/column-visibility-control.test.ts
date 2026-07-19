@@ -240,6 +240,33 @@ describe('ColumnVisibilityControl', () => {
         expect(document.querySelector('.column-visibility-limit')).toBeNull();
     });
 
+    it('repositions an open popover after a visibility badge reflows the trigger', () => {
+        vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (this.classList.contains('column-visibility-trigger')) {
+                    return this.querySelector('.hidden-count-badge')
+                        ? make_rect(100, 90, 80, 24)
+                        : make_rect(700, 20, 80, 24);
+                }
+                if (this.classList.contains('column-visibility-popover')) {
+                    return make_rect(0, 0, 200, 100);
+                }
+                return make_rect(0, 0, 0, 0);
+            });
+
+        const rendered = render_control({ hidden_count: 0 });
+        act(() => trigger().click());
+        const popover = document.querySelector<HTMLElement>(
+            '.column-visibility-popover',
+        )!;
+        expect(popover.style.left).toBe('580px');
+        expect(popover.style.top).toBe('50px');
+
+        rendered.rerender({ hidden_count: 12 });
+        expect(popover.style.left).toBe('8px');
+        expect(popover.style.top).toBe('120px');
+    });
+
     it('clamps horizontally and flips above the trigger near the viewport edge', () => {
         const original_width = window.innerWidth;
         const original_height = window.innerHeight;
