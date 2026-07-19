@@ -29,7 +29,7 @@ export function column_context_menu_items(
     props: Omit<ColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
 ): MenuItem[] {
     const items: MenuItem[] = [
-        { label: 'Copy Column', on_click: () => props.on_copy() },
+        { label: 'Copy column', on_click: () => props.on_copy() },
         { label: 'Hide column', on_click: () => props.on_hide() },
     ];
     if (!props.transform_sections) return items;

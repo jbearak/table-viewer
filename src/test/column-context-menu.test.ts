@@ -27,9 +27,9 @@ function base() {
 }
 
 describe('column context menu model', () => {
-    it('keeps Copy Column and Hide column in preview/edit while omitting transforms', () => {
+    it('keeps Copy column and Hide column in preview/edit while omitting transforms', () => {
         const props = { ...base(), transform_sections: false };
-        expect(labels(column_context_menu_items(props))).toEqual(['Copy Column', 'Hide column']);
+        expect(labels(column_context_menu_items(props))).toEqual(['Copy column', 'Hide column']);
     });
 
     it('shows replace, append, clear, and filter actions with textual shortcuts', () => {
@@ -41,7 +41,7 @@ describe('column context menu model', () => {
         };
         const items = column_context_menu_items(props);
         expect(labels(items)).toEqual([
-            'Copy Column',
+            'Copy column',
             'Hide column',
             'Sort ascending',
             'Sort descending',

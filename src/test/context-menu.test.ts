@@ -62,6 +62,25 @@ describe('ContextMenu keyboard behavior', () => {
         expect(document.activeElement?.textContent).toContain('First');
     });
 
+    it('clamps the rendered position through component state', () => {
+        const original_width = window.innerWidth;
+        const original_height = window.innerHeight;
+        Object.defineProperty(window, 'innerWidth', { configurable: true, value: 30 });
+        Object.defineProperty(window, 'innerHeight', { configurable: true, value: 20 });
+        const get_bounding_client_rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockReturnValue({ width: 40, height: 30 } as DOMRect);
+
+        render_menu([{ label: 'Copy', on_click: vi.fn() }]);
+
+        const menu = document.querySelector<HTMLElement>('.context-menu')!;
+        expect(menu.style.left).toBe('4px');
+        expect(menu.style.top).toBe('4px');
+
+        get_bounding_client_rect.mockRestore();
+        Object.defineProperty(window, 'innerWidth', { configurable: true, value: original_width });
+        Object.defineProperty(window, 'innerHeight', { configurable: true, value: original_height });
+    });
+
     it('renders checked items, separators, and textual shortcuts', () => {
         render_menu([
             { label: 'Sort ascending', checked: true, shortcut: 'Shift+Alt+A', on_click: vi.fn() },

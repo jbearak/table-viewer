@@ -122,6 +122,24 @@ describe('compact visibility state', () => {
             .toEqual({ hiddenColumns: [4], schema: SCHEMA });
     });
 
+    it('uses the same hidden-side representation at an exact 50/50 split', () => {
+        const hidden_path = toggle_source_column(
+            toggle_source_column(undefined, 2, 4, SCHEMA),
+            3,
+            4,
+            SCHEMA,
+        );
+        const visible_path = toggle_source_column(
+            toggle_source_column(hide_all_columns(4, SCHEMA), 0, 4, SCHEMA),
+            1,
+            4,
+            SCHEMA,
+        );
+
+        expect(hidden_path).toEqual({ hiddenColumns: [2, 3], schema: SCHEMA });
+        expect(visible_path).toEqual(hidden_path);
+    });
+
     it('keeps hide-all sparse for a very wide schema', () => {
         const state = hide_all_columns(1_000_000, SCHEMA);
         const projection = create_column_projection(1_000_000, state, SCHEMA);

@@ -1208,14 +1208,13 @@ export function App(): React.JSX.Element {
         [column_names],
     );
     const handle_preview_scroll_applied = useCallback((sequence: number) => {
-        set_pending_preview_scroll((current) => {
-            if (
-                current?.sequence !== sequence
-                || pending_preview_scroll_ref.current?.sequence !== sequence
-            ) return current;
+        if (pending_preview_scroll_ref.current?.sequence !== sequence) return;
+        set_pending_preview_scroll((current) => (
+            current?.sequence === sequence ? null : current
+        ));
+        if (pending_preview_scroll_ref.current?.sequence === sequence) {
             pending_preview_scroll_ref.current = null;
-            return null;
-        });
+        }
     }, []);
     const handle_preview_visible_row_change = useCallback((row: number) => {
         if (preview_mode_ref.current) last_preview_visible_row_ref.current = row;
