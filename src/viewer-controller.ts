@@ -1656,6 +1656,19 @@ export function attach_viewer(
             && edit_session_id === active_edit_session_id;
     }
 
+    // A save/cleanup promise can outlive its panel: writing saves stay pinned to
+    // completion after disposal so durable edit state is cleared correctly. Their
+    // user-facing notifications, however, must be gated on liveness — popping a
+    // warning or error for an editor the user already closed is a spurious effect.
+    function show_owner_warning(message: string): void {
+        if (disposed) return;
+        void vscode.window.showWarningMessage(message);
+    }
+    function show_owner_error(message: string): void {
+        if (disposed) return;
+        void vscode.window.showErrorMessage(message);
+    }
+
     async function handle_save(
         edits: Record<string, string>,
         edit_session_id: string,
@@ -1688,7 +1701,7 @@ export function attach_viewer(
                     !== file_coordinator.authority().authorityRevision
             ) {
                 save_command_pending = false;
-                vscode.window.showWarningMessage(
+                show_owner_warning(
                     'The table view is still refreshing. Please try saving again.');
                 void panel.webview.postMessage({ type: 'saveResult', success: false });
                 return;
@@ -1730,7 +1743,7 @@ export function attach_viewer(
                 || source_authority.authorityRevision
                     !== file_coordinator.authority().authorityRevision
             ) {
-                vscode.window.showWarningMessage(
+                show_owner_warning(
                     'File was modified externally. Please review the changes and try again.');
                 // A conflict performs only panel-local forced recovery. The external
                 // editor's watcher event independently refreshes every attachment;
@@ -1763,7 +1776,7 @@ export function attach_viewer(
                     csv_edit_file_states.delete(file_key);
                 }
             }
-            vscode.window.showErrorMessage(
+            show_owner_error(
                 `Failed to save: ${error instanceof Error ? error.message : String(error)}`);
             void panel.webview.postMessage({ type: 'saveResult', success: false });
             return;
@@ -1802,7 +1815,7 @@ export function attach_viewer(
             }
         }).catch((error) => {
             console.error('Post-save refresh request failed (file was written)', error);
-            void vscode.window.showWarningMessage(
+            show_owner_warning(
                 'The file was saved, but Table Viewer could not refresh the table view.');
         });
 
@@ -1812,7 +1825,7 @@ export function attach_viewer(
         }).catch((error) => {
             finish_edit_cleanup(cleanup_operation, false);
             console.error('CSV save succeeded but pending-edit cleanup failed', error);
-            void vscode.window.showWarningMessage(
+            show_owner_warning(
                 'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.');
         });
     }
@@ -2053,7 +2066,7 @@ export function attach_viewer(
                     } catch (error) {
                         finish_edit_cleanup(operation, false);
                         console.error('Failed to clear discarded CSV edits', error);
-                        void vscode.window.showWarningMessage(
+                        show_owner_warning(
                             'Table Viewer could not clear the discarded edit state. Editing remains disabled for this file.');
                     }
                 }

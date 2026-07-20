@@ -141,10 +141,14 @@ function setup_preview(
         return enabled ? 1 : 0;
     }
 
-    async function reveal_source_line(
+    // `editor` is always a currently-visible editor (from find_matching_editor),
+    // so revealing scrolls it in place. Re-showing it via showTextDocument would
+    // re-activate/reorder the editor group and race with rapid scroll events; a
+    // direct synchronous revealRange preserves focus and avoids that race.
+    function reveal_source_line(
         editor: vscode.TextEditor,
         source_line: number
-    ): Promise<void> {
+    ): void {
         const visible_range = editor.visibleRanges[0];
         const reveal_target_line = get_preview_reveal_target_line(
             source_line,
@@ -157,24 +161,13 @@ function setup_preview(
             get_sticky_header_lines()
         );
         if (reveal_target_line === null) return;
-        const show_options: vscode.TextDocumentShowOptions = {
-            preserveFocus: true,
-        };
-        if (editor.viewColumn !== undefined) {
-            show_options.viewColumn = editor.viewColumn;
-        }
-
-        const shown_editor = await vscode.window.showTextDocument(
-            editor.document,
-            show_options
-        );
         const range = new vscode.Range(
             reveal_target_line,
             0,
             reveal_target_line,
             0
         );
-        shown_editor.revealRange(range, vscode.TextEditorRevealType.AtTop);
+        editor.revealRange(range, vscode.TextEditorRevealType.AtTop);
     }
 
     // Read-only preview profile: the controller owns load/adopt/reload/watcher
@@ -194,7 +187,7 @@ function setup_preview(
             if (!editor) return true;
             // Set lockout to prevent editor scroll from bouncing back
             start_lockout(preview_lockout);
-            void reveal_source_line(editor, line_map[msg.row]);
+            reveal_source_line(editor, line_map[msg.row]);
             return true;
         },
     };

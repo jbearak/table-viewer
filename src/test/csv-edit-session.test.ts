@@ -1036,6 +1036,56 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
     });
 
+    it('suppresses the cleanup-failure warning when the saving panel is disposed', async () => {
+        // A save promise outlives its panel: after the disk write, durable cleanup
+        // stays pinned even once the tab closes. But its user-facing warning must
+        // not fire for an editor the user already closed.
+        const file_path = '/tmp/disposed-save-cleanup-warning.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = state_store({ pendingEdits });
+        const cleanup_started = deferred();
+        const cleanup_gate = deferred();
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    // Suspend the post-write cleanup so the panel can be disposed
+                    // before it fails, then fail it.
+                    cleanup_started.resolve();
+                    await cleanup_gate.promise;
+                    throw new Error('cleanup storage failed');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await cleanup_started.promise;
+        await flush_promises();
+
+        // Disk write already succeeded; only the pinned cleanup remains.
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        warning.mockClear();
+        panel.dispose();
+        cleanup_gate.resolve();
+        await flush_promises();
+
+        // The cleanup CAS threw, but the owning panel is gone: no popup fires.
+        expect(warning).not.toHaveBeenCalled();
+        // The durable edit remains uncleared, exactly as in the non-disposed case.
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+    });
+
     it('keeps disk success while a pending-edit cleanup failure disables editing', async () => {
         const file_path = '/tmp/save-cleanup-failure.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
