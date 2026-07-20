@@ -1,5 +1,12 @@
-import * as path from 'path';
 import type { ExcelHeaderPlanningInput } from './data-source/excel-header-source';
+import {
+    canonical_file_key,
+    file_refresh_watch_identity,
+    type FileRefreshWatchIdentity,
+    type FileRefreshWatcher,
+    type FileRefreshWatcherEventKind,
+    type FileRefreshWatcherFactory,
+} from './file-refresh-watcher';
 import type { ExcelHeaderOverride } from './data-source/interface';
 import { normalize_host_state, plan_excel_override_state } from './excel-header-plan';
 import type {
@@ -106,6 +113,40 @@ export interface CommitExcelHeaderCommand {
 
 export type ExcelHeaderSubscriber = (receipt: ExcelHeaderOperationReceipt) => void | Promise<void>;
 
+export type FileRefreshReason =
+    | 'watcherChange'
+    | 'watcherCreate'
+    | 'watcherDelete'
+    | 'postSave';
+
+export interface FileRefreshEvent {
+    readonly refreshRevision: number;
+    readonly episode: number;
+    readonly reason: FileRefreshReason;
+    readonly priority: 'normal' | 'high';
+}
+
+export type FileRefreshSubscriber = (event: FileRefreshEvent) => void | Promise<void>;
+
+export type FileRefreshRequestResult =
+    | { readonly type: 'completed'; readonly event: FileRefreshEvent }
+    | { readonly type: 'disposed' };
+
+export interface FileRefreshSubscription {
+    request(reason: 'postSave'): Promise<FileRefreshRequestResult>;
+    dispose(): void;
+}
+
+interface RefreshSubscriberState {
+    readonly listener: FileRefreshSubscriber;
+    disposed: boolean;
+}
+
+interface PendingRefreshBatch {
+    revision: number;
+    reason: Exclude<FileRefreshReason, 'postSave'>;
+}
+
 interface OperationState {
     valid: boolean;
     requested: boolean;
@@ -126,6 +167,7 @@ interface FileCoordinatorEntry {
     readonly fileKey: string;
     readonly statePath: string;
     readonly platform: NodeJS.Platform;
+    readonly watchIdentity: FileRefreshWatchIdentity;
     stateReady: Promise<void>;
     readonly aliases: Set<string>;
     attachments: number;
@@ -136,19 +178,20 @@ interface FileCoordinatorEntry {
     readonly requests: Map<AuthorityOperationToken, TurnRequest>;
     activeTurn?: TurnInternal;
     readonly subscribers: Set<ExcelHeaderSubscriber>;
+    readonly refreshSubscribers: Set<RefreshSubscriberState>;
+    refreshWatcher?: FileRefreshWatcher;
+    refreshWatcherListener?: { dispose(): void };
+    refreshRevision: number;
+    refreshEpisode: number;
+    refreshRequests: number;
+    pendingRefresh?: PendingRefreshBatch;
+    pendingRefreshFlushes: number;
     readonly warnedKeys: Set<string>;
 }
 
 const entries = new Map<string, FileCoordinatorEntry>();
 
-export function canonical_file_key(
-    file_path: string,
-    platform: NodeJS.Platform = process.platform,
-): string {
-    return platform === 'win32'
-        ? path.win32.normalize(path.win32.resolve(file_path)).toLowerCase()
-        : path.posix.normalize(path.posix.resolve(file_path));
-}
+export { canonical_file_key } from './file-refresh-watcher';
 
 function snapshot(entry: FileCoordinatorEntry): FileAuthoritySnapshot {
     return Object.freeze({ fileKey: entry.fileKey, ...structuredClone(entry.authority) });
@@ -159,10 +202,113 @@ function cleanup(entry: FileCoordinatorEntry): void {
         entry.attachments === 0
         && entry.operations === 0
         && entry.subscribers.size === 0
+        && entry.refreshSubscribers.size === 0
+        && entry.refreshRequests === 0
+        && entry.pendingRefreshFlushes === 0
         && entries.get(entry.fileKey) === entry
     ) {
+        entry.refreshWatcherListener?.dispose();
+        entry.refreshWatcherListener = undefined;
+        entry.refreshWatcher?.dispose();
+        entry.refreshWatcher = undefined;
         entries.delete(entry.fileKey);
         release_authority_fallback(entry.statePath);
+    }
+}
+
+function watcher_reason(kind: FileRefreshWatcherEventKind): Exclude<FileRefreshReason, 'postSave'> {
+    if (kind === 'create') return 'watcherCreate';
+    if (kind === 'delete') return 'watcherDelete';
+    return 'watcherChange';
+}
+
+function invoke_refresh_subscribers(
+    entry: FileCoordinatorEntry,
+    event: FileRefreshEvent,
+    requester?: RefreshSubscriberState,
+): Promise<void> | undefined {
+    let requester_completion: Promise<void> | undefined;
+    for (const subscriber of [...entry.refreshSubscribers]) {
+        const delivered = deep_clone_and_freeze(event);
+        let completion: Promise<void>;
+        try {
+            completion = Promise.resolve(subscriber.listener(delivered)).then(() => undefined);
+        } catch (error) {
+            console.error('Failed to refresh a file view', error);
+            completion = Promise.resolve();
+        }
+        const safe_completion = completion.catch((error) => {
+            console.error('Failed to refresh a file view', error);
+        });
+        if (subscriber === requester) requester_completion = safe_completion;
+        else void safe_completion;
+    }
+    return requester_completion;
+}
+
+function dispatch_refresh(
+    entry: FileCoordinatorEntry,
+    revision: number,
+    reason: FileRefreshReason,
+    priority: 'normal' | 'high',
+    requester?: RefreshSubscriberState,
+): { event: FileRefreshEvent; completion?: Promise<void> } {
+    const event = deep_clone_and_freeze({
+        refreshRevision: revision,
+        episode: ++entry.refreshEpisode,
+        reason,
+        priority,
+    });
+    return {
+        event,
+        completion: invoke_refresh_subscribers(entry, event, requester),
+    };
+}
+
+function queue_watcher_refresh(
+    entry: FileCoordinatorEntry,
+    kind: FileRefreshWatcherEventKind,
+): void {
+    const revision = ++entry.refreshRevision;
+    const next_reason = watcher_reason(kind);
+    const pending = entry.pendingRefresh;
+    if (pending) {
+        pending.revision = revision;
+        if (next_reason !== 'watcherChange' || pending.reason === 'watcherChange') {
+            pending.reason = next_reason;
+        }
+        return;
+    }
+
+    const batch: PendingRefreshBatch = { revision, reason: next_reason };
+    entry.pendingRefresh = batch;
+    entry.pendingRefreshFlushes += 1;
+    queueMicrotask(() => {
+        try {
+            if (entry.pendingRefresh !== batch) return;
+            entry.pendingRefresh = undefined;
+            dispatch_refresh(entry, batch.revision, batch.reason, 'normal');
+        } finally {
+            entry.pendingRefreshFlushes -= 1;
+            cleanup(entry);
+        }
+    });
+}
+
+function ensure_refresh_watcher(
+    entry: FileCoordinatorEntry,
+    factory: FileRefreshWatcherFactory,
+): void {
+    if (entry.refreshWatcher) return;
+    const watcher = factory.create(entry.watchIdentity);
+    try {
+        entry.refreshWatcherListener = watcher.on_event((kind) => {
+            queue_watcher_refresh(entry, kind);
+        });
+        entry.refreshWatcher = watcher;
+    } catch (error) {
+        watcher.dispose();
+        throw error;
     }
 }
 
@@ -174,6 +320,7 @@ function entry_for(file_path: string, platform: NodeJS.Platform): FileCoordinato
             fileKey,
             statePath: fileKey,
             platform,
+            watchIdentity: file_refresh_watch_identity(file_path, platform),
             stateReady: Promise.resolve(),
             aliases: new Set(),
             attachments: 0,
@@ -188,6 +335,11 @@ function entry_for(file_path: string, platform: NodeJS.Platform): FileCoordinato
             states: new Map(),
             requests: new Map(),
             subscribers: new Set(),
+            refreshSubscribers: new Set(),
+            refreshRevision: 0,
+            refreshEpisode: 0,
+            refreshRequests: 0,
+            pendingRefreshFlushes: 0,
             warnedKeys: new Set(),
         };
         entries.set(fileKey, entry);
@@ -326,6 +478,10 @@ export interface FileCoordinatorAttachment {
     cancel(token: AuthorityOperationToken): void;
     commit_excel_header(command: CommitExcelHeaderCommand): Promise<ExcelHeaderCommitResult>;
     subscribe_excel_headers(listener: ExcelHeaderSubscriber): { dispose(): void };
+    subscribe_refresh(
+        listener: FileRefreshSubscriber,
+        factory: FileRefreshWatcherFactory,
+    ): FileRefreshSubscription;
     mark_warning_seen(key: string): boolean;
     dispose(): void;
 }
@@ -617,6 +773,42 @@ export function acquire_file_coordinator(
             return {
                 dispose() {
                     entry.subscribers.delete(listener);
+                    cleanup(entry);
+                },
+            };
+        },
+
+        subscribe_refresh(listener, factory) {
+            ensure_refresh_watcher(entry, factory);
+            const subscriber: RefreshSubscriberState = { listener, disposed: false };
+            entry.refreshSubscribers.add(subscriber);
+            return {
+                async request(reason) {
+                    if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
+                        return { type: 'disposed' };
+                    }
+                    entry.refreshRequests += 1;
+                    try {
+                        const revision = ++entry.refreshRevision;
+                        entry.pendingRefresh = undefined;
+                        const dispatched = dispatch_refresh(
+                            entry,
+                            revision,
+                            reason,
+                            'high',
+                            subscriber,
+                        );
+                        await dispatched.completion;
+                        return { type: 'completed', event: dispatched.event };
+                    } finally {
+                        entry.refreshRequests -= 1;
+                        cleanup(entry);
+                    }
+                },
+                dispose() {
+                    if (subscriber.disposed) return;
+                    subscriber.disposed = true;
+                    entry.refreshSubscribers.delete(subscriber);
                     cleanup(entry);
                 },
             };

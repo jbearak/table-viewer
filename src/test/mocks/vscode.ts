@@ -46,7 +46,7 @@ export class RelativePattern {
 }
 
 type MessageHandler = (message: unknown) => unknown;
-type WatchHandler = () => unknown;
+type WatchHandler = (uri: UriLike) => unknown;
 
 interface MockWebviewPanel {
     title: string;
@@ -64,12 +64,16 @@ interface MockWebviewPanel {
     __receive(message: unknown): Promise<void>;
 }
 
-interface MockWatcher {
+export interface MockWatcher {
+    readonly __pattern: unknown;
+    readonly __disposed: boolean;
     onDidChange(handler: WatchHandler): { dispose(): void };
     onDidCreate(handler: WatchHandler): { dispose(): void };
+    onDidDelete(handler: WatchHandler): { dispose(): void };
     dispose(): void;
-    __fireChange(): Promise<void>;
-    __fireCreate(): Promise<void>;
+    __fireChange(uri?: UriLike): Promise<void>;
+    __fireCreate(uri?: UriLike): Promise<void>;
+    __fireDelete(uri?: UriLike): Promise<void>;
 }
 
 const panels: MockWebviewPanel[] = [];
@@ -165,11 +169,24 @@ function make_panel(title: string): MockWebviewPanel {
     return panel;
 }
 
-function make_watcher(): MockWatcher {
+function default_watcher_uri(pattern: unknown): UriLike {
+    if (!(pattern instanceof RelativePattern)) return make_uri('');
+    const base = pattern.base.fsPath;
+    const separator = base.includes('\\') && !base.includes('/') ? '\\' : '/';
+    const joined = base.endsWith(separator)
+        ? `${base}${pattern.pattern}`
+        : `${base}${separator}${pattern.pattern}`;
+    return make_uri(joined);
+}
+
+function make_watcher(pattern: unknown): MockWatcher {
     const change_handlers: WatchHandler[] = [];
     const create_handlers: WatchHandler[] = [];
+    const delete_handlers: WatchHandler[] = [];
     let disposed = false;
     return {
+        __pattern: pattern,
+        get __disposed() { return disposed; },
         onDidChange(handler: WatchHandler): { dispose(): void } {
             change_handlers.push(handler);
             return disposable(change_handlers, handler);
@@ -178,16 +195,24 @@ function make_watcher(): MockWatcher {
             create_handlers.push(handler);
             return disposable(create_handlers, handler);
         },
+        onDidDelete(handler: WatchHandler): { dispose(): void } {
+            delete_handlers.push(handler);
+            return disposable(delete_handlers, handler);
+        },
         dispose() {
             disposed = true;
         },
-        async __fireChange(): Promise<void> {
+        async __fireChange(uri = default_watcher_uri(pattern)): Promise<void> {
             if (disposed) return;
-            await Promise.all(change_handlers.map((handler) => handler()));
+            await Promise.all([...change_handlers].map((handler) => handler(uri)));
         },
-        async __fireCreate(): Promise<void> {
+        async __fireCreate(uri = default_watcher_uri(pattern)): Promise<void> {
             if (disposed) return;
-            await Promise.all(create_handlers.map((handler) => handler()));
+            await Promise.all([...create_handlers].map((handler) => handler(uri)));
+        },
+        async __fireDelete(uri = default_watcher_uri(pattern)): Promise<void> {
+            if (disposed) return;
+            await Promise.all([...delete_handlers].map((handler) => handler(uri)));
         },
     };
 }
@@ -242,8 +267,8 @@ export const workspace = {
         },
         async writeFile(): Promise<void> {},
     },
-    createFileSystemWatcher(): MockWatcher {
-        const watcher = make_watcher();
+    createFileSystemWatcher(pattern?: unknown): MockWatcher {
+        const watcher = make_watcher(pattern);
         watchers.push(watcher);
         return watcher;
     },
@@ -284,6 +309,14 @@ export function __getPanels(): MockWebviewPanel[] {
 
 export function __getWatchers(): MockWatcher[] {
     return watchers;
+}
+
+export function __getWatcherHistory(): MockWatcher[] {
+    return watchers;
+}
+
+export function __getActiveWatchers(): MockWatcher[] {
+    return watchers.filter((watcher) => !watcher.__disposed);
 }
 
 export function __getCustomEditorRegistrations() {

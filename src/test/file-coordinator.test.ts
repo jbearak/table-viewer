@@ -5,9 +5,16 @@ import {
     file_coordinator_registry_size,
     type AuthorityOperationToken,
     type ExcelHeaderOperationReceipt,
+    type FileRefreshEvent,
     type PhysicalAuthorityCommitReceipt,
     type SuccessfulAuthorityFinalization,
 } from '../file-coordinator';
+import type {
+    FileRefreshWatchIdentity,
+    FileRefreshWatcher,
+    FileRefreshWatcherEventKind,
+    FileRefreshWatcherFactory,
+} from '../file-refresh-watcher';
 import type { FinalizationReconciliation } from '../finalization-reconciliation';
 import type { ExcelHeaderPlanningInput } from '../data-source/excel-header-source';
 import type { AuthorityFileStateStore, FileStateStore } from '../state';
@@ -145,6 +152,42 @@ function header_command(
         planningInput: planning_input,
         stateStore: store,
     } as const;
+}
+
+class TestRefreshWatcher implements FileRefreshWatcher {
+    readonly listeners = new Set<(kind: FileRefreshWatcherEventKind) => void>();
+    disposeCalls = 0;
+
+    on_event(listener: (kind: FileRefreshWatcherEventKind) => void): { dispose(): void } {
+        this.listeners.add(listener);
+        return { dispose: () => { this.listeners.delete(listener); } };
+    }
+
+    emit(kind: FileRefreshWatcherEventKind): void {
+        for (const listener of [...this.listeners]) listener(kind);
+    }
+
+    dispose(): void {
+        this.disposeCalls += 1;
+        this.listeners.clear();
+    }
+}
+
+class TestRefreshWatcherFactory implements FileRefreshWatcherFactory {
+    readonly identities: FileRefreshWatchIdentity[] = [];
+    readonly watchers: TestRefreshWatcher[] = [];
+
+    create(identity: FileRefreshWatchIdentity): FileRefreshWatcher {
+        this.identities.push(identity);
+        const watcher = new TestRefreshWatcher();
+        this.watchers.push(watcher);
+        return watcher;
+    }
+}
+
+async function flush_refresh(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
 }
 
 describe('file coordinator reservations', () => {
@@ -795,6 +838,265 @@ describe('file coordinator reservations', () => {
         expect(notified).toHaveBeenCalledOnce();
         subscription.dispose();
         secondary.dispose();
+    });
+});
+
+describe('file coordinator refresh stream', () => {
+    it('shares one watcher and stream across canonical aliases', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const first = acquire_file_coordinator('C:\\Data\\Book.xlsx', undefined, 'win32');
+        const second = acquire_file_coordinator('c:\\data\\book.xlsx', undefined, 'win32');
+        const first_events: FileRefreshEvent[] = [];
+        const second_events: FileRefreshEvent[] = [];
+        const one = first.subscribe_refresh((event) => { first_events.push(event); }, factory);
+        const two = second.subscribe_refresh((event) => { second_events.push(event); }, factory);
+
+        expect(factory.watchers).toHaveLength(1);
+        expect(factory.identities[0]).toMatchObject({
+            fileKey: 'c:\\data\\book.xlsx',
+            filePath: 'C:\\Data\\Book.xlsx',
+            directory: 'C:\\Data',
+            basename: 'Book.xlsx',
+        });
+        factory.watchers[0].emit('change');
+        await flush_refresh();
+        expect(first_events).toEqual(second_events);
+        expect(first_events).toMatchObject([{
+            refreshRevision: 1,
+            episode: 1,
+            reason: 'watcherChange',
+            priority: 'normal',
+        }]);
+        expect(first_events[0]).not.toBe(second_events[0]);
+        expect(Object.isFrozen(first_events[0])).toBe(true);
+
+        one.dispose();
+        two.dispose();
+        first.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        second.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+    });
+
+    it('keeps Darwin case-distinct watch entries', () => {
+        const factory = new TestRefreshWatcherFactory();
+        const upper = acquire_file_coordinator('/Volumes/Case/Book.xlsx', undefined, 'darwin');
+        const lower = acquire_file_coordinator('/Volumes/Case/book.xlsx', undefined, 'darwin');
+        const a = upper.subscribe_refresh(() => {}, factory);
+        const b = lower.subscribe_refresh(() => {}, factory);
+        expect(factory.watchers).toHaveLength(2);
+        expect(factory.identities.map((identity) => identity.filePath)).toEqual([
+            '/Volumes/Case/Book.xlsx',
+            '/Volumes/Case/book.xlsx',
+        ]);
+        a.dispose();
+        b.dispose();
+        upper.dispose();
+        lower.dispose();
+        expect(factory.watchers.map((watcher) => watcher.disposeCalls)).toEqual([1, 1]);
+    });
+
+    it('retains the watcher through the last attachment, operation, and subscriber', () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/refresh-lifetime-${Math.random()}.csv`);
+        const refresh = coordinator.subscribe_refresh(() => {}, factory);
+        const excel = coordinator.subscribe_excel_headers(() => {});
+        const operation = begin_physical(coordinator, 'digest');
+
+        coordinator.dispose();
+        refresh.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        excel.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        coordinator.cancel(operation);
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+        expect(file_coordinator_registry_size()).toBe(0);
+    });
+
+    it('retains the entry and watcher through a pending flush', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/pending-refresh-${Math.random()}.csv`);
+        const subscription = coordinator.subscribe_refresh(() => {}, factory);
+        factory.watchers[0].emit('change');
+        subscription.dispose();
+        coordinator.dispose();
+
+        expect(file_coordinator_registry_size()).toBe(1);
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        await flush_refresh();
+        expect(file_coordinator_registry_size()).toBe(0);
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+    });
+
+    it('retains one shared entry through requesting-subscriber completion', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const file_path = `/tmp/request-lifetime-${Math.random()}.csv`;
+        const first = acquire_file_coordinator(file_path);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        const first_subscription = first.subscribe_refresh(() => gate, factory);
+        const request = first_subscription.request('postSave');
+        first_subscription.dispose();
+        first.dispose();
+
+        expect(file_coordinator_registry_size()).toBe(1);
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        const second = acquire_file_coordinator(file_path);
+        const second_subscription = second.subscribe_refresh(() => {}, factory);
+        expect(factory.watchers).toHaveLength(1);
+
+        release();
+        await expect(request).resolves.toMatchObject({ type: 'completed' });
+        expect(factory.watchers[0].disposeCalls).toBe(0);
+        second_subscription.dispose();
+        second.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+        expect(file_coordinator_registry_size()).toBe(0);
+    });
+
+    it('coalesces watcher reasons while preserving revisions and episodes', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/coalesce-${Math.random()}.csv`);
+        const events: FileRefreshEvent[] = [];
+        const subscription = coordinator.subscribe_refresh((event) => { events.push(event); }, factory);
+        const watcher = factory.watchers[0];
+
+        watcher.emit('change');
+        watcher.emit('create');
+        watcher.emit('change');
+        await flush_refresh();
+        watcher.emit('delete');
+        watcher.emit('create');
+        await flush_refresh();
+
+        expect(events).toMatchObject([
+            { refreshRevision: 3, episode: 1, reason: 'watcherCreate', priority: 'normal' },
+            { refreshRevision: 5, episode: 2, reason: 'watcherCreate', priority: 'normal' },
+        ]);
+        subscription.dispose();
+        coordinator.dispose();
+    });
+
+    it('lets postSave absorb pending watcher work but not later signals', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/post-save-${Math.random()}.csv`);
+        const events: FileRefreshEvent[] = [];
+        const subscription = coordinator.subscribe_refresh((event) => { events.push(event); }, factory);
+        const watcher = factory.watchers[0];
+
+        watcher.emit('change');
+        const requested = subscription.request('postSave');
+        watcher.emit('delete');
+        await expect(requested).resolves.toMatchObject({
+            type: 'completed',
+            event: { refreshRevision: 2, episode: 1, reason: 'postSave', priority: 'high' },
+        });
+        await flush_refresh();
+        expect(events).toMatchObject([
+            { refreshRevision: 2, episode: 1, reason: 'postSave', priority: 'high' },
+            { refreshRevision: 3, episode: 2, reason: 'watcherDelete', priority: 'normal' },
+        ]);
+
+        subscription.dispose();
+        coordinator.dispose();
+    });
+
+    it('forms a later watcher episode while subscriber work is still pending', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/in-flight-refresh-${Math.random()}.csv`);
+        const events: FileRefreshEvent[] = [];
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        const subscription = coordinator.subscribe_refresh((event) => {
+            events.push(event);
+            if (event.reason === 'postSave') return gate;
+        }, factory);
+
+        const request = subscription.request('postSave');
+        factory.watchers[0].emit('change');
+        await flush_refresh();
+        expect(events).toMatchObject([
+            { refreshRevision: 1, episode: 1, reason: 'postSave' },
+            { refreshRevision: 2, episode: 2, reason: 'watcherChange' },
+        ]);
+        release();
+        await expect(request).resolves.toMatchObject({ type: 'completed' });
+        subscription.dispose();
+        coordinator.dispose();
+    });
+
+    it('starts every subscriber and isolates requesting completion from failures and hangs', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/isolation-${Math.random()}.csv`);
+        const starts: string[] = [];
+        let release_requester!: () => void;
+        const requester_gate = new Promise<void>((resolve) => { release_requester = resolve; });
+        const requester = coordinator.subscribe_refresh(() => {
+            starts.push('requester');
+            return requester_gate;
+        }, factory);
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const throwing = coordinator.subscribe_refresh(() => {
+            starts.push('throwing');
+            throw new Error('subscriber failed');
+        }, factory);
+        const hanging = coordinator.subscribe_refresh(() => {
+            starts.push('hanging');
+            return new Promise<void>(() => {});
+        }, factory);
+
+        let request_settled = false;
+        const request = requester.request('postSave').then((result) => {
+            request_settled = true;
+            return result;
+        });
+        await Promise.resolve();
+        expect(starts).toEqual(['requester', 'throwing', 'hanging']);
+        expect(request_settled).toBe(false);
+        release_requester();
+        await expect(request).resolves.toMatchObject({ type: 'completed' });
+        expect(error).toHaveBeenCalledOnce();
+
+        requester.dispose();
+        throwing.dispose();
+        hanging.dispose();
+        coordinator.dispose();
+        error.mockRestore();
+    });
+
+    it('does not interact with authority turns and safely rejects disposed requests', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/no-turn-${Math.random()}.csv`);
+        const operation = begin_physical(coordinator, 'digest');
+        const before = coordinator.authority();
+        const subscription = coordinator.subscribe_refresh(() => {}, factory);
+        await expect(subscription.request('postSave')).resolves.toMatchObject({ type: 'completed' });
+        expect(coordinator.operation_is_current(operation)).toBe(true);
+        expect(coordinator.authority()).toEqual(before);
+
+        subscription.dispose();
+        await expect(subscription.request('postSave')).resolves.toEqual({ type: 'disposed' });
+        coordinator.cancel(operation);
+        coordinator.dispose();
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+    });
+
+    it('cleans up after a throwing watcher subscriber', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/throw-cleanup-${Math.random()}.csv`);
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const subscription = coordinator.subscribe_refresh(() => {
+            throw new Error('refresh failed');
+        }, factory);
+        factory.watchers[0].emit('create');
+        await flush_refresh();
+        subscription.dispose();
+        coordinator.dispose();
+
+        expect(error).toHaveBeenCalledOnce();
+        expect(file_coordinator_registry_size()).toBe(0);
+        expect(factory.watchers[0].disposeCalls).toBe(1);
+        error.mockRestore();
     });
 });
 
