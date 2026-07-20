@@ -83,31 +83,37 @@ function authority(revision = 3): FileAuthoritySnapshot {
 type ObservedAdoption = Extract<PanelAdoption, { source: 'observed' }>;
 
 function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
+    const core = overrides.core ?? {
+        generation: 5,
+        sourceGeneration: 4,
+        meta: {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 2,
+                columnCount: 1,
+                merges: [],
+                hasFormatting: false,
+                columnNames: ['Value'],
+            }],
+        },
+    };
+    const diagnostics = overrides.diagnostics ?? { truncationMessage: null };
+    const live_material = structuredClone({ core, diagnostics });
+    const resources = overrides.resources ?? {
+        source: { close: vi.fn() } as unknown as DataSource,
+        core: {
+            dispose: vi.fn(),
+            snapshot_material: vi.fn(() => structuredClone(live_material)),
+        } as unknown as ViewerPanelCore,
+    };
     return {
         source: 'observed',
         canonicalFileId: 'file:/book.xlsx',
-        resources: {
-            source: { close: vi.fn() } as unknown as DataSource,
-            core: { dispose: vi.fn() } as unknown as ViewerPanelCore,
-        },
         authority: authority(),
         stateSnapshot: { state: {}, revision: 7 },
-        core: {
-            generation: 5,
-            sourceGeneration: 4,
-            meta: {
-                hasFormatting: false,
-                sheets: [{
-                    name: 'Sheet1',
-                    rowCount: 2,
-                    columnCount: 1,
-                    merges: [],
-                    hasFormatting: false,
-                    columnNames: ['Value'],
-                }],
-            },
-        },
-        diagnostics: { truncationMessage: null },
+        core,
+        diagnostics,
         warnings: ['warning'],
         reason: 'fileReload',
         project: () => ({
@@ -121,6 +127,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             },
         }),
         ...overrides,
+        resources,
     };
 }
 
@@ -128,6 +135,7 @@ function make_session(options: {
     responses?: Array<boolean | Promise<boolean> | Error>;
     backoffMs?: number[];
     ackTimeoutMs?: number;
+    dormantRetryMs?: number;
     onNeedsInitialSource?: () => void;
     onNeedsResyncSource?: (value: PanelAdoption) => void;
     onCurrentAdoptionAcknowledged?: (value: PanelAdoption) => void;
@@ -147,6 +155,7 @@ function make_session(options: {
         scheduler,
         backoffMs: options.backoffMs ?? [25, 50, 100, 200],
         ackTimeoutMs: options.ackTimeoutMs ?? 500,
+        dormantRetryMs: options.dormantRetryMs,
         onNeedsInitialSource: options.onNeedsInitialSource,
         onNeedsResyncSource: options.onNeedsResyncSource,
         onCurrentAdoptionAcknowledged: options.onCurrentAdoptionAcknowledged,
@@ -282,6 +291,64 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(scheduler.pending().map(({ delay }) => delay)).toEqual([500]);
     });
 
+    it('resamples live core material for a superseding delivery but never for its retries', async () => {
+        const source = adoption();
+        const sample = vi.mocked(source.resources.core.snapshot_material);
+        const project = vi.fn(source.project);
+        const sampled_source = { ...source, project };
+        const { session, posted, scheduler } = make_session({
+            responses: [true, false, true],
+        });
+        session.replace_adoption(sampled_source);
+        session.ready();
+        await settle();
+        const initial = snapshot(posted);
+        expect(initial.generation).toBe(5);
+        expect(sample).toHaveBeenCalledOnce();
+        expect(project).toHaveBeenCalledOnce();
+
+        sample.mockReturnValue({
+            core: {
+                generation: 6,
+                sourceGeneration: 4,
+                meta: {
+                    hasFormatting: false,
+                    sheets: [{
+                        name: 'Locally transformed',
+                        rowCount: 1,
+                        columnCount: 1,
+                        merges: [],
+                        hasFormatting: false,
+                        columnNames: ['Value'],
+                    }],
+                },
+            },
+            diagnostics: { truncationMessage: 'current diagnostics' },
+        });
+        session.retain_command_result({
+            type: 'excelFirstRowHeader',
+            requestId: 'resampled',
+            outcome: 'applied',
+        });
+        await settle();
+        const superseding = snapshot(posted);
+        expect(superseding.identity.deliveryId).toBeGreaterThan(initial.identity.deliveryId);
+        expect(superseding.generation).toBe(6);
+        expect(superseding.sourceGeneration).toBe(4);
+        expect(superseding.meta.sheets[0].name).toBe('Locally transformed');
+        expect(superseding.truncationMessage).toBe('current diagnostics');
+        expect(sample).toHaveBeenCalledTimes(2);
+        expect(project).toHaveBeenCalledOnce();
+
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([25]);
+        scheduler.run_next();
+        await settle();
+        expect(snapshot(posted)).toBe(superseding);
+        expect(snapshot(posted).identity.deliveryId).toBe(superseding.identity.deliveryId);
+        expect(sample).toHaveBeenCalledTimes(2);
+        expect(project).toHaveBeenCalledOnce();
+    });
+
     it('times out a still-pending post and fences its late completion', async () => {
         const pending = deferred<boolean>();
         const { session, posted, scheduler } = make_session({
@@ -304,33 +371,146 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
     });
 
-    it('retransmits after a lost ACK, exhausts into dormancy, and wakes a new burst', async () => {
+    it('retransmits after a lost ACK, enters dormant probing, and wakes a new burst', async () => {
         const { session, posted, scheduler } = make_session({
             responses: [true, true, false, false],
             backoffMs: [10, 20],
             ackTimeoutMs: 100,
+            dormantRetryMs: 1_000,
         });
         session.replace_adoption(adoption());
         session.ready();
         await settle();
         const original = snapshot(posted);
-        expect(scheduler.pending()[0].delay).toBe(100);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
 
         scheduler.run_next(); // ACK timeout
-        expect(scheduler.pending()[0].delay).toBe(10);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([10]);
         scheduler.run_next(); // retransmit true
         await settle();
         expect(snapshot(posted)).toBe(original);
         scheduler.run_next(); // second ACK timeout
-        expect(scheduler.pending()[0].delay).toBe(20);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([20]);
         scheduler.run_next(); // false, burst exhausted
         await settle();
-        expect(scheduler.pending()).toHaveLength(0);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([1_000]);
+
+        scheduler.run_next(); // dormant probe fails
+        await settle();
+        expect(snapshot(posted)).toBe(original);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([1_000]);
 
         session.wake_delivery();
         await settle();
         expect(snapshot(posted)).toBe(original);
-        expect(scheduler.pending()[0].delay).toBe(10);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
+    });
+
+    it('keeps one dormant timer or probe until an accepted snapshot is exactly ACKed', async () => {
+        const dormant_post = deferred<boolean>();
+        const { session, posted, scheduler } = make_session({
+            responses: [true, true, dormant_post.promise],
+            backoffMs: [10],
+            ackTimeoutMs: 100,
+            dormantRetryMs: 1_000,
+        });
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        const delivered = snapshot(posted);
+
+        scheduler.run_next(); // first ACK timeout
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([10]);
+        scheduler.run_next(); // accepted normal retry
+        await settle();
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
+        scheduler.run_next(); // normal burst exhausted
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([1_000]);
+        scheduler.run_next(); // one dormant probe remains pending
+        expect(posted).toHaveLength(3);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
+
+        dormant_post.resolve(true);
+        await settle();
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
+        scheduler.run_next(); // accepted dormant probe also requires an exact ACK
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([1_000]);
+        scheduler.run_next(); // next dormant probe is accepted
+        await settle();
+        expect(posted).toHaveLength(4);
+        expect(snapshot(posted)).toBe(delivered);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([100]);
+
+        ack(session, delivered);
+        expect(session.acknowledged_current()).toBe(true);
+        expect(scheduler.pending()).toHaveLength(0);
+    });
+
+    it('cancels a dormant retry on supersession and fences its callback', async () => {
+        const { session, posted, scheduler } = make_session({
+            responses: [false, true],
+            backoffMs: [],
+            dormantRetryMs: 1_000,
+        });
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        const obsolete = snapshot(posted);
+        const dormant = scheduler.pending()[0];
+        expect(dormant.delay).toBe(1_000);
+
+        session.replace_adoption(adoption({ authority: authority(4) }));
+        await settle();
+        const current = snapshot(posted);
+        expect(current.identity.deliveryId).toBeGreaterThan(obsolete.identity.deliveryId);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([500]);
+        dormant.callback();
+        await settle();
+        expect(posted).toHaveLength(2);
+        expect(snapshot(posted)).toBe(current);
+    });
+
+    it('cancels a dormant retry when a delayed exact ACK arrives', async () => {
+        const { session, posted, scheduler } = make_session({
+            responses: [true],
+            backoffMs: [],
+            ackTimeoutMs: 100,
+            dormantRetryMs: 1_000,
+        });
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        const delivered = snapshot(posted);
+        scheduler.run_next(); // ACK timeout exhausts the normal burst
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([1_000]);
+
+        ack(session, delivered);
+        expect(session.acknowledged_current()).toBe(true);
+        expect(scheduler.pending()).toHaveLength(0);
+    });
+
+    it('cancels a dormant retry on disposal and makes its callback inert', async () => {
+        const released = vi.fn();
+        const source = adoption();
+        const { session, posted, scheduler } = make_session({
+            responses: [false],
+            backoffMs: [],
+            dormantRetryMs: 1_000,
+            onAdoptionReleased: released,
+        });
+        session.replace_adoption(source);
+        session.ready();
+        await settle();
+        const dormant = scheduler.pending()[0];
+        expect(dormant.delay).toBe(1_000);
+
+        session.dispose();
+        expect(scheduler.pending()).toHaveLength(0);
+        dormant.callback();
+        await settle();
+        expect(posted).toHaveLength(1);
+        expect(released).toHaveBeenCalledOnce();
+        expect(released).toHaveBeenCalledWith(source);
     });
 
     it.each(['applied', 'duplicate'] as const)(
@@ -562,7 +742,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         scheduler.run_next();
         await settle();
         expect(snapshot(posted)).toBe(first);
-        expect(scheduler.pending()).toHaveLength(0);
+        expect(scheduler.pending().map(({ delay }) => delay)).toEqual([30_000]);
 
         session.replace_adoption(adoption({
             authority: authority(4),

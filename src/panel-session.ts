@@ -72,6 +72,7 @@ export interface PanelSessionOptions<Handle = ReturnType<typeof setTimeout>> {
     readonly scheduler?: PanelSessionScheduler<Handle>;
     readonly backoffMs?: readonly number[];
     readonly ackTimeoutMs?: number;
+    readonly dormantRetryMs?: number;
     readonly issuedLedgerLimit?: number;
     readonly onNeedsInitialSource?: () => void;
     readonly onNeedsResyncSource?: (adoption: PanelAdoption) => void;
@@ -127,6 +128,7 @@ interface IssuedDelivery {
 
 const DEFAULT_BACKOFF_MS = Object.freeze([25, 50, 100, 200]);
 const DEFAULT_ACK_TIMEOUT_MS = 1_000;
+const DEFAULT_DORMANT_RETRY_MS = 30_000;
 const DEFAULT_LEDGER_LIMIT = 32;
 
 function default_scheduler(): PanelSessionScheduler<ReturnType<typeof setTimeout>> {
@@ -202,6 +204,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private readonly scheduler: PanelSessionScheduler<Handle>;
     private readonly backoff_ms: readonly number[];
     private readonly ack_timeout_ms: number;
+    private readonly dormant_retry_ms: number;
     private readonly ledger_limit: number;
     private readonly on_needs_initial_source?: () => void;
     private readonly on_needs_resync_source?: (adoption: PanelAdoption) => void;
@@ -225,6 +228,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private timer_token = 0;
     private attempt_token = 0;
     private retry_index = 0;
+    private transport_mode: 'normal' | 'dormant' = 'normal';
     private receiver_baseline_file_id?: string;
     private stale_adoption_epoch?: number;
 
@@ -237,6 +241,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             ?? (default_scheduler() as unknown as PanelSessionScheduler<Handle>);
         this.backoff_ms = Object.freeze([...(options.backoffMs ?? DEFAULT_BACKOFF_MS)]);
         this.ack_timeout_ms = options.ackTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+        this.dormant_retry_ms = options.dormantRetryMs ?? DEFAULT_DORMANT_RETRY_MS;
         this.ledger_limit = Math.max(1, options.issuedLedgerLimit ?? DEFAULT_LEDGER_LIMIT);
         this.on_needs_initial_source = options.onNeedsInitialSource;
         this.on_needs_resync_source = options.onNeedsResyncSource;
@@ -456,6 +461,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (this.desired.status === 'acked') return;
         this.invalidate_transport();
         this.retry_index = 0;
+        this.transport_mode = 'normal';
         this.desired.status = 'desired';
         this.post_desired(this.desired);
     }
@@ -584,9 +590,12 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     ): void {
         const adoption = this.current;
         if (!adoption || this._lifecycle === 'disposed') return;
+        const live_material = adoption.adoption.resources.core.snapshot_material();
+        if (this.current !== adoption || this.lifecycle === 'disposed') return;
         this.invalidate_transport();
         this.supersede_desired();
         this.retry_index = 0;
+        this.transport_mode = 'normal';
         const delivery_id = this.next_delivery_id++;
         const material = adoption.material;
         const command_result = this.retained_results.values().next().value as
@@ -594,12 +603,12 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         const common = {
             deliveryId: delivery_id,
             canonicalFileId: material.canonicalFileId,
-            core: material.core,
+            core: live_material.core,
             presentation,
             reason,
             configuration: adoption.projection.configuration,
             capabilities: adoption.projection.capabilities,
-            diagnostics: material.diagnostics,
+            diagnostics: live_material.diagnostics,
             commandResult: command_result,
         } as const;
         const snapshot = material.source === 'commitReceipt'
@@ -697,8 +706,16 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
 
     private schedule_retry(issued: IssuedDelivery): void {
         this.clear_timer();
+        if (this.transport_mode === 'dormant') {
+            this.schedule_dormant_probe(issued);
+            return;
+        }
         const delay = this.backoff_ms[this.retry_index];
-        if (delay === undefined) return;
+        if (delay === undefined) {
+            this.transport_mode = 'dormant';
+            this.schedule_dormant_probe(issued);
+            return;
+        }
         this.retry_index += 1;
         const timer_token = ++this.timer_token;
         this.timer = this.scheduler.schedule(() => {
@@ -706,6 +723,15 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             this.timer = undefined;
             this.post_desired(issued);
         }, delay);
+    }
+
+    private schedule_dormant_probe(issued: IssuedDelivery): void {
+        const timer_token = ++this.timer_token;
+        this.timer = this.scheduler.schedule(() => {
+            if (!this.timer_is_current(issued, timer_token)) return;
+            this.timer = undefined;
+            this.post_desired(issued);
+        }, this.dormant_retry_ms);
     }
 
     private attempt_is_current(issued: IssuedDelivery, token: number): boolean {
