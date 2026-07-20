@@ -173,6 +173,12 @@ function ack(
 }
 
 describe('PanelSession lifecycle and reliable snapshot transport', () => {
+    it('requires snapshot posting configuration at construction', () => {
+        expect(() => new PanelSession(
+            {} as ConstructorParameters<typeof PanelSession>[0],
+        )).toThrow('requires snapshot postMessage configuration');
+    });
+
     it('does not post before ready and activates when a missing initial source arrives', async () => {
         const needs = vi.fn();
         const { session, posted } = make_session({ onNeedsInitialSource: needs });

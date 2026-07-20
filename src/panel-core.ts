@@ -9,9 +9,7 @@ import {
     EMPTY_TRANSFORM,
     transform_schema_for_sheet,
     type HostMessage,
-    type PerFileState,
     type SheetTransformState,
-    type StoredPerFileState,
     type WebviewMessage,
 } from './types';
 
@@ -24,35 +22,6 @@ export interface PanelLike {
     webview: {
         postMessage(message: unknown): Thenable<boolean> | Promise<boolean> | boolean;
     };
-}
-
-/** Panel-specific fields bundled into each `sheetMeta` send. The panels own
- *  state/config; the core owns meta + generation + the page cache. */
-interface MetaEnvelope {
-    state: StoredPerFileState;
-    defaultTabOrientation: 'horizontal' | 'vertical';
-    previewMode?: boolean;
-    csvEditable?: boolean;
-    csvEditingSupported?: boolean;
-    projectionChange?: 'excelHeader';
-    headerRequestId?: string;
-    error?: string;
-}
-
-interface ReloadEnvelope {
-    state?: PerFileState;
-    csvEditable?: boolean;
-    csvEditingSupported?: boolean;
-    projectionChange?: 'excelHeader';
-    headerRequestId?: string;
-}
-
-interface MetaRecoveryEnvelope {
-    state: PerFileState;
-    csvEditable?: boolean;
-    csvEditingSupported?: boolean;
-    headerRequestId: string;
-    error?: string;
 }
 
 type SetTransformMessage = Extract<WebviewMessage, { type: 'setTransform' }>;
@@ -82,9 +51,9 @@ export type AdoptSourceResult =
  *  - the `requestRows` -> `rowData` handler with a generation guard and
  *    boundary validation.
  *
- * It does NOT own watchers, save/conflict flow, or vscode config — those stay
- * in the format-specific panels, which call `send_meta`/`send_meta_reload` and
- * forward webview messages to `handle_message`.
+ * It does NOT own metadata delivery, watchers, save/conflict flow, or vscode
+ * config. PanelSession owns snapshots; controllers forward row/transform
+ * messages to `handle_message`.
  */
 export class ViewerPanelCore {
     private _generation = 1;
@@ -172,64 +141,6 @@ export class ViewerPanelCore {
         this.transform_indices.clear();
         this.transform_states.clear();
         this.cache.clear();
-    }
-
-    /** Initial legacy structure send for the already-adopted source identity. */
-    async send_meta(envelope: MetaEnvelope): Promise<boolean> {
-        if (this.disposed) return false;
-        const material = this.snapshot_material();
-        return this.post({
-            type: 'sheetMeta',
-            meta: material.core.meta,
-            state: envelope.state,
-            defaultTabOrientation: envelope.defaultTabOrientation,
-            previewMode: envelope.previewMode,
-            csvEditable: envelope.csvEditable,
-            csvEditingSupported: envelope.csvEditingSupported,
-            projectionChange: envelope.projectionChange,
-            headerRequestId: envelope.headerRequestId,
-            error: envelope.error,
-            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
-            generation: material.core.generation,
-            sourceGeneration: material.core.sourceGeneration,
-        });
-    }
-
-    /** Full authoritative metadata recovery without changing core generations. */
-    async send_meta_recovery(envelope: MetaRecoveryEnvelope): Promise<boolean> {
-        if (this.disposed) return false;
-        const material = this.snapshot_material();
-        return this.post({
-            type: 'metaReloadRecovery',
-            meta: material.core.meta,
-            state: envelope.state,
-            csvEditable: envelope.csvEditable,
-            csvEditingSupported: envelope.csvEditingSupported,
-            projectionChange: 'excelHeader',
-            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
-            generation: material.core.generation,
-            sourceGeneration: material.core.sourceGeneration,
-            headerRequestId: envelope.headerRequestId,
-            error: envelope.error,
-        });
-    }
-
-    /** Legacy reload post for the already-adopted source identity. */
-    async send_meta_reload(envelope?: ReloadEnvelope): Promise<boolean> {
-        if (this.disposed) return false;
-        const material = this.snapshot_material();
-        return this.post({
-            type: 'metaReload',
-            meta: material.core.meta,
-            state: envelope?.state,
-            csvEditable: envelope?.csvEditable,
-            csvEditingSupported: envelope?.csvEditingSupported,
-            projectionChange: envelope?.projectionChange,
-            headerRequestId: envelope?.headerRequestId,
-            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
-            generation: material.core.generation,
-            sourceGeneration: material.core.sourceGeneration,
-        });
     }
 
     /** Entry point for webview->host messages the core is responsible for. */

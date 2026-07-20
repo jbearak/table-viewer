@@ -170,10 +170,10 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
-/** Messages from extension host to webview */
+/** Messages from extension host to webview. Legacy metadata variants remain
+ * compatibility-only until the Phase 6 webview protocol cleanup; production host
+ * delivery uses workbookSnapshot exclusively. */
 export type HostMessage =
-    // Paginated protocol (Phase B+). `generation` rises on every (re)load so the
-    // webview can drop row windows that belong to a superseded document version.
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number; projectionChange?: 'excelHeader'; headerRequestId?: string; error?: string }
     | { type: 'metaReloadRecovery'; meta: WorkbookMeta; state: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange: 'excelHeader'; headerRequestId: string; generation: number; sourceGeneration: number; error?: string }

@@ -180,7 +180,6 @@ function setup_preview(
     // Read-only preview profile: the controller owns load/adopt/reload/watcher
     // and paginated row serving; scroll-sync is layered on via the hooks below.
     const profile: ViewerProfile = {
-        metadataDelivery: 'workbookSnapshot',
         editing: false,
         previewMode: true,
         build_source: build_csv_source,

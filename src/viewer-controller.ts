@@ -59,8 +59,6 @@ export interface ViewerHostPanel extends PanelLike {
 }
 
 export interface ViewerProfile {
-    /** Fixed for one attachment; mixing metadata protocols is a controller bug. */
-    metadataDelivery: 'legacy' | 'workbookSnapshot';
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
         raw: Uint8Array,
@@ -135,7 +133,6 @@ function same_durable_authority(
 
 function excel_profile(): ViewerProfile {
     return {
-        metadataDelivery: 'workbookSnapshot',
         editing: false,
         async build_source(raw, file_path, state) {
             const physical = file_path.toLowerCase().endsWith('.xlsx')
@@ -161,7 +158,6 @@ export function build_csv_source(raw: Uint8Array, file_path: string): Promise<Cs
 
 export function csv_table_profile(): ViewerProfile {
     return {
-        metadataDelivery: 'workbookSnapshot',
         editing: true,
         build_source: build_csv_source,
     };

@@ -66,8 +66,6 @@ export interface PanelSessionScheduler<Handle = unknown> {
 type SnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
 
 export interface PanelSessionOptions<Handle = ReturnType<typeof setTimeout>> {
-    /** Disabled for legacy-only panels; adoption ownership remains active. */
-    readonly transportEnabled?: boolean;
     readonly postMessage: (
         message: SnapshotMessage,
     ) => boolean | Thenable<boolean> | Promise<boolean>;
@@ -198,7 +196,6 @@ function physical_digest(adoption: CapturedAdoption): string | undefined {
 /** Reliable, readiness-gated transport for complete immutable workbook snapshots. */
 export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private _lifecycle: PanelSessionLifecycle = 'awaitingReady';
-    private readonly transport_enabled: boolean;
     private readonly post_message: PanelSessionOptions<Handle>['postMessage'];
     private readonly scheduler: PanelSessionScheduler<Handle>;
     private readonly backoff_ms: readonly number[];
@@ -230,7 +227,9 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private stale_adoption_epoch?: number;
 
     constructor(options: PanelSessionOptions<Handle>) {
-        this.transport_enabled = options.transportEnabled ?? true;
+        if (typeof options.postMessage !== 'function') {
+            throw new TypeError('PanelSession requires snapshot postMessage configuration.');
+        }
         this.post_message = options.postMessage;
         this.scheduler = options.scheduler
             ?? (default_scheduler() as unknown as PanelSessionScheduler<Handle>);
@@ -291,7 +290,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
                 : { type: 'needsInitialSource', receiverEpoch: receiver_epoch };
         }
         this._lifecycle = 'active';
-        if (this.transport_enabled) this.create_desired('initial', 'ready');
+        this.create_desired('initial', 'ready');
         return { type: 'ready', receiverEpoch: receiver_epoch };
     }
 
@@ -362,13 +361,11 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             return true;
         }
         this._lifecycle = 'active';
-        if (this.transport_enabled) {
-            const presentation = this.receiver_baseline_file_id
-                === this.current.material.canonicalFileId
-                ? 'refresh'
-                : 'initial';
-            this.create_desired(presentation, this.current.material.reason);
-        }
+        const presentation = this.receiver_baseline_file_id
+            === this.current.material.canonicalFileId
+            ? 'refresh'
+            : 'initial';
+        this.create_desired(presentation, this.current.material.reason);
         // Release only after the replacement is current and its desired delivery
         // exists. If an injected release callback throws, the new session state is
         // still coherent and its transport attempt is already underway.
@@ -394,7 +391,6 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         this.current.stateSnapshot = deep_clone_and_freeze(stateSnapshot);
         if (
             options.deliver === true
-            && this.transport_enabled
             && this.receiver_epoch > 0
             && this.ready_gate_epoch !== this.receiver_epoch
             && this.stale_adoption_epoch !== this.current.epoch

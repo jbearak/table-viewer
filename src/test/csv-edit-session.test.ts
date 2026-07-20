@@ -485,7 +485,7 @@ describe('CSV edit sessions', () => {
         await second.__receive({ type: 'ready' });
         const schema = '["Sheet1",1,["h"]]';
 
-        // The second tab captures stale state for metaReload cleanup, but its generic
+        // The second tab captures stale state for refresh cleanup, but its generic
         // persistence reaches the host only after the first tab's direct user choice.
         const cleanup_gate = deferred();
         const delayed_cleanup = cleanup_gate.promise.then(() => second.__receive({
@@ -524,7 +524,7 @@ describe('CSV edit sessions', () => {
         const panel = open_csv_table(uri(file_path), state.store);
         await panel.__receive({ type: 'ready' });
 
-        // This is the snapshot the webview posts after sanitizing sheetMeta.
+        // This is the snapshot the webview posts after sanitizing initial metadata.
         await panel.__receive({
             type: 'stateChanged',
             sourceGeneration: 1,
@@ -671,7 +671,6 @@ describe('CSV edit sessions', () => {
         };
         const state = state_store({ transforms: [saved_transform] });
         const profile: ViewerProfile = {
-            metadataDelivery: 'workbookSnapshot',
             editing: false,
             async build_source() {
                 return new FailingTransformSource();
@@ -868,7 +867,6 @@ describe('CSV edit sessions', () => {
         const pending = { '0:0': { value: 'draft', base: 'a' } };
         const state = state_store({ pendingEdits: pending });
         const profile: ViewerProfile = {
-            metadataDelivery: 'workbookSnapshot',
             editing: false,
             previewMode: true,
             build_source: async () => new StubSource(),
@@ -895,7 +893,6 @@ describe('CSV edit sessions', () => {
     it('fences preview-originated source messages until the current adoption is ACKed', async () => {
         const on_message = vi.fn(async () => true);
         const profile: ViewerProfile = {
-            metadataDelivery: 'workbookSnapshot',
             editing: false,
             previewMode: true,
             build_source: async () => new StubSource(),
@@ -927,7 +924,6 @@ describe('CSV edit sessions', () => {
             readonly warnings = ['CSV warning'];
         }
         const profile: ViewerProfile = {
-            metadataDelivery: 'workbookSnapshot',
             editing: false,
             build_source: async () => new WarningSource(),
         };
@@ -961,7 +957,6 @@ describe('CSV edit sessions', () => {
         const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const state = state_store();
         const panel = open_csv_table(uri('/tmp/truncated.csv'), state.store, {
-            metadataDelivery: 'workbookSnapshot',
             editing: true,
             build_source: async () => new StubSource('Showing 1 of 2 rows'),
         });

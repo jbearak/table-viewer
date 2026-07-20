@@ -1,13 +1,43 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import type { HostMessage, WebviewMessage } from '../types';
 import type { WorkbookMeta, RenderedCell } from '../data-source/interface';
 import type { RetainedSnapshotCommandResult } from '../viewer-snapshot';
+
+function production_host_sources(directory: string): string[] {
+    return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) {
+            if (entry.name === 'test' || entry.name === 'webview') return [];
+            return production_host_sources(path);
+        }
+        return /\.tsx?$/.test(entry.name) && entry.name !== 'types.ts' ? [path] : [];
+    });
+}
 
 describe('paginated protocol message shapes', () => {
     const meta: WorkbookMeta = {
         hasFormatting: false,
         sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
     };
+
+    it('has no production host references to compatibility-only metadata messages', () => {
+        const source_root = join(__dirname, '..');
+        const forbidden = [
+            'sheetMeta',
+            'metaReload',
+            'metaReloadRecovery',
+            'excelFirstRowHeaderError',
+        ];
+        const matches = production_host_sources(source_root).flatMap((path) => {
+            const contents = readFileSync(path, 'utf8');
+            return forbidden
+                .filter((message_type) => contents.includes(message_type))
+                .map((message_type) => `${relative(source_root, path)}: ${message_type}`);
+        });
+        expect(matches).toEqual([]);
+    });
 
     it('carries a complete workbookSnapshot authority envelope', () => {
         const msg: HostMessage = {
@@ -84,7 +114,7 @@ describe('paginated protocol message shapes', () => {
         ]);
     });
 
-    it('HostMessage carries a sheetMeta variant with generation', () => {
+    it('retains the compatibility-only sheetMeta wire shape', () => {
         const msg: HostMessage = {
             type: 'sheetMeta',
             meta,
@@ -100,7 +130,7 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
-    it('HostMessage carries a metaReload variant', () => {
+    it('retains the compatibility-only metaReload wire shape', () => {
         const msg: HostMessage = {
             type: 'metaReload',
             meta,
@@ -119,7 +149,7 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
-    it('HostMessage carries terminal header metadata recovery', () => {
+    it('retains the compatibility-only metadata recovery wire shape', () => {
         const msg: HostMessage = {
             type: 'metaReloadRecovery',
             meta,
@@ -194,7 +224,7 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
-    it('carries Excel first-row header request and result variants', () => {
+    it('retains the header request and compatibility-only error result shapes', () => {
         const request: WebviewMessage = {
             type: 'setExcelFirstRowHeader',
             sheetIndex: 1,

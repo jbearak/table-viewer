@@ -55,28 +55,16 @@ function deferred<T = void>() {
     return { promise, resolve };
 }
 
-const ENVELOPE = { state: {}, defaultTabOrientation: 'horizontal' as const };
-
 describe('ViewerPanelCore', () => {
-    it('starts at generation 1/sourceGeneration 1 and posts that identity', async () => {
+    it('starts at generation 1/sourceGeneration 1 without posting metadata', () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource());
         expect(core.generation).toBe(1);
         expect(core.source_generation).toBe(1);
-        await core.send_meta(ENVELOPE);
-        expect(posted[0].type).toBe('sheetMeta');
-        expect(posted[0].meta.sheets[0].rowCount).toBe(100);
-        expect(posted[0].generation).toBe(core.generation);
-        expect(posted[0].defaultTabOrientation).toBe('horizontal');
-    });
-
-    it('send_meta surfaces the source truncationMessage by default', async () => {
-        const { panel, posted } = make_panel();
-        const src = new StubSource();
-        src.truncationMessage = 'Showing 2 of 4 rows';
-        const core = new ViewerPanelCore(panel, src);
-        await core.send_meta(ENVELOPE);
-        expect(posted[0].truncationMessage).toBe('Showing 2 of 4 rows');
+        expect(posted).toHaveLength(0);
+        expect('send_meta' in core).toBe(false);
+        expect('send_meta_reload' in core).toBe(false);
+        expect('send_meta_recovery' in core).toBe(false);
     });
 
     it('snapshot_material clones and freezes source metadata and diagnostics', () => {
@@ -141,78 +129,6 @@ describe('ViewerPanelCore', () => {
         expect(src.read_rows_calls).toBe(1);
     });
 
-    it('repeated legacy reload posts do not advance versions or clear cache', async () => {
-        const { panel, posted } = make_panel();
-        const src = new StubSource();
-        const core = new ViewerPanelCore(panel, src);
-        await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'a', generation: core.generation });
-        expect(src.read_rows_calls).toBe(1);
-
-        const generation = core.generation;
-        const source_generation = core.source_generation;
-        const envelope = {
-            state: { transforms: [] },
-            projectionChange: 'excelHeader' as const,
-            headerRequestId: 'header:1',
-        };
-        await core.send_meta_reload(envelope);
-        await core.send_meta_reload(envelope);
-
-        expect(core.generation).toBe(generation);
-        expect(core.source_generation).toBe(source_generation);
-        const last = posted.at(-1);
-        expect(last).toMatchObject({
-            type: 'metaReload',
-            generation,
-            sourceGeneration: source_generation,
-            projectionChange: 'excelHeader',
-            headerRequestId: 'header:1',
-            state: { transforms: [] },
-        });
-
-        await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'c', generation });
-        expect(src.read_rows_calls).toBe(1);
-    });
-
-    it('does not advance versions when a legacy metadata post fails', async () => {
-        const { panel, postMessage } = make_panel();
-        const core = new ViewerPanelCore(panel, new StubSource());
-        postMessage.mockResolvedValueOnce(false);
-        const generation = core.generation;
-        const source_generation = core.source_generation;
-
-        expect(await core.send_meta_reload()).toBe(false);
-        expect(core.generation).toBe(generation);
-        expect(core.source_generation).toBe(source_generation);
-    });
-
-    it('posts terminal metadata recovery without advancing generations', async () => {
-        const { panel, posted } = make_panel();
-        const core = new ViewerPanelCore(panel, new StubSource());
-        core.adopt_source(new StubSource(3));
-        await core.send_meta_reload();
-        const generation = core.generation;
-        const source_generation = core.source_generation;
-
-        await core.send_meta_recovery({
-            state: { transforms: [] },
-            headerRequestId: 'header:terminal',
-            error: 'Delivery retries were exhausted.',
-        });
-
-        expect(core.generation).toBe(generation);
-        expect(core.source_generation).toBe(source_generation);
-        expect(posted.at(-1)).toMatchObject({
-            type: 'metaReloadRecovery',
-            generation,
-            sourceGeneration: source_generation,
-            projectionChange: 'excelHeader',
-            headerRequestId: 'header:terminal',
-            error: 'Delivery retries were exhausted.',
-            meta: { sheets: [{ rowCount: 3 }] },
-        });
-    });
-
     it('physical replacement advances both generations and clears cache exactly once', async () => {
         const { panel } = make_panel();
         const previous = new StubSource();
@@ -227,7 +143,6 @@ describe('ViewerPanelCore', () => {
         expect(result.type).toBe('adopted');
         expect(core.generation).toBe(2);
         expect(core.source_generation).toBe(2);
-        await core.send_meta_reload();
         expect(core.generation).toBe(2);
         expect(core.source_generation).toBe(2);
 
@@ -252,7 +167,6 @@ describe('ViewerPanelCore', () => {
 
         const adopted = adopt_source_into_core(core, panel, src, src);
         expect(adopted.type).toBe('adopted');
-        await core.send_meta_reload();
 
         expect(core.source_generation).toBe(source_generation + 1);
         expect(core.generation).toBe(view_generation + 1);
@@ -357,7 +271,6 @@ describe('ViewerPanelCore', () => {
         const stale_generation = core.generation;
         const stale_source_generation = core.source_generation;
         core.adopt_source(new StubSource(5));
-        await core.send_meta_reload();
 
         await core.handle_message({
             type: 'setTransform',
@@ -527,8 +440,8 @@ describe('ViewerPanelCore', () => {
         expect(installed).toBe(core);
         expect(core.generation).toBe(2);
         expect(core.source_generation).toBe(2);
-        await core.send_meta(ENVELOPE);
-        expect(posted.at(-1)?.meta.sheets[0].rowCount).toBe(5);
+        expect(core.snapshot_material().core.meta.sheets[0].rowCount).toBe(5);
+        expect(posted).toHaveLength(0);
     });
 
     it('cancels source work before closing a replaced source', async () => {

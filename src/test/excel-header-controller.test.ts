@@ -136,7 +136,6 @@ function excel_profile(
     break_projection = false,
 ): ViewerProfile {
     return {
-        metadataDelivery: 'workbookSnapshot',
         editing: false,
         async build_source(_raw, _path, state) {
             builds.count += 1;

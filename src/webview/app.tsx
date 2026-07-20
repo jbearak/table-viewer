@@ -107,18 +107,14 @@ function transforms_semantically_equal(
 }
 
 /**
- * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
- * protocol (structure only — cells stream in later via the row loader inside
- * {@link GridShell}) and mounts the Glide canvas grid keyed by sheet index so a
- * sheet switch remounts (and clears) the loader. Editing, selection, row
- * resize, and canvas-measured auto-fit are restored in Phases D/E; here the grid
- * is read-only plain text + bold/italic.
+ * Webview root for snapshot metadata plus paginated row delivery. Phase 6 will
+ * remove the compatibility adapters for legacy metadata messages below.
  */
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
-    // Bumped on every `sheetMeta` (a fresh document load — including the preview
-    // pane reusing its panel for a different file). Folded into the GridShell key
+    // Bumped on every initial snapshot (a fresh document load — including the
+    // preview pane reusing its panel for a different file). Folded into the GridShell key
     // so the row loader remounts clean; a new file can otherwise collide with the
     // previous one's generation (both start at 1) and surface stale cached pages.
     const [load_epoch, set_load_epoch] = useState(0);
@@ -331,6 +327,8 @@ export function App(): React.JSX.Element {
                     updateCsvEditingSupported: boolean;
                     updatePreviewMode: boolean;
                 };
+                // Compatibility-only adapters retained through Phase 6. Native
+                // workbookSnapshot messages bypass this synthetic translation.
                 const retained_header_result = (
                     projection_change: 'excelHeader' | undefined,
                     request_id: string | undefined,

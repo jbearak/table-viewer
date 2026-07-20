@@ -87,11 +87,11 @@ function workbook_snapshots(panel: { __messages: unknown[] }): CsvSnapshot['snap
     ));
 }
 
-function meta_reloads(panel: { __messages: unknown[] }) {
+function refresh_snapshots(panel: { __messages: unknown[] }) {
     return workbook_snapshots(panel).filter((snapshot) => snapshot.presentation === 'refresh');
 }
 
-function sheet_meta(panel: { __messages: unknown[] }) {
+function initial_snapshots(panel: { __messages: unknown[] }) {
     return workbook_snapshots(panel).filter((snapshot) => snapshot.presentation === 'initial');
 }
 
@@ -212,7 +212,7 @@ describe('CSV reload races', () => {
         await vscode_mock.__getWatchers()[0].__fireChange();
 
         expect(close_spy).toHaveBeenCalledTimes(1);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(2);
     });
@@ -244,7 +244,7 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
-        expect(sheet_meta(panel)[0]).toMatchObject({
+        expect(initial_snapshots(panel)[0]).toMatchObject({
             state: { pendingEdits: { '0:0': 'later' } },
         });
         expect(versioned.get_state(file_path).pendingEdits).toEqual({ '0:0': 'later' });
@@ -268,7 +268,7 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
-        expect(sheet_meta(panel)).toHaveLength(1);
+        expect(initial_snapshots(panel)).toHaveLength(1);
         expect(close_spy).not.toHaveBeenCalled();
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(1);
@@ -302,8 +302,8 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
-        expect(sheet_meta(panel)).toHaveLength(0);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(initial_snapshots(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(1);
@@ -339,7 +339,7 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
-        expect(sheet_meta(panel)).toHaveLength(0);
+        expect(initial_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
         panel.dispose();
     });
@@ -379,12 +379,12 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
 
-        expect(sheet_meta(panel)).toHaveLength(0);
+        expect(initial_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
         panel.dispose();
     });
 
-    it('CSV table ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
+    it('CSV table ignores an older reload and sends an initial snapshot when the newer reload is first delivery', async () => {
         const older = deferred<Uint8Array>();
         const newer = deferred<Uint8Array>();
         // Each candidate is read once to parse and once immediately before
@@ -409,10 +409,10 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         expect(workbook_snapshots(panel)).toHaveLength(0);
         await panel.__receive({ type: 'ready' });
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
@@ -434,7 +434,7 @@ describe('CSV reload races', () => {
         // The new adoption is installed before old-source cleanup; its snapshot
         // may already be posted even when closing the old source throws.
         expect(close_spy).toHaveBeenCalledTimes(1);
-        expect(meta_reloads(panel)).toHaveLength(1);
+        expect(refresh_snapshots(panel)).toHaveLength(1);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(2);
     });
@@ -453,7 +453,7 @@ describe('CSV reload races', () => {
 
         await vscode_mock.__getWatchers()[0].__fireChange();
 
-        expect(meta_reloads(panel)).toHaveLength(1);
+        expect(refresh_snapshots(panel)).toHaveLength(1);
         expect(close_spy).toHaveBeenCalledTimes(2);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(2);
@@ -493,7 +493,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/finalization-supersession.csv'), store);
         const panel = vscode_mock.__getPanels()[0];
         await panel.__receive({ type: 'ready' });
-        const initial = sheet_meta(panel)[0] as unknown as {
+        const initial = initial_snapshots(panel)[0] as unknown as {
             generation: number;
             sourceGeneration: number;
         };
@@ -504,7 +504,7 @@ describe('CSV reload races', () => {
         release_old();
         await old_reload;
 
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
         await panel.__receive({
             type: 'requestRows',
@@ -539,7 +539,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
         await vscode_mock.__getWatchers()[0].__fireChange();
 
-        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
+        expect(refresh_snapshots(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
     });
 
     it('ignores a delayed initial post after a newer initial adoption fails delivery', async () => {
@@ -576,19 +576,19 @@ describe('CSV reload races', () => {
         await ready;
 
         // The successful A post cannot make B initial/delivered. A same-digest B
-        // event must re-adopt and retry sheetMeta rather than deduplicating or
-        // switching prematurely to metaReload.
+        // event must re-adopt and retry the initial snapshot rather than
+        // deduplicating or switching prematurely to a refresh presentation.
         await watcher.__fireChange();
         expect(attempts).toEqual([
             { generation: 1, sourceGeneration: 1 },
             { generation: 1, sourceGeneration: 1 },
             { generation: 2, sourceGeneration: 2 },
         ]);
-        expect(sheet_meta(panel).at(-1)).toMatchObject({
+        expect(initial_snapshots(panel).at(-1)).toMatchObject({
             generation: 2,
             sourceGeneration: 2,
         });
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
     });
 
     it('counts the source re-adoption, not the failed initial metadata post', async () => {
@@ -598,7 +598,7 @@ describe('CSV reload races', () => {
         open_csv_table(uri('/tmp/initial-delivery.csv'));
         const panel = vscode_mock.__getPanels()[0];
         const original_post = panel.webview.postMessage.bind(panel.webview);
-        let sheet_meta_attempts = 0;
+        let initial_snapshots_attempts = 0;
         vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: unknown) => {
             if (
                 typeof message === 'object'
@@ -606,8 +606,8 @@ describe('CSV reload races', () => {
                 && 'type' in message
                 && message.type === 'workbookSnapshot'
             ) {
-                sheet_meta_attempts += 1;
-                if (sheet_meta_attempts === 1) return false;
+                initial_snapshots_attempts += 1;
+                if (initial_snapshots_attempts === 1) return false;
             }
             return original_post(message);
         });
@@ -615,13 +615,13 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
         await vi.advanceTimersByTimeAsync(50);
 
-        expect(sheet_meta_attempts).toBe(2);
-        expect(sheet_meta(panel)).toMatchObject([{
+        expect(initial_snapshots_attempts).toBe(2);
+        expect(initial_snapshots(panel)).toMatchObject([{
             sourceGeneration: 1,
             generation: 1,
         }]);
         await vscode_mock.__getWatchers()[0].__fireChange();
-        expect(sheet_meta_attempts).toBe(2);
+        expect(initial_snapshots_attempts).toBe(2);
         vi.useRealTimers();
     });
 
@@ -673,7 +673,7 @@ describe('CSV reload races', () => {
             { generation: 2, sourceGeneration: 2 },
             { generation: 3, sourceGeneration: 3 },
         ]);
-        expect(meta_reloads(panel).at(-1)).toMatchObject({
+        expect(refresh_snapshots(panel).at(-1)).toMatchObject({
             generation: 3,
             sourceGeneration: 3,
             meta: { sheets: [{ rowCount: 1 }] },
@@ -709,7 +709,7 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
 
         expect(reload_attempts).toBe(2);
-        expect(meta_reloads(panel)).toMatchObject([{
+        expect(refresh_snapshots(panel)).toMatchObject([{
             sourceGeneration: 2,
             generation: 2,
             meta: { sheets: [{ rowCount: 2 }] },
@@ -734,7 +734,7 @@ describe('CSV reload races', () => {
         await vscode_mock.__getWatchers()[0].__fireChange();
         await vi.advanceTimersByTimeAsync(50);
 
-        expect(meta_reloads(panel)).toMatchObject([{
+        expect(refresh_snapshots(panel)).toMatchObject([{
             meta: { sheets: [{ rowCount: 3 }] },
         }]);
         vi.useRealTimers();
@@ -764,7 +764,7 @@ describe('CSV reload races', () => {
         await vi.advanceTimersByTimeAsync(500);
 
         expect(stat_calls).toBe(6);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         vi.useRealTimers();
     });
 
@@ -785,7 +785,7 @@ describe('CSV reload races', () => {
         await vscode_mock.__getWatchers()[0].__fireChange();
 
         expect(close_spy).toHaveBeenCalledTimes(1);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
     });
 
     it('retries transient locked-file reload failures', async () => {
@@ -811,7 +811,7 @@ describe('CSV reload races', () => {
         await vi.advanceTimersByTimeAsync(50);
 
         expect(attempts).toBeGreaterThanOrEqual(3);
-        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
+        expect(refresh_snapshots(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
         vi.useRealTimers();
     });
 
@@ -839,10 +839,10 @@ describe('CSV reload races', () => {
         // Initial parse+verification, then four bounded watcher attempts that
         // are rejected by the first validation stat before another read.
         expect(reads).toBe(6);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
     });
 
-    it('CSV table sends sheetMeta when a watcher reload wins before initial ready completes', async () => {
+    it('CSV table sends an initial snapshot when a watcher reload wins before initial ready completes', async () => {
         const initial = deferred<Uint8Array>();
         const reload = deferred<Uint8Array>();
         const reads = [initial, reload, reload, initial];
@@ -862,14 +862,14 @@ describe('CSV reload races', () => {
         initial.resolve(enc.encode('h\nold\n'));
         await initial_ready;
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
-    it('CSV table still sends sheetMeta for a post-ready reload after a pre-ready reload completed', async () => {
+    it('CSV table still sends an initial snapshot for a post-ready reload after a pre-ready reload completed', async () => {
         const pre_ready_reload = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
         const reads = [
@@ -898,10 +898,10 @@ describe('CSV reload races', () => {
         post_ready_reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await post_ready_done;
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(1);
-        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
+        expect(refresh_snapshots(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
     });
 
     it('CSV table ignores and closes an initial ready load that completes after panel disposal', async () => {
@@ -919,12 +919,12 @@ describe('CSV reload races', () => {
         initial.resolve(enc.encode('h\nold\n'));
         await initial_ready;
 
-        expect(sheet_meta(panel)).toHaveLength(0);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(initial_snapshots(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
-    it('CSV preview ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
+    it('CSV preview ignores an older reload and sends an initial snapshot when the newer reload is first delivery', async () => {
         const older = deferred<Uint8Array>();
         const newer = deferred<Uint8Array>();
         // Each candidate is read once to parse and once immediately before
@@ -948,15 +948,15 @@ describe('CSV reload races', () => {
         const panel = vscode_mock.__getPanels()[0];
         expect(workbook_snapshots(panel)).toHaveLength(0);
         await panel.__receive({ type: 'ready' });
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
         expect(metas[0].previewMode).toBe(true);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
-    it('CSV preview sends sheetMeta with previewMode when a watcher reload wins before initial ready completes', async () => {
+    it('CSV preview sends an initial snapshot with previewMode when a watcher reload wins before initial ready completes', async () => {
         const initial = deferred<Uint8Array>();
         const reload = deferred<Uint8Array>();
         const reads = [initial, reload, reload, initial];
@@ -975,15 +975,15 @@ describe('CSV reload races', () => {
         initial.resolve(enc.encode('h\nold\n'));
         await flush_promises();
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
         expect(metas[0].previewMode).toBe(true);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 
-    it('CSV preview still sends sheetMeta for a post-ready reload after a pre-ready reload completed', async () => {
+    it('CSV preview still sends an initial snapshot for a post-ready reload after a pre-ready reload completed', async () => {
         const pre_ready_reload = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
         const reads = [
@@ -1013,11 +1013,11 @@ describe('CSV reload races', () => {
         await post_ready_done;
         await flush_promises();
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(1);
         expect(metas[0].previewMode).toBe(true);
-        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
+        expect(refresh_snapshots(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
     });
 
     it('CSV preview reuse ignores an old initial load that completes after the panel is reused', async () => {
@@ -1042,7 +1042,7 @@ describe('CSV reload races', () => {
         old_load.resolve(enc.encode('h\nold\n'));
         await old_ready;
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
         expect(close_spy).toHaveBeenCalledTimes(1);
@@ -1083,8 +1083,8 @@ describe('CSV reload races', () => {
         stale.resolve(enc.encode('h\nx\ny\nz\n'));                  // rowCount 3
         await reload_done;
 
-        const reloads = meta_reloads(panel);
-        // The save's metaReload (rowCount 2) must stand; the stale reload's
+        const reloads = refresh_snapshots(panel);
+        // The save's refresh snapshot (rowCount 2) must stand; the stale reload's
         // rowCount-3 result must never be adopted.
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 3)).toBe(false);
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 2)).toBe(true);
@@ -1116,7 +1116,7 @@ describe('CSV reload races', () => {
         current_mtime = 2;
         await vscode_mock.__getWatchers()[0].__fireChange();
 
-        const reloads = meta_reloads(panel);
+        const reloads = refresh_snapshots(panel);
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 5)).toBe(true);
     });
 
@@ -1154,7 +1154,7 @@ describe('CSV reload races', () => {
         await vi.advanceTimersByTimeAsync(50);
 
         expect(reload_attempts).toBe(2);
-        expect(meta_reloads(panel)).toMatchObject([{
+        expect(refresh_snapshots(panel)).toMatchObject([{
             sourceGeneration: 2,
             generation: 2,
         }]);
@@ -1193,7 +1193,7 @@ describe('CSV reload races', () => {
 
         watcher_bytes.resolve(enc.encode('h\na\nb\n'));
         await watcher_done;
-        expect(meta_reloads(panel)).toMatchObject([{
+        expect(refresh_snapshots(panel)).toMatchObject([{
             meta: { sheets: [{ rowCount: 2 }] },
         }]);
 
@@ -1336,10 +1336,10 @@ describe('CSV reload races', () => {
         await old_reload_done;
         await flush_promises();
 
-        const metas = sheet_meta(panel);
+        const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
 });
