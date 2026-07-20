@@ -4,6 +4,7 @@ import type {
     DurableFileAuthority,
     FileStateSnapshot,
 } from './state';
+import { same_authority } from './authority-order';
 import type { StoredPerFileState } from './types';
 
 export interface FinalizationDescriptor {
@@ -72,7 +73,7 @@ export async function reconcile_finalization(
         : inspected.snapshot.revision === descriptor.expectedStateRevision;
     if (
         !inspected.stagePresent
-        && equal(inspected.authority, expectedAuthority)
+        && same_authority(inspected.authority, expectedAuthority)
         && revisionMatches
         && equal(inspected.snapshot.state, expectedState)
     ) {
@@ -84,7 +85,7 @@ export async function reconcile_finalization(
     }
     if (
         inspected.stagePresent
-        && equal(inspected.authority, basisAuthority)
+        && same_authority(inspected.authority, basisAuthority)
         && inspected.snapshot.revision === descriptor.expectedStateRevision
         && equal(inspected.snapshot.state, descriptor.previousState)
     ) return { type: 'notCommitted' };

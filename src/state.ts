@@ -1,9 +1,9 @@
 import type { ExtensionContext } from 'vscode';
+import { compare_authority } from './authority-order';
 import type { PerFileState, StoredPerFileState } from './types';
 
 const STATE_KEY = 'tableViewer.fileState';
 const STATE_FORMAT = 'tableViewer.fileState.v1';
-const MAX_STAGES_PER_ENTRY = 8;
 const STALE_STAGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_MAX_STORED_FILES = 10_000;
 
@@ -13,23 +13,23 @@ export interface FileStateSnapshot {
 }
 
 export interface DurableFileAuthority {
-commitSequence: number;
-authorityRevision: number;
-physicalRevision: number;
-projectionRevision: number;
-physicalDigest?: string;
+    commitSequence: number;
+    authorityRevision: number;
+    physicalRevision: number;
+    projectionRevision: number;
+    physicalDigest?: string;
 }
 
 export type AuthorityTransactionKind = 'physical' | 'projection';
 
 export interface AuthorityTransactionStageInput {
-id: string;
-kind: AuthorityTransactionKind;
-ordinal: number;
-expectedStateRevision: number;
-expectedCommitSequence: number;
-nextState?: PerFileState;
-physicalDigest?: string;
+    id: string;
+    kind: AuthorityTransactionKind;
+    ordinal: number;
+    expectedStateRevision: number;
+    expectedCommitSequence: number;
+    nextState?: PerFileState;
+    physicalDigest?: string;
 }
 
 export type AuthorityTransactionStageResult =
@@ -50,6 +50,27 @@ export type FileStateCompareAndSetResult =
     | { type: 'committed'; snapshot: FileStateSnapshot }
     | { type: 'conflict'; snapshot: FileStateSnapshot };
 
+export interface FileStateLease {
+    release(): Promise<void>;
+}
+
+export type FileStateCopyResult =
+    | {
+        readonly type: 'copied';
+        readonly source: FileStateSnapshot;
+        readonly destination: FileStateSnapshot;
+    }
+    | {
+        readonly type: 'sourceAbsent';
+        readonly source: FileStateSnapshot;
+        readonly destination: FileStateSnapshot;
+    }
+    | {
+        readonly type: 'destinationExists';
+        readonly destination: FileStateSnapshot;
+    }
+    | { readonly type: 'unsupported' };
+
 export interface FileStateStore {
     read(file_path: string): Promise<FileStateSnapshot>;
     compare_and_set(
@@ -62,6 +83,19 @@ export interface FileStateStore {
         canonical_path: string,
         canonical_key: (file_path: string) => string,
     ): Promise<void>;
+    lease_entry?(
+        canonical_path: string,
+        canonical_key: (file_path: string) => string,
+        copy_from_if_absent?: string,
+        copy_id?: string,
+    ): Promise<FileStateLease>;
+    /** Atomically clone the complete persisted entry when destination is absent.
+     * The source remains untouched because legacy fsPath ownership is ambiguous. */
+    copy_entry_if_absent?(
+        source_path: string,
+        destination_path: string,
+        copy_id: string,
+    ): Promise<FileStateCopyResult>;
     touch(file_path: string): Promise<void>;
 }
 
@@ -92,6 +126,11 @@ interface PersistedEntry {
     state: StoredPerFileState;
     authority?: DurableFileAuthority;
     stages?: Record<string, PersistedAuthorityStage>;
+    copyProvenance?: {
+        id: string;
+        sourcePath: string;
+        sourceRevision: number;
+    };
 }
 
 interface PersistedStateEnvelope {
@@ -101,8 +140,22 @@ interface PersistedStateEnvelope {
     entries: Record<string, PersistedEntry>;
 }
 
+interface StateRuntime {
+    pending: Promise<unknown>;
+    readonly leases: Map<string, number>;
+}
+
 type LegacyStoredStateMap = Record<string, StoredPerFileState>;
-const pending_by_memento = new WeakMap<object, Promise<unknown>>();
+const runtime_by_memento = new WeakMap<object, StateRuntime>();
+
+function runtime_for(memento: object): StateRuntime {
+    let runtime = runtime_by_memento.get(memento);
+    if (!runtime) {
+        runtime = { pending: Promise.resolve(), leases: new Map() };
+        runtime_by_memento.set(memento, runtime);
+    }
+    return runtime;
+}
 
 function empty_authority(): DurableFileAuthority {
     return {
@@ -178,16 +231,145 @@ function ensure_entry(all: PersistedStateEnvelope, file_path: string): Persisted
     };
 }
 
-function evict_excess(all: PersistedStateEnvelope, max: number): void {
-    const keys = Object.keys(all.entries);
-    const count = keys.length - max;
-    if (count <= 0) return;
-    for (let index = 0; index < count; index++) delete all.entries[keys[index]];
-    all.absenceRevision = allocate_revision(all);
+function stages_are_live(entry: PersistedEntry, now: number): boolean {
+    return Object.values(entry.stages ?? {}).some((stage) => now - stage.createdAt <= STALE_STAGE_MS);
+}
+
+function trim_entries(
+    all: PersistedStateEnvelope,
+    runtime: StateRuntime,
+    max: number,
+    additionally_protected: ReadonlySet<string> = new Set(),
+    now = Date.now(),
+): boolean {
+    let changed = false;
+    for (const entry of Object.values(all.entries)) {
+        if (!entry.stages) continue;
+        for (const [id, stage] of Object.entries(entry.stages)) {
+            if (now - stage.createdAt > STALE_STAGE_MS) {
+                delete entry.stages[id];
+                delete entry.copyProvenance;
+                changed = true;
+            }
+        }
+        if (Object.keys(entry.stages).length === 0) delete entry.stages;
+    }
+    const ordinary = Object.keys(all.entries).filter((key) => (
+        !additionally_protected.has(key)
+        && (runtime.leases.get(key) ?? 0) === 0
+        && !stages_are_live(all.entries[key], now)
+    ));
+    const excess = ordinary.length - Math.max(1, max);
+    if (excess > 0) {
+        for (let index = 0; index < excess; index += 1) delete all.entries[ordinary[index]];
+        all.absenceRevision = allocate_revision(all);
+        changed = true;
+    }
+    return changed;
 }
 
 function states_equal(left: StoredPerFileState, right: StoredPerFileState): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function canonicalize_entries(
+    all: PersistedStateEnvelope,
+    canonical_path: string,
+    canonical_key: (file_path: string) => string,
+): boolean {
+    const aliases = Object.keys(all.entries).filter((key) => (
+        key !== canonical_path && canonical_key(key) === canonical_path
+    ));
+    if (aliases.length === 0) return false;
+    const keyed = [canonical_path, ...aliases]
+        .map((key) => ({ key, entry: all.entries[key] }))
+        .filter((candidate): candidate is { key: string; entry: PersistedEntry } => !!candidate.entry);
+    const winner = keyed.reduce((left, right) => {
+        const relation = compare_authority(
+            authority_for(left.entry),
+            authority_for(right.entry),
+        );
+        if (relation === 'dominates') return left;
+        if (relation === 'dominated') return right;
+        if (relation === 'divergent') {
+            throw new Error('Cannot canonicalize divergent durable file authority.');
+        }
+        if (right.entry.revision !== left.entry.revision) {
+            return right.entry.revision > left.entry.revision ? right : left;
+        }
+        if (right.key === canonical_path) return right;
+        return left;
+    });
+    all.entries[canonical_path] = structuredClone(winner.entry);
+    for (const alias of aliases) delete all.entries[alias];
+    all.absenceRevision = allocate_revision(all);
+    return true;
+}
+
+function copy_persisted_entry_if_absent(
+    all: PersistedStateEnvelope,
+    source_path: string,
+    destination_path: string,
+    copy_id: string,
+): { result: FileStateCopyResult; changed: boolean } {
+    const destination = all.entries[destination_path];
+    if (destination) {
+        if (
+            destination.copyProvenance?.id === copy_id
+            && destination.copyProvenance.sourcePath === source_path
+        ) {
+            return {
+                result: {
+                    type: 'copied',
+                    source: {
+                        state: structuredClone(destination.state),
+                        revision: destination.copyProvenance.sourceRevision,
+                    },
+                    destination: snapshot_for(all, destination_path),
+                },
+                changed: false,
+            };
+        }
+        return {
+            result: {
+                type: 'destinationExists',
+                destination: snapshot_for(all, destination_path),
+            },
+            changed: false,
+        };
+    }
+    const source = all.entries[source_path];
+    if (!source) {
+        return {
+            result: {
+                type: 'sourceAbsent',
+                source: snapshot_for(all, source_path),
+                destination: snapshot_for(all, destination_path),
+            },
+            changed: false,
+        };
+    }
+    const copied = structuredClone(source);
+    copied.revision = allocate_revision(all);
+    for (const stage of Object.values(copied.stages ?? {})) {
+        if (stage.expectedStateRevision === source.revision) {
+            stage.expectedStateRevision = copied.revision;
+        }
+    }
+    copied.copyProvenance = {
+        id: copy_id,
+        sourcePath: source_path,
+        sourceRevision: source.revision,
+    };
+    all.entries[destination_path] = copied;
+    return {
+        result: {
+            type: 'copied',
+            source: snapshot_for(all, source_path),
+            destination: snapshot_for(all, destination_path),
+        },
+        changed: true,
+    };
 }
 
 export function create_file_state_store(
@@ -196,10 +378,10 @@ export function create_file_state_store(
 ): AuthorityFileStateStore {
     const get_max = get_max_stored ?? (() => DEFAULT_MAX_STORED_FILES);
     const memento = context.globalState as object;
+    const runtime = runtime_for(memento);
     const enqueue = <T>(operation: () => Promise<T>): Promise<T> => {
-        const pending = pending_by_memento.get(memento) ?? Promise.resolve();
-        const result = pending.catch(() => {}).then(operation);
-        pending_by_memento.set(memento, result);
+        const result = runtime.pending.catch(() => {}).then(operation);
+        runtime.pending = result;
         return result;
     };
 
@@ -227,7 +409,7 @@ export function create_file_state_store(
                 };
                 delete all.entries[file_path];
                 all.entries[file_path] = entry;
-                evict_excess(all, get_max());
+                trim_entries(all, runtime, get_max());
                 await context.globalState.update(STATE_KEY, all);
                 return {
                     type: 'committed',
@@ -253,11 +435,8 @@ export function create_file_state_store(
                 ) return { type: 'conflict', snapshot: current, authority };
                 const stages = entry.stages ??= {};
                 stages[input.id] = stage;
-                const ordered = Object.values(stages)
-                    .sort((left, right) => left.createdAt - right.createdAt);
-                while (ordered.length > MAX_STAGES_PER_ENTRY) {
-                    delete stages[ordered.shift()!.id];
-                }
+                delete entry.copyProvenance;
+                trim_entries(all, runtime, get_max());
                 await context.globalState.update(STATE_KEY, all);
                 return { type: 'staged' };
             });
@@ -290,7 +469,7 @@ export function create_file_state_store(
                     if (stage.physicalDigest === undefined) {
                         delete (next_authority as { physicalDigest?: string }).physicalDigest;
                     } else {
-                        (next_authority as { physicalDigest?: string }).physicalDigest = stage.physicalDigest;
+                        next_authority.physicalDigest = stage.physicalDigest;
                     }
                 }
                 const next_state = stage.nextState ?? entry.state;
@@ -298,11 +477,12 @@ export function create_file_state_store(
                 entry.state = structuredClone(next_state);
                 if (state_changed) entry.revision = allocate_revision(all);
                 entry.authority = next_authority;
+                delete entry.copyProvenance;
                 delete entry.stages![stage_id];
                 if (Object.keys(entry.stages!).length === 0) delete entry.stages;
                 delete all.entries[file_path];
                 all.entries[file_path] = entry;
-                evict_excess(all, get_max());
+                trim_entries(all, runtime, get_max());
                 await context.globalState.update(STATE_KEY, all);
                 return {
                     type: 'finalized',
@@ -329,26 +509,18 @@ export function create_file_state_store(
                 const all = get_all_state(context);
                 const entry = all.entries[file_path];
                 if (!entry?.stages?.[stage_id]) return;
+                delete entry.copyProvenance;
                 delete entry.stages[stage_id];
                 if (Object.keys(entry.stages).length === 0) delete entry.stages;
+                trim_entries(all, runtime, get_max());
                 await context.globalState.update(STATE_KEY, all);
             });
         },
 
-        cleanup_authority_transactions(file_path, now = Date.now()) {
+        cleanup_authority_transactions(_file_path, now = Date.now()) {
             return enqueue(async () => {
                 const all = get_all_state(context);
-                const entry = all.entries[file_path];
-                if (!entry?.stages) return;
-                let changed = false;
-                for (const [id, stage] of Object.entries(entry.stages)) {
-                    if (now - stage.createdAt > STALE_STAGE_MS) {
-                        delete entry.stages[id];
-                        changed = true;
-                    }
-                }
-                if (!changed) return;
-                if (Object.keys(entry.stages).length === 0) delete entry.stages;
+                if (!trim_entries(all, runtime, get_max(), new Set(), now)) return;
                 await context.globalState.update(STATE_KEY, all);
             });
         },
@@ -356,30 +528,81 @@ export function create_file_state_store(
         canonicalize_path(canonical_path, canonical_key) {
             return enqueue(async () => {
                 const all = get_all_state(context);
-                const aliases = Object.keys(all.entries).filter((key) => (
-                    key !== canonical_path && canonical_key(key) === canonical_path
-                ));
-                if (aliases.length === 0) return;
-                const candidates = [canonical_path, ...aliases]
-                    .map((key) => all.entries[key])
-                    .filter((entry): entry is PersistedEntry => !!entry);
-                const durable = candidates.filter((entry) => (
-                    authority_for(entry).commitSequence > 0
-                ));
-                const winner = (durable.length > 0 ? durable : candidates)
-                    .reduce((left, right) => {
-                        if (durable.length > 0) {
-                            return authority_for(right).commitSequence
-                                > authority_for(left).commitSequence ? right : left;
-                        }
-                        return right.revision > left.revision ? right : left;
-                    });
-                const canonical = structuredClone(winner);
-                canonical.stages = undefined;
-                all.entries[canonical_path] = canonical;
-                for (const alias of aliases) delete all.entries[alias];
-                all.absenceRevision = allocate_revision(all);
+                const changed = canonicalize_entries(all, canonical_path, canonical_key);
+                const trimmed = trim_entries(
+                    all,
+                    runtime,
+                    get_max(),
+                    new Set([canonical_path]),
+                );
+                if (!changed && !trimmed) return;
                 await context.globalState.update(STATE_KEY, all);
+            });
+        },
+
+        lease_entry(canonical_path, canonical_key, copy_from_if_absent, copy_id) {
+            return enqueue(async () => {
+                const all = get_all_state(context);
+                let changed = canonicalize_entries(all, canonical_path, canonical_key);
+                if (copy_from_if_absent) {
+                    const copied = copy_persisted_entry_if_absent(
+                        all,
+                        copy_from_if_absent,
+                        canonical_path,
+                        copy_id ?? `lease:${copy_from_if_absent}:${canonical_path}`,
+                    );
+                    changed = copied.changed || changed;
+                }
+                const protected_paths = new Set([canonical_path]);
+                if (copy_from_if_absent) protected_paths.add(copy_from_if_absent);
+                const trimmed = trim_entries(
+                    all,
+                    runtime,
+                    get_max(),
+                    protected_paths,
+                );
+                if (changed || trimmed) await context.globalState.update(STATE_KEY, all);
+                runtime.leases.set(canonical_path, (runtime.leases.get(canonical_path) ?? 0) + 1);
+                let released = false;
+                let release_promise: Promise<void> | undefined;
+                return {
+                    release(): Promise<void> {
+                        if (release_promise) return release_promise;
+                        release_promise = enqueue(async () => {
+                            if (released) return;
+                            released = true;
+                            const count = runtime.leases.get(canonical_path) ?? 0;
+                            if (count <= 1) runtime.leases.delete(canonical_path);
+                            else runtime.leases.set(canonical_path, count - 1);
+                            const current = get_all_state(context);
+                            if (!trim_entries(current, runtime, get_max())) return;
+                            await context.globalState.update(STATE_KEY, current);
+                        });
+                        return release_promise;
+                    },
+                };
+            });
+        },
+
+        copy_entry_if_absent(source_path, destination_path, copy_id) {
+            return enqueue(async () => {
+                const all = get_all_state(context);
+                const copied = copy_persisted_entry_if_absent(
+                    all,
+                    source_path,
+                    destination_path,
+                    copy_id,
+                );
+                const trimmed = trim_entries(
+                    all,
+                    runtime,
+                    get_max(),
+                    new Set([source_path, destination_path]),
+                );
+                if (copied.changed || trimmed) {
+                    await context.globalState.update(STATE_KEY, all);
+                }
+                return copied.result;
             });
         },
 
@@ -387,10 +610,14 @@ export function create_file_state_store(
             return enqueue(async () => {
                 const all = get_all_state(context);
                 const current = all.entries[file_path];
-                if (!current) return;
-                delete all.entries[file_path];
-                all.entries[file_path] = current;
-                await context.globalState.update(STATE_KEY, all);
+                let changed = false;
+                if (current) {
+                    delete all.entries[file_path];
+                    all.entries[file_path] = current;
+                    changed = true;
+                }
+                changed = trim_entries(all, runtime, get_max()) || changed;
+                if (changed) await context.globalState.update(STATE_KEY, all);
             });
         },
     };

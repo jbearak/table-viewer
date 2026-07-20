@@ -16,16 +16,27 @@ import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
  * old `open_csv_table` entry point: create a mock panel, attach the editable
  * CSV profile, and route disposal the way the custom-editor host does.
  */
+const default_state_stores = new Map<string, AuthorityFileStateStore>();
+
 function open_csv_table(
     file_uri: vscode.Uri,
-    store: AuthorityFileStateStore = state_store(),
+    store?: AuthorityFileStateStore,
     profile = csv_table_profile(),
 ) {
+    let resolved_store = store;
+    if (!resolved_store) {
+        const key = file_uri.toString();
+        resolved_store = default_state_stores.get(key);
+        if (!resolved_store) {
+            resolved_store = state_store();
+            default_state_stores.set(key, resolved_store);
+        }
+    }
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         file_uri,
-        store,
+        resolved_store,
         profile,
     );
     panel.onDidDispose(() => controller.dispose());
@@ -107,6 +118,7 @@ function initial_snapshots(panel: { __messages: unknown[] }) {
 }
 
 beforeEach(() => {
+    default_state_stores.clear();
     dispose_csv_preview();
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
     vi.restoreAllMocks();
@@ -306,16 +318,17 @@ describe('CSV reload races', () => {
         };
         const first = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'first');
         const second = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'second');
+        const shared_store = state_store();
         const first_controller = attach_viewer(
             first as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/shared-parser.csv'),
-            state_store(),
+            shared_store,
             failing_profile,
         );
         const second_controller = attach_viewer(
             second as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/shared-parser.csv'),
-            state_store(),
+            shared_store,
             csv_table_profile(),
         );
         await first.__receive({ type: 'ready' });
@@ -357,16 +370,17 @@ describe('CSV reload races', () => {
         };
         const stalled_panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'stalled');
         const healthy_panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'healthy');
+        const shared_store = state_store();
         const stalled_controller = attach_viewer(
             stalled_panel as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/stalled-shared.csv'),
-            state_store(),
+            shared_store,
             stalling_profile,
         );
         const healthy_controller = attach_viewer(
             healthy_panel as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/stalled-shared.csv'),
-            state_store(),
+            shared_store,
             csv_table_profile(),
         );
         await stalled_panel.__receive({ type: 'ready' });
@@ -495,6 +509,53 @@ describe('CSV reload races', () => {
         expect(close_spy).not.toHaveBeenCalled();
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('recovers when successful finalization is followed by a transient inspect failure', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        let injected = false;
+        let fail_inspect = false;
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                const local = await base.finalize_authority_transaction(path, id);
+                if (local.type === 'finalized' && !injected && id.startsWith('physical:')) {
+                    injected = true;
+                    const current = await base.read(path);
+                    await base.stage_authority_transaction(path, {
+                        id: 'post-finalize-sequence',
+                        kind: 'physical',
+                        ordinal: 999,
+                        expectedStateRevision: current.revision,
+                        expectedCommitSequence: local.authority.commitSequence,
+                        physicalDigest: local.authority.physicalDigest,
+                    });
+                    await base.finalize_authority_transaction(path, 'post-finalize-sequence');
+                    fail_inspect = true;
+                }
+                return local;
+            },
+            async inspect_authority_transaction(path, id) {
+                if (fail_inspect && id.startsWith('physical:')) {
+                    fail_inspect = false;
+                    throw new Error('transient inspect failure');
+                }
+                return base.inspect_authority_transaction(path, id);
+            },
+        };
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.length, mtime: bytes.length }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+
+        open_csv_table(uri('/tmp/post-finalize-inspect.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(initial_snapshots(panel)).toHaveLength(1));
+
+        bytes = enc.encode('h\na\nb\n');
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(refresh_snapshots(panel)).toHaveLength(1));
     });
 
     it('never transfers a candidate after advanced finalization reconciliation', async () => {
@@ -1403,9 +1464,10 @@ describe('CSV reload races', () => {
             bytes = new Uint8Array(content);
         });
 
-        const owner = open_csv_table(uri(file_path));
-        const peer = open_csv_table(uri(file_path));
-        show_csv_preview(uri(file_path), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Beside));
+        const shared_store = state_store();
+        const owner = open_csv_table(uri(file_path), shared_store);
+        const peer = open_csv_table(uri(file_path), shared_store);
+        show_csv_preview(uri(file_path), uri('/ext'), shared_store, view_column(vscode_mock.ViewColumn.Beside));
         const preview = vscode_mock.__getPanels()[2];
         await owner.__receive({ type: 'ready' });
         await peer.__receive({ type: 'ready' });
@@ -1468,14 +1530,15 @@ describe('CSV reload races', () => {
         vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
             bytes = new Uint8Array(content);
         });
-        const owner = open_csv_table(uri(file_path), state_store(), {
+        const shared_store = state_store();
+        const owner = open_csv_table(uri(file_path), shared_store, {
             editing: true,
             async build_source(raw, path) {
                 owner_builds += 1;
                 return build_csv_source(raw, path);
             },
         });
-        const peer = open_csv_table(uri(file_path), state_store(), {
+        const peer = open_csv_table(uri(file_path), shared_store, {
             editing: false,
             async build_source(raw, path) {
                 peer_builds += 1;

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ExtensionContext } from 'vscode';
+import { compare_authority } from '../authority-order';
 import { create_file_state_store } from '../state';
 
 function context_with(initial: unknown) {
@@ -146,6 +147,219 @@ describe('FileStateStore versioned state', () => {
         });
     });
 
+    it('rejects divergent alias authority without overwriting either complete entry', async () => {
+        const alias = 'C:\\Data\\Divergent.xlsx';
+        const canonical = 'c:\\data\\divergent.xlsx';
+        const backing = context_with({
+            format: 'tableViewer.fileState.v1',
+            nextRevision: 30,
+            absenceRevision: 0,
+            entries: {
+                [alias]: {
+                    revision: 20,
+                    state: { activeSheetIndex: 6 },
+                    authority: {
+                        commitSequence: 6,
+                        authorityRevision: 1,
+                        physicalRevision: 1,
+                        projectionRevision: 0,
+                        physicalDigest: 'A',
+                    },
+                },
+                [canonical]: {
+                    revision: 21,
+                    state: { activeSheetIndex: 5 },
+                    authority: {
+                        commitSequence: 5,
+                        authorityRevision: 5,
+                        physicalRevision: 5,
+                        projectionRevision: 0,
+                        physicalDigest: 'B',
+                    },
+                },
+            },
+        });
+        const store = create_file_state_store(backing.context);
+
+        await expect(store.canonicalize_path!(canonical, (key) => key.toLowerCase()))
+            .rejects.toThrow('Cannot canonicalize divergent durable file authority.');
+
+        expect((await store.read(alias)).state).toEqual({ activeSheetIndex: 6 });
+        expect(await store.read_authority(alias)).toMatchObject({
+            commitSequence: 6,
+            physicalRevision: 1,
+            physicalDigest: 'A',
+        });
+        expect((await store.read(canonical)).state).toEqual({ activeSheetIndex: 5 });
+        expect(await store.read_authority(canonical)).toMatchObject({
+            commitSequence: 5,
+            physicalRevision: 5,
+            physicalDigest: 'B',
+        });
+    });
+
+    it('copies a complete legacy entry into a provider key without deleting the source', async () => {
+        const legacy = '/same/provider.xlsx';
+        const provider = 'tableViewer.resource.v1:["memfs","workspace","/provider.xlsx",""]';
+        const backing = context_with({
+            format: 'tableViewer.fileState.v1',
+            nextRevision: 8,
+            absenceRevision: 0,
+            entries: {
+                [legacy]: {
+                    revision: 4,
+                    state: { activeSheetIndex: 3 },
+                    authority: {
+                        commitSequence: 2,
+                        authorityRevision: 1,
+                        physicalRevision: 1,
+                        projectionRevision: 0,
+                        physicalDigest: 'legacy-digest',
+                    },
+                    stages: {
+                        recovery: {
+                            id: 'recovery', kind: 'physical', ordinal: 3,
+                            expectedStateRevision: 4, expectedCommitSequence: 2,
+                            physicalDigest: 'next-digest', createdAt: Date.now(),
+                        },
+                    },
+                },
+            },
+        });
+        const store = create_file_state_store(backing.context);
+        await expect(store.copy_entry_if_absent!(legacy, provider, 'provider-copy'))
+            .resolves.toMatchObject({
+                type: 'copied',
+                source: { revision: 4 },
+                destination: { revision: 8 },
+            });
+        await expect(store.copy_entry_if_absent!(legacy, provider, 'provider-copy'))
+            .resolves.toMatchObject({
+                type: 'copied',
+                source: { revision: 4 },
+                destination: { revision: 8 },
+            });
+        await expect(store.copy_entry_if_absent!(legacy, provider, 'unrelated-copy'))
+            .resolves.toMatchObject({
+                type: 'destinationExists',
+                destination: { revision: 8 },
+            });
+
+        expect(backing.value().entries[provider]).toMatchObject({
+            revision: 8,
+            state: { activeSheetIndex: 3 },
+            authority: backing.value().entries[legacy].authority,
+            stages: {
+                recovery: { expectedStateRevision: 8 },
+            },
+            copyProvenance: {
+                id: 'provider-copy',
+                sourcePath: legacy,
+                sourceRevision: 4,
+            },
+        });
+        expect(await store.read_authority(provider)).toMatchObject({
+            commitSequence: 2,
+            physicalDigest: 'legacy-digest',
+        });
+        expect((await store.inspect_authority_transaction(provider, 'recovery')).stagePresent)
+            .toBe(true);
+        await expect(store.finalize_authority_transaction(provider, 'recovery'))
+            .resolves.toMatchObject({
+                type: 'finalized',
+                authority: {
+                    commitSequence: 3,
+                    physicalRevision: 2,
+                    physicalDigest: 'next-digest',
+                },
+            });
+
+        const atomic_provider = `${provider}:atomic`;
+        const lease = await store.lease_entry!(
+            atomic_provider,
+            (key) => key,
+            legacy,
+            'lease-copy',
+        );
+        expect(backing.value().entries[atomic_provider]).toMatchObject({
+            revision: 9,
+            state: { activeSheetIndex: 3 },
+            authority: backing.value().entries[legacy].authority,
+            stages: {
+                recovery: { expectedStateRevision: 9 },
+            },
+            copyProvenance: {
+                id: 'lease-copy',
+                sourcePath: legacy,
+                sourceRevision: 4,
+            },
+        });
+        expect(backing.value().entries[legacy]).toBeDefined();
+        await lease.release();
+    });
+
+    it('allocates a destination revision that fences pre-copy absence CAS', async () => {
+        const source = '/legacy-revision-zero.xlsx';
+        const destination = '/provider-revision-fence.xlsx';
+        const backing = context_with({
+            format: 'tableViewer.fileState.v1',
+            nextRevision: 1,
+            absenceRevision: 0,
+            entries: {
+                [source]: {
+                    revision: 0,
+                    state: { activeSheetIndex: 4 },
+                },
+            },
+        });
+        const store = create_file_state_store(backing.context);
+        const stale_destination = await store.read(destination);
+        expect(stale_destination.revision).toBe(0);
+
+        await expect(store.copy_entry_if_absent!(source, destination, 'revision-fence-copy'))
+            .resolves.toMatchObject({
+                type: 'copied',
+                source: { revision: 0 },
+                destination: { revision: 1 },
+            });
+        await expect(store.compare_and_set(
+            destination,
+            stale_destination.revision,
+            { activeSheetIndex: 9 },
+        )).resolves.toMatchObject({
+            type: 'conflict',
+            snapshot: {
+                revision: 1,
+                state: { activeSheetIndex: 4 },
+            },
+        });
+    });
+
+    it('does not materialize a destination when an atomic copy source is absent', async () => {
+        const backing = context_with({});
+        const store = create_file_state_store(backing.context);
+
+        await expect(store.copy_entry_if_absent!(
+            '/absent-source.xlsx',
+            '/absent-destination.xlsx',
+            'absent-copy',
+        )).resolves.toMatchObject({
+            type: 'sourceAbsent',
+            source: { state: {}, revision: 0 },
+            destination: { state: {}, revision: 0 },
+        });
+
+        expect(backing.value().entries?.['/absent-destination.xlsx']).toBeUndefined();
+        await store.compare_and_set('/absent-source.xlsx', 0, { activeSheetIndex: 3 });
+        await expect(store.copy_entry_if_absent!(
+            '/absent-source.xlsx',
+            '/absent-destination.xlsx',
+            'later-copy',
+        )).resolves.toMatchObject({ type: 'copied' });
+        expect((await store.read('/absent-destination.xlsx')).state)
+            .toEqual({ activeSheetIndex: 3 });
+    });
+
     it('discovers a lone legacy alias during canonicalization', async () => {
         const store = create_file_state_store(context_with({}).context);
         await store.compare_and_set('C:\\Data\\Legacy.xlsx', 0, { activeSheetIndex: 4 });
@@ -205,7 +419,7 @@ describe('FileStateStore versioned state', () => {
         expect(await reopened.read_authority!('/book')).toEqual(finalized.authority);
     });
 
-    it('bounds and cleans abandoned invisible stages without semantic revision changes', async () => {
+    it('keeps fresh invisible stages and cleans them without semantic revision changes', async () => {
         const backing = context_with({});
         const store = create_file_state_store(backing.context);
         for (let index = 0; index < 10; index++) {
@@ -218,7 +432,7 @@ describe('FileStateStore versioned state', () => {
                 physicalDigest: String(index),
             });
         }
-        expect(Object.keys(backing.value().entries['/book'].stages)).toHaveLength(8);
+        expect(Object.keys(backing.value().entries['/book'].stages)).toHaveLength(10);
         expect(await store.read('/book')).toEqual({ state: {}, revision: 0 });
         await store.cleanup_authority_transactions!(
             '/book',
@@ -254,6 +468,62 @@ describe('FileStateStore versioned state', () => {
                 projectionRevision: 0,
             },
         });
+    });
+
+    it('orders complete authority vectors without rejecting sequence-only advances', () => {
+        const basis = {
+            commitSequence: 4,
+            authorityRevision: 3,
+            physicalRevision: 2,
+            projectionRevision: 1,
+            physicalDigest: 'same',
+        };
+        expect(compare_authority({ ...basis, commitSequence: 5 }, basis)).toBe('dominates');
+        expect(compare_authority(basis, { ...basis, commitSequence: 5 })).toBe('dominated');
+        expect(compare_authority({
+            ...basis,
+            commitSequence: 5,
+            physicalRevision: 1,
+        }, basis)).toBe('divergent');
+        expect(compare_authority({ ...basis, physicalDigest: 'other' }, basis)).toBe('divergent');
+        expect(compare_authority(basis, structuredClone(basis))).toBe('equal');
+    });
+
+    it('keeps live leased entries through LRU churn and evicts them after release', async () => {
+        const backing = context_with({});
+        const store = create_file_state_store(backing.context, () => 1);
+        const lease = await store.lease_entry!('/live', (key) => key);
+        await store.compare_and_set('/live', 0, { activeSheetIndex: 1 });
+        await store.compare_and_set('/old', 0, { activeSheetIndex: 2 });
+        const newest = await store.read('/new');
+        await store.compare_and_set('/new', newest.revision, { activeSheetIndex: 3 });
+
+        expect(Object.keys(backing.value().entries)).toEqual(['/live', '/new']);
+        expect((await store.read('/live')).state).toEqual({ activeSheetIndex: 1 });
+        await lease.release();
+        expect(Object.keys(backing.value().entries)).toEqual(['/new']);
+    });
+
+    it('keeps a fresh recovery stage non-evictable through LRU churn', async () => {
+        const backing = context_with({});
+        const store = create_file_state_store(backing.context, () => 1);
+        await store.stage_authority_transaction('/recovery', {
+            id: 'recovery-stage',
+            kind: 'physical',
+            ordinal: 1,
+            expectedStateRevision: 0,
+            expectedCommitSequence: 0,
+            physicalDigest: 'recovered',
+        });
+        await store.compare_and_set('/old', 0, { activeSheetIndex: 1 });
+        const newest = await store.read('/new');
+        await store.compare_and_set('/new', newest.revision, { activeSheetIndex: 2 });
+
+        expect(Object.keys(backing.value().entries)).toEqual(['/recovery', '/new']);
+        const inspection = await store.inspect_authority_transaction('/recovery', 'recovery-stage');
+        expect(inspection.stagePresent).toBe(true);
+        expect((await store.finalize_authority_transaction('/recovery', 'recovery-stage')).type)
+            .toBe('finalized');
     });
 
     it('leaves old visible state and authority when finalization update fails', async () => {
@@ -411,9 +681,11 @@ describe('FileStateStore versioned state', () => {
             'canonicalize_path',
             'cleanup_authority_transactions',
             'compare_and_set',
+            'copy_entry_if_absent',
             'discard_authority_transaction',
             'finalize_authority_transaction',
             'inspect_authority_transaction',
+            'lease_entry',
             'read',
             'read_authority',
             'stage_authority_transaction',

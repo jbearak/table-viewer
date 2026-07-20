@@ -17,9 +17,9 @@ import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type {
     AuthorityFileStateStore,
-    DurableFileAuthority,
     FileStateSnapshot,
 } from './state';
+import { compare_authority, same_authority } from './authority-order';
 import {
     discard_authority,
     finalize_authority,
@@ -136,19 +136,14 @@ function same_file_authority_basis(
     left: FileAuthoritySnapshot,
     right: FileAuthoritySnapshot,
 ): boolean {
-    return left.fileKey === right.fileKey
-        && left.commitSequence === right.commitSequence
-        && left.authorityRevision === right.authorityRevision
-        && left.physicalRevision === right.physicalRevision
-        && left.projectionRevision === right.projectionRevision
-        && left.physicalDigest === right.physicalDigest;
+    return left.fileKey === right.fileKey && same_authority(left, right);
 }
 
-function same_durable_authority(
-    left: DurableFileAuthority,
-    right: DurableFileAuthority,
+function same_semantic_authority_basis(
+    left: FileAuthoritySnapshot,
+    right: FileAuthoritySnapshot,
 ): boolean {
-    return left.commitSequence === right.commitSequence
+    return left.fileKey === right.fileKey
         && left.authorityRevision === right.authorityRevision
         && left.physicalRevision === right.physicalRevision
         && left.projectionRevision === right.projectionRevision
@@ -211,7 +206,7 @@ export function attach_viewer(
     const file_path = uri.fsPath;
     const disposables: vscode.Disposable[] = [];
     const durable_state_store = state_store;
-    const file_coordinator = acquire_file_coordinator(file_path, durable_state_store);
+    const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
     let file_edit_state = profile.editing
@@ -311,6 +306,30 @@ export function attach_viewer(
         },
     });
 
+    const abort_setup = (error: unknown): never => {
+        disposed = true;
+        const cleanup = (action: () => void) => {
+            try {
+                action();
+            } catch {
+                // Preserve the setup failure while completing best-effort teardown.
+            }
+        };
+        cleanup(() => session.dispose());
+        for (const disposable of [...disposables].reverse()) {
+            cleanup(() => disposable.dispose());
+        }
+        cleanup(() => file_coordinator.dispose());
+        if (file_edit_state) {
+            file_edit_state.attachments = Math.max(0, file_edit_state.attachments - 1);
+            if (
+                file_edit_state.attachments === 0
+                && file_edit_state.phase.type === 'free'
+            ) csv_edit_file_states.delete(file_key);
+        }
+        throw error;
+    };
+
     if (file_edit_state) {
         const edit_state_subscriber: CsvEditStateSubscriber = (snapshot) => {
             if (disposed) return;
@@ -327,10 +346,16 @@ export function attach_viewer(
 
     // Subscribe before the panel can become ready. Coordinator events may build
     // and install a panel-local source pre-ready; PanelSession defers delivery.
-    const refresh_subscription = file_coordinator.subscribe_refresh(
-        refresh_from_event,
-        vscode_file_refresh_watcher_factory,
-    );
+    const refresh_subscription = (() => {
+        try {
+            return file_coordinator.subscribe_refresh(
+                refresh_from_event,
+                vscode_file_refresh_watcher_factory,
+            );
+        } catch (error) {
+            return abort_setup(error);
+        }
+    })();
     disposables.push(refresh_subscription);
 
     function edit_phase(): CsvEditFilePhase {
@@ -689,25 +714,27 @@ export function attach_viewer(
                 );
                 if (staged.type === 'conflict') {
                     const current_authority = file_coordinator.authority();
-                    if (same_durable_authority(staged.authority, current_authority)) {
-                        continue;
-                    }
-                    const observation_turn = await file_coordinator.request_commit_turn(token);
-                    if (observation_turn.type === 'granted') {
-                        if (same_durable_authority(
-                            file_coordinator.authority(),
-                            current_authority,
-                        )) {
-                            file_coordinator.observe_advanced_authority(
-                                token,
-                                observation_turn.turn,
-                                staged.authority,
-                            );
-                        } else {
-                            file_coordinator.release_commit_turn(observation_turn.turn);
+                    const relation = compare_authority(staged.authority, current_authority);
+                    if (relation === 'equal') continue;
+                    if (relation === 'dominates') {
+                        const observation_turn = await file_coordinator.request_commit_turn(token);
+                        if (observation_turn.type === 'granted') {
+                            if (same_authority(
+                                file_coordinator.authority(),
+                                current_authority,
+                            )) {
+                                file_coordinator.observe_advanced_authority(
+                                    token,
+                                    observation_turn.turn,
+                                    staged.authority,
+                                );
+                            } else {
+                                file_coordinator.release_commit_turn(observation_turn.turn);
+                            }
                         }
+                        return { type: 'advanced' };
                     }
-                    return { type: 'advanced' };
+                    return { type: 'rejected' };
                 }
                 const requested = await file_coordinator.request_commit_turn(token);
                 if (requested.type === 'rejected') return { type: 'rejected' };
@@ -748,26 +775,36 @@ export function attach_viewer(
                                 token,
                                 requested.turn,
                                 reconciled,
+                                finalizationBasis,
                             ),
                         };
                     }
                     if (reconciled.type === 'advanced') {
-                        file_coordinator.observe_advanced_authority(
-                            token,
-                            requested.turn,
+                        const relation = compare_authority(
                             reconciled.authority,
+                            file_coordinator.authority(),
                         );
-                        return { type: 'advanced' };
+                        if (relation === 'dominates') {
+                            file_coordinator.observe_advanced_authority(
+                                token,
+                                requested.turn,
+                                reconciled.authority,
+                            );
+                            return { type: 'advanced' };
+                        }
+                        file_coordinator.release_commit_turn(requested.turn);
+                        return { type: 'rejected' };
                     }
                     file_coordinator.release_commit_turn(requested.turn);
                     void discard_authority(durable_state_store, state_path, token.id);
                     throw error;
                 }
                 if (finalized.type === 'conflict') {
-                    if (!same_durable_authority(
+                    const relation = compare_authority(
                         finalized.authority,
                         finalizationBasis,
-                    )) {
+                    );
+                    if (relation === 'dominates') {
                         file_coordinator.observe_advanced_authority(
                             token,
                             requested.turn,
@@ -776,7 +813,42 @@ export function attach_viewer(
                         return { type: 'advanced' };
                     }
                     file_coordinator.release_commit_turn(requested.turn);
-                    continue;
+                    if (relation === 'equal') continue;
+                    return { type: 'rejected' };
+                }
+                let inspected;
+                try {
+                    inspected = await durable_state_store.inspect_authority_transaction(
+                        state_path,
+                        token.id,
+                    );
+                } catch {
+                    file_coordinator.observe_advanced_authority(
+                        token,
+                        requested.turn,
+                        finalized.authority,
+                    );
+                    return { type: 'advanced' };
+                }
+                const inspected_relation = compare_authority(
+                    inspected.authority,
+                    finalized.authority,
+                );
+                if (inspected_relation === 'dominates') {
+                    file_coordinator.observe_advanced_authority(
+                        token,
+                        requested.turn,
+                        inspected.authority,
+                    );
+                    return { type: 'advanced' };
+                }
+                if (inspected_relation !== 'equal') {
+                    file_coordinator.observe_advanced_authority(
+                        token,
+                        requested.turn,
+                        finalized.authority,
+                    );
+                    return { type: 'advanced' };
                 }
                 return {
                     type: 'committed',
@@ -784,6 +856,7 @@ export function attach_viewer(
                         token,
                         requested.turn,
                         finalized,
+                        finalizationBasis,
                     ),
                 };
             }
@@ -911,8 +984,8 @@ export function attach_viewer(
                         continue;
                     }
                     if (
-                        receipt.resultingBasis.authorityRevision
-                            < source_authority.authorityRevision
+                        compare_authority(receipt.resultingBasis, source_authority)
+                            === 'dominated'
                     ) {
                         if (is_origin) {
                             session.retain_command_result({
@@ -927,6 +1000,15 @@ export function attach_viewer(
                     const exact_basis = same_file_authority_basis(
                         source_authority,
                         receipt.previousBasis,
+                    ) || (
+                        same_semantic_authority_basis(
+                            source_authority,
+                            receipt.previousBasis,
+                        )
+                        && compare_authority(
+                            receipt.previousBasis,
+                            source_authority,
+                        ) === 'dominates'
                     );
                     const current_adoption = session.current_adoption();
                     if (
@@ -1022,9 +1104,13 @@ export function attach_viewer(
         queueMicrotask(process_excel_header_receipts);
     }
 
-    disposables.push(file_coordinator.subscribe_excel_headers(
-        enqueue_excel_header_receipt,
-    ));
+    try {
+        disposables.push(file_coordinator.subscribe_excel_headers(
+            enqueue_excel_header_receipt,
+        ));
+    } catch (error) {
+        return abort_setup(error);
+    }
 
     // CSV pending-edit persistence deliberately remains on FileStateStore's CAS
     // queue in this phase. Edit-session ownership is separate from file authority;
@@ -1336,7 +1422,12 @@ export function attach_viewer(
             seq: supersede_panel_load(),
             refreshEvent: event,
         };
-        return run_physical_refresh(request, false, 'fileReload');
+        const projection_recovery = event.reason === 'projectionRecovery';
+        return run_physical_refresh(
+            request,
+            projection_recovery,
+            projection_recovery ? 'recovery' : 'fileReload',
+        );
     }
 
     async function send_initial_data(): Promise<void> {
@@ -1599,7 +1690,8 @@ export function attach_viewer(
         });
     }
 
-    disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
+    try {
+        disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
         if (disposed) return;
         if (
             msg.type !== 'ready'
@@ -1761,6 +1853,7 @@ export function attach_viewer(
 
                 const command_source = source;
                 const expected_physical_revision = source_authority.physicalRevision;
+                const expected_physical_digest = source_authority.physicalDigest;
                 const result = await file_coordinator.commit_excel_header({
                     requestId: msg.requestId,
                     sheetIndex: msg.sheetIndex,
@@ -1768,10 +1861,18 @@ export function attach_viewer(
                     override: msg.enabled ? 'on' : 'off',
                     originToken: excel_header_subscriber_token,
                     expectedPhysicalRevision: expected_physical_revision,
+                    expectedPhysicalDigest: expected_physical_digest,
                     planningInput: command_source.planning_input(),
                     stateStore: durable_state_store,
                 });
-                if (result.type === 'rejected' && !disposed) {
+                if (result.type === 'indeterminate' && !disposed) {
+                    session.retain_command_result({
+                        type: 'excelFirstRowHeader',
+                        requestId: msg.requestId,
+                        outcome: 'recovered',
+                        error: result.error,
+                    });
+                } else if (result.type === 'rejected' && !disposed) {
                     fail(result.error);
                 }
                 return;
@@ -1961,7 +2062,10 @@ export function attach_viewer(
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
         }
-    }));
+        }));
+    } catch (error) {
+        return abort_setup(error);
+    }
 
     return {
         dispose() {

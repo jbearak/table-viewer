@@ -6,6 +6,7 @@ import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { file_coordinator_registry_size } from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
@@ -1365,6 +1366,60 @@ describe('CSV edit sessions', () => {
         expect(edit_session_results(second)).toEqual([
             { type: 'editSessionResult', granted: false },
         ]);
+    });
+
+    it('rolls back coordinator, edit attachment, and lease when watcher setup fails', async () => {
+        const registry_before = file_coordinator_registry_size();
+        const versioned = state_store();
+        const release = vi.fn(async () => {});
+        const store: FileStateStore = {
+            ...versioned.store,
+            async lease_entry() { return { release }; },
+        };
+        vscode_mock.__setWatcherRegistrationFailure('create');
+        expect(() => open_csv_table(uri('/tmp/setup-failure.csv'), store))
+            .toThrow('watch create registration failed');
+        vscode_mock.__setWatcherRegistrationFailure(undefined);
+        await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+        expect(file_coordinator_registry_size()).toBe(registry_before);
+
+        const panel = open_csv_table(uri('/tmp/setup-failure.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        expect(edit_session_results(panel).at(-1)).toEqual({
+            type: 'editSessionResult', granted: true,
+        });
+        panel.dispose();
+        await vi.waitFor(() => expect(file_coordinator_registry_size()).toBe(registry_before));
+    });
+
+    it('isolates edit ownership for provider resources sharing one fsPath', async () => {
+        const state = state_store();
+        const first_uri = vscode_mock.Uri.from({
+            scheme: 'memfs', authority: 'workspace-a', path: '/session.csv',
+            query: '', fragment: '', fsPath: '/same/session.csv',
+        }) as unknown as vscode.Uri;
+        const second_uri = vscode_mock.Uri.from({
+            scheme: 'memfs', authority: 'workspace-b', path: '/session.csv',
+            query: '', fragment: '', fsPath: '/same/session.csv',
+        }) as unknown as vscode.Uri;
+        const first = open_csv_table(first_uri, state.store);
+        const second = open_csv_table(second_uri, state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+
+        await first.__receive({ type: 'requestEditSession' } as never);
+        await second.__receive({ type: 'requestEditSession' } as never);
+        expect(edit_session_results(first).at(-1)).toEqual({
+            type: 'editSessionResult', granted: true,
+        });
+        expect(edit_session_results(second).at(-1)).toEqual({
+            type: 'editSessionResult', granted: true,
+        });
+        expect(latest_snapshot(first).identity.authority.fileId)
+            .not.toBe(latest_snapshot(second).identity.authority.fileId);
+        first.dispose();
+        second.dispose();
     });
 
     it('ignores pending-edit writes from a viewer that does not own the edit session', async () => {

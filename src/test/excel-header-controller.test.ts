@@ -8,11 +8,16 @@ import type {
     RowWindow,
     WorkbookMeta,
 } from '../data-source/interface';
-import type { FileStateStore } from '../state';
+import type { AuthorityFileStateStore, FileStateStore } from '../state';
 import type { HostMessage, StoredPerFileState } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
-import { with_in_memory_authority_transactions } from '../state-authority';
+import { acquire_file_coordinator } from '../file-coordinator';
+import {
+    finalize_authority,
+    stage_authority,
+    with_in_memory_authority_transactions,
+} from '../state-authority';
 
 class PhysicalExcelSource implements DataSource {
     readonly warnings?: string[];
@@ -308,6 +313,164 @@ describe('Excel workbook snapshot controller', () => {
 
         expect(builds.count).toBe(2);
         expect(snapshots(panel).at(-1)?.reason).toBe('excelHeader');
+    });
+
+    it('fast-applies across tabs after a commit-sequence-only physical advance', async () => {
+        const path = '/cross-tab-sequence.xlsx';
+        const state = mutable_state_store();
+        const authority_store = with_in_memory_authority_transactions(state.store);
+        const first_builds = { count: 0 };
+        const second_builds = { count: 0 };
+        const first = open_excel(path, state.store, excel_profile(first_builds));
+        const second = open_excel(path, state.store, excel_profile(second_builds));
+        const first_basis = await ready(first);
+        await ready(second);
+        const coordinator = acquire_file_coordinator(
+            vscode_mock.Uri.file(path),
+            authority_store,
+        );
+        await coordinator.state_ready();
+        const authority = coordinator.authority();
+        const started = coordinator.begin_physical(
+            authority.authorityRevision,
+            authority.physicalDigest!,
+        );
+        if (started.type !== 'started') throw new Error('operation rejected');
+        const stored = await authority_store.read(coordinator.statePath);
+        await stage_authority(authority_store, coordinator.statePath, {
+            id: started.token.id,
+            kind: 'physical',
+            ordinal: started.token.ordinal,
+            expectedStateRevision: stored.revision,
+            expectedCommitSequence: authority.commitSequence,
+            physicalDigest: authority.physicalDigest,
+        });
+        const turn = await coordinator.request_commit_turn(started.token);
+        if (turn.type !== 'granted') throw new Error('turn rejected');
+        const finalization_basis = coordinator.authority();
+        const finalized = await finalize_authority(
+            authority_store,
+            coordinator.statePath,
+            started.token.id,
+        );
+        if (finalized.type !== 'finalized') throw new Error('finalize rejected');
+        coordinator.finalize_authority_commit(
+            started.token,
+            turn.turn,
+            finalized,
+            finalization_basis,
+        );
+
+        await toggle(first, first_basis, 'cross-tab-sequence', false);
+        await vi.waitFor(() => expect(snapshots(first).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'cross-tab-sequence', outcome: 'applied' }));
+        await vi.waitFor(() => expect(snapshots(second).at(-1)?.reason).toBe('excelHeader'));
+        expect(first_builds.count).toBe(1);
+        expect(second_builds.count).toBe(1);
+        coordinator.dispose();
+    });
+
+    it('signals every tab to recover after an indeterminate header finalization', async () => {
+        const state = mutable_state_store();
+        const base = with_in_memory_authority_transactions(state.store);
+        let projection_id = '';
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                const local = await base.finalize_authority_transaction(path, id);
+                if (local.type === 'finalized' && id.startsWith('projection:')) {
+                    projection_id = id;
+                    const current = await base.read(path);
+                    await base.stage_authority_transaction(path, {
+                        id: 'later-sequence',
+                        kind: 'physical',
+                        ordinal: 999,
+                        expectedStateRevision: current.revision,
+                        expectedCommitSequence: local.authority.commitSequence,
+                        physicalDigest: local.authority.physicalDigest,
+                    });
+                    await base.finalize_authority_transaction(path, 'later-sequence');
+                }
+                return local;
+            },
+            async inspect_authority_transaction(path, id) {
+                if (id === projection_id) throw new Error('transient inspect failure');
+                return base.inspect_authority_transaction(path, id);
+            },
+        };
+        const first_builds = { count: 0 };
+        const second_builds = { count: 0 };
+        const first = open_excel(
+            '/indeterminate-header.xlsx',
+            store,
+            excel_profile(first_builds),
+        );
+        const second = open_excel(
+            '/indeterminate-header.xlsx',
+            store,
+            excel_profile(second_builds),
+        );
+        const first_initial = await ready(first);
+        await ready(second);
+
+        await toggle(first, first_initial, 'indeterminate-header', false);
+        await vi.waitFor(() => expect(snapshots(first).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'indeterminate-header', outcome: 'recovered' }));
+        await vi.waitFor(() => expect(first_builds.count).toBeGreaterThan(1));
+        await vi.waitFor(() => expect(second_builds.count).toBeGreaterThan(1));
+        await vi.waitFor(() => expect(snapshots(second).at(-1)?.meta.sheets[0]
+            .excelFirstRowHeader?.active).toBe(false));
+        expect(snapshots(first).some((snapshot) => (
+            snapshot.reason === 'excelHeader'
+            && snapshot.commandResult?.requestId === 'indeterminate-header'
+            && snapshot.commandResult.outcome === 'applied'
+        ))).toBe(false);
+        expect(snapshots(second).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'indeterminate-header'
+        ))).toBe(false);
+        expect(snapshots(second).at(-1)?.reason).toBe('recovery');
+    });
+
+    it('recovers when header finalization and reconciliation inspection both fail', async () => {
+        const state = mutable_state_store();
+        const base = with_in_memory_authority_transactions(state.store);
+        let projection_id = '';
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                if (!id.startsWith('projection:')) {
+                    return base.finalize_authority_transaction(path, id);
+                }
+                projection_id = id;
+                const finalized = await base.finalize_authority_transaction(path, id);
+                if (finalized.type !== 'finalized') return finalized;
+                throw new Error('ambiguous finalize');
+            },
+            async inspect_authority_transaction(path, id) {
+                if (id === projection_id) throw new Error('inspection unavailable');
+                return base.inspect_authority_transaction(path, id);
+            },
+        };
+        const builds = { count: 0 };
+        const panel = open_excel(
+            '/finalize-reconcile-failure-header.xlsx',
+            store,
+            excel_profile(builds),
+        );
+        const initial = await ready(panel);
+
+        await toggle(panel, initial, 'finalize-reconcile-failure', false);
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({
+                requestId: 'finalize-reconcile-failure',
+                outcome: 'recovered',
+            }));
+        await vi.waitFor(() => expect(builds.count).toBeGreaterThan(1));
+        expect(snapshots(panel).some((snapshot) => (
+            snapshot.reason === 'excelHeader'
+            && snapshot.commandResult?.requestId === 'finalize-reconcile-failure'
+            && snapshot.commandResult.outcome === 'applied'
+        ))).toBe(false);
     });
 
     it('uses a result-only snapshot for validation rejection', async () => {
