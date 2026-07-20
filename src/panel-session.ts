@@ -109,6 +109,8 @@ interface CapturedAdoption {
     readonly epoch: number;
     /** Immutable source/core/authority basis sampled by replace_adoption(). */
     readonly material: CapturedAdoptionMaterial;
+    /** Latest configuration/capability projection for future deliveries. */
+    projection: PanelAdoptionProjection;
     /** Latest panel-projected durable state used only for future deliveries. */
     stateSnapshot: Readonly<FileStateSnapshot>;
 }
@@ -333,6 +335,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
                 adoption,
                 epoch: this.adoption_epoch,
                 material,
+                projection: material.projection,
                 stateSnapshot: captured_state_snapshot(material),
             };
         onAccepted?.();
@@ -389,17 +392,28 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (this._lifecycle === 'disposed' || !this.current) return false;
         if (stateSnapshot.revision < this.current.stateSnapshot.revision) return false;
         this.current.stateSnapshot = deep_clone_and_freeze(stateSnapshot);
-        if (
-            options.deliver === true
-            && this.receiver_epoch > 0
-            && this.ready_gate_epoch !== this.receiver_epoch
-            && this.stale_adoption_epoch !== this.current.epoch
-        ) {
-            this.invalidate_transport();
-            this.supersede_desired();
-            this.acknowledged = undefined;
-            this.create_desired('refresh', 'other');
+        if (options.deliver === true) this.deliver_material_refresh();
+        return true;
+    }
+
+    /** Re-sample only configuration/capabilities from the current adoption.
+     * Source/core/authority identity and generations remain unchanged, while every
+     * already-issued snapshot stays immutable. */
+    recapture_current_projection(
+        options: { readonly deliver?: boolean } = {},
+    ): boolean {
+        if (this._lifecycle === 'disposed' || !this.current) return false;
+        let projection: PanelAdoptionProjection;
+        try {
+            projection = this.current.adoption.project();
+        } catch {
+            return false;
         }
+        this.current.projection = deep_clone_and_freeze({
+            configuration: projection.configuration,
+            capabilities: projection.capabilities,
+        });
+        if (options.deliver === true) this.deliver_material_refresh();
         return true;
     }
 
@@ -550,6 +564,20 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (adoption) this.on_adoption_released?.(adoption);
     }
 
+    private deliver_material_refresh(): void {
+        if (
+            !this.current
+            || this._lifecycle === 'disposed'
+            || this.receiver_epoch === 0
+            || this.ready_gate_epoch === this.receiver_epoch
+            || this.stale_adoption_epoch === this.current.epoch
+        ) return;
+        this.invalidate_transport();
+        this.supersede_desired();
+        this.acknowledged = undefined;
+        this.create_desired('refresh', 'other');
+    }
+
     private create_desired(
         presentation: WorkbookSnapshot['presentation'],
         reason: WorkbookSnapshotReason,
@@ -569,8 +597,8 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             core: material.core,
             presentation,
             reason,
-            configuration: material.projection.configuration,
-            capabilities: material.projection.capabilities,
+            configuration: adoption.projection.configuration,
+            capabilities: adoption.projection.capabilities,
             diagnostics: material.diagnostics,
             commandResult: command_result,
         } as const;

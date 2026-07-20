@@ -141,6 +141,9 @@ export type FileRefreshRequestResult =
     | { readonly type: 'disposed' };
 
 export interface FileRefreshSubscription {
+    /** Hold watcher dispatch across the final checked-write boundary. A following
+     * postSave request absorbs the held batch; cancel releases it normally. */
+    reserve_post_save(): { cancel(): void };
     request(reason: 'postSave'): Promise<FileRefreshRequestResult>;
     dispose(): void;
 }
@@ -148,6 +151,7 @@ export interface FileRefreshSubscription {
 interface RefreshSubscriberState {
     readonly listener: FileRefreshSubscriber;
     disposed: boolean;
+    postSaveReservations: number;
 }
 
 interface PendingRefreshBatch {
@@ -192,6 +196,7 @@ interface FileCoordinatorEntry {
     refreshRevision: number;
     refreshEpisode: number;
     refreshRequests: number;
+    refreshReservations: number;
     pendingRefresh?: PendingRefreshBatch;
     pendingRefreshFlushes: number;
     readonly warnedKeys: Set<string>;
@@ -212,6 +217,7 @@ function cleanup(entry: FileCoordinatorEntry): void {
         && entry.subscribers.size === 0
         && entry.refreshSubscribers.size === 0
         && entry.refreshRequests === 0
+        && entry.refreshReservations === 0
         && entry.pendingRefreshFlushes === 0
         && entries.get(entry.fileKey) === entry
     ) {
@@ -273,6 +279,26 @@ function dispatch_refresh(
     };
 }
 
+function schedule_pending_refresh(
+    entry: FileCoordinatorEntry,
+    batch: PendingRefreshBatch,
+): void {
+    entry.pendingRefreshFlushes += 1;
+    queueMicrotask(() => {
+        try {
+            if (
+                entry.pendingRefresh !== batch
+                || entry.refreshReservations > 0
+            ) return;
+            entry.pendingRefresh = undefined;
+            dispatch_refresh(entry, batch.revision, batch.reason, 'normal');
+        } finally {
+            entry.pendingRefreshFlushes -= 1;
+            cleanup(entry);
+        }
+    });
+}
+
 function queue_watcher_refresh(
     entry: FileCoordinatorEntry,
     kind: FileRefreshWatcherEventKind,
@@ -290,17 +316,7 @@ function queue_watcher_refresh(
 
     const batch: PendingRefreshBatch = { revision, reason: next_reason };
     entry.pendingRefresh = batch;
-    entry.pendingRefreshFlushes += 1;
-    queueMicrotask(() => {
-        try {
-            if (entry.pendingRefresh !== batch) return;
-            entry.pendingRefresh = undefined;
-            dispatch_refresh(entry, batch.revision, batch.reason, 'normal');
-        } finally {
-            entry.pendingRefreshFlushes -= 1;
-            cleanup(entry);
-        }
-    });
+    schedule_pending_refresh(entry, batch);
 }
 
 function ensure_refresh_watcher(
@@ -347,6 +363,7 @@ function entry_for(file_path: string, platform: NodeJS.Platform): FileCoordinato
             refreshRevision: 0,
             refreshEpisode: 0,
             refreshRequests: 0,
+            refreshReservations: 0,
             pendingRefreshFlushes: 0,
             warnedKeys: new Set(),
         };
@@ -788,13 +805,46 @@ export function acquire_file_coordinator(
 
         subscribe_refresh(listener, factory) {
             ensure_refresh_watcher(entry, factory);
-            const subscriber: RefreshSubscriberState = { listener, disposed: false };
+            const subscriber: RefreshSubscriberState = {
+                listener,
+                disposed: false,
+                postSaveReservations: 0,
+            };
             entry.refreshSubscribers.add(subscriber);
+
+            const release_reservation = (flush: boolean): void => {
+                if (subscriber.postSaveReservations === 0) return;
+                subscriber.postSaveReservations -= 1;
+                entry.refreshReservations -= 1;
+                if (flush && entry.refreshReservations === 0 && entry.pendingRefresh) {
+                    schedule_pending_refresh(entry, entry.pendingRefresh);
+                }
+                cleanup(entry);
+            };
+
             return {
+                reserve_post_save() {
+                    if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
+                        return { cancel() {} };
+                    }
+                    subscriber.postSaveReservations += 1;
+                    entry.refreshReservations += 1;
+                    let active = true;
+                    return {
+                        cancel() {
+                            if (!active) return;
+                            active = false;
+                            release_reservation(true);
+                        },
+                    };
+                },
                 async request(reason) {
                     if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
                         return { type: 'disposed' };
                     }
+                    // Consume this subscriber's checked-write reservation without
+                    // flushing its watcher batch: postSave absorbs that revision.
+                    release_reservation(false);
                     entry.refreshRequests += 1;
                     try {
                         const revision = ++entry.refreshRevision;
@@ -817,6 +867,9 @@ export function acquire_file_coordinator(
                     if (subscriber.disposed) return;
                     subscriber.disposed = true;
                     entry.refreshSubscribers.delete(subscriber);
+                    while (subscriber.postSaveReservations > 0) {
+                        release_reservation(true);
+                    }
                     cleanup(entry);
                 },
             };

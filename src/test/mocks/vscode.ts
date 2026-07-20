@@ -86,6 +86,7 @@ const custom_editor_registrations: {
 
 let stat_impl: ((uri: UriLike) => Promise<{ size: number; mtime: number }>) | undefined;
 let read_file_impl: ((uri: UriLike) => Promise<Uint8Array>) | undefined;
+let write_file_impl: ((uri: UriLike, content: Uint8Array) => Promise<void>) | undefined;
 
 function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
     return {
@@ -146,11 +147,31 @@ function make_panel(title: string): MockWebviewPanel {
         async __receive(message: unknown): Promise<void> {
             let forwarded = message;
             if (
-                typeof message === 'object'
-                && message !== null
-                && 'type' in message
-                && message.type === 'stateChanged'
-                && !('snapshotIdentity' in message)
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && (forwarded.type === 'saveCsv' || forwarded.type === 'pendingEditsChanged')
+                && !('editSessionId' in forwarded)
+            ) {
+                const grant = [...panel.__messages].reverse().find((candidate) => (
+                    typeof candidate === 'object'
+                    && candidate !== null
+                    && 'type' in candidate
+                    && candidate.type === 'editSessionResult'
+                    && 'granted' in candidate
+                    && candidate.granted === true
+                    && 'editSessionId' in candidate
+                )) as { editSessionId?: string } | undefined;
+                if (grant?.editSessionId) {
+                    forwarded = { ...forwarded, editSessionId: grant.editSessionId };
+                }
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'stateChanged'
+                && !('snapshotIdentity' in forwarded)
             ) {
                 const latest = [...panel.__messages].reverse().find((candidate) => (
                     typeof candidate === 'object'
@@ -160,7 +181,7 @@ function make_panel(title: string): MockWebviewPanel {
                     && 'snapshot' in candidate
                 )) as { snapshot?: { identity?: unknown } } | undefined;
                 if (latest?.snapshot?.identity !== undefined) {
-                    forwarded = { ...message, snapshotIdentity: latest.snapshot.identity };
+                    forwarded = { ...forwarded, snapshotIdentity: latest.snapshot.identity };
                 }
             }
             await Promise.all(message_handlers.map((handler) => handler(forwarded)));
@@ -275,7 +296,9 @@ export const workspace = {
             if (!read_file_impl) return new Uint8Array();
             return read_file_impl(uri);
         },
-        async writeFile(): Promise<void> {},
+        async writeFile(uri: UriLike, content: Uint8Array): Promise<void> {
+            await write_file_impl?.(uri, content);
+        },
     },
     createFileSystemWatcher(pattern?: unknown): MockWatcher {
         const watcher = make_watcher(pattern);
@@ -299,6 +322,7 @@ export function __reset(): void {
     custom_editor_registrations.length = 0;
     stat_impl = undefined;
     read_file_impl = undefined;
+    write_file_impl = undefined;
 }
 
 export function __setStatImplementation(
@@ -311,6 +335,12 @@ export function __setReadFileImplementation(
     impl: (uri: UriLike) => Promise<Uint8Array>,
 ): void {
     read_file_impl = impl;
+}
+
+export function __setWriteFileImplementation(
+    impl: (uri: UriLike, content: Uint8Array) => Promise<void>,
+): void {
+    write_file_impl = impl;
 }
 
 export function __getPanels(): MockWebviewPanel[] {

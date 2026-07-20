@@ -78,18 +78,35 @@ export interface ViewerProfile {
     on_message?(msg: WebviewMessage): boolean | Promise<boolean>;
 }
 
-const active_csv_edit_sessions = new Map<string, symbol>();
+type CsvEditFilePhase =
+    | { type: 'free' }
+    | { type: 'owned'; token: symbol }
+    | { type: 'cleanupPending'; operation: symbol }
+    | { type: 'uncertain'; operation: symbol };
+
+type CsvEditStateSubscriber = (snapshot?: Readonly<FileStateSnapshot>) => void;
+
+interface CsvEditFileState {
+    attachments: number;
+    phase: CsvEditFilePhase;
+    /** State revisions at or below this boundary predate a completed edit clear. */
+    clearedStateRevision?: number;
+    recovery?: Promise<boolean>;
+    readonly subscribers: Set<CsvEditStateSubscriber>;
+}
+
+// Edit ownership and post-write cleanup uncertainty are file-scoped. In
+// particular, releasing one panel after a successful write must not allow a
+// sibling panel to reclaim durable edits that have not yet been cleared.
+const csv_edit_file_states = new Map<string, CsvEditFileState>();
 const RELOAD_RETRY_COUNT = 3;
 const RELOAD_RETRY_MS = 50;
 const READY_STATE_RETRY_COUNT = 3;
 const READY_STATE_RETRY_MS = 50;
+const EDIT_CLEANUP_RECOVERY_MS = 250;
 
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
-}
-
-function delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 type PhysicalAuthorityCommitResult =
@@ -197,6 +214,18 @@ export function attach_viewer(
     const file_coordinator = acquire_file_coordinator(file_path, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
+    let file_edit_state = profile.editing
+        ? csv_edit_file_states.get(file_key)
+        : undefined;
+    if (profile.editing && !file_edit_state) {
+        file_edit_state = {
+            attachments: 0,
+            phase: { type: 'free' },
+            subscribers: new Set(),
+        };
+        csv_edit_file_states.set(file_key, file_edit_state);
+    }
+    if (file_edit_state) file_edit_state.attachments += 1;
 
     // Borrowed aliases are updated only at the same synchronous boundary as the
     // session adoption. PanelSession remains the sole source/core lifecycle owner.
@@ -207,6 +236,9 @@ export function attach_viewer(
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
+    let save_command_pending = false;
+    let save_write_pending = false;
+    let pending_edit_writes: Promise<void> = Promise.resolve();
     let reload_retry_attempts = 0;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
     let refresh_retry_wait: {
@@ -217,7 +249,14 @@ export function attach_viewer(
         timer: ReturnType<typeof setTimeout>;
         resolve: (proceed: boolean) => void;
     }>();
+    const edit_cleanup_waiters = new Map<symbol, {
+        timer: ReturnType<typeof setTimeout>;
+        resolve: (recovered: boolean) => void;
+    }>();
+    let current_edit_cleanup_waiter: symbol | undefined;
     const edit_session_token = Symbol(file_key);
+    let next_edit_session_epoch = 1;
+    let active_edit_session_id: string | undefined;
     const excel_header_subscriber_token = Symbol(file_key);
     const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
     let header_receipt_processing = false;
@@ -272,26 +311,115 @@ export function attach_viewer(
         },
     });
 
-    // Subscribe before the panel can become ready. Coordinator events may build
-    // and install a panel-local source pre-ready; PanelSession defers delivery.
-    disposables.push(file_coordinator.subscribe_refresh(
-        refresh_from_event,
-        vscode_file_refresh_watcher_factory,
-    ));
-
-    function owns_edit_session(): boolean {
-        return active_csv_edit_sessions.get(file_key) === edit_session_token;
+    if (file_edit_state) {
+        const edit_state_subscriber: CsvEditStateSubscriber = (snapshot) => {
+            if (disposed) return;
+            if (snapshot) update_session_state_material(snapshot, false);
+            session.recapture_current_projection({ deliver: true });
+        };
+        file_edit_state.subscribers.add(edit_state_subscriber);
+        disposables.push({
+            dispose() {
+                file_edit_state?.subscribers.delete(edit_state_subscriber);
+            },
+        });
     }
 
-    function try_claim_edit_session(): boolean {
-        const owner = active_csv_edit_sessions.get(file_key);
-        if (owner && owner !== edit_session_token) return false;
-        active_csv_edit_sessions.set(file_key, edit_session_token);
+    // Subscribe before the panel can become ready. Coordinator events may build
+    // and install a panel-local source pre-ready; PanelSession defers delivery.
+    const refresh_subscription = file_coordinator.subscribe_refresh(
+        refresh_from_event,
+        vscode_file_refresh_watcher_factory,
+    );
+    disposables.push(refresh_subscription);
+
+    function edit_phase(): CsvEditFilePhase {
+        return file_edit_state?.phase ?? { type: 'free' };
+    }
+
+    function edit_cleanup_blocked(): boolean {
+        const phase = edit_phase();
+        return phase.type === 'cleanupPending' || phase.type === 'uncertain';
+    }
+
+    function editing_available_for_panel(): boolean {
+        const phase = edit_phase();
+        return phase.type === 'free'
+            || (phase.type === 'owned' && phase.token === edit_session_token);
+    }
+
+    function notify_edit_state(snapshot?: Readonly<FileStateSnapshot>): void {
+        if (!file_edit_state) return;
+        for (const subscriber of [...file_edit_state.subscribers]) {
+            try {
+                subscriber(snapshot);
+            } catch (error) {
+                console.error('Failed to update CSV edit availability', error);
+            }
+        }
+    }
+
+    function owns_edit_session(): boolean {
+        const phase = edit_phase();
+        return phase.type === 'owned' && phase.token === edit_session_token;
+    }
+
+    function try_claim_edit_session(notify = true): boolean {
+        if (!file_edit_state) return false;
+        const phase = file_edit_state.phase;
+        if (phase.type === 'owned') {
+            if (phase.token !== edit_session_token) return false;
+            active_edit_session_id ??= `${file_key}:${next_edit_session_epoch++}`;
+            return true;
+        }
+        if (phase.type !== 'free') return false;
+        active_edit_session_id = `${file_key}:${next_edit_session_epoch++}`;
+        file_edit_state.phase = { type: 'owned', token: edit_session_token };
+        if (notify) notify_edit_state();
         return true;
     }
 
     function release_edit_session(): void {
-        if (owns_edit_session()) active_csv_edit_sessions.delete(file_key);
+        if (save_write_pending) return;
+        if (file_edit_state && owns_edit_session()) {
+            active_edit_session_id = undefined;
+            file_edit_state.phase = { type: 'free' };
+            notify_edit_state();
+        }
+    }
+
+    function begin_edit_cleanup(): symbol | undefined {
+        if (!file_edit_state || !owns_edit_session()) return undefined;
+        const operation = Symbol(file_key);
+        active_edit_session_id = undefined;
+        file_edit_state.phase = { type: 'cleanupPending', operation };
+        return operation;
+    }
+
+    function finish_edit_cleanup(
+        operation: symbol,
+        success: boolean,
+        cleared_snapshot?: Readonly<FileStateSnapshot>,
+    ): void {
+        if (!file_edit_state) return;
+        const phase = file_edit_state.phase;
+        if (
+            (phase.type !== 'cleanupPending' && phase.type !== 'uncertain')
+            || phase.operation !== operation
+        ) return;
+        file_edit_state.phase = success
+            ? { type: 'free' }
+            : { type: 'uncertain', operation };
+        if (success && cleared_snapshot !== undefined) {
+            file_edit_state.clearedStateRevision = Math.max(
+                file_edit_state.clearedStateRevision ?? -1,
+                cleared_snapshot.revision,
+            );
+        }
+        notify_edit_state(cleared_snapshot);
+        if (success && file_edit_state.attachments === 0) {
+            csv_edit_file_states.delete(file_key);
+        }
     }
 
     /** Project durable state for this panel without mutating shared authority. */
@@ -303,9 +431,13 @@ export function attach_viewer(
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
         }
+        const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
+            && snapshot.revision <= file_edit_state.clearedStateRevision;
         if (
-            profile.editing
-            && (owns_edit_session() || (allow_claim && try_claim_edit_session()))
+            !predates_completed_clear
+            && !edit_cleanup_blocked()
+            && profile.editing
+            && (owns_edit_session() || (allow_claim && try_claim_edit_session(false)))
         ) {
             return { revision: snapshot.revision, state };
         }
@@ -352,9 +484,47 @@ export function attach_viewer(
                 validate,
             );
             if (result.type === 'committed') {
-                update_session_state_material(result.snapshot);
+                if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
+            snapshot = result.snapshot;
+        }
+    }
+
+    type EditStateWriteResult =
+        | { type: 'committed'; snapshot: FileStateSnapshot }
+        | { type: 'unchanged' }
+        | { type: 'aborted' };
+
+    async function update_edit_session_state(
+        edit_session_id: string,
+        updater: (current: PerFileState) => PerFileState,
+    ): Promise<EditStateWriteResult> {
+        const is_current = () => (
+            !disposed
+            && edit_message_is_current(edit_session_id)
+            && edit_phase().type === 'owned'
+        );
+        let snapshot = await read_file_state();
+        for (;;) {
+            if (!is_current()) return { type: 'aborted' };
+            const current = normalize_host_state(
+                snapshot.state,
+                source?.meta().sheets.map((sheet) => sheet.name) ?? [],
+            );
+            const next = updater(current);
+            if (next === current) return { type: 'unchanged' };
+            const result = await state_store.compare_and_set(
+                state_path,
+                snapshot.revision,
+                next,
+                is_current,
+            );
+            if (result.type === 'committed') {
+                if (is_current()) update_session_state_material(result.snapshot);
+                return { type: 'committed', snapshot: result.snapshot };
+            }
+            if (!is_current()) return { type: 'aborted' };
             snapshot = result.snapshot;
         }
     }
@@ -627,7 +797,7 @@ export function attach_viewer(
         candidate: SourceCandidate,
         committed: Extract<PhysicalAuthorityCommitResult, { type: 'committed' }>,
         seq: number,
-        reason: 'ready' | 'fileReload' | 'recovery' | 'save' = 'fileReload',
+        reason: 'ready' | 'fileReload' | 'recovery' = 'fileReload',
         projected_state?: FileStateSnapshot,
         refresh_event?: FileRefreshEvent,
     ): DataSource | undefined {
@@ -676,7 +846,12 @@ export function attach_viewer(
                             },
                             capabilities: {
                                 csvEditingSupported: profile.editing,
-                                csvEditable: profile.editing && !next.truncationMessage,
+                                csvEditable: profile.editing
+                                    && editing_available_for_panel()
+                                    && !next.truncationMessage,
+                                ...(owns_edit_session() && active_edit_session_id
+                                    ? { csvEditSessionId: active_edit_session_id }
+                                    : {}),
                             },
                             stateSnapshot: adoption_state,
                         }),
@@ -795,7 +970,12 @@ export function attach_viewer(
                                     },
                                     capabilities: {
                                         csvEditingSupported: profile.editing,
-                                        csvEditable: profile.editing && !source!.truncationMessage,
+                                        csvEditable: profile.editing
+                                            && editing_available_for_panel()
+                                            && !source!.truncationMessage,
+                                        ...(owns_edit_session() && active_edit_session_id
+                                            ? { csvEditSessionId: active_edit_session_id }
+                                            : {}),
                                     },
                                     stateSnapshot: project_state_for_panel(
                                         receipt.stateSnapshot,
@@ -849,13 +1029,76 @@ export function attach_viewer(
     // CSV pending-edit persistence deliberately remains on FileStateStore's CAS
     // queue in this phase. Edit-session ownership is separate from file authority;
     // physical/projection/layout writes use the coordinator serialization above.
-    async function clear_pending_edits(): Promise<void> {
+    async function clear_pending_edits(): Promise<FileStateSnapshot> {
         const committed = await update_file_state((current) => {
             if (!current.pendingEdits) return current;
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
         });
-        if (!committed) await refresh_session_state_material();
+        return committed ?? refresh_session_state_material(false);
+    }
+
+    function recover_uncertain_edit_cleanup(): Promise<boolean> {
+        if (!file_edit_state) return Promise.resolve(false);
+        const phase = file_edit_state.phase;
+        if (phase.type !== 'uncertain') {
+            return Promise.resolve(phase.type === 'free');
+        }
+        if (!file_edit_state.recovery) {
+            const operation = phase.operation;
+            const recovery = (async () => {
+                try {
+                    const snapshot = await clear_pending_edits();
+                    // Recovery only restores file availability. A live request waiter
+                    // must subsequently win the ordinary free -> owned transition.
+                    finish_edit_cleanup(operation, true, snapshot);
+                    if (!disposed) update_session_state_material(snapshot, false);
+                    return true;
+                } catch (error) {
+                    console.error('Failed to recover CSV pending-edit cleanup', error);
+                    return false;
+                }
+            })();
+            file_edit_state.recovery = recovery;
+            void recovery.finally(() => {
+                if (file_edit_state?.recovery === recovery) {
+                    file_edit_state.recovery = undefined;
+                }
+            });
+        }
+        return file_edit_state.recovery;
+    }
+
+    function wait_for_edit_cleanup_recovery(waiter: symbol): Promise<boolean> {
+        const recovery = recover_uncertain_edit_cleanup();
+        return new Promise((resolve) => {
+            const settle = (recovered: boolean) => {
+                const current = edit_cleanup_waiters.get(waiter);
+                if (!current) return;
+                clearTimeout(current.timer);
+                edit_cleanup_waiters.delete(waiter);
+                resolve(recovered);
+            };
+            const timer = setTimeout(
+                () => settle(false),
+                EDIT_CLEANUP_RECOVERY_MS,
+            );
+            edit_cleanup_waiters.set(waiter, { timer, resolve: settle });
+            void recovery.then((recovered) => settle(
+                recovered && !disposed && edit_cleanup_waiters.has(waiter),
+            ));
+        });
+    }
+
+    function cancel_edit_cleanup_waiter(waiter: symbol): void {
+        edit_cleanup_waiters.get(waiter)?.resolve(false);
+    }
+
+    function cancel_edit_cleanup_waiters(): void {
+        for (const pending of [...edit_cleanup_waiters.values()]) {
+            pending.resolve(false);
+        }
+        current_edit_cleanup_waiter = undefined;
     }
 
     function cancel_refresh_retry_wait(): void {
@@ -888,15 +1131,24 @@ export function attach_viewer(
         return disposed ? { type: 'disposed' } : { type: 'superseded' };
     }
 
-    function report_refresh_failure(error: unknown, initial: boolean): void {
+    function report_refresh_failure(
+        error: unknown,
+        initial: boolean,
+        post_save = false,
+    ): void {
         if (initial) {
             void vscode.window.showErrorMessage(
                 error instanceof Error ? error.message : String(error));
             return;
         }
         console.error('Failed to reload table viewer data', error);
-        void vscode.window.showErrorMessage(
-            `Failed to reload: ${error instanceof Error ? error.message : String(error)}`);
+        const message = `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
+        if (post_save) {
+            void vscode.window.showWarningMessage(
+                `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
+        } else {
+            void vscode.window.showErrorMessage(message);
+        }
     }
 
     async function run_physical_refresh(
@@ -990,7 +1242,11 @@ export function attach_viewer(
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
-                report_refresh_failure(last_error, initial);
+                report_refresh_failure(
+                    last_error,
+                    initial,
+                    request.refreshEvent?.reason === 'postSave',
+                );
                 return { type: 'failed', error: last_error };
             }
             attempts += 1;
@@ -1087,49 +1343,6 @@ export function attach_viewer(
         await refresh_panel_source(true, 'ready', true);
     }
 
-    // Build the direct post-save/conflict refresh before superseding watcher work.
-    // Phase 5.3 will publish these refreshes through the coordinator; for now a
-    // transient post-save read/parse failure leaves a viable watcher load intact.
-    async function reparse_and_post(
-        reason: 'fileReload' | 'save' = 'fileReload',
-    ): Promise<boolean> {
-        const expected_authority = file_coordinator.authority().authorityRevision;
-        let candidate: SourceCandidate | undefined;
-        let attempts = 0;
-        try {
-            for (;;) {
-                if (disposed) return false;
-                try {
-                    candidate = await build_source();
-                    break;
-                } catch (error) {
-                    if (disposed || attempts >= RELOAD_RETRY_COUNT) throw error;
-                    attempts += 1;
-                    await delay(RELOAD_RETRY_MS);
-                }
-            }
-            if (disposed) return false;
-            const seq = supersede_panel_load();
-            reload_retry_attempts = attempts;
-            const committed = await commit_physical_candidate(
-                candidate, seq, expected_authority,
-            );
-            if (committed.type !== 'committed') {
-                schedule_direct_refresh_retry(seq);
-                return false;
-            }
-            return adopt_committed_candidate(
-                candidate,
-                committed,
-                seq,
-                reason,
-                profile.editing ? await read_file_state() : undefined,
-            ) !== undefined;
-        } finally {
-            candidate?.dispose();
-        }
-    }
-
     function reset_reload_retry(): void {
         reload_retry_attempts = 0;
         if (reload_retry_timer !== undefined) {
@@ -1159,15 +1372,6 @@ export function attach_viewer(
             }
         }, RELOAD_RETRY_MS);
         return true;
-    }
-
-    function schedule_direct_refresh_retry(seq: number): boolean {
-        return schedule_local_refresh_retry(
-            { seq },
-            true,
-            'recovery',
-            false,
-        );
     }
 
     function wait_for_ready_state_retry(ms: number): Promise<boolean> {
@@ -1228,43 +1432,67 @@ export function attach_viewer(
         return undefined;
     }
 
-    async function handle_save(edits: Record<string, string>): Promise<void> {
-        if (!source) return;
-        if (source.truncationMessage) {
-            panel.webview.postMessage({ type: 'saveResult', success: false });
+    function edit_message_is_current(edit_session_id: string | undefined): boolean {
+        return owns_edit_session()
+            && active_edit_session_id !== undefined
+            && edit_session_id === active_edit_session_id;
+    }
+
+    async function handle_save(
+        edits: Record<string, string>,
+        edit_session_id: string,
+    ): Promise<void> {
+        if (!edit_message_is_current(edit_session_id) || save_command_pending) {
+            void panel.webview.postMessage({ type: 'saveResult', success: false });
             return;
         }
+        // Fence all later pending-edit messages synchronously, then settle every
+        // accepted pre-boundary persistence write before validating/serializing.
+        save_command_pending = true;
+        let content: string;
+        let post_save_reservation: { cancel(): void } | undefined;
         try {
+            await pending_edit_writes;
             const current_adoption = session.current_adoption();
             const expected_digest = session.acknowledged_physical_digest();
+            const src = source;
             if (
-                expected_digest === undefined
+                edit_cleanup_blocked()
+                || !profile.editing
+                || !owns_edit_session()
+                || !src
+                || !!src.truncationMessage
+                || expected_digest === undefined
                 || !session.acknowledged_current()
-                || current_adoption?.resources.source !== source
+                || current_adoption?.resources.source !== src
                 || current_adoption.resources.core !== core
                 || source_authority.authorityRevision
                     !== file_coordinator.authority().authorityRevision
             ) {
+                save_command_pending = false;
                 vscode.window.showWarningMessage(
                     'The table view is still refreshing. Please try saving again.');
-                panel.webview.postMessage({ type: 'saveResult', success: false });
+                void panel.webview.postMessage({ type: 'saveResult', success: false });
                 return;
             }
+
+            const acknowledged_source = src;
             const SAVE_WINDOW = 10_000;
-            const src = source;
-            const row_count = src.meta().sheets[0].rowCount;
+            const row_count = acknowledged_source.meta().sheets[0].rowCount;
             function* row_windows(): Generator<(RenderedCell | null)[]> {
                 for (let start = 0; start < row_count; start += SAVE_WINDOW) {
-                    const { rows } = src.read_rows(0, start, SAVE_WINDOW);
+                    const { rows } = acknowledged_source.read_rows(0, start, SAVE_WINDOW);
                     for (const row of rows) yield row;
                 }
             }
-            // serialize_csv re-prepends src.headerLine (when the source consumed
-            // row 0 as the column names) so the header survives the save even
-            // though it is never an editable grid cell.
-            const content = serialize_csv(
+            // Serialize only from the exact source/core adoption acknowledged by
+            // this panel. serialize_csv restores the promoted CSV header line.
+            content = serialize_csv(
                 row_windows(), get_delimiter(file_path), edits,
-                src.originalColumnCounts, src.lineEnding, src.headerLine);
+                acknowledged_source.originalColumnCounts,
+                acknowledged_source.lineEnding,
+                acknowledged_source.headerLine);
+
             const current_stat = await vscode.workspace.fs.stat(uri);
             const max_mib = get_max_file_size_mib();
             assert_safe_file_size(current_stat.size, max_mib);
@@ -1276,43 +1504,99 @@ export function attach_viewer(
             if (
                 snapshot_changed
                 || content_digest(current_raw) !== expected_digest
+                || !owns_edit_session()
                 || !session.acknowledged_current()
                 || session.current_adoption() !== current_adoption
-                || current_adoption?.resources.source !== src
+                || current_adoption.resources.source !== src
                 || current_adoption.resources.core !== core
                 || source_authority.authorityRevision
                     !== file_coordinator.authority().authorityRevision
             ) {
                 vscode.window.showWarningMessage(
                     'File was modified externally. Please review the changes and try again.');
-                try {
-                    await reparse_and_post();
-                } catch (reload_err) {
-                    console.error('Post-conflict reload failed', reload_err);
-                }
-                panel.webview.postMessage({ type: 'saveResult', success: false });
+                // A conflict performs only panel-local forced recovery. The external
+                // editor's watcher event independently refreshes every attachment;
+                // no write occurred, so this must not create a postSave episode.
+                await refresh_panel_source(true, 'recovery');
+                save_command_pending = false;
+                void panel.webview.postMessage({ type: 'saveResult', success: false });
                 return;
             }
+
+            // Hold a synchronously queued own-write watcher batch until the
+            // successful postSave request can absorb it into one canonical episode.
+            post_save_reservation = refresh_subscription.reserve_post_save();
+            save_write_pending = true;
+            // Known limitation: an external writer can still win the interval after
+            // the final check and before/during writeFile. Phase 5.3 deliberately
+            // does not claim that watcher coordination closes this pre-write TOCTOU.
             await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-            // Clear edit state before creating the post-save adoption so neither a
-            // replayed delivery nor a new ready epoch can restore saved edits.
-            await clear_pending_edits();
-            // The write succeeded — the save is done. A failure to re-parse the
-            // just-written file (a transient read error, or an external delete in
-            // the TOCTOU window) must not be reported as a failed save: the bytes
-            // are on disk. The adopted digest changes only after a successful reparse, so
-            // the watcher event from our own write still refreshes the grid here.
-            try {
-                await reparse_and_post('save');
-            } catch (reload_err) {
-                console.error('Post-save reload failed (file was written)', reload_err);
+        } catch (error) {
+            save_command_pending = false;
+            save_write_pending = false;
+            post_save_reservation?.cancel();
+            if (disposed) {
+                release_edit_session();
+                if (
+                    file_edit_state
+                    && file_edit_state.attachments === 0
+                    && file_edit_state.phase.type === 'free'
+                ) {
+                    csv_edit_file_states.delete(file_key);
+                }
             }
-            panel.webview.postMessage({ type: 'saveResult', success: true });
-        } catch (err) {
             vscode.window.showErrorMessage(
-                `Failed to save: ${err instanceof Error ? err.message : String(err)}`);
-            panel.webview.postMessage({ type: 'saveResult', success: false });
+                `Failed to save: ${error instanceof Error ? error.message : String(error)}`);
+            void panel.webview.postMessage({ type: 'saveResult', success: false });
+            return;
         }
+
+        save_write_pending = false;
+        // writeFile completed: atomically block all file attachments from claiming
+        // or projecting durable edits before reporting the irrevocable disk success.
+        let cleanup_operation = begin_edit_cleanup();
+        if (!cleanup_operation) {
+            // The write still succeeded. This can only indicate an internal ownership
+            // invariant failure, so conservatively block the file and still attempt
+            // the durable cleanup.
+            cleanup_operation = Symbol(file_key);
+            if (file_edit_state) {
+                file_edit_state.phase = {
+                    type: 'cleanupPending',
+                    operation: cleanup_operation,
+                };
+            }
+            console.error('CSV save lost edit ownership after writeFile');
+        }
+        // Exactly one terminal result is posted immediately, while GridShell is
+        // still mounted to clear its save-in-flight state. Neither durable-state
+        // cleanup nor the requesting panel's parser can emit a later failure.
+        void panel.webview.postMessage({ type: 'saveResult', success: true });
+        void panel.webview.postMessage({
+            type: 'editSessionRevoked',
+            reason: 'saved',
+        });
+        notify_edit_state();
+
+        void refresh_subscription.request('postSave').then((refresh) => {
+            if (refresh.type === 'disposed') {
+                console.warn('CSV save refresh was skipped because the panel was disposed');
+            }
+        }).catch((error) => {
+            console.error('Post-save refresh request failed (file was written)', error);
+            void vscode.window.showWarningMessage(
+                'The file was saved, but Table Viewer could not refresh the table view.');
+        });
+
+        void clear_pending_edits().then((snapshot) => {
+            finish_edit_cleanup(cleanup_operation, true, snapshot);
+            if (!disposed) update_session_state_material(snapshot, false);
+        }).catch((error) => {
+            finish_edit_cleanup(cleanup_operation, false);
+            console.error('CSV save succeeded but pending-edit cleanup failed', error);
+            void vscode.window.showWarningMessage(
+                'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.');
+        });
     }
 
     disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
@@ -1520,18 +1804,43 @@ export function attach_viewer(
                 return;
             }
             case 'requestEditSession': {
-                const can_edit = profile.editing
+                const recovery_waiter = edit_phase().type === 'uncertain'
+                    ? Symbol(file_key)
+                    : undefined;
+                if (recovery_waiter && current_edit_cleanup_waiter) {
+                    cancel_edit_cleanup_waiter(current_edit_cleanup_waiter);
+                }
+                if (recovery_waiter) current_edit_cleanup_waiter = recovery_waiter;
+                const recovered = recovery_waiter
+                    ? await wait_for_edit_cleanup_recovery(recovery_waiter)
+                    : true;
+                const recovery_authorized = !recovery_waiter
+                    || (
+                        recovered
+                        && current_edit_cleanup_waiter === recovery_waiter
+                    );
+                if (current_edit_cleanup_waiter === recovery_waiter) {
+                    current_edit_cleanup_waiter = undefined;
+                }
+                if (disposed) return;
+                const phase = edit_phase();
+                const cleanup_blocked = phase.type === 'cleanupPending'
+                    || phase.type === 'uncertain';
+                const can_edit = recovery_authorized
+                    && !disposed
+                    && profile.editing
+                    && !cleanup_blocked
                     && !!source
                     && !source.truncationMessage
                     && !(core?.has_transform_work ?? false);
-                const owner = active_csv_edit_sessions.get(file_key);
                 const denied_by_owner = can_edit
-                    && owner !== undefined
-                    && owner !== edit_session_token;
+                    && phase.type === 'owned'
+                    && phase.token !== edit_session_token;
                 const denied_by_transform = profile.editing
                     && !!source
                     && !source.truncationMessage
                     && (core?.has_transform_work ?? false);
+                if (can_edit && !denied_by_owner) save_command_pending = false;
                 const granted = can_edit && !denied_by_owner && try_claim_edit_session();
                 const edit_state = granted ? await read_file_state() : undefined;
                 if (edit_state) update_session_state_material(edit_state);
@@ -1541,9 +1850,15 @@ export function attach_viewer(
                 panel.webview.postMessage({
                     type: 'editSessionResult',
                     granted,
+                    ...(granted && active_edit_session_id
+                        ? { editSessionId: active_edit_session_id }
+                        : {}),
                     ...(pendingEdits ? { pendingEdits } : {}),
                 });
-                if (denied_by_owner) {
+                if (cleanup_blocked) {
+                    vscode.window.showWarningMessage(
+                        'Editing is temporarily unavailable while saved edit state is being cleared.');
+                } else if (denied_by_owner) {
                     vscode.window.showWarningMessage(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
@@ -1578,32 +1893,53 @@ export function attach_viewer(
                 return;
             case 'discardEditSession':
                 if (profile.editing && owns_edit_session()) {
-                    await clear_pending_edits();
-                    release_edit_session();
+                    const operation = begin_edit_cleanup();
+                    if (!operation) return;
+                    notify_edit_state();
+                    try {
+                        const snapshot = await clear_pending_edits();
+                        finish_edit_cleanup(operation, true, snapshot);
+                        if (!disposed) update_session_state_material(snapshot, false);
+                    } catch (error) {
+                        finish_edit_cleanup(operation, false);
+                        console.error('Failed to clear discarded CSV edits', error);
+                        void vscode.window.showWarningMessage(
+                            'Table Viewer could not clear the discarded edit state. Editing remains disabled for this file.');
+                    }
                 }
                 return;
             case 'showWarning':
                 vscode.window.showWarningMessage(msg.message);
                 return;
             case 'saveCsv':
-                if (profile.editing && owns_edit_session()) {
-                    await handle_save(msg.edits);
+                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                    await handle_save(msg.edits, msg.editSessionId);
                 } else if (profile.editing) {
                     panel.webview.postMessage({ type: 'saveResult', success: false });
                 }
                 return;
             case 'pendingEditsChanged': {
-                if (!profile.editing) return;
-                if (!owns_edit_session()) return;
-                if (msg.edits) {
-                    const edits = msg.edits;
-                    await update_file_state((current) => ({
-                        ...current,
-                        pendingEdits: edits,
-                    }));
-                } else {
-                    await clear_pending_edits();
-                }
+                if (!profile.editing || save_command_pending) return;
+                if (!edit_message_is_current(msg.editSessionId)) return;
+                const edit_session_id = msg.editSessionId;
+                const write = pending_edit_writes.catch(() => {}).then(async () => {
+                    if (!edit_message_is_current(edit_session_id)) return;
+                    if (msg.edits) {
+                        const edits = msg.edits;
+                        await update_edit_session_state(edit_session_id, (current) => ({
+                            ...current,
+                            pendingEdits: edits,
+                        }));
+                    } else {
+                        await update_edit_session_state(edit_session_id, (current) => {
+                            if (!current.pendingEdits) return current;
+                            const { pendingEdits: _drop, ...rest } = current;
+                            return rest;
+                        });
+                    }
+                });
+                pending_edit_writes = write;
+                await write;
                 return;
             }
             case 'showSaveDialog': {
@@ -1634,6 +1970,7 @@ export function attach_viewer(
             reset_reload_retry();
             cancel_refresh_retry_wait();
             cancel_ready_state_retry_waits();
+            cancel_edit_cleanup_waiters();
             header_receipt_queue.length = 0;
             let first_error: unknown;
             const cleanup = (action: () => void) => {
@@ -1649,6 +1986,15 @@ export function attach_viewer(
             source = undefined;
             for (const d of disposables) cleanup(() => d.dispose());
             cleanup(() => file_coordinator.dispose());
+            if (file_edit_state) {
+                file_edit_state.attachments = Math.max(0, file_edit_state.attachments - 1);
+                if (
+                    file_edit_state.attachments === 0
+                    && file_edit_state.phase.type === 'free'
+                ) {
+                    csv_edit_file_states.delete(file_key);
+                }
+            }
             if (first_error !== undefined) throw first_error;
         },
     };

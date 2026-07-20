@@ -10,9 +10,10 @@ import type { WorkbookSnapshot } from '../viewer-snapshot';
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
     has_live_uncommitted: false,
+    save_in_flight: false,
     has_uncommitted_changes: false,
     mount_count: 0,
-    on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
+    on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
@@ -43,8 +44,9 @@ vi.mock('../webview/grid-shell', () => ({
         row_heights: Record<number, number>;
         merges: { startRow: number }[];
         edit_mode?: boolean;
+        edit_session_id?: string;
         initial_edits?: Record<string, string | { value: string; base: string }>;
-        on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
+        on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
             current: {
                 request_save: () => boolean;
@@ -94,14 +96,20 @@ vi.mock('../webview/grid-shell', () => ({
             grid_shell_mock.on_editing_change?.({
                 is_dirty: grid_shell_mock.is_dirty,
                 has_live_uncommitted: grid_shell_mock.has_live_uncommitted,
+                save_in_flight: grid_shell_mock.save_in_flight,
                 edits: grid_shell_mock.is_dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
                 conflicted: [],
             });
-            if (grid_shell_mock.emit_pending_edits_on_mount) {
+            if (
+                grid_shell_mock.emit_pending_edits_on_mount
+                && props.edit_mode
+                && props.edit_session_id
+            ) {
                 (globalThis as typeof globalThis & {
                     acquireVsCodeApi: () => { postMessage: (message: unknown) => void };
                 }).acquireVsCodeApi().postMessage({
                     type: 'pendingEditsChanged',
+                    editSessionId: props.edit_session_id,
                     edits: props.initial_edits ?? null,
                 });
             }
@@ -314,10 +322,17 @@ async function open_columns() {
         .not.toBeNull();
 }
 
-async function enter_edit_mode(post_message: ReturnType<typeof vi.fn>) {
+async function enter_edit_mode(
+    post_message: ReturnType<typeof vi.fn>,
+    edit_session_id = 'test-edit-session',
+) {
     await click_button('Edit');
     expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
-    await dispatch_host_message({ type: 'editSessionResult', granted: true });
+    await dispatch_host_message({
+        type: 'editSessionResult',
+        granted: true,
+        editSessionId: edit_session_id,
+    });
 }
 
 async function report_grid_editing(
@@ -327,6 +342,7 @@ async function report_grid_editing(
     edits: Record<string, { value: string; base: string }> = dirty
         ? { '0:0': { value: 'dirty', base: 'base' } }
         : {},
+    save_in_flight = false,
 ) {
     // The overlay-attributable part of "uncommitted" is whatever is uncommitted
     // beyond the committed dirty map — i.e. an open overlay differing from base.
@@ -334,10 +350,12 @@ async function report_grid_editing(
     grid_shell_mock.is_dirty = dirty;
     grid_shell_mock.has_live_uncommitted = has_live_uncommitted;
     grid_shell_mock.has_uncommitted_changes = uncommitted;
+    grid_shell_mock.save_in_flight = save_in_flight;
     await act(async () => {
         grid_shell_mock.on_editing_change?.({
             is_dirty: dirty,
             has_live_uncommitted,
+            save_in_flight,
             edits,
             conflicted,
         });
@@ -436,6 +454,7 @@ function cleanup() {
     document.body.innerHTML = '';
     grid_shell_mock.is_dirty = false;
     grid_shell_mock.has_live_uncommitted = false;
+    grid_shell_mock.save_in_flight = false;
     grid_shell_mock.has_uncommitted_changes = false;
     grid_shell_mock.mount_count = 0;
     grid_shell_mock.on_editing_change = null;
@@ -699,6 +718,7 @@ describe('workbook snapshot hydration', () => {
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
             },
             state: {
                 columnWidths: [], rowHeights: [], scrollPosition: [],
@@ -715,6 +735,7 @@ describe('workbook snapshot hydration', () => {
             .filter((item) => item.type === 'pendingEditsChanged');
         expect(pending_messages).toContainEqual({
             type: 'pendingEditsChanged',
+            editSessionId: 'test-edit-session',
             edits: authoritative,
         });
         expect(pending_messages.some((item) => item.edits === null)).toBe(false);
@@ -746,6 +767,7 @@ describe('workbook snapshot hydration', () => {
             .filter((item) => item.type === 'pendingEditsChanged');
         expect(pending_messages).toContainEqual({
             type: 'pendingEditsChanged',
+            editSessionId: 'test-edit-session',
             edits: live_edits,
         });
         expect(pending_messages.some((item) => item.edits === null)).toBe(false);
@@ -2201,6 +2223,122 @@ describe('edit mode save exit', () => {
             JSON.stringify(pendingEdits)
         );
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
+    });
+
+    it('does not clear pending edits when capability ID arrives before the session grant', async () => {
+        grid_shell_mock.emit_pending_edits_on_mount = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+            },
+        }));
+        post_message.mockClear();
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            presentation: 'refresh',
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'session-new',
+            },
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+        }));
+        expect(post_message.mock.calls.some(([message]) => (
+            (message as { type?: string }).type === 'pendingEditsChanged'
+        ))).toBe(false);
+
+        const pendingEdits = { '0:0': { value: 'restored', base: 'a' } };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'session-new',
+            pendingEdits,
+        });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'pendingEditsChanged',
+            editSessionId: 'session-new',
+            edits: pendingEdits,
+        });
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
+            JSON.stringify(pendingEdits),
+        );
+    });
+
+    it('drops edit mode and pending restoration when the host revokes a saved session', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
+        });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        post_message.mockClear();
+        await dispatch_host_message({ type: 'editSessionRevoked', reason: 'saved' });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(post_message).not.toHaveBeenCalledWith({ type: 'releaseEditSession' });
+        expect(post_message.mock.calls.some(([message]) => (
+            (message as { type?: string }).type === 'pendingEditsChanged'
+        ))).toBe(false);
+    });
+
+    it('stays in edit mode when cleanup recovery enables capability before granting', async () => {
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: true,
+            },
+        }));
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            presentation: 'refresh',
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+        }));
+        await dispatch_host_message({ type: 'editSessionResult', granted: true });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('disables the edit toolbar while GridShell is saving', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            sheet_meta_message(make_meta(['Sheet1'], false), {
+                csvEditable: true,
+                csvEditingSupported: true,
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '0:0': { value: 'dirty', base: 'base' },
+        }, true);
+
+        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
     });
 
     it('stays in edit mode when save is requested while dirty work is already saving', async () => {

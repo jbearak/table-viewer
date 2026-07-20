@@ -17,6 +17,10 @@ function deferred<T = void>() {
     return { promise, resolve };
 }
 
+async function flush_promises(): Promise<void> {
+    for (let index = 0; index < 100; index += 1) await Promise.resolve();
+}
+
 function state_store(initial: PerFileState = {}) {
     return versioned_state_store(initial);
 }
@@ -67,11 +71,33 @@ function open_csv_table(
     return panel;
 }
 
+function uncertain_cleanup_store(initial: PerFileState) {
+    const versioned = state_store(initial);
+    const recovery_started = deferred();
+    const recovery_gate = deferred();
+    let cleanup_attempts = 0;
+    const store: FileStateStore = {
+        ...versioned.store,
+        async compare_and_set(path, expected, next, validate) {
+            const current = await versioned.store.read(path);
+            if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                cleanup_attempts += 1;
+                if (cleanup_attempts === 1) throw new Error('initial cleanup failed');
+                recovery_started.resolve();
+                await recovery_gate.promise;
+            }
+            return versioned.store.compare_and_set(path, expected, next, validate);
+        },
+    };
+    return { versioned, store, recovery_started, recovery_gate };
+}
+
 function edit_session_results(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
         (message): message is {
             type: string;
             granted: boolean;
+            editSessionId?: string;
             pendingEdits?: PerFileState['pendingEdits'];
         } => (
             typeof message === 'object'
@@ -79,7 +105,21 @@ function edit_session_results(panel: { __messages: unknown[] }) {
             && 'type' in message
             && message.type === 'editSessionResult'
         )
-    );
+    ).map(({ editSessionId: _session, ...message }) => message);
+}
+
+function latest_edit_session_message(panel: { __messages: unknown[] }) {
+    return [...panel.__messages].reverse().find((message): message is {
+        type: 'editSessionResult';
+        granted: boolean;
+        editSessionId?: string;
+        pendingEdits?: PerFileState['pendingEdits'];
+    } => (
+        typeof message === 'object'
+        && message !== null
+        && 'type' in message
+        && message.type === 'editSessionResult'
+    ));
 }
 
 function latest_snapshot(panel: { __messages: unknown[] }): {
@@ -439,6 +479,533 @@ describe('CSV edit sessions', () => {
 
         await panel.__receive({ type: 'ready' });
         expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
+    });
+
+    it('reacquires with a new edit epoch and rejects delayed messages from the old session', async () => {
+        const file_path = '/tmp/reacquired-edit-epoch.csv';
+        const state = state_store();
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const first = latest_edit_session_message(panel)!;
+        expect(first.editSessionId).toBeDefined();
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: first.editSessionId,
+            edits: { '0:0': { value: 'first', base: 'a' } },
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            editSessionId: first.editSessionId,
+            edits: { '0:0': 'first' },
+        });
+        await flush_promises();
+
+        await panel.__receive({ type: 'requestEditSession' });
+        const second = latest_edit_session_message(panel)!;
+        expect(second.granted).toBe(true);
+        expect(second.editSessionId).toBeDefined();
+        expect(second.editSessionId).not.toBe(first.editSessionId);
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: first.editSessionId,
+            edits: { '0:0': { value: 'stale', base: 'first' } },
+        });
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: undefined,
+            edits: { '0:0': { value: 'idless stale', base: 'first' } },
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        await panel.__receive({
+            type: 'saveCsv',
+            editSessionId: undefined,
+            edits: { '0:0': 'idless stale' },
+        });
+        expect(panel.__messages.filter((message: any) => (
+            message?.type === 'saveResult' && message.success === true
+        ))).toHaveLength(1);
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: second.editSessionId,
+            edits: { '0:0': { value: 'second', base: 'first' } },
+        });
+        expect(state.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'second', base: 'first' },
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            editSessionId: second.editSessionId,
+            edits: { '0:0': 'second' },
+        });
+        expect(panel.__messages.filter((message: any) => (
+            message?.type === 'saveResult' && message.success === true
+        ))).toHaveLength(2);
+    });
+
+    it('aborts an old epoch when ownership changes between state read and CAS', async () => {
+        const file_path = '/tmp/pending-cas-epoch-race.csv';
+        const versioned = state_store();
+        const old_cas_started = deferred();
+        const old_cas_gate = deferred();
+        let block_old = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const pending = next.pendingEdits?.['0:0'];
+                if (
+                    block_old
+                    && typeof pending === 'object'
+                    && pending?.value === 'old owner'
+                ) {
+                    block_old = false;
+                    old_cas_started.resolve();
+                    await old_cas_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const old_owner = open_csv_table(uri(file_path), store);
+        const new_owner = open_csv_table(uri(file_path), store);
+        await old_owner.__receive({ type: 'ready' });
+        await new_owner.__receive({ type: 'ready' });
+        await old_owner.__receive({ type: 'requestEditSession' });
+        const old_session = latest_edit_session_message(old_owner)!.editSessionId!;
+
+        const stale_write = old_owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: old_session,
+            edits: { '0:0': { value: 'old owner', base: 'a' } },
+        });
+        await old_cas_started.promise;
+        await old_owner.__receive({ type: 'releaseEditSession' });
+        old_owner.dispose();
+
+        await new_owner.__receive({ type: 'requestEditSession' });
+        const new_session = latest_edit_session_message(new_owner)!.editSessionId!;
+        await new_owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: new_session,
+            edits: { '0:0': { value: 'new owner', base: 'a' } },
+        });
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'new owner', base: 'a' },
+        });
+
+        old_cas_gate.resolve();
+        await stale_write;
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'new owner', base: 'a' },
+        });
+    });
+
+    it('settles accepted pending-edit persistence before writing a save', async () => {
+        const file_path = '/tmp/settled-pending-before-save.csv';
+        const versioned = state_store();
+        const pending_started = deferred();
+        const pending_gate = deferred();
+        const write_started = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits) {
+                    pending_started.resolve();
+                    await pending_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        vscode_mock.__setWriteFileImplementation(async () => {
+            write_started.resolve();
+        });
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const pending = panel.__receive({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'accepted', base: 'a' } },
+        });
+        await pending_started.promise;
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'accepted' } });
+        let wrote = false;
+        void write_started.promise.then(() => { wrote = true; });
+        await flush_promises();
+        expect(wrote).toBe(false);
+
+        pending_gate.resolve();
+        await Promise.all([pending, save, write_started.promise]);
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+    });
+
+    it('ignores late pending-edit messages after save submission', async () => {
+        const file_path = '/tmp/late-pending-after-save.csv';
+        const original = { '0:0': { value: 'accepted', base: 'a' } };
+        const state = state_store({ pendingEdits: original });
+        const write_started = deferred();
+        const write_gate = deferred();
+        vscode_mock.__setWriteFileImplementation(async () => {
+            write_started.resolve();
+            await write_gate.promise;
+        });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'accepted' } });
+        await write_started.promise;
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'too late', base: 'a' } },
+        });
+        expect(state.get_state(file_path).pendingEdits).toEqual(original);
+
+        write_gate.resolve();
+        await save;
+        await flush_promises();
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+    });
+
+    it('keeps disk success while a pending-edit cleanup failure disables editing', async () => {
+        const file_path = '/tmp/save-cleanup-failure.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = state_store({ pendingEdits });
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    throw new Error('cleanup storage failed');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const panel = open_csv_table(uri(file_path), store);
+        const peer = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+        await peer.__receive({ type: 'requestEditSession' });
+        await panel.__receive({ type: 'ready' });
+
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
+        expect(edit_session_results(peer).at(-1)).toEqual({
+            type: 'editSessionResult',
+            granted: false,
+        });
+        expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+    });
+
+    it('reports disk success before stalled cleanup and refresh, then blocks every panel', async () => {
+        const file_path = '/tmp/stalled-save-followup.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = state_store({ pendingEdits });
+        const cleanup_started = deferred();
+        const cleanup_gate = deferred();
+        let builds = 0;
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    cleanup_started.resolve();
+                    await cleanup_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: true,
+            async build_source(raw, path) {
+                builds += 1;
+                if (builds > 1) return new Promise<DataSource>(() => {});
+                return csv_table_profile().build_source(raw, path, {});
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store, profile);
+        const peer = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await cleanup_started.promise;
+        await flush_promises();
+
+        expect(owner.__messages).toContainEqual({
+            type: 'editSessionRevoked',
+            reason: 'saved',
+        });
+        expect(owner.__messages.filter((message: any) => message?.type === 'saveResult'))
+            .toEqual([{ type: 'saveResult', success: true }]);
+        const peer_refresh = [...peer.__messages].reverse().find((message: any) => (
+            message?.type === 'workbookSnapshot'
+            && message.snapshot.presentation === 'refresh'
+        )) as { snapshot?: { capabilities?: { csvEditable?: boolean } } } | undefined;
+        expect(peer_refresh?.snapshot?.capabilities?.csvEditable).toBe(false);
+        await peer.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(peer).at(-1)?.granted).toBe(false);
+        await owner.__receive({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'stale', base: 'a' } },
+        });
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+    });
+
+    it('recovers uncertain cleanup before another panel can claim', async () => {
+        const file_path = '/tmp/recover-save-cleanup.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = state_store({ pendingEdits });
+        let fail_cleanup = true;
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if (
+                    fail_cleanup
+                    && (current.state as PerFileState).pendingEdits
+                    && !next.pendingEdits
+                ) {
+                    throw new Error('cleanup failed once');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        const peer = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        fail_cleanup = false;
+        await peer.__receive({ type: 'requestEditSession' });
+
+        expect(edit_session_results(peer).at(-1)).toEqual({
+            type: 'editSessionResult',
+            granted: true,
+        });
+        const grant_index = peer.__messages.map((message: any) => (
+            message?.type === 'editSessionResult' && message.granted === true
+        )).lastIndexOf(true);
+        const capability_index = peer.__messages.map((message: any) => (
+            message?.type === 'workbookSnapshot'
+            && message.snapshot.capabilities.csvEditable === true
+        )).lastIndexOf(true);
+        expect(capability_index).toBeGreaterThanOrEqual(0);
+        expect(capability_index).toBeLessThan(grant_index);
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('denies a timed-out recovery waiter and lets a sibling claim after late cleanup', async () => {
+        vi.useFakeTimers();
+        const file_path = '/tmp/timed-out-cleanup-waiter.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const owner = open_csv_table(uri(file_path), cleanup.store);
+        const timed_out = open_csv_table(uri(file_path), cleanup.store);
+        const sibling = open_csv_table(uri(file_path), cleanup.store);
+        await owner.__receive({ type: 'ready' });
+        await timed_out.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        const first_request = timed_out.__receive({ type: 'requestEditSession' });
+        await cleanup.recovery_started.promise;
+        await vi.advanceTimersByTimeAsync(250);
+        await first_request;
+        expect(edit_session_results(timed_out).at(-1)?.granted).toBe(false);
+
+        cleanup.recovery_gate.resolve();
+        await flush_promises();
+        expect(edit_session_results(timed_out).some((result) => result.granted)).toBe(false);
+        await sibling.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(true);
+        vi.useRealTimers();
+    });
+
+    it('leaves recovery free when its requester is disposed', async () => {
+        const file_path = '/tmp/disposed-cleanup-waiter.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const owner = open_csv_table(uri(file_path), cleanup.store);
+        const disposed_waiter = open_csv_table(uri(file_path), cleanup.store);
+        const survivor = open_csv_table(uri(file_path), cleanup.store);
+        await owner.__receive({ type: 'ready' });
+        await disposed_waiter.__receive({ type: 'ready' });
+        await survivor.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        const request = disposed_waiter.__receive({ type: 'requestEditSession' });
+        await cleanup.recovery_started.promise;
+        disposed_waiter.dispose();
+        await request;
+        cleanup.recovery_gate.resolve();
+        await flush_promises();
+
+        await survivor.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(survivor).at(-1)?.granted).toBe(true);
+        expect(edit_session_results(disposed_waiter).some((result) => result.granted)).toBe(false);
+    });
+
+    it('allows exactly one live waiter to claim a shared cleanup recovery', async () => {
+        const file_path = '/tmp/shared-cleanup-waiters.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const owner = open_csv_table(uri(file_path), cleanup.store);
+        const first = open_csv_table(uri(file_path), cleanup.store);
+        const second = open_csv_table(uri(file_path), cleanup.store);
+        await owner.__receive({ type: 'ready' });
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        const first_request = first.__receive({ type: 'requestEditSession' });
+        const second_request = second.__receive({ type: 'requestEditSession' });
+        await cleanup.recovery_started.promise;
+        cleanup.recovery_gate.resolve();
+        await Promise.all([first_request, second_request]);
+
+        const granted = [first, second].filter((panel) => (
+            edit_session_results(panel).at(-1)?.granted === true
+        ));
+        expect(granted).toHaveLength(1);
+        expect(edit_session_results(first).at(-1)?.granted).toBe(true);
+        expect(edit_session_results(second).at(-1)?.granted).toBe(false);
+    });
+
+    it('lets a timed-out panel retry after late recovery leaves the file free', async () => {
+        vi.useFakeTimers();
+        const file_path = '/tmp/retry-cleanup-waiter.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const owner = open_csv_table(uri(file_path), cleanup.store);
+        const waiter = open_csv_table(uri(file_path), cleanup.store);
+        await owner.__receive({ type: 'ready' });
+        await waiter.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        const first_request = waiter.__receive({ type: 'requestEditSession' });
+        await cleanup.recovery_started.promise;
+        await vi.advanceTimersByTimeAsync(250);
+        await first_request;
+        expect(edit_session_results(waiter).at(-1)?.granted).toBe(false);
+        cleanup.recovery_gate.resolve();
+        await flush_promises();
+
+        await waiter.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(waiter).at(-1)?.granted).toBe(true);
+        vi.useRealTimers();
+    });
+
+    it('finishes file cleanup after the saving owner is disposed', async () => {
+        const file_path = '/tmp/disposed-owner-cleanup.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = state_store({ pendingEdits });
+        const cleanup_started = deferred();
+        const cleanup_gate = deferred();
+        let bytes = enc.encode('h\na\n');
+        let file_reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            file_reads += 1;
+            return bytes;
+        });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    cleanup_started.resolve();
+                    await cleanup_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        const peer = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await cleanup_started.promise;
+        await flush_promises();
+        const blocked = [...peer.__messages].reverse().find((message: any) => (
+            message?.type === 'workbookSnapshot'
+            && message.snapshot.capabilities.csvEditable === false
+        )) as { snapshot: {
+            generation: number;
+            sourceGeneration: number;
+            identity: WorkbookSnapshotIdentity;
+        } };
+        const owner_messages_before_dispose = owner.__messages.length;
+        const reads_before_cleanup_completion = file_reads;
+        owner.dispose();
+
+        await peer.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(peer).at(-1)?.granted).toBe(false);
+        cleanup_gate.resolve();
+        await flush_promises();
+        const available = [...peer.__messages].reverse().find((message: any) => (
+            message?.type === 'workbookSnapshot'
+            && message.snapshot.capabilities.csvEditable === true
+            && message.snapshot.presentation === 'refresh'
+        )) as typeof blocked;
+        expect(available.snapshot.generation).toBe(blocked.snapshot.generation);
+        expect(available.snapshot.sourceGeneration).toBe(blocked.snapshot.sourceGeneration);
+        expect(available.snapshot.identity.sourceBasis).toEqual(
+            blocked.snapshot.identity.sourceBasis,
+        );
+        expect(file_reads).toBe(reads_before_cleanup_completion);
+        expect(owner.__messages).toHaveLength(owner_messages_before_dispose);
+
+        await peer.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(peer).at(-1)?.granted).toBe(true);
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
     it('does not resurrect cleared pending edits from a later visibility snapshot', async () => {

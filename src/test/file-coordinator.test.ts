@@ -977,6 +977,44 @@ describe('file coordinator refresh stream', () => {
         coordinator.dispose();
     });
 
+    it('holds an own-write watcher batch for postSave and releases it on cancel', async () => {
+        const factory = new TestRefreshWatcherFactory();
+        const coordinator = acquire_file_coordinator(`/tmp/reserved-post-save-${Math.random()}.csv`);
+        const events: FileRefreshEvent[] = [];
+        const subscription = coordinator.subscribe_refresh((event) => { events.push(event); }, factory);
+
+        const absorbed = subscription.reserve_post_save();
+        factory.watchers[0].emit('change');
+        await flush_refresh();
+        expect(events).toEqual([]);
+        await expect(subscription.request('postSave')).resolves.toMatchObject({
+            event: { refreshRevision: 2, episode: 1, reason: 'postSave' },
+        });
+        absorbed.cancel(); // already consumed by request
+        expect(events).toMatchObject([{
+            refreshRevision: 2,
+            episode: 1,
+            reason: 'postSave',
+            priority: 'high',
+        }]);
+
+        const released = subscription.reserve_post_save();
+        factory.watchers[0].emit('delete');
+        await flush_refresh();
+        expect(events).toHaveLength(1);
+        released.cancel();
+        await flush_refresh();
+        expect(events[1]).toMatchObject({
+            refreshRevision: 3,
+            episode: 2,
+            reason: 'watcherDelete',
+            priority: 'normal',
+        });
+
+        subscription.dispose();
+        coordinator.dispose();
+    });
+
     it('lets postSave absorb pending watcher work but not later signals', async () => {
         const factory = new TestRefreshWatcherFactory();
         const coordinator = acquire_file_coordinator(`/tmp/post-save-${Math.random()}.csv`);

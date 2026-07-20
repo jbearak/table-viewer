@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
-import { attach_viewer, csv_table_profile } from '../viewer-controller';
+import { attach_viewer, build_csv_source, csv_table_profile } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
 import type { DataSource } from '../data-source/interface';
@@ -19,28 +19,34 @@ import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 function open_csv_table(
     file_uri: vscode.Uri,
     store: AuthorityFileStateStore = state_store(),
-): void {
+    profile = csv_table_profile(),
+) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         file_uri,
         store,
-        csv_table_profile(),
+        profile,
     );
     panel.onDidDispose(() => controller.dispose());
+    return panel;
 }
 
 const enc = new TextEncoder();
 
 function deferred<T>() {
     let resolve!: (value: T) => void;
-    const promise = new Promise<T>((r) => { resolve = r; });
-    return { promise, resolve };
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((r, j) => {
+        resolve = r;
+        reject = j;
+    });
+    return { promise, resolve, reject };
 }
 
 async function flush_promises(): Promise<void> {
     // Coordinator adoption adds a short serialized authority-establishment hop.
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 200; i++) {
         await Promise.resolve();
     }
 }
@@ -90,6 +96,10 @@ function workbook_snapshots(panel: { __messages: unknown[] }): CsvSnapshot['snap
 
 function refresh_snapshots(panel: { __messages: unknown[] }) {
     return workbook_snapshots(panel).filter((snapshot) => snapshot.presentation === 'refresh');
+}
+
+function source_refresh_snapshots(panel: { __messages: unknown[] }) {
+    return refresh_snapshots(panel).filter((snapshot) => snapshot.reason !== 'other');
 }
 
 function initial_snapshots(panel: { __messages: unknown[] }) {
@@ -159,7 +169,7 @@ describe('CSV reload races', () => {
             disposition: 'duplicate',
         });
         await panel.__receive({ type: 'saveCsv', edits: {} });
-        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
     });
 
     it('mock event disposables unregister handlers', async () => {
@@ -929,7 +939,7 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
 
         expect(reload_attempts).toBe(2);
-        expect(refresh_snapshots(panel)).toMatchObject([{
+        expect(source_refresh_snapshots(panel)).toMatchObject([{
             sourceGeneration: 2,
             generation: 2,
             meta: { sheets: [{ rowCount: 2 }] },
@@ -1270,9 +1280,9 @@ describe('CSV reload races', () => {
 
     it('a save is not rolled back by an in-flight stale reload', async () => {
         // A watcher reload is in flight (awaiting its parse) when the user saves.
-        // The save re-parses the just-written file and adopts it; when the older
-        // reload finally resolves it must be discarded, not allowed to overwrite
-        // the saved source with stale content.
+        // The high-priority postSave episode refreshes the just-written file; when
+        // the older reload finally resolves it must be discarded, not allowed to
+        // overwrite the saved source with stale content.
         const stale = deferred<Uint8Array>();
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let call = 0;
@@ -1283,8 +1293,8 @@ describe('CSV reload races', () => {
             if (call <= 2) return enc.encode('h\na\n'); // initial parse + verification
             if (call === 3) return stale.promise; // in-flight watcher parse
             if (call === 4) return enc.encode('h\na\n'); // save conflict check
-            // Save reparse and the stale candidate's final verification see the
-            // bytes that were written, so the stale candidate must be rejected.
+            // The postSave candidate and stale candidate verification see the
+            // written bytes, so the older candidate must be rejected.
             return enc.encode('h\na\nb\n');
         });
 
@@ -1302,9 +1312,10 @@ describe('CSV reload races', () => {
         // The older reload resolves only after the save has adopted its result.
         stale.resolve(enc.encode('h\nx\ny\nz\n'));                  // rowCount 3
         await reload_done;
+        await flush_promises();
 
         const reloads = refresh_snapshots(panel);
-        // The save's refresh snapshot (rowCount 2) must stand; the stale reload's
+        // The postSave snapshot (rowCount 2) must stand; the stale reload's
         // rowCount-3 result must never be adopted.
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 3)).toBe(false);
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 2)).toBe(true);
@@ -1313,16 +1324,16 @@ describe('CSV reload races', () => {
 
     it('does not drop an external edit that lands right after a save', async () => {
         // A real external change immediately after a save must still reload —
-        // ordering (reload_seq), not a wall-clock window, decides which parse
-        // wins, so a legitimate edit within the old 2s suppress window isn't lost.
+        // ordering, not a wall-clock suppression window, decides which bytes win.
         let current_mtime = 1;
-        let call = 0;
-        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: current_mtime }));
-        vscode_mock.__setReadFileImplementation(async () => {
-            call++;
-            if (call <= 3) return enc.encode('h\na\n'); // ready + save conflict check
-            if (call <= 5) return enc.encode('h\na\nb\n'); // save parse + verification
-            return enc.encode('h\np\nq\nr\ns\nt\n'); // external parse + verification
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime: current_mtime,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -1330,11 +1341,13 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' });
 
-        await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
 
-        // An external edit changes the file (new mtime) right after the save.
+        // An external edit changes the file immediately after disk success.
+        bytes = enc.encode('h\np\nq\nr\ns\nt\n');
         current_mtime = 2;
         await vscode_mock.__getWatchers()[0].__fireChange();
+        await flush_promises();
 
         const reloads = refresh_snapshots(panel);
         expect(reloads.some((r) => r.meta.sheets[0].rowCount === 5)).toBe(true);
@@ -1363,6 +1376,8 @@ describe('CSV reload races', () => {
                 && message !== null
                 && 'type' in message
                 && message.type === 'workbookSnapshot'
+                && 'snapshot' in message
+                && (message.snapshot as { reason?: string }).reason !== 'other'
             ) {
                 reload_attempts += 1;
                 if (reload_attempts === 1) return false;
@@ -1374,7 +1389,7 @@ describe('CSV reload races', () => {
         await vi.advanceTimersByTimeAsync(50);
 
         expect(reload_attempts).toBe(2);
-        expect(refresh_snapshots(panel)).toMatchObject([{
+        expect(source_refresh_snapshots(panel)).toMatchObject([{
             sourceGeneration: 2,
             generation: 2,
         }]);
@@ -1384,71 +1399,330 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
-    it('keeps an in-flight watcher viable when the post-save reparse cannot build', async () => {
+    it('publishes one postSave episode to table and preview panels', async () => {
         vi.useFakeTimers();
-        const watcher_bytes = deferred<Uint8Array>();
-        const first_reparse_failed = deferred<void>();
-        let reads = 0;
-        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
-        vscode_mock.__setReadFileImplementation(async () => {
-            reads += 1;
-            if (reads <= 2) return enc.encode('h\na\n');
-            if (reads === 3) return watcher_bytes.promise;
-            if (reads === 4) return enc.encode('h\na\n');
-            if (reads === 5) {
-                first_reparse_failed.resolve();
-                throw Object.assign(new Error('busy'), { code: 'EBUSY' });
-            }
-            if (reads === 6) return enc.encode('h\na\nb\n');
-            throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+        const file_path = '/tmp/shared-post-save.csv';
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
         });
-        open_csv_table(uri('/tmp/save-watcher-fallback.csv'));
-        const panel = vscode_mock.__getPanels()[0];
-        await panel.__receive({ type: 'ready' });
-        await panel.__receive({ type: 'requestEditSession' });
-        const watcher_done = vscode_mock.__getWatchers()[0].__fireChange();
-        await flush_promises();
-        const save_done = panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
-        await first_reparse_failed.promise;
 
-        watcher_bytes.resolve(enc.encode('h\na\nb\n'));
-        await watcher_done;
-        expect(refresh_snapshots(panel)).toMatchObject([{
-            meta: { sheets: [{ rowCount: 2 }] },
-        }]);
+        const owner = open_csv_table(uri(file_path));
+        const peer = open_csv_table(uri(file_path));
+        show_csv_preview(uri(file_path), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Beside));
+        const preview = vscode_mock.__getPanels()[2];
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await preview.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
 
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
         await vi.advanceTimersByTimeAsync(500);
-        await save_done;
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        await save;
+        await flush_promises();
+
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
+        expect([owner, peer, preview].map((panel) => source_refresh_snapshots(panel).length))
+            .toEqual([1, 1, 1]);
+        for (const panel of [owner, peer, preview]) {
+            expect(source_refresh_snapshots(panel)[0].meta.sheets[0].rowCount).toBe(1);
+        }
+        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(peer.__messages.some((message: any) => message?.type === 'saveResult')).toBe(false);
+        expect(preview.__messages.some((message: any) => message?.type === 'saveResult')).toBe(false);
         vi.useRealTimers();
     });
 
-    it('reports save success even when the post-write reload fails', async () => {
-        // The write succeeded, so the bytes are on disk. If the follow-up
-        // re-parse throws (transient read error / external delete in the TOCTOU
-        // window), the save must still be reported as successful, not failed.
-        let call = 0;
-        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
-        vscode_mock.__setReadFileImplementation(async () => {
-            call++;
-            if (call <= 3) return enc.encode('h\na\n'); // ready + conflict digest check
-            throw new Error('reload boom'); // bounded post-save reparses fail
+    it('absorbs a watcher queued synchronously by writeFile into postSave', async () => {
+        const file_path = '/tmp/synchronous-own-watcher.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), state_store(), {
+            editing: true,
+            async build_source(raw, path) {
+                builds += 1;
+                return build_csv_source(raw, path);
+            },
+        });
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+            void vscode_mock.__getActiveWatchers()[0].__fireChange();
         });
 
-        open_csv_table(uri('/tmp/save.csv'));
-        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        expect(builds).toBe(2);
+        expect(source_refresh_snapshots(panel)).toHaveLength(1);
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+    });
+
+    it('deduplicates a delayed own watcher only for panels that ACKed postSave', async () => {
+        vi.useFakeTimers();
+        const file_path = '/tmp/delayed-own-watcher.csv';
+        let bytes = enc.encode('h\na\n');
+        let owner_builds = 0;
+        let peer_builds = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const owner = open_csv_table(uri(file_path), state_store(), {
+            editing: true,
+            async build_source(raw, path) {
+                owner_builds += 1;
+                return build_csv_source(raw, path);
+            },
+        });
+        const peer = open_csv_table(uri(file_path), state_store(), {
+            editing: false,
+            async build_source(raw, path) {
+                peer_builds += 1;
+                return build_csv_source(raw, path);
+            },
+        });
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        peer.__autoAckSnapshots = false;
+        await owner.__receive({ type: 'requestEditSession' });
+
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await vi.advanceTimersByTimeAsync(500);
+        await save;
+        expect(source_refresh_snapshots(owner)).toHaveLength(1);
+        expect(source_refresh_snapshots(peer)).toHaveLength(1);
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await vi.advanceTimersByTimeAsync(500);
+
+        expect(owner_builds).toBeGreaterThanOrEqual(3);
+        expect(peer_builds).toBeGreaterThanOrEqual(3);
+        expect(source_refresh_snapshots(owner)).toHaveLength(1);
+        expect(source_refresh_snapshots(peer).length).toBeGreaterThanOrEqual(2);
+        vi.useRealTimers();
+    });
+
+    it('does not await another panel whose postSave parser hangs', async () => {
+        const file_path = '/tmp/post-save-hanging-peer.csv';
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const owner = open_csv_table(uri(file_path));
+        let builds = 0;
+        const peer_started = deferred<void>();
+        const peer_profile = {
+            editing: false,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds > 1) {
+                    peer_started.resolve();
+                    return new Promise<DataSource>(() => {});
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const peer = open_csv_table(uri(file_path), state_store(), peer_profile);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await peer_started.promise;
+        await save;
+        await flush_promises();
+
+        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(source_refresh_snapshots(owner)).toHaveLength(1);
+        peer.dispose();
+    });
+
+    it('reports exactly one save success when the owner postSave refresh fails', async () => {
+        vi.useFakeTimers();
+        const file_path = '/tmp/post-save-owner-failure.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const profile = {
+            editing: true,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds > 1) throw new Error('owner parser failed');
+                return build_csv_source(raw, path);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), state_store(), profile);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await vi.advanceTimersByTimeAsync(500);
+        await save;
+
+        const results = owner.__messages.filter((message: any) => message?.type === 'saveResult');
+        expect(results).toEqual([{ type: 'saveResult', success: true }]);
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
+        vi.useRealTimers();
+    });
+
+    it('keeps save success and the prior view when the file is deleted after write', async () => {
+        vi.useFakeTimers();
+        const file_path = '/tmp/post-save-delete.csv';
+        let bytes = enc.encode('h\na\n');
+        let deleted = false;
+        vscode_mock.__setStatImplementation(async () => {
+            if (deleted) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+            return { size: bytes.byteLength, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async () => {
+            if (deleted) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+            return bytes;
+        });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+            deleted = true;
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const panel = open_csv_table(uri(file_path));
+        await panel.__receive({ type: 'ready' });
+        const initial = initial_snapshots(panel)[0];
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await vi.advanceTimersByTimeAsync(500);
+        await save;
+
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(source_refresh_snapshots(panel)).toHaveLength(0);
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(initial.meta.sheets[0].rowCount).toBe(1);
+
+        deleted = false;
+        await vscode_mock.__getActiveWatchers()[0].__fireCreate();
+        expect(source_refresh_snapshots(panel)).toHaveLength(1);
+        vi.useRealTimers();
+    });
+
+    it('lets a same-stat external watcher supersede a stalled postSave candidate', async () => {
+        const file_path = '/tmp/post-save-external-supersede.csv';
+        let bytes = enc.encode('h\naaaaa\n');
+        let builds = 0;
+        const post_save_started = deferred<void>();
+        const release_post_save = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const profile = {
+            editing: true,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 2) {
+                    post_save_started.resolve();
+                    await release_post_save.promise;
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' });
 
-        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await post_save_started.promise;
+        bytes = enc.encode('h\nother\n'); // same size and mtime as the saved bytes
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        release_post_save.resolve();
+        await save;
+        await flush_promises();
 
-        const results = panel.__messages.filter(
-            (m): m is { type: string; success: boolean } => (
-                typeof m === 'object' && m !== null && 'type' in m
-                && (m as { type: string }).type === 'saveResult'
-            ),
-        );
-        expect(results).toEqual([{ type: 'saveResult', success: true }]);
+        const latest = workbook_snapshots(panel).at(-1)!;
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'external-wins',
+            generation: latest.generation,
+            sourceGeneration: latest.sourceGeneration,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'external-wins',
+            rows: [[expect.objectContaining({ raw: 'other' })]],
+        }));
+        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+    });
+
+    it('emits one success even when the panel is disposed after writeFile', async () => {
+        const file_path = '/tmp/save-disposal.csv';
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path));
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+            panel.dispose();
+        });
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+
+        expect(panel.__messages.filter((message: any) => message?.type === 'saveResult'))
+            .toEqual([{ type: 'saveResult', success: true }]);
+    });
+
+    it('releases a disposed owner when writeFile rejects', async () => {
+        const file_path = '/tmp/rejected-disposed-save.csv';
+        const write_started = deferred<void>();
+        const write_gate = deferred<void>();
+        const bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async () => {
+            write_started.resolve();
+            await write_gate.promise;
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const owner = open_csv_table(uri(file_path));
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await write_started.promise;
+        owner.dispose();
+        write_gate.reject(new Error('write rejected'));
+        await save;
+
+        expect(owner.__messages.some((message: any) => (
+            message?.type === 'saveResult' && message.success === true
+        ))).toBe(false);
+        expect(warning).not.toHaveBeenCalledWith(expect.stringContaining('file was saved'));
+
+        vscode_mock.__setWriteFileImplementation(async () => {});
+        const replacement = open_csv_table(uri(file_path));
+        await replacement.__receive({ type: 'ready' });
+        await replacement.__receive({ type: 'requestEditSession' });
+        expect(replacement.__messages).toContainEqual(expect.objectContaining({
+            type: 'editSessionResult',
+            granted: true,
+        }));
     });
 
     it('refuses a same-size same-mtime external edit before saving', async () => {
@@ -1472,6 +1746,43 @@ describe('CSV reload races', () => {
         expect(warning_spy).toHaveBeenCalledWith(
             expect.stringContaining('modified externally'),
         );
+    });
+
+    it('uses panel-local conflict recovery without publishing postSave', async () => {
+        const file_path = '/tmp/local-conflict-recovery.csv';
+        let bytes = enc.encode('h\na\n');
+        let owner_builds = 0;
+        let peer_builds = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const owner_profile = {
+            editing: true,
+            async build_source(raw: Uint8Array, path: string) {
+                owner_builds += 1;
+                return build_csv_source(raw, path);
+            },
+        };
+        const peer_profile = {
+            editing: false,
+            async build_source(raw: Uint8Array, path: string) {
+                peer_builds += 1;
+                return build_csv_source(raw, path);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), state_store(), owner_profile);
+        const peer = open_csv_table(uri(file_path), state_store(), peer_profile);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' });
+        bytes = enc.encode('h\nx\n');
+
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+
+        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: false });
+        expect(owner_builds).toBe(2);
+        expect(peer_builds).toBe(1);
+        expect(source_refresh_snapshots(owner)).toHaveLength(1);
+        expect(source_refresh_snapshots(peer)).toHaveLength(0);
     });
 
     it('detects an external edit that lands during CSV serialization', async () => {
@@ -1509,7 +1820,7 @@ describe('CSV reload races', () => {
             call++;
             if (call <= 2) return enc.encode('h\na\n'); // initial parse + verification
             if (call === 3) return enc.encode('h\nx\n'); // conflict digest check
-            throw new Error('reload boom'); // bounded post-conflict reparses fail
+            throw new Error('reload boom'); // bounded local recovery attempts fail
         });
         const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
 

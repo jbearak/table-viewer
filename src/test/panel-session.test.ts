@@ -947,6 +947,50 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(issued.state.columnWidths).toEqual([]);
     });
 
+    it('recaptures capabilities without replacing source identity or mutating issued snapshots', async () => {
+        let editable = false;
+        const source = adoption({
+            project: () => ({
+                configuration: {
+                    defaultTabOrientation: 'horizontal',
+                    previewMode: false,
+                },
+                capabilities: {
+                    csvEditable: editable,
+                    csvEditingSupported: true,
+                },
+            }),
+        });
+        const { session, posted } = make_session();
+        session.replace_adoption(source);
+        session.ready();
+        await settle();
+        const initial = snapshot(posted);
+        ack(session, initial);
+        expect(session.acknowledged_current()).toBe(true);
+
+        editable = true;
+        expect(session.recapture_current_projection({ deliver: true })).toBe(true);
+        await settle();
+        const capability = snapshot(posted);
+
+        expect(posted).toHaveLength(2);
+        expect(initial.capabilities.csvEditable).toBe(false);
+        expect(capability.capabilities.csvEditable).toBe(true);
+        expect(capability.generation).toBe(initial.generation);
+        expect(capability.sourceGeneration).toBe(initial.sourceGeneration);
+        expect(capability.identity.sourceBasis).toEqual(initial.identity.sourceBasis);
+        expect(capability.identity.authority).toEqual(initial.identity.authority);
+        expect(session.acknowledged_current()).toBe(false);
+        ack(session, capability);
+        expect(session.acknowledged_current()).toBe(true);
+
+        session.dispose();
+        editable = false;
+        expect(session.recapture_current_projection({ deliver: true })).toBe(false);
+        expect(posted).toHaveLength(2);
+    });
+
     it('isolates the immutable snapshot from later input mutation', async () => {
         const source = adoption();
         const mutable_state = source.stateSnapshot.state as { pendingEdits?: Record<string, string> };

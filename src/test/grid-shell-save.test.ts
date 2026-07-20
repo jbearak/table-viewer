@@ -8,6 +8,7 @@ import type { EditingHandle } from '../webview/grid-shell';
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
         onCellEdited?: (cell: [number, number], value: { kind: string; data: string }) => void;
+        onGridSelectionChange?: (selection: unknown) => void;
     },
 }));
 
@@ -106,6 +107,7 @@ async function render_grid(
             merges: [],
             edit_mode: true,
             csv_editable: true,
+            edit_session_id: 'session-1',
             editing_ref,
         }));
     });
@@ -119,6 +121,14 @@ async function edit_cell(value: string) {
     });
 }
 
+async function request_save(editing_ref: React.RefObject<EditingHandle | null>) {
+    let result = false;
+    await act(async () => {
+        result = editing_ref.current!.request_save();
+    });
+    return result;
+}
+
 async function save_result(success: boolean) {
     await act(async () => {
         window.dispatchEvent(new MessageEvent('message', { data: { type: 'saveResult', success } }));
@@ -128,7 +138,8 @@ async function save_result(success: boolean) {
 function save_messages(post_message: ReturnType<typeof vi.fn>) {
     return post_message.mock.calls
         .map(([msg]) => msg)
-        .filter((msg) => msg && typeof msg === 'object' && 'type' in msg && msg.type === 'saveCsv');
+        .filter((msg) => msg && typeof msg === 'object' && 'type' in msg && msg.type === 'saveCsv')
+        .map((msg) => ({ type: msg.type, edits: msg.edits }));
 }
 
 afterEach(() => {
@@ -154,32 +165,50 @@ describe('GridShell CSV save', () => {
         await edit_cell('projected');
         post_message.mockClear();
 
-        expect(editing_ref.current!.request_save()).toBe(true);
+        expect(await request_save(editing_ref)).toBe(true);
         expect(save_messages(post_message)).toEqual([{
             type: 'saveCsv',
             edits: { '0:2': 'projected' },
         }]);
     });
 
-    it('blocks overlapping saves and preserves edits newer than the in-flight save', async () => {
+    it('blocks edits and overlapping saves while a save is in flight', async () => {
         const { post_message, editing_ref } = await render_grid();
 
         await edit_cell('first');
         post_message.mockClear();
 
-        expect(editing_ref.current!.request_save()).toBe(true);
+        expect(await request_save(editing_ref)).toBe(true);
         expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'first' } }]);
 
         await edit_cell('second');
-        expect(editing_ref.current!.request_save()).toBe(false);
+        expect(await request_save(editing_ref)).toBe(false);
         expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'first' } }]);
 
         await save_result(true);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+
+        post_message.mockClear();
+        expect(await request_save(editing_ref)).toBe(false);
+        expect(save_messages(post_message)).toEqual([]);
+    });
+
+    it('blocks edit and clear mutations until a failed save re-enables editing', async () => {
+        const { post_message, editing_ref } = await render_grid();
+        await edit_cell('first');
+        post_message.mockClear();
+        expect(await request_save(editing_ref)).toBe(true);
+
+        await edit_cell('too late');
+        editing_ref.current!.clear_dirty();
+        await save_result(false);
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
 
         post_message.mockClear();
-        expect(editing_ref.current!.request_save()).toBe(true);
-        expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'second' } }]);
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(save_messages(post_message)).toEqual([{
+            type: 'saveCsv', edits: { '0:0': 'first' },
+        }]);
     });
 
     it('does not clear dirty edits on a duplicate success after a failed save', async () => {
@@ -188,33 +217,69 @@ describe('GridShell CSV save', () => {
         await edit_cell('first');
         post_message.mockClear();
 
-        expect(editing_ref.current!.request_save()).toBe(true);
+        expect(await request_save(editing_ref)).toBe(true);
         expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'first' } }]);
 
         await save_result(false);
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
+        await edit_cell('second');
+        post_message.mockClear();
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(save_messages(post_message)).toEqual([{
+            type: 'saveCsv', edits: { '0:0': 'second' },
+        }]);
 
+        await save_result(false);
         await save_result(true);
 
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
     });
 
-    it('preserves a revert to the pre-save value while the save is in flight', async () => {
+    it('includes an open editor value before closing the save boundary', async () => {
+        const { post_message, editing_ref } = await render_grid();
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                current: {
+                    cell: [0, 0],
+                    range: { x: 0, y: 0, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+                columns: {},
+                rows: {},
+            });
+        });
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = 'open editor value';
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        post_message.mockClear();
+
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(save_messages(post_message)).toEqual([{
+            type: 'saveCsv', edits: { '0:0': 'open editor value' },
+        }]);
+        await edit_cell('too late');
+        expect(save_messages(post_message)).toHaveLength(1);
+    });
+
+    it('blocks a revert while the save is in flight', async () => {
         const { post_message, editing_ref } = await render_grid();
 
         await edit_cell('first');
         post_message.mockClear();
 
-        expect(editing_ref.current!.request_save()).toBe(true);
+        expect(await request_save(editing_ref)).toBe(true);
         expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'first' } }]);
 
         await edit_cell('base');
         await save_result(true);
 
-        expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
 
         post_message.mockClear();
-        expect(editing_ref.current!.request_save()).toBe(true);
-        expect(save_messages(post_message)).toEqual([{ type: 'saveCsv', edits: { '0:0': 'base' } }]);
+        expect(await request_save(editing_ref)).toBe(false);
+        expect(save_messages(post_message)).toEqual([]);
     });
 });

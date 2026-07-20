@@ -73,6 +73,7 @@ export interface WorkbookSnapshotConfiguration {
 export interface WorkbookSnapshotCapabilities {
     readonly csvEditable: boolean;
     readonly csvEditingSupported: boolean;
+    readonly csvEditSessionId?: string;
 }
 
 export interface NormalizedPerFileState extends PerFileState {

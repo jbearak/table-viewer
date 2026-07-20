@@ -181,7 +181,8 @@ export type HostMessage =
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
-    | { type: 'editSessionResult'; granted: boolean; pendingEdits?: PerFileState['pendingEdits'] }
+    | { type: 'editSessionResult'; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
+    | { type: 'editSessionRevoked'; reason: 'saved' | 'cleanupUncertain' }
     | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' }
     | { type: 'excelFirstRowHeaderError'; requestId: string; error: string }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
@@ -196,9 +197,9 @@ export type WebviewMessage =
     | { type: 'requestEditSession' }
     | { type: 'releaseEditSession' }
     | { type: 'discardEditSession' }
-    | { type: 'saveCsv'; edits: Record<string, string> }
+    | { type: 'saveCsv'; edits: Record<string, string>; editSessionId: string }
     | { type: 'showSaveDialog' }
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null }
+    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }

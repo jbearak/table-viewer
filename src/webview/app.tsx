@@ -138,6 +138,7 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
+    const [csv_edit_session_id, set_csv_edit_session_id] = useState<string>();
     const [edit_mode, set_edit_mode] = useState(false);
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [transforms, set_transforms] = useState<
@@ -477,6 +478,12 @@ export function App(): React.JSX.Element {
                     && (
                         snapshot.generation !== generation_ref.current
                         || snapshot.sourceGeneration !== source_generation_ref.current
+                        || snapshot.capabilities.csvEditable !== csv_editable
+                        || snapshot.capabilities.csvEditingSupported
+                            !== csv_editing_supported
+                        || snapshot.capabilities.csvEditSessionId
+                            !== csv_edit_session_id
+                        || snapshot.configuration.previewMode !== preview_mode_ref.current
                     )
                     ? 'applied'
                     : classified_disposition;
@@ -793,6 +800,9 @@ export function App(): React.JSX.Element {
                     set_truncation_message(snapshot.truncationMessage);
                     if (application.updateCsvEditable) {
                         set_csv_editable(snapshot.capabilities.csvEditable);
+                        set_csv_edit_session_id(
+                            snapshot.capabilities.csvEditSessionId,
+                        );
                     }
                     if (application.updateCsvEditingSupported) {
                         set_csv_editing_supported(
@@ -924,6 +934,7 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         clear_pending_preview_scroll,
+        csv_edit_session_id,
         csv_editable,
         csv_editing_supported,
         edit_mode,
@@ -1304,6 +1315,7 @@ export function App(): React.JSX.Element {
             if (msg.type === 'editSessionResult') {
                 set_edit_session_pending(false);
                 if (msg.granted) {
+                    set_csv_edit_session_id(msg.editSessionId);
                     if (msg.pendingEdits) {
                         latest_live_edits_ref.current = msg.pendingEdits;
                         set_initial_edits(msg.pendingEdits);
@@ -1313,8 +1325,20 @@ export function App(): React.JSX.Element {
                 } else {
                     pending_exit_ref.current = false;
                     pending_exit_save_succeeded_ref.current = false;
+                    set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
                 }
+            } else if (msg.type === 'editSessionRevoked') {
+                // The host has crossed the disk-success boundary and now owns
+                // cleanup. Drop all local edit restoration state without posting a
+                // release or stale pending-edit snapshot back to the host.
+                latest_live_edits_ref.current = undefined;
+                pending_exit_ref.current = false;
+                pending_exit_save_succeeded_ref.current = false;
+                set_edit_session_pending(false);
+                set_initial_edits(undefined);
+                set_csv_edit_session_id(undefined);
+                set_edit_mode(false);
             } else if (msg.type === 'saveDialogResult') {
                 if (msg.choice === 'save') {
                     const editing = editing_ref.current;
@@ -1710,6 +1734,7 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode}
             csv_editable={csv_editable}
+            edit_session_id={csv_edit_session_id}
             initial_edits={initial_edits}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
@@ -1803,14 +1828,17 @@ export function App(): React.JSX.Element {
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
                 edit_disabled={
-                    !edit_mode && (
+                    editing_status?.save_in_flight === true
+                    || (!edit_mode && (
                         edit_session_pending
                         || transform_active
                         || transform_pending
-                    )
+                    ))
                 }
                 edit_disabled_reason={
-                    edit_session_pending
+                    editing_status?.save_in_flight
+                        ? 'Saving changes.'
+                        : edit_session_pending
                         ? 'Waiting to enter edit mode.'
                         : transform_pending
                         ? 'Wait for sorting and filtering to finish.'
