@@ -1,5 +1,4 @@
 import { createHash } from 'crypto';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
@@ -34,8 +33,11 @@ import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
     type FileAuthoritySnapshot,
+    type FileRefreshEvent,
+    type FileRefreshSubscriberResult,
     type PhysicalAuthorityCommitReceipt,
 } from './file-coordinator';
+import { vscode_file_refresh_watcher_factory } from './vscode-file-refresh-watcher';
 import { reconcile_finalization } from './finalization-reconciliation';
 import { SourceCandidate } from './source-candidate';
 import {
@@ -95,6 +97,11 @@ type PhysicalAuthorityCommitResult =
     | { type: 'stale' }
     | { type: 'rejected' }
     | { type: 'advanced' };
+
+interface PanelLoadRequest {
+    readonly seq: number;
+    readonly refreshEvent?: FileRefreshEvent;
+}
 
 function same_snapshot_identity(
     left: NonNullable<Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity']>,
@@ -197,10 +204,15 @@ export function attach_viewer(
     let source: DataSource | undefined;
     let source_authority = file_coordinator.authority();
     const transform_authorities = new Map<string, number>();
-    let reload_seq = 0;
+    let load_seq = 0;
+    let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
     let reload_retry_attempts = 0;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
+    let refresh_retry_wait: {
+        timer: ReturnType<typeof setTimeout>;
+        resolve: (proceed: boolean) => void;
+    } | undefined;
     const ready_state_retry_waits = new Set<{
         timer: ReturnType<typeof setTimeout>;
         resolve: (proceed: boolean) => void;
@@ -215,7 +227,7 @@ export function attach_viewer(
 
     const session = new PanelSession({
         postMessage: (message) => panel.webview.postMessage(message),
-        onNeedsResyncSource: () => { void send_reload(true); },
+        onNeedsResyncSource: () => { void refresh_panel_source(true); },
         onCurrentAdoptionAcknowledged: (adoption) => {
             if (disposed || session.current_adoption() !== adoption) return;
             const digest = adoption.source === 'commitReceipt'
@@ -259,6 +271,13 @@ export function attach_viewer(
             if (first_error !== undefined) throw first_error;
         },
     });
+
+    // Subscribe before the panel can become ready. Coordinator events may build
+    // and install a panel-local source pre-ready; PanelSession defers delivery.
+    disposables.push(file_coordinator.subscribe_refresh(
+        refresh_from_event,
+        vscode_file_refresh_watcher_factory,
+    ));
 
     function owns_edit_session(): boolean {
         return active_csv_edit_sessions.get(file_key) === edit_session_token;
@@ -384,6 +403,33 @@ export function attach_viewer(
         }
     }
 
+    function same_refresh_event(
+        left: FileRefreshEvent | undefined,
+        right: FileRefreshEvent | undefined,
+    ): boolean {
+        return left === undefined
+            ? right === undefined
+            : right !== undefined
+                && left.refreshRevision === right.refreshRevision
+                && left.episode === right.episode;
+    }
+
+    function load_is_current(
+        seq: number,
+        refresh_event?: FileRefreshEvent,
+    ): boolean {
+        return !disposed
+            && seq === load_seq
+            && (refresh_event === undefined
+                || same_refresh_event(refresh_event, latest_refresh_event));
+    }
+
+    function supersede_panel_load(): number {
+        reset_reload_retry();
+        cancel_refresh_retry_wait();
+        return ++load_seq;
+    }
+
     async function build_source(): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await vscode.workspace.fs.stat(uri);
@@ -404,21 +450,20 @@ export function attach_viewer(
     async function built_source_is_current(
         seq: number,
         candidate: SourceCandidate,
+        refresh_event?: FileRefreshEvent,
     ): Promise<boolean> {
-        if (disposed || seq !== reload_seq) return false;
+        if (!load_is_current(seq, refresh_event)) return false;
         const { fingerprint, digest } = candidate.observation;
         const stat = await vscode.workspace.fs.stat(uri);
         if (
-            disposed
-            || seq !== reload_seq
+            !load_is_current(seq, refresh_event)
             || `${stat.mtime}:${stat.size}` !== fingerprint
         ) {
             return false;
         }
         const raw = await vscode.workspace.fs.readFile(uri);
         const verified_stat = await vscode.workspace.fs.stat(uri);
-        return !disposed
-            && seq === reload_seq
+        return load_is_current(seq, refresh_event)
             && `${verified_stat.mtime}:${verified_stat.size}` === fingerprint
             && content_digest(raw) === digest;
     }
@@ -428,10 +473,11 @@ export function attach_viewer(
         seq: number,
         expected_authority_revision: number,
         already_verified = false,
+        refresh_event?: FileRefreshEvent,
     ): Promise<PhysicalAuthorityCommitResult> {
         if (
             !already_verified
-            && !await built_source_is_current(seq, candidate)
+            && !await built_source_is_current(seq, candidate, refresh_event)
         ) return { type: 'stale' };
         const { digest } = candidate.observation;
         const started = file_coordinator.begin_physical(
@@ -448,8 +494,7 @@ export function attach_viewer(
         try {
             for (;;) {
                 if (
-                    disposed
-                    || seq !== reload_seq
+                    !load_is_current(seq, refresh_event)
                     || !file_coordinator.operation_is_current(token)
                 ) return { type: 'stale' };
                 const state_snapshot = await read_file_state(false);
@@ -584,11 +629,12 @@ export function attach_viewer(
         seq: number,
         reason: 'ready' | 'fileReload' | 'recovery' | 'save' = 'fileReload',
         projected_state?: FileStateSnapshot,
+        refresh_event?: FileRefreshEvent,
     ): DataSource | undefined {
         // A durable commit can finish after a newer panel-local load starts. Keep
         // ownership with the candidate unless this exact load is still current at
         // the synchronous installation boundary.
-        if (disposed || seq !== reload_seq) return undefined;
+        if (!load_is_current(seq, refresh_event)) return undefined;
         const inspected = candidate.borrow();
         if (inspected instanceof ExcelHeaderDataSource) {
             const committed_state = normalize_host_state(
@@ -601,7 +647,7 @@ export function attach_viewer(
         }
         let adopted: DataSource | undefined;
         const transferred = candidate.transfer_to((next, confirm_transfer) => {
-            if (disposed || seq !== reload_seq) return;
+            if (!load_is_current(seq, refresh_event)) return;
             const result = adopt_source_into_core(
                 core,
                 panel,
@@ -659,7 +705,7 @@ export function attach_viewer(
                 header_refresh_scheduled = false;
                 return;
             }
-            void send_reload(true).finally(() => {
+            void refresh_panel_source(true).finally(() => {
                 header_refresh_scheduled = false;
             });
         });
@@ -812,41 +858,238 @@ export function attach_viewer(
         if (!committed) await refresh_session_state_material();
     }
 
-    async function send_initial_data(): Promise<void> {
-        reset_reload_retry();
-        const seq = ++reload_seq;
+    function cancel_refresh_retry_wait(): void {
+        if (!refresh_retry_wait) return;
+        const wait = refresh_retry_wait;
+        refresh_retry_wait = undefined;
+        clearTimeout(wait.timer);
+        wait.resolve(false);
+    }
+
+    function wait_for_refresh_retry(request: PanelLoadRequest): Promise<boolean> {
+        if (!load_is_current(request.seq, request.refreshEvent)) {
+            return Promise.resolve(false);
+        }
+        cancel_refresh_retry_wait();
+        return new Promise((resolve) => {
+            const wait = {
+                timer: undefined as unknown as ReturnType<typeof setTimeout>,
+                resolve,
+            };
+            wait.timer = setTimeout(() => {
+                if (refresh_retry_wait === wait) refresh_retry_wait = undefined;
+                resolve(load_is_current(request.seq, request.refreshEvent));
+            }, RELOAD_RETRY_MS);
+            refresh_retry_wait = wait;
+        });
+    }
+
+    function inactive_refresh_result(): FileRefreshSubscriberResult {
+        return disposed ? { type: 'disposed' } : { type: 'superseded' };
+    }
+
+    function report_refresh_failure(error: unknown, initial: boolean): void {
+        if (initial) {
+            void vscode.window.showErrorMessage(
+                error instanceof Error ? error.message : String(error));
+            return;
+        }
+        console.error('Failed to reload table viewer data', error);
+        void vscode.window.showErrorMessage(
+            `Failed to reload: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    async function run_physical_refresh(
+        request: PanelLoadRequest,
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery',
+        initial = false,
+    ): Promise<FileRefreshSubscriberResult> {
+        let attempts = 0;
+        let last_error: unknown = new Error('The file changed while it was being refreshed.');
+        for (;;) {
+            if (!load_is_current(request.seq, request.refreshEvent)) {
+                return inactive_refresh_result();
+            }
+            let candidate: SourceCandidate | undefined;
+            try {
+                const expected_authority = file_coordinator.authority().authorityRevision;
+                candidate = await build_source();
+                if (!load_is_current(request.seq, request.refreshEvent)) {
+                    return inactive_refresh_result();
+                }
+                if (!await built_source_is_current(
+                    request.seq,
+                    candidate,
+                    request.refreshEvent,
+                )) {
+                    if (!load_is_current(request.seq, request.refreshEvent)) {
+                        return inactive_refresh_result();
+                    }
+                    last_error = new Error('The file changed while it was being refreshed.');
+                } else if (
+                    !force
+                    && candidate.observation.digest
+                        === session.acknowledged_physical_digest()
+                ) {
+                    const deduplicated = await commit_physical_candidate(
+                        candidate,
+                        request.seq,
+                        expected_authority,
+                        true,
+                        request.refreshEvent,
+                    );
+                    if (!load_is_current(request.seq, request.refreshEvent)) {
+                        return inactive_refresh_result();
+                    }
+                    if (deduplicated.type === 'committed') {
+                        source_authority = deduplicated.receipt.resultingBasis;
+                        update_session_state_material(
+                            deduplicated.receipt.stateSnapshot,
+                            true,
+                        );
+                        return { type: 'completed' };
+                    }
+                    last_error = new Error('The file authority changed while it was refreshed.');
+                } else {
+                    const committed = await commit_physical_candidate(
+                        candidate,
+                        request.seq,
+                        expected_authority,
+                        true,
+                        request.refreshEvent,
+                    );
+                    if (!load_is_current(request.seq, request.refreshEvent)) {
+                        return inactive_refresh_result();
+                    }
+                    if (committed.type === 'committed') {
+                        const adopted = adopt_committed_candidate(
+                            candidate,
+                            committed,
+                            request.seq,
+                            reason,
+                            profile.editing ? await read_file_state() : undefined,
+                            request.refreshEvent,
+                        );
+                        if (!load_is_current(request.seq, request.refreshEvent)) {
+                            return inactive_refresh_result();
+                        }
+                        if (adopted) return { type: 'completed' };
+                    }
+                    last_error = new Error('The file authority changed while it was refreshed.');
+                }
+            } catch (error) {
+                if (!load_is_current(request.seq, request.refreshEvent)) {
+                    return inactive_refresh_result();
+                }
+                last_error = error;
+            } finally {
+                candidate?.dispose();
+            }
+            if (attempts >= RELOAD_RETRY_COUNT) {
+                if (!load_is_current(request.seq, request.refreshEvent)) {
+                    return inactive_refresh_result();
+                }
+                report_refresh_failure(last_error, initial);
+                return { type: 'failed', error: last_error };
+            }
+            attempts += 1;
+            if (!await wait_for_refresh_retry(request)) {
+                return inactive_refresh_result();
+            }
+        }
+    }
+
+    async function run_local_refresh_attempt(
+        request: PanelLoadRequest,
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery',
+        initial: boolean,
+    ): Promise<boolean> {
+        if (!load_is_current(request.seq)) return false;
         let candidate: SourceCandidate | undefined;
         try {
             const expected_authority = file_coordinator.authority().authorityRevision;
             candidate = await build_source();
+            if (!await built_source_is_current(request.seq, candidate)) {
+                schedule_local_refresh_retry(request, force, reason, initial);
+                return false;
+            }
+            if (
+                !force
+                && candidate.observation.digest
+                    === session.acknowledged_physical_digest()
+            ) {
+                const deduplicated = await commit_physical_candidate(
+                    candidate, request.seq, expected_authority, true,
+                );
+                if (deduplicated.type === 'committed' && load_is_current(request.seq)) {
+                    source_authority = deduplicated.receipt.resultingBasis;
+                    update_session_state_material(deduplicated.receipt.stateSnapshot, true);
+                    reset_reload_retry();
+                    return true;
+                }
+                schedule_local_refresh_retry(request, force, reason, initial);
+                return false;
+            }
             const committed = await commit_physical_candidate(
-                candidate, seq, expected_authority,
+                candidate, request.seq, expected_authority, true,
             );
             if (committed.type !== 'committed') {
-                schedule_reload_retry(true, seq);
-                return;
+                schedule_local_refresh_retry(request, force, reason, initial);
+                return false;
             }
-            const ds = adopt_committed_candidate(
+            const adopted = adopt_committed_candidate(
                 candidate,
                 committed,
-                seq,
-                'ready',
+                request.seq,
+                reason,
                 profile.editing ? await read_file_state() : undefined,
             );
-            if (ds) reset_reload_retry();
-        } catch (err) {
-            if (disposed) return;
-            if (!schedule_reload_retry(true, seq)) {
-                vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
+            if (!adopted) return false;
+            reset_reload_retry();
+            return true;
+        } catch (error) {
+            if (!load_is_current(request.seq)) return false;
+            if (!schedule_local_refresh_retry(request, force, reason, initial)) {
+                report_refresh_failure(error, initial);
             }
+            return false;
         } finally {
             candidate?.dispose();
         }
     }
 
-    // Build explicit refreshes before superseding watcher work. A transient
-    // post-save read/parse failure therefore cannot invalidate the only viable
-    // watcher refresh. Transport retry is owned independently by PanelSession.
+    function refresh_panel_source(
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery' = force ? 'recovery' : 'fileReload',
+        initial = false,
+    ): Promise<boolean> {
+        if (disposed) return Promise.resolve(false);
+        const request = { seq: supersede_panel_load() };
+        return run_local_refresh_attempt(request, force, reason, initial);
+    }
+
+    function refresh_from_event(
+        event: FileRefreshEvent,
+    ): Promise<FileRefreshSubscriberResult> {
+        if (disposed) return Promise.resolve({ type: 'disposed' });
+        latest_refresh_event = event;
+        session.wake_delivery();
+        const request = {
+            seq: supersede_panel_load(),
+            refreshEvent: event,
+        };
+        return run_physical_refresh(request, false, 'fileReload');
+    }
+
+    async function send_initial_data(): Promise<void> {
+        await refresh_panel_source(true, 'ready', true);
+    }
+
+    // Build the direct post-save/conflict refresh before superseding watcher work.
+    // Phase 5.3 will publish these refreshes through the coordinator; for now a
+    // transient post-save read/parse failure leaves a viable watcher load intact.
     async function reparse_and_post(
         reason: 'fileReload' | 'save' = 'fileReload',
     ): Promise<boolean> {
@@ -866,14 +1109,13 @@ export function attach_viewer(
                 }
             }
             if (disposed) return false;
-            reset_reload_retry();
+            const seq = supersede_panel_load();
             reload_retry_attempts = attempts;
-            const seq = ++reload_seq;
             const committed = await commit_physical_candidate(
                 candidate, seq, expected_authority,
             );
             if (committed.type !== 'committed') {
-                schedule_reload_retry(true, seq);
+                schedule_direct_refresh_retry(seq);
                 return false;
             }
             return adopt_committed_candidate(
@@ -896,10 +1138,14 @@ export function attach_viewer(
         }
     }
 
-    function schedule_reload_retry(force: boolean, seq: number): boolean {
+    function schedule_local_refresh_retry(
+        request: PanelLoadRequest,
+        force: boolean,
+        reason: 'ready' | 'fileReload' | 'recovery',
+        initial: boolean,
+    ): boolean {
         if (
-            disposed
-            || seq !== reload_seq
+            !load_is_current(request.seq)
             || reload_retry_attempts >= RELOAD_RETRY_COUNT
         ) {
             return false;
@@ -908,84 +1154,20 @@ export function attach_viewer(
         if (reload_retry_timer !== undefined) clearTimeout(reload_retry_timer);
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
-            if (!disposed && seq === reload_seq) {
-                void send_reload(force, true, seq);
+            if (load_is_current(request.seq)) {
+                void run_local_refresh_attempt(request, force, reason, initial);
             }
         }, RELOAD_RETRY_MS);
         return true;
     }
 
-    async function send_reload(
-        force = false,
-        retry = false,
-        retry_seq?: number,
-    ): Promise<boolean> {
-        if (disposed) return false;
-        let seq: number;
-        if (retry) {
-            if (retry_seq === undefined || retry_seq !== reload_seq) return false;
-            seq = retry_seq;
-        } else {
-            reset_reload_retry();
-            seq = ++reload_seq;
-        }
-        let candidate: SourceCandidate | undefined;
-        try {
-            const expected_authority = file_coordinator.authority().authorityRevision;
-            candidate = await build_source();
-            if (!await built_source_is_current(seq, candidate)) {
-                schedule_reload_retry(force, seq);
-                return false;
-            }
-            if (
-                !force
-                && candidate.observation.digest
-                    === session.acknowledged_physical_digest()
-            ) {
-                const deduplicated = await commit_physical_candidate(
-                    candidate, seq, expected_authority, true,
-                );
-                if (deduplicated.type === 'committed') {
-                    if (seq === reload_seq) {
-                        source_authority = deduplicated.receipt.resultingBasis;
-                        update_session_state_material(
-                            deduplicated.receipt.stateSnapshot,
-                            true,
-                        );
-                        reset_reload_retry();
-                    }
-                    return true;
-                }
-                schedule_reload_retry(force, seq);
-                return false;
-            }
-            const committed = await commit_physical_candidate(
-                candidate, seq, expected_authority, true,
-            );
-            if (committed.type !== 'committed') {
-                schedule_reload_retry(force, seq);
-                return false;
-            }
-            const adopted = adopt_committed_candidate(
-                candidate,
-                committed,
-                seq,
-                force ? 'recovery' : 'fileReload',
-                profile.editing ? await read_file_state() : undefined,
-            );
-            if (!adopted) return false;
-            reset_reload_retry();
-            return true;
-        } catch (err) {
-            if (disposed) return false;
-            if (schedule_reload_retry(force, seq)) return false;
-            console.error('Failed to reload table viewer data', err);
-            vscode.window.showErrorMessage(
-                `Failed to reload: ${err instanceof Error ? err.message : String(err)}`);
-            return false;
-        } finally {
-            candidate?.dispose();
-        }
+    function schedule_direct_refresh_retry(seq: number): boolean {
+        return schedule_local_refresh_retry(
+            { seq },
+            true,
+            'recovery',
+            false,
+        );
     }
 
     function wait_for_ready_state_retry(ms: number): Promise<boolean> {
@@ -1444,24 +1626,13 @@ export function attach_viewer(
         }
     }));
 
-    const dir = path.dirname(file_path);
-    const basename = path.basename(file_path);
-    const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(vscode.Uri.file(dir), basename));
-    const handle_watcher_event = () => {
-        session.wake_delivery();
-        return send_reload();
-    };
-    disposables.push(watcher.onDidChange(handle_watcher_event));
-    disposables.push(watcher.onDidCreate(handle_watcher_event));
-    disposables.push(watcher);
-
     return {
         dispose() {
             if (disposed) return;
             disposed = true;
-            reload_seq++;
+            load_seq++;
             reset_reload_retry();
+            cancel_refresh_retry_wait();
             cancel_ready_state_retry_waits();
             header_receipt_queue.length = 0;
             let first_error: unknown;

@@ -126,7 +126,15 @@ export interface FileRefreshEvent {
     readonly priority: 'normal' | 'high';
 }
 
-export type FileRefreshSubscriber = (event: FileRefreshEvent) => void | Promise<void>;
+export type FileRefreshSubscriberResult =
+    | { readonly type: 'completed' }
+    | { readonly type: 'superseded' }
+    | { readonly type: 'disposed' }
+    | { readonly type: 'failed'; readonly error: unknown };
+
+export type FileRefreshSubscriber = (
+    event: FileRefreshEvent,
+) => void | FileRefreshSubscriberResult | Promise<void | FileRefreshSubscriberResult>;
 
 export type FileRefreshRequestResult =
     | { readonly type: 'completed'; readonly event: FileRefreshEvent }

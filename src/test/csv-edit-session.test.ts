@@ -760,8 +760,9 @@ describe('CSV edit sessions', () => {
         expect(latest_snapshot(first).state.pendingEdits).toEqual(pendingEdits);
 
         const second = open_csv_table(uri(file_path), state.store);
-        const second_watcher = vscode_mock.__getWatchers().at(-1)!;
-        await second_watcher.__fireChange();
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
+        const shared_watcher = vscode_mock.__getActiveWatchers()[0];
+        await shared_watcher.__fireChange();
         expect(second.__messages).toHaveLength(0);
         await second.__receive({ type: 'ready' });
         expect(latest_snapshot(second).state.pendingEdits).toBeUndefined();

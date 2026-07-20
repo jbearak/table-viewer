@@ -179,6 +179,13 @@ function default_watcher_uri(pattern: unknown): UriLike {
     return make_uri(joined);
 }
 
+async function flush_watcher_dispatch(): Promise<void> {
+    // The production coordinator coalesces raw watcher signals in a microtask,
+    // then starts subscriber work without awaiting it. Give ordinary async
+    // controller work a deterministic chance to settle while preserving hangs.
+    for (let index = 0; index < 100; index += 1) await Promise.resolve();
+}
+
 function make_watcher(pattern: unknown): MockWatcher {
     const change_handlers: WatchHandler[] = [];
     const create_handlers: WatchHandler[] = [];
@@ -205,14 +212,17 @@ function make_watcher(pattern: unknown): MockWatcher {
         async __fireChange(uri = default_watcher_uri(pattern)): Promise<void> {
             if (disposed) return;
             await Promise.all([...change_handlers].map((handler) => handler(uri)));
+            await flush_watcher_dispatch();
         },
         async __fireCreate(uri = default_watcher_uri(pattern)): Promise<void> {
             if (disposed) return;
             await Promise.all([...create_handlers].map((handler) => handler(uri)));
+            await flush_watcher_dispatch();
         },
         async __fireDelete(uri = default_watcher_uri(pattern)): Promise<void> {
             if (disposed) return;
             await Promise.all([...delete_handlers].map((handler) => handler(uri)));
+            await flush_watcher_dispatch();
         },
     };
 }

@@ -3,6 +3,7 @@ import type * as vscode from 'vscode';
 import { attach_viewer, csv_table_profile } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
+import type { DataSource } from '../data-source/interface';
 import { acquire_file_coordinator } from '../file-coordinator';
 import type { AuthorityFileStateStore } from '../state';
 import { versioned_state_store } from './helpers/versioned-state-store';
@@ -172,10 +173,14 @@ describe('CSV reload races', () => {
         expect(calls).toBe(0);
     });
 
-    it('keeps per-panel watchers while sharing one physical authority', async () => {
+    it('shares one watcher while each panel refreshes independently', async () => {
         const file_path = '/tmp/shared-watchers.csv';
+        let reads = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
-        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
 
         open_csv_table(uri(file_path));
         open_csv_table(uri(file_path));
@@ -183,8 +188,8 @@ describe('CSV reload races', () => {
         await panels[0].__receive({ type: 'ready' });
         await panels[1].__receive({ type: 'ready' });
 
-        const watchers = vscode_mock.__getWatchers();
-        expect(watchers).toHaveLength(2);
+        const watchers = vscode_mock.__getActiveWatchers();
+        expect(watchers).toHaveLength(1);
         const authority = acquire_file_coordinator(file_path);
         expect(authority.authority()).toMatchObject({
             physicalRevision: 1,
@@ -192,13 +197,227 @@ describe('CSV reload races', () => {
             authorityRevision: 1,
         });
 
-        await Promise.all(watchers.map((watcher) => watcher.__fireChange()));
+        const reads_before_refresh = reads;
+        await watchers[0].__fireChange();
+        expect(reads - reads_before_refresh).toBe(4);
         expect(authority.authority()).toMatchObject({
             physicalRevision: 1,
             projectionRevision: 0,
             authorityRevision: 1,
         });
+
+        panels[0].dispose();
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
+        panels[1].dispose();
         authority.dispose();
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(0);
+    });
+
+    it('shares a watcher between preview and table while building separate sources', async () => {
+        let reads = 0;
+        const file_path = '/tmp/preview-table-shared.csv';
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
+
+        show_csv_preview(
+            uri(file_path),
+            uri('/ext'),
+            state_store(),
+            view_column(vscode_mock.ViewColumn.Active),
+        );
+        open_csv_table(uri(file_path));
+        const panels = vscode_mock.__getPanels();
+        await panels[0].__receive({ type: 'ready' });
+        await panels[1].__receive({ type: 'ready' });
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
+
+        const reads_before_refresh = reads;
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        expect(reads - reads_before_refresh).toBe(4);
+    });
+
+    it('re-adopts a shared same-digest event only for an unacknowledged panel', async () => {
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri('/tmp/shared-ack.csv'));
+        open_csv_table(uri('/tmp/shared-ack.csv'));
+        const [acknowledged, unacknowledged] = vscode_mock.__getPanels();
+        unacknowledged.__autoAckSnapshots = false;
+        await acknowledged.__receive({ type: 'ready' });
+        await unacknowledged.__receive({ type: 'ready' });
+        const unacknowledged_initial = workbook_snapshots(unacknowledged).at(-1)!;
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+
+        expect(refresh_snapshots(acknowledged)).toHaveLength(0);
+        const recovered = workbook_snapshots(unacknowledged).at(-1)!;
+        expect(recovered.sourceGeneration).toBeGreaterThan(
+            unacknowledged_initial.sourceGeneration,
+        );
+    });
+
+    it('coalesces delete-create-change into one panel-local build per subscriber', async () => {
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
+
+        open_csv_table(uri('/tmp/coalesced-shared.csv'));
+        open_csv_table(uri('/tmp/coalesced-shared.csv'));
+        const panels = vscode_mock.__getPanels();
+        await panels[0].__receive({ type: 'ready' });
+        await panels[1].__receive({ type: 'ready' });
+        const reads_before_refresh = reads;
+        const watcher = vscode_mock.__getActiveWatchers()[0];
+
+        await Promise.all([
+            watcher.__fireDelete(),
+            watcher.__fireCreate(),
+            watcher.__fireChange(),
+        ]);
+
+        expect(reads - reads_before_refresh).toBe(4);
+        expect(refresh_snapshots(panels[0])).toHaveLength(0);
+        expect(refresh_snapshots(panels[1])).toHaveLength(0);
+    });
+
+    it('lets another panel finish when one shared-event parser fails', async () => {
+        let bytes = enc.encode('h\na\n');
+        let fail_first_panel = false;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const base_profile = csv_table_profile();
+        const failing_profile = {
+            ...base_profile,
+            async build_source(raw: Uint8Array, file_path: string, state: Parameters<typeof base_profile.build_source>[2]) {
+                if (fail_first_panel) throw new Error('panel parser failed');
+                return base_profile.build_source(raw, file_path, state);
+            },
+        };
+        const first = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'first');
+        const second = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'second');
+        const first_controller = attach_viewer(
+            first as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/shared-parser.csv'),
+            state_store(),
+            failing_profile,
+        );
+        const second_controller = attach_viewer(
+            second as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/shared-parser.csv'),
+            state_store(),
+            csv_table_profile(),
+        );
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        fail_first_panel = true;
+        bytes = enc.encode('h\na\nb\n');
+
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(refresh_snapshots(second)).toHaveLength(1));
+        expect(refresh_snapshots(first)).toHaveLength(0);
+
+        first_controller.dispose();
+        second_controller.dispose();
+    });
+
+    it('lets a newer episode pass a stalled panel load without blocking peers', async () => {
+        let bytes = enc.encode('h\na\n');
+        let mtime = 1;
+        let builds = 0;
+        const stalled = deferred<DataSource>();
+        const stalled_started = deferred<DataSource>();
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const base_profile = csv_table_profile();
+        const stalling_profile = {
+            ...base_profile,
+            async build_source(raw: Uint8Array, file_path: string, state: Parameters<typeof base_profile.build_source>[2]) {
+                builds += 1;
+                const built = await base_profile.build_source(raw, file_path, state);
+                if (builds === 2) {
+                    stalled_started.resolve(built);
+                    return stalled.promise;
+                }
+                return built;
+            },
+        };
+        const stalled_panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'stalled');
+        const healthy_panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'healthy');
+        const stalled_controller = attach_viewer(
+            stalled_panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/stalled-shared.csv'),
+            state_store(),
+            stalling_profile,
+        );
+        const healthy_controller = attach_viewer(
+            healthy_panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/stalled-shared.csv'),
+            state_store(),
+            csv_table_profile(),
+        );
+        await stalled_panel.__receive({ type: 'ready' });
+        await healthy_panel.__receive({ type: 'ready' });
+        const watcher = vscode_mock.__getActiveWatchers()[0];
+
+        bytes = enc.encode('h\na\nb\n');
+        mtime = 2;
+        await watcher.__fireChange();
+        const stale_source = await stalled_started.promise;
+        await vi.waitFor(() => expect(refresh_snapshots(healthy_panel)).toHaveLength(1));
+
+        bytes = enc.encode('h\na\nb\nc\n');
+        mtime = 3;
+        await watcher.__fireChange();
+        await vi.waitFor(() => expect(refresh_snapshots(healthy_panel)).toHaveLength(2));
+        await vi.waitFor(() => expect(refresh_snapshots(stalled_panel)).toHaveLength(1));
+
+        const stale_close = vi.spyOn(stale_source, 'close');
+        stalled.resolve(stale_source);
+        await flush_promises();
+        expect(stale_close).toHaveBeenCalledTimes(1);
+        expect(refresh_snapshots(stalled_panel)).toHaveLength(1);
+
+        stalled_controller.dispose();
+        healthy_controller.dispose();
+    });
+
+    it('retains the adopted view across delete retries and recovers on create', async () => {
+        let deleted = false;
+        let bytes = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => {
+            if (deleted) throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+            return { size: bytes.byteLength, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        open_csv_table(uri('/tmp/delete-create.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        vi.useFakeTimers();
+        deleted = true;
+
+        await vscode_mock.__getActiveWatchers()[0].__fireDelete();
+        await vi.advanceTimersByTimeAsync(500);
+
+        expect(refresh_snapshots(panel)).toHaveLength(0);
+        expect(error_spy).toHaveBeenCalledTimes(1);
+
+        deleted = false;
+        bytes = enc.encode('h\na\nb\n');
+        await vscode_mock.__getActiveWatchers()[0].__fireCreate();
+        await vi.waitFor(() => expect(refresh_snapshots(panel)).toHaveLength(1));
+        expect(refresh_snapshots(panel)[0].meta.sheets[0].rowCount).toBe(2);
+        vi.useRealTimers();
     });
 
     it('closes a same-digest dedup candidate without transferring it', async () => {
@@ -503,6 +722,7 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
         release_old();
         await old_reload;
+        await flush_promises();
 
         expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
@@ -1315,17 +1535,24 @@ describe('CSV reload races', () => {
 
     it('CSV preview reuse ignores an old reload that completes after the panel is reused', async () => {
         const old_reload = deferred<Uint8Array>();
+        const old_read_started = deferred<void>();
         const new_load = deferred<Uint8Array>();
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 0 }));
-        vscode_mock.__setReadFileImplementation(async (request_uri) => (
-            request_uri.fsPath === '/tmp/old.csv' ? old_reload.promise : new_load.promise
-        ));
+        vscode_mock.__setReadFileImplementation(async (request_uri) => {
+            if (request_uri.fsPath === '/tmp/old.csv') {
+                old_read_started.resolve();
+                return old_reload.promise;
+            }
+            return new_load.promise;
+        });
 
         show_csv_preview(uri('/tmp/old.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         const panel = vscode_mock.__getPanels()[0];
         const old_reload_done = vscode_mock.__getWatchers()[0].__fireChange();
+        await old_read_started.promise;
+        await old_reload_done;
 
         show_csv_preview(uri('/tmp/new.csv'), uri('/ext'), state_store(), view_column(vscode_mock.ViewColumn.Active));
         void panel.__receive({ type: 'ready' });
@@ -1335,6 +1562,9 @@ describe('CSV reload races', () => {
         old_reload.resolve(enc.encode('h\nold\n'));
         await old_reload_done;
         await flush_promises();
+        expect(vscode_mock.__getWatcherHistory()).toHaveLength(2);
+        expect(vscode_mock.__getWatcherHistory()[0].__disposed).toBe(true);
+        expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
 
         const metas = initial_snapshots(panel);
         expect(metas).toHaveLength(1);
