@@ -4,10 +4,17 @@ import type { ExcelHeaderOverride } from './data-source/interface';
 import { normalize_host_state, plan_excel_override_state } from './excel-header-plan';
 import type {
     AuthorityFileStateStore,
+    AuthorityTransactionFinalizeResult,
+    AuthorityTransactionKind,
     DurableFileAuthority,
+    FileStateSnapshot,
 } from './state';
 import type { PerFileState } from './types';
-import { reconcile_finalization } from './finalization-reconciliation';
+import {
+    reconcile_finalization,
+    type FinalizationReconciliation,
+} from './finalization-reconciliation';
+import { deep_clone_and_freeze } from './immutable';
 import {
     cleanup_authority,
     discard_authority,
@@ -21,15 +28,19 @@ export interface FileAuthoritySnapshot extends DurableFileAuthority {
     readonly fileKey: string;
 }
 
-export interface AuthorityOperationToken {
+export interface AuthorityOperationToken<
+    Kind extends AuthorityTransactionKind = AuthorityTransactionKind,
+> {
     readonly ordinal: number;
-    readonly kind: 'physical' | 'projection';
+    readonly kind: Kind;
     readonly basis: FileAuthoritySnapshot;
     readonly id: string;
 }
 
-export type AuthorityOperationStart =
-    | { readonly type: 'started'; readonly token: AuthorityOperationToken }
+export type AuthorityOperationStart<
+    Kind extends AuthorityTransactionKind = AuthorityTransactionKind,
+> =
+    | { readonly type: 'started'; readonly token: AuthorityOperationToken<Kind> }
     | { readonly type: 'rejected'; readonly basis: FileAuthoritySnapshot };
 
 export interface AuthorityCommitTurn {
@@ -40,17 +51,42 @@ export type AuthorityCommitTurnResult =
     | { readonly type: 'granted'; readonly turn: AuthorityCommitTurn }
     | { readonly type: 'rejected' };
 
-export interface ExcelHeaderOperationReceipt {
+export interface AuthorityCommitReceiptBase {
+    readonly operationKind: AuthorityTransactionKind;
+    readonly operationOrdinal: number;
+    readonly previousBasis: FileAuthoritySnapshot;
+    readonly resultingBasis: FileAuthoritySnapshot;
+    readonly stateSnapshot: Readonly<FileStateSnapshot>;
+}
+
+export interface PhysicalAuthorityCommitReceipt extends AuthorityCommitReceiptBase {
+    readonly operationKind: 'physical';
+    readonly digest: string;
+}
+
+export interface ProjectionAuthorityCommitReceipt extends AuthorityCommitReceiptBase {
+    readonly operationKind: 'projection';
+}
+
+export type AuthorityCommitReceipt =
+    | PhysicalAuthorityCommitReceipt
+    | ProjectionAuthorityCommitReceipt;
+
+export type AuthorityCommitReceiptFor<Kind extends AuthorityTransactionKind> =
+    Kind extends 'physical'
+        ? PhysicalAuthorityCommitReceipt
+        : ProjectionAuthorityCommitReceipt;
+
+export type SuccessfulAuthorityFinalization =
+    | Extract<AuthorityTransactionFinalizeResult, { type: 'finalized' }>
+    | Extract<FinalizationReconciliation, { type: 'committed' }>;
+
+export interface ExcelHeaderOperationReceipt extends ProjectionAuthorityCommitReceipt {
     readonly requestId: string;
     readonly sheetIndex: number;
     readonly sheetName: string;
     readonly override: ExcelHeaderOverride;
     readonly originToken: symbol;
-    readonly operationOrdinal: number;
-    readonly previousBasis: FileAuthoritySnapshot;
-    readonly resultingBasis: FileAuthoritySnapshot;
-    readonly stateRevision: number;
-    readonly state: PerFileState;
 }
 
 export type ExcelHeaderCommitResult =
@@ -220,32 +256,68 @@ function finish(entry: FileCoordinatorEntry, token: AuthorityOperationToken): vo
     cleanup(entry);
 }
 
+function reject_operation(
+    entry: FileCoordinatorEntry,
+    token: AuthorityOperationToken,
+    state: OperationState,
+): void {
+    state.valid = false;
+    const request = entry.requests.get(token);
+    if (request) {
+        entry.requests.delete(token);
+        request.resolve({ type: 'rejected' });
+    }
+}
+
 function invalidate(entry: FileCoordinatorEntry, physical_change: boolean): void {
     for (const [token, state] of entry.states) {
         if (!state.valid || entry.activeTurn?.token === token) continue;
         if (token.kind === 'physical' || (token.kind === 'projection' && physical_change)) {
-            state.valid = false;
-            const request = entry.requests.get(token);
-            if (request) {
-                entry.requests.delete(token);
-                request.resolve({ type: 'rejected' });
-            }
-            void token;
+            reject_operation(entry, token, state);
         }
     }
     activate_turn(entry);
+}
+
+function invalidate_after_observed_advance(
+    entry: FileCoordinatorEntry,
+    finishing: AuthorityOperationToken,
+    previous: FileAuthoritySnapshot,
+    observed: DurableFileAuthority,
+): void {
+    const physical_change = previous.physicalRevision !== observed.physicalRevision
+        || previous.physicalDigest !== observed.physicalDigest;
+    const projection_change = previous.projectionRevision !== observed.projectionRevision;
+    for (const [token, state] of entry.states) {
+        if (!state.valid || token === finishing) continue;
+        if (
+            physical_change
+            || (
+                projection_change
+                && token.kind === 'projection'
+                && token.ordinal < finishing.ordinal
+            )
+        ) {
+            reject_operation(entry, token, state);
+        }
+    }
 }
 
 export interface FileCoordinatorAttachment {
     readonly statePath: string;
     authority(): FileAuthoritySnapshot;
     state_ready(): Promise<void>;
-    begin_physical(expectedAuthorityRevision: number, digest: string): AuthorityOperationStart;
+    begin_physical(expectedAuthorityRevision: number, digest: string): AuthorityOperationStart<'physical'>;
     operation_is_current(token: AuthorityOperationToken): boolean;
     state_write_is_current(authorityRevision: number): boolean;
     request_commit_turn(token: AuthorityOperationToken): Promise<AuthorityCommitTurnResult>;
     start_finalization(turn: AuthorityCommitTurn): void;
-    install_finalized_authority(
+    finalize_authority_commit<Kind extends AuthorityTransactionKind>(
+        token: AuthorityOperationToken<Kind>,
+        turn: AuthorityCommitTurn,
+        finalized: SuccessfulAuthorityFinalization,
+    ): AuthorityCommitReceiptFor<Kind>;
+    observe_advanced_authority(
         token: AuthorityOperationToken,
         turn: AuthorityCommitTurn,
         authority: DurableFileAuthority,
@@ -317,11 +389,48 @@ export function acquire_file_coordinator(
             entry.activeTurn.phase = 'finalizing';
         },
 
-        install_finalized_authority(token, turn, authority) {
+        finalize_authority_commit(token, turn, finalized) {
             if (entry.activeTurn !== turn || entry.activeTurn.token !== token) {
                 throw new Error('The authority commit turn is no longer active.');
             }
+            const operation = entry.states.get(token);
+            if (!operation) {
+                throw new Error('The authority operation is no longer active.');
+            }
+            if (token.kind === 'physical' && operation.digest === undefined) {
+                throw new Error('The physical authority operation has no digest.');
+            }
+            const previousBasis = snapshot(entry);
+            entry.authority = structuredClone(finalized.authority);
+            entry.activeTurn = undefined;
+            finish(entry, token);
+            const base = {
+                operationKind: token.kind,
+                operationOrdinal: token.ordinal,
+                previousBasis,
+                resultingBasis: snapshot(entry),
+                stateSnapshot: finalized.snapshot,
+            };
+            const receipt = token.kind === 'physical'
+                ? {
+                    ...base,
+                    operationKind: 'physical' as const,
+                    digest: operation.digest as string,
+                }
+                : {
+                    ...base,
+                    operationKind: 'projection' as const,
+                };
+            return deep_clone_and_freeze(receipt) as AuthorityCommitReceiptFor<typeof token.kind>;
+        },
+
+        observe_advanced_authority(token, turn, authority) {
+            if (entry.activeTurn !== turn || entry.activeTurn.token !== token) {
+                throw new Error('The authority commit turn is no longer active.');
+            }
+            const previous = snapshot(entry);
             entry.authority = structuredClone(authority);
+            invalidate_after_observed_advance(entry, token, previous, authority);
             entry.activeTurn = undefined;
             finish(entry, token);
             return snapshot(entry);
@@ -435,7 +544,7 @@ export function acquire_file_coordinator(
                                 authority: reconciled.authority,
                             };
                         } else if (reconciled.type === 'advanced') {
-                            attachment.install_finalized_authority(
+                            attachment.observe_advanced_authority(
                                 token,
                                 requested.turn,
                                 reconciled.authority,
@@ -466,23 +575,18 @@ export function acquire_file_coordinator(
                         }
                         continue;
                     }
-                    const previousBasis = attachment.authority();
-                    const resultingBasis = attachment.install_finalized_authority(
+                    const authorityReceipt = attachment.finalize_authority_commit(
                         token,
                         requested.turn,
-                        finalized.authority,
+                        finalized,
                     );
                     receipt = Object.freeze({
+                        ...authorityReceipt,
                         requestId: command.requestId,
                         sheetIndex: command.sheetIndex,
                         sheetName: command.sheetName,
                         override: command.override,
                         originToken: command.originToken,
-                        operationOrdinal: token.ordinal,
-                        previousBasis,
-                        resultingBasis,
-                        stateRevision: finalized.snapshot.revision,
-                        state: finalized.snapshot.state as PerFileState,
                     });
                     return { type: 'committed', receipt };
                 }
@@ -493,6 +597,7 @@ export function acquire_file_coordinator(
                 throw error;
             } finally {
                 if (entry.states.has(token)) finish(entry, token);
+                void discard_authority(command.stateStore, entry.statePath, token.id);
                 if (receipt) {
                     for (const subscriber of [...entry.subscribers]) {
                         try {

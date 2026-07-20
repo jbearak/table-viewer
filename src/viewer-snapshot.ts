@@ -1,4 +1,10 @@
 import type { WorkbookMeta } from './data-source/interface';
+import type {
+    AuthorityCommitReceiptBase,
+    FileAuthoritySnapshot,
+} from './file-coordinator';
+import type { FileStateSnapshot } from './state';
+import { deep_clone_and_freeze } from './immutable';
 import {
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
@@ -52,7 +58,7 @@ export type WorkbookSnapshotReason =
 export interface ExcelHeaderSnapshotResult {
     readonly type: 'excelFirstRowHeader';
     readonly requestId: string;
-    readonly outcome: 'applied' | 'recovered';
+    readonly outcome: 'applied' | 'recovered' | 'rejected';
     readonly error?: string;
 }
 
@@ -93,7 +99,84 @@ export interface WorkbookSnapshot {
     readonly commandResult?: RetainedSnapshotCommandResult;
 }
 
+export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = WorkbookMeta> {
+    readonly generation: number;
+    readonly sourceGeneration: number;
+    readonly meta: Meta;
+}
+
+export interface WorkbookSnapshotDiagnostics {
+    readonly truncationMessage: string | null;
+}
+
+interface BuildWorkbookSnapshotCommonInput<Meta extends WorkbookMeta> {
+    readonly deliveryId: number;
+    readonly canonicalFileId: string;
+    readonly core: WorkbookSnapshotCoreMaterial<Meta>;
+    readonly presentation: WorkbookSnapshot['presentation'];
+    readonly reason: WorkbookSnapshotReason;
+    readonly configuration: WorkbookSnapshotConfiguration;
+    readonly capabilities: WorkbookSnapshotCapabilities;
+    readonly diagnostics: WorkbookSnapshotDiagnostics;
+    readonly commandResult?: RetainedSnapshotCommandResult;
+}
+
+export type BuildWorkbookSnapshotInput<Meta extends WorkbookMeta = WorkbookMeta> =
+    BuildWorkbookSnapshotCommonInput<Meta> & (
+        | {
+            readonly source: 'commitReceipt';
+            readonly receipt: AuthorityCommitReceiptBase;
+        }
+        | {
+            readonly source: 'observed';
+            readonly authority: FileAuthoritySnapshot;
+            readonly state_snapshot: FileStateSnapshot;
+        }
+    );
+
 export type SnapshotDisposition = 'applied' | 'duplicate' | 'stale';
+
+/** Build one complete, immutable host delivery without mutating source material. */
+export function build_workbook_snapshot<Meta extends WorkbookMeta>(
+    input: BuildWorkbookSnapshotInput<Meta>,
+): WorkbookSnapshot {
+    const authority = input.source === 'commitReceipt'
+        ? input.receipt.resultingBasis
+        : input.authority;
+    const state_snapshot = input.source === 'commitReceipt'
+        ? input.receipt.stateSnapshot
+        : input.state_snapshot;
+    const snapshot: WorkbookSnapshot = {
+        identity: {
+            deliveryId: input.deliveryId,
+            authority: {
+                fileId: input.canonicalFileId,
+                revision: authority.authorityRevision,
+            },
+            stateRevision: state_snapshot.revision,
+            sourceBasis: {
+                physicalRevision: authority.physicalRevision,
+                projectionRevision: authority.projectionRevision,
+            },
+        },
+        generation: input.core.generation,
+        sourceGeneration: input.core.sourceGeneration,
+        presentation: input.presentation,
+        reason: input.reason,
+        meta: input.core.meta,
+        state: normalize_workbook_snapshot_state(
+            state_snapshot.state,
+            input.core.meta,
+        ),
+        configuration: input.configuration,
+        capabilities: input.capabilities,
+        truncationMessage: input.diagnostics.truncationMessage,
+        ...(input.commandResult === undefined
+            ? {}
+            : { commandResult: input.commandResult }),
+    };
+    return deep_clone_and_freeze(snapshot);
+}
 
 /**
  * Compare a received snapshot with the last applied authority. Same-file

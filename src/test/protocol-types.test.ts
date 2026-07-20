@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { HostMessage, WebviewMessage } from '../types';
 import type { WorkbookMeta, RenderedCell } from '../data-source/interface';
+import type { RetainedSnapshotCommandResult } from '../viewer-snapshot';
 
 describe('paginated protocol message shapes', () => {
     const meta: WorkbookMeta = {
@@ -53,6 +54,34 @@ describe('paginated protocol message shapes', () => {
         };
         expect(msg.snapshot.identity.stateRevision).toBe(44);
         expect(msg.snapshot.commandResult?.requestId).toBe('header:1');
+    });
+
+    it('types every retained Excel header terminal outcome', () => {
+        const results: RetainedSnapshotCommandResult[] = [
+            {
+                type: 'excelFirstRowHeader',
+                requestId: 'applied',
+                outcome: 'applied',
+            },
+            {
+                type: 'excelFirstRowHeader',
+                requestId: 'recovered',
+                outcome: 'recovered',
+                error: 'Recovered after an ambiguous finalization.',
+            },
+            {
+                type: 'excelFirstRowHeader',
+                requestId: 'rejected',
+                outcome: 'rejected',
+                error: 'The worksheet changed.',
+            },
+        ];
+
+        expect(results.map(({ outcome }) => outcome)).toEqual([
+            'applied',
+            'recovered',
+            'rejected',
+        ]);
     });
 
     it('HostMessage carries a sheetMeta variant with generation', () => {

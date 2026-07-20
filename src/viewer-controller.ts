@@ -416,15 +416,17 @@ export function attach_viewer(
                         if (plan && ds instanceof ExcelHeaderDataSource) {
                             ds.replace_overrides(plan.overrides);
                         }
-                        const authority = file_coordinator.install_finalized_authority(
+                        const receipt = file_coordinator.finalize_authority_commit(
                             token,
                             requested.turn,
-                            reconciled.authority,
+                            reconciled,
                         );
-                        return adopt_candidate ? adopt(ds, digest, authority) : true;
+                        return adopt_candidate
+                            ? adopt(ds, digest, receipt.resultingBasis)
+                            : true;
                     }
                     if (reconciled.type === 'advanced') {
-                        file_coordinator.install_finalized_authority(
+                        file_coordinator.observe_advanced_authority(
                             token,
                             requested.turn,
                             reconciled.authority,
@@ -442,17 +444,17 @@ export function attach_viewer(
                 if (plan && ds instanceof ExcelHeaderDataSource) {
                     ds.replace_overrides(plan.overrides);
                 }
-                const authority = file_coordinator.install_finalized_authority(
+                const receipt = file_coordinator.finalize_authority_commit(
                     token,
                     requested.turn,
-                    finalized.authority,
+                    finalized,
                 );
-                return adopt_candidate ? adopt(ds, digest, authority) : true;
+                return adopt_candidate
+                    ? adopt(ds, digest, receipt.resultingBasis)
+                    : true;
             }
         } finally {
-            if (file_coordinator.operation_is_current(token)) {
-                file_coordinator.cancel(token);
-            }
+            file_coordinator.cancel(token);
             void discard_authority(durable_state_store, state_path, token.id);
         }
     }
@@ -630,7 +632,7 @@ export function attach_viewer(
                 if (await post_header_projection(
                     source,
                     receipt.requestId,
-                    receipt.state,
+                    receipt.stateSnapshot.state as PerFileState,
                 )) {
                     mark_metadata_delivered();
                     return;

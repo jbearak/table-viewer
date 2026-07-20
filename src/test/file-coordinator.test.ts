@@ -5,7 +5,10 @@ import {
     file_coordinator_registry_size,
     type AuthorityOperationToken,
     type ExcelHeaderOperationReceipt,
+    type PhysicalAuthorityCommitReceipt,
+    type SuccessfulAuthorityFinalization,
 } from '../file-coordinator';
+import type { FinalizationReconciliation } from '../finalization-reconciliation';
 import type { ExcelHeaderPlanningInput } from '../data-source/excel-header-source';
 import type { AuthorityFileStateStore, FileStateStore } from '../state';
 import type { StoredPerFileState } from '../types';
@@ -91,7 +94,7 @@ const planning_input: ExcelHeaderPlanningInput = Object.freeze({
 function begin_physical(
     coordinator: ReturnType<typeof acquire_file_coordinator>,
     digest: string,
-): AuthorityOperationToken {
+): AuthorityOperationToken<'physical'> {
     const result = coordinator.begin_physical(
         coordinator.authority().authorityRevision,
         digest,
@@ -120,11 +123,11 @@ async function establish(
     if (requested.type !== 'granted') throw new Error('turn rejected');
     const finalized = await finalize_authority(store, coordinator.statePath, operation.id);
     if (finalized.type !== 'finalized') throw new Error('finalize rejected');
-    return coordinator.install_finalized_authority(
+    return coordinator.finalize_authority_commit(
         operation,
         requested.turn,
-        finalized.authority,
-    );
+        finalized,
+    ).resultingBasis;
 }
 
 function header_command(
@@ -170,6 +173,306 @@ describe('file coordinator reservations', () => {
             physicalRevision: 2,
             projectionRevision: 1,
             authorityRevision: 3,
+        });
+        coordinator.dispose();
+    });
+
+    it('returns ordered physical and projection receipts from exact finalizations', async () => {
+        const path = `/tmp/coordinator-receipts-${Math.random()}.xlsx`;
+        const state = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, state.store);
+        const physical = begin_physical(coordinator, 'digest-receipt');
+        const before = await state.store.read(coordinator.statePath);
+        await stage_authority(state.store, coordinator.statePath, {
+            id: physical.id,
+            kind: 'physical',
+            ordinal: physical.ordinal,
+            expectedStateRevision: before.revision,
+            expectedCommitSequence: 0,
+            nextState: { activeSheetIndex: 1 },
+            physicalDigest: 'digest-receipt',
+        });
+        const physical_turn = await coordinator.request_commit_turn(physical);
+        if (physical_turn.type !== 'granted') throw new Error('turn rejected');
+        const physical_finalized = await finalize_authority(
+            state.store,
+            coordinator.statePath,
+            physical.id,
+        );
+        if (physical_finalized.type !== 'finalized') throw new Error('finalize rejected');
+        const physical_receipt: PhysicalAuthorityCommitReceipt =
+            coordinator.finalize_authority_commit(
+                physical,
+                physical_turn.turn,
+                physical_finalized,
+            );
+
+        const projection = await coordinator.commit_excel_header(
+            header_command(state.store, 'receipt-projection', 'off'),
+        );
+        if (projection.type !== 'committed') throw new Error('projection rejected');
+
+        expect(physical_receipt).toMatchObject({
+            operationKind: 'physical',
+            operationOrdinal: 1,
+            digest: 'digest-receipt',
+            previousBasis: { authorityRevision: 0 },
+            resultingBasis: {
+                authorityRevision: 1,
+                physicalRevision: 1,
+                projectionRevision: 0,
+            },
+            stateSnapshot: physical_finalized.snapshot,
+        });
+        expect(projection.receipt).toMatchObject({
+            operationKind: 'projection',
+            operationOrdinal: 2,
+            previousBasis: { authorityRevision: 1 },
+            resultingBasis: {
+                authorityRevision: 2,
+                physicalRevision: 1,
+                projectionRevision: 1,
+            },
+        });
+        expect(projection.receipt.stateSnapshot).toEqual(
+            await state.store.read(coordinator.statePath),
+        );
+        expect(Object.isFrozen(physical_receipt.stateSnapshot.state)).toBe(true);
+        coordinator.dispose();
+    });
+
+    it('observes advanced authority without producing a commit receipt', async () => {
+        const path = `/tmp/advanced-${Math.random()}.xlsx`;
+        const coordinator = acquire_file_coordinator(path);
+        const operation = begin_physical(coordinator, 'advanced-digest');
+        const turn = await coordinator.request_commit_turn(operation);
+        if (turn.type !== 'granted') throw new Error('turn rejected');
+        coordinator.start_finalization(turn.turn);
+        const invalidated = begin_physical(coordinator, 'queued-digest');
+
+        const observed = coordinator.observe_advanced_authority(
+            operation,
+            turn.turn,
+            {
+                commitSequence: 4,
+                authorityRevision: 3,
+                physicalRevision: 2,
+                projectionRevision: 1,
+                physicalDigest: 'other-digest',
+            },
+        );
+
+        expect(observed).toMatchObject({
+            authorityRevision: 3,
+            physicalRevision: 2,
+            projectionRevision: 1,
+        });
+        expect(observed).not.toHaveProperty('operationKind');
+        expect(observed).not.toHaveProperty('stateSnapshot');
+        type Advanced = Extract<FinalizationReconciliation, { type: 'advanced' }>;
+        type AdvancedCanFinalize = Advanced extends SuccessfulAuthorityFinalization
+            ? true
+            : false;
+        const advanced_can_finalize: AdvancedCanFinalize = false;
+        expect(advanced_can_finalize).toBe(false);
+        expect(coordinator.operation_is_current(invalidated)).toBe(false);
+        coordinator.cancel(invalidated);
+        coordinator.dispose();
+        expect(file_coordinator_registry_size()).toBe(0);
+    });
+
+    it('rejects a queued projection when observed reconciliation advances physical authority', async () => {
+        const path = `/tmp/observed-physical-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const active = begin_physical(coordinator, 'candidate-digest');
+        const active_turn = await coordinator.request_commit_turn(active);
+        if (active_turn.type !== 'granted') throw new Error('turn rejected');
+        coordinator.start_finalization(active_turn.turn);
+
+        let projection_stages = 0;
+        let projection_staged!: () => void;
+        const projection_ready = new Promise<void>((resolve) => {
+            projection_staged = resolve;
+        });
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async stage_authority_transaction(file_path, stage) {
+                const result = await base.store.stage_authority_transaction(file_path, stage);
+                if (stage.kind === 'projection') {
+                    projection_stages += 1;
+                    projection_staged();
+                }
+                return result;
+            },
+        };
+        const queued = coordinator.commit_excel_header(
+            header_command(store, 'stale-physical-plan', 'off'),
+        );
+        await projection_ready;
+
+        const previous = coordinator.authority();
+        coordinator.observe_advanced_authority(active, active_turn.turn, {
+            commitSequence: previous.commitSequence + 1,
+            authorityRevision: previous.authorityRevision + 1,
+            physicalRevision: previous.physicalRevision + 1,
+            projectionRevision: previous.projectionRevision,
+            physicalDigest: 'external-digest',
+        });
+
+        await expect(queued).resolves.toMatchObject({ type: 'rejected' });
+        expect(projection_stages).toBe(1);
+        expect(base.value(coordinator.statePath) ?? {}).not.toHaveProperty(
+            'excelFirstRowHeaders.People',
+        );
+        const cleanup = begin_physical(coordinator, 'cleanup-digest');
+        const cleanup_turn = await coordinator.request_commit_turn(cleanup);
+        expect(cleanup_turn.type).toBe('granted');
+        if (cleanup_turn.type === 'granted') {
+            coordinator.release_commit_turn(cleanup_turn.turn);
+        }
+        coordinator.cancel(cleanup);
+        coordinator.dispose();
+    });
+
+    it('rejects an older queued projection after an observed projection-only advance', async () => {
+        const path = `/tmp/observed-older-projection-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+
+        let release_read!: () => void;
+        const read_gate = new Promise<void>((resolve) => { release_read = resolve; });
+        let read_started!: () => void;
+        const read_ready = new Promise<void>((resolve) => { read_started = resolve; });
+        let projection_staged!: () => void;
+        const stage_ready = new Promise<void>((resolve) => { projection_staged = resolve; });
+        let gate_once = true;
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async read(file_path) {
+                if (gate_once) {
+                    gate_once = false;
+                    read_started();
+                    await read_gate;
+                }
+                return base.store.read(file_path);
+            },
+            async stage_authority_transaction(file_path, stage) {
+                const result = await base.store.stage_authority_transaction(file_path, stage);
+                if (stage.kind === 'projection') projection_staged();
+                return result;
+            },
+        };
+        const older = coordinator.commit_excel_header(
+            header_command(store, 'older-projection', 'off'),
+        );
+        await read_ready;
+
+        const active = begin_physical(coordinator, 'digest-a');
+        const active_turn = await coordinator.request_commit_turn(active);
+        if (active_turn.type !== 'granted') throw new Error('turn rejected');
+        coordinator.start_finalization(active_turn.turn);
+        release_read();
+        await stage_ready;
+
+        const external_state = await base.store.read(coordinator.statePath);
+        const external_authority = await base.store.read_authority(coordinator.statePath);
+        const external_id = `external-older:${Math.random()}`;
+        const external_stage = await stage_authority(base.store, coordinator.statePath, {
+            id: external_id,
+            kind: 'projection',
+            ordinal: active.ordinal,
+            expectedStateRevision: external_state.revision,
+            expectedCommitSequence: external_authority.commitSequence,
+        });
+        if (external_stage.type !== 'staged') throw new Error('external stage rejected');
+        const external = await finalize_authority(
+            base.store,
+            coordinator.statePath,
+            external_id,
+        );
+        if (external.type !== 'finalized') throw new Error('external finalize rejected');
+
+        coordinator.observe_advanced_authority(active, active_turn.turn, external.authority);
+
+        await expect(older).resolves.toMatchObject({ type: 'rejected' });
+        const cleanup = begin_physical(coordinator, 'digest-a');
+        const cleanup_turn = await coordinator.request_commit_turn(cleanup);
+        expect(cleanup_turn.type).toBe('granted');
+        if (cleanup_turn.type === 'granted') {
+            coordinator.release_commit_turn(cleanup_turn.turn);
+        }
+        coordinator.cancel(cleanup);
+        coordinator.dispose();
+    });
+
+    it('preserves newer queued projection order after an observed projection-only advance', async () => {
+        const path = `/tmp/observed-projection-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        const active = begin_physical(coordinator, 'digest-a');
+        const active_turn = await coordinator.request_commit_turn(active);
+        if (active_turn.type !== 'granted') throw new Error('turn rejected');
+        coordinator.start_finalization(active_turn.turn);
+
+        let projection_staged!: () => void;
+        const projection_ready = new Promise<void>((resolve) => {
+            projection_staged = resolve;
+        });
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async stage_authority_transaction(file_path, stage) {
+                const result = await base.store.stage_authority_transaction(file_path, stage);
+                if (stage.kind === 'projection' && stage.id.includes('newer-projection')) {
+                    projection_staged();
+                }
+                return result;
+            },
+        };
+        const queued = coordinator.commit_excel_header(
+            header_command(store, 'newer-projection', 'off'),
+        );
+        await projection_ready;
+
+        const external_state = await base.store.read(coordinator.statePath);
+        const external_authority = await base.store.read_authority(coordinator.statePath);
+        const external_id = `external:${Math.random()}`;
+        const external_stage = await stage_authority(
+            base.store,
+            coordinator.statePath,
+            {
+                id: external_id,
+                kind: 'projection',
+                ordinal: active.ordinal,
+                expectedStateRevision: external_state.revision,
+                expectedCommitSequence: external_authority.commitSequence,
+            },
+        );
+        if (external_stage.type !== 'staged') throw new Error('external stage rejected');
+        const external = await finalize_authority(
+            base.store,
+            coordinator.statePath,
+            external_id,
+        );
+        if (external.type !== 'finalized') throw new Error('external finalize rejected');
+
+        coordinator.observe_advanced_authority(
+            active,
+            active_turn.turn,
+            external.authority,
+        );
+
+        await expect(queued).resolves.toMatchObject({ type: 'committed' });
+        expect(coordinator.authority()).toMatchObject({
+            physicalRevision: 1,
+            projectionRevision: 2,
+            authorityRevision: 3,
+        });
+        expect(base.value(coordinator.statePath)).toMatchObject({
+            excelFirstRowHeaders: { People: 'off' },
         });
         coordinator.dispose();
     });
@@ -388,6 +691,56 @@ describe('file coordinator reservations', () => {
         coordinator.dispose();
     });
 
+    it('discards a projection stage after observing an advanced reconciliation', async () => {
+        const path = `/tmp/advanced-projection-stage-${Math.random()}.xlsx`;
+        const base = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, base.store);
+        await establish(coordinator, 'digest-a', base.store);
+        let local_id = '';
+        const store: AuthorityFileStateStore = {
+            ...base.store,
+            async finalize_authority_transaction(file_path, id) {
+                local_id = id;
+                const state = await base.store.read(file_path);
+                const authority = await base.store.read_authority(file_path);
+                const external_id = `external-advance:${Math.random()}`;
+                const staged = await stage_authority(base.store, file_path, {
+                    id: external_id,
+                    kind: 'projection',
+                    ordinal: 999,
+                    expectedStateRevision: state.revision,
+                    expectedCommitSequence: authority.commitSequence,
+                });
+                if (staged.type !== 'staged') throw new Error('external stage rejected');
+                const external = await finalize_authority(
+                    base.store,
+                    file_path,
+                    external_id,
+                );
+                if (external.type !== 'finalized') {
+                    throw new Error('external finalize rejected');
+                }
+                throw new Error('ambiguous advanced finalize');
+            },
+        };
+
+        await expect(coordinator.commit_excel_header(
+            header_command(store, 'advanced-stage', 'off'),
+        )).resolves.toMatchObject({
+            type: 'rejected',
+            error: 'The durable workbook advanced during header finalization.',
+        });
+        expect(local_id).not.toBe('');
+        await vi.waitFor(async () => {
+            const inspection = await base.store.inspect_authority_transaction(
+                coordinator.statePath,
+                local_id,
+            );
+            expect(inspection.stagePresent).toBe(false);
+        });
+        coordinator.dispose();
+    });
+
     it('cannot cancel an active finalization and starts the next turn afterward', async () => {
         const path = `/tmp/active-finalize-${Math.random()}.xlsx`;
         const state = mapped_state_store();
@@ -413,10 +766,10 @@ describe('file coordinator reservations', () => {
             first.id,
         );
         if (finalized.type !== 'finalized') throw new Error('finalize rejected');
-        coordinator.install_finalized_authority(
+        coordinator.finalize_authority_commit(
             first,
             first_turn.turn,
-            finalized.authority,
+            finalized,
         );
         const second_turn = await second_wait;
         expect(second_turn.type).toBe('granted');
