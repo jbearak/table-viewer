@@ -5,16 +5,18 @@ import type { HostMessage, WebviewMessage } from '../types';
 import type { WorkbookMeta, RenderedCell } from '../data-source/interface';
 import type { RetainedSnapshotCommandResult } from '../viewer-snapshot';
 
-function production_host_sources(directory: string): string[] {
+function protocol_sources(directory: string): string[] {
     return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) {
-            if (entry.name === 'test' || entry.name === 'webview') return [];
-            return production_host_sources(path);
+            if (entry.name === 'test') return [];
+            return protocol_sources(path);
         }
-        return /\.tsx?$/.test(entry.name) && entry.name !== 'types.ts' ? [path] : [];
+        return /\.tsx?$/.test(entry.name) ? [path] : [];
     });
 }
+
+type AssertNever<T extends never> = T;
 
 describe('paginated protocol message shapes', () => {
     const meta: WorkbookMeta = {
@@ -22,15 +24,30 @@ describe('paginated protocol message shapes', () => {
         sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
     };
 
-    it('has no production host references to compatibility-only metadata messages', () => {
+    it('rejects removed metadata discriminants at compile time', () => {
+        type RemovedSheetMessage = `sheet${'Meta'}`;
+        type RemovedReloadMessage = `meta${'Reload'}`;
+        type RemovedRecoveryMessage = `meta${'Reload'}${'Recovery'}`;
+        type RemovedHeaderErrorMessage = `excelFirstRowHeader${'Error'}`;
+        const proof: readonly [
+            AssertNever<Extract<HostMessage, { type: RemovedSheetMessage }>>,
+            AssertNever<Extract<HostMessage, { type: RemovedReloadMessage }>>,
+            AssertNever<Extract<HostMessage, { type: RemovedRecoveryMessage }>>,
+            AssertNever<Extract<HostMessage, { type: RemovedHeaderErrorMessage }>>,
+        ] | null = null;
+
+        expect(proof).toBeNull();
+    });
+
+    it('has no removed metadata discriminants in protocol source', () => {
         const source_root = join(__dirname, '..');
         const forbidden = [
-            'sheetMeta',
-            'metaReload',
-            'metaReloadRecovery',
-            'excelFirstRowHeaderError',
+            `sheet${'Meta'}`,
+            `meta${'Reload'}`,
+            `meta${'Reload'}${'Recovery'}`,
+            `excelFirstRowHeader${'Error'}`,
         ];
-        const matches = production_host_sources(source_root).flatMap((path) => {
+        const matches = protocol_sources(source_root).flatMap((path) => {
             const contents = readFileSync(path, 'utf8');
             return forbidden
                 .filter((message_type) => contents.includes(message_type))
@@ -114,56 +131,6 @@ describe('paginated protocol message shapes', () => {
         ]);
     });
 
-    it('retains the compatibility-only sheetMeta wire shape', () => {
-        const msg: HostMessage = {
-            type: 'sheetMeta',
-            meta,
-            state: {},
-            defaultTabOrientation: 'horizontal',
-            generation: 1,
-            sourceGeneration: 1,
-        };
-        expect(msg.type).toBe('sheetMeta');
-        if (msg.type === 'sheetMeta') {
-            expect(msg.meta.sheets[0].rowCount).toBe(3);
-            expect(msg.generation).toBe(1);
-        }
-    });
-
-    it('retains the compatibility-only metaReload wire shape', () => {
-        const msg: HostMessage = {
-            type: 'metaReload',
-            meta,
-            state: { transforms: [] },
-            projectionChange: 'excelHeader',
-            headerRequestId: 'header:1',
-            generation: 2,
-            sourceGeneration: 2,
-        };
-        expect(msg.type).toBe('metaReload');
-        if (msg.type === 'metaReload') {
-            expect(msg.generation).toBe(2);
-            expect(msg.projectionChange).toBe('excelHeader');
-            expect(msg.headerRequestId).toBe('header:1');
-            expect(msg.state?.transforms).toEqual([]);
-        }
-    });
-
-    it('retains the compatibility-only metadata recovery wire shape', () => {
-        const msg: HostMessage = {
-            type: 'metaReloadRecovery',
-            meta,
-            state: {},
-            projectionChange: 'excelHeader',
-            headerRequestId: 'header:terminal',
-            generation: 8,
-            sourceGeneration: 6,
-            error: 'Delivery retries were exhausted.',
-        };
-        expect(msg.generation).toBe(8);
-        expect(msg.sourceGeneration).toBe(6);
-    });
-
     it('HostMessage carries a rowData variant addressed by sheet/start/requestId', () => {
         const cell: RenderedCell = { raw: 'a', formatted: 'a', bold: false, italic: false };
         const msg: HostMessage = {
@@ -205,12 +172,32 @@ describe('paginated protocol message shapes', () => {
         const msg: WebviewMessage = {
             type: 'stateChanged',
             sourceGeneration: 3,
+            snapshotIdentity: {
+                deliveryId: 12,
+                authority: { fileId: 'file:people.xlsx', revision: 9 },
+                stateRevision: 44,
+                sourceBasis: {
+                    physicalRevision: 7,
+                    projectionRevision: 2,
+                },
+            },
             state: {
                 rowHeights: [{ 0: 44 }],
                 scrollPosition: [{ top: 100, left: 20 }],
             },
         };
         expect(msg.sourceGeneration).toBe(3);
+        expect(msg.snapshotIdentity.deliveryId).toBe(12);
+    });
+
+    it('rejects stateChanged without a snapshot identity at compile time', () => {
+        type StateChanged = Extract<WebviewMessage, { type: 'stateChanged' }>;
+        type IdentitylessStateChanged = Omit<StateChanged, 'snapshotIdentity'>;
+        type MissingIdentityIsAccepted = IdentitylessStateChanged extends StateChanged
+            ? true
+            : false;
+        const proof: MissingIdentityIsAccepted = false;
+        expect(proof).toBe(false);
     });
 
     it('WebviewMessage carries a showWarning variant with a message', () => {
@@ -224,7 +211,7 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
-    it('retains the header request and compatibility-only error result shapes', () => {
+    it('retains header and column visibility request shapes', () => {
         const request: WebviewMessage = {
             type: 'setExcelFirstRowHeader',
             sheetIndex: 1,
@@ -234,11 +221,6 @@ describe('paginated protocol message shapes', () => {
             generation: 2,
             sourceGeneration: 3,
         };
-        const result: HostMessage = {
-            type: 'excelFirstRowHeaderError',
-            requestId: 'header:1',
-            error: 'The worksheet changed.',
-        };
         const visibility: WebviewMessage = {
             type: 'setColumnVisibility',
             sheetIndex: 1,
@@ -247,7 +229,6 @@ describe('paginated protocol message shapes', () => {
             sourceGeneration: 3,
         };
         expect(request.type).toBe('setExcelFirstRowHeader');
-        expect(result.type).toBe('excelFirstRowHeaderError');
         expect(visibility.type).toBe('setColumnVisibility');
     });
 

@@ -131,12 +131,6 @@ describe('CSV reload races', () => {
         await flush_promises();
         const second = workbook_snapshots(panel).at(-1)!;
 
-        expect(panel.__messages.some((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && ['sheetMeta', 'metaReload', 'metaReloadRecovery'].includes(String(message.type))
-        ))).toBe(false);
         expect(second.identity).not.toEqual(first.identity);
         expect(second.generation).toBe(first.generation);
         expect(second.sourceGeneration).toBe(first.sourceGeneration);

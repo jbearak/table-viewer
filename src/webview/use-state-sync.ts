@@ -15,7 +15,7 @@ const DEBOUNCE_MS = 150;
 export function use_state_sync(
     current_state: React.MutableRefObject<PerFileState>,
     source_generation: React.MutableRefObject<number>,
-    snapshot_identity?: React.MutableRefObject<WorkbookSnapshotIdentity | null>,
+    snapshot_identity: React.MutableRefObject<WorkbookSnapshotIdentity | null>,
 ) {
     const timer_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -28,13 +28,13 @@ export function use_state_sync(
     }, []);
 
     const persist = useCallback(() => {
+        const identity = snapshot_identity.current;
+        if (!identity) return;
         vscode_api.postMessage({
             type: 'stateChanged',
             state: current_state.current,
             sourceGeneration: source_generation.current,
-            ...(snapshot_identity?.current
-                ? { snapshotIdentity: snapshot_identity.current }
-                : {}),
+            snapshotIdentity: identity,
         });
     }, [current_state, snapshot_identity, source_generation]);
 

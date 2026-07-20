@@ -300,7 +300,7 @@ async function load_acknowledged_transform(
     post_message: ReturnType<typeof vi.fn>,
     state: SheetTransformState,
 ) {
-    await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+    await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
         state: { transforms: [state] },
     }));
     const restore = latest_transform_request(post_message);
@@ -368,39 +368,42 @@ function grid_stub(): HTMLDivElement {
     return stub as HTMLDivElement;
 }
 
-function sheet_meta_message(
-    meta: WorkbookMeta,
-    extra: Partial<Extract<HostMessage, { type: 'sheetMeta' }>> = {}
-): HostMessage {
-    return {
-        type: 'sheetMeta',
-        meta,
-        state: {},
-        defaultTabOrientation: 'horizontal',
-        generation: 1,
-        sourceGeneration: 1,
-        ...extra,
+type SnapshotExtra = Omit<Partial<WorkbookSnapshot>,
+    'identity' | 'state' | 'configuration' | 'capabilities'> & {
+        identity?: Partial<WorkbookSnapshot['identity']>;
+        state?: Partial<WorkbookSnapshot['state']>;
+        configuration?: Partial<WorkbookSnapshot['configuration']>;
+        capabilities?: Partial<WorkbookSnapshot['capabilities']>;
     };
+
+function initial_snapshot_message(
+    meta: WorkbookMeta,
+    extra: SnapshotExtra = {},
+): Extract<HostMessage, { type: 'workbookSnapshot' }> {
+    return workbook_snapshot_message(meta, extra);
 }
 
-function meta_reload_message(
+function refresh_snapshot_message(
     meta: WorkbookMeta,
-    extra: Partial<Extract<HostMessage, { type: 'metaReload' }>> = {}
-): HostMessage {
-    return {
-        type: 'metaReload',
-        meta,
+    extra: SnapshotExtra = {},
+): Extract<HostMessage, { type: 'workbookSnapshot' }> {
+    return workbook_snapshot_message(meta, {
         generation: 2,
         sourceGeneration: 2,
+        presentation: 'refresh',
+        reason: 'fileReload',
         ...extra,
-    };
+    });
 }
+
+let snapshot_delivery_sequence = 0;
 
 function workbook_snapshot_message(
     meta: WorkbookMeta,
-    extra: Partial<WorkbookSnapshot> = {},
+    extra: SnapshotExtra = {},
 ): Extract<HostMessage, { type: 'workbookSnapshot' }> {
-    const delivery_id = extra.identity?.deliveryId ?? 1;
+    const delivery_id = extra.identity?.deliveryId ?? ++snapshot_delivery_sequence;
+    const { state, configuration, capabilities, identity, ...snapshot_extra } = extra;
     return {
         type: 'workbookSnapshot',
         snapshot: {
@@ -417,14 +420,17 @@ function workbook_snapshot_message(
                 tabOrientation: null,
                 transforms: meta.sheets.map(() => undefined),
                 columnVisibility: meta.sheets.map(() => undefined),
+                ...state,
             },
             configuration: {
                 defaultTabOrientation: 'horizontal',
                 previewMode: false,
+                ...configuration,
             },
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
+                ...capabilities,
             },
             truncationMessage: null,
             identity: {
@@ -438,8 +444,9 @@ function workbook_snapshot_message(
                     physicalRevision: delivery_id,
                     projectionRevision: 0,
                 },
+                ...identity,
             },
-            ...extra,
+            ...snapshot_extra,
         },
     };
 }
@@ -457,6 +464,7 @@ function cleanup() {
     grid_shell_mock.save_in_flight = false;
     grid_shell_mock.has_uncommitted_changes = false;
     grid_shell_mock.mount_count = 0;
+    snapshot_delivery_sequence = 0;
     grid_shell_mock.on_editing_change = null;
     grid_shell_mock.request_save.mockReset();
     grid_shell_mock.request_save.mockReturnValue(false);
@@ -486,20 +494,20 @@ describe('initial render', () => {
         expect(post_message).toHaveBeenCalledWith({ type: 'ready' });
     });
 
-    it('mounts the grid and toolbar after sheetMeta', async () => {
+    it('mounts the grid and toolbar after the initial snapshot', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         expect(container!.querySelector('.grid-shell-stub')).not.toBeNull();
         expect(get_button('Auto-fit Columns')).toBeDefined();
     });
 
     it('threads sheet index and generation into the grid', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         expect(grid_stub().getAttribute('data-generation')).toBe('1');
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
 
-        await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'])));
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
     });
 });
@@ -741,37 +749,6 @@ describe('workbook snapshot hydration', () => {
         expect(pending_messages.some((item) => item.edits === null)).toBe(false);
     });
 
-    it('preserves live dirty edits across a state-less legacy refresh', async () => {
-        grid_shell_mock.emit_pending_edits_on_mount = true;
-        const { post_message } = await render_app();
-        const meta = make_meta(['Sheet1'], false);
-        await dispatch_host_message(sheet_meta_message(meta, {
-            csvEditable: true,
-            csvEditingSupported: true,
-        }));
-        await enter_edit_mode(post_message);
-        const live_edits = {
-            '2:0': { value: 'live', base: 'before' },
-        };
-        await report_grid_editing(true, true, [], live_edits);
-        post_message.mockClear();
-
-        await dispatch_host_message(meta_reload_message(meta, {
-            generation: 2,
-            sourceGeneration: 2,
-        }));
-
-        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
-            .toEqual(live_edits);
-        const pending_messages = post_message.mock.calls.map((call) => call[0])
-            .filter((item) => item.type === 'pendingEditsChanged');
-        expect(pending_messages).toContainEqual({
-            type: 'pendingEditsChanged',
-            editSessionId: 'test-edit-session',
-            edits: live_edits,
-        });
-        expect(pending_messages.some((item) => item.edits === null)).toBe(false);
-    });
 
     it('clears a pending header request only when an initial snapshot changes files', async () => {
         const { post_message } = await render_app();
@@ -846,22 +823,6 @@ describe('workbook snapshot hydration', () => {
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent ?? '').toBe('');
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
-    });
-
-    it('does not let delayed legacy metadata regress a native snapshot', async () => {
-        await render_app();
-        await dispatch_host_message(workbook_snapshot_message(make_meta(['Native']), {
-            generation: 5,
-        }));
-        const mount = grid_stub().getAttribute('data-mount-id');
-
-        await dispatch_host_message(sheet_meta_message(make_meta(['Legacy']), {
-            generation: 1,
-            sourceGeneration: 1,
-        }));
-
-        expect(grid_stub().getAttribute('data-generation')).toBe('5');
-        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount);
     });
 
     it('settles only a matching retained header result and only once', async () => {
@@ -962,7 +923,7 @@ describe('workbook snapshot hydration', () => {
 describe('formatting toggle', () => {
     it('passes show_formatting to the grid and flips it on toggle', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
 
         // Defaults on.
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
@@ -974,7 +935,7 @@ describe('formatting toggle', () => {
     it('hides the Formatting button when the workbook has no formatting', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false))
+            initial_snapshot_message(make_meta(['Sheet1'], false))
         );
         const formatting = Array.from(
             container!.querySelectorAll('button')
@@ -1003,12 +964,12 @@ describe('Excel first-row header toggle', () => {
 
     it('is shown only for Excel-capable sheet metadata', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'], false)));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false)));
         expect(Array.from(document.querySelectorAll('button')).some(
             (button) => button.textContent === 'First Row as Header',
         )).toBe(false);
 
-        await dispatch_host_message(sheet_meta_message(excel_meta(true)));
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true)));
         const button = get_button('First Row as Header');
         expect(button.getAttribute('aria-pressed')).toBe('true');
     });
@@ -1023,7 +984,7 @@ describe('Excel first-row header toggle', () => {
             active: true,
             available: false,
         };
-        await dispatch_host_message(sheet_meta_message(active_empty));
+        await dispatch_host_message(initial_snapshot_message(active_empty));
         post_message.mockClear();
 
         const button = get_button('First Row as Header');
@@ -1046,9 +1007,13 @@ describe('Excel first-row header toggle', () => {
             active: false,
             available: false,
         };
-        await dispatch_host_message(meta_reload_message(inactive_empty, {
-            projectionChange: 'excelHeader',
-            headerRequestId: request.requestId,
+        await dispatch_host_message(refresh_snapshot_message(inactive_empty, {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
         }));
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
@@ -1063,9 +1028,9 @@ describe('Excel first-row header toggle', () => {
             );
     });
 
-    it('requests an authoritative toggle and waits for metaReload', async () => {
+    it('requests an authoritative toggle and waits for the result snapshot', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: { rowHeights: [{ 0: 44 }] },
             generation: 4,
             sourceGeneration: 7,
@@ -1116,9 +1081,13 @@ describe('Excel first-row header toggle', () => {
         expect(document.querySelector('.filter-popover')).toBeNull();
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
-            projectionChange: 'excelHeader',
-            headerRequestId: request.requestId,
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -1141,7 +1110,7 @@ describe('Excel first-row header toggle', () => {
             };
             sheet.columnNames = ['Name'];
         }
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 transforms: [undefined, {
                     sort: [{ colIndex: 0, direction: 'asc' }],
@@ -1170,7 +1139,7 @@ describe('Excel first-row header toggle', () => {
         meta.sheets[1].excelFirstRowHeader = {
             mode: 'off', detected: false, active: false, available: true,
         };
-        await dispatch_host_message(sheet_meta_message(meta));
+        await dispatch_host_message(initial_snapshot_message(meta));
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
         await click_button('Notes');
         expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
@@ -1195,7 +1164,7 @@ describe('Excel first-row header toggle', () => {
             filters: [],
             schema: '["Notes",1,["Name"]]',
         };
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: { transforms: [people_transform, notes_transform] },
         }));
         await acknowledge_transform(latest_transform_request(post_message), 2);
@@ -1211,14 +1180,14 @@ describe('Excel first-row header toggle', () => {
             .toBe('Wait for sorting and filtering to finish.');
     });
 
-    it('restores a saved transform after a header-changing metaReload', async () => {
+    it('restores a saved transform after a header-changing snapshot', async () => {
         const { post_message } = await render_app();
         const transform: SheetTransformState = {
             sort: [{ colIndex: 1, direction: 'asc' }],
             filters: [],
             schema: '["People",2,["Name","Age"]]',
         };
-        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: { transforms: [transform] },
             generation: 4,
             sourceGeneration: 7,
@@ -1226,7 +1195,7 @@ describe('Excel first-row header toggle', () => {
         await acknowledge_transform(latest_transform_request(post_message), 4);
         post_message.mockClear();
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false, 'off'), {
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
             state: {
                 transforms: [{
                     sort: [{ colIndex: 1, direction: 'asc' }],
@@ -1238,7 +1207,7 @@ describe('Excel first-row header toggle', () => {
                     schema: '["People",2,null]',
                 }],
             },
-            projectionChange: 'excelHeader',
+            reason: 'excelHeader',
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -1261,7 +1230,7 @@ describe('Excel first-row header toggle', () => {
         const { post_message } = await render_app();
         const initial = make_meta(['People', 'Other']);
         initial.sheets[0] = excel_meta(true).sheets[0];
-        await dispatch_host_message(sheet_meta_message(initial, {
+        await dispatch_host_message(initial_snapshot_message(initial, {
             state: {
                 columnWidths: [undefined, { 0: 120 }],
                 rowHeights: [undefined, { 2: 40 }],
@@ -1276,7 +1245,7 @@ describe('Excel first-row header toggle', () => {
 
         const reloaded = make_meta(['People', 'Other']);
         reloaded.sheets[0] = excel_meta(false).sheets[0];
-        await dispatch_host_message(meta_reload_message(reloaded, {
+        await dispatch_host_message(refresh_snapshot_message(reloaded, {
             state: {
                 columnWidths: [undefined, { 0: 222 }],
                 rowHeights: [undefined, { 2: 77 }],
@@ -1286,8 +1255,12 @@ describe('Excel first-row header toggle', () => {
                 transforms: [undefined, undefined],
                 columnVisibility: [undefined, undefined],
             },
-            projectionChange: 'excelHeader',
-            headerRequestId: 'other-tab-header',
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: 'other-tab-header',
+                outcome: 'applied',
+            },
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -1324,7 +1297,7 @@ describe('Excel first-row header toggle', () => {
     it('does not persist a clean reload that has no authoritative state', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['People']);
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnWidths: [{ 0: 140 }],
                 rowHeights: [{ 2: 44 }],
@@ -1337,7 +1310,7 @@ describe('Excel first-row header toggle', () => {
         }));
         post_message.mockClear();
 
-        await dispatch_host_message(meta_reload_message(meta, {
+        await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -1355,7 +1328,7 @@ describe('Excel first-row header toggle', () => {
             filters: [],
             schema: old_schema,
         };
-        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: {
                 transforms: [transform],
                 columnVisibility: [{ hiddenColumns: [1], schema: old_schema }],
@@ -1366,7 +1339,7 @@ describe('Excel first-row header toggle', () => {
         await acknowledge_transform(latest_transform_request(post_message), 4);
         post_message.mockClear();
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             generation: 5,
             sourceGeneration: 8,
         }));
@@ -1374,18 +1347,13 @@ describe('Excel first-row header toggle', () => {
         const messages = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage);
         expect(messages.some((message) => message.type === 'setTransform')).toBe(false);
-        expect(messages.filter((message) => message.type === 'stateChanged').at(-1))
-            .toMatchObject({
-                state: {
-                    transforms: [undefined],
-                    columnVisibility: [undefined],
-                },
-            });
+        expect(messages.some((message) => message.type === 'stateChanged')).toBe(false);
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([0, 1]);
     });
 
     it('applies terminal header recovery before clearing the request', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: {
                 rowHeights: [{ 0: 44 }],
                 scrollPosition: [{ top: 100, left: 20 }],
@@ -1402,27 +1370,29 @@ describe('Excel first-row header toggle', () => {
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             generation: 7,
             sourceGeneration: 5,
         }));
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
 
-        await dispatch_host_message({
-            type: 'metaReloadRecovery',
-            meta: excel_meta(false),
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
                 rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
             },
-            projectionChange: 'excelHeader',
-            headerRequestId: request.requestId,
+            reason: 'recovery',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'recovered',
+                error: 'The normal snapshot delivery retries were exhausted.',
+            },
             generation: 8,
             sourceGeneration: 6,
-            error: 'The normal metadata delivery retries were exhausted.',
-        });
+        }));
 
         expect(grid_stub().getAttribute('data-generation')).toBe('8');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
@@ -1456,7 +1426,7 @@ describe('Excel first-row header toggle', () => {
 
     it('settles a dormant header request on a later correlated reload', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(excel_meta(true), {
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             generation: 1,
             sourceGeneration: 1,
         }));
@@ -1469,21 +1439,25 @@ describe('Excel first-row header toggle', () => {
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             generation: 8,
             sourceGeneration: 6,
         }));
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
 
-        await dispatch_host_message(meta_reload_message(excel_meta(false), {
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
                 rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
             },
-            projectionChange: 'excelHeader',
-            headerRequestId: request.requestId,
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
             generation: 9,
             sourceGeneration: 7,
         }));
@@ -1602,7 +1576,7 @@ describe('Excel first-row header toggle', () => {
 describe('sheet tabs', () => {
     it('hides tabs and the vertical-tabs button for a single sheet', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Only'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Only'])));
         const vtab = Array.from(container!.querySelectorAll('button')).find(
             (b) => b.textContent === 'Vertical Tabs'
         );
@@ -1611,9 +1585,8 @@ describe('sheet tabs', () => {
 
     it('switches the active sheet and persists the selection', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(
-            sheet_meta_message(make_meta(['First', 'Second']))
-        );
+        const initial = initial_snapshot_message(make_meta(['First', 'Second']));
+        await dispatch_host_message(initial);
         post_message.mockClear();
 
         await click_button('Second');
@@ -1622,6 +1595,7 @@ describe('sheet tabs', () => {
         expect(post_message).toHaveBeenCalledWith(
             expect.objectContaining({
                 type: 'stateChanged',
+                snapshotIdentity: initial.snapshot.identity,
                 state: expect.objectContaining({ activeSheetIndex: 1 }),
             })
         );
@@ -1631,7 +1605,7 @@ describe('sheet tabs', () => {
 describe('column width persistence', () => {
     it('stores a column resize per sheet and persists it', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         post_message.mockClear();
 
         await act(async () => {
@@ -1648,10 +1622,10 @@ describe('column width persistence', () => {
         expect(last.state.columnWidths[0]).toEqual({ 2: 222 });
     });
 
-    it('restores saved column widths from sheetMeta state', async () => {
+    it('restores saved column widths from initial snapshot state', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), {
+            initial_snapshot_message(make_meta(['Sheet1']), {
                 state: { columnWidths: [{ 0: 150 }] },
             })
         );
@@ -1666,7 +1640,7 @@ describe('column visibility projection', () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 5;
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnVisibility: [{
                     hiddenColumns: [3, 1],
@@ -1681,11 +1655,7 @@ describe('column visibility projection', () => {
             .toEqual([0, null, 1, null, 2]);
         expect(post_message.mock.calls
             .map((call) => call[0])
-            .find((message) => message.type === 'stateChanged')?.state.columnVisibility)
-            .toEqual([{
-                hiddenColumns: [1, 3],
-                schema: '["Sheet1",5,null]',
-            }]);
+            .some((message) => message.type === 'stateChanged')).toBe(false);
     });
 
     it('sanitizes invalid columns and persists the corrected descriptor', async () => {
@@ -1693,7 +1663,7 @@ describe('column visibility projection', () => {
         post_message.mockClear();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 3;
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnVisibility: [{
                     hiddenColumns: [2, 9, -1, 2],
@@ -1718,7 +1688,7 @@ describe('column visibility projection', () => {
         const { post_message } = await render_app();
         const initial = make_meta(['Sheet1']);
         initial.sheets[0].columnCount = 3;
-        await dispatch_host_message(sheet_meta_message(initial, {
+        await dispatch_host_message(initial_snapshot_message(initial, {
             state: {
                 columnVisibility: [{
                     hiddenColumns: [1],
@@ -1731,7 +1701,7 @@ describe('column visibility projection', () => {
         expect(post_message.mock.calls.map((call) => call[0])
             .some((message) => message.type === 'setColumnVisibility')).toBe(false);
 
-        await dispatch_host_message(sheet_meta_message(initial, {
+        await dispatch_host_message(initial_snapshot_message(initial, {
             state: {
                 columnVisibility: [{
                     hiddenColumns: [1],
@@ -1746,12 +1716,12 @@ describe('column visibility projection', () => {
         post_message.mockClear();
         const reloaded = make_meta(['Renamed']);
         reloaded.sheets[0].columnCount = 3;
-        await dispatch_host_message(meta_reload_message(reloaded));
+        await dispatch_host_message(refresh_snapshot_message(reloaded));
         expect(JSON.parse(grid_stub().getAttribute('data-projection')!))
             .toEqual([0, 1, 2]);
         const reload_messages = post_message.mock.calls.map((call) => call[0]);
-        const persisted = reload_messages.find((message) => message.type === 'stateChanged');
-        expect(persisted.state.columnVisibility).toEqual([undefined]);
+        expect(reload_messages.some((message) => message.type === 'stateChanged'))
+            .toBe(false);
         expect(reload_messages.some((message) => message.type === 'setColumnVisibility'))
             .toBe(false);
     });
@@ -1760,7 +1730,7 @@ describe('column visibility projection', () => {
         await render_app();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 2;
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnVisibility: [{
                     hiddenColumns: [0, 1],
@@ -1773,7 +1743,7 @@ describe('column visibility projection', () => {
 
     it('exposes the stable Columns trigger as grid focus recovery', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         const other = document.createElement('button');
         document.body.appendChild(other);
         other.focus();
@@ -1790,7 +1760,7 @@ describe('column visibility projection', () => {
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 3;
         meta.sheets[0].columnNames = ['Revenue', 'Revenue', 'Region'];
-        await dispatch_host_message(sheet_meta_message(meta));
+        await dispatch_host_message(initial_snapshot_message(meta));
 
         await open_columns();
         const labels = Array.from(document.querySelectorAll(
@@ -1809,7 +1779,7 @@ describe('column visibility projection', () => {
         meta.sheets[0].columnCount = 3;
         meta.sheets[0].columnNames = ['Name', 'Value', 'Notes'];
         meta.sheets[1].columnCount = 2;
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnVisibility: [undefined, {
                     hiddenColumns: [1],
@@ -1897,7 +1867,7 @@ describe('column visibility projection', () => {
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 2;
         meta.sheets[0].columnNames = ['First', 'Second'];
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: { columnWidths: [{ 0: 80, 1: 90 }] },
         }));
 
@@ -1934,14 +1904,16 @@ describe('column visibility projection', () => {
 
     it('keeps Columns available in preview, edit-session pending, edit, and transform-pending states', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Preview']), {
-            previewMode: true,
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Preview']), {
+            configuration: { previewMode: true },
         }));
         expect(columns_trigger().disabled).toBe(false);
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Editable'], false), {
-            csvEditable: true,
-            csvEditingSupported: true,
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Editable'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
             generation: 2,
         }));
         expect(columns_trigger().disabled).toBe(false);
@@ -1950,7 +1922,7 @@ describe('column visibility projection', () => {
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(columns_trigger().disabled).toBe(false);
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Pending']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Pending']), {
             state: {
                 transforms: [{
                     sort: [{ colIndex: 0, direction: 'asc' }],
@@ -1970,7 +1942,7 @@ describe('column visibility projection', () => {
 describe('row height persistence', () => {
     it('stores a row resize per sheet and persists it', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             sourceGeneration: 7,
         }));
         post_message.mockClear();
@@ -1989,10 +1961,10 @@ describe('row height persistence', () => {
         expect(last.state.rowHeights[0]).toEqual({ 3: 50 });
     });
 
-    it('restores saved row heights from sheetMeta state', async () => {
+    it('restores saved row heights from initial snapshot state', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), {
+            initial_snapshot_message(make_meta(['Sheet1']), {
                 state: { rowHeights: [{ 1: 44 }] },
             })
         );
@@ -2009,7 +1981,7 @@ describe('merges', () => {
         meta.sheets[0].merges = [
             { startRow: 0, startCol: 0, endRow: 0, endCol: 2 },
         ];
-        await dispatch_host_message(sheet_meta_message(meta));
+        await dispatch_host_message(initial_snapshot_message(meta));
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
     });
 
@@ -2020,7 +1992,7 @@ describe('merges', () => {
         meta.sheets[0].merges = [
             { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
         ];
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 rowHeights: [{ 0: 48 }],
                 columnVisibility: [{
@@ -2044,7 +2016,7 @@ describe('merges', () => {
         meta.sheets[0].merges = [
             { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
         ];
-        await dispatch_host_message(sheet_meta_message(meta));
+        await dispatch_host_message(initial_snapshot_message(meta));
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
 
         await open_columns();
@@ -2064,12 +2036,12 @@ describe('merges', () => {
 describe('auto-fit state', () => {
     it('clears auto-fit state when a new workbook loads', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['First'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First'])));
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Second'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Second'])));
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
 
         await click_button('Auto-fit Columns');
@@ -2078,12 +2050,12 @@ describe('auto-fit state', () => {
 
     it('clears auto-fit state on live reload', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Source'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Source'])));
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
 
-        await dispatch_host_message(meta_reload_message(make_meta(['Reloaded'])));
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Reloaded'])));
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
     });
 
@@ -2092,7 +2064,7 @@ describe('auto-fit state', () => {
         await render_app();
         const meta = make_meta(['Sheet1']);
         meta.sheets[0].columnCount = 3;
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnWidths: [{ 0: 80, 1: 160, 2: 180 }],
                 columnVisibility: [{
@@ -2115,10 +2087,12 @@ describe('truncation banner', () => {
     it('shows editing-disabled text when csvEditingSupported and truncated', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
                 truncationMessage: 'Showing 10,000 of 50,000 rows',
-                csvEditable: false,
-                csvEditingSupported: true,
+                capabilities: {
+                    csvEditable: false,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2132,9 +2106,9 @@ describe('truncation banner', () => {
     it('omits editing-disabled text in preview mode (editing never available)', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
                 truncationMessage: 'Showing 10,000 of 50,000 rows',
-                previewMode: true,
+                configuration: { previewMode: true },
             })
         );
 
@@ -2145,24 +2119,29 @@ describe('truncation banner', () => {
 
     it('does not render the banner when truncationMessage is absent', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         expect(container!.querySelector('.truncation-banner')).toBeNull();
     });
 
     it('introduces the banner when a reload reports truncation', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         expect(container!.querySelector('.truncation-banner')).toBeNull();
 
         await dispatch_host_message(
-            meta_reload_message(make_meta(['Sheet1'], false), {
+            refresh_snapshot_message(make_meta(['Sheet1'], false), {
                 truncationMessage: 'Showing 10,000 of 50,000 rows',
-                csvEditable: false,
+                capabilities: {
+                    csvEditable: false,
+                    csvEditingSupported: true,
+                },
             })
         );
         const banner = container!.querySelector('.truncation-banner');
@@ -2180,9 +2159,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         await enter_edit_mode(post_message);
@@ -2201,9 +2182,11 @@ describe('edit mode save exit', () => {
     it('enters edit mode with pending edits returned by the host session grant', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         const first_mount_id = grid_stub().getAttribute('data-mount-id');
@@ -2275,9 +2258,11 @@ describe('edit mode save exit', () => {
     it('drops edit mode and pending restoration when the host revokes a saved session', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         await dispatch_host_message({
@@ -2328,9 +2313,11 @@ describe('edit mode save exit', () => {
     it('disables the edit toolbar while GridShell is saving', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         await enter_edit_mode(post_message);
@@ -2348,9 +2335,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2377,9 +2366,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2406,9 +2397,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2435,9 +2428,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2468,9 +2463,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2499,9 +2496,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
 
@@ -2519,9 +2518,11 @@ describe('edit mode save exit', () => {
         // restored edits, so edit mode re-engages. The earlier pending exit must
         // not fire against this new document when its editing state goes clean.
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Fresh'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Fresh'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
                 state: { pendingEdits: { '0:0': { value: 'restored', base: 'base' } } },
                 generation: 2,
             })
@@ -2539,9 +2540,11 @@ describe('edit mode save exit', () => {
 
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             })
         );
         await enter_edit_mode(post_message);
@@ -2560,15 +2563,15 @@ describe('preview mode', () => {
     it('passes preview_mode through to the grid', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
+            initial_snapshot_message(make_meta(['Sheet1']), { configuration: { previewMode: true } })
         );
         expect(grid_stub().getAttribute('data-preview')).toBe('true');
     });
 
-    it('retains the latest queued scroll across metaReload until GridShell acknowledges it', async () => {
+    it('retains the latest queued scroll across a snapshot refresh until GridShell acknowledges it', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
+            initial_snapshot_message(make_meta(['Sheet1']), { configuration: { previewMode: true } })
         );
         await dispatch_host_message({ type: 'scrollToRow', row: 40 });
         await dispatch_host_message({ type: 'scrollToRow', row: 80 });
@@ -2577,7 +2580,9 @@ describe('preview mode', () => {
         );
         expect(pending_before).toMatchObject({ row: 80 });
 
-        await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            configuration: { previewMode: true },
+        }));
         expect(JSON.parse(grid_stub().getAttribute('data-pending-preview-scroll')!))
             .toEqual(pending_before);
 
@@ -2587,17 +2592,19 @@ describe('preview mode', () => {
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
     });
 
-    it('queues the last visible preview row across metaReload when no host scroll is pending', async () => {
+    it('queues the last visible preview row across a snapshot refresh when no host scroll is pending', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true })
+            initial_snapshot_message(make_meta(['Sheet1']), { configuration: { previewMode: true } })
         );
         const report_visible = grid_shell_mock.latest_props
             ?.on_preview_visible_row_change as ((row: number) => void) | undefined;
         await act(async () => report_visible?.(75));
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
 
-        await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            configuration: { previewMode: true },
+        }));
         const retained = JSON.parse(
             grid_stub().getAttribute('data-pending-preview-scroll')!,
         );
@@ -2612,20 +2619,20 @@ describe('preview mode', () => {
     it('drops queued preview scrolls on a fresh document or when preview mode ends', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Preview']), { previewMode: true })
+            initial_snapshot_message(make_meta(['Preview']), { configuration: { previewMode: true } })
         );
         await dispatch_host_message({ type: 'scrollToRow', row: 25 });
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).not.toBe('null');
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Fresh']), {
-            previewMode: true,
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Fresh']), {
+            configuration: { previewMode: true },
             generation: 2,
         }));
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
 
         await dispatch_host_message({ type: 'scrollToRow', row: 30 });
-        await dispatch_host_message(sheet_meta_message(make_meta(['Editor']), {
-            previewMode: false,
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Editor']), {
+            configuration: { previewMode: false },
             generation: 3,
         }));
         expect(grid_stub().getAttribute('data-pending-preview-scroll')).toBe('null');
@@ -2636,9 +2643,11 @@ describe('sorting and filtering', () => {
     it('disables transform controls while an edit-session request is pending', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1'], false), {
-                csvEditable: true,
-                csvEditingSupported: true,
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
             }),
         );
 
@@ -2654,7 +2663,7 @@ describe('sorting and filtering', () => {
     it('drops and persists invalid saved transforms on initial load', async () => {
         const { post_message } = await render_app();
         post_message.mockClear();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: {
                 transforms: [{
                     sort: [{ colIndex: 9, direction: 'asc' }],
@@ -2680,7 +2689,7 @@ describe('sorting and filtering', () => {
             id: 'disabled-filter', colIndex: 0, operator: 'between' as const,
             value: 'low', secondValue: 'high', caseSensitive: false, enabled: false,
         };
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: { transforms: [{
                 sort: [], filters: [disabled], schema: '["Sheet1",1,null]',
             }] },
@@ -2712,7 +2721,7 @@ describe('sorting and filtering', () => {
             value: 'x', caseSensitive: false, enabled: true,
         };
         const filter_state = { sort: [], filters: [filter], schema };
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: { transforms: [filter_state] },
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
@@ -2741,7 +2750,7 @@ describe('sorting and filtering', () => {
             .some((message) => message.type === 'setTransform')).toBe(false);
         expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: { transforms: [{
                 sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema,
             }] },
@@ -2767,7 +2776,7 @@ describe('sorting and filtering', () => {
             .some((message) => message.type === 'setTransform')).toBe(false);
         expect(grid_stub().getAttribute('data-mount-id')).toBe(sort_mount_id);
 
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         post_message.mockClear();
         const empty_mount_id = grid_stub().getAttribute('data-mount-id');
         const clear_empty = grid_shell_mock.latest_props?.on_transform_change as
@@ -2785,7 +2794,7 @@ describe('sorting and filtering', () => {
     ])('restores grid focus after a %s transform acknowledgement remount', async (_label, selector) => {
         vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         post_message.mockClear();
         const previous_mount = grid_stub().getAttribute('data-mount-id');
         const toolbar_focus = vi.spyOn(
@@ -2816,7 +2825,7 @@ describe('sorting and filtering', () => {
     it('does not restore grid focus after the webview loses focus before acknowledgement', async () => {
         const has_focus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         post_message.mockClear();
 
         await act(async () => (
@@ -2834,7 +2843,7 @@ describe('sorting and filtering', () => {
 
     it('restores grid focus after a grid-opened filter applies and remounts', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         const restore_old_grid = vi.fn();
         const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
             source_column: number,
@@ -2870,7 +2879,7 @@ describe('sorting and filtering', () => {
 
     it('restores grid focus when a grid transform fails without a generation bump', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         post_message.mockClear();
         const previous_mount = grid_stub().getAttribute('data-mount-id');
         await act(async () => (
@@ -2893,7 +2902,7 @@ describe('sorting and filtering', () => {
 
     it('restores filter focus only for Escape and explicit Cancel', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         const open_filter = grid_shell_mock.latest_props!.on_open_filter as (
             source_column: number,
             anchor: { left: number; top: number },
@@ -2950,7 +2959,7 @@ describe('sorting and filtering', () => {
             id: 'f', colIndex: 0, operator: 'contains' as const,
             value: 'old', caseSensitive: false, enabled: true,
         };
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: { transforms: [{ sort: [], filters: [filter], schema }] },
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
@@ -3144,7 +3153,7 @@ describe('sorting and filtering', () => {
 
     it('preserves a surviving filter chip across Enable acknowledgement', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: { transforms: [{
                 sort: [],
                 filters: [{
@@ -3193,7 +3202,7 @@ describe('sorting and filtering', () => {
                 endCol: 0,
             }],
         };
-        await dispatch_host_message(sheet_meta_message(meta, {
+        await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 transforms: [{
                     sort: [{ colIndex: 0, direction: 'asc' }],
@@ -3233,7 +3242,7 @@ describe('sorting and filtering', () => {
 
     it('lets the user cancel a pending saved transform and forgets it', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1']), {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
             state: {
                 transforms: [{
                     sort: [{ colIndex: 0, direction: 'asc' }],
@@ -3286,9 +3295,11 @@ describe('sorting and filtering', () => {
                 endCol: 0,
             }],
         };
-        await dispatch_host_message(sheet_meta_message(meta, {
-            csvEditable: true,
-            csvEditingSupported: true,
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
         }));
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
 
@@ -3420,7 +3431,7 @@ describe('sorting and filtering', () => {
 
     it('does not restore an old filter opener when outside-clicking into another popover', async () => {
         await render_app();
-        await dispatch_host_message(sheet_meta_message(make_meta(['Sheet1'])));
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
         const first_restore = vi.fn();
         const second_restore = vi.fn();
         const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
@@ -3442,7 +3453,7 @@ describe('sorting and filtering', () => {
     it('disables transforms in synchronized preview mode', async () => {
         await render_app();
         await dispatch_host_message(
-            sheet_meta_message(make_meta(['Sheet1']), { previewMode: true }),
+            initial_snapshot_message(make_meta(['Sheet1']), { configuration: { previewMode: true } }),
         );
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
     });

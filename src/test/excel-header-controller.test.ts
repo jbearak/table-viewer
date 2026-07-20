@@ -182,13 +182,6 @@ function snapshots(panel: { __messages: unknown[] }): WorkbookSnapshot[] {
     return messages_of(panel, 'workbookSnapshot').map((message) => message.snapshot);
 }
 
-function expect_no_legacy_excel_messages(panel: { __messages: unknown[] }): void {
-    expect(messages_of(panel, 'sheetMeta')).toHaveLength(0);
-    expect(messages_of(panel, 'metaReload')).toHaveLength(0);
-    expect(messages_of(panel, 'metaReloadRecovery')).toHaveLength(0);
-    expect(messages_of(panel, 'excelFirstRowHeaderError')).toHaveLength(0);
-}
-
 async function ready(panel: ReturnType<typeof open_excel>): Promise<WorkbookSnapshot> {
     await panel.__receive({ type: 'ready' });
     await vi.waitFor(() => expect(snapshots(panel).length).toBeGreaterThan(0));
@@ -243,7 +236,6 @@ describe('Excel workbook snapshot controller', () => {
             csvEditable: false,
             csvEditingSupported: false,
         });
-        expect_no_legacy_excel_messages(panel);
         expect(builds.count).toBe(1);
     });
 
@@ -274,7 +266,6 @@ describe('Excel workbook snapshot controller', () => {
             requestId: 'fast',
             outcome: 'applied',
         });
-        expect_no_legacy_excel_messages(panel);
     });
 
     it('retains the exact result snapshot across ACK loss and watcher wake', async () => {
@@ -301,7 +292,6 @@ describe('Excel workbook snapshot controller', () => {
         ));
         expect(retries.every((snapshot) => snapshot === result_snapshot)).toBe(true);
         expect(builds.count).toBeGreaterThanOrEqual(2);
-        expect_no_legacy_excel_messages(panel);
     });
 
     it('keeps the exact authority basis after a same-digest watcher refresh', async () => {
@@ -318,7 +308,6 @@ describe('Excel workbook snapshot controller', () => {
 
         expect(builds.count).toBe(2);
         expect(snapshots(panel).at(-1)?.reason).toBe('excelHeader');
-        expect_no_legacy_excel_messages(panel);
     });
 
     it('uses a result-only snapshot for validation rejection', async () => {
@@ -350,7 +339,6 @@ describe('Excel workbook snapshot controller', () => {
             outcome: 'rejected',
             error: 'The selected worksheet no longer matches this request.',
         });
-        expect_no_legacy_excel_messages(panel);
     });
 
     it('rebuilds through the shared physical refresh when fast projection is unavailable', async () => {
@@ -380,7 +368,6 @@ describe('Excel workbook snapshot controller', () => {
             requestId: 'recovered',
             outcome: 'recovered',
         });
-        expect_no_legacy_excel_messages(panel);
     });
 
     it('broadcasts the latest projection to every tab but retains the result only at origin', async () => {
@@ -407,8 +394,6 @@ describe('Excel workbook snapshot controller', () => {
         expect(projected_b.meta.sheets[0].excelFirstRowHeader?.active).toBe(false);
         expect(builds_a.count).toBeGreaterThanOrEqual(1);
         expect(builds_b.count).toBeGreaterThanOrEqual(1);
-        expect_no_legacy_excel_messages(panel_a);
-        expect_no_legacy_excel_messages(panel_b);
     });
 
     it('does not block durable commit on another panel transport', async () => {
@@ -424,8 +409,6 @@ describe('Excel workbook snapshot controller', () => {
             .resolves.toBeUndefined();
         await vi.waitFor(() => expect(snapshots(panel_a).at(-1)?.commandResult)
             .toMatchObject({ requestId: 'nonblocking' }));
-        expect_no_legacy_excel_messages(panel_a);
-        expect_no_legacy_excel_messages(panel_b);
     });
 
     it('continues broadcasting after the origin is disposed during commit', async () => {

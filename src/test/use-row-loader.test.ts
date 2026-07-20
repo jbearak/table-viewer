@@ -153,7 +153,7 @@ describe('RowLoader', () => {
         expect(loader.get_row(510)).toBeDefined();
         post.mockClear();
 
-        // A metaReload bumps the generation. The cache clears; the visible
+        // A snapshot refresh bumps the generation. The cache clears; the visible
         // region must be re-fetched at the NEW generation without waiting for a
         // scroll, otherwise the grid paints blanks until the user scrolls.
         loader.configure(0, 10_000, 2);

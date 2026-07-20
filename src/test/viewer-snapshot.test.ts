@@ -6,8 +6,10 @@ import type {
 } from '../file-coordinator';
 import {
     build_workbook_snapshot,
+    classify_snapshot,
     type BuildWorkbookSnapshotInput,
     type RetainedSnapshotCommandResult,
+    type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
 
 describe('workbook snapshot builder', () => {
@@ -183,5 +185,63 @@ describe('workbook snapshot builder', () => {
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
+    });
+});
+
+describe('snapshot classification', () => {
+    const identity = (
+        deliveryId: number,
+        overrides: Partial<WorkbookSnapshotIdentity> = {},
+    ): WorkbookSnapshotIdentity => ({
+        deliveryId,
+        authority: { fileId: 'file:test', revision: 4 },
+        stateRevision: 7,
+        sourceBasis: { physicalRevision: 5, projectionRevision: 2 },
+        ...overrides,
+    });
+
+    it.each([
+        'capability-only delivery',
+        'result-only delivery',
+        'same-authority generation change',
+        'new ready receiver epoch',
+    ])('applies a new same-basis identity for %s', () => {
+        expect(classify_snapshot(identity(2), identity(1))).toBe('applied');
+    });
+
+    it('classifies a retry with the same delivery ID as duplicate', () => {
+        expect(classify_snapshot(identity(1), identity(1))).toBe('duplicate');
+    });
+
+    it.each([
+        identity(2, { stateRevision: 6 }),
+        identity(2, {
+            sourceBasis: { physicalRevision: 4, projectionRevision: 2 },
+        }),
+        identity(2, {
+            sourceBasis: { physicalRevision: 5, projectionRevision: 1 },
+        }),
+        identity(2, {
+            stateRevision: 8,
+            sourceBasis: { physicalRevision: 4, projectionRevision: 2 },
+        }),
+    ])('rejects a lower semantic basis as stale', (incoming) => {
+        expect(classify_snapshot(incoming, identity(1))).toBe('stale');
+    });
+
+    it.each([
+        identity(2, { stateRevision: 8 }),
+        identity(2, {
+            sourceBasis: { physicalRevision: 6, projectionRevision: 2 },
+        }),
+        identity(2, {
+            sourceBasis: { physicalRevision: 5, projectionRevision: 3 },
+        }),
+    ])('applies a greater semantic basis', (incoming) => {
+        expect(classify_snapshot(incoming, identity(1))).toBe('applied');
+    });
+
+    it('rejects an older delivery with an equal semantic basis', () => {
+        expect(classify_snapshot(identity(1), identity(2))).toBe('stale');
     });
 });

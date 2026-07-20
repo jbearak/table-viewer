@@ -22,8 +22,6 @@ import {
 /**
  * Opaque file-global authority identity. `fileId` identifies one logical file;
  * `revision` must increase whenever any authoritative snapshot input changes.
- * During the compatibility phase legacy messages use synthetic identities only
- * inside the webview and are never acknowledged.
  */
 export interface SnapshotAuthorityIdentity {
     readonly fileId: string;
@@ -181,8 +179,8 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
 
 /**
  * Compare a received snapshot with the last applied authority. Same-file
- * authority revisions are primary; panel delivery order fences file changes.
- * Repeated authority is a duplicate even when retransmitted with a new delivery.
+ * authority and semantic revisions are primary; panel delivery order fences
+ * file changes and intentionally new same-basis receiver epochs.
  */
 export function classify_snapshot(
     incoming: WorkbookSnapshotIdentity,
@@ -190,19 +188,30 @@ export function classify_snapshot(
 ): SnapshotDisposition {
     if (!applied) return 'applied';
     if (incoming.deliveryId === applied.deliveryId) return 'duplicate';
-    if (incoming.authority.fileId === applied.authority.fileId) {
-        if (incoming.authority.revision === applied.authority.revision) {
-            const same_semantic_basis = incoming.stateRevision === applied.stateRevision
-                && incoming.sourceBasis.physicalRevision
-                    === applied.sourceBasis.physicalRevision
-                && incoming.sourceBasis.projectionRevision
-                    === applied.sourceBasis.projectionRevision;
-            if (same_semantic_basis) return 'duplicate';
-            return incoming.deliveryId > applied.deliveryId ? 'applied' : 'stale';
-        }
+    if (incoming.authority.fileId !== applied.authority.fileId) {
+        return incoming.deliveryId > applied.deliveryId ? 'applied' : 'stale';
+    }
+    if (incoming.authority.revision !== applied.authority.revision) {
         return incoming.authority.revision > applied.authority.revision
             ? 'applied'
             : 'stale';
+    }
+
+    const incoming_basis = [
+        incoming.stateRevision,
+        incoming.sourceBasis.physicalRevision,
+        incoming.sourceBasis.projectionRevision,
+    ] as const;
+    const applied_basis = [
+        applied.stateRevision,
+        applied.sourceBasis.physicalRevision,
+        applied.sourceBasis.projectionRevision,
+    ] as const;
+    if (incoming_basis.some((value, index) => value < applied_basis[index])) {
+        return 'stale';
+    }
+    if (incoming_basis.some((value, index) => value > applied_basis[index])) {
+        return 'applied';
     }
     return incoming.deliveryId > applied.deliveryId ? 'applied' : 'stale';
 }

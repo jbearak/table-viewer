@@ -1030,6 +1030,7 @@ describe('CSV edit sessions', () => {
         await panel.__receive({
             type: 'stateChanged',
             sourceGeneration: 1,
+            snapshotIdentity: initial_snapshot(panel).identity,
             state: {
                 pendingEdits: restored,
                 columnVisibility: [undefined],
@@ -1051,12 +1052,15 @@ describe('CSV edit sessions', () => {
         await first.__receive({ type: 'ready' });
         await second.__receive({ type: 'ready' });
         const schema = '["Sheet1",1,["h"]]';
+        const second_identity = initial_snapshot(second).identity;
 
         // The second tab captures stale state for refresh cleanup, but its generic
         // persistence reaches the host only after the first tab's direct user choice.
         const cleanup_gate = deferred();
         const delayed_cleanup = cleanup_gate.promise.then(() => second.__receive({
-            type: 'stateChanged', sourceGeneration: 1, state: { columnVisibility: [undefined], activeSheetIndex: 0 },
+            type: 'stateChanged', sourceGeneration: 1,
+            snapshotIdentity: second_identity,
+            state: { columnVisibility: [undefined], activeSheetIndex: 0 },
         } as never));
         await first.__receive({
             type: 'setColumnVisibility', sheetIndex: 0, sheetName: 'Sheet1',
@@ -1073,7 +1077,9 @@ describe('CSV edit sessions', () => {
             sourceGeneration: 1, state: undefined,
         } as never);
         await second.__receive({
-            type: 'stateChanged', sourceGeneration: 1, state: {
+            type: 'stateChanged', sourceGeneration: 1,
+            snapshotIdentity: second_identity,
+            state: {
                 columnVisibility: [{ visibleColumns: [], schema }], activeSheetIndex: 0,
             },
         } as never);
@@ -1090,11 +1096,13 @@ describe('CSV edit sessions', () => {
         const state = state_store({ transforms: [stale_transform] });
         const panel = open_csv_table(uri(file_path), state.store);
         await panel.__receive({ type: 'ready' });
+        const snapshot = initial_snapshot(panel);
 
         // This is the snapshot the webview posts after sanitizing initial metadata.
         await panel.__receive({
             type: 'stateChanged',
-            sourceGeneration: 1,
+            sourceGeneration: snapshot.sourceGeneration,
+            snapshotIdentity: snapshot.identity,
             state: { transforms: [undefined], activeSheetIndex: 0 },
         } as never);
 
@@ -1151,7 +1159,8 @@ describe('CSV edit sessions', () => {
         // A debounced snapshot captured before Cancel must not resurrect it.
         await first.__receive({
             type: 'stateChanged',
-            sourceGeneration: 1,
+            sourceGeneration: meta.sourceGeneration,
+            snapshotIdentity: meta.identity,
             state: { transforms: [saved_transform], activeSheetIndex: 0 },
         } as never);
         expect(state.get_state(file_path).transforms).toEqual([undefined]);

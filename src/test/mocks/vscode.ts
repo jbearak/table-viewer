@@ -166,24 +166,6 @@ function make_panel(title: string): MockWebviewPanel {
                     forwarded = { ...forwarded, editSessionId: grant.editSessionId };
                 }
             }
-            if (
-                typeof forwarded === 'object'
-                && forwarded !== null
-                && 'type' in forwarded
-                && forwarded.type === 'stateChanged'
-                && !('snapshotIdentity' in forwarded)
-            ) {
-                const latest = [...panel.__messages].reverse().find((candidate) => (
-                    typeof candidate === 'object'
-                    && candidate !== null
-                    && 'type' in candidate
-                    && candidate.type === 'workbookSnapshot'
-                    && 'snapshot' in candidate
-                )) as { snapshot?: { identity?: unknown } } | undefined;
-                if (latest?.snapshot?.identity !== undefined) {
-                    forwarded = { ...forwarded, snapshotIdentity: latest.snapshot.identity };
-                }
-            }
             await Promise.all(message_handlers.map((handler) => handler(forwarded)));
         },
     };

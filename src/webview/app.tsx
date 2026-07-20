@@ -21,11 +21,9 @@ import {
 import type { WorkbookMeta } from '../data-source/interface';
 import {
     classify_snapshot,
-    complete_normalized_per_file_state,
     normalize_complete_per_file_state,
     normalize_workbook_snapshot_state,
     type RetainedSnapshotCommandResult,
-    type WorkbookSnapshot,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
@@ -106,10 +104,7 @@ function transforms_semantically_equal(
         === JSON.stringify(semantic_filters(right.filters));
 }
 
-/**
- * Webview root for snapshot metadata plus paginated row delivery. Phase 6 will
- * remove the compatibility adapters for legacy metadata messages below.
- */
+/** Webview root for snapshot metadata plus paginated row delivery. */
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
@@ -215,7 +210,6 @@ export function App(): React.JSX.Element {
     const snapshot_identity_ref = useRef<WorkbookSnapshotIdentity | null>(null);
     const last_applied_snapshot_ref = useRef<WorkbookSnapshotIdentity | null>(null);
     const processed_snapshot_results_ref = useRef(new Set<string>());
-    const legacy_snapshot_sequence_ref = useRef(0);
     const document_epoch_ref = useRef(0);
     const preview_mode_ref = useRef(false);
     const preview_scroll_sequence_ref = useRef(0);
@@ -314,179 +308,17 @@ export function App(): React.JSX.Element {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
-            if (
-                msg.type === 'workbookSnapshot'
-                || msg.type === 'sheetMeta'
-                || msg.type === 'metaReload'
-                || msg.type === 'metaReloadRecovery'
-            ) {
-                type SnapshotApplication = {
-                    snapshot: WorkbookSnapshot;
-                    acknowledge: boolean;
-                    authoritativeState: boolean;
-                    updateCsvEditable: boolean;
-                    updateCsvEditingSupported: boolean;
-                    updatePreviewMode: boolean;
-                };
-                // Compatibility-only adapters retained through Phase 6. Native
-                // workbookSnapshot messages bypass this synthetic translation.
-                const retained_header_result = (
-                    projection_change: 'excelHeader' | undefined,
-                    request_id: string | undefined,
-                    recovery: boolean,
-                    error?: string,
-                ): RetainedSnapshotCommandResult | undefined => (
-                    projection_change === 'excelHeader' && request_id
-                        ? {
-                            type: 'excelFirstRowHeader',
-                            requestId: request_id,
-                            outcome: recovery ? 'recovered' : 'applied',
-                            ...(error ? { error } : {}),
-                        }
-                        : undefined
-                );
-                const synthetic_identity = (): WorkbookSnapshotIdentity => {
-                    const revision = ++legacy_snapshot_sequence_ref.current;
-                    return {
-                        deliveryId: revision,
-                        authority: { fileId: 'legacy-webview-adapter', revision },
-                        stateRevision: 0,
-                        sourceBasis: {
-                            physicalRevision: 0,
-                            projectionRevision: 0,
-                        },
-                    };
-                };
-                const application: SnapshotApplication = (() => {
-                    if (msg.type === 'workbookSnapshot') {
-                        return {
-                            snapshot: msg.snapshot,
-                            acknowledge: true,
-                            authoritativeState: true,
-                            updateCsvEditable: true,
-                            updateCsvEditingSupported: true,
-                            updatePreviewMode: true,
-                        };
-                    }
-                    if (msg.type === 'sheetMeta') {
-                        return {
-                            snapshot: {
-                                identity: synthetic_identity(),
-                                generation: msg.generation,
-                                sourceGeneration: msg.sourceGeneration,
-                                presentation: 'initial',
-                                reason: msg.projectionChange === 'excelHeader'
-                                    ? 'excelHeader'
-                                    : 'ready',
-                                meta: msg.meta,
-                                state: complete_normalized_per_file_state(
-                                    msg.state,
-                                    msg.meta.sheets.map((sheet) => sheet.name),
-                                ),
-                                configuration: {
-                                    defaultTabOrientation: msg.defaultTabOrientation,
-                                    previewMode: msg.previewMode ?? false,
-                                },
-                                capabilities: {
-                                    csvEditable: msg.csvEditable ?? false,
-                                    csvEditingSupported: msg.csvEditingSupported ?? false,
-                                },
-                                truncationMessage: msg.truncationMessage ?? null,
-                                commandResult: retained_header_result(
-                                    msg.projectionChange,
-                                    msg.headerRequestId,
-                                    !!msg.error,
-                                    msg.error,
-                                ),
-                            },
-                            acknowledge: false,
-                            authoritativeState: true,
-                            updateCsvEditable: true,
-                            updateCsvEditingSupported: true,
-                            updatePreviewMode: true,
-                        };
-                    }
-                    const legacy_state = complete_normalized_per_file_state(
-                        msg.state ?? state_ref.current,
-                        msg.meta.sheets.map((sheet) => sheet.name),
-                    );
-                    return {
-                        snapshot: {
-                            identity: synthetic_identity(),
-                            generation: msg.generation,
-                            sourceGeneration: msg.sourceGeneration,
-                            presentation: 'refresh',
-                            reason: msg.type === 'metaReloadRecovery'
-                                ? 'recovery'
-                                : msg.projectionChange === 'excelHeader'
-                                    ? 'excelHeader'
-                                    : 'fileReload',
-                            meta: msg.meta,
-                            state: legacy_state,
-                            configuration: {
-                                defaultTabOrientation: 'horizontal',
-                                previewMode: preview_mode_ref.current,
-                            },
-                            capabilities: {
-                                csvEditable: msg.csvEditable ?? csv_editable,
-                                csvEditingSupported:
-                                    msg.csvEditingSupported ?? csv_editing_supported,
-                            },
-                            truncationMessage: msg.truncationMessage ?? null,
-                            commandResult: retained_header_result(
-                                msg.projectionChange,
-                                msg.headerRequestId,
-                                msg.type === 'metaReloadRecovery',
-                                msg.type === 'metaReloadRecovery' ? msg.error : undefined,
-                            ),
-                        },
-                        acknowledge: false,
-                        authoritativeState: msg.state !== undefined,
-                        updateCsvEditable: msg.csvEditable !== undefined,
-                        updateCsvEditingSupported:
-                            msg.csvEditingSupported !== undefined,
-                        updatePreviewMode: false,
-                    };
-                })();
-
-                const { snapshot } = application;
+            if (msg.type === 'workbookSnapshot') {
+                const { snapshot } = msg;
                 const previous_native_identity = last_applied_snapshot_ref.current;
-                const cross_file_initial = application.acknowledge
-                    && snapshot.presentation === 'initial'
+                const cross_file_initial = snapshot.presentation === 'initial'
                     && previous_native_identity !== null
                     && previous_native_identity.authority.fileId
                         !== snapshot.identity.authority.fileId;
-                // Legacy traffic is authoritative until the first native snapshot.
-                // After cutover, unsequenced legacy metadata is safely treated as
-                // stale so a delayed compatibility message cannot regress the UI.
-                const classified_disposition = application.acknowledge
-                    ? classify_snapshot(
-                        snapshot.identity,
-                        last_applied_snapshot_ref.current,
-                    )
-                    : last_applied_snapshot_ref.current
-                        ? 'stale'
-                        : 'applied';
-                // A same-authority physical re-adoption can legitimately advance
-                // panel generations without changing the durable file basis. It is
-                // not a retransmission: install it so row/state fencing stays aligned.
-                const disposition = application.acknowledge
-                    && classified_disposition === 'duplicate'
-                    && previous_native_identity !== null
-                    && snapshot.identity.deliveryId
-                        !== previous_native_identity.deliveryId
-                    && (
-                        snapshot.generation !== generation_ref.current
-                        || snapshot.sourceGeneration !== source_generation_ref.current
-                        || snapshot.capabilities.csvEditable !== csv_editable
-                        || snapshot.capabilities.csvEditingSupported
-                            !== csv_editing_supported
-                        || snapshot.capabilities.csvEditSessionId
-                            !== csv_edit_session_id
-                        || snapshot.configuration.previewMode !== preview_mode_ref.current
-                    )
-                    ? 'applied'
-                    : classified_disposition;
+                const disposition = classify_snapshot(
+                    snapshot.identity,
+                    last_applied_snapshot_ref.current,
+                );
                 if (cross_file_initial && disposition === 'applied') {
                     pending_excel_header_ref.current = null;
                     set_pending_excel_header(null);
@@ -539,14 +371,8 @@ export function App(): React.JSX.Element {
                 process_command_result(snapshot.commandResult);
 
                 if (disposition === 'applied') {
-                    if (application.acknowledge) {
-                        last_applied_snapshot_ref.current = snapshot.identity;
-                        snapshot_identity_ref.current = snapshot.identity;
-                    } else {
-                        // Legacy compatibility traffic must not become an authority
-                        // token on later stateChanged messages.
-                        snapshot_identity_ref.current = null;
-                    }
+                    last_applied_snapshot_ref.current = snapshot.identity;
+                    snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets = new Map(
                         (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
                     );
@@ -561,22 +387,18 @@ export function App(): React.JSX.Element {
                             header_changed.add(index);
                         }
                     });
-                    // Capture edits before generation/source updates can remount the
-                    // grid. Authoritative refresh state wins; state-less legacy
-                    // reloads use the latest dirty map reported by the live grid.
+                    // Capture authoritative edits before generation/source updates
+                    // can remount the grid.
                     const refresh_authoritative_state =
                         snapshot.presentation === 'refresh'
-                        && application.authoritativeState
-                            ? normalize_complete_per_file_state(
+                            ? normalize_workbook_snapshot_state(
                                 snapshot.state,
-                                snapshot.meta.sheets.map((sheet) => sheet.name),
+                                snapshot.meta,
                             )
                             : undefined;
                     const refresh_edits = snapshot.presentation === 'refresh'
                         && edit_mode
-                            ? refresh_authoritative_state
-                                ? refresh_authoritative_state.pendingEdits
-                                : latest_live_edits_ref.current
+                            ? refresh_authoritative_state?.pendingEdits
                             : undefined;
                     if (snapshot.presentation === 'refresh' && edit_mode) {
                         latest_live_edits_ref.current = refresh_edits;
@@ -595,10 +417,8 @@ export function App(): React.JSX.Element {
                     ) {
                         queue_preview_scroll(last_preview_visible_row_ref.current);
                     }
-                    if (application.updatePreviewMode) {
-                        preview_mode_ref.current = snapshot.configuration.previewMode;
-                        set_preview_mode(snapshot.configuration.previewMode);
-                    }
+                    preview_mode_ref.current = snapshot.configuration.previewMode;
+                    set_preview_mode(snapshot.configuration.previewMode);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
@@ -666,70 +486,32 @@ export function App(): React.JSX.Element {
                         pending_exit_save_succeeded_ref.current = false;
                     } else {
                         const sheet_count = snapshot.meta.sheets.length;
-                        const authoritative_state = refresh_authoritative_state;
+                        const authoritative_state = refresh_authoritative_state!;
                         const next_column_widths = trim_sheet_state_array(
-                            authoritative_state
-                                ? authoritative_state.columnWidths
-                                : state_ref.current.columnWidths,
+                            authoritative_state.columnWidths,
                             sheet_count,
                         );
                         const next_row_heights = trim_sheet_state_array(
-                            authoritative_state
-                                ? authoritative_state.rowHeights
-                                : state_ref.current.rowHeights,
+                            authoritative_state.rowHeights,
                             sheet_count,
                         ).map((value, index) => (
                             header_changed.has(index) ? undefined : value
                         ));
                         const next_scroll_position = trim_sheet_state_array(
-                            authoritative_state
-                                ? authoritative_state.scrollPosition
-                                : state_ref.current.scrollPosition,
+                            authoritative_state.scrollPosition,
                             sheet_count,
                         ).map((value, index) => (
                             header_changed.has(index) ? undefined : value
                         ));
-                        const migrate_schema = <T extends { schema?: string }>(
-                            value: T | undefined,
-                            sheet: (typeof snapshot.meta.sheets)[number],
-                            index: number,
-                        ): T | undefined => {
-                            if (
-                                !value
-                                || snapshot.reason !== 'excelHeader'
-                                || !header_changed.has(index)
-                            ) return value;
-                            const previous = previous_sheets.get(sheet.name);
-                            if (
-                                !previous
-                                || value.schema !== transform_schema_for_sheet(previous)
-                            ) return value;
-                            return {
-                                ...value,
-                                schema: transform_schema_for_sheet(sheet),
-                            };
-                        };
                         const next_transforms = snapshot.meta.sheets.map((sheet, index) =>
                             sanitize_transform_state(
-                                authoritative_state
-                                    ? authoritative_state.transforms?.[index]
-                                    : migrate_schema(
-                                        state_ref.current.transforms?.[index],
-                                        sheet,
-                                        index,
-                                    ),
+                                authoritative_state.transforms[index],
                                 sheet.columnCount,
                                 transform_schema_for_sheet(sheet),
                             ));
                         const next_column_visibility = snapshot.meta.sheets.map(
                             (sheet, index) => sanitize_column_visibility_state(
-                                authoritative_state
-                                    ? authoritative_state.columnVisibility?.[index]
-                                    : migrate_schema(
-                                        state_ref.current.columnVisibility?.[index],
-                                        sheet,
-                                        index,
-                                    ),
+                                authoritative_state.columnVisibility[index],
                                 sheet.columnCount,
                                 transform_schema_for_sheet(sheet),
                             ),
@@ -738,40 +520,17 @@ export function App(): React.JSX.Element {
                             active_sheet_index,
                             sheet_count,
                         );
-                        const authoritative_requires_correction = authoritative_state
-                            ? JSON.stringify({
-                                rowHeights: authoritative_state.rowHeights ?? [],
-                                scrollPosition: authoritative_state.scrollPosition ?? [],
-                                transforms: authoritative_state.transforms ?? [],
-                                columnVisibility:
-                                    authoritative_state.columnVisibility ?? [],
-                            }) !== JSON.stringify({
-                                rowHeights: next_row_heights,
-                                scrollPosition: next_scroll_position,
-                                transforms: next_transforms,
-                                columnVisibility: next_column_visibility,
-                            })
-                            : false;
-                        const local_requires_correction = !authoritative_state
-                            && JSON.stringify({
-                                columnWidths: state_ref.current.columnWidths ?? [],
-                                rowHeights: state_ref.current.rowHeights ?? [],
-                                scrollPosition: state_ref.current.scrollPosition ?? [],
-                                transforms: state_ref.current.transforms ?? [],
-                                columnVisibility:
-                                    state_ref.current.columnVisibility ?? [],
-                                activeSheetIndex:
-                                    state_ref.current.activeSheetIndex ?? 0,
-                            }) !== JSON.stringify({
-                                columnWidths: next_column_widths,
-                                rowHeights: next_row_heights,
-                                scrollPosition: next_scroll_position,
-                                transforms: next_transforms,
-                                columnVisibility: next_column_visibility,
-                                activeSheetIndex: next_active_sheet_index,
-                            });
-                        correction_required = authoritative_requires_correction
-                            || local_requires_correction;
+                        correction_required = JSON.stringify({
+                            rowHeights: authoritative_state.rowHeights,
+                            scrollPosition: authoritative_state.scrollPosition,
+                            transforms: authoritative_state.transforms,
+                            columnVisibility: authoritative_state.columnVisibility,
+                        }) !== JSON.stringify({
+                            rowHeights: next_row_heights,
+                            scrollPosition: next_scroll_position,
+                            transforms: next_transforms,
+                            columnVisibility: next_column_visibility,
+                        });
                         set_column_widths(next_column_widths);
                         set_row_heights(next_row_heights);
                         set_effective_row_counts(
@@ -785,59 +544,38 @@ export function App(): React.JSX.Element {
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
-                            ...(authoritative_state ?? {}),
+                            ...authoritative_state,
                             columnWidths: next_column_widths,
                             rowHeights: next_row_heights,
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
-                            activeSheetIndex: authoritative_state
-                                ? authoritative_state.activeSheetIndex
-                                : next_active_sheet_index,
+                            activeSheetIndex: authoritative_state.activeSheetIndex,
                             ...(edit_mode ? { pendingEdits: refresh_edits } : {}),
                         };
                     }
                     set_truncation_message(snapshot.truncationMessage);
-                    if (application.updateCsvEditable) {
-                        set_csv_editable(snapshot.capabilities.csvEditable);
-                        set_csv_edit_session_id(
-                            snapshot.capabilities.csvEditSessionId,
-                        );
-                    }
-                    if (application.updateCsvEditingSupported) {
-                        set_csv_editing_supported(
-                            snapshot.capabilities.csvEditingSupported,
-                        );
-                    }
+                    set_csv_editable(snapshot.capabilities.csvEditable);
+                    set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
+                    set_csv_editing_supported(
+                        snapshot.capabilities.csvEditingSupported,
+                    );
 
-                    // Application acknowledgement is transport-independent and is
-                    // emitted before an optional corrective CAS write.
-                    if (application.acknowledge) {
-                        vscode_api.postMessage({
-                            type: 'snapshotApplied',
-                            identity: snapshot.identity,
-                            disposition,
-                        });
-                    }
+                    // Acknowledge the exact delivered identity before an optional
+                    // corrective CAS write.
+                    vscode_api.postMessage({
+                        type: 'snapshotApplied',
+                        identity: snapshot.identity,
+                        disposition,
+                    });
                     if (correction_required) persist_immediate();
-                } else if (application.acknowledge) {
+                } else {
                     vscode_api.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
                         disposition,
                     });
                 }
-            }
-
-            if (msg.type === 'excelFirstRowHeaderError') {
-                if (pending_excel_header_ref.current !== msg.requestId) return;
-                pending_excel_header_ref.current = null;
-                set_pending_excel_header(null);
-                set_excel_header_status('Column names were not updated.');
-                vscode_api.postMessage({
-                    type: 'showWarning',
-                    message: `Could not change the header row: ${msg.error}`,
-                });
             }
 
             if (
@@ -934,9 +672,6 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         clear_pending_preview_scroll,
-        csv_edit_session_id,
-        csv_editable,
-        csv_editing_supported,
         edit_mode,
         persist_immediate,
         queue_preview_scroll,

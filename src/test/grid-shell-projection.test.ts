@@ -474,7 +474,7 @@ describe('GridShell column projection', () => {
             column_projection: hidden_projection,
         }));
 
-        // metaReload changes the generation key while hidden. App supplies the
+        // A snapshot refresh changes the generation key while hidden. App supplies the
         // latest sequence to the replacement GridShell.
         await act(async () => root!.render(React.createElement(GridShell, {
             ...props({

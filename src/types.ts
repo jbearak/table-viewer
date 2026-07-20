@@ -170,21 +170,15 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
-/** Messages from extension host to webview. Legacy metadata variants remain
- * compatibility-only until the Phase 6 webview protocol cleanup; production host
- * delivery uses workbookSnapshot exclusively. */
+/** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
-    | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number; projectionChange?: 'excelHeader'; headerRequestId?: string; error?: string }
-    | { type: 'metaReloadRecovery'; meta: WorkbookMeta; state: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange: 'excelHeader'; headerRequestId: string; generation: number; sourceGeneration: number; error?: string }
-    | { type: 'metaReload'; meta: WorkbookMeta; state?: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange?: 'excelHeader'; headerRequestId?: string; generation: number; sourceGeneration: number }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveResult'; success: boolean }
     | { type: 'editSessionResult'; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'editSessionRevoked'; reason: 'saved' | 'cleanupUncertain' }
     | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' }
-    | { type: 'excelFirstRowHeaderError'; requestId: string; error: string }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 
 /** Messages from webview to extension host */
@@ -192,7 +186,7 @@ export type WebviewMessage =
     | { type: 'ready' }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
-    | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity?: WorkbookSnapshotIdentity }
+    | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'requestEditSession' }
     | { type: 'releaseEditSession' }

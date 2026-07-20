@@ -121,8 +121,8 @@ interface PanelLoadRequest {
 }
 
 function same_snapshot_identity(
-    left: NonNullable<Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity']>,
-    right: NonNullable<Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity']>,
+    left: Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity'],
+    right: Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity'],
 ): boolean {
     return left.deliveryId === right.deliveryId
         && left.authority.fileId === right.authority.fileId
@@ -1633,18 +1633,19 @@ export function attach_viewer(
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
                 const acknowledged_identity = session.acknowledged_identity();
-                const native_identity_is_current = msg.snapshotIdentity !== undefined
-                    && acknowledged_identity !== undefined
-                    && same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity);
-                if (!native_identity_is_current) return;
+                if (
+                    acknowledged_identity === undefined
+                    || msg.snapshotIdentity.authority.revision !== expected_authority
+                    || !same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity)
+                ) return;
                 await update_file_state((current) => {
                         if (
                             disposed
                             || !core
                             || !file_coordinator.state_write_is_current(expected_authority)
                             || source_authority.authorityRevision !== expected_authority
+                            || msg.snapshotIdentity.authority.revision !== expected_authority
                             || msg.sourceGeneration !== core.source_generation
-                            || msg.snapshotIdentity === undefined
                             || session.acknowledged_identity() === undefined
                             || !same_snapshot_identity(
                                 msg.snapshotIdentity,
@@ -1706,8 +1707,8 @@ export function attach_viewer(
                     !disposed
                     && file_coordinator.state_write_is_current(expected_authority)
                     && source_authority.authorityRevision === expected_authority
+                    && msg.snapshotIdentity.authority.revision === expected_authority
                     && msg.sourceGeneration === core?.source_generation
-                    && msg.snapshotIdentity !== undefined
                     && session.acknowledged_identity() !== undefined
                     && same_snapshot_identity(
                         msg.snapshotIdentity,
