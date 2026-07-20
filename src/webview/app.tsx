@@ -460,7 +460,7 @@ export function App(): React.JSX.Element {
                 // Legacy traffic is authoritative until the first native snapshot.
                 // After cutover, unsequenced legacy metadata is safely treated as
                 // stale so a delayed compatibility message cannot regress the UI.
-                const disposition = application.acknowledge
+                const classified_disposition = application.acknowledge
                     ? classify_snapshot(
                         snapshot.identity,
                         last_applied_snapshot_ref.current,
@@ -468,6 +468,20 @@ export function App(): React.JSX.Element {
                     : last_applied_snapshot_ref.current
                         ? 'stale'
                         : 'applied';
+                // A same-authority physical re-adoption can legitimately advance
+                // panel generations without changing the durable file basis. It is
+                // not a retransmission: install it so row/state fencing stays aligned.
+                const disposition = application.acknowledge
+                    && classified_disposition === 'duplicate'
+                    && previous_native_identity !== null
+                    && snapshot.identity.deliveryId
+                        !== previous_native_identity.deliveryId
+                    && (
+                        snapshot.generation !== generation_ref.current
+                        || snapshot.sourceGeneration !== source_generation_ref.current
+                    )
+                    ? 'applied'
+                    : classified_disposition;
                 if (cross_file_initial && disposition === 'applied') {
                     pending_excel_header_ref.current = null;
                     set_pending_excel_header(null);

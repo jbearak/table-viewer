@@ -143,6 +143,7 @@ function excel_profile(
     make_source: () => DataSource = () => new PhysicalExcelSource(),
 ): ViewerProfile {
     return {
+        metadataDelivery: 'legacy',
         editing: false,
         async build_source(_raw, _path, state) {
             builds.count++;
@@ -211,6 +212,20 @@ describe('Excel first-row header controller', () => {
             excelFirstRowHeader: { mode: 'off', active: false, detected: true },
         });
         expect(builds.count).toBe(1);
+        expect(messages_of(panel, 'workbookSnapshot')).toHaveLength(0);
+
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: {
+                deliveryId: 999,
+                authority: { fileId: '/tmp/people.xlsx', revision: 999 },
+                stateRevision: 999,
+                sourceBasis: { physicalRevision: 999, projectionRevision: 999 },
+            },
+            disposition: 'applied',
+        });
+        expect(messages_of(panel, 'sheetMeta')).toHaveLength(1);
+        expect(messages_of(panel, 'workbookSnapshot')).toHaveLength(0);
     });
 
     it('derives adopted overrides from the immutable physical receipt state', async () => {
@@ -559,6 +574,7 @@ describe('Excel first-row header controller', () => {
             [text('Bob'), text('Paris')],
         ];
         const profile: ViewerProfile = {
+            metadataDelivery: 'legacy',
             editing: false,
             async build_source(raw, _path, current) {
                 const physical = raw[0] === 1
@@ -688,6 +704,7 @@ describe('Excel first-row header controller', () => {
             [text('Bob'), text('Paris')],
         ];
         const profile: ViewerProfile = {
+            metadataDelivery: 'legacy',
             editing: false,
             async build_source(raw, _path, current) {
                 return new ExcelHeaderDataSource(
@@ -788,6 +805,7 @@ describe('Excel first-row header controller', () => {
             [text('Bob'), text('Paris')],
         ];
         const profile: ViewerProfile = {
+            metadataDelivery: 'legacy',
             editing: false,
             async build_source(raw, _path, current) {
                 return new ExcelHeaderDataSource(

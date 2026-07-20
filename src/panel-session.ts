@@ -1,6 +1,8 @@
 import type { FileAuthoritySnapshot, AuthorityCommitReceiptBase } from './file-coordinator';
 import { deep_clone_and_freeze } from './immutable';
 import type { FileStateSnapshot } from './state';
+import type { DataSource } from './data-source/interface';
+import type { ViewerPanelCore } from './panel-core';
 import type { HostMessage } from './types';
 import {
     build_workbook_snapshot,
@@ -20,17 +22,23 @@ export type PanelSessionLifecycle = 'awaitingReady' | 'ready' | 'active' | 'disp
 export interface PanelAdoptionProjection {
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
+    /** Optional panel-specific state projection; the durable receipt remains exact. */
+    readonly stateSnapshot?: Readonly<FileStateSnapshot>;
+}
+
+export interface PanelAdoptionResources {
+    readonly source: DataSource;
+    readonly core: ViewerPanelCore;
 }
 
 /**
- * Immutable caller-owned description of one already-adopted source. PanelSession
- * retains its object identity for ACK gating but owns no DataSource, core,
- * authority, parser, watcher, or durable state. `project` is sampled exactly once
- * at replacement time; source ownership can move here in Phase 4.5 through the
- * explicit release callback without coupling this transport checkpoint to it.
+ * One installed source/core adoption. PanelSession is the sole lifecycle owner of
+ * these resources after replacement succeeds; callers may only borrow them through
+ * current_adoption(). `project` is sampled exactly once at replacement time.
  */
 interface PanelAdoptionCommon {
     readonly canonicalFileId: string;
+    readonly resources: PanelAdoptionResources;
     readonly core: WorkbookSnapshotCoreMaterial;
     readonly diagnostics: WorkbookSnapshotDiagnostics;
     readonly warnings?: readonly string[];
@@ -58,6 +66,8 @@ export interface PanelSessionScheduler<Handle = unknown> {
 type SnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
 
 export interface PanelSessionOptions<Handle = ReturnType<typeof setTimeout>> {
+    /** Disabled for legacy-only panels; adoption ownership remains active. */
+    readonly transportEnabled?: boolean;
     readonly postMessage: (
         message: SnapshotMessage,
     ) => boolean | Thenable<boolean> | Promise<boolean>;
@@ -71,11 +81,17 @@ export interface PanelSessionOptions<Handle = ReturnType<typeof setTimeout>> {
     readonly onAdoptionReleased?: (adoption: PanelAdoption) => void;
 }
 
+export interface PanelReadyEpoch {
+    readonly receiverEpoch: number;
+    readonly hasSource: boolean;
+}
+
 export type PanelReadyResult =
     | { readonly type: 'ready'; readonly receiverEpoch: number }
-    | { readonly type: 'needsInitialSource'; readonly receiverEpoch: number };
+    | { readonly type: 'needsInitialSource'; readonly receiverEpoch: number }
+    | { readonly type: 'stale'; readonly receiverEpoch: number };
 
-type CapturedAdoptionMaterial = Omit<PanelAdoptionCommon, 'project'> & {
+type CapturedAdoptionMaterial = Omit<PanelAdoptionCommon, 'project' | 'resources'> & {
     readonly projection: PanelAdoptionProjection;
 } & (
     | {
@@ -93,8 +109,10 @@ interface CapturedAdoption {
     /** Original opaque identity used only for association and callbacks. */
     readonly adoption: PanelAdoption;
     readonly epoch: number;
-    /** Isolated immutable basis sampled atomically by replace_adoption(). */
+    /** Immutable source/core/authority basis sampled by replace_adoption(). */
     readonly material: CapturedAdoptionMaterial;
+    /** Latest panel-projected durable state used only for future deliveries. */
+    stateSnapshot: Readonly<FileStateSnapshot>;
 }
 
 interface IssuedDelivery {
@@ -161,6 +179,16 @@ function capture_adoption(adoption: PanelAdoption): CapturedAdoptionMaterial {
     });
 }
 
+function captured_state_snapshot(
+    material: CapturedAdoptionMaterial,
+): Readonly<FileStateSnapshot> {
+    const state = material.projection.stateSnapshot
+        ?? (material.source === 'commitReceipt'
+            ? material.receipt.stateSnapshot
+            : material.stateSnapshot);
+    return deep_clone_and_freeze(state);
+}
+
 function physical_digest(adoption: CapturedAdoption): string | undefined {
     return adoption.material.source === 'commitReceipt'
         ? adoption.material.receipt.resultingBasis.physicalDigest
@@ -170,6 +198,7 @@ function physical_digest(adoption: CapturedAdoption): string | undefined {
 /** Reliable, readiness-gated transport for complete immutable workbook snapshots. */
 export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private _lifecycle: PanelSessionLifecycle = 'awaitingReady';
+    private readonly transport_enabled: boolean;
     private readonly post_message: PanelSessionOptions<Handle>['postMessage'];
     private readonly scheduler: PanelSessionScheduler<Handle>;
     private readonly backoff_ms: readonly number[];
@@ -181,6 +210,8 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private readonly on_adoption_released?: (adoption: PanelAdoption) => void;
 
     private receiver_epoch = 0;
+    /** Set only while a receiver epoch is waiting for async state preparation. */
+    private ready_gate_epoch?: number;
     private adoption_epoch = 0;
     private replacement_token = 0;
     private next_delivery_id = 1;
@@ -198,6 +229,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private stale_adoption_epoch?: number;
 
     constructor(options: PanelSessionOptions<Handle>) {
+        this.transport_enabled = options.transportEnabled ?? true;
         this.post_message = options.postMessage;
         this.scheduler = options.scheduler
             ?? (default_scheduler() as unknown as PanelSessionScheduler<Handle>);
@@ -215,37 +247,69 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     }
 
     /**
-     * Every ready call denotes a new receiver epoch. Duplicate notifications are
-     * therefore safe but intentionally restart delivery with a new deliveryId.
+     * Start a receiver epoch synchronously. This immediately invalidates every old
+     * post continuation, retry, and ACK timer, but deliberately posts nothing until
+     * complete_ready() after the caller has prepared current durable state.
      */
-    ready(): PanelReadyResult {
+    begin_ready(): PanelReadyEpoch {
         if (this._lifecycle === 'disposed') {
-            return { type: 'needsInitialSource', receiverEpoch: this.receiver_epoch };
+            return { receiverEpoch: this.receiver_epoch, hasSource: false };
         }
         const receiver_epoch = ++this.receiver_epoch;
+        this.ready_gate_epoch = receiver_epoch;
         this.receiver_baseline_file_id = undefined;
         this.stale_adoption_epoch = undefined;
         this.invalidate_transport();
         this.supersede_desired();
         this.acknowledged = undefined;
+        this._lifecycle = 'ready';
+        return { receiverEpoch: receiver_epoch, hasSource: this.current !== undefined };
+    }
+
+    ready_epoch_is_current(receiver_epoch: number): boolean {
+        return this._lifecycle !== 'disposed'
+            && this.receiver_epoch === receiver_epoch
+            && this.ready_gate_epoch === receiver_epoch;
+    }
+
+    /** Finish the current receiver epoch and create its initial delivery exactly once. */
+    complete_ready(receiver_epoch: number): PanelReadyResult {
+        if (!this.ready_epoch_is_current(receiver_epoch)) {
+            return { type: 'stale', receiverEpoch: receiver_epoch };
+        }
+        this.ready_gate_epoch = undefined;
         if (!this.current) {
             this._lifecycle = 'ready';
             this.on_needs_initial_source?.();
-            // A callback may synchronously establish a source or even start a newer
-            // receiver epoch. This invocation reports its own captured epoch and
-            // never creates duplicate work after that reentrant continuation.
+            // A callback may synchronously establish a source or begin a newer epoch.
+            if (this.receiver_epoch !== receiver_epoch) {
+                return { type: 'stale', receiverEpoch: receiver_epoch };
+            }
             return this.current
                 ? { type: 'ready', receiverEpoch: receiver_epoch }
                 : { type: 'needsInitialSource', receiverEpoch: receiver_epoch };
         }
         this._lifecycle = 'active';
-        this.create_desired('initial', 'ready');
+        if (this.transport_enabled) this.create_desired('initial', 'ready');
         return { type: 'ready', receiverEpoch: receiver_epoch };
     }
 
-    /** Replace the opaque adopted context. Passing undefined clears the source. */
-    replace_adoption(adoption: PanelAdoption | undefined): void {
-        if (this._lifecycle === 'disposed') return;
+    /** Synchronous convenience used by standalone callers and legacy tests. */
+    ready(): PanelReadyResult {
+        const begun = this.begin_ready();
+        return this.complete_ready(begun.receiverEpoch);
+    }
+
+    /**
+     * Replace the adopted context. `onAccepted` runs after installation but before
+     * transport or release callbacks, allowing candidate ownership to transfer
+     * atomically. False means ownership remained with the caller.
+     */
+    replace_adoption(
+        adoption: PanelAdoption | undefined,
+        onAccepted?: () => void,
+    ): boolean {
+        if (this._lifecycle === 'disposed') return false;
         const replacement_token = ++this.replacement_token;
         const material = adoption === undefined ? undefined : capture_adoption(adoption);
         if (
@@ -254,7 +318,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         ) {
             // The candidate was never installed. Its ownership remains entirely
             // with the caller, while any reentrant replacement/disposal stands.
-            return;
+            return false;
         }
         const previous = this.current?.adoption;
         this.invalidate_transport();
@@ -265,33 +329,81 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         this.adoption_epoch += 1;
         this.current = adoption === undefined || material === undefined
             ? undefined
-            : { adoption, epoch: this.adoption_epoch, material };
+            : {
+                adoption,
+                epoch: this.adoption_epoch,
+                material,
+                stateSnapshot: captured_state_snapshot(material),
+            };
+        onAccepted?.();
+        if (
+            this.replacement_token !== replacement_token
+            || this.current?.adoption !== adoption
+        ) {
+            // Ownership was accepted, then reentrant caller work superseded or
+            // disposed it; that newer operation is responsible for release.
+            return true;
+        }
         const release_previous = () => {
             if (previous && previous !== adoption) this.on_adoption_released?.(previous);
         };
         if (!this.current) {
             if (this.receiver_epoch > 0) this._lifecycle = 'ready';
             release_previous();
-            return;
+            return true;
         }
-        if (this.receiver_epoch === 0) {
+        if (
+            this.receiver_epoch === 0
+            || this.ready_gate_epoch === this.receiver_epoch
+        ) {
+            this._lifecycle = this.receiver_epoch === 0 ? this._lifecycle : 'ready';
             release_previous();
-            return;
+            return true;
         }
         this._lifecycle = 'active';
-        const presentation = this.receiver_baseline_file_id
-            === this.current.material.canonicalFileId
-            ? 'refresh'
-            : 'initial';
-        this.create_desired(presentation, this.current.material.reason);
+        if (this.transport_enabled) {
+            const presentation = this.receiver_baseline_file_id
+                === this.current.material.canonicalFileId
+                ? 'refresh'
+                : 'initial';
+            this.create_desired(presentation, this.current.material.reason);
+        }
         // Release only after the replacement is current and its desired delivery
         // exists. If an injected release callback throws, the new session state is
         // still coherent and its transport attempt is already underway.
         release_previous();
+        return true;
     }
 
     current_adoption(): PanelAdoption | undefined {
         return this._lifecycle === 'disposed' ? undefined : this.current?.adoption;
+    }
+
+    /**
+     * Replace only the mutable panel-state material for future snapshots. Existing
+     * issued deliveries remain immutable. By default this never echoes a delivery;
+     * `deliver: true` supersedes any current desired delivery and emits a refresh.
+     */
+    update_state_snapshot(
+        stateSnapshot: Readonly<FileStateSnapshot>,
+        options: { readonly deliver?: boolean } = {},
+    ): boolean {
+        if (this._lifecycle === 'disposed' || !this.current) return false;
+        if (stateSnapshot.revision < this.current.stateSnapshot.revision) return false;
+        this.current.stateSnapshot = deep_clone_and_freeze(stateSnapshot);
+        if (
+            options.deliver === true
+            && this.transport_enabled
+            && this.receiver_epoch > 0
+            && this.ready_gate_epoch !== this.receiver_epoch
+            && this.stale_adoption_epoch !== this.current.epoch
+        ) {
+            this.invalidate_transport();
+            this.supersede_desired();
+            this.acknowledged = undefined;
+            this.create_desired('refresh', 'other');
+        }
+        return true;
     }
 
     /** Retain one locally-originated result until a current containing ACK settles it. */
@@ -301,6 +413,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (
             !this.current
             || this.receiver_epoch === 0
+            || this.ready_gate_epoch === this.receiver_epoch
             || this.stale_adoption_epoch === this.current.epoch
         ) return;
         this.invalidate_transport();
@@ -400,6 +513,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (this._lifecycle === 'disposed') return;
         this._lifecycle = 'disposed';
         this.replacement_token += 1;
+        this.ready_gate_epoch = undefined;
         this.invalidate_transport();
         const adoption = this.current?.adoption;
         this.current = undefined;
@@ -438,13 +552,16 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             ? build_workbook_snapshot({
                 ...common,
                 source: 'commitReceipt',
-                receipt: material.receipt,
+                receipt: {
+                    ...material.receipt,
+                    stateSnapshot: adoption.stateSnapshot,
+                },
             })
             : build_workbook_snapshot({
                 ...common,
                 source: 'observed',
                 authority: material.authority,
-                state_snapshot: material.stateSnapshot,
+                state_snapshot: adoption.stateSnapshot,
             });
         const issued: IssuedDelivery = {
             deliveryId: delivery_id,

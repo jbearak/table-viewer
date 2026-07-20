@@ -8,6 +8,7 @@ import type { AuthorityFileStateStore } from '../state';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { with_in_memory_authority_transactions } from '../state-authority';
+import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
 /**
  * Drive the CSV-table lifecycle through the shared controller, mirroring the
@@ -55,22 +56,43 @@ function view_column(column: number): vscode.ViewColumn {
     return column as vscode.ViewColumn;
 }
 
-function meta_reloads(panel: { __messages: unknown[] }) {
-    return panel.__messages.filter((message): message is { type: string; meta: { sheets: { rowCount: number }[] } } => (
+interface CsvSnapshot {
+    type: 'workbookSnapshot';
+    snapshot: {
+        presentation: 'initial' | 'refresh';
+        reason: string;
+        generation: number;
+        sourceGeneration: number;
+        previewMode?: boolean;
+        configuration: { previewMode: boolean };
+        capabilities: { csvEditable: boolean; csvEditingSupported: boolean };
+        meta: { sheets: { rowCount: number }[] };
+        state: Record<string, unknown>;
+        identity: WorkbookSnapshotIdentity;
+    };
+}
+
+function workbook_snapshots(panel: { __messages: unknown[] }): CsvSnapshot['snapshot'][] {
+    return panel.__messages.flatMap((message) => (
         typeof message === 'object'
         && message !== null
         && 'type' in message
-        && message.type === 'metaReload'
+        && message.type === 'workbookSnapshot'
+        && 'snapshot' in message
+            ? [{
+                ...(message as CsvSnapshot).snapshot,
+                previewMode: (message as CsvSnapshot).snapshot.configuration.previewMode,
+            }]
+            : []
     ));
 }
 
+function meta_reloads(panel: { __messages: unknown[] }) {
+    return workbook_snapshots(panel).filter((snapshot) => snapshot.presentation === 'refresh');
+}
+
 function sheet_meta(panel: { __messages: unknown[] }) {
-    return panel.__messages.filter((message): message is { type: string; previewMode?: boolean; meta: { sheets: { rowCount: number }[] } } => (
-        typeof message === 'object'
-        && message !== null
-        && 'type' in message
-        && message.type === 'sheetMeta'
-    ));
+    return workbook_snapshots(panel).filter((snapshot) => snapshot.presentation === 'initial');
 }
 
 beforeEach(() => {
@@ -81,6 +103,64 @@ beforeEach(() => {
 });
 
 describe('CSV reload races', () => {
+    it('uses only native metadata and resends an active source on a new ready epoch', async () => {
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return enc.encode('h\na\n');
+        });
+        open_csv_table(uri('/tmp/native-only.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+        const first = workbook_snapshots(panel).at(-1)!;
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+        const second = workbook_snapshots(panel).at(-1)!;
+
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && ['sheetMeta', 'metaReload', 'metaReloadRecovery'].includes(String(message.type))
+        ))).toBe(false);
+        expect(second.identity).not.toEqual(first.identity);
+        expect(second.generation).toBe(first.generation);
+        expect(second.sourceGeneration).toBe(first.sourceGeneration);
+        expect(reads).toBe(2);
+    });
+
+    it('requires an exact current snapshot ACK before CSV save', async () => {
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        open_csv_table(uri('/tmp/ack-save.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        panel.__autoAckSnapshots = false;
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const delivered = workbook_snapshots(panel).at(-1)!;
+
+        await panel.__receive({ type: 'saveCsv', edits: {} });
+        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: { ...delivered.identity, deliveryId: 999 },
+            disposition: 'applied',
+        });
+        await panel.__receive({ type: 'saveCsv', edits: {} });
+        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: delivered.identity,
+            disposition: 'duplicate',
+        });
+        await panel.__receive({ type: 'saveCsv', edits: {} });
+        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: true });
+    });
+
     it('mock event disposables unregister handlers', async () => {
         let calls = 0;
         const watcher = vscode_mock.workspace.createFileSystemWatcher();
@@ -137,7 +217,7 @@ describe('CSV reload races', () => {
         expect(close_spy).toHaveBeenCalledTimes(2);
     });
 
-    it('delivers state from the exact physical receipt rather than a later reread', async () => {
+    it('delivers the latest durable panel state after physical finalization', async () => {
         const file_path = '/tmp/receipt-state.csv';
         const versioned = versioned_state_store({
             pendingEdits: { '0:0': 'committed' },
@@ -165,7 +245,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
 
         expect(sheet_meta(panel)[0]).toMatchObject({
-            state: { pendingEdits: { '0:0': 'committed' } },
+            state: { pendingEdits: { '0:0': 'later' } },
         });
         expect(versioned.get_state(file_path).pendingEdits).toEqual({ '0:0': 'later' });
     });
@@ -327,6 +407,8 @@ describe('CSV reload races', () => {
         await first_reload;
 
         const panel = vscode_mock.__getPanels()[0];
+        expect(workbook_snapshots(panel)).toHaveLength(0);
+        await panel.__receive({ type: 'ready' });
         const metas = sheet_meta(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
@@ -349,10 +431,10 @@ describe('CSV reload races', () => {
         await vscode_mock.__getWatchers()[0].__fireChange();
 
         // Installation and transfer are confirmed before old-source cleanup. The
-        // cleanup error suppresses delivery, but the panel unambiguously owns the
-        // new source and closes it once on disposal.
+        // The new adoption is installed before old-source cleanup; its snapshot
+        // may already be posted even when closing the old source throws.
         expect(close_spy).toHaveBeenCalledTimes(1);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(meta_reloads(panel)).toHaveLength(1);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(2);
     });
@@ -371,7 +453,7 @@ describe('CSV reload races', () => {
 
         await vscode_mock.__getWatchers()[0].__fireChange();
 
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(meta_reloads(panel)).toHaveLength(1);
         expect(close_spy).toHaveBeenCalledTimes(2);
         panel.dispose();
         expect(close_spy).toHaveBeenCalledTimes(2);
@@ -471,10 +553,10 @@ describe('CSV reload races', () => {
         const older_started = deferred<void>();
         const attempts: Array<{ generation: number; sourceGeneration: number }> = [];
         vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: any) => {
-            if (message?.type === 'sheetMeta') {
+            if (message?.type === 'workbookSnapshot') {
                 attempts.push({
-                    generation: message.generation,
-                    sourceGeneration: message.sourceGeneration,
+                    generation: message.snapshot.generation,
+                    sourceGeneration: message.snapshot.sourceGeneration,
                 });
                 if (attempts.length === 1) {
                     older_started.resolve(undefined);
@@ -499,12 +581,12 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
         expect(attempts).toEqual([
             { generation: 1, sourceGeneration: 1 },
+            { generation: 1, sourceGeneration: 1 },
             { generation: 2, sourceGeneration: 2 },
-            { generation: 3, sourceGeneration: 3 },
         ]);
         expect(sheet_meta(panel).at(-1)).toMatchObject({
-            generation: 3,
-            sourceGeneration: 3,
+            generation: 2,
+            sourceGeneration: 2,
         });
         expect(meta_reloads(panel)).toHaveLength(0);
     });
@@ -522,7 +604,7 @@ describe('CSV reload races', () => {
                 typeof message === 'object'
                 && message !== null
                 && 'type' in message
-                && message.type === 'sheetMeta'
+                && message.type === 'workbookSnapshot'
             ) {
                 sheet_meta_attempts += 1;
                 if (sheet_meta_attempts === 1) return false;
@@ -535,8 +617,8 @@ describe('CSV reload races', () => {
 
         expect(sheet_meta_attempts).toBe(2);
         expect(sheet_meta(panel)).toMatchObject([{
-            sourceGeneration: 2,
-            generation: 2,
+            sourceGeneration: 1,
+            generation: 1,
         }]);
         await vscode_mock.__getWatchers()[0].__fireChange();
         expect(sheet_meta_attempts).toBe(2);
@@ -556,10 +638,10 @@ describe('CSV reload races', () => {
         const older_started = deferred<void>();
         const attempts: Array<{ generation: number; sourceGeneration: number }> = [];
         vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: any) => {
-            if (message?.type === 'metaReload') {
+            if (message?.type === 'workbookSnapshot') {
                 attempts.push({
-                    generation: message.generation,
-                    sourceGeneration: message.sourceGeneration,
+                    generation: message.snapshot.generation,
+                    sourceGeneration: message.snapshot.sourceGeneration,
                 });
                 if (attempts.length === 1) {
                     older_started.resolve(undefined);
@@ -588,12 +670,12 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
         expect(attempts).toEqual([
             { generation: 2, sourceGeneration: 2 },
+            { generation: 2, sourceGeneration: 2 },
             { generation: 3, sourceGeneration: 3 },
-            { generation: 4, sourceGeneration: 4 },
         ]);
         expect(meta_reloads(panel).at(-1)).toMatchObject({
-            generation: 4,
-            sourceGeneration: 4,
+            generation: 3,
+            sourceGeneration: 3,
             meta: { sheets: [{ rowCount: 1 }] },
         });
     });
@@ -614,7 +696,7 @@ describe('CSV reload races', () => {
                 typeof message === 'object'
                 && message !== null
                 && 'type' in message
-                && message.type === 'metaReload'
+                && message.type === 'workbookSnapshot'
             ) {
                 reload_attempts += 1;
                 if (reload_attempts === 1) return false;
@@ -628,8 +710,8 @@ describe('CSV reload races', () => {
 
         expect(reload_attempts).toBe(2);
         expect(meta_reloads(panel)).toMatchObject([{
-            sourceGeneration: 3,
-            generation: 3,
+            sourceGeneration: 2,
+            generation: 2,
             meta: { sheets: [{ rowCount: 2 }] },
         }]);
         expect(close_spy).toHaveBeenCalledTimes(2);
@@ -789,15 +871,12 @@ describe('CSV reload races', () => {
 
     it('CSV table still sends sheetMeta for a post-ready reload after a pre-ready reload completed', async () => {
         const pre_ready_reload = deferred<Uint8Array>();
-        const initial = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
         const reads = [
             pre_ready_reload,
             pre_ready_reload,
-            initial,
             post_ready_reload,
             post_ready_reload,
-            initial,
         ];
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
@@ -812,18 +891,17 @@ describe('CSV reload races', () => {
         await pre_ready_done;
         panel.__messages.length = 0;
 
-        const initial_ready = panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
         const post_ready_done = watcher.__fireChange();
 
         post_ready_reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await post_ready_done;
-        initial.resolve(enc.encode('h\nold\n'));
-        await initial_ready;
 
         const metas = sheet_meta(panel);
         expect(metas).toHaveLength(1);
-        expect(metas[0].meta.sheets[0].rowCount).toBe(3);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(metas[0].meta.sheets[0].rowCount).toBe(1);
+        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
     });
 
     it('CSV table ignores and closes an initial ready load that completes after panel disposal', async () => {
@@ -868,6 +946,8 @@ describe('CSV reload races', () => {
         await first_reload;
 
         const panel = vscode_mock.__getPanels()[0];
+        expect(workbook_snapshots(panel)).toHaveLength(0);
+        await panel.__receive({ type: 'ready' });
         const metas = sheet_meta(panel);
         expect(metas).toHaveLength(1);
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
@@ -905,15 +985,12 @@ describe('CSV reload races', () => {
 
     it('CSV preview still sends sheetMeta for a post-ready reload after a pre-ready reload completed', async () => {
         const pre_ready_reload = deferred<Uint8Array>();
-        const initial = deferred<Uint8Array>();
         const post_ready_reload = deferred<Uint8Array>();
         const reads = [
             pre_ready_reload,
             pre_ready_reload,
-            initial,
             post_ready_reload,
             post_ready_reload,
-            initial,
         ];
 
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 0 }));
@@ -928,19 +1005,19 @@ describe('CSV reload races', () => {
         await pre_ready_done;
         panel.__messages.length = 0;
 
-        void panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
         const post_ready_done = watcher.__fireChange();
 
         post_ready_reload.resolve(enc.encode('h\nn\n1\n2\n'));
         await post_ready_done;
-        initial.resolve(enc.encode('h\nold\n'));
         await flush_promises();
 
         const metas = sheet_meta(panel);
         expect(metas).toHaveLength(1);
-        expect(metas[0].meta.sheets[0].rowCount).toBe(3);
+        expect(metas[0].meta.sheets[0].rowCount).toBe(1);
         expect(metas[0].previewMode).toBe(true);
-        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(3);
     });
 
     it('CSV preview reuse ignores an old initial load that completes after the panel is reused', async () => {
@@ -1065,7 +1142,7 @@ describe('CSV reload races', () => {
                 typeof message === 'object'
                 && message !== null
                 && 'type' in message
-                && message.type === 'metaReload'
+                && message.type === 'workbookSnapshot'
             ) {
                 reload_attempts += 1;
                 if (reload_attempts === 1) return false;
@@ -1078,12 +1155,12 @@ describe('CSV reload races', () => {
 
         expect(reload_attempts).toBe(2);
         expect(meta_reloads(panel)).toMatchObject([{
-            sourceGeneration: 3,
-            generation: 3,
+            sourceGeneration: 2,
+            generation: 2,
         }]);
         await vscode_mock.__getWatchers()[0].__fireChange();
         expect(reload_attempts).toBe(2);
-        expect(close_spy).toHaveBeenCalledTimes(3);
+        expect(close_spy).toHaveBeenCalledTimes(2);
         vi.useRealTimers();
     });
 

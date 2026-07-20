@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
-import type { FileStateStore } from '../state';
+import type { FileStateSnapshot, FileStateStore } from '../state';
 import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { with_in_memory_authority_transactions } from '../state-authority';
+import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
 const enc = new TextEncoder();
 
@@ -81,13 +82,58 @@ function edit_session_results(panel: { __messages: unknown[] }) {
     );
 }
 
+function latest_snapshot(panel: { __messages: unknown[] }): {
+    generation: number;
+    sourceGeneration: number;
+    state: PerFileState;
+    identity: WorkbookSnapshotIdentity;
+} {
+    const message = [...panel.__messages].reverse().find((candidate) => (
+        typeof candidate === 'object'
+        && candidate !== null
+        && 'type' in candidate
+        && candidate.type === 'workbookSnapshot'
+        && 'snapshot' in candidate
+    )) as { snapshot: {
+        generation: number;
+        sourceGeneration: number;
+        state: PerFileState;
+        identity: WorkbookSnapshotIdentity;
+    } };
+    return message.snapshot;
+}
+
+function initial_snapshot(panel: { __messages: unknown[] }): {
+    generation: number;
+    sourceGeneration: number;
+    state: PerFileState;
+    identity: WorkbookSnapshotIdentity;
+} {
+    const message = panel.__messages.find((candidate) => (
+        typeof candidate === 'object'
+        && candidate !== null
+        && 'type' in candidate
+        && candidate.type === 'workbookSnapshot'
+        && 'snapshot' in candidate
+        && (candidate.snapshot as { presentation?: string }).presentation === 'initial'
+    )) as { snapshot: {
+        generation: number;
+        sourceGeneration: number;
+        state: PerFileState;
+        identity: WorkbookSnapshotIdentity;
+    } };
+    return message.snapshot;
+}
+
 function sheet_meta_count(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
         (message) => (
             typeof message === 'object'
             && message !== null
             && 'type' in message
-            && message.type === 'sheetMeta'
+            && message.type === 'workbookSnapshot'
+            && 'snapshot' in message
+            && (message.snapshot as { presentation?: string }).presentation === 'initial'
         )
     ).length;
 }
@@ -101,6 +147,300 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    it('invalidates old receiver retries before awaiting ready-state refresh', async () => {
+        vi.useFakeTimers();
+        const versioned = state_store();
+        const gate = deferred();
+        let gate_reads = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (gate_reads) await gate.promise;
+                return versioned.store.read(path);
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-read-gate.csv'), store);
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        let snapshot_attempts = 0;
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: unknown) => {
+            if (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'workbookSnapshot'
+            ) {
+                snapshot_attempts += 1;
+                if (snapshot_attempts === 1) return false;
+            }
+            return original_post(message);
+        });
+        await panel.__receive({ type: 'ready' });
+        expect(snapshot_attempts).toBe(1);
+
+        gate_reads = true;
+        const repeated_ready = panel.__receive({ type: 'ready' });
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(500);
+        expect(snapshot_attempts).toBe(1);
+
+        gate.resolve();
+        await repeated_ready;
+        expect(snapshot_attempts).toBe(2);
+        vi.useRealTimers();
+    });
+
+    it('retries a failed ready-state read and completes once with fresh state', async () => {
+        vi.useFakeTimers();
+        const versioned = state_store();
+        let fail_next = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (fail_next) {
+                    fail_next = false;
+                    throw new Error('transient state read');
+                }
+                if (versioned.revision(path) === 0) return versioned.store.read(path);
+                return { revision: 5, state: { columnWidths: [{ 0: 188 }] } };
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-read-retry.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const before = sheet_meta_count(panel);
+        // Make the successful retry return an explicit newer snapshot.
+        await versioned.store.compare_and_set('/tmp/ready-read-retry.csv', 0, {});
+        fail_next = true;
+        const ready = panel.__receive({ type: 'ready' });
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(50);
+        await ready;
+
+        expect(sheet_meta_count(panel)).toBe(before + 1);
+        expect(latest_snapshot(panel).identity.stateRevision).toBe(5);
+        expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 188 }]);
+        vi.useRealTimers();
+    });
+
+    it('completes with retained state after bounded ready-state read failures', async () => {
+        vi.useFakeTimers();
+        const versioned = state_store();
+        let fail_reads = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (fail_reads) throw new Error('persistent state read');
+                return versioned.store.read(path);
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-read-fallback.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const retained = latest_snapshot(panel);
+        const before = sheet_meta_count(panel);
+        fail_reads = true;
+        const error_spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const ready = panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await ready;
+
+        expect(sheet_meta_count(panel)).toBe(before + 1);
+        const fallback = latest_snapshot(panel);
+        expect(fallback.identity.stateRevision).toBe(retained.identity.stateRevision);
+        expect(fallback.state).toEqual(retained.state);
+        expect(fallback.identity.deliveryId).toBeGreaterThan(retained.identity.deliveryId);
+        expect(error_spy).toHaveBeenCalledOnce();
+        vi.useRealTimers();
+    });
+
+    it('makes an older ready retry inert when a newer ready succeeds', async () => {
+        vi.useFakeTimers();
+        const versioned = state_store();
+        let ready_reads = 0;
+        let ready_mode = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (!ready_mode) return versioned.store.read(path);
+                ready_reads += 1;
+                if (ready_reads === 1) throw new Error('older read failed');
+                return { revision: 6, state: { rowHeights: [{ 0: 29 }] } };
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-newer-wins.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const before = sheet_meta_count(panel);
+        ready_mode = true;
+        const older = panel.__receive({ type: 'ready' });
+        await Promise.resolve();
+        const newer = panel.__receive({ type: 'ready' });
+        await newer;
+        await vi.advanceTimersByTimeAsync(500);
+        await older;
+
+        expect(sheet_meta_count(panel)).toBe(before + 1);
+        expect(latest_snapshot(panel).identity.stateRevision).toBe(6);
+        expect(latest_snapshot(panel).state.rowHeights).toEqual([{ 0: 29 }]);
+        vi.useRealTimers();
+    });
+
+    it('cancels ready-state retry waits on disposal without posting', async () => {
+        vi.useFakeTimers();
+        const versioned = state_store();
+        let fail_reads = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (fail_reads) throw new Error('state unavailable');
+                return versioned.store.read(path);
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-dispose-retry.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const before = sheet_meta_count(panel);
+        fail_reads = true;
+        const ready = panel.__receive({ type: 'ready' });
+        await Promise.resolve();
+        panel.dispose();
+        await ready;
+
+        expect(sheet_meta_count(panel)).toBe(before);
+        expect(vi.getTimerCount()).toBe(0);
+        vi.useRealTimers();
+    });
+
+    it('ignores an older ready completion when durable reads finish out of order', async () => {
+        const versioned = state_store();
+        const queued: Array<ReturnType<typeof deferred<FileStateSnapshot>>> = [];
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const next = queued.shift();
+                return next ? next.promise : versioned.store.read(path);
+            },
+        };
+        const panel = open_csv_table(uri('/tmp/ready-order.csv'), store);
+        await panel.__receive({ type: 'ready' });
+        const before = panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'workbookSnapshot'
+        )).length;
+        const older = deferred<FileStateSnapshot>();
+        const newer = deferred<FileStateSnapshot>();
+        queued.push(older, newer);
+
+        const older_ready = panel.__receive({ type: 'ready' });
+        const newer_ready = panel.__receive({ type: 'ready' });
+        newer.resolve({ revision: 3, state: { columnWidths: [{ 0: 203 }] } });
+        await newer_ready;
+        older.resolve({ revision: 3, state: { columnWidths: [{ 0: 102 }] } });
+        await older_ready;
+
+        const snapshots = panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'workbookSnapshot'
+        ));
+        expect(snapshots).toHaveLength(before + 1);
+        expect(latest_snapshot(panel).identity.stateRevision).toBe(3);
+        expect(latest_snapshot(panel).state.columnWidths).toEqual([{ 0: 203 }]);
+    });
+
+    it('replays exact committed layout state on ready without an echo delivery', async () => {
+        const file_path = '/tmp/repeated-ready-layout.csv';
+        const state = state_store();
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        const first = latest_snapshot(panel);
+        const before = panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'workbookSnapshot'
+        )).length;
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: first.sourceGeneration,
+            snapshotIdentity: first.identity,
+            state: {
+                ...first.state,
+                columnWidths: [{ 0: 177 }],
+                activeSheetIndex: 0,
+            },
+        });
+        expect(panel.__messages.filter((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'workbookSnapshot'
+        ))).toHaveLength(before);
+
+        await panel.__receive({ type: 'ready' });
+        const replay = latest_snapshot(panel);
+        expect(replay.identity.stateRevision).toBeGreaterThan(first.identity.stateRevision);
+        expect(replay.state.columnWidths).toEqual([{ 0: 177 }]);
+        expect(replay.generation).toBe(first.generation);
+        expect(replay.sourceGeneration).toBe(first.sourceGeneration);
+        expect(replay.identity.sourceBasis).toEqual(first.identity.sourceBasis);
+    });
+
+    it('uses the exact committed state snapshot after a CAS conflict', async () => {
+        const file_path = '/tmp/state-conflict-replay.csv';
+        const versioned = state_store();
+        let inject_conflict = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (inject_conflict) {
+                    inject_conflict = false;
+                    const external = await versioned.store.compare_and_set(
+                        path,
+                        expected,
+                        { rowHeights: [{ 0: 41 }] },
+                    );
+                    if (external.type !== 'committed') throw new Error('Expected injected commit.');
+                    return { type: 'conflict', snapshot: external.snapshot };
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const first = latest_snapshot(panel);
+        const before = panel.__messages.length;
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: first.sourceGeneration,
+            snapshotIdentity: first.identity,
+            state: { ...first.state, columnWidths: [{ 0: 166 }] },
+        });
+        expect(panel.__messages).toHaveLength(before);
+
+        await panel.__receive({ type: 'ready' });
+        const replay = latest_snapshot(panel);
+        expect(replay.identity.stateRevision).toBe(2);
+        expect(replay.state.columnWidths).toEqual([{ 0: 166 }]);
+    });
+
+    it('cannot restore pending edits after save clearing and a new ready epoch', async () => {
+        const file_path = '/tmp/save-clear-ready.csv';
+        const state = state_store();
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'saved', base: 'a' } },
+        });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+
+        await panel.__receive({ type: 'ready' });
+        expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
+    });
+
     it('does not resurrect cleared pending edits from a later visibility snapshot', async () => {
         const file_path = '/tmp/cleared-edits-visibility.csv';
         const restored = { '0:0': { value: 'draft', base: 'a' } };
@@ -204,12 +544,7 @@ describe('CSV edit sessions', () => {
         const state = state_store({ transforms: [saved_transform] });
         const first = open_csv_table(uri(file_path), state.store);
         await first.__receive({ type: 'ready' });
-        const meta = first.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'sheetMeta',
-        ) as { generation: number; sourceGeneration: number };
+        const meta = initial_snapshot(first);
 
         await first.__receive({
             type: 'setTransform',
@@ -257,12 +592,7 @@ describe('CSV edit sessions', () => {
         first.dispose();
         const reopened = open_csv_table(uri(file_path), state.store);
         await reopened.__receive({ type: 'ready' });
-        const reopened_meta = reopened.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'sheetMeta',
-        ) as { state: PerFileState };
+        const reopened_meta = initial_snapshot(reopened);
         expect(reopened_meta.state.transforms).toEqual([undefined]);
     });
 
@@ -300,12 +630,7 @@ describe('CSV edit sessions', () => {
         };
         const panel = open_csv_table(uri(file_path), store);
         await panel.__receive({ type: 'ready' });
-        const meta = panel.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'sheetMeta',
-        ) as { generation: number; sourceGeneration: number };
+        const meta = initial_snapshot(panel);
 
         const cancel = panel.__receive({
             type: 'setTransform',
@@ -346,6 +671,7 @@ describe('CSV edit sessions', () => {
         };
         const state = state_store({ transforms: [saved_transform] });
         const profile: ViewerProfile = {
+            metadataDelivery: 'workbookSnapshot',
             editing: false,
             async build_source() {
                 return new FailingTransformSource();
@@ -353,12 +679,7 @@ describe('CSV edit sessions', () => {
         };
         const panel = open_csv_table(uri(file_path), state.store, profile);
         await panel.__receive({ type: 'ready' });
-        const meta = panel.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'sheetMeta',
-        ) as { generation: number; sourceGeneration: number };
+        const meta = initial_snapshot(panel);
 
         await panel.__receive({
             type: 'setTransform',
@@ -429,6 +750,22 @@ describe('CSV edit sessions', () => {
         expect(edit_session_results(panel)).toEqual([
             { type: 'editSessionResult', granted: false },
         ]);
+    });
+
+    it('projects pending edits for the owner but not a pre-ready watcher adoption in a nonowner', async () => {
+        const file_path = '/tmp/pre-ready-nonowner.csv';
+        const pendingEdits = { '0:0': { value: 'owner', base: 'a' } };
+        const state = state_store({ pendingEdits });
+        const first = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        expect(latest_snapshot(first).state.pendingEdits).toEqual(pendingEdits);
+
+        const second = open_csv_table(uri(file_path), state.store);
+        const second_watcher = vscode_mock.__getWatchers().at(-1)!;
+        await second_watcher.__fireChange();
+        expect(second.__messages).toHaveLength(0);
+        await second.__receive({ type: 'ready' });
+        expect(latest_snapshot(second).state.pendingEdits).toBeUndefined();
     });
 
     it('allows multiple viewers for one CSV file but grants edit mode to only one', async () => {
@@ -526,10 +863,105 @@ describe('CSV edit sessions', () => {
         });
     });
 
+    it('strips pending edits from previews and cannot resurrect a cleared map', async () => {
+        const file_path = '/tmp/preview-pending.csv';
+        const pending = { '0:0': { value: 'draft', base: 'a' } };
+        const state = state_store({ pendingEdits: pending });
+        const profile: ViewerProfile = {
+            metadataDelivery: 'workbookSnapshot',
+            editing: false,
+            previewMode: true,
+            build_source: async () => new StubSource(),
+        };
+        const panel = open_csv_table(uri(file_path), state.store, profile);
+        await panel.__receive({ type: 'ready' });
+        const first = latest_snapshot(panel);
+        expect(first.state.pendingEdits).toBeUndefined();
+
+        await state.store.compare_and_set(file_path, state.revision(file_path), {});
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: first.sourceGeneration,
+            snapshotIdentity: first.identity,
+            state: { ...first.state, pendingEdits: pending, columnWidths: [{ 0: 133 }] },
+        });
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        await panel.__receive({ type: 'ready' });
+        const replay = latest_snapshot(panel);
+        expect(replay.state.pendingEdits).toBeUndefined();
+        expect(replay.state.columnWidths).toEqual([{ 0: 133 }]);
+    });
+
+    it('fences preview-originated source messages until the current adoption is ACKed', async () => {
+        const on_message = vi.fn(async () => true);
+        const profile: ViewerProfile = {
+            metadataDelivery: 'workbookSnapshot',
+            editing: false,
+            previewMode: true,
+            build_source: async () => new StubSource(),
+            on_message,
+        };
+        const panel = open_csv_table(
+            uri('/tmp/preview-ack-fence.csv'),
+            state_store().store,
+            profile,
+        );
+        panel.__autoAckSnapshots = false;
+        await panel.__receive({ type: 'ready' });
+        const snapshot = initial_snapshot(panel);
+
+        await panel.__receive({ type: 'visibleRowChanged', row: 0 });
+        expect(on_message).not.toHaveBeenCalled();
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: snapshot.identity,
+            disposition: 'applied',
+        });
+        await panel.__receive({ type: 'visibleRowChanged', row: 0 });
+        expect(on_message).toHaveBeenCalledOnce();
+    });
+
+    it('surfaces immutable source warnings only after current ACK and deduplicates across panels', async () => {
+        const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        class WarningSource extends StubSource {
+            readonly warnings = ['CSV warning'];
+        }
+        const profile: ViewerProfile = {
+            metadataDelivery: 'workbookSnapshot',
+            editing: false,
+            build_source: async () => new WarningSource(),
+        };
+        const state = state_store();
+        const file_uri = uri('/tmp/warnings.csv');
+        const first = open_csv_table(file_uri, state.store, profile);
+        first.__autoAckSnapshots = false;
+        await first.__receive({ type: 'ready' });
+        expect(warning_spy).not.toHaveBeenCalled();
+        const first_snapshot = initial_snapshot(first);
+        await first.__receive({
+            type: 'snapshotApplied',
+            identity: first_snapshot.identity,
+            disposition: 'applied',
+        });
+        expect(warning_spy).toHaveBeenCalledTimes(1);
+
+        const second = open_csv_table(file_uri, state.store, profile);
+        second.__autoAckSnapshots = false;
+        await second.__receive({ type: 'ready' });
+        const second_snapshot = initial_snapshot(second);
+        await second.__receive({
+            type: 'snapshotApplied',
+            identity: second_snapshot.identity,
+            disposition: 'duplicate',
+        });
+        expect(warning_spy).toHaveBeenCalledTimes(1);
+    });
+
     it('does not warn about another editor when edit mode is denied by truncation', async () => {
         const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const state = state_store();
         const panel = open_csv_table(uri('/tmp/truncated.csv'), state.store, {
+            metadataDelivery: 'workbookSnapshot',
             editing: true,
             build_source: async () => new StubSource('Showing 1 of 2 rows'),
         });

@@ -608,6 +608,31 @@ describe('workbook snapshot hydration', () => {
         });
     });
 
+    it('applies a same-authority re-adoption when panel generations advance', async () => {
+        const { post_message } = await render_app();
+        const first = workbook_snapshot_message(make_meta(['First']), {
+            generation: 1,
+            sourceGeneration: 1,
+        });
+        await dispatch_host_message(first);
+        post_message.mockClear();
+        const readopted = workbook_snapshot_message(make_meta(['Readopted']), {
+            identity: { ...first.snapshot.identity, deliveryId: 2 },
+            generation: 2,
+            sourceGeneration: 2,
+            presentation: 'refresh',
+        });
+
+        await dispatch_host_message(readopted);
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(post_message.mock.calls.map((call) => call[0]).at(-1)).toEqual({
+            type: 'snapshotApplied',
+            identity: readopted.snapshot.identity,
+            disposition: 'applied',
+        });
+    });
+
     it('ignores and acknowledges stale snapshots after a newer authority', async () => {
         const { post_message } = await render_app();
         const newer = workbook_snapshot_message(make_meta(['New']), {

@@ -60,6 +60,7 @@ interface MockWebviewPanel {
     reveal(): void;
     dispose(): void;
     __messages: unknown[];
+    __autoAckSnapshots: boolean;
     __receive(message: unknown): Promise<void>;
 }
 
@@ -104,6 +105,23 @@ function make_panel(title: string): MockWebviewPanel {
             },
             async postMessage(message: unknown): Promise<boolean> {
                 panel.__messages.push(message);
+                if (
+                    panel.__autoAckSnapshots
+                    && typeof message === 'object'
+                    && message !== null
+                    && 'type' in message
+                    && message.type === 'workbookSnapshot'
+                    && 'snapshot' in message
+                ) {
+                    const snapshot = message.snapshot as { identity: unknown };
+                    queueMicrotask(() => {
+                        void panel.__receive({
+                            type: 'snapshotApplied',
+                            identity: snapshot.identity,
+                            disposition: 'applied',
+                        });
+                    });
+                }
                 return true;
             },
             onDidReceiveMessage(handler: MessageHandler): { dispose(): void } {
@@ -120,8 +138,28 @@ function make_panel(title: string): MockWebviewPanel {
             for (const handler of dispose_handlers) handler();
         },
         __messages: [],
+        __autoAckSnapshots: true,
         async __receive(message: unknown): Promise<void> {
-            await Promise.all(message_handlers.map((handler) => handler(message)));
+            let forwarded = message;
+            if (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'stateChanged'
+                && !('snapshotIdentity' in message)
+            ) {
+                const latest = [...panel.__messages].reverse().find((candidate) => (
+                    typeof candidate === 'object'
+                    && candidate !== null
+                    && 'type' in candidate
+                    && candidate.type === 'workbookSnapshot'
+                    && 'snapshot' in candidate
+                )) as { snapshot?: { identity?: unknown } } | undefined;
+                if (latest?.snapshot?.identity !== undefined) {
+                    forwarded = { ...message, snapshotIdentity: latest.snapshot.identity };
+                }
+            }
+            await Promise.all(message_handlers.map((handler) => handler(forwarded)));
         },
     };
     return panel;

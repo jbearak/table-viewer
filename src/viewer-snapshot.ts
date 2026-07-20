@@ -191,7 +191,13 @@ export function classify_snapshot(
     if (incoming.deliveryId === applied.deliveryId) return 'duplicate';
     if (incoming.authority.fileId === applied.authority.fileId) {
         if (incoming.authority.revision === applied.authority.revision) {
-            return 'duplicate';
+            const same_semantic_basis = incoming.stateRevision === applied.stateRevision
+                && incoming.sourceBasis.physicalRevision
+                    === applied.sourceBasis.physicalRevision
+                && incoming.sourceBasis.projectionRevision
+                    === applied.sourceBasis.projectionRevision;
+            if (same_semantic_basis) return 'duplicate';
+            return incoming.deliveryId > applied.deliveryId ? 'applied' : 'stale';
         }
         return incoming.authority.revision > applied.authority.revision
             ? 'applied'

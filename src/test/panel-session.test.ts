@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { DataSource } from '../data-source/interface';
+import type { ViewerPanelCore } from '../panel-core';
 import type {
     AuthorityCommitReceiptBase,
     FileAuthoritySnapshot,
@@ -84,6 +86,10 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
     return {
         source: 'observed',
         canonicalFileId: 'file:/book.xlsx',
+        resources: {
+            source: { close: vi.fn() } as unknown as DataSource,
+            core: { dispose: vi.fn() } as unknown as ViewerPanelCore,
+        },
         authority: authority(),
         stateSnapshot: { state: {}, revision: 7 },
         core: {
@@ -223,7 +229,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         session_ref = created.session;
         const outer_result = created.session.ready();
         await settle();
-        expect(outer_result).toEqual({ type: 'ready', receiverEpoch: 1 });
+        expect(outer_result).toEqual({ type: 'stale', receiverEpoch: 1 });
         expect(inner_result).toEqual({ type: 'ready', receiverEpoch: 2 });
         expect(created.posted).toHaveLength(1);
         expect(created.session.lifecycle).toBe('active');
@@ -439,8 +445,10 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 return projection;
             },
         });
+        const accepted = vi.fn();
 
-        session.replace_adoption(candidate);
+        expect(session.replace_adoption(candidate, accepted)).toBe(false);
+        expect(accepted).not.toHaveBeenCalled();
         expect(session.lifecycle).toBe('disposed');
         expect(session.current_adoption()).toBeUndefined();
         expect(posted).toHaveLength(0);
@@ -462,8 +470,10 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 return projection;
             },
         });
+        const accepted = vi.fn();
 
-        session.replace_adoption(candidate);
+        expect(session.replace_adoption(candidate, accepted)).toBe(false);
+        expect(accepted).not.toHaveBeenCalled();
         expect(session.lifecycle).toBe('disposed');
         expect(session.current_adoption()).toBeUndefined();
         expect(posted).toHaveLength(1);
@@ -710,6 +720,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
             source: 'commitReceipt',
             receipt,
             canonicalFileId: base.canonicalFileId,
+            resources: base.resources,
             core: base.core,
             diagnostics: base.diagnostics,
             warnings: base.warnings,
@@ -764,6 +775,113 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         session.replace_adoption(adoption());
         expect(posted).toHaveLength(1);
         expect(warned).not.toHaveBeenCalled();
+    });
+
+    it('begin_ready immediately cancels old transport while state preparation is gated', async () => {
+        const old_post = deferred<boolean>();
+        const { session, posted, scheduler } = make_session({
+            responses: [old_post.promise, true],
+        });
+        session.replace_adoption(adoption());
+        session.ready();
+        const old = snapshot(posted);
+        expect(scheduler.pending()).toHaveLength(1);
+
+        const begun = session.begin_ready();
+        expect(begun.hasSource).toBe(true);
+        expect(scheduler.pending()).toHaveLength(0);
+        expect(session.update_state_snapshot({
+            revision: 8,
+            state: { columnWidths: [{ 0: 151 }] },
+        })).toBe(true);
+        old_post.resolve(true);
+        await settle();
+        expect(posted).toHaveLength(1);
+        expect(scheduler.pending()).toHaveLength(0);
+
+        expect(session.complete_ready(begun.receiverEpoch)).toEqual({
+            type: 'ready', receiverEpoch: begun.receiverEpoch,
+        });
+        await settle();
+        const fresh = snapshot(posted);
+        expect(posted).toHaveLength(2);
+        expect(fresh.identity.deliveryId).toBeGreaterThan(old.identity.deliveryId);
+        expect(fresh.identity.stateRevision).toBe(8);
+        expect(fresh.state.columnWidths).toEqual([{ 0: 151 }]);
+    });
+
+    it('only completes the newest of two overlapping ready epochs', async () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        const older = session.begin_ready();
+        const newer = session.begin_ready();
+        session.update_state_snapshot({ revision: 9, state: { rowHeights: [{ 0: 33 }] } });
+
+        expect(session.complete_ready(older.receiverEpoch)).toEqual({
+            type: 'stale', receiverEpoch: older.receiverEpoch,
+        });
+        expect(posted).toHaveLength(0);
+        expect(session.complete_ready(newer.receiverEpoch)).toEqual({
+            type: 'ready', receiverEpoch: newer.receiverEpoch,
+        });
+        await settle();
+        expect(snapshot(posted).identity.stateRevision).toBe(9);
+    });
+
+    it('makes completion inert after disposal during ready preparation', () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        const begun = session.begin_ready();
+        session.dispose();
+
+        expect(session.complete_ready(begun.receiverEpoch)).toEqual({
+            type: 'stale', receiverEpoch: begun.receiverEpoch,
+        });
+        expect(posted).toHaveLength(0);
+    });
+
+    it('completes a ready gate against a replacement adopted during the read', async () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        const begun = session.begin_ready();
+        session.replace_adoption(adoption({ authority: authority(4) }));
+        session.update_state_snapshot({ revision: 10, state: { activeSheetIndex: 0 } });
+        expect(posted).toHaveLength(0);
+
+        expect(session.complete_ready(begun.receiverEpoch).type).toBe('ready');
+        await settle();
+        expect(snapshot(posted).identity).toMatchObject({
+            authority: { revision: 4 },
+            stateRevision: 10,
+        });
+    });
+
+    it('updates only future snapshot state without mutating or echoing issued work', async () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        const issued = snapshot(posted);
+
+        expect(session.update_state_snapshot({
+            revision: 8,
+            state: { columnWidths: [{ 0: 144 }], activeSheetIndex: 0 },
+        })).toBe(true);
+        expect(posted).toHaveLength(1);
+        expect(session.update_state_snapshot({ revision: 6, state: {} })).toBe(false);
+        expect(issued.identity.stateRevision).toBe(7);
+        expect(issued.state.columnWidths).toEqual([]);
+
+        session.ready();
+        await settle();
+        const replay = snapshot(posted);
+        expect(replay.identity.stateRevision).toBe(8);
+        expect(replay.state.columnWidths).toEqual([{ 0: 144 }]);
+        expect(replay.generation).toBe(issued.generation);
+        expect(replay.sourceGeneration).toBe(issued.sourceGeneration);
+        expect(replay.identity.sourceBasis).toEqual(issued.identity.sourceBasis);
+        expect(issued.identity.stateRevision).toBe(7);
+        expect(issued.state.columnWidths).toEqual([]);
     });
 
     it('isolates the immutable snapshot from later input mutation', async () => {

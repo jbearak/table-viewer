@@ -10,6 +10,7 @@ import type {
     RenderedCell,
 } from './data-source/interface';
 import { ViewerPanelCore, adopt_source_into_core, type PanelLike } from './panel-core';
+import { PanelSession, type PanelAdoption } from './panel-session';
 import {
     get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib,
 } from './viewer-config';
@@ -60,6 +61,8 @@ export interface ViewerHostPanel extends PanelLike {
 }
 
 export interface ViewerProfile {
+    /** Fixed for one attachment; mixing metadata protocols is a controller bug. */
+    metadataDelivery: 'legacy' | 'workbookSnapshot';
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
         raw: Uint8Array,
@@ -83,6 +86,8 @@ const HEADER_RELOAD_RETRY_MS = 25;
 const RELOAD_RETRY_COUNT = 3;
 const RELOAD_RETRY_MS = 50;
 const HEADER_TERMINAL_RETRY_COUNT = 3;
+const READY_STATE_RETRY_COUNT = 3;
+const READY_STATE_RETRY_MS = 50;
 
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
@@ -127,6 +132,18 @@ type PhysicalAuthorityCommitResult =
     | { type: 'rejected' }
     | { type: 'advanced' };
 
+function same_snapshot_identity(
+    left: NonNullable<Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity']>,
+    right: NonNullable<Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity']>,
+): boolean {
+    return left.deliveryId === right.deliveryId
+        && left.authority.fileId === right.authority.fileId
+        && left.authority.revision === right.authority.revision
+        && left.stateRevision === right.stateRevision
+        && left.sourceBasis.physicalRevision === right.sourceBasis.physicalRevision
+        && left.sourceBasis.projectionRevision === right.sourceBasis.projectionRevision;
+}
+
 function same_durable_authority(
     left: DurableFileAuthority,
     right: DurableFileAuthority,
@@ -140,6 +157,7 @@ function same_durable_authority(
 
 function excel_profile(): ViewerProfile {
     return {
+        metadataDelivery: 'legacy',
         editing: false,
         async build_source(raw, file_path, state) {
             const physical = file_path.toLowerCase().endsWith('.xlsx')
@@ -164,7 +182,11 @@ export function build_csv_source(raw: Uint8Array, file_path: string): Promise<Cs
 }
 
 export function csv_table_profile(): ViewerProfile {
-    return { editing: true, build_source: build_csv_source };
+    return {
+        metadataDelivery: 'workbookSnapshot',
+        editing: true,
+        build_source: build_csv_source,
+    };
 }
 
 /** Profile for a uri, by extension: csv/tsv → editable table; else Excel viewer. */
@@ -194,7 +216,10 @@ export function attach_viewer(
     const file_coordinator = acquire_file_coordinator(file_path, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
+    const uses_snapshots = profile.metadataDelivery === 'workbookSnapshot';
 
+    // Borrowed aliases are updated only at the same synchronous boundary as the
+    // session adoption. PanelSession remains the sole source/core lifecycle owner.
     let core: ViewerPanelCore | undefined;
     let source: DataSource | undefined;
     let source_authority = file_coordinator.authority();
@@ -212,9 +237,68 @@ export function attach_viewer(
         timer: ReturnType<typeof setTimeout>;
         resolve: (proceed: boolean) => void;
     }>();
+    const ready_state_retry_waits = new Set<{
+        timer: ReturnType<typeof setTimeout>;
+        resolve: (proceed: boolean) => void;
+    }>();
     let outstanding_header_settlement: HeaderSettlement | undefined;
     const edit_session_token = Symbol(file_key);
     const excel_header_subscriber_token = Symbol(file_key);
+    const released_sources = new WeakSet<DataSource>();
+    const released_cores = new WeakSet<ViewerPanelCore>();
+
+    const session = new PanelSession({
+        transportEnabled: uses_snapshots,
+        postMessage: (message) => {
+            if (!uses_snapshots) {
+                throw new Error('Legacy panels cannot emit workbookSnapshot metadata.');
+            }
+            return panel.webview.postMessage(message);
+        },
+        onNeedsResyncSource: () => { void send_reload(true); },
+        onCurrentAdoptionAcknowledged: (adoption) => {
+            if (!uses_snapshots || disposed || session.current_adoption() !== adoption) return;
+            const digest = adoption.source === 'commitReceipt'
+                ? adoption.receipt.resultingBasis.physicalDigest
+                : adoption.authority.physicalDigest;
+            for (const [index, warning] of (adoption.warnings ?? []).entries()) {
+                const basis = digest
+                    ?? (adoption.source === 'commitReceipt'
+                        ? adoption.receipt.resultingBasis.physicalRevision
+                        : adoption.authority.physicalRevision);
+                if (file_coordinator.mark_warning_seen(`${basis}:${index}:${warning}`)) {
+                    void vscode.window.showWarningMessage(warning);
+                }
+            }
+        },
+        onAdoptionReleased: (adoption) => {
+            const current = session.current_adoption();
+            let first_error: unknown;
+            if (
+                current?.resources.core !== adoption.resources.core
+                && !released_cores.has(adoption.resources.core)
+            ) {
+                released_cores.add(adoption.resources.core);
+                try {
+                    adoption.resources.core.dispose();
+                } catch (error) {
+                    first_error = error;
+                }
+            }
+            if (
+                current?.resources.source !== adoption.resources.source
+                && !released_sources.has(adoption.resources.source)
+            ) {
+                released_sources.add(adoption.resources.source);
+                try {
+                    adoption.resources.source.close();
+                } catch (error) {
+                    first_error ??= error;
+                }
+            }
+            if (first_error !== undefined) throw first_error;
+        },
+    });
 
     function owns_edit_session(): boolean {
         return active_csv_edit_sessions.get(file_key) === edit_session_token;
@@ -229,6 +313,41 @@ export function attach_viewer(
 
     function release_edit_session(): void {
         if (owns_edit_session()) active_csv_edit_sessions.delete(file_key);
+    }
+
+    /** Project durable state for this panel without mutating shared authority. */
+    function project_state_for_panel(
+        snapshot: Readonly<FileStateSnapshot>,
+        allow_claim = false,
+    ): FileStateSnapshot {
+        const state = snapshot.state as PerFileState;
+        if (!state.pendingEdits) {
+            return { revision: snapshot.revision, state };
+        }
+        if (
+            profile.editing
+            && (owns_edit_session() || (allow_claim && try_claim_edit_session()))
+        ) {
+            return { revision: snapshot.revision, state };
+        }
+        const { pendingEdits: _drop, ...rest } = state;
+        return { revision: snapshot.revision, state: rest };
+    }
+
+    function update_session_state_material(
+        snapshot: Readonly<FileStateSnapshot>,
+        allow_claim = false,
+    ): void {
+        if (!uses_snapshots) return;
+        session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
+    }
+
+    async function refresh_session_state_material(
+        allow_claim = false,
+    ): Promise<FileStateSnapshot> {
+        const snapshot = await read_file_state();
+        update_session_state_material(snapshot, allow_claim);
+        return snapshot;
     }
 
     // CSV editability flags for the meta/reload envelope. Non-editing profiles
@@ -252,19 +371,22 @@ export function attach_viewer(
         updater: (current: PerFileState) => PerFileState,
         sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
         validate?: () => boolean,
-    ): Promise<boolean> {
+    ): Promise<FileStateSnapshot | undefined> {
         let snapshot = await read_file_state();
         for (;;) {
             const current = normalize_host_state(snapshot.state, sheet_names);
             const next = updater(current);
-            if (next === current) return false;
+            if (next === current) return undefined;
             const result = await state_store.compare_and_set(
                 state_path,
                 snapshot.revision,
                 next,
                 validate,
             );
-            if (result.type === 'committed') return true;
+            if (result.type === 'committed') {
+                update_session_state_material(result.snapshot);
+                return result.snapshot;
+            }
             snapshot = result.snapshot;
         }
     }
@@ -511,6 +633,8 @@ export function attach_viewer(
         candidate: SourceCandidate,
         committed: Extract<PhysicalAuthorityCommitResult, { type: 'committed' }>,
         seq: number,
+        reason: 'ready' | 'fileReload' | 'recovery' | 'save' = 'fileReload',
+        projected_state?: FileStateSnapshot,
     ): DataSource | undefined {
         // A durable commit can finish after a newer panel-local load starts. Keep
         // ownership with the candidate unless this exact load is still current at
@@ -529,21 +653,48 @@ export function attach_viewer(
         let adopted: DataSource | undefined;
         const transferred = candidate.transfer_to((next, confirm_transfer) => {
             if (disposed || seq !== reload_seq) return;
-            const previous = source;
             const result = adopt_source_into_core(
                 core,
                 panel,
-                previous,
+                undefined,
                 next,
                 { onTransformCommit: persist_transform_commit },
                 (installed) => {
+                    const material = installed.snapshot_material();
+                    const adoption_state = project_state_for_panel(
+                        projected_state ?? committed.receipt.stateSnapshot,
+                        true,
+                    );
+                    const adoption: PanelAdoption = {
+                        source: 'commitReceipt',
+                        canonicalFileId: file_key,
+                        resources: { source: next, core: installed },
+                        receipt: committed.receipt,
+                        core: material.core,
+                        diagnostics: material.diagnostics,
+                        warnings: Object.freeze([...(next.warnings ?? [])]),
+                        reason,
+                        project: () => ({
+                            configuration: {
+                                defaultTabOrientation: get_default_orientation(),
+                                previewMode: profile.previewMode === true,
+                            },
+                            capabilities: {
+                                csvEditingSupported: profile.editing,
+                                csvEditable: profile.editing && !next.truncationMessage,
+                            },
+                            stateSnapshot: adoption_state,
+                        }),
+                    };
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
                     adopted_digest = committed.receipt.digest;
                     adoption_epoch += 1;
-                    adopted = next;
-                    confirm_transfer();
+                    session.replace_adoption(adoption, () => {
+                        confirm_transfer();
+                        adopted = next;
+                    });
                 },
             );
             if (result.type === 'refused') return;
@@ -637,6 +788,9 @@ export function attach_viewer(
         ds: DataSource,
         committed_state?: PerFileState,
     ): Promise<LegacyDeliveryResult | undefined> {
+        if (uses_snapshots) {
+            throw new Error('Snapshot panels cannot emit legacy metadata.');
+        }
         const state = await state_for_first_meta(committed_state);
         const identity = capture_legacy_delivery_identity(ds);
         if (!identity || !core) return undefined;
@@ -669,6 +823,9 @@ export function attach_viewer(
         headerRequestId?: string,
         state?: PerFileState,
     ): Promise<LegacyDeliveryResult | undefined> {
+        if (uses_snapshots) {
+            throw new Error('Snapshot panels cannot emit legacy metadata.');
+        }
         const resolved_state = state ?? (outstanding_header_settlement
             ? await state_for_reload(ds)
             : undefined);
@@ -696,6 +853,9 @@ export function attach_viewer(
         ds: DataSource,
         settlement: HeaderSettlement,
     ): Promise<LegacyDeliveryResult | undefined> {
+        if (uses_snapshots) {
+            throw new Error('Snapshot panels cannot emit legacy metadata.');
+        }
         const state = await state_for_reload(ds);
         const identity = capture_legacy_delivery_identity(ds);
         if (!identity || !core) return undefined;
@@ -779,6 +939,27 @@ export function attach_viewer(
         core = projection_adoption.core;
         source_authority = receipt.resultingBasis;
         adoption_epoch += 1;
+        const material = core.snapshot_material();
+        session.replace_adoption({
+            source: 'commitReceipt',
+            canonicalFileId: file_key,
+            resources: { source, core },
+            receipt,
+            core: material.core,
+            diagnostics: material.diagnostics,
+            warnings: Object.freeze([...(source.warnings ?? [])]),
+            reason: 'excelHeader',
+            project: () => ({
+                configuration: {
+                    defaultTabOrientation: get_default_orientation(),
+                    previewMode: false,
+                },
+                capabilities: {
+                    csvEditingSupported: false,
+                    csvEditable: false,
+                },
+            }),
+        });
         const attempts = is_origin ? HEADER_RELOAD_RETRY_COUNT : 1;
         for (let attempt = 0; attempt < attempts; attempt++) {
             if (
@@ -825,10 +1006,12 @@ export function attach_viewer(
     // queue in this phase. Edit-session ownership is separate from file authority;
     // physical/projection/layout writes use the coordinator serialization above.
     async function clear_pending_edits(): Promise<void> {
-        await update_file_state((current) => {
+        const committed = await update_file_state((current) => {
+            if (!current.pendingEdits) return current;
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
         });
+        if (!committed && uses_snapshots) await refresh_session_state_material();
     }
 
     async function send_initial_data(): Promise<void> {
@@ -845,12 +1028,27 @@ export function attach_viewer(
                 schedule_reload_retry(true, seq);
                 return;
             }
-            const ds = adopt_committed_candidate(candidate, committed, seq);
-            if (!ds) return;
-            const delivery = await send_first_meta(
-                ds,
-                state_from_physical_receipt(ds, committed.receipt),
+            const receipt_state = state_from_physical_receipt(
+                candidate.borrow(), committed.receipt,
             );
+            const initial_state = uses_snapshots
+                ? undefined
+                : await state_for_first_meta(receipt_state);
+            const projected_state = uses_snapshots
+                ? await read_file_state()
+                : {
+                    revision: committed.receipt.stateSnapshot.revision,
+                    state: initial_state!,
+                } satisfies FileStateSnapshot;
+            const ds = adopt_committed_candidate(
+                candidate, committed, seq, 'ready', projected_state,
+            );
+            if (!ds) return;
+            if (uses_snapshots) {
+                reset_reload_retry();
+                return;
+            }
+            const delivery = await send_first_meta(ds, initial_state);
             if (
                 delivery?.delivered
                 && delivery.current
@@ -874,7 +1072,9 @@ export function attach_viewer(
     // post-save read/parse failure therefore cannot invalidate the only viable
     // watcher refresh. The pre-adoption failures and later unstable-snapshot
     // failures share one bounded retry budget.
-    async function reparse_and_post(): Promise<boolean> {
+    async function reparse_and_post(
+        reason: 'fileReload' | 'save' = 'fileReload',
+    ): Promise<boolean> {
         const expected_authority = file_coordinator.authority().authorityRevision;
         let candidate: SourceCandidate | undefined;
         let attempts = 0;
@@ -901,8 +1101,15 @@ export function attach_viewer(
                 schedule_reload_retry(true, seq);
                 return false;
             }
-            const ds = adopt_committed_candidate(candidate, committed, seq);
+            const ds = adopt_committed_candidate(
+                candidate,
+                committed,
+                seq,
+                reason,
+                uses_snapshots ? await read_file_state() : undefined,
+            );
             if (!ds) return false;
+            if (uses_snapshots) return true;
             let delivery: LegacyDeliveryResult | undefined;
             try {
                 delivery = await post_reload(
@@ -993,8 +1200,13 @@ export function attach_viewer(
             if (
                 !force
                 && outstanding_header_settlement === undefined
-                && candidate.observation.digest === delivered_identity?.digest
-                && metadata_is_delivered()
+                && (
+                    uses_snapshots
+                        ? candidate.observation.digest
+                            === session.acknowledged_physical_digest()
+                        : candidate.observation.digest === delivered_identity?.digest
+                            && metadata_is_delivered()
+                )
             ) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, seq, expected_authority, true,
@@ -1013,7 +1225,17 @@ export function attach_viewer(
                 if (!header_recovery) schedule_reload_retry(force, seq);
                 return delivered;
             }
-            if (!adopt_committed_candidate(candidate, committed, seq)) return false;
+            if (!adopt_committed_candidate(
+                candidate,
+                committed,
+                seq,
+                header_recovery ? 'recovery' : 'fileReload',
+                uses_snapshots ? await read_file_state() : undefined,
+            )) return false;
+            if (uses_snapshots) {
+                reset_reload_retry();
+                return true;
+            }
             if (!initial_meta_sent) {
                 const delivery = await send_first_meta(
                     ds,
@@ -1082,6 +1304,64 @@ export function attach_viewer(
             terminal_retry_waits.delete(wait);
             wait.resolve(false);
         }
+    }
+
+    function wait_for_ready_state_retry(ms: number): Promise<boolean> {
+        if (disposed) return Promise.resolve(false);
+        return new Promise((resolve) => {
+            const wait = {
+                timer: undefined as unknown as ReturnType<typeof setTimeout>,
+                resolve,
+            };
+            wait.timer = setTimeout(() => {
+                ready_state_retry_waits.delete(wait);
+                resolve(true);
+            }, ms);
+            ready_state_retry_waits.add(wait);
+        });
+    }
+
+    function cancel_ready_state_retry_waits(): void {
+        for (const wait of [...ready_state_retry_waits]) {
+            clearTimeout(wait.timer);
+            ready_state_retry_waits.delete(wait);
+            wait.resolve(false);
+        }
+    }
+
+    async function read_state_for_ready_epoch(
+        receiver_epoch: number,
+    ): Promise<FileStateSnapshot | undefined> {
+        for (let attempt = 0; attempt <= READY_STATE_RETRY_COUNT; attempt += 1) {
+            if (
+                disposed
+                || !session.ready_epoch_is_current(receiver_epoch)
+            ) return undefined;
+            try {
+                return await read_file_state();
+            } catch (error) {
+                if (
+                    disposed
+                    || !session.ready_epoch_is_current(receiver_epoch)
+                ) return undefined;
+                if (attempt === READY_STATE_RETRY_COUNT) {
+                    console.error(
+                        'Failed to refresh table viewer state before ready; using retained state',
+                        error,
+                    );
+                    return undefined;
+                }
+                const proceed = await wait_for_ready_state_retry(
+                    READY_STATE_RETRY_MS * (2 ** attempt),
+                );
+                if (
+                    !proceed
+                    || disposed
+                    || !session.ready_epoch_is_current(receiver_epoch)
+                ) return undefined;
+            }
+        }
+        return undefined;
     }
 
     function publish_header_settlement(
@@ -1208,10 +1488,19 @@ export function attach_viewer(
             return;
         }
         try {
-            const expected_digest = adopted_digest;
+            const current_adoption = session.current_adoption();
+            const expected_digest = uses_snapshots
+                ? session.acknowledged_physical_digest()
+                : adopted_digest;
             if (
                 expected_digest === undefined
-                || !metadata_is_delivered()
+                || (uses_snapshots
+                    ? !session.acknowledged_current()
+                        || current_adoption?.resources.source !== source
+                        || current_adoption.resources.core !== core
+                        || source_authority.authorityRevision
+                            !== file_coordinator.authority().authorityRevision
+                    : !metadata_is_delivered())
             ) {
                 vscode.window.showWarningMessage(
                     'The table view is still refreshing. Please try saving again.');
@@ -1241,7 +1530,18 @@ export function attach_viewer(
             const verified_stat = await vscode.workspace.fs.stat(uri);
             const snapshot_changed = current_stat.mtime !== verified_stat.mtime
                 || current_stat.size !== verified_stat.size;
-            if (snapshot_changed || content_digest(current_raw) !== expected_digest) {
+            if (
+                snapshot_changed
+                || content_digest(current_raw) !== expected_digest
+                || (uses_snapshots && (
+                    !session.acknowledged_current()
+                    || session.current_adoption() !== current_adoption
+                    || current_adoption?.resources.source !== src
+                    || current_adoption.resources.core !== core
+                    || source_authority.authorityRevision
+                        !== file_coordinator.authority().authorityRevision
+                ))
+            ) {
                 vscode.window.showWarningMessage(
                     'File was modified externally. Please review the changes and try again.');
                 try {
@@ -1253,17 +1553,19 @@ export function attach_viewer(
                 return;
             }
             await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
+            // Clear edit state before creating the post-save adoption so neither a
+            // replayed delivery nor a new ready epoch can restore saved edits.
+            await clear_pending_edits();
             // The write succeeded — the save is done. A failure to re-parse the
             // just-written file (a transient read error, or an external delete in
             // the TOCTOU window) must not be reported as a failed save: the bytes
             // are on disk. The adopted digest changes only after a successful reparse, so
             // the watcher event from our own write still refreshes the grid here.
             try {
-                await reparse_and_post();
+                await reparse_and_post('save');
             } catch (reload_err) {
                 console.error('Post-save reload failed (file was written)', reload_err);
             }
-            await clear_pending_edits();
             panel.webview.postMessage({ type: 'saveResult', success: true });
         } catch (err) {
             vscode.window.showErrorMessage(
@@ -1274,13 +1576,55 @@ export function attach_viewer(
 
     disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
         if (disposed) return;
+        if (
+            uses_snapshots
+            && msg.type !== 'ready'
+            && msg.type !== 'snapshotApplied'
+            && msg.type !== 'showWarning'
+        ) {
+            session.wake_delivery();
+        }
         switch (msg.type) {
-            case 'ready':
+            case 'ready': {
                 ready_seen = true;
-                await send_initial_data();
+                if (!uses_snapshots) {
+                    const ready = session.ready();
+                    if (ready.type === 'needsInitialSource') await send_initial_data();
+                    return;
+                }
+                const begun = session.begin_ready();
+                if (begun.hasSource) {
+                    const state_snapshot = await read_state_for_ready_epoch(
+                        begun.receiverEpoch,
+                    );
+                    if (
+                        disposed
+                        || !session.ready_epoch_is_current(begun.receiverEpoch)
+                    ) return;
+                    if (state_snapshot) {
+                        update_session_state_material(state_snapshot, true);
+                    }
+                }
+                const ready = session.complete_ready(begun.receiverEpoch);
+                if (ready.type === 'needsInitialSource') await send_initial_data();
+                return;
+            }
+            case 'snapshotApplied':
+                if (uses_snapshots) {
+                    session.handle_snapshot_applied(msg.identity, msg.disposition);
+                }
                 return;
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
+                const acknowledged_identity = uses_snapshots
+                    ? session.acknowledged_identity()
+                    : undefined;
+                const native_identity_is_current = !uses_snapshots || (
+                    msg.snapshotIdentity !== undefined
+                    && acknowledged_identity !== undefined
+                    && same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity)
+                );
+                if (!native_identity_is_current) return;
                 await update_file_state((current) => {
                         if (
                             disposed
@@ -1288,6 +1632,14 @@ export function attach_viewer(
                             || !file_coordinator.state_write_is_current(expected_authority)
                             || source_authority.authorityRevision !== expected_authority
                             || msg.sourceGeneration !== core.source_generation
+                            || (uses_snapshots && (
+                                msg.snapshotIdentity === undefined
+                                || session.acknowledged_identity() === undefined
+                                || !same_snapshot_identity(
+                                    msg.snapshotIdentity,
+                                    session.acknowledged_identity()!,
+                                )
+                            ))
                         ) {
                             return current;
                         }
@@ -1314,15 +1666,13 @@ export function attach_viewer(
                                 transform_schema_for_sheet(sheet),
                             ))
                         : current_visibility;
-                    // Pending edits are host-owned for editable profiles. Preserve
-                    // the current map when present, and delete stale snapshots after
-                    // save/discard has durably cleared it.
-                    if (profile.editing) {
-                        if (current.pendingEdits) {
-                            next.pendingEdits = current.pendingEdits;
-                        } else {
-                            delete next.pendingEdits;
-                        }
+                    // Pending edits are host-owned for every profile. Only the
+                    // edit-session owner path may change them; previews/nonowners
+                    // cannot resurrect a cleared durable map.
+                    if (current.pendingEdits) {
+                        next.pendingEdits = current.pendingEdits;
+                    } else {
+                        delete next.pendingEdits;
                     }
                     // Excel header overrides are host-owned. A delayed debounced
                     // layout snapshot from this or another tab must not undo one.
@@ -1347,6 +1697,14 @@ export function attach_viewer(
                     && file_coordinator.state_write_is_current(expected_authority)
                     && source_authority.authorityRevision === expected_authority
                     && msg.sourceGeneration === core?.source_generation
+                    && (!uses_snapshots || (
+                        msg.snapshotIdentity !== undefined
+                        && session.acknowledged_identity() !== undefined
+                        && same_snapshot_identity(
+                            msg.snapshotIdentity,
+                            session.acknowledged_identity()!,
+                        )
+                    ))
                 ));
                 return;
             }
@@ -1449,8 +1807,10 @@ export function attach_viewer(
                     && !source.truncationMessage
                     && (core?.has_transform_work ?? false);
                 const granted = can_edit && !denied_by_owner && try_claim_edit_session();
+                const edit_state = granted ? await read_file_state() : undefined;
+                if (edit_state) update_session_state_material(edit_state);
                 const pendingEdits = granted
-                    ? ((await read_file_state()).state as PerFileState).pendingEdits
+                    ? (edit_state?.state as PerFileState | undefined)?.pendingEdits
                     : undefined;
                 panel.webview.postMessage({
                     type: 'editSessionResult',
@@ -1485,7 +1845,10 @@ export function attach_viewer(
                 }
                 return;
             case 'releaseEditSession':
-                if (profile.editing) release_edit_session();
+                if (profile.editing) {
+                    release_edit_session();
+                    if (uses_snapshots) await refresh_session_state_material(false);
+                }
                 return;
             case 'discardEditSession':
                 if (profile.editing && owns_edit_session()) {
@@ -1528,6 +1891,11 @@ export function attach_viewer(
                 return;
             }
             default:
+                if (
+                    msg.type === 'visibleRowChanged'
+                    && uses_snapshots
+                    && !session.acknowledged_current()
+                ) return;
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
         }
@@ -1537,8 +1905,12 @@ export function attach_viewer(
     const basename = path.basename(file_path);
     const watcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), basename));
-    disposables.push(watcher.onDidChange(() => send_reload()));
-    disposables.push(watcher.onDidCreate(() => send_reload()));
+    const handle_watcher_event = () => {
+        if (uses_snapshots) session.wake_delivery();
+        return send_reload();
+    };
+    disposables.push(watcher.onDidChange(handle_watcher_event));
+    disposables.push(watcher.onDidCreate(handle_watcher_event));
     disposables.push(watcher);
 
     return {
@@ -1548,6 +1920,7 @@ export function attach_viewer(
             reload_seq++;
             reset_reload_retry();
             cancel_terminal_retry_waits();
+            cancel_ready_state_retry_waits();
             outstanding_header_settlement = undefined;
             let first_error: unknown;
             const cleanup = (action: () => void) => {
@@ -1558,8 +1931,9 @@ export function attach_viewer(
                 }
             };
             cleanup(release_edit_session);
-            cleanup(() => core?.dispose());
-            cleanup(() => source?.close());
+            cleanup(() => session.dispose());
+            core = undefined;
+            source = undefined;
             for (const d of disposables) cleanup(() => d.dispose());
             cleanup(() => file_coordinator.dispose());
             if (first_error !== undefined) throw first_error;
