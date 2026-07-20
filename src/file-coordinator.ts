@@ -1,0 +1,538 @@
+import * as path from 'path';
+import type { ExcelHeaderPlanningInput } from './data-source/excel-header-source';
+import type { ExcelHeaderOverride } from './data-source/interface';
+import { normalize_host_state, plan_excel_override_state } from './excel-header-plan';
+import type {
+    AuthorityFileStateStore,
+    DurableFileAuthority,
+} from './state';
+import type { PerFileState } from './types';
+import { reconcile_finalization } from './finalization-reconciliation';
+import {
+    cleanup_authority,
+    discard_authority,
+    finalize_authority,
+    read_authority,
+    release_authority_fallback,
+    stage_authority,
+} from './state-authority';
+
+export interface FileAuthoritySnapshot extends DurableFileAuthority {
+    readonly fileKey: string;
+}
+
+export interface AuthorityOperationToken {
+    readonly ordinal: number;
+    readonly kind: 'physical' | 'projection';
+    readonly basis: FileAuthoritySnapshot;
+    readonly id: string;
+}
+
+export type AuthorityOperationStart =
+    | { readonly type: 'started'; readonly token: AuthorityOperationToken }
+    | { readonly type: 'rejected'; readonly basis: FileAuthoritySnapshot };
+
+export interface AuthorityCommitTurn {
+    readonly operationOrdinal: number;
+}
+
+export type AuthorityCommitTurnResult =
+    | { readonly type: 'granted'; readonly turn: AuthorityCommitTurn }
+    | { readonly type: 'rejected' };
+
+export interface ExcelHeaderOperationReceipt {
+    readonly requestId: string;
+    readonly sheetIndex: number;
+    readonly sheetName: string;
+    readonly override: ExcelHeaderOverride;
+    readonly originToken: symbol;
+    readonly operationOrdinal: number;
+    readonly previousBasis: FileAuthoritySnapshot;
+    readonly resultingBasis: FileAuthoritySnapshot;
+    readonly stateRevision: number;
+    readonly state: PerFileState;
+}
+
+export type ExcelHeaderCommitResult =
+    | { readonly type: 'committed'; readonly receipt: ExcelHeaderOperationReceipt }
+    | { readonly type: 'rejected'; readonly error: string };
+
+export interface CommitExcelHeaderCommand {
+    readonly requestId: string;
+    readonly sheetIndex: number;
+    readonly sheetName: string;
+    readonly override: ExcelHeaderOverride;
+    readonly originToken: symbol;
+    readonly expectedPhysicalRevision: number;
+    readonly planningInput: ExcelHeaderPlanningInput;
+    readonly stateStore: AuthorityFileStateStore;
+}
+
+export type ExcelHeaderSubscriber = (receipt: ExcelHeaderOperationReceipt) => void | Promise<void>;
+
+interface OperationState {
+    valid: boolean;
+    requested: boolean;
+    readonly digest?: string;
+}
+
+interface TurnInternal extends AuthorityCommitTurn {
+    readonly token: AuthorityOperationToken;
+    phase: 'granted' | 'finalizing';
+}
+
+interface TurnRequest {
+    readonly token: AuthorityOperationToken;
+    readonly resolve: (result: AuthorityCommitTurnResult) => void;
+}
+
+interface FileCoordinatorEntry {
+    readonly fileKey: string;
+    readonly statePath: string;
+    readonly platform: NodeJS.Platform;
+    stateReady: Promise<void>;
+    readonly aliases: Set<string>;
+    attachments: number;
+    operations: number;
+    nextOrdinal: number;
+    authority: DurableFileAuthority;
+    readonly states: Map<AuthorityOperationToken, OperationState>;
+    readonly requests: Map<AuthorityOperationToken, TurnRequest>;
+    activeTurn?: TurnInternal;
+    readonly subscribers: Set<ExcelHeaderSubscriber>;
+    readonly warnedKeys: Set<string>;
+}
+
+const entries = new Map<string, FileCoordinatorEntry>();
+
+export function canonical_file_key(
+    file_path: string,
+    platform: NodeJS.Platform = process.platform,
+): string {
+    return platform === 'win32'
+        ? path.win32.normalize(path.win32.resolve(file_path)).toLowerCase()
+        : path.posix.normalize(path.posix.resolve(file_path));
+}
+
+function snapshot(entry: FileCoordinatorEntry): FileAuthoritySnapshot {
+    return Object.freeze({ fileKey: entry.fileKey, ...structuredClone(entry.authority) });
+}
+
+function cleanup(entry: FileCoordinatorEntry): void {
+    if (
+        entry.attachments === 0
+        && entry.operations === 0
+        && entry.subscribers.size === 0
+        && entries.get(entry.fileKey) === entry
+    ) {
+        entries.delete(entry.fileKey);
+        release_authority_fallback(entry.statePath);
+    }
+}
+
+function entry_for(file_path: string, platform: NodeJS.Platform): FileCoordinatorEntry {
+    const fileKey = canonical_file_key(file_path, platform);
+    let entry = entries.get(fileKey);
+    if (!entry) {
+        entry = {
+            fileKey,
+            statePath: fileKey,
+            platform,
+            stateReady: Promise.resolve(),
+            aliases: new Set(),
+            attachments: 0,
+            operations: 0,
+            nextOrdinal: 1,
+            authority: {
+                commitSequence: 0,
+                authorityRevision: 0,
+                physicalRevision: 0,
+                projectionRevision: 0,
+            },
+            states: new Map(),
+            requests: new Map(),
+            subscribers: new Set(),
+            warnedKeys: new Set(),
+        };
+        entries.set(fileKey, entry);
+    }
+    return entry;
+}
+
+function register_store(
+    entry: FileCoordinatorEntry,
+    raw_path: string,
+    store: AuthorityFileStateStore | undefined,
+): void {
+    if (!store || entry.aliases.has(raw_path)) return;
+    entry.aliases.add(raw_path);
+    entry.operations += 1;
+    const work = entry.stateReady.catch(() => {}).then(async () => {
+        await store.canonicalize_path?.(
+            entry.statePath,
+            (candidate) => canonical_file_key(candidate, entry.platform),
+        );
+        if (raw_path !== entry.statePath) {
+            const [stable, alias] = await Promise.all([
+                store.read(entry.statePath),
+                store.read(raw_path),
+            ]);
+            if (Object.keys(stable.state).length === 0 && Object.keys(alias.state).length > 0) {
+                await store.compare_and_set(entry.statePath, stable.revision, alias.state as PerFileState);
+            }
+        }
+        entry.authority = await read_authority(store, entry.statePath);
+        void cleanup_authority(store, entry.statePath).catch(() => {});
+    });
+    entry.stateReady = work.finally(() => {
+        entry.operations -= 1;
+        cleanup(entry);
+    });
+}
+
+function activate_turn(entry: FileCoordinatorEntry): void {
+    if (entry.activeTurn) return;
+    const request = [...entry.requests.values()]
+        .filter(({ token }) => entry.states.get(token)?.valid)
+        .sort((a, b) => a.token.ordinal - b.token.ordinal)[0];
+    if (!request) return;
+    entry.requests.delete(request.token);
+    const turn: TurnInternal = {
+        operationOrdinal: request.token.ordinal,
+        token: request.token,
+        phase: 'granted',
+    };
+    entry.activeTurn = turn;
+    request.resolve({ type: 'granted', turn });
+}
+
+function finish(entry: FileCoordinatorEntry, token: AuthorityOperationToken): void {
+    const state = entry.states.get(token);
+    if (!state) return;
+    const request = entry.requests.get(token);
+    if (request) {
+        entry.requests.delete(token);
+        request.resolve({ type: 'rejected' });
+    }
+    entry.states.delete(token);
+    entry.operations -= 1;
+    activate_turn(entry);
+    cleanup(entry);
+}
+
+function invalidate(entry: FileCoordinatorEntry, physical_change: boolean): void {
+    for (const [token, state] of entry.states) {
+        if (!state.valid || entry.activeTurn?.token === token) continue;
+        if (token.kind === 'physical' || (token.kind === 'projection' && physical_change)) {
+            state.valid = false;
+            const request = entry.requests.get(token);
+            if (request) {
+                entry.requests.delete(token);
+                request.resolve({ type: 'rejected' });
+            }
+            void token;
+        }
+    }
+    activate_turn(entry);
+}
+
+export interface FileCoordinatorAttachment {
+    readonly statePath: string;
+    authority(): FileAuthoritySnapshot;
+    state_ready(): Promise<void>;
+    begin_physical(expectedAuthorityRevision: number, digest: string): AuthorityOperationStart;
+    operation_is_current(token: AuthorityOperationToken): boolean;
+    state_write_is_current(authorityRevision: number): boolean;
+    request_commit_turn(token: AuthorityOperationToken): Promise<AuthorityCommitTurnResult>;
+    start_finalization(turn: AuthorityCommitTurn): void;
+    install_finalized_authority(
+        token: AuthorityOperationToken,
+        turn: AuthorityCommitTurn,
+        authority: DurableFileAuthority,
+    ): FileAuthoritySnapshot;
+    release_commit_turn(turn: AuthorityCommitTurn): void;
+    cancel(token: AuthorityOperationToken): void;
+    commit_excel_header(command: CommitExcelHeaderCommand): Promise<ExcelHeaderCommitResult>;
+    subscribe_excel_headers(listener: ExcelHeaderSubscriber): { dispose(): void };
+    mark_warning_seen(key: string): boolean;
+    dispose(): void;
+}
+
+export function acquire_file_coordinator(
+    file_path: string,
+    state_store?: AuthorityFileStateStore,
+    platform: NodeJS.Platform = process.platform,
+): FileCoordinatorAttachment {
+    const entry = entry_for(file_path, platform);
+    entry.attachments += 1;
+    register_store(entry, file_path, state_store);
+    let disposed = false;
+
+    const attachment: FileCoordinatorAttachment = {
+        statePath: entry.statePath,
+        authority: () => snapshot(entry),
+        state_ready: () => entry.stateReady,
+
+        begin_physical(expectedAuthorityRevision, digest) {
+            const basis = snapshot(entry);
+            if (
+                basis.authorityRevision !== expectedAuthorityRevision
+                && basis.physicalDigest !== digest
+            ) return { type: 'rejected', basis };
+            invalidate(entry, basis.physicalDigest !== digest);
+            const token = Object.freeze({
+                ordinal: entry.nextOrdinal++,
+                kind: 'physical' as const,
+                basis,
+                id: `physical:${entry.fileKey}:${Date.now()}:${Math.random()}`,
+            });
+            entry.states.set(token, { valid: true, requested: false, digest });
+            entry.operations += 1;
+            return { type: 'started', token };
+        },
+
+        operation_is_current(token) {
+            return entry.states.get(token)?.valid === true;
+        },
+
+        state_write_is_current(authorityRevision) {
+            return entry.authority.authorityRevision === authorityRevision
+                && entry.activeTurn?.phase !== 'finalizing';
+        },
+
+        request_commit_turn(token) {
+            const state = entry.states.get(token);
+            if (!state?.valid) return Promise.resolve({ type: 'rejected' });
+            state.requested = true;
+            return new Promise<AuthorityCommitTurnResult>((resolve) => {
+                entry.requests.set(token, { token, resolve });
+                activate_turn(entry);
+            });
+        },
+
+        start_finalization(turn) {
+            if (entry.activeTurn !== turn || entry.activeTurn.phase !== 'granted') {
+                throw new Error('The authority commit turn cannot begin finalization.');
+            }
+            entry.activeTurn.phase = 'finalizing';
+        },
+
+        install_finalized_authority(token, turn, authority) {
+            if (entry.activeTurn !== turn || entry.activeTurn.token !== token) {
+                throw new Error('The authority commit turn is no longer active.');
+            }
+            entry.authority = structuredClone(authority);
+            entry.activeTurn = undefined;
+            finish(entry, token);
+            return snapshot(entry);
+        },
+
+        release_commit_turn(turn) {
+            if (entry.activeTurn !== turn) return;
+            entry.activeTurn = undefined;
+            activate_turn(entry);
+        },
+
+        cancel(token) {
+            if (
+                entry.activeTurn?.token === token
+                && entry.activeTurn.phase === 'finalizing'
+            ) return;
+            if (entry.activeTurn?.token === token) entry.activeTurn = undefined;
+            finish(entry, token);
+        },
+
+        async commit_excel_header(command) {
+            await entry.stateReady;
+            const basis = snapshot(entry);
+            if (basis.physicalRevision !== command.expectedPhysicalRevision) {
+                return { type: 'rejected', error: 'The worksheet changed before the header request arrived.' };
+            }
+            for (const [older, state] of entry.states) {
+                if (
+                    older.kind === 'projection'
+                    && state.valid
+                    && !state.requested
+                    && entry.activeTurn?.token !== older
+                ) {
+                    state.valid = false;
+                    const waiting = entry.requests.get(older);
+                    if (waiting) {
+                        entry.requests.delete(older);
+                        waiting.resolve({ type: 'rejected' });
+                    }
+                }
+            }
+            const token = Object.freeze({
+                ordinal: entry.nextOrdinal++,
+                kind: 'projection' as const,
+                basis,
+                id: `projection:${entry.fileKey}:${command.requestId}:${Math.random()}`,
+            });
+            entry.states.set(token, { valid: true, requested: false });
+            entry.operations += 1;
+            let receipt: ExcelHeaderOperationReceipt | undefined;
+            try {
+                const names = command.planningInput.sheets.map((sheet) => sheet.name);
+                for (;;) {
+                    if (!attachment.operation_is_current(token)) {
+                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                    }
+                    const state_snapshot = await command.stateStore.read(entry.statePath);
+                    const plan = plan_excel_override_state(
+                        normalize_host_state(state_snapshot.state, names),
+                        command.planningInput,
+                        command.sheetIndex,
+                        command.sheetName,
+                        command.override,
+                    );
+                    if (!plan) return { type: 'rejected', error: 'The selected worksheet no longer matches this request.' };
+                    const stage = await stage_authority(
+                        command.stateStore,
+                        entry.statePath,
+                        {
+                            id: token.id,
+                            kind: 'projection',
+                            ordinal: token.ordinal,
+                            expectedStateRevision: state_snapshot.revision,
+                            expectedCommitSequence: attachment.authority().commitSequence,
+                            nextState: plan.state,
+                        },
+                    );
+                    if (stage.type === 'conflict') continue;
+                    const requested = await attachment.request_commit_turn(token);
+                    if (requested.type === 'rejected') {
+                        void discard_authority(command.stateStore, entry.statePath, token.id);
+                        return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
+                    }
+                    const finalizationBasis = attachment.authority();
+                    const descriptor = {
+                        transactionId: token.id,
+                        kind: 'projection' as const,
+                        basis: finalizationBasis,
+                        expectedStateRevision: state_snapshot.revision,
+                        previousState: state_snapshot.state,
+                        nextState: plan.state,
+                    };
+                    attachment.start_finalization(requested.turn);
+                    let finalized: Awaited<ReturnType<typeof finalize_authority>>;
+                    try {
+                        finalized = await finalize_authority(
+                            command.stateStore,
+                            entry.statePath,
+                            token.id,
+                        );
+                    } catch (error) {
+                        const reconciled = await reconcile_finalization(
+                            command.stateStore,
+                            entry.statePath,
+                            descriptor,
+                        );
+                        if (reconciled.type === 'committed') {
+                            finalized = {
+                                type: 'finalized',
+                                snapshot: reconciled.snapshot,
+                                authority: reconciled.authority,
+                            };
+                        } else if (reconciled.type === 'advanced') {
+                            attachment.install_finalized_authority(
+                                token,
+                                requested.turn,
+                                reconciled.authority,
+                            );
+                            return {
+                                type: 'rejected',
+                                error: 'The durable workbook advanced during header finalization.',
+                            };
+                        } else {
+                            attachment.release_commit_turn(requested.turn);
+                            void discard_authority(command.stateStore, entry.statePath, token.id);
+                            throw error;
+                        }
+                    }
+                    if (finalized.type === 'conflict') {
+                        attachment.release_commit_turn(requested.turn);
+                        const state = entry.states.get(token);
+                        if (state) state.requested = false;
+                        const newer = [...entry.states.entries()].some(([candidate, candidate_state]) => (
+                            candidate.kind === 'projection'
+                            && candidate.ordinal > token.ordinal
+                            && candidate_state.valid
+                        ));
+                        if (newer) {
+                            if (state) state.valid = false;
+                            void discard_authority(command.stateStore, entry.statePath, token.id);
+                            return { type: 'rejected', error: 'A newer header setting superseded this request.' };
+                        }
+                        continue;
+                    }
+                    const previousBasis = attachment.authority();
+                    const resultingBasis = attachment.install_finalized_authority(
+                        token,
+                        requested.turn,
+                        finalized.authority,
+                    );
+                    receipt = Object.freeze({
+                        requestId: command.requestId,
+                        sheetIndex: command.sheetIndex,
+                        sheetName: command.sheetName,
+                        override: command.override,
+                        originToken: command.originToken,
+                        operationOrdinal: token.ordinal,
+                        previousBasis,
+                        resultingBasis,
+                        stateRevision: finalized.snapshot.revision,
+                        state: finalized.snapshot.state as PerFileState,
+                    });
+                    return { type: 'committed', receipt };
+                }
+            } catch (error) {
+                if (entry.activeTurn?.token === token) {
+                    attachment.release_commit_turn(entry.activeTurn);
+                }
+                throw error;
+            } finally {
+                if (entry.states.has(token)) finish(entry, token);
+                if (receipt) {
+                    for (const subscriber of [...entry.subscribers]) {
+                        try {
+                            void Promise.resolve(subscriber(receipt)).catch((error) => {
+                                console.error('Failed to refresh an Excel header view', error);
+                            });
+                        } catch (error) {
+                            console.error('Failed to refresh an Excel header view', error);
+                        }
+                    }
+                }
+            }
+        },
+
+        subscribe_excel_headers(listener) {
+            entry.subscribers.add(listener);
+            return {
+                dispose() {
+                    entry.subscribers.delete(listener);
+                    cleanup(entry);
+                },
+            };
+        },
+
+        mark_warning_seen(key) {
+            if (entry.warnedKeys.has(key)) return false;
+            entry.warnedKeys.add(key);
+            return true;
+        },
+
+        dispose() {
+            if (disposed) return;
+            disposed = true;
+            entry.attachments = Math.max(0, entry.attachments - 1);
+            cleanup(entry);
+        },
+    };
+    return attachment;
+}
+
+export function file_coordinator_registry_size(): number {
+    return entries.size;
+}

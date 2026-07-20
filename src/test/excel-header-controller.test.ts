@@ -14,6 +14,7 @@ import type {
 import type { FileStateStore } from '../state';
 import type { PerFileState, StoredPerFileState } from '../types';
 import * as vscode_mock from './mocks/vscode';
+import { with_in_memory_authority_transactions } from '../state-authority';
 
 const HEADER_RELOAD_RETRY_TEST_MS = 250;
 
@@ -165,7 +166,7 @@ function open_excel(
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file(path) as unknown as vscode.Uri,
-        store,
+        with_in_memory_authority_transactions(store),
         profile,
     );
     panel.onDidDispose(() => controller.dispose());
@@ -589,6 +590,213 @@ describe('Excel first-row header controller', () => {
             excelFirstRowHeaderVersion: 1,
         });
         expect(state.commit_count()).toBe(commits_before_stale_candidate + 1);
+    });
+
+    it('orders a leased migration before a newer physical replan', async () => {
+        const original: StoredPerFileState = {
+            rowHeights: [{ 0: 44 }],
+            scrollPosition: [{ top: 100, left: 20 }],
+            transforms: [{
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [],
+                schema: '["People",2,null]',
+            }],
+            columnVisibility: [{ hiddenColumns: [1], schema: '["People",2,null]' }],
+            excelFirstRowHeaderActive: { People: false },
+            excelFirstRowHeaderVersion: 1,
+        };
+        let persisted = structuredClone(original);
+        let revision = 0;
+        let gate_migration = false;
+        let release_migration!: () => void;
+        const migration_gate = new Promise<void>((resolve) => {
+            release_migration = resolve;
+        });
+        let mark_migration_started!: () => void;
+        const migration_started = new Promise<void>((resolve) => {
+            mark_migration_started = resolve;
+        });
+        const store: FileStateStore = {
+            async read() {
+                return { state: structuredClone(persisted), revision };
+            },
+            async compare_and_set(_path, expected, next, validate) {
+                if (gate_migration) {
+                    gate_migration = false;
+                    mark_migration_started();
+                    await migration_gate;
+                }
+                if (expected !== revision || validate?.() === false) {
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(persisted), revision },
+                    };
+                }
+                persisted = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(persisted), revision },
+                };
+            },
+            async touch() {},
+        };
+        const ambiguous_rows = [
+            [text('Name'), text('City')],
+            [text('Alice'), text('London')],
+            [text('Bob'), text('Paris')],
+        ];
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source(raw, _path, current) {
+                return new ExcelHeaderDataSource(
+                    raw[0] === 2
+                        ? new PhysicalExcelSource()
+                        : new PhysicalExcelSource(ambiguous_rows),
+                    current.excelFirstRowHeaders,
+                );
+            },
+        };
+        const file_path = '/tmp/stale-candidate-migration.xlsx';
+        const first = open_excel(file_path, store, profile);
+        const second = open_excel(file_path, store, profile);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+
+        vscode_mock.__setStatImplementation(async () => ({ size: 10, mtime: 2 }));
+        let mark_newer_verified!: () => void;
+        const newer_verified = new Promise<void>((resolve) => {
+            mark_newer_verified = resolve;
+        });
+        let reads = 0;
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads === 4) mark_newer_verified();
+            return new Uint8Array([reads <= 2 ? 2 : 3]);
+        });
+        const close_spy = vi.spyOn(PhysicalExcelSource.prototype, 'close');
+        gate_migration = true;
+        const stale_reload = vscode_mock.__getWatchers()[0].__fireChange();
+        await migration_started;
+
+        // The older operation already owns the durable commit lease. The newer
+        // verified candidate queues, then replans from the committed state.
+        const newer_reload = vscode_mock.__getWatchers()[1].__fireChange();
+        await newer_verified;
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        release_migration();
+        await Promise.all([stale_reload, newer_reload]);
+
+        expect(persisted).toMatchObject({
+            rowHeights: [undefined],
+            scrollPosition: [undefined],
+            excelFirstRowHeaderActive: { People: false },
+            excelFirstRowHeaderVersion: 1,
+        });
+        expect(close_spy).toHaveBeenCalled();
+        const latest = messages_of(second, 'metaReload').at(-1)!;
+        expect(latest.meta.sheets[0].excelFirstRowHeader.active).toBe(false);
+    });
+
+    it('orders blocked B before a newer candidate reverts to digest A', async () => {
+        const original: StoredPerFileState = {
+            rowHeights: [{ 0: 44 }],
+            scrollPosition: [{ top: 100, left: 20 }],
+            excelFirstRowHeaderActive: { People: false },
+            excelFirstRowHeaderVersion: 1,
+        };
+        let persisted = structuredClone(original);
+        let revision = 0;
+        let gate_migration = false;
+        let release_migration!: () => void;
+        const migration_gate = new Promise<void>((resolve) => {
+            release_migration = resolve;
+        });
+        let mark_migration_started!: () => void;
+        const migration_started = new Promise<void>((resolve) => {
+            mark_migration_started = resolve;
+        });
+        const store: FileStateStore = {
+            async read() {
+                return { state: structuredClone(persisted), revision };
+            },
+            async compare_and_set(_path, expected, next, validate) {
+                if (gate_migration) {
+                    gate_migration = false;
+                    mark_migration_started();
+                    await migration_gate;
+                }
+                if (expected !== revision || validate?.() === false) {
+                    return {
+                        type: 'conflict',
+                        snapshot: { state: structuredClone(persisted), revision },
+                    };
+                }
+                persisted = structuredClone(next);
+                revision += 1;
+                return {
+                    type: 'committed',
+                    snapshot: { state: structuredClone(persisted), revision },
+                };
+            },
+            async touch() {},
+        };
+        const ambiguous_rows = [
+            [text('Name'), text('City')],
+            [text('Alice'), text('London')],
+            [text('Bob'), text('Paris')],
+        ];
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source(raw, _path, current) {
+                return new ExcelHeaderDataSource(
+                    raw[0] === 2
+                        ? new PhysicalExcelSource()
+                        : new PhysicalExcelSource(ambiguous_rows),
+                    current.excelFirstRowHeaders,
+                );
+            },
+        };
+        const file_path = '/tmp/reverted-candidate-migration.xlsx';
+        const first = open_excel(file_path, store, profile);
+        const second = open_excel(file_path, store, profile);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+
+        vscode_mock.__setStatImplementation(async () => ({ size: 10, mtime: 2 }));
+        let mark_revert_verified!: () => void;
+        const revert_verified = new Promise<void>((resolve) => {
+            mark_revert_verified = resolve;
+        });
+        let reads = 0;
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads === 4) mark_revert_verified();
+            return new Uint8Array([reads <= 2 ? 2 : 1]);
+        });
+        const close_spy = vi.spyOn(PhysicalExcelSource.prototype, 'close');
+        gate_migration = true;
+        const blocked_b = vscode_mock.__getWatchers()[0].__fireChange();
+        await migration_started;
+
+        // B owns the lease, so the newer A operation queues. After B commits,
+        // A replans from B's state and restores the effective A projection.
+        const reverted_a = vscode_mock.__getWatchers()[1].__fireChange();
+        await revert_verified;
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        release_migration();
+        await Promise.all([blocked_b, reverted_a]);
+
+        expect(persisted).toMatchObject({
+            rowHeights: [undefined],
+            scrollPosition: [undefined],
+            excelFirstRowHeaderActive: { People: false },
+            excelFirstRowHeaderVersion: 1,
+        });
+        expect(close_spy).toHaveBeenCalled();
+        const latest = messages_of(second, 'metaReload').at(-1)
+            ?? messages_of(second, 'sheetMeta').at(-1)!;
+        expect(latest.meta.sheets[0].excelFirstRowHeader.active).toBe(false);
     });
 
     it('clears row-addressed state when auto-detection changes while closed', async () => {
@@ -1151,6 +1359,7 @@ describe('Excel first-row header controller', () => {
         });
         resolve_recovery_read(new Uint8Array([1]));
         await request_a;
+        await vi.waitFor(() => expect(builds.count).toBe(2));
         vi.useRealTimers();
 
         expect(builds.count).toBe(2);
@@ -1931,10 +2140,7 @@ describe('Excel first-row header controller', () => {
         });
         await Promise.all([header_request, stale_visibility]);
 
-        expect((state.value() as PerFileState).columnVisibility?.[0]).toEqual({
-            hiddenColumns: [1],
-            schema: '["People",2,null]',
-        });
+        expect((state.value() as PerFileState).columnVisibility?.[0]).toBeUndefined();
     });
 
     it('rejects stale cross-tab row layout after a header projection change', async () => {
@@ -2016,7 +2222,7 @@ describe('Excel first-row header controller', () => {
         });
     });
 
-    it('serializes concurrent header requests and rejects the stale one', async () => {
+    it('lets a newer same-basis header supersede an unrequested older one', async () => {
         const state = mutable_state_store({ excelFirstRowHeaderVersion: 1 });
         const profile = excel_profile({ count: 0 });
         const first = open_excel('/tmp/concurrent-header.xlsx', state.store, profile);
@@ -2050,9 +2256,13 @@ describe('Excel first-row header controller', () => {
             .toEqual({ People: 'off' });
         expect(messages_of(first, 'metaReload')).toHaveLength(1);
         expect(messages_of(second, 'metaReload')).toHaveLength(1);
-        expect(messages_of(second, 'excelFirstRowHeaderError')).toMatchObject([{
-            requestId: 'second',
+        expect(messages_of(first, 'excelFirstRowHeaderError')).toMatchObject([{
+            requestId: 'first',
         }]);
+        expect(messages_of(second, 'excelFirstRowHeaderError')).toHaveLength(0);
+        expect(messages_of(first, 'metaReload').at(-1)).toMatchObject({
+            headerRequestId: 'second',
+        });
     });
 
     it('uses correlated sheetMeta when direct broadcast is the first delivery', async () => {

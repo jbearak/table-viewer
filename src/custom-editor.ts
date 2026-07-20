@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { attach_viewer, profile_for } from './viewer-controller';
-import type { FileStateStore } from './state';
+import type { AuthorityFileStateStore } from './state';
 import { build_webview_html, generate_nonce } from './webview-html';
 
 const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
@@ -16,7 +16,7 @@ export class TableViewerEditorProvider
 
     constructor(
         private readonly extension_uri: vscode.Uri,
-        private readonly state_store: FileStateStore,
+        private readonly state_store: AuthorityFileStateStore,
     ) {}
 
     async openCustomDocument(uri: vscode.Uri): Promise<TableViewerDocument> {
@@ -44,7 +44,7 @@ export class TableViewerEditorProvider
 
 export function register_table_viewer(
     context: vscode.ExtensionContext,
-    state_store: FileStateStore,
+    state_store: AuthorityFileStateStore,
 ): void {
     const provider = new TableViewerEditorProvider(context.extensionUri, state_store);
     // Both editors deliberately allow multiple tabs per document. The CSV/TSV

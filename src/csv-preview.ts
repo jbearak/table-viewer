@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import { attach_viewer, build_csv_source, type ViewerProfile } from './viewer-controller';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
-import type { FileStateStore } from './state';
+import type { AuthorityFileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_webview_html, generate_nonce } from './webview-html';
 
@@ -25,7 +25,7 @@ let active_preview: ActivePreview | null = null;
 export function show_csv_preview(
     uri: vscode.Uri,
     extension_uri: vscode.Uri,
-    state_store: FileStateStore,
+    state_store: AuthorityFileStateStore,
     view_column: vscode.ViewColumn
 ): void {
     if (active_preview) {
@@ -76,7 +76,7 @@ function setup_preview(
     panel: vscode.WebviewPanel,
     uri: vscode.Uri,
     extension_uri: vscode.Uri,
-    state_store: FileStateStore,
+    state_store: AuthorityFileStateStore,
     reusing: boolean
 ): () => void {
     const disposables: vscode.Disposable[] = [];

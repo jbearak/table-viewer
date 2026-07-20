@@ -6,6 +6,7 @@ import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { with_in_memory_authority_transactions } from '../state-authority';
 
 const enc = new TextEncoder();
 
@@ -58,7 +59,7 @@ function open_csv_table(
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         file_uri,
-        store,
+        with_in_memory_authority_transactions(store),
         profile,
     );
     panel.onDidDispose(() => controller.dispose());

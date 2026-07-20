@@ -3,9 +3,11 @@ import type * as vscode from 'vscode';
 import { attach_viewer, csv_table_profile } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
-import type { FileStateStore } from '../state';
+import { acquire_file_coordinator } from '../file-coordinator';
+import type { AuthorityFileStateStore } from '../state';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { with_in_memory_authority_transactions } from '../state-authority';
 
 /**
  * Drive the CSV-table lifecycle through the shared controller, mirroring the
@@ -17,7 +19,7 @@ function open_csv_table(file_uri: vscode.Uri): void {
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         file_uri,
-        state_store(),
+        with_in_memory_authority_transactions(state_store()),
         csv_table_profile(),
     );
     panel.onDidDispose(() => controller.dispose());
@@ -32,13 +34,14 @@ function deferred<T>() {
 }
 
 async function flush_promises(): Promise<void> {
-    for (let i = 0; i < 10; i++) {
+    // Coordinator adoption adds a short serialized authority-establishment hop.
+    for (let i = 0; i < 20; i++) {
         await Promise.resolve();
     }
 }
 
-function state_store(): FileStateStore {
-    return versioned_state_store().store;
+function state_store(): AuthorityFileStateStore {
+    return with_in_memory_authority_transactions(versioned_state_store().store);
 }
 
 function uri(path: string): vscode.Uri {
@@ -84,6 +87,35 @@ describe('CSV reload races', () => {
         await watcher.__fireChange();
 
         expect(calls).toBe(0);
+    });
+
+    it('keeps per-panel watchers while sharing one physical authority', async () => {
+        const file_path = '/tmp/shared-watchers.csv';
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri(file_path));
+        open_csv_table(uri(file_path));
+        const panels = vscode_mock.__getPanels();
+        await panels[0].__receive({ type: 'ready' });
+        await panels[1].__receive({ type: 'ready' });
+
+        const watchers = vscode_mock.__getWatchers();
+        expect(watchers).toHaveLength(2);
+        const authority = acquire_file_coordinator(file_path);
+        expect(authority.authority()).toMatchObject({
+            physicalRevision: 1,
+            projectionRevision: 0,
+            authorityRevision: 1,
+        });
+
+        await Promise.all(watchers.map((watcher) => watcher.__fireChange()));
+        expect(authority.authority()).toMatchObject({
+            physicalRevision: 1,
+            projectionRevision: 0,
+            authorityRevision: 1,
+        });
+        authority.dispose();
     });
 
     it('CSV table ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
