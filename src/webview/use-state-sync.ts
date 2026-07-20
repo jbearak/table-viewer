@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect } from 'react';
 import type { PerFileState } from '../types';
+import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
 declare function acquireVsCodeApi(): {
     postMessage(msg: unknown): void;
@@ -14,6 +15,7 @@ const DEBOUNCE_MS = 150;
 export function use_state_sync(
     current_state: React.MutableRefObject<PerFileState>,
     source_generation: React.MutableRefObject<number>,
+    snapshot_identity?: React.MutableRefObject<WorkbookSnapshotIdentity | null>,
 ) {
     const timer_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -30,8 +32,11 @@ export function use_state_sync(
             type: 'stateChanged',
             state: current_state.current,
             sourceGeneration: source_generation.current,
+            ...(snapshot_identity?.current
+                ? { snapshotIdentity: snapshot_identity.current }
+                : {}),
         });
-    }, [current_state, source_generation]);
+    }, [current_state, snapshot_identity, source_generation]);
 
     const persist_debounced = useCallback(() => {
         if (timer_ref.current) {

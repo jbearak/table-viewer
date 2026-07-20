@@ -8,6 +8,53 @@ describe('paginated protocol message shapes', () => {
         sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
     };
 
+    it('carries a complete workbookSnapshot authority envelope', () => {
+        const msg: HostMessage = {
+            type: 'workbookSnapshot',
+            snapshot: {
+                identity: {
+                    deliveryId: 12,
+                    authority: { fileId: 'file:people.xlsx', revision: 9 },
+                    stateRevision: 44,
+                    sourceBasis: {
+                        physicalRevision: 7,
+                        projectionRevision: 2,
+                    },
+                },
+                generation: 5,
+                sourceGeneration: 4,
+                presentation: 'refresh',
+                reason: 'excelHeader',
+                meta,
+                state: {
+                    columnWidths: [],
+                    rowHeights: [],
+                    scrollPosition: [],
+                    activeSheetIndex: 0,
+                    tabOrientation: null,
+                    transforms: [],
+                    columnVisibility: [],
+                },
+                configuration: {
+                    defaultTabOrientation: 'horizontal',
+                    previewMode: false,
+                },
+                capabilities: {
+                    csvEditable: false,
+                    csvEditingSupported: false,
+                },
+                truncationMessage: null,
+                commandResult: {
+                    type: 'excelFirstRowHeader',
+                    requestId: 'header:1',
+                    outcome: 'applied',
+                },
+            },
+        };
+        expect(msg.snapshot.identity.stateRevision).toBe(44);
+        expect(msg.snapshot.commandResult?.requestId).toBe('header:1');
+    });
+
     it('HostMessage carries a sheetMeta variant with generation', () => {
         const msg: HostMessage = {
             type: 'sheetMeta',
@@ -75,6 +122,24 @@ describe('paginated protocol message shapes', () => {
             expect(msg.rows[0][1]).toBeNull();
             expect(msg.requestId).toBe('req-1');
         }
+    });
+
+    it('echoes exact snapshot identity and disposition in snapshotApplied', () => {
+        const msg: WebviewMessage = {
+            type: 'snapshotApplied',
+            identity: {
+                deliveryId: 12,
+                authority: { fileId: 'file:people.xlsx', revision: 9 },
+                stateRevision: 44,
+                sourceBasis: {
+                    physicalRevision: 7,
+                    projectionRevision: 2,
+                },
+            },
+            disposition: 'stale',
+        };
+        expect(msg.identity.deliveryId).toBe(12);
+        expect(msg.disposition).toBe('stale');
     });
 
     it('WebviewMessage fences state snapshots by source generation', () => {

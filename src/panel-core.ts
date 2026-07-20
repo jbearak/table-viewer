@@ -3,6 +3,8 @@ import { compute_transform, transformed_window } from './table-transform';
 import {
     EMPTY_TRANSFORM,
     transform_schema_for_sheet,
+    type HostMessage,
+    type PerFileState,
     type SheetTransformState,
     type StoredPerFileState,
     type WebviewMessage,
@@ -33,7 +35,7 @@ interface MetaEnvelope {
 }
 
 interface ReloadEnvelope {
-    state?: StoredPerFileState;
+    state?: PerFileState;
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
     projectionChange?: 'excelHeader';
@@ -41,7 +43,7 @@ interface ReloadEnvelope {
 }
 
 interface MetaRecoveryEnvelope {
-    state: StoredPerFileState;
+    state: PerFileState;
     csvEditable?: boolean;
     csvEditingSupported?: boolean;
     headerRequestId: string;
@@ -444,7 +446,7 @@ export class ViewerPanelCore {
         }
     }
 
-    private post(message: unknown): Promise<boolean> {
+    private post(message: HostMessage): Promise<boolean> {
         if (this.disposed) return Promise.resolve(false);
         return Promise.resolve(this.panel.webview.postMessage(message));
     }

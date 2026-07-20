@@ -15,7 +15,7 @@ import {
     sanitize_excel_header_overrides,
     transform_schema_for_sheet,
 } from './types';
-import { normalize_per_file_state } from './webview/sheet-state';
+import { normalize_complete_per_file_state } from './viewer-snapshot';
 
 export interface ExcelCandidateStatePlan {
     state: PerFileState;
@@ -36,24 +36,7 @@ export function normalize_host_state(
     stored: StoredPerFileState,
     sheet_names: string[],
 ): PerFileState {
-    const normalized = normalize_per_file_state(stored, sheet_names);
-    if ('excelFirstRowHeaders' in stored) {
-        normalized.excelFirstRowHeaders = sanitize_excel_header_overrides(
-            stored.excelFirstRowHeaders,
-        );
-    }
-    if ('excelFirstRowHeaderActive' in stored) {
-        normalized.excelFirstRowHeaderActive = sanitize_excel_header_active(
-            stored.excelFirstRowHeaderActive,
-        );
-    }
-    if (
-        'excelFirstRowHeaderVersion' in stored
-        && stored.excelFirstRowHeaderVersion === 1
-    ) {
-        normalized.excelFirstRowHeaderVersion = 1;
-    }
-    return normalized;
+    return normalize_complete_per_file_state(stored, sheet_names);
 }
 
 export function effective_excel_header_map(

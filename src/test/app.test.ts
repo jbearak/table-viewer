@@ -5,6 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HostMessage, SheetTransformState, WebviewMessage } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import type { WorkbookSnapshot } from '../viewer-snapshot';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -19,6 +20,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     focus_grid: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
+    emit_pending_edits_on_mount: false,
 }));
 
 // Glide's DataEditor renders to a <canvas>, which jsdom can't drive. Replace the
@@ -95,10 +97,18 @@ vi.mock('../webview/grid-shell', () => ({
                 edits: grid_shell_mock.is_dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
                 conflicted: [],
             });
+            if (grid_shell_mock.emit_pending_edits_on_mount) {
+                (globalThis as typeof globalThis & {
+                    acquireVsCodeApi: () => { postMessage: (message: unknown) => void };
+                }).acquireVsCodeApi().postMessage({
+                    type: 'pendingEditsChanged',
+                    edits: props.initial_edits ?? null,
+                });
+            }
             return () => {
                 grid_shell_mock.on_editing_change = null;
             };
-        }, [props.on_editing_change]);
+        }, [props.initial_edits, props.on_editing_change]);
         if (props.editing_ref) {
             props.editing_ref.current = {
                 request_save: grid_shell_mock.request_save,
@@ -314,6 +324,9 @@ async function report_grid_editing(
     dirty: boolean,
     uncommitted = dirty,
     conflicted: string[] = [],
+    edits: Record<string, { value: string; base: string }> = dirty
+        ? { '0:0': { value: 'dirty', base: 'base' } }
+        : {},
 ) {
     // The overlay-attributable part of "uncommitted" is whatever is uncommitted
     // beyond the committed dirty map — i.e. an open overlay differing from base.
@@ -325,7 +338,7 @@ async function report_grid_editing(
         grid_shell_mock.on_editing_change?.({
             is_dirty: dirty,
             has_live_uncommitted,
-            edits: dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
+            edits,
             conflicted,
         });
     });
@@ -365,6 +378,54 @@ function meta_reload_message(
     };
 }
 
+function workbook_snapshot_message(
+    meta: WorkbookMeta,
+    extra: Partial<WorkbookSnapshot> = {},
+): Extract<HostMessage, { type: 'workbookSnapshot' }> {
+    const delivery_id = extra.identity?.deliveryId ?? 1;
+    return {
+        type: 'workbookSnapshot',
+        snapshot: {
+            generation: 1,
+            sourceGeneration: 1,
+            presentation: 'initial',
+            reason: 'ready',
+            meta,
+            state: {
+                columnWidths: [],
+                rowHeights: [],
+                scrollPosition: [],
+                activeSheetIndex: 0,
+                tabOrientation: null,
+                transforms: meta.sheets.map(() => undefined),
+                columnVisibility: meta.sheets.map(() => undefined),
+            },
+            configuration: {
+                defaultTabOrientation: 'horizontal',
+                previewMode: false,
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: false,
+            },
+            truncationMessage: null,
+            identity: {
+                deliveryId: delivery_id,
+                authority: {
+                    fileId: 'file:test',
+                    revision: delivery_id,
+                },
+                stateRevision: delivery_id,
+                sourceBasis: {
+                    physicalRevision: delivery_id,
+                    projectionRevision: 0,
+                },
+            },
+            ...extra,
+        },
+    };
+}
+
 function cleanup() {
     act(() => {
         root?.unmount();
@@ -385,6 +446,7 @@ function cleanup() {
     grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
+    grid_shell_mock.emit_pending_edits_on_mount = false;
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -420,6 +482,427 @@ describe('initial render', () => {
 
         await dispatch_host_message(meta_reload_message(make_meta(['Sheet1'])));
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
+    });
+});
+
+describe('workbook snapshot hydration', () => {
+    it('matches fresh initial hydration and acknowledges independently', async () => {
+        const { post_message } = await render_app();
+        post_message.mockClear();
+        const meta = make_meta(['First', 'Second']);
+        const message = workbook_snapshot_message(meta, {
+            generation: 4,
+            sourceGeneration: 7,
+            state: {
+                columnWidths: [undefined, { 0: 155 }],
+                rowHeights: [],
+                scrollPosition: [],
+                activeSheetIndex: 1,
+                tabOrientation: 'vertical',
+                pendingEdits: { '0:0': { value: 'new', base: 'old' } },
+                transforms: [],
+                columnVisibility: [],
+            },
+            configuration: {
+                defaultTabOrientation: 'horizontal',
+                previewMode: true,
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+        });
+        await dispatch_host_message(message);
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('4');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-preview')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
+            .toEqual({ '0:0': { value: 'new', base: 'old' } });
+        expect(get_button('Vertical Tabs').getAttribute('aria-pressed')).toBe('true');
+        expect(post_message.mock.calls.map((call) => call[0])).toContainEqual({
+            type: 'snapshotApplied',
+            identity: message.snapshot.identity,
+            disposition: 'applied',
+        });
+    });
+
+    it('keeps visible sheet and orientation on refresh while updating state authority', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['First', 'Second']);
+        await dispatch_host_message(workbook_snapshot_message(meta));
+        await click_button('Vertical Tabs');
+        post_message.mockClear();
+
+        const refresh = workbook_snapshot_message(meta, {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 2 },
+                stateRevision: 8,
+                sourceBasis: { physicalRevision: 2, projectionRevision: 0 },
+            },
+            generation: 2,
+            sourceGeneration: 2,
+            presentation: 'refresh',
+            reason: 'fileReload',
+            state: {
+                columnWidths: [undefined, { 0: 210 }],
+                rowHeights: [],
+                scrollPosition: [],
+                activeSheetIndex: 1,
+                tabOrientation: 'horizontal',
+                transforms: [],
+                columnVisibility: [],
+            },
+        });
+        await dispatch_host_message(refresh);
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(get_button('Vertical Tabs').getAttribute('aria-pressed')).toBe('true');
+        await act(async () => {
+            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
+        });
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((message) => message.type === 'stateChanged').at(-1))
+            .toMatchObject({
+                sourceGeneration: 2,
+                snapshotIdentity: refresh.snapshot.identity,
+                state: {
+                    activeSheetIndex: 1,
+                    tabOrientation: 'horizontal',
+                },
+            });
+    });
+
+    it('acknowledges a duplicate without rehydrating or correcting twice', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 2;
+        const message = workbook_snapshot_message(meta, {
+            state: {
+                columnWidths: [], rowHeights: [], scrollPosition: [],
+                activeSheetIndex: 0, tabOrientation: null, transforms: [],
+                columnVisibility: [{
+                    hiddenColumns: [1, 9],
+                    schema: '["Sheet1",2,null]',
+                }],
+            },
+        });
+        await dispatch_host_message(message);
+        const mount = grid_stub().getAttribute('data-mount-id');
+        const correction_count = post_message.mock.calls.map((call) => call[0])
+            .filter((item) => item.type === 'stateChanged').length;
+
+        await dispatch_host_message(message);
+
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount);
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((item) => item.type === 'stateChanged')).toHaveLength(
+                correction_count,
+            );
+        expect(post_message.mock.calls.map((call) => call[0]).at(-1)).toEqual({
+            type: 'snapshotApplied',
+            identity: message.snapshot.identity,
+            disposition: 'duplicate',
+        });
+    });
+
+    it('ignores and acknowledges stale snapshots after a newer authority', async () => {
+        const { post_message } = await render_app();
+        const newer = workbook_snapshot_message(make_meta(['New']), {
+            identity: {
+                deliveryId: 3,
+                authority: { fileId: 'file:test', revision: 3 },
+                stateRevision: 3,
+                sourceBasis: { physicalRevision: 3, projectionRevision: 0 },
+            },
+            generation: 3,
+        });
+        await dispatch_host_message(newer);
+        const mount = grid_stub().getAttribute('data-mount-id');
+        const older = workbook_snapshot_message(make_meta(['Old']), {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 2 },
+                stateRevision: 2,
+                sourceBasis: { physicalRevision: 2, projectionRevision: 0 },
+            },
+            generation: 2,
+        });
+        await dispatch_host_message(older);
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount);
+        expect(post_message.mock.calls.map((call) => call[0]).at(-1)).toEqual({
+            type: 'snapshotApplied',
+            identity: older.snapshot.identity,
+            disposition: 'stale',
+        });
+    });
+
+    it('restores authoritative pending edits before a native refresh remount', async () => {
+        grid_shell_mock.emit_pending_edits_on_mount = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+        }));
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '0:0': { value: 'local', base: 'base' },
+        });
+        post_message.mockClear();
+        const authoritative = {
+            '1:0': { value: 'host', base: 'old' },
+        };
+
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 2 },
+                stateRevision: 8,
+                sourceBasis: { physicalRevision: 2, projectionRevision: 0 },
+            },
+            presentation: 'refresh',
+            reason: 'fileReload',
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+            state: {
+                columnWidths: [], rowHeights: [], scrollPosition: [],
+                activeSheetIndex: 0, tabOrientation: null,
+                pendingEdits: authoritative,
+                transforms: [undefined],
+                columnVisibility: [undefined],
+            },
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
+            .toEqual(authoritative);
+        const pending_messages = post_message.mock.calls.map((call) => call[0])
+            .filter((item) => item.type === 'pendingEditsChanged');
+        expect(pending_messages).toContainEqual({
+            type: 'pendingEditsChanged',
+            edits: authoritative,
+        });
+        expect(pending_messages.some((item) => item.edits === null)).toBe(false);
+    });
+
+    it('preserves live dirty edits across a state-less legacy refresh', async () => {
+        grid_shell_mock.emit_pending_edits_on_mount = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(sheet_meta_message(meta, {
+            csvEditable: true,
+            csvEditingSupported: true,
+        }));
+        await enter_edit_mode(post_message);
+        const live_edits = {
+            '2:0': { value: 'live', base: 'before' },
+        };
+        await report_grid_editing(true, true, [], live_edits);
+        post_message.mockClear();
+
+        await dispatch_host_message(meta_reload_message(meta, {
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
+            .toEqual(live_edits);
+        const pending_messages = post_message.mock.calls.map((call) => call[0])
+            .filter((item) => item.type === 'pendingEditsChanged');
+        expect(pending_messages).toContainEqual({
+            type: 'pendingEditsChanged',
+            edits: live_edits,
+        });
+        expect(pending_messages.some((item) => item.edits === null)).toBe(false);
+    });
+
+    it('clears a pending header request only when an initial snapshot changes files', async () => {
+        const { post_message } = await render_app();
+        const file_a = make_meta(['People']);
+        file_a.sheets[0].excelFirstRowHeader = {
+            mode: 'auto', detected: true, active: true, available: true,
+        };
+        await dispatch_host_message(workbook_snapshot_message(file_a, {
+            identity: {
+                deliveryId: 1,
+                authority: { fileId: 'file:A', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+        }));
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .find((item): item is Extract<WebviewMessage, { type: 'setExcelFirstRowHeader' }> =>
+                item.type === 'setExcelFirstRowHeader')!;
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        post_message.mockClear();
+
+        const file_b = make_meta(['Orders']);
+        file_b.sheets[0].columnNames = ['Id'];
+        file_b.sheets[0].excelFirstRowHeader = {
+            mode: 'auto', detected: true, active: true, available: true,
+        };
+        const transform: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Orders",1,["Id"]]',
+        };
+        await dispatch_host_message(workbook_snapshot_message(file_b, {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:B', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+            state: {
+                columnWidths: [], rowHeights: [], scrollPosition: [],
+                activeSheetIndex: 0, tabOrientation: null,
+                transforms: [transform],
+                columnVisibility: [undefined],
+            },
+        }));
+
+        const restored_transform = latest_transform_request(post_message);
+        expect(restored_transform).toMatchObject({
+            state: transform,
+            generation: 1,
+            sourceGeneration: 1,
+        });
+        await acknowledge_transform(restored_transform, 2);
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+
+        await dispatch_host_message(workbook_snapshot_message(file_a, {
+            identity: {
+                deliveryId: 1,
+                authority: { fileId: 'file:A', revision: 2 },
+                stateRevision: 2,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 1 },
+            },
+            presentation: 'refresh',
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(document.querySelector('[role="status"]')?.textContent ?? '').toBe('');
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+    });
+
+    it('does not let delayed legacy metadata regress a native snapshot', async () => {
+        await render_app();
+        await dispatch_host_message(workbook_snapshot_message(make_meta(['Native']), {
+            generation: 5,
+        }));
+        const mount = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(sheet_meta_message(make_meta(['Legacy']), {
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('5');
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount);
+    });
+
+    it('settles only a matching retained header result and only once', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['People']);
+        meta.sheets[0].excelFirstRowHeader = {
+            mode: 'auto', detected: true, active: true, available: true,
+        };
+        await dispatch_host_message(workbook_snapshot_message(meta));
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .find((item): item is Extract<WebviewMessage, { type: 'setExcelFirstRowHeader' }> =>
+                item.type === 'setExcelFirstRowHeader')!;
+
+        await dispatch_host_message(workbook_snapshot_message(meta, {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 2 },
+                stateRevision: 2,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 1 },
+            },
+            presentation: 'initial',
+        }));
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+
+        const result = workbook_snapshot_message(meta, {
+            identity: {
+                deliveryId: 3,
+                authority: { fileId: 'file:test', revision: 3 },
+                stateRevision: 3,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 2 },
+            },
+            presentation: 'refresh',
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+        });
+        await dispatch_host_message(result);
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names updated.');
+        await dispatch_host_message(result);
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((item) => item.type === 'showWarning')).toHaveLength(0);
+    });
+
+    it('acknowledges before a correction and attaches exact authority to it', async () => {
+        const { post_message } = await render_app();
+        post_message.mockClear();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0].columnCount = 2;
+        const message = workbook_snapshot_message(meta, {
+            state: {
+                columnWidths: [], rowHeights: [], scrollPosition: [],
+                activeSheetIndex: 0, tabOrientation: null, transforms: [],
+                columnVisibility: [{
+                    hiddenColumns: [1, 8],
+                    schema: '["Sheet1",2,null]',
+                }],
+            },
+        });
+        await dispatch_host_message(message);
+        const outbound = post_message.mock.calls.map((call) => call[0]);
+        const ack_index = outbound.findIndex((item) => item.type === 'snapshotApplied');
+        const correction_index = outbound.findIndex((item) => item.type === 'stateChanged');
+        expect(ack_index).toBeGreaterThanOrEqual(0);
+        expect(correction_index).toBeGreaterThan(ack_index);
+        expect(outbound[correction_index]).toMatchObject({
+            snapshotIdentity: message.snapshot.identity,
+            sourceGeneration: 1,
+        });
+    });
+
+    it('acknowledges an accepted clean snapshot even without correction', async () => {
+        const { post_message } = await render_app();
+        post_message.mockClear();
+        const message = workbook_snapshot_message(make_meta(['Sheet1']));
+        await dispatch_host_message(message);
+        const outbound = post_message.mock.calls.map((call) => call[0]);
+        expect(outbound).toContainEqual({
+            type: 'snapshotApplied',
+            identity: message.snapshot.identity,
+            disposition: 'applied',
+        });
+        expect(outbound.some((item) => item.type === 'stateChanged')).toBe(false);
     });
 });
 

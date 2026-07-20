@@ -3,6 +3,11 @@ import type {
     WorkbookMeta,
     RenderedCell,
 } from './data-source/interface';
+import type {
+    SnapshotDisposition,
+    WorkbookSnapshot,
+    WorkbookSnapshotIdentity,
+} from './viewer-snapshot';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -169,6 +174,7 @@ export type StoredPerFileState = PerFileState | LegacyPerFileState;
 export type HostMessage =
     // Paginated protocol (Phase B+). `generation` rises on every (re)load so the
     // webview can drop row windows that belong to a superseded document version.
+    | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'sheetMeta'; meta: WorkbookMeta; state: StoredPerFileState; defaultTabOrientation: 'horizontal' | 'vertical'; truncationMessage?: string; previewMode?: boolean; csvEditable?: boolean; csvEditingSupported?: boolean; generation: number; sourceGeneration: number; projectionChange?: 'excelHeader'; headerRequestId?: string; error?: string }
     | { type: 'metaReloadRecovery'; meta: WorkbookMeta; state: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange: 'excelHeader'; headerRequestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'metaReload'; meta: WorkbookMeta; state?: PerFileState; truncationMessage?: string; csvEditable?: boolean; csvEditingSupported?: boolean; projectionChange?: 'excelHeader'; headerRequestId?: string; generation: number; sourceGeneration: number }
@@ -183,8 +189,9 @@ export type HostMessage =
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
+    | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
-    | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number }
+    | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity?: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     | { type: 'requestEditSession' }
     | { type: 'releaseEditSession' }
