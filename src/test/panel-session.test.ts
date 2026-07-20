@@ -565,6 +565,63 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(snapshot(posted).commandResult).toEqual(result);
     });
 
+    it('silently retains a result for the next adoption', async () => {
+        const result: RetainedSnapshotCommandResult = {
+            type: 'excelFirstRowHeader',
+            requestId: 'header:silent',
+            outcome: 'recovered',
+        };
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        const base = snapshot(posted);
+        ack(session, base);
+
+        session.retain_command_result(result, { deliver: false });
+        await settle();
+        expect(posted).toHaveLength(1);
+
+        session.replace_adoption(adoption({ authority: authority(4) }));
+        await settle();
+        const replacement = snapshot(posted);
+        expect(replacement.commandResult).toEqual(result);
+        ack(session, replacement);
+        session.ready();
+        await settle();
+        expect(snapshot(posted).commandResult).toBeUndefined();
+    });
+
+    it('delivers retained results in order without dropping an unacknowledged request', async () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        ack(session, snapshot(posted));
+        session.retain_command_result({
+            type: 'excelFirstRowHeader',
+            requestId: 'header:first',
+            outcome: 'applied',
+        });
+        session.retain_command_result({
+            type: 'excelFirstRowHeader',
+            requestId: 'header:second',
+            outcome: 'rejected',
+            error: 'Rejected.',
+        });
+        await settle();
+        const first = snapshot(posted);
+        expect(first.commandResult?.requestId).toBe('header:first');
+        ack(session, first);
+        await settle();
+        const second = snapshot(posted);
+        expect(second.commandResult?.requestId).toBe('header:second');
+        ack(session, second);
+        session.ready();
+        await settle();
+        expect(snapshot(posted).commandResult).toBeUndefined();
+    });
+
     it('retains a new result without waking a known-stale adoption', async () => {
         const result: RetainedSnapshotCommandResult = {
             type: 'excelFirstRowHeader',

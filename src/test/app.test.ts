@@ -861,7 +861,13 @@ describe('workbook snapshot hydration', () => {
                 stateRevision: 2,
                 sourceBasis: { physicalRevision: 1, projectionRevision: 1 },
             },
-            presentation: 'initial',
+            presentation: 'refresh',
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: 'another-panel-request',
+                outcome: 'applied',
+            },
         }));
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
 
@@ -1482,9 +1488,10 @@ describe('Excel first-row header toggle', () => {
             });
     });
 
-    it('clears pending state and surfaces a rejected request', async () => {
+    it('clears pending state and surfaces a retained rejected result once', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(sheet_meta_message(excel_meta(false)));
+        const initial = workbook_snapshot_message(excel_meta(false));
+        await dispatch_host_message(initial);
         post_message.mockClear();
         await click_button('First Row as Header');
         const request = post_message.mock.calls
@@ -1493,17 +1500,22 @@ describe('Excel first-row header toggle', () => {
                 WebviewMessage,
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
-        await dispatch_host_message(meta_reload_message(excel_meta(false), {
-            generation: 2,
-            sourceGeneration: 2,
-        }));
-        expect(get_button('First Row as Header').disabled).toBe(false);
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
-        await dispatch_host_message({
-            type: 'excelFirstRowHeaderError',
-            requestId: request.requestId,
-            error: 'The worksheet changed.',
+        const rejected = workbook_snapshot_message(excel_meta(false), {
+            identity: {
+                ...initial.snapshot.identity,
+                deliveryId: 2,
+            },
+            presentation: 'refresh',
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'rejected',
+                error: 'The worksheet changed.',
+            },
         });
+        await dispatch_host_message(rejected);
+        await dispatch_host_message(rejected);
         expect(get_button('First Row as Header').disabled).toBe(false);
         expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent)
@@ -1512,6 +1524,56 @@ describe('Excel first-row header toggle', () => {
             type: 'showWarning',
             message: 'Could not change the header row: The worksheet changed.',
         });
+        expect(post_message.mock.calls.filter(([message]) => (
+            (message as WebviewMessage).type === 'showWarning'
+        ))).toHaveLength(1);
+    });
+
+    it('settles a native recovered header result after applying its source snapshot', async () => {
+        const { post_message } = await render_app();
+        const initial_meta = excel_meta(false);
+        const initial = workbook_snapshot_message(initial_meta);
+        await dispatch_host_message(initial);
+        post_message.mockClear();
+        await click_button('First Row as Header');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        const recovered_meta = excel_meta(true);
+        await dispatch_host_message(workbook_snapshot_message(recovered_meta, {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:test', revision: 2 },
+                stateRevision: 2,
+                sourceBasis: { physicalRevision: 2, projectionRevision: 1 },
+            },
+            generation: 2,
+            sourceGeneration: 2,
+            presentation: 'refresh',
+            reason: 'recovery',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'recovered',
+                error: 'The workbook view was rebuilt.',
+            },
+        }));
+
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names were updated, but recovery was required.');
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'The header setting was saved after recovery: The workbook view was rebuilt.',
+        });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'snapshotApplied',
+            identity: expect.objectContaining({ deliveryId: 2 }),
+        }));
     });
 });
 

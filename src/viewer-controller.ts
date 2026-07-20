@@ -33,6 +33,7 @@ import {
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
+    type FileAuthoritySnapshot,
     type PhysicalAuthorityCommitReceipt,
 } from './file-coordinator';
 import { reconcile_finalization } from './finalization-reconciliation';
@@ -45,10 +46,7 @@ import {
     type SheetTransformState,
     type WebviewMessage,
 } from './types';
-import {
-    normalize_per_file_state,
-    sanitize_transform_state,
-} from './webview/sheet-state';
+import { sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
@@ -81,11 +79,8 @@ export interface ViewerProfile {
 }
 
 const active_csv_edit_sessions = new Map<string, symbol>();
-const HEADER_RELOAD_RETRY_COUNT = 3;
-const HEADER_RELOAD_RETRY_MS = 25;
 const RELOAD_RETRY_COUNT = 3;
 const RELOAD_RETRY_MS = 50;
-const HEADER_TERMINAL_RETRY_COUNT = 3;
 const READY_STATE_RETRY_COUNT = 3;
 const READY_STATE_RETRY_MS = 50;
 
@@ -95,35 +90,6 @@ function content_digest(bytes: Uint8Array): string {
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-interface HeaderSettlement {
-    requestId: string;
-    error: string | undefined;
-    origin: boolean;
-    operationEpoch: number;
-}
-
-interface ExcelHeaderRecovery {
-    requestId: string;
-    settlement: HeaderSettlement;
-}
-
-interface LegacyDeliveryIdentity {
-    readonly adoptionEpoch: number;
-    readonly source: DataSource;
-    readonly digest: string | undefined;
-    readonly authorityRevision: number;
-    readonly physicalRevision: number;
-    readonly projectionRevision: number;
-    readonly generation: number;
-    readonly sourceGeneration: number;
-}
-
-interface LegacyDeliveryResult {
-    readonly delivered: boolean;
-    readonly identity: LegacyDeliveryIdentity;
-    readonly current: boolean;
 }
 
 type PhysicalAuthorityCommitResult =
@@ -144,6 +110,18 @@ function same_snapshot_identity(
         && left.sourceBasis.projectionRevision === right.sourceBasis.projectionRevision;
 }
 
+function same_file_authority_basis(
+    left: FileAuthoritySnapshot,
+    right: FileAuthoritySnapshot,
+): boolean {
+    return left.fileKey === right.fileKey
+        && left.commitSequence === right.commitSequence
+        && left.authorityRevision === right.authorityRevision
+        && left.physicalRevision === right.physicalRevision
+        && left.projectionRevision === right.projectionRevision
+        && left.physicalDigest === right.physicalDigest;
+}
+
 function same_durable_authority(
     left: DurableFileAuthority,
     right: DurableFileAuthority,
@@ -157,7 +135,7 @@ function same_durable_authority(
 
 function excel_profile(): ViewerProfile {
     return {
-        metadataDelivery: 'legacy',
+        metadataDelivery: 'workbookSnapshot',
         editing: false,
         async build_source(raw, file_path, state) {
             const physical = file_path.toLowerCase().endsWith('.xlsx')
@@ -216,7 +194,6 @@ export function attach_viewer(
     const file_coordinator = acquire_file_coordinator(file_path, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
-    const uses_snapshots = profile.metadataDelivery === 'workbookSnapshot';
 
     // Borrowed aliases are updated only at the same synchronous boundary as the
     // session adoption. PanelSession remains the sole source/core lifecycle owner.
@@ -226,38 +203,25 @@ export function attach_viewer(
     const transform_authorities = new Map<string, number>();
     let reload_seq = 0;
     let disposed = false;
-    let initial_meta_sent = false;
-    let ready_seen = false;
-    let adoption_epoch = 0;
-    let adopted_digest: string | undefined;
-    let delivered_identity: LegacyDeliveryIdentity | undefined;
     let reload_retry_attempts = 0;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
-    const terminal_retry_waits = new Set<{
-        timer: ReturnType<typeof setTimeout>;
-        resolve: (proceed: boolean) => void;
-    }>();
     const ready_state_retry_waits = new Set<{
         timer: ReturnType<typeof setTimeout>;
         resolve: (proceed: boolean) => void;
     }>();
-    let outstanding_header_settlement: HeaderSettlement | undefined;
     const edit_session_token = Symbol(file_key);
     const excel_header_subscriber_token = Symbol(file_key);
+    const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
+    let header_receipt_processing = false;
+    let header_refresh_scheduled = false;
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
 
     const session = new PanelSession({
-        transportEnabled: uses_snapshots,
-        postMessage: (message) => {
-            if (!uses_snapshots) {
-                throw new Error('Legacy panels cannot emit workbookSnapshot metadata.');
-            }
-            return panel.webview.postMessage(message);
-        },
+        postMessage: (message) => panel.webview.postMessage(message),
         onNeedsResyncSource: () => { void send_reload(true); },
         onCurrentAdoptionAcknowledged: (adoption) => {
-            if (!uses_snapshots || disposed || session.current_adoption() !== adoption) return;
+            if (disposed || session.current_adoption() !== adoption) return;
             const digest = adoption.source === 'commitReceipt'
                 ? adoption.receipt.resultingBasis.physicalDigest
                 : adoption.authority.physicalDigest;
@@ -338,7 +302,6 @@ export function attach_viewer(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): void {
-        if (!uses_snapshots) return;
         session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
     }
 
@@ -348,16 +311,6 @@ export function attach_viewer(
         const snapshot = await read_file_state();
         update_session_state_material(snapshot, allow_claim);
         return snapshot;
-    }
-
-    // CSV editability flags for the meta/reload envelope. Non-editing profiles
-    // emit `undefined` (not `false`) deliberately: on the reload path the webview
-    // only applies these when they are defined, so `undefined` leaves the prior
-    // state untouched. Do not collapse to plain booleans.
-    function editing_flags(ds: DataSource): { csvEditingSupported: true | undefined; csvEditable: boolean | undefined } {
-        return profile.editing
-            ? { csvEditingSupported: true, csvEditable: !ds.truncationMessage }
-            : { csvEditingSupported: undefined, csvEditable: undefined };
     }
 
     async function read_file_state(touch = true): Promise<FileStateSnapshot> {
@@ -689,8 +642,6 @@ export function attach_viewer(
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
-                    adopted_digest = committed.receipt.digest;
-                    adoption_epoch += 1;
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
                         adopted = next;
@@ -704,303 +655,154 @@ export function attach_viewer(
         return adopted;
     }
 
-    function capture_legacy_delivery_identity(
-        expected_source: DataSource,
-    ): LegacyDeliveryIdentity | undefined {
-        if (disposed || !core || source !== expected_source) return undefined;
-        return Object.freeze({
-            adoptionEpoch: adoption_epoch,
-            source: expected_source,
-            digest: adopted_digest,
-            authorityRevision: source_authority.authorityRevision,
-            physicalRevision: source_authority.physicalRevision,
-            projectionRevision: source_authority.projectionRevision,
-            generation: core.generation,
-            sourceGeneration: core.source_generation,
-        });
-    }
-
-    function legacy_delivery_is_current(
-        identity: LegacyDeliveryIdentity,
-    ): boolean {
-        return !disposed
-            && core !== undefined
-            && source === identity.source
-            && adoption_epoch === identity.adoptionEpoch
-            && adopted_digest === identity.digest
-            && source_authority.authorityRevision === identity.authorityRevision
-            && source_authority.physicalRevision === identity.physicalRevision
-            && source_authority.projectionRevision === identity.projectionRevision
-            && core.generation === identity.generation
-            && core.source_generation === identity.sourceGeneration;
-    }
-
-    function metadata_is_delivered(): boolean {
-        return initial_meta_sent
-            && delivered_identity !== undefined
-            && legacy_delivery_is_current(delivered_identity)
-            && source_authority.authorityRevision
-                === file_coordinator.authority().authorityRevision;
-    }
-
-    function mark_metadata_delivered(
-        identity: LegacyDeliveryIdentity,
-        seq?: number,
-    ): boolean {
-        if (!legacy_delivery_is_current(identity)) return false;
-        delivered_identity = identity;
-        // A direct header projection delivery is not completion of an unrelated
-        // physical-file reload episode. Only that episode's own successful post
-        // may clear its retry timer and budget.
-        if (seq !== undefined && seq === reload_seq) reset_reload_retry();
-        return true;
-    }
-
-    async function state_for_reload(ds: DataSource): Promise<PerFileState> {
-        return normalize_per_file_state(
-            (await read_file_state()).state,
-            ds.meta().sheets.map((sheet) => sheet.name),
-        );
-    }
-
-    async function state_for_first_meta(
-        committed_state?: PerFileState,
-    ): Promise<PerFileState> {
-        const state = committed_state
-            ?? (await read_file_state()).state as PerFileState;
-        if (!profile.editing || !state.pendingEdits) return state;
-        if (try_claim_edit_session()) return state;
-        const { pendingEdits: _drop, ...rest } = state;
-        return rest;
-    }
-
-    function state_from_physical_receipt(
-        ds: DataSource,
-        receipt: PhysicalAuthorityCommitReceipt,
-    ): PerFileState {
-        return normalize_per_file_state(
-            receipt.stateSnapshot.state,
-            ds.meta().sheets.map((sheet) => sheet.name),
-        );
-    }
-
-    async function send_first_meta(
-        ds: DataSource,
-        committed_state?: PerFileState,
-    ): Promise<LegacyDeliveryResult | undefined> {
-        if (uses_snapshots) {
-            throw new Error('Snapshot panels cannot emit legacy metadata.');
-        }
-        const state = await state_for_first_meta(committed_state);
-        const identity = capture_legacy_delivery_identity(ds);
-        if (!identity || !core) return undefined;
-        const settlement = outstanding_header_settlement;
-        const delivered = await core.send_meta({
-            state,
-            defaultTabOrientation: get_default_orientation(),
-            previewMode: profile.previewMode,
-            ...editing_flags(ds),
-            projectionChange: settlement ? 'excelHeader' : undefined,
-            headerRequestId: settlement?.requestId,
-            error: settlement?.error,
-        });
-        const current = legacy_delivery_is_current(identity);
-        if (
-            delivered
-            && current
-            && ready_seen
-            && settlement === outstanding_header_settlement
-        ) {
-            initial_meta_sent = true;
-            outstanding_header_settlement = undefined;
-        }
-        return { delivered, identity, current };
-    }
-
-    async function post_reload(
-        ds: DataSource,
-        projectionChange?: 'excelHeader',
-        headerRequestId?: string,
-        state?: PerFileState,
-    ): Promise<LegacyDeliveryResult | undefined> {
-        if (uses_snapshots) {
-            throw new Error('Snapshot panels cannot emit legacy metadata.');
-        }
-        const resolved_state = state ?? (outstanding_header_settlement
-            ? await state_for_reload(ds)
-            : undefined);
-        const identity = capture_legacy_delivery_identity(ds);
-        if (!identity || !core) return undefined;
-        const settlement = outstanding_header_settlement;
-        const delivered = await core.send_meta_reload({
-            ...editing_flags(ds),
-            projectionChange: settlement ? 'excelHeader' : projectionChange,
-            headerRequestId: settlement?.requestId ?? headerRequestId,
-            state: settlement ? resolved_state : state,
-        });
-        const current = legacy_delivery_is_current(identity);
-        if (
-            delivered
-            && current
-            && settlement === outstanding_header_settlement
-        ) {
-            outstanding_header_settlement = undefined;
-        }
-        return { delivered, identity, current };
-    }
-
-    async function post_meta_recovery(
-        ds: DataSource,
-        settlement: HeaderSettlement,
-    ): Promise<LegacyDeliveryResult | undefined> {
-        if (uses_snapshots) {
-            throw new Error('Snapshot panels cannot emit legacy metadata.');
-        }
-        const state = await state_for_reload(ds);
-        const identity = capture_legacy_delivery_identity(ds);
-        if (!identity || !core) return undefined;
-        const delivered = await core.send_meta_recovery({
-            state,
-            ...editing_flags(ds),
-            headerRequestId: settlement.requestId,
-            error: settlement.error,
-        });
-        return {
-            delivered,
-            identity,
-            current: legacy_delivery_is_current(identity),
-        };
-    }
-
-    async function post_header_projection(
-        ds: DataSource,
-        request_id: string,
-        committed_state?: PerFileState,
-    ): Promise<LegacyDeliveryResult | undefined> {
-        if (!initial_meta_sent) return send_first_meta(ds, committed_state);
-        const state = committed_state ?? await state_for_reload(ds);
-        return post_reload(ds, 'excelHeader', request_id, state);
-    }
-
-    async function apply_excel_header_receipt(
-        receipt: ExcelHeaderOperationReceipt,
-    ): Promise<void> {
-        if (disposed) return;
-        const is_origin = receipt.originToken === excel_header_subscriber_token;
-        const settlement = publish_header_settlement(
-            receipt.requestId,
-            receipt.resultingBasis.authorityRevision,
-            is_origin,
-        );
-        if (
-            source_authority.authorityRevision
-                !== receipt.previousBasis.authorityRevision
-            || source_authority.physicalRevision
-                !== receipt.previousBasis.physicalRevision
-        ) {
-            void send_header_recovery(
-                settlement,
-                is_origin
-                    ? 'The header setting was saved, but the view could not refresh.'
-                    : undefined,
-            );
-            return;
-        }
-        if (
-            !core
-            || !(source instanceof ExcelHeaderDataSource)
-            || !source.set_override(receipt.sheetName, receipt.override)
-        ) {
-            void send_header_recovery(
-                settlement,
-                is_origin
-                    ? 'The header setting was saved, but the view could not refresh.'
-                    : undefined,
-            );
-            return;
-        }
-        // The projected source object is intentionally reused, but its logical
-        // adoption still advances both generations and invalidates source work.
-        const projection_adoption = adopt_source_into_core(
-            core,
-            panel,
-            source,
-            source,
-        );
-        if (projection_adoption.type === 'refused') {
-            void send_header_recovery(
-                settlement,
-                is_origin
-                    ? 'The header setting was saved, but the view could not refresh.'
-                    : undefined,
-            );
-            return;
-        }
-        core = projection_adoption.core;
-        source_authority = receipt.resultingBasis;
-        adoption_epoch += 1;
-        const material = core.snapshot_material();
-        session.replace_adoption({
-            source: 'commitReceipt',
-            canonicalFileId: file_key,
-            resources: { source, core },
-            receipt,
-            core: material.core,
-            diagnostics: material.diagnostics,
-            warnings: Object.freeze([...(source.warnings ?? [])]),
-            reason: 'excelHeader',
-            project: () => ({
-                configuration: {
-                    defaultTabOrientation: get_default_orientation(),
-                    previewMode: false,
-                },
-                capabilities: {
-                    csvEditingSupported: false,
-                    csvEditable: false,
-                },
-            }),
-        });
-        const attempts = is_origin ? HEADER_RELOAD_RETRY_COUNT : 1;
-        for (let attempt = 0; attempt < attempts; attempt++) {
-            if (
-                disposed
-                || source_authority.authorityRevision
-                    !== receipt.resultingBasis.authorityRevision
-            ) return;
-            try {
-                const delivery = await post_header_projection(
-                    source,
-                    receipt.requestId,
-                    receipt.stateSnapshot.state as PerFileState,
-                );
-                if (
-                    delivery?.delivered
-                    && delivery.current
-                    && mark_metadata_delivered(delivery.identity)
-                ) return;
-            } catch {
-                // Delivery and retry remain panel-local and never hold the file queue.
+    function schedule_header_refresh(): void {
+        if (disposed || header_refresh_scheduled) return;
+        header_refresh_scheduled = true;
+        queueMicrotask(() => {
+            if (disposed) {
+                header_refresh_scheduled = false;
+                return;
             }
-            if (attempt + 1 < attempts) await delay(HEADER_RELOAD_RETRY_MS);
+            void send_reload(true).finally(() => {
+                header_refresh_scheduled = false;
+            });
+        });
+    }
+
+    function process_excel_header_receipts(): void {
+        if (disposed || header_receipt_processing) return;
+        header_receipt_processing = true;
+        try {
+            header_receipt_queue.sort((left, right) => (
+                left.operationOrdinal - right.operationOrdinal
+            ));
+            while (header_receipt_queue.length > 0 && !disposed) {
+                const receipt = header_receipt_queue.shift()!;
+                const is_origin = receipt.originToken === excel_header_subscriber_token;
+                try {
+                    if (same_file_authority_basis(
+                        source_authority,
+                        receipt.resultingBasis,
+                    )) {
+                        if (is_origin) {
+                            session.retain_command_result({
+                                type: 'excelFirstRowHeader',
+                                requestId: receipt.requestId,
+                                outcome: 'applied',
+                            });
+                        }
+                        continue;
+                    }
+                    if (
+                        receipt.resultingBasis.authorityRevision
+                            < source_authority.authorityRevision
+                    ) {
+                        if (is_origin) {
+                            session.retain_command_result({
+                                type: 'excelFirstRowHeader',
+                                requestId: receipt.requestId,
+                                outcome: 'recovered',
+                                error: 'A newer workbook projection was already active.',
+                            });
+                        }
+                        continue;
+                    }
+                    const exact_basis = same_file_authority_basis(
+                        source_authority,
+                        receipt.previousBasis,
+                    );
+                    const current_adoption = session.current_adoption();
+                    if (
+                        exact_basis
+                        && core
+                        && source instanceof ExcelHeaderDataSource
+                        && current_adoption?.resources.source === source
+                        && current_adoption.resources.core === core
+                        && source.set_override(receipt.sheetName, receipt.override)
+                    ) {
+                        const projection_adoption = adopt_source_into_core(
+                            core,
+                            panel,
+                            source,
+                            source,
+                        );
+                        if (projection_adoption.type !== 'refused') {
+                            core = projection_adoption.core;
+                            source_authority = receipt.resultingBasis;
+                            if (is_origin) {
+                                session.retain_command_result({
+                                    type: 'excelFirstRowHeader',
+                                    requestId: receipt.requestId,
+                                    outcome: 'applied',
+                                }, { deliver: false });
+                            }
+                            const material = core.snapshot_material();
+                            session.replace_adoption({
+                                source: 'commitReceipt',
+                                canonicalFileId: file_key,
+                                resources: { source, core },
+                                receipt,
+                                core: material.core,
+                                diagnostics: material.diagnostics,
+                                warnings: Object.freeze([...(source.warnings ?? [])]),
+                                reason: 'excelHeader',
+                                project: () => ({
+                                    configuration: {
+                                        defaultTabOrientation: get_default_orientation(),
+                                        previewMode: profile.previewMode === true,
+                                    },
+                                    capabilities: {
+                                        csvEditingSupported: profile.editing,
+                                        csvEditable: profile.editing && !source!.truncationMessage,
+                                    },
+                                    stateSnapshot: project_state_for_panel(
+                                        receipt.stateSnapshot,
+                                        true,
+                                    ),
+                                }),
+                            });
+                            continue;
+                        }
+                    }
+                    if (is_origin) {
+                        session.retain_command_result({
+                            type: 'excelFirstRowHeader',
+                            requestId: receipt.requestId,
+                            outcome: 'recovered',
+                            error: 'The header setting was saved after rebuilding the workbook view.',
+                        }, { deliver: false });
+                    }
+                    schedule_header_refresh();
+                } catch (error) {
+                    console.error('Failed to apply an Excel header receipt', error);
+                    if (is_origin) {
+                        session.retain_command_result({
+                            type: 'excelFirstRowHeader',
+                            requestId: receipt.requestId,
+                            outcome: 'recovered',
+                            error: 'The header setting was saved after rebuilding the workbook view.',
+                        }, { deliver: false });
+                    }
+                    schedule_header_refresh();
+                }
+            }
+        } finally {
+            header_receipt_processing = false;
+            if (header_receipt_queue.length > 0 && !disposed) {
+                queueMicrotask(process_excel_header_receipts);
+            }
         }
-        if (!disposed) {
-            void send_header_recovery(
-                settlement,
-                is_origin
-                    ? 'The header setting was saved, but the view could not refresh.'
-                    : undefined,
-            );
-        }
+    }
+
+    function enqueue_excel_header_receipt(receipt: ExcelHeaderOperationReceipt): void {
+        if (disposed) return;
+        header_receipt_queue.push(receipt);
+        queueMicrotask(process_excel_header_receipts);
     }
 
     disposables.push(file_coordinator.subscribe_excel_headers(
-        apply_excel_header_receipt,
+        enqueue_excel_header_receipt,
     ));
-
-    function surface_warnings(ds: DataSource): void {
-        const warnings = ds.warnings ?? [];
-        if (warnings.length > 0) vscode.window.showWarningMessage(warnings[0]);
-    }
 
     // CSV pending-edit persistence deliberately remains on FileStateStore's CAS
     // queue in this phase. Edit-session ownership is separate from file authority;
@@ -1011,7 +813,7 @@ export function attach_viewer(
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
         });
-        if (!committed && uses_snapshots) await refresh_session_state_material();
+        if (!committed) await refresh_session_state_material();
     }
 
     async function send_initial_data(): Promise<void> {
@@ -1028,36 +830,14 @@ export function attach_viewer(
                 schedule_reload_retry(true, seq);
                 return;
             }
-            const receipt_state = state_from_physical_receipt(
-                candidate.borrow(), committed.receipt,
-            );
-            const initial_state = uses_snapshots
-                ? undefined
-                : await state_for_first_meta(receipt_state);
-            const projected_state = uses_snapshots
-                ? await read_file_state()
-                : {
-                    revision: committed.receipt.stateSnapshot.revision,
-                    state: initial_state!,
-                } satisfies FileStateSnapshot;
             const ds = adopt_committed_candidate(
-                candidate, committed, seq, 'ready', projected_state,
+                candidate,
+                committed,
+                seq,
+                'ready',
+                profile.editing ? await read_file_state() : undefined,
             );
-            if (!ds) return;
-            if (uses_snapshots) {
-                reset_reload_retry();
-                return;
-            }
-            const delivery = await send_first_meta(ds, initial_state);
-            if (
-                delivery?.delivered
-                && delivery.current
-                && mark_metadata_delivered(delivery.identity, seq)
-            ) {
-                surface_warnings(ds);
-            } else {
-                schedule_reload_retry(true, seq);
-            }
+            if (ds) reset_reload_retry();
         } catch (err) {
             if (disposed) return;
             if (!schedule_reload_retry(true, seq)) {
@@ -1070,8 +850,7 @@ export function attach_viewer(
 
     // Build explicit refreshes before superseding watcher work. A transient
     // post-save read/parse failure therefore cannot invalidate the only viable
-    // watcher refresh. The pre-adoption failures and later unstable-snapshot
-    // failures share one bounded retry budget.
+    // watcher refresh. Transport retry is owned independently by PanelSession.
     async function reparse_and_post(
         reason: 'fileReload' | 'save' = 'fileReload',
     ): Promise<boolean> {
@@ -1101,32 +880,13 @@ export function attach_viewer(
                 schedule_reload_retry(true, seq);
                 return false;
             }
-            const ds = adopt_committed_candidate(
+            return adopt_committed_candidate(
                 candidate,
                 committed,
                 seq,
                 reason,
-                uses_snapshots ? await read_file_state() : undefined,
-            );
-            if (!ds) return false;
-            if (uses_snapshots) return true;
-            let delivery: LegacyDeliveryResult | undefined;
-            try {
-                delivery = await post_reload(
-                    ds,
-                    undefined,
-                    undefined,
-                    state_from_physical_receipt(ds, committed.receipt),
-                );
-            } catch (error) {
-                if (!schedule_reload_retry(true, seq)) throw error;
-                return false;
-            }
-            const delivered = !!delivery?.delivered
-                && delivery.current
-                && mark_metadata_delivered(delivery.identity, seq);
-            if (!delivered) schedule_reload_retry(true, seq);
-            return delivered;
+                profile.editing ? await read_file_state() : undefined,
+            ) !== undefined;
         } finally {
             candidate?.dispose();
         }
@@ -1140,11 +900,7 @@ export function attach_viewer(
         }
     }
 
-    function schedule_reload_retry(
-        force: boolean,
-        seq: number,
-        header_recovery?: ExcelHeaderRecovery,
-    ): boolean {
+    function schedule_reload_retry(force: boolean, seq: number): boolean {
         if (
             disposed
             || seq !== reload_seq
@@ -1157,7 +913,7 @@ export function attach_viewer(
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
             if (!disposed && seq === reload_seq) {
-                void send_reload(force, true, header_recovery, seq);
+                void send_reload(force, true, seq);
             }
         }, RELOAD_RETRY_MS);
         return true;
@@ -1166,7 +922,6 @@ export function attach_viewer(
     async function send_reload(
         force = false,
         retry = false,
-        header_recovery?: ExcelHeaderRecovery,
         retry_seq?: number,
     ): Promise<boolean> {
         if (disposed) return false;
@@ -1178,131 +933,62 @@ export function attach_viewer(
             reset_reload_retry();
             seq = ++reload_seq;
         }
-        let delivered = false;
         let candidate: SourceCandidate | undefined;
         try {
             const expected_authority = file_coordinator.authority().authorityRevision;
             candidate = await build_source();
-            const ds = candidate.borrow();
-            if (
-                header_recovery
-                && outstanding_header_settlement !== header_recovery.settlement
-            ) {
-                delivered = true;
-                return delivered;
-            }
             if (!await built_source_is_current(seq, candidate)) {
-                if (!header_recovery) schedule_reload_retry(force, seq);
-                return delivered;
+                schedule_reload_retry(force, seq);
+                return false;
             }
-            // Deduplicate only when the webview has actually received metadata
-            // for the currently adopted source and both core generations.
             if (
                 !force
-                && outstanding_header_settlement === undefined
-                && (
-                    uses_snapshots
-                        ? candidate.observation.digest
-                            === session.acknowledged_physical_digest()
-                        : candidate.observation.digest === delivered_identity?.digest
-                            && metadata_is_delivered()
-                )
+                && candidate.observation.digest
+                    === session.acknowledged_physical_digest()
             ) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, seq, expected_authority, true,
                 );
                 if (deduplicated.type === 'committed') {
-                    if (seq === reload_seq) reset_reload_retry();
+                    if (seq === reload_seq) {
+                        source_authority = deduplicated.receipt.resultingBasis;
+                        update_session_state_material(
+                            deduplicated.receipt.stateSnapshot,
+                            true,
+                        );
+                        reset_reload_retry();
+                    }
                     return true;
                 }
-                if (!header_recovery) schedule_reload_retry(force, seq);
-                return delivered;
+                schedule_reload_retry(force, seq);
+                return false;
             }
             const committed = await commit_physical_candidate(
                 candidate, seq, expected_authority, true,
             );
             if (committed.type !== 'committed') {
-                if (!header_recovery) schedule_reload_retry(force, seq);
-                return delivered;
+                schedule_reload_retry(force, seq);
+                return false;
             }
-            if (!adopt_committed_candidate(
+            const adopted = adopt_committed_candidate(
                 candidate,
                 committed,
                 seq,
-                header_recovery ? 'recovery' : 'fileReload',
-                uses_snapshots ? await read_file_state() : undefined,
-            )) return false;
-            if (uses_snapshots) {
-                reset_reload_retry();
-                return true;
-            }
-            if (!initial_meta_sent) {
-                const delivery = await send_first_meta(
-                    ds,
-                    state_from_physical_receipt(ds, committed.receipt),
-                );
-                delivered = !!delivery?.delivered
-                    && delivery.current
-                    && mark_metadata_delivered(
-                        delivery.identity,
-                        header_recovery ? undefined : seq,
-                    );
-                if (!delivered) {
-                    if (!header_recovery) schedule_reload_retry(force, seq);
-                    return false;
-                }
-                surface_warnings(ds);
-                return true;
-            }
-            const delivery = await post_reload(
-                ds,
-                header_recovery ? 'excelHeader' : undefined,
-                header_recovery?.requestId,
-                state_from_physical_receipt(ds, committed.receipt),
+                force ? 'recovery' : 'fileReload',
+                profile.editing ? await read_file_state() : undefined,
             );
-            delivered = !!delivery?.delivered
-                && delivery.current
-                && mark_metadata_delivered(
-                    delivery.identity,
-                    header_recovery ? undefined : seq,
-                );
-            if (!delivered) {
-                if (!header_recovery) schedule_reload_retry(force, seq);
-                return false;
-            }
-            surface_warnings(ds);
+            if (!adopted) return false;
+            reset_reload_retry();
+            return true;
         } catch (err) {
-            if (disposed || header_recovery) return false;
+            if (disposed) return false;
             if (schedule_reload_retry(force, seq)) return false;
             console.error('Failed to reload table viewer data', err);
             vscode.window.showErrorMessage(
                 `Failed to reload: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
         } finally {
             candidate?.dispose();
-        }
-        return delivered;
-    }
-
-    function wait_for_terminal_retry(ms: number): Promise<boolean> {
-        if (disposed) return Promise.resolve(false);
-        return new Promise((resolve) => {
-            const wait = {
-                timer: undefined as unknown as ReturnType<typeof setTimeout>,
-                resolve,
-            };
-            wait.timer = setTimeout(() => {
-                terminal_retry_waits.delete(wait);
-                resolve(true);
-            }, ms);
-            terminal_retry_waits.add(wait);
-        });
-    }
-
-    function cancel_terminal_retry_waits(): void {
-        for (const wait of [...terminal_retry_waits]) {
-            clearTimeout(wait.timer);
-            terminal_retry_waits.delete(wait);
-            wait.resolve(false);
         }
     }
 
@@ -1364,123 +1050,6 @@ export function attach_viewer(
         return undefined;
     }
 
-    function publish_header_settlement(
-        request_id: string,
-        operation_epoch: number,
-        origin: boolean,
-        terminal_error?: string,
-    ): HeaderSettlement {
-        if (outstanding_header_settlement?.requestId === request_id) {
-            if (terminal_error !== undefined) {
-                outstanding_header_settlement.error = terminal_error;
-                outstanding_header_settlement.origin = true;
-            }
-            return outstanding_header_settlement;
-        }
-        const candidate: HeaderSettlement = {
-            requestId: request_id,
-            error: terminal_error,
-            origin,
-            operationEpoch: operation_epoch,
-        };
-        if (
-            outstanding_header_settlement === undefined
-            || candidate.operationEpoch > outstanding_header_settlement.operationEpoch
-            || (
-                candidate.operationEpoch === outstanding_header_settlement.operationEpoch
-                && candidate.origin
-                && !outstanding_header_settlement.origin
-            )
-        ) {
-            outstanding_header_settlement = candidate;
-        }
-        return outstanding_header_settlement;
-    }
-
-    async function send_terminal_header_sync(
-        tracked_settlement: HeaderSettlement,
-    ): Promise<boolean> {
-        if (outstanding_header_settlement !== tracked_settlement) return true;
-        for (
-            let attempt = 0;
-            attempt <= HEADER_TERMINAL_RETRY_COUNT;
-            attempt++
-        ) {
-            if (disposed) return false;
-            if (outstanding_header_settlement !== tracked_settlement) return true;
-            let delivery: LegacyDeliveryResult | undefined;
-            if (outstanding_header_settlement !== tracked_settlement) return true;
-            if (
-                disposed
-                || !core
-                || !source
-                || source_authority.authorityRevision
-                    !== file_coordinator.authority().authorityRevision
-            ) return false;
-            const delivery_source = source;
-            try {
-                delivery = !initial_meta_sent
-                    ? await send_first_meta(delivery_source)
-                    : await post_meta_recovery(delivery_source, tracked_settlement);
-            } catch {
-                delivery = undefined;
-            }
-            const delivered = !!delivery?.delivered
-                && delivery.current
-                && mark_metadata_delivered(delivery.identity);
-            if (delivered) {
-                surface_warnings(delivery_source);
-                if (
-                    initial_meta_sent
-                    && tracked_settlement === outstanding_header_settlement
-                ) {
-                    outstanding_header_settlement = undefined;
-                }
-                return true;
-            }
-            if (attempt === HEADER_TERMINAL_RETRY_COUNT) break;
-            const proceed = await wait_for_terminal_retry(
-                RELOAD_RETRY_MS * (2 ** attempt),
-            );
-            if (!proceed) return false;
-            if (outstanding_header_settlement !== tracked_settlement) return true;
-        }
-        return false;
-    }
-
-    async function send_header_recovery(
-        tracked_settlement: HeaderSettlement,
-        terminal_error?: string,
-    ): Promise<boolean> {
-        if (outstanding_header_settlement !== tracked_settlement) return true;
-        if (terminal_error !== undefined) {
-            tracked_settlement.error = terminal_error;
-            tracked_settlement.origin = true;
-        }
-        const seq = reload_seq;
-        const recovery = {
-            requestId: tracked_settlement.requestId,
-            settlement: tracked_settlement,
-        };
-        for (let attempt = 0; attempt <= RELOAD_RETRY_COUNT; attempt++) {
-            if (disposed) return false;
-            if (outstanding_header_settlement !== tracked_settlement) return true;
-            if (seq !== reload_seq) {
-                return send_terminal_header_sync(tracked_settlement);
-            }
-            if (attempt > 0) {
-                await delay(RELOAD_RETRY_MS);
-                if (disposed) return false;
-                if (outstanding_header_settlement !== tracked_settlement) return true;
-                if (seq !== reload_seq) {
-                    return send_terminal_header_sync(tracked_settlement);
-                }
-            }
-            if (await send_reload(true, true, recovery, seq)) return true;
-        }
-        return send_terminal_header_sync(tracked_settlement);
-    }
-
     async function handle_save(edits: Record<string, string>): Promise<void> {
         if (!source) return;
         if (source.truncationMessage) {
@@ -1489,18 +1058,14 @@ export function attach_viewer(
         }
         try {
             const current_adoption = session.current_adoption();
-            const expected_digest = uses_snapshots
-                ? session.acknowledged_physical_digest()
-                : adopted_digest;
+            const expected_digest = session.acknowledged_physical_digest();
             if (
                 expected_digest === undefined
-                || (uses_snapshots
-                    ? !session.acknowledged_current()
-                        || current_adoption?.resources.source !== source
-                        || current_adoption.resources.core !== core
-                        || source_authority.authorityRevision
-                            !== file_coordinator.authority().authorityRevision
-                    : !metadata_is_delivered())
+                || !session.acknowledged_current()
+                || current_adoption?.resources.source !== source
+                || current_adoption.resources.core !== core
+                || source_authority.authorityRevision
+                    !== file_coordinator.authority().authorityRevision
             ) {
                 vscode.window.showWarningMessage(
                     'The table view is still refreshing. Please try saving again.');
@@ -1533,14 +1098,12 @@ export function attach_viewer(
             if (
                 snapshot_changed
                 || content_digest(current_raw) !== expected_digest
-                || (uses_snapshots && (
-                    !session.acknowledged_current()
-                    || session.current_adoption() !== current_adoption
-                    || current_adoption?.resources.source !== src
-                    || current_adoption.resources.core !== core
-                    || source_authority.authorityRevision
-                        !== file_coordinator.authority().authorityRevision
-                ))
+                || !session.acknowledged_current()
+                || session.current_adoption() !== current_adoption
+                || current_adoption?.resources.source !== src
+                || current_adoption.resources.core !== core
+                || source_authority.authorityRevision
+                    !== file_coordinator.authority().authorityRevision
             ) {
                 vscode.window.showWarningMessage(
                     'File was modified externally. Please review the changes and try again.');
@@ -1577,8 +1140,7 @@ export function attach_viewer(
     disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
         if (disposed) return;
         if (
-            uses_snapshots
-            && msg.type !== 'ready'
+            msg.type !== 'ready'
             && msg.type !== 'snapshotApplied'
             && msg.type !== 'showWarning'
         ) {
@@ -1586,12 +1148,6 @@ export function attach_viewer(
         }
         switch (msg.type) {
             case 'ready': {
-                ready_seen = true;
-                if (!uses_snapshots) {
-                    const ready = session.ready();
-                    if (ready.type === 'needsInitialSource') await send_initial_data();
-                    return;
-                }
                 const begun = session.begin_ready();
                 if (begun.hasSource) {
                     const state_snapshot = await read_state_for_ready_epoch(
@@ -1610,20 +1166,14 @@ export function attach_viewer(
                 return;
             }
             case 'snapshotApplied':
-                if (uses_snapshots) {
-                    session.handle_snapshot_applied(msg.identity, msg.disposition);
-                }
+                session.handle_snapshot_applied(msg.identity, msg.disposition);
                 return;
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
-                const acknowledged_identity = uses_snapshots
-                    ? session.acknowledged_identity()
-                    : undefined;
-                const native_identity_is_current = !uses_snapshots || (
-                    msg.snapshotIdentity !== undefined
+                const acknowledged_identity = session.acknowledged_identity();
+                const native_identity_is_current = msg.snapshotIdentity !== undefined
                     && acknowledged_identity !== undefined
-                    && same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity)
-                );
+                    && same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity);
                 if (!native_identity_is_current) return;
                 await update_file_state((current) => {
                         if (
@@ -1632,14 +1182,12 @@ export function attach_viewer(
                             || !file_coordinator.state_write_is_current(expected_authority)
                             || source_authority.authorityRevision !== expected_authority
                             || msg.sourceGeneration !== core.source_generation
-                            || (uses_snapshots && (
-                                msg.snapshotIdentity === undefined
-                                || session.acknowledged_identity() === undefined
-                                || !same_snapshot_identity(
-                                    msg.snapshotIdentity,
-                                    session.acknowledged_identity()!,
-                                )
-                            ))
+                            || msg.snapshotIdentity === undefined
+                            || session.acknowledged_identity() === undefined
+                            || !same_snapshot_identity(
+                                msg.snapshotIdentity,
+                                session.acknowledged_identity()!,
+                            )
                         ) {
                             return current;
                         }
@@ -1697,22 +1245,21 @@ export function attach_viewer(
                     && file_coordinator.state_write_is_current(expected_authority)
                     && source_authority.authorityRevision === expected_authority
                     && msg.sourceGeneration === core?.source_generation
-                    && (!uses_snapshots || (
-                        msg.snapshotIdentity !== undefined
-                        && session.acknowledged_identity() !== undefined
-                        && same_snapshot_identity(
-                            msg.snapshotIdentity,
-                            session.acknowledged_identity()!,
-                        )
-                    ))
+                    && msg.snapshotIdentity !== undefined
+                    && session.acknowledged_identity() !== undefined
+                    && same_snapshot_identity(
+                        msg.snapshotIdentity,
+                        session.acknowledged_identity()!,
+                    )
                 ));
                 return;
             }
             case 'setExcelFirstRowHeader': {
-                const fail = async (error: string) => {
-                    await panel.webview.postMessage({
-                        type: 'excelFirstRowHeaderError',
+                const fail = (error: string) => {
+                    session.retain_command_result({
+                        type: 'excelFirstRowHeader',
                         requestId: msg.requestId,
+                        outcome: 'rejected',
                         error,
                     });
                 };
@@ -1721,30 +1268,31 @@ export function attach_viewer(
                     || !(source instanceof ExcelHeaderDataSource)
                     || !core
                 ) {
-                    await fail('First-row headers are only available for Excel worksheets.');
+                    fail('First-row headers are only available for Excel worksheets.');
                     return;
                 }
                 if (
-                    source_authority.authorityRevision
+                    !session.acknowledged_current()
+                    || source_authority.authorityRevision
                         !== file_coordinator.authority().authorityRevision
                     || msg.generation !== core.generation
                     || msg.sourceGeneration !== core.source_generation
                 ) {
-                    await fail('The worksheet changed before the header request arrived.');
+                    fail('The worksheet changed before the header request arrived.');
                     return;
                 }
                 const sheet = source.meta().sheets[msg.sheetIndex];
                 if (!sheet || sheet.name !== msg.sheetName) {
-                    await fail('The selected worksheet no longer matches this request.');
+                    fail('The selected worksheet no longer matches this request.');
                     return;
                 }
                 const header = sheet.excelFirstRowHeader;
                 if (!header) {
-                    await fail('First-row headers are only available for Excel worksheets.');
+                    fail('First-row headers are only available for Excel worksheets.');
                     return;
                 }
                 if (msg.enabled && !header.available) {
-                    await fail('This worksheet has no first row to use as column names.');
+                    fail('This worksheet has no first row to use as column names.');
                     return;
                 }
 
@@ -1761,7 +1309,7 @@ export function attach_viewer(
                     stateStore: durable_state_store,
                 });
                 if (result.type === 'rejected' && !disposed) {
-                    await fail(result.error);
+                    fail(result.error);
                 }
                 return;
             }
@@ -1847,7 +1395,7 @@ export function attach_viewer(
             case 'releaseEditSession':
                 if (profile.editing) {
                     release_edit_session();
-                    if (uses_snapshots) await refresh_session_state_material(false);
+                    await refresh_session_state_material(false);
                 }
                 return;
             case 'discardEditSession':
@@ -1893,7 +1441,6 @@ export function attach_viewer(
             default:
                 if (
                     msg.type === 'visibleRowChanged'
-                    && uses_snapshots
                     && !session.acknowledged_current()
                 ) return;
                 if (profile.on_message && await profile.on_message(msg)) return;
@@ -1906,7 +1453,7 @@ export function attach_viewer(
     const watcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), basename));
     const handle_watcher_event = () => {
-        if (uses_snapshots) session.wake_delivery();
+        session.wake_delivery();
         return send_reload();
     };
     disposables.push(watcher.onDidChange(handle_watcher_event));
@@ -1919,9 +1466,8 @@ export function attach_viewer(
             disposed = true;
             reload_seq++;
             reset_reload_retry();
-            cancel_terminal_retry_waits();
             cancel_ready_state_retry_waits();
-            outstanding_header_settlement = undefined;
+            header_receipt_queue.length = 0;
             let first_error: unknown;
             const cleanup = (action: () => void) => {
                 try {

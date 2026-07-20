@@ -218,7 +218,8 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
     private current?: CapturedAdoption;
     private desired?: IssuedDelivery;
     private acknowledged?: IssuedDelivery;
-    private retained_result?: RetainedSnapshotCommandResult;
+    private readonly retained_results = new Map<string, RetainedSnapshotCommandResult>();
+    private readonly settled_result_ids = new Set<string>();
     private acknowledged_adoption_epoch?: number;
     private readonly ledger = new Map<number, IssuedDelivery>();
     private timer?: Handle;
@@ -406,15 +407,28 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         return true;
     }
 
-    /** Retain one locally-originated result until a current containing ACK settles it. */
-    retain_command_result(result: RetainedSnapshotCommandResult): void {
-        if (this._lifecycle === 'disposed') return;
-        this.retained_result = deep_clone_and_freeze(result);
+    /**
+     * Retain a locally-originated terminal result until an exact containing ACK
+     * settles it. `deliver: false` stages a committed result for the next source
+     * adoption without ever attaching it to the obsolete current source.
+     */
+    retain_command_result(
+        result: RetainedSnapshotCommandResult,
+        options: { readonly deliver?: boolean } = {},
+    ): void {
+        if (this._lifecycle === 'disposed' || this.settled_result_ids.has(result.requestId)) {
+            return;
+        }
+        const existing = this.retained_results.get(result.requestId);
+        if (existing) return;
+        this.retained_results.set(result.requestId, deep_clone_and_freeze(result));
         if (
-            !this.current
+            options.deliver === false
+            || !this.current
             || this.receiver_epoch === 0
             || this.ready_gate_epoch === this.receiver_epoch
             || this.stale_adoption_epoch === this.current.epoch
+            || this.desired?.commandResult !== undefined
         ) return;
         this.invalidate_transport();
         this.supersede_desired();
@@ -471,11 +485,17 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         issued.status = 'acked';
         this.acknowledged = issued;
         this.receiver_baseline_file_id = issued.adoption.material.canonicalFileId;
-        if (
-            issued.commandResult !== undefined
-            && issued.commandResult === this.retained_result
-        ) {
-            this.retained_result = undefined;
+        if (issued.commandResult !== undefined) {
+            const retained = this.retained_results.get(issued.commandResult.requestId);
+            if (retained === issued.commandResult) {
+                this.retained_results.delete(issued.commandResult.requestId);
+                this.settled_result_ids.add(issued.commandResult.requestId);
+                while (this.settled_result_ids.size > this.ledger_limit) {
+                    const oldest = this.settled_result_ids.values().next().value;
+                    if (oldest === undefined) break;
+                    this.settled_result_ids.delete(oldest);
+                }
+            }
         }
         const adoption_epoch = issued.adoption.epoch;
         if (this.acknowledged_adoption_epoch !== adoption_epoch) {
@@ -483,6 +503,13 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             // duplicate the callback. A reentrant replacement resets the scalar.
             this.acknowledged_adoption_epoch = adoption_epoch;
             this.on_current_adoption_acknowledged?.(issued.adoption.adoption);
+        }
+        if (
+            this.current === issued.adoption
+            && this.retained_results.size > 0
+            && issued.commandResult !== undefined
+        ) {
+            this.create_desired('refresh', 'excelHeader');
         }
     }
 
@@ -519,7 +546,8 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         this.current = undefined;
         this.desired = undefined;
         this.acknowledged = undefined;
-        this.retained_result = undefined;
+        this.retained_results.clear();
+        this.settled_result_ids.clear();
         this.acknowledged_adoption_epoch = undefined;
         this.stale_adoption_epoch = undefined;
         this.ledger.clear();
@@ -537,6 +565,8 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         this.retry_index = 0;
         const delivery_id = this.next_delivery_id++;
         const material = adoption.material;
+        const command_result = this.retained_results.values().next().value as
+            RetainedSnapshotCommandResult | undefined;
         const common = {
             deliveryId: delivery_id,
             canonicalFileId: material.canonicalFileId,
@@ -546,7 +576,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             configuration: material.projection.configuration,
             capabilities: material.projection.capabilities,
             diagnostics: material.diagnostics,
-            commandResult: this.retained_result,
+            commandResult: command_result,
         } as const;
         const snapshot = material.source === 'commitReceipt'
             ? build_workbook_snapshot({
@@ -568,7 +598,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
             receiverEpoch: this.receiver_epoch,
             adoption,
             snapshot,
-            commandResult: this.retained_result,
+            commandResult: command_result,
             attempted: false,
             status: 'desired',
         };

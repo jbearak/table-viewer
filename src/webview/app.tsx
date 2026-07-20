@@ -491,23 +491,38 @@ export function App(): React.JSX.Element {
                     result: RetainedSnapshotCommandResult | undefined,
                 ) => {
                     if (!result) return;
-                    const key = `${result.type}:${result.requestId}:${result.outcome}`;
+                    const key = `${result.type}:${result.requestId}`;
                     if (processed_snapshot_results_ref.current.has(key)) return;
                     processed_snapshot_results_ref.current.add(key);
+                    while (processed_snapshot_results_ref.current.size > 128) {
+                        const oldest = processed_snapshot_results_ref.current.values().next().value;
+                        if (oldest === undefined) break;
+                        processed_snapshot_results_ref.current.delete(oldest);
+                    }
                     if (
                         result.type !== 'excelFirstRowHeader'
                         || pending_excel_header_ref.current !== result.requestId
                     ) return;
                     pending_excel_header_ref.current = null;
                     set_pending_excel_header(null);
-                    if (result.outcome === 'recovered' && result.error) {
+                    if (result.outcome === 'rejected') {
+                        set_excel_header_status('Column names were not updated.');
+                        if (result.error) {
+                            vscode_api.postMessage({
+                                type: 'showWarning',
+                                message: `Could not change the header row: ${result.error}`,
+                            });
+                        }
+                    } else if (result.outcome === 'recovered') {
                         set_excel_header_status(
                             'Column names were updated, but recovery was required.',
                         );
-                        vscode_api.postMessage({
-                            type: 'showWarning',
-                            message: `The header setting was saved after recovery: ${result.error}`,
-                        });
+                        if (result.error) {
+                            vscode_api.postMessage({
+                                type: 'showWarning',
+                                message: `The header setting was saved after recovery: ${result.error}`,
+                            });
+                        }
                     } else {
                         set_excel_header_status('Column names updated.');
                     }
