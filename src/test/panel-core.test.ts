@@ -415,6 +415,42 @@ describe('ViewerPanelCore', () => {
         expect(core.has_transform_work).toBe(false);
     });
 
+    it('refuses source installation on a disposed core without closing either source', () => {
+        const { panel } = make_panel();
+        const previous = new CloseAwareSource();
+        const next = new CloseAwareSource();
+        const core = new ViewerPanelCore(panel, previous);
+        core.dispose();
+
+        const result = adopt_source_into_core(core, panel, previous, next);
+
+        expect(result).toEqual({ type: 'refused' });
+        expect(previous.closed).toBe(false);
+        expect(next.closed).toBe(false);
+    });
+
+    it('confirms installation before a throwing old-source close', async () => {
+        const { panel, posted } = make_panel();
+        const previous = new CloseAwareSource();
+        previous.close = () => { throw new Error('close failed'); };
+        const next = new StubSource(5);
+        const core = new ViewerPanelCore(panel, previous);
+        let installed: ViewerPanelCore | undefined;
+
+        expect(() => adopt_source_into_core(
+            core,
+            panel,
+            previous,
+            next,
+            undefined,
+            (accepted) => { installed = accepted; },
+        )).toThrow('close failed');
+
+        expect(installed).toBe(core);
+        await core.send_meta(ENVELOPE);
+        expect(posted.at(-1)?.meta.sheets[0].rowCount).toBe(5);
+    });
+
     it('cancels source work before closing a replaced source', async () => {
         const { panel, posted } = make_panel();
         const previous = new CloseAwareSource(2_001);

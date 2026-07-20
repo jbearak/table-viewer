@@ -11,7 +11,7 @@ import type {
     RowWindow,
     WorkbookMeta,
 } from '../data-source/interface';
-import type { FileStateStore } from '../state';
+import type { AuthorityFileStateStore, FileStateStore } from '../state';
 import type { PerFileState, StoredPerFileState } from '../types';
 import * as vscode_mock from './mocks/vscode';
 import { with_in_memory_authority_transactions } from '../state-authority';
@@ -211,6 +211,47 @@ describe('Excel first-row header controller', () => {
             excelFirstRowHeader: { mode: 'off', active: false, detected: true },
         });
         expect(builds.count).toBe(1);
+    });
+
+    it('derives adopted overrides from the immutable physical receipt state', async () => {
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+            excelFirstRowHeaderVersion: 1,
+        });
+        const base = with_in_memory_authority_transactions(state.store);
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                const finalized = await base.finalize_authority_transaction(path, id);
+                if (finalized.type === 'finalized') {
+                    const later = await state.store.compare_and_set(
+                        path,
+                        finalized.snapshot.revision,
+                        {
+                            ...(finalized.snapshot.state as PerFileState),
+                            excelFirstRowHeaders: { People: 'on' },
+                        },
+                    );
+                    expect(later.type).toBe('committed');
+                }
+                return finalized;
+            },
+        };
+        const panel = open_excel(
+            '/tmp/receipt-overrides.xlsx',
+            store,
+            excel_profile({ count: 0 }),
+        );
+
+        await panel.__receive({ type: 'ready' });
+
+        expect((state.value() as PerFileState).excelFirstRowHeaders)
+            .toEqual({ People: 'on' });
+        expect(messages_of(panel, 'sheetMeta')[0].meta.sheets[0]).toMatchObject({
+            rowCount: 3,
+            columnNames: undefined,
+            excelFirstRowHeader: { mode: 'off', active: false, detected: true },
+        });
     });
 
     it('allows disabling an active header override after the sheet becomes empty', async () => {

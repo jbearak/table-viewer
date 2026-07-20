@@ -111,8 +111,8 @@ export class ViewerPanelCore {
     }
 
     /** Swap in a freshly-parsed source (reload) without sending a message. */
-    set_source(source: DataSource): void {
-        if (this.disposed) return;
+    set_source(source: DataSource): boolean {
+        if (this.disposed) return false;
         this.source = source;
         this.source_epoch += 1;
         this._source_generation += 1;
@@ -121,6 +121,7 @@ export class ViewerPanelCore {
         this.transform_sequences.clear();
         this.transforms_in_flight.clear();
         this.cache.clear();
+        return true;
     }
 
     /** Cancel asynchronous work before its source is closed or replaced. */
@@ -466,23 +467,33 @@ function clone_transform(state: SheetTransformState): SheetTransformState {
  * (when it is being replaced) and either swap it into the existing core or create
  * one. Returns the core to assign back. Every panel (csv/preview/custom-editor)
  * shares this close + create-or-swap dance, so it lives here rather than being
- * re-implemented in each panel's `adopt`.
+ * re-implemented in each panel's `adopt`. Installation is explicit: a disposed
+ * core refuses the source, and the previous source closes only after the new
+ * source is installed and `on_installed` has transferred controller ownership.
  */
+export type AdoptSourceIntoCoreResult =
+    | { type: 'adopted'; core: ViewerPanelCore }
+    | { type: 'refused' };
+
 export function adopt_source_into_core(
     core: ViewerPanelCore | undefined,
     panel: PanelLike,
     previous: DataSource | undefined,
     next: DataSource,
     opts?: { onTransformCommit?: TransformCommit },
-): ViewerPanelCore {
+    on_installed?: (installed: ViewerPanelCore) => void,
+): AdoptSourceIntoCoreResult {
+    let installed: ViewerPanelCore;
     if (core) {
         core.cancel_pending();
-        if (previous && previous !== next) previous.close();
-        core.set_source(next);
-        return core;
+        if (!core.set_source(next)) return { type: 'refused' };
+        installed = core;
+    } else {
+        installed = new ViewerPanelCore(panel, next, opts);
     }
+    on_installed?.(installed);
     if (previous && previous !== next) previous.close();
-    return new ViewerPanelCore(panel, next, opts);
+    return { type: 'adopted', core: installed };
 }
 
 function transform_states_equal(left: SheetTransformState, right: SheetTransformState): boolean {

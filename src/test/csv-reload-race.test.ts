@@ -14,12 +14,15 @@ import { with_in_memory_authority_transactions } from '../state-authority';
  * old `open_csv_table` entry point: create a mock panel, attach the editable
  * CSV profile, and route disposal the way the custom-editor host does.
  */
-function open_csv_table(file_uri: vscode.Uri): void {
+function open_csv_table(
+    file_uri: vscode.Uri,
+    store: AuthorityFileStateStore = state_store(),
+): void {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         file_uri,
-        with_in_memory_authority_transactions(state_store()),
+        store,
         csv_table_profile(),
     );
     panel.onDidDispose(() => controller.dispose());
@@ -118,6 +121,189 @@ describe('CSV reload races', () => {
         authority.dispose();
     });
 
+    it('closes a same-digest dedup candidate without transferring it', async () => {
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+
+        open_csv_table(uri('/tmp/dedup-ownership.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        expect(meta_reloads(panel)).toHaveLength(0);
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(2);
+    });
+
+    it('delivers state from the exact physical receipt rather than a later reread', async () => {
+        const file_path = '/tmp/receipt-state.csv';
+        const versioned = versioned_state_store({
+            pendingEdits: { '0:0': 'committed' },
+        });
+        const base = with_in_memory_authority_transactions(versioned.store);
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                const finalized = await base.finalize_authority_transaction(path, id);
+                if (finalized.type === 'finalized') {
+                    await versioned.store.compare_and_set(
+                        path,
+                        finalized.snapshot.revision,
+                        { pendingEdits: { '0:0': 'later' } },
+                    );
+                }
+                return finalized;
+            },
+        };
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri(file_path), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        expect(sheet_meta(panel)[0]).toMatchObject({
+            state: { pendingEdits: { '0:0': 'committed' } },
+        });
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({ '0:0': 'later' });
+    });
+
+    it('adopts a candidate reconciled from an exact committed finalization', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                await base.finalize_authority_transaction(path, id);
+                throw new Error('reported after commit');
+            },
+        };
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri('/tmp/reconciled-commit.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        expect(sheet_meta(panel)).toHaveLength(1);
+        expect(close_spy).not.toHaveBeenCalled();
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('never transfers a candidate after advanced finalization reconciliation', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                const local = await base.finalize_authority_transaction(path, id);
+                if (local.type !== 'finalized') return local;
+                await base.stage_authority_transaction(path, {
+                    id: 'external-advance',
+                    kind: 'physical',
+                    ordinal: 999,
+                    expectedStateRevision: local.snapshot.revision,
+                    expectedCommitSequence: local.authority.commitSequence,
+                    physicalDigest: 'external-digest',
+                });
+                await base.finalize_authority_transaction(path, 'external-advance');
+                throw new Error('ambiguous finalization');
+            },
+        };
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri('/tmp/advanced-finalization.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        expect(sheet_meta(panel)).toHaveLength(0);
+        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('observes authority advancement reported by staging without retrying forever', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        let advanced = false;
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async stage_authority_transaction(path, input) {
+                if (!advanced) {
+                    advanced = true;
+                    await base.stage_authority_transaction(path, {
+                        id: 'external-stage-advance',
+                        kind: 'physical',
+                        ordinal: 999,
+                        expectedStateRevision: input.expectedStateRevision,
+                        expectedCommitSequence: input.expectedCommitSequence,
+                        physicalDigest: 'external-digest',
+                    });
+                    await base.finalize_authority_transaction(path, 'external-stage-advance');
+                }
+                return base.stage_authority_transaction(path, input);
+            },
+        };
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri('/tmp/stage-authority-advance.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        expect(sheet_meta(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        panel.dispose();
+    });
+
+    it('observes authority advancement returned by finalization without a receipt', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        let advanced = false;
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                if (!advanced) {
+                    advanced = true;
+                    const snapshot = await base.read(path);
+                    const authority = await base.read_authority(path);
+                    await base.stage_authority_transaction(path, {
+                        id: 'external-finalize-advance',
+                        kind: 'physical',
+                        ordinal: 999,
+                        expectedStateRevision: snapshot.revision,
+                        expectedCommitSequence: authority.commitSequence,
+                        physicalDigest: 'external-digest',
+                    });
+                    await base.finalize_authority_transaction(
+                        path,
+                        'external-finalize-advance',
+                    );
+                }
+                return base.finalize_authority_transaction(path, id);
+            },
+        };
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+
+        open_csv_table(uri('/tmp/finalize-authority-advance.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        expect(sheet_meta(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        panel.dispose();
+    });
+
     it('CSV table ignores an older reload and sends sheetMeta when the newer reload is first delivery', async () => {
         const older = deferred<Uint8Array>();
         const newer = deferred<Uint8Array>();
@@ -146,6 +332,114 @@ describe('CSV reload races', () => {
         expect(metas[0].meta.sheets[0].rowCount).toBe(3);
         expect(meta_reloads(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('retains candidate ownership when replacing the previous source throws', async () => {
+        let current = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => current);
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+
+        open_csv_table(uri('/tmp/adoption-close-throw.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        current = enc.encode('h\nb\n');
+        close_spy.mockImplementationOnce(() => { throw new Error('old close failed'); });
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        // Installation and transfer are confirmed before old-source cleanup. The
+        // cleanup error suppresses delivery, but the panel unambiguously owns the
+        // new source and closes it once on disposal.
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        expect(meta_reloads(panel)).toHaveLength(0);
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps transferred ownership unambiguous during reentrant panel disposal', async () => {
+        let current = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => current);
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+
+        open_csv_table(uri('/tmp/reentrant-adoption-disposal.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        current = enc.encode('h\nb\n');
+        close_spy.mockImplementationOnce(() => { panel.dispose(); });
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+
+        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(2);
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not install an older commit after a newer reload supersedes finalization', async () => {
+        const versioned = versioned_state_store();
+        const base = with_in_memory_authority_transactions(versioned.store);
+        let finalize_calls = 0;
+        let mark_old_finalizing!: () => void;
+        const old_finalizing = new Promise<void>((resolve) => {
+            mark_old_finalizing = resolve;
+        });
+        let release_old!: () => void;
+        const old_gate = new Promise<void>((resolve) => { release_old = resolve; });
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async finalize_authority_transaction(path, id) {
+                finalize_calls += 1;
+                if (finalize_calls === 2) {
+                    mark_old_finalizing();
+                    await old_gate;
+                }
+                return base.finalize_authority_transaction(path, id);
+            },
+        };
+        let reads = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads <= 2) return enc.encode('h\noriginal\n');
+            if (reads <= 4) return enc.encode('h\nstale\nextra\n');
+            throw new Error('newer reload failed');
+        });
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+
+        open_csv_table(uri('/tmp/finalization-supersession.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        const initial = sheet_meta(panel)[0] as unknown as {
+            generation: number;
+            sourceGeneration: number;
+        };
+        const watcher = vscode_mock.__getWatchers()[0];
+        const old_reload = watcher.__fireChange();
+        await old_finalizing;
+        await watcher.__fireChange();
+        release_old();
+        await old_reload;
+
+        expect(meta_reloads(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(1);
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'retained-source',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'retained-source',
+            rows: [[expect.objectContaining({ raw: 'original' })]],
+        }));
+        panel.dispose();
+        expect(close_spy).toHaveBeenCalledTimes(2);
     });
 
     it('reloads changed bytes even when stat metadata is unchanged', async () => {
@@ -201,6 +495,7 @@ describe('CSV reload races', () => {
     });
 
     it('does not deduplicate a same-digest watcher after failed reload delivery', async () => {
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let current = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => current);
@@ -233,6 +528,7 @@ describe('CSV reload races', () => {
             generation: 3,
             meta: { sheets: [{ rowCount: 2 }] },
         }]);
+        expect(close_spy).toHaveBeenCalledTimes(2);
     });
 
     it('rejects stale same-stat parsed bytes and retries the current snapshot', async () => {
@@ -645,6 +941,7 @@ describe('CSV reload races', () => {
 
     it('retries failed post-save metadata delivery and then deduplicates safely', async () => {
         vi.useFakeTimers();
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let reads = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
@@ -682,6 +979,7 @@ describe('CSV reload races', () => {
         }]);
         await vscode_mock.__getWatchers()[0].__fireChange();
         expect(reload_attempts).toBe(2);
+        expect(close_spy).toHaveBeenCalledTimes(3);
         vi.useRealTimers();
     });
 

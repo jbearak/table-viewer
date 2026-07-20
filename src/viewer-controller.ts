@@ -17,6 +17,7 @@ import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type {
     AuthorityFileStateStore,
+    DurableFileAuthority,
     FileStateSnapshot,
 } from './state';
 import {
@@ -31,9 +32,10 @@ import {
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
-    type FileAuthoritySnapshot,
+    type PhysicalAuthorityCommitReceipt,
 } from './file-coordinator';
 import { reconcile_finalization } from './finalization-reconciliation';
+import { SourceCandidate } from './source-candidate';
 import {
     sanitize_excel_header_overrides,
     transform_has_entries,
@@ -100,6 +102,23 @@ interface HeaderSettlement {
 interface ExcelHeaderRecovery {
     requestId: string;
     settlement: HeaderSettlement;
+}
+
+type PhysicalAuthorityCommitResult =
+    | { type: 'committed'; receipt: PhysicalAuthorityCommitReceipt }
+    | { type: 'stale' }
+    | { type: 'rejected' }
+    | { type: 'advanced' };
+
+function same_durable_authority(
+    left: DurableFileAuthority,
+    right: DurableFileAuthority,
+): boolean {
+    return left.commitSequence === right.commitSequence
+        && left.authorityRevision === right.authorityRevision
+        && left.physicalRevision === right.physicalRevision
+        && left.projectionRevision === right.projectionRevision
+        && left.physicalDigest === right.physicalDigest;
 }
 
 function excel_profile(): ViewerProfile {
@@ -279,45 +298,34 @@ export function attach_viewer(
         }
     }
 
-    async function build_source(): Promise<{
-        source: DataSource;
-        digest: string;
-        snapshot: string;
-    }> {
+    async function build_source(): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await vscode.workspace.fs.stat(uri);
         const max_mib = get_max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
         const raw = await vscode.workspace.fs.readFile(uri);
         assert_safe_file_size(raw.byteLength, max_mib);
-        return {
-            source: await profile.build_source(raw, file_path, state),
+        const observation = {
+            fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
-            snapshot: `${stat.mtime}:${stat.size}`,
         };
-    }
-
-    function discard_stale_built_source(
-        ds: DataSource,
-        seq: number,
-        force = false,
-        header_recovery?: ExcelHeaderRecovery,
-    ): void {
-        ds.close();
-        if (!header_recovery) schedule_reload_retry(force, seq);
+        return new SourceCandidate(
+            await profile.build_source(raw, file_path, state),
+            observation,
+        );
     }
 
     async function built_source_is_current(
         seq: number,
-        snapshot: string,
-        digest: string,
+        candidate: SourceCandidate,
     ): Promise<boolean> {
         if (disposed || seq !== reload_seq) return false;
+        const { fingerprint, digest } = candidate.observation;
         const stat = await vscode.workspace.fs.stat(uri);
         if (
             disposed
             || seq !== reload_seq
-            || `${stat.mtime}:${stat.size}` !== snapshot
+            || `${stat.mtime}:${stat.size}` !== fingerprint
         ) {
             return false;
         }
@@ -325,29 +333,28 @@ export function attach_viewer(
         const verified_stat = await vscode.workspace.fs.stat(uri);
         return !disposed
             && seq === reload_seq
-            && `${verified_stat.mtime}:${verified_stat.size}` === snapshot
+            && `${verified_stat.mtime}:${verified_stat.size}` === fingerprint
             && content_digest(raw) === digest;
     }
 
-    async function reserve_and_prepare_adoption(
-        ds: DataSource,
+    async function commit_physical_candidate(
+        candidate: SourceCandidate,
         seq: number,
-        snapshot: string,
-        digest: string,
         expected_authority_revision: number,
         already_verified = false,
-        adopt_candidate = true,
-    ): Promise<boolean> {
+    ): Promise<PhysicalAuthorityCommitResult> {
         if (
             !already_verified
-            && !await built_source_is_current(seq, snapshot, digest)
-        ) return false;
+            && !await built_source_is_current(seq, candidate)
+        ) return { type: 'stale' };
+        const { digest } = candidate.observation;
         const started = file_coordinator.begin_physical(
             expected_authority_revision,
             digest,
         );
-        if (started.type === 'rejected') return false;
+        if (started.type === 'rejected') return { type: 'rejected' };
         const { token } = started;
+        const ds = candidate.borrow();
         const planning_input = ds instanceof ExcelHeaderDataSource
             ? ds.planning_input()
             : undefined;
@@ -358,7 +365,7 @@ export function attach_viewer(
                     disposed
                     || seq !== reload_seq
                     || !file_coordinator.operation_is_current(token)
-                ) return false;
+                ) return { type: 'stale' };
                 const state_snapshot = await read_file_state(false);
                 const plan = planning_input
                     ? plan_excel_candidate_state(
@@ -379,9 +386,30 @@ export function attach_viewer(
                         physicalDigest: digest,
                     },
                 );
-                if (staged.type === 'conflict') continue;
+                if (staged.type === 'conflict') {
+                    const current_authority = file_coordinator.authority();
+                    if (same_durable_authority(staged.authority, current_authority)) {
+                        continue;
+                    }
+                    const observation_turn = await file_coordinator.request_commit_turn(token);
+                    if (observation_turn.type === 'granted') {
+                        if (same_durable_authority(
+                            file_coordinator.authority(),
+                            current_authority,
+                        )) {
+                            file_coordinator.observe_advanced_authority(
+                                token,
+                                observation_turn.turn,
+                                staged.authority,
+                            );
+                        } else {
+                            file_coordinator.release_commit_turn(observation_turn.turn);
+                        }
+                    }
+                    return { type: 'advanced' };
+                }
                 const requested = await file_coordinator.request_commit_turn(token);
-                if (requested.type === 'rejected') return false;
+                if (requested.type === 'rejected') return { type: 'rejected' };
                 const finalizationBasis = file_coordinator.authority();
                 const descriptor = {
                     transactionId: token.id,
@@ -413,17 +441,14 @@ export function attach_viewer(
                         throw error;
                     }
                     if (reconciled.type === 'committed') {
-                        if (plan && ds instanceof ExcelHeaderDataSource) {
-                            ds.replace_overrides(plan.overrides);
-                        }
-                        const receipt = file_coordinator.finalize_authority_commit(
-                            token,
-                            requested.turn,
-                            reconciled,
-                        );
-                        return adopt_candidate
-                            ? adopt(ds, digest, receipt.resultingBasis)
-                            : true;
+                        return {
+                            type: 'committed',
+                            receipt: file_coordinator.finalize_authority_commit(
+                                token,
+                                requested.turn,
+                                reconciled,
+                            ),
+                        };
                     }
                     if (reconciled.type === 'advanced') {
                         file_coordinator.observe_advanced_authority(
@@ -431,27 +456,35 @@ export function attach_viewer(
                             requested.turn,
                             reconciled.authority,
                         );
-                        return false;
+                        return { type: 'advanced' };
                     }
                     file_coordinator.release_commit_turn(requested.turn);
                     void discard_authority(durable_state_store, state_path, token.id);
                     throw error;
                 }
                 if (finalized.type === 'conflict') {
+                    if (!same_durable_authority(
+                        finalized.authority,
+                        finalizationBasis,
+                    )) {
+                        file_coordinator.observe_advanced_authority(
+                            token,
+                            requested.turn,
+                            finalized.authority,
+                        );
+                        return { type: 'advanced' };
+                    }
                     file_coordinator.release_commit_turn(requested.turn);
                     continue;
                 }
-                if (plan && ds instanceof ExcelHeaderDataSource) {
-                    ds.replace_overrides(plan.overrides);
-                }
-                const receipt = file_coordinator.finalize_authority_commit(
-                    token,
-                    requested.turn,
-                    finalized,
-                );
-                return adopt_candidate
-                    ? adopt(ds, digest, receipt.resultingBasis)
-                    : true;
+                return {
+                    type: 'committed',
+                    receipt: file_coordinator.finalize_authority_commit(
+                        token,
+                        requested.turn,
+                        finalized,
+                    ),
+                };
             }
         } finally {
             file_coordinator.cancel(token);
@@ -459,27 +492,49 @@ export function attach_viewer(
         }
     }
 
-    function adopt(
-        ds: DataSource,
-        digest: string,
-        authority: FileAuthoritySnapshot,
-    ): boolean {
-        // Snapshot/state linearization may legitimately complete after a newer file
-        // event, but panel disposal is an absolute lifecycle boundary. Refuse the
-        // fresh candidate before installing a core/source and own its single close.
-        if (disposed) return false;
-        core = adopt_source_into_core(core, panel, source, ds, {
-            onTransformCommit: persist_transform_commit,
+    function adopt_committed_candidate(
+        candidate: SourceCandidate,
+        committed: Extract<PhysicalAuthorityCommitResult, { type: 'committed' }>,
+        seq: number,
+    ): DataSource | undefined {
+        // A durable commit can finish after a newer panel-local load starts. Keep
+        // ownership with the candidate unless this exact load is still current at
+        // the synchronous installation boundary.
+        if (disposed || seq !== reload_seq) return undefined;
+        const inspected = candidate.borrow();
+        if (inspected instanceof ExcelHeaderDataSource) {
+            const committed_state = normalize_host_state(
+                committed.receipt.stateSnapshot.state,
+                inspected.meta().sheets.map((sheet) => sheet.name),
+            );
+            inspected.replace_overrides(sanitize_excel_header_overrides(
+                committed_state.excelFirstRowHeaders,
+            ));
+        }
+        let adopted: DataSource | undefined;
+        const transferred = candidate.transfer_to((next, confirm_transfer) => {
+            if (disposed || seq !== reload_seq) return;
+            const previous = source;
+            const result = adopt_source_into_core(
+                core,
+                panel,
+                previous,
+                next,
+                { onTransformCommit: persist_transform_commit },
+                (installed) => {
+                    core = installed;
+                    source = next;
+                    source_authority = committed.receipt.resultingBasis;
+                    adopted_digest = committed.receipt.digest;
+                    adopted = next;
+                    confirm_transfer();
+                },
+            );
+            if (result.type === 'refused') return;
         });
-        source = ds;
-        source_authority = authority;
-        adopted_digest = digest;
-        profile.on_source_adopted?.(ds);
-        return true;
-    }
-
-    function close_unadopted_candidate(candidate: DataSource | undefined): void {
-        if (candidate && candidate !== source) candidate.close();
+        if (!transferred || !adopted || disposed) return undefined;
+        profile.on_source_adopted?.(adopted);
+        return adopted;
     }
 
     function metadata_is_delivered(): boolean {
@@ -511,12 +566,25 @@ export function attach_viewer(
         );
     }
 
-    async function state_for_first_meta(): Promise<PerFileState> {
-        const state = (await read_file_state()).state as PerFileState;
+    async function state_for_first_meta(
+        committed_state?: PerFileState,
+    ): Promise<PerFileState> {
+        const state = committed_state
+            ?? (await read_file_state()).state as PerFileState;
         if (!profile.editing || !state.pendingEdits) return state;
         if (try_claim_edit_session()) return state;
         const { pendingEdits: _drop, ...rest } = state;
         return rest;
+    }
+
+    function state_from_physical_receipt(
+        ds: DataSource,
+        receipt: PhysicalAuthorityCommitReceipt,
+    ): PerFileState {
+        return normalize_per_file_state(
+            receipt.stateSnapshot.state,
+            ds.meta().sheets.map((sheet) => sheet.name),
+        );
     }
 
     async function send_first_meta(
@@ -525,7 +593,7 @@ export function attach_viewer(
     ): Promise<boolean> {
         const settlement = outstanding_header_settlement;
         const delivered = await core!.send_meta({
-            state: committed_state ?? await state_for_first_meta(),
+            state: await state_for_first_meta(committed_state),
             defaultTabOrientation: get_default_orientation(),
             previewMode: profile.previewMode,
             ...editing_flags(ds),
@@ -674,18 +742,23 @@ export function attach_viewer(
     async function send_initial_data(): Promise<void> {
         reset_reload_retry();
         const seq = ++reload_seq;
-        let candidate: DataSource | undefined;
+        let candidate: SourceCandidate | undefined;
         try {
             const expected_authority = file_coordinator.authority().authorityRevision;
-            const { source: ds, digest, snapshot } = await build_source();
-            candidate = ds;
-            if (!await reserve_and_prepare_adoption(
-                ds, seq, snapshot, digest, expected_authority,
-            )) {
-                discard_stale_built_source(ds, seq, true);
+            candidate = await build_source();
+            const committed = await commit_physical_candidate(
+                candidate, seq, expected_authority,
+            );
+            if (committed.type !== 'committed') {
+                schedule_reload_retry(true, seq);
                 return;
             }
-            if (await send_first_meta(ds)) {
+            const ds = adopt_committed_candidate(candidate, committed, seq);
+            if (!ds) return;
+            if (await send_first_meta(
+                ds,
+                state_from_physical_receipt(ds, committed.receipt),
+            )) {
                 initial_meta_sent = true;
                 mark_metadata_delivered(seq);
                 surface_warnings(ds);
@@ -693,11 +766,12 @@ export function attach_viewer(
                 schedule_reload_retry(true, seq);
             }
         } catch (err) {
-            close_unadopted_candidate(candidate);
             if (disposed) return;
             if (!schedule_reload_retry(true, seq)) {
                 vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
             }
+        } finally {
+            candidate?.dispose();
         }
     }
 
@@ -707,37 +781,41 @@ export function attach_viewer(
     // failures share one bounded retry budget.
     async function reparse_and_post(): Promise<boolean> {
         const expected_authority = file_coordinator.authority().authorityRevision;
-        let built: Awaited<ReturnType<typeof build_source>>;
+        let candidate: SourceCandidate | undefined;
         let attempts = 0;
-        for (;;) {
-            if (disposed) return false;
-            try {
-                built = await build_source();
-                break;
-            } catch (error) {
-                if (disposed || attempts >= RELOAD_RETRY_COUNT) throw error;
-                attempts += 1;
-                await delay(RELOAD_RETRY_MS);
-            }
-        }
-        if (disposed) {
-            built.source.close();
-            return false;
-        }
-        reset_reload_retry();
-        reload_retry_attempts = attempts;
-        const seq = ++reload_seq;
-        const { source: ds, digest, snapshot } = built;
-        let delivered = false;
         try {
-            if (!await reserve_and_prepare_adoption(
-                ds, seq, snapshot, digest, expected_authority,
-            )) {
-                discard_stale_built_source(ds, seq, true);
+            for (;;) {
+                if (disposed) return false;
+                try {
+                    candidate = await build_source();
+                    break;
+                } catch (error) {
+                    if (disposed || attempts >= RELOAD_RETRY_COUNT) throw error;
+                    attempts += 1;
+                    await delay(RELOAD_RETRY_MS);
+                }
+            }
+            if (disposed) return false;
+            reset_reload_retry();
+            reload_retry_attempts = attempts;
+            const seq = ++reload_seq;
+            const committed = await commit_physical_candidate(
+                candidate, seq, expected_authority,
+            );
+            if (committed.type !== 'committed') {
+                schedule_reload_retry(true, seq);
                 return false;
             }
+            const ds = adopt_committed_candidate(candidate, committed, seq);
+            if (!ds) return false;
+            let delivered: boolean;
             try {
-                delivered = await post_reload(ds);
+                delivered = await post_reload(
+                    ds,
+                    undefined,
+                    undefined,
+                    state_from_physical_receipt(ds, committed.receipt),
+                );
             } catch (error) {
                 if (!schedule_reload_retry(true, seq)) throw error;
                 return false;
@@ -747,11 +825,10 @@ export function attach_viewer(
             } else {
                 schedule_reload_retry(true, seq);
             }
-        } catch (error) {
-            close_unadopted_candidate(ds);
-            throw error;
+            return delivered;
+        } finally {
+            candidate?.dispose();
         }
-        return delivered;
     }
 
     function reset_reload_retry(): void {
@@ -801,21 +878,20 @@ export function attach_viewer(
             seq = ++reload_seq;
         }
         let delivered = false;
-        let candidate: DataSource | undefined;
+        let candidate: SourceCandidate | undefined;
         try {
-            let expected_authority = file_coordinator.authority().authorityRevision;
-            const { source: ds, digest, snapshot } = await build_source();
-            candidate = ds;
+            const expected_authority = file_coordinator.authority().authorityRevision;
+            candidate = await build_source();
+            const ds = candidate.borrow();
             if (
                 header_recovery
                 && outstanding_header_settlement !== header_recovery.settlement
             ) {
-                ds.close();
                 delivered = true;
                 return delivered;
             }
-            if (!await built_source_is_current(seq, snapshot, digest)) {
-                discard_stale_built_source(ds, seq, force, header_recovery);
+            if (!await built_source_is_current(seq, candidate)) {
+                if (!header_recovery) schedule_reload_retry(force, seq);
                 return delivered;
             }
             // Deduplicate only when the webview has actually received metadata
@@ -823,26 +899,32 @@ export function attach_viewer(
             if (
                 !force
                 && outstanding_header_settlement === undefined
-                && digest === delivered_digest
+                && candidate.observation.digest === delivered_digest
                 && metadata_is_delivered()
             ) {
-                if (await reserve_and_prepare_adoption(
-                    ds, seq, snapshot, digest, expected_authority, true, false,
-                )) {
-                    ds.close();
+                const deduplicated = await commit_physical_candidate(
+                    candidate, seq, expected_authority, true,
+                );
+                if (deduplicated.type === 'committed') {
                     mark_metadata_delivered(seq);
                     return true;
                 }
-                expected_authority = file_coordinator.authority().authorityRevision;
-            }
-            if (!await reserve_and_prepare_adoption(
-                ds, seq, snapshot, digest, expected_authority, true,
-            )) {
-                discard_stale_built_source(ds, seq, force, header_recovery);
+                if (!header_recovery) schedule_reload_retry(force, seq);
                 return delivered;
             }
+            const committed = await commit_physical_candidate(
+                candidate, seq, expected_authority, true,
+            );
+            if (committed.type !== 'committed') {
+                if (!header_recovery) schedule_reload_retry(force, seq);
+                return delivered;
+            }
+            if (!adopt_committed_candidate(candidate, committed, seq)) return false;
             if (!initial_meta_sent) {
-                delivered = await send_first_meta(ds);
+                delivered = await send_first_meta(
+                    ds,
+                    state_from_physical_receipt(ds, committed.receipt),
+                );
                 if (!delivered) {
                     if (!header_recovery) schedule_reload_retry(force, seq);
                     return delivered;
@@ -856,7 +938,7 @@ export function attach_viewer(
                 ds,
                 header_recovery ? 'excelHeader' : undefined,
                 header_recovery?.requestId,
-                header_recovery ? await state_for_reload(ds) : undefined,
+                state_from_physical_receipt(ds, committed.receipt),
             );
             if (!delivered) {
                 if (!header_recovery) schedule_reload_retry(force, seq);
@@ -865,12 +947,13 @@ export function attach_viewer(
             mark_metadata_delivered(header_recovery ? undefined : seq);
             surface_warnings(ds);
         } catch (err) {
-            close_unadopted_candidate(candidate);
             if (disposed || header_recovery) return false;
             if (schedule_reload_retry(force, seq)) return false;
             console.error('Failed to reload table viewer data', err);
             vscode.window.showErrorMessage(
                 `Failed to reload: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+            candidate?.dispose();
         }
         return delivered;
     }
@@ -1372,11 +1455,20 @@ export function attach_viewer(
             reset_reload_retry();
             cancel_terminal_retry_waits();
             outstanding_header_settlement = undefined;
-            release_edit_session();
-            core?.dispose();
-            source?.close();
-            for (const d of disposables) d.dispose();
-            file_coordinator.dispose();
+            let first_error: unknown;
+            const cleanup = (action: () => void) => {
+                try {
+                    action();
+                } catch (error) {
+                    first_error ??= error;
+                }
+            };
+            cleanup(release_edit_session);
+            cleanup(() => core?.dispose());
+            cleanup(() => source?.close());
+            for (const d of disposables) cleanup(() => d.dispose());
+            cleanup(() => file_coordinator.dispose());
+            if (first_error !== undefined) throw first_error;
         },
     };
 }
