@@ -1,5 +1,10 @@
 import type { DataSource, RowWindow } from './data-source/interface';
+import { deep_clone_and_freeze } from './immutable';
 import { compute_transform, transformed_window } from './table-transform';
+import type {
+    WorkbookSnapshotCoreMaterial,
+    WorkbookSnapshotDiagnostics,
+} from './viewer-snapshot';
 import {
     EMPTY_TRANSFORM,
     transform_schema_for_sheet,
@@ -58,12 +63,21 @@ type TransformCommit = (
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
 
+export interface ViewerPanelSnapshotMaterial {
+    readonly core: WorkbookSnapshotCoreMaterial;
+    readonly diagnostics: WorkbookSnapshotDiagnostics;
+}
+
+export type AdoptSourceResult =
+    | { type: 'adopted' }
+    | { type: 'refused' };
+
 /**
  * Protocol engine shared by the xlsx/xls custom editor and the CSV panel.
  *
  * Owns:
- *  - a monotonic `generation` counter (bumped on every reload) so the webview
- *    can drop row windows belonging to a superseded document version;
+ *  - monotonic view/source generations advanced by logical adoption, with view
+ *    generation also advancing after a successfully installed transform;
  *  - an LRU cache of already-served row windows keyed by sheet/start/count;
  *  - the `requestRows` -> `rowData` handler with a generation guard and
  *    boundary validation.
@@ -110,25 +124,44 @@ export class ViewerPanelCore {
             || this.transform_indices.size > 0;
     }
 
-    /** Swap in a freshly-parsed source (reload) without sending a message. */
-    set_source(source: DataSource): boolean {
-        if (this.disposed) return false;
+    /**
+     * Adopt a new physical source or logical projection without posting metadata.
+     * Object identity is deliberately irrelevant: an in-place Excel projection is
+     * still a new source/view generation. A disposed core refuses ownership.
+     */
+    adopt_source(source: DataSource): AdoptSourceResult {
+        if (this.disposed) return { type: 'refused' };
         this.source = source;
         this.source_epoch += 1;
+        this._generation += 1;
         this._source_generation += 1;
         this.transform_indices.clear();
         this.transform_states.clear();
         this.transform_sequences.clear();
         this.transforms_in_flight.clear();
         this.cache.clear();
-        return true;
+        return { type: 'adopted' };
     }
 
-    /** Cancel asynchronous work before its source is closed or replaced. */
-    cancel_pending(): void {
+    /** Cancel asynchronous work before disposal. Adoption cancels atomically. */
+    private cancel_pending(): void {
         this.source_epoch += 1;
         this.transform_sequences.clear();
         this.transforms_in_flight.clear();
+    }
+
+    /** Clone and freeze all source-owned material needed by a future snapshot. */
+    snapshot_material(): ViewerPanelSnapshotMaterial {
+        return deep_clone_and_freeze({
+            core: {
+                generation: this._generation,
+                sourceGeneration: this._source_generation,
+                meta: this.source.meta(),
+            },
+            diagnostics: {
+                truncationMessage: this.source.truncationMessage ?? null,
+            },
+        });
     }
 
     /** Permanently stop work and suppress all later protocol messages. */
@@ -141,13 +174,13 @@ export class ViewerPanelCore {
         this.cache.clear();
     }
 
-    /** Initial structure send. Generation is left as-is (a fresh panel starts
-     *  at generation 1; subsequent reloads bump it via send_meta_reload). */
+    /** Initial legacy structure send for the already-adopted source identity. */
     async send_meta(envelope: MetaEnvelope): Promise<boolean> {
         if (this.disposed) return false;
+        const material = this.snapshot_material();
         return this.post({
             type: 'sheetMeta',
-            meta: this.source.meta(),
+            meta: material.core.meta,
             state: envelope.state,
             defaultTabOrientation: envelope.defaultTabOrientation,
             previewMode: envelope.previewMode,
@@ -156,46 +189,46 @@ export class ViewerPanelCore {
             projectionChange: envelope.projectionChange,
             headerRequestId: envelope.headerRequestId,
             error: envelope.error,
-            truncationMessage: this.source.truncationMessage,
-            generation: this._generation,
-            sourceGeneration: this._source_generation,
+            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
+            generation: material.core.generation,
+            sourceGeneration: material.core.sourceGeneration,
         });
     }
 
     /** Full authoritative metadata recovery without changing core generations. */
     async send_meta_recovery(envelope: MetaRecoveryEnvelope): Promise<boolean> {
         if (this.disposed) return false;
+        const material = this.snapshot_material();
         return this.post({
             type: 'metaReloadRecovery',
-            meta: this.source.meta(),
+            meta: material.core.meta,
             state: envelope.state,
             csvEditable: envelope.csvEditable,
             csvEditingSupported: envelope.csvEditingSupported,
             projectionChange: 'excelHeader',
-            truncationMessage: this.source.truncationMessage,
-            generation: this._generation,
-            sourceGeneration: this._source_generation,
+            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
+            generation: material.core.generation,
+            sourceGeneration: material.core.sourceGeneration,
             headerRequestId: envelope.headerRequestId,
             error: envelope.error,
         });
     }
 
-    /** Reload send: bump generation, drop cached windows, post metaReload. */
+    /** Legacy reload post for the already-adopted source identity. */
     async send_meta_reload(envelope?: ReloadEnvelope): Promise<boolean> {
         if (this.disposed) return false;
-        this._generation += 1;
-        this.cache.clear();
+        const material = this.snapshot_material();
         return this.post({
             type: 'metaReload',
-            meta: this.source.meta(),
+            meta: material.core.meta,
             state: envelope?.state,
             csvEditable: envelope?.csvEditable,
             csvEditingSupported: envelope?.csvEditingSupported,
             projectionChange: envelope?.projectionChange,
             headerRequestId: envelope?.headerRequestId,
-            truncationMessage: this.source.truncationMessage,
-            generation: this._generation,
-            sourceGeneration: this._source_generation,
+            truncationMessage: material.diagnostics.truncationMessage ?? undefined,
+            generation: material.core.generation,
+            sourceGeneration: material.core.sourceGeneration,
         });
     }
 
@@ -463,9 +496,9 @@ function clone_transform(state: SheetTransformState): SheetTransformState {
 }
 
 /**
- * Install a freshly-built source into a panel's core: close the previous source
- * (when it is being replaced) and either swap it into the existing core or create
- * one. Returns the core to assign back. Every panel (csv/preview/custom-editor)
+ * Adopt a freshly-built source or same-object logical projection into a panel's
+ * core: close a distinct previous source after installation, or create the initial
+ * core at generation/sourceGeneration 1. Every panel (csv/preview/custom-editor)
  * shares this close + create-or-swap dance, so it lives here rather than being
  * re-implemented in each panel's `adopt`. Installation is explicit: a disposed
  * core refuses the source, and the previous source closes only after the new
@@ -485,8 +518,7 @@ export function adopt_source_into_core(
 ): AdoptSourceIntoCoreResult {
     let installed: ViewerPanelCore;
     if (core) {
-        core.cancel_pending();
-        if (!core.set_source(next)) return { type: 'refused' };
+        if (core.adopt_source(next).type === 'refused') return { type: 'refused' };
         installed = core;
     } else {
         installed = new ViewerPanelCore(panel, next, opts);

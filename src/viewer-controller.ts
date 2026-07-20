@@ -104,6 +104,23 @@ interface ExcelHeaderRecovery {
     settlement: HeaderSettlement;
 }
 
+interface LegacyDeliveryIdentity {
+    readonly adoptionEpoch: number;
+    readonly source: DataSource;
+    readonly digest: string | undefined;
+    readonly authorityRevision: number;
+    readonly physicalRevision: number;
+    readonly projectionRevision: number;
+    readonly generation: number;
+    readonly sourceGeneration: number;
+}
+
+interface LegacyDeliveryResult {
+    readonly delivered: boolean;
+    readonly identity: LegacyDeliveryIdentity;
+    readonly current: boolean;
+}
+
 type PhysicalAuthorityCommitResult =
     | { type: 'committed'; receipt: PhysicalAuthorityCommitReceipt }
     | { type: 'stale' }
@@ -186,11 +203,9 @@ export function attach_viewer(
     let disposed = false;
     let initial_meta_sent = false;
     let ready_seen = false;
+    let adoption_epoch = 0;
     let adopted_digest: string | undefined;
-    let delivered_digest: string | undefined;
-    let delivered_authority_revision = source_authority.authorityRevision;
-    let delivered_generation: number | undefined;
-    let delivered_source_generation: number | undefined;
+    let delivered_identity: LegacyDeliveryIdentity | undefined;
     let reload_retry_attempts = 0;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
     const terminal_retry_waits = new Set<{
@@ -526,6 +541,7 @@ export function attach_viewer(
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
                     adopted_digest = committed.receipt.digest;
+                    adoption_epoch += 1;
                     adopted = next;
                     confirm_transfer();
                 },
@@ -537,26 +553,56 @@ export function attach_viewer(
         return adopted;
     }
 
-    function metadata_is_delivered(): boolean {
-        return initial_meta_sent
-            && core !== undefined
-            && adopted_digest === delivered_digest
-            && source_authority.authorityRevision === delivered_authority_revision
-            && source_authority.authorityRevision
-                === file_coordinator.authority().authorityRevision
-            && core.generation === delivered_generation
-            && core.source_generation === delivered_source_generation;
+    function capture_legacy_delivery_identity(
+        expected_source: DataSource,
+    ): LegacyDeliveryIdentity | undefined {
+        if (disposed || !core || source !== expected_source) return undefined;
+        return Object.freeze({
+            adoptionEpoch: adoption_epoch,
+            source: expected_source,
+            digest: adopted_digest,
+            authorityRevision: source_authority.authorityRevision,
+            physicalRevision: source_authority.physicalRevision,
+            projectionRevision: source_authority.projectionRevision,
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
     }
 
-    function mark_metadata_delivered(seq?: number): void {
-        delivered_digest = adopted_digest;
-        delivered_authority_revision = source_authority.authorityRevision;
-        delivered_generation = core?.generation;
-        delivered_source_generation = core?.source_generation;
+    function legacy_delivery_is_current(
+        identity: LegacyDeliveryIdentity,
+    ): boolean {
+        return !disposed
+            && core !== undefined
+            && source === identity.source
+            && adoption_epoch === identity.adoptionEpoch
+            && adopted_digest === identity.digest
+            && source_authority.authorityRevision === identity.authorityRevision
+            && source_authority.physicalRevision === identity.physicalRevision
+            && source_authority.projectionRevision === identity.projectionRevision
+            && core.generation === identity.generation
+            && core.source_generation === identity.sourceGeneration;
+    }
+
+    function metadata_is_delivered(): boolean {
+        return initial_meta_sent
+            && delivered_identity !== undefined
+            && legacy_delivery_is_current(delivered_identity)
+            && source_authority.authorityRevision
+                === file_coordinator.authority().authorityRevision;
+    }
+
+    function mark_metadata_delivered(
+        identity: LegacyDeliveryIdentity,
+        seq?: number,
+    ): boolean {
+        if (!legacy_delivery_is_current(identity)) return false;
+        delivered_identity = identity;
         // A direct header projection delivery is not completion of an unrelated
         // physical-file reload episode. Only that episode's own successful post
         // may clear its retry timer and budget.
         if (seq !== undefined && seq === reload_seq) reset_reload_retry();
+        return true;
     }
 
     async function state_for_reload(ds: DataSource): Promise<PerFileState> {
@@ -590,10 +636,13 @@ export function attach_viewer(
     async function send_first_meta(
         ds: DataSource,
         committed_state?: PerFileState,
-    ): Promise<boolean> {
+    ): Promise<LegacyDeliveryResult | undefined> {
+        const state = await state_for_first_meta(committed_state);
+        const identity = capture_legacy_delivery_identity(ds);
+        if (!identity || !core) return undefined;
         const settlement = outstanding_header_settlement;
-        const delivered = await core!.send_meta({
-            state: await state_for_first_meta(committed_state),
+        const delivered = await core.send_meta({
+            state,
             defaultTabOrientation: get_default_orientation(),
             previewMode: profile.previewMode,
             ...editing_flags(ds),
@@ -601,14 +650,17 @@ export function attach_viewer(
             headerRequestId: settlement?.requestId,
             error: settlement?.error,
         });
+        const current = legacy_delivery_is_current(identity);
         if (
             delivered
+            && current
             && ready_seen
             && settlement === outstanding_header_settlement
         ) {
+            initial_meta_sent = true;
             outstanding_header_settlement = undefined;
         }
-        return delivered;
+        return { delivered, identity, current };
     }
 
     async function post_reload(
@@ -616,36 +668,58 @@ export function attach_viewer(
         projectionChange?: 'excelHeader',
         headerRequestId?: string,
         state?: PerFileState,
-    ): Promise<boolean> {
+    ): Promise<LegacyDeliveryResult | undefined> {
+        const resolved_state = state ?? (outstanding_header_settlement
+            ? await state_for_reload(ds)
+            : undefined);
+        const identity = capture_legacy_delivery_identity(ds);
+        if (!identity || !core) return undefined;
         const settlement = outstanding_header_settlement;
-        const delivered = await core!.send_meta_reload({
+        const delivered = await core.send_meta_reload({
             ...editing_flags(ds),
             projectionChange: settlement ? 'excelHeader' : projectionChange,
             headerRequestId: settlement?.requestId ?? headerRequestId,
-            state: settlement ? (state ?? await state_for_reload(ds)) : state,
+            state: settlement ? resolved_state : state,
         });
-        if (delivered && settlement === outstanding_header_settlement) {
+        const current = legacy_delivery_is_current(identity);
+        if (
+            delivered
+            && current
+            && settlement === outstanding_header_settlement
+        ) {
             outstanding_header_settlement = undefined;
         }
-        return delivered;
+        return { delivered, identity, current };
+    }
+
+    async function post_meta_recovery(
+        ds: DataSource,
+        settlement: HeaderSettlement,
+    ): Promise<LegacyDeliveryResult | undefined> {
+        const state = await state_for_reload(ds);
+        const identity = capture_legacy_delivery_identity(ds);
+        if (!identity || !core) return undefined;
+        const delivered = await core.send_meta_recovery({
+            state,
+            ...editing_flags(ds),
+            headerRequestId: settlement.requestId,
+            error: settlement.error,
+        });
+        return {
+            delivered,
+            identity,
+            current: legacy_delivery_is_current(identity),
+        };
     }
 
     async function post_header_projection(
         ds: DataSource,
         request_id: string,
         committed_state?: PerFileState,
-    ): Promise<boolean> {
-        if (!initial_meta_sent) {
-            const delivered = await send_first_meta(ds, committed_state);
-            if (delivered && ready_seen) initial_meta_sent = true;
-            return delivered;
-        }
-        return post_reload(
-            ds,
-            'excelHeader',
-            request_id,
-            committed_state ?? await state_for_reload(ds),
-        );
+    ): Promise<LegacyDeliveryResult | undefined> {
+        if (!initial_meta_sent) return send_first_meta(ds, committed_state);
+        const state = committed_state ?? await state_for_reload(ds);
+        return post_reload(ds, 'excelHeader', request_id, state);
     }
 
     async function apply_excel_header_receipt(
@@ -685,10 +759,26 @@ export function attach_viewer(
             );
             return;
         }
-        // The projected source object is intentionally reused. set_source still
-        // invalidates source generations, transforms, and row-window caches.
-        core.set_source(source);
+        // The projected source object is intentionally reused, but its logical
+        // adoption still advances both generations and invalidates source work.
+        const projection_adoption = adopt_source_into_core(
+            core,
+            panel,
+            source,
+            source,
+        );
+        if (projection_adoption.type === 'refused') {
+            void send_header_recovery(
+                settlement,
+                is_origin
+                    ? 'The header setting was saved, but the view could not refresh.'
+                    : undefined,
+            );
+            return;
+        }
+        core = projection_adoption.core;
         source_authority = receipt.resultingBasis;
+        adoption_epoch += 1;
         const attempts = is_origin ? HEADER_RELOAD_RETRY_COUNT : 1;
         for (let attempt = 0; attempt < attempts; attempt++) {
             if (
@@ -697,14 +787,16 @@ export function attach_viewer(
                     !== receipt.resultingBasis.authorityRevision
             ) return;
             try {
-                if (await post_header_projection(
+                const delivery = await post_header_projection(
                     source,
                     receipt.requestId,
                     receipt.stateSnapshot.state as PerFileState,
-                )) {
-                    mark_metadata_delivered();
-                    return;
-                }
+                );
+                if (
+                    delivery?.delivered
+                    && delivery.current
+                    && mark_metadata_delivered(delivery.identity)
+                ) return;
             } catch {
                 // Delivery and retry remain panel-local and never hold the file queue.
             }
@@ -755,12 +847,15 @@ export function attach_viewer(
             }
             const ds = adopt_committed_candidate(candidate, committed, seq);
             if (!ds) return;
-            if (await send_first_meta(
+            const delivery = await send_first_meta(
                 ds,
                 state_from_physical_receipt(ds, committed.receipt),
-            )) {
-                initial_meta_sent = true;
-                mark_metadata_delivered(seq);
+            );
+            if (
+                delivery?.delivered
+                && delivery.current
+                && mark_metadata_delivered(delivery.identity, seq)
+            ) {
                 surface_warnings(ds);
             } else {
                 schedule_reload_retry(true, seq);
@@ -808,9 +903,9 @@ export function attach_viewer(
             }
             const ds = adopt_committed_candidate(candidate, committed, seq);
             if (!ds) return false;
-            let delivered: boolean;
+            let delivery: LegacyDeliveryResult | undefined;
             try {
-                delivered = await post_reload(
+                delivery = await post_reload(
                     ds,
                     undefined,
                     undefined,
@@ -820,11 +915,10 @@ export function attach_viewer(
                 if (!schedule_reload_retry(true, seq)) throw error;
                 return false;
             }
-            if (delivered) {
-                mark_metadata_delivered(seq);
-            } else {
-                schedule_reload_retry(true, seq);
-            }
+            const delivered = !!delivery?.delivered
+                && delivery.current
+                && mark_metadata_delivered(delivery.identity, seq);
+            if (!delivered) schedule_reload_retry(true, seq);
             return delivered;
         } finally {
             candidate?.dispose();
@@ -899,14 +993,14 @@ export function attach_viewer(
             if (
                 !force
                 && outstanding_header_settlement === undefined
-                && candidate.observation.digest === delivered_digest
+                && candidate.observation.digest === delivered_identity?.digest
                 && metadata_is_delivered()
             ) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, seq, expected_authority, true,
                 );
                 if (deduplicated.type === 'committed') {
-                    mark_metadata_delivered(seq);
+                    if (seq === reload_seq) reset_reload_retry();
                     return true;
                 }
                 if (!header_recovery) schedule_reload_retry(force, seq);
@@ -921,30 +1015,39 @@ export function attach_viewer(
             }
             if (!adopt_committed_candidate(candidate, committed, seq)) return false;
             if (!initial_meta_sent) {
-                delivered = await send_first_meta(
+                const delivery = await send_first_meta(
                     ds,
                     state_from_physical_receipt(ds, committed.receipt),
                 );
+                delivered = !!delivery?.delivered
+                    && delivery.current
+                    && mark_metadata_delivered(
+                        delivery.identity,
+                        header_recovery ? undefined : seq,
+                    );
                 if (!delivered) {
                     if (!header_recovery) schedule_reload_retry(force, seq);
-                    return delivered;
+                    return false;
                 }
-                if (ready_seen) initial_meta_sent = true;
-                mark_metadata_delivered(header_recovery ? undefined : seq);
                 surface_warnings(ds);
-                return delivered;
+                return true;
             }
-            delivered = await post_reload(
+            const delivery = await post_reload(
                 ds,
                 header_recovery ? 'excelHeader' : undefined,
                 header_recovery?.requestId,
                 state_from_physical_receipt(ds, committed.receipt),
             );
+            delivered = !!delivery?.delivered
+                && delivery.current
+                && mark_metadata_delivered(
+                    delivery.identity,
+                    header_recovery ? undefined : seq,
+                );
             if (!delivered) {
                 if (!header_recovery) schedule_reload_retry(force, seq);
-                return delivered;
+                return false;
             }
-            mark_metadata_delivered(header_recovery ? undefined : seq);
             surface_warnings(ds);
         } catch (err) {
             if (disposed || header_recovery) return false;
@@ -1025,8 +1128,7 @@ export function attach_viewer(
         ) {
             if (disposed) return false;
             if (outstanding_header_settlement !== tracked_settlement) return true;
-            let delivered = false;
-            let delivered_settlement: typeof tracked_settlement | undefined;
+            let delivery: LegacyDeliveryResult | undefined;
             if (outstanding_header_settlement !== tracked_settlement) return true;
             if (
                 disposed
@@ -1035,30 +1137,22 @@ export function attach_viewer(
                 || source_authority.authorityRevision
                     !== file_coordinator.authority().authorityRevision
             ) return false;
+            const delivery_source = source;
             try {
-                if (!initial_meta_sent) {
-                    delivered = await send_first_meta(source);
-                    if (delivered && ready_seen) initial_meta_sent = true;
-                } else {
-                    delivered = await core.send_meta_recovery({
-                        state: await state_for_reload(source),
-                        ...editing_flags(source),
-                        headerRequestId: tracked_settlement.requestId,
-                        error: tracked_settlement.error,
-                    });
-                }
+                delivery = !initial_meta_sent
+                    ? await send_first_meta(delivery_source)
+                    : await post_meta_recovery(delivery_source, tracked_settlement);
             } catch {
-                delivered = false;
+                delivery = undefined;
             }
+            const delivered = !!delivery?.delivered
+                && delivery.current
+                && mark_metadata_delivered(delivery.identity);
             if (delivered) {
-                delivered_settlement = tracked_settlement;
-                mark_metadata_delivered();
-                surface_warnings(source);
-            }
-            if (delivered) {
+                surface_warnings(delivery_source);
                 if (
                     initial_meta_sent
-                    && delivered_settlement === outstanding_header_settlement
+                    && tracked_settlement === outstanding_header_settlement
                 ) {
                     outstanding_header_settlement = undefined;
                 }

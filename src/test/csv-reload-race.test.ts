@@ -460,7 +460,56 @@ describe('CSV reload races', () => {
         expect(meta_reloads(panel).at(-1)?.meta.sheets[0].rowCount).toBe(2);
     });
 
-    it('retries a failed initial metadata post without stranding generations', async () => {
+    it('ignores a delayed initial post after a newer initial adoption fails delivery', async () => {
+        let current = enc.encode('h\na\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => current);
+        open_csv_table(uri('/tmp/delayed-initial-delivery.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        const older_post = deferred<boolean>();
+        const older_started = deferred<void>();
+        const attempts: Array<{ generation: number; sourceGeneration: number }> = [];
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: any) => {
+            if (message?.type === 'sheetMeta') {
+                attempts.push({
+                    generation: message.generation,
+                    sourceGeneration: message.sourceGeneration,
+                });
+                if (attempts.length === 1) {
+                    older_started.resolve(undefined);
+                    return older_post.promise;
+                }
+                if (attempts.length === 2) return false;
+            }
+            return original_post(message);
+        });
+
+        const ready = panel.__receive({ type: 'ready' });
+        await older_started.promise;
+        current = enc.encode('h\nb\n');
+        const watcher = vscode_mock.__getWatchers()[0];
+        await watcher.__fireChange();
+        older_post.resolve(true);
+        await ready;
+
+        // The successful A post cannot make B initial/delivered. A same-digest B
+        // event must re-adopt and retry sheetMeta rather than deduplicating or
+        // switching prematurely to metaReload.
+        await watcher.__fireChange();
+        expect(attempts).toEqual([
+            { generation: 1, sourceGeneration: 1 },
+            { generation: 2, sourceGeneration: 2 },
+            { generation: 3, sourceGeneration: 3 },
+        ]);
+        expect(sheet_meta(panel).at(-1)).toMatchObject({
+            generation: 3,
+            sourceGeneration: 3,
+        });
+        expect(meta_reloads(panel)).toHaveLength(0);
+    });
+
+    it('counts the source re-adoption, not the failed initial metadata post', async () => {
         vi.useFakeTimers();
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
@@ -487,11 +536,66 @@ describe('CSV reload races', () => {
         expect(sheet_meta_attempts).toBe(2);
         expect(sheet_meta(panel)).toMatchObject([{
             sourceGeneration: 2,
-            generation: 1,
+            generation: 2,
         }]);
         await vscode_mock.__getWatchers()[0].__fireChange();
         expect(sheet_meta_attempts).toBe(2);
         vi.useRealTimers();
+    });
+
+    it('does not credit a delayed older post to a newer failed adoption', async () => {
+        let current = enc.encode('h\ninitial\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => current);
+        open_csv_table(uri('/tmp/delayed-delivery.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+
+        const original_post = panel.webview.postMessage.bind(panel.webview);
+        const older_post = deferred<boolean>();
+        const older_started = deferred<void>();
+        const attempts: Array<{ generation: number; sourceGeneration: number }> = [];
+        vi.spyOn(panel.webview, 'postMessage').mockImplementation(async (message: any) => {
+            if (message?.type === 'metaReload') {
+                attempts.push({
+                    generation: message.generation,
+                    sourceGeneration: message.sourceGeneration,
+                });
+                if (attempts.length === 1) {
+                    older_started.resolve(undefined);
+                    return older_post.promise;
+                }
+                if (attempts.length === 2) return false;
+            }
+            return original_post(message);
+        });
+
+        const watcher = vscode_mock.__getWatchers()[0];
+        current = enc.encode('h\na\n');
+        const older_reload = watcher.__fireChange();
+        await older_started.promise;
+
+        current = enc.encode('h\nb\n');
+        await watcher.__fireChange();
+        older_post.resolve(true);
+        await older_reload;
+
+        await panel.__receive({ type: 'saveCsv', edits: {} });
+        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+
+        // The same B digest must not deduplicate: only a B metadata post can mark
+        // this adoption delivered. The third event therefore reparses and posts.
+        await watcher.__fireChange();
+        expect(attempts).toEqual([
+            { generation: 2, sourceGeneration: 2 },
+            { generation: 3, sourceGeneration: 3 },
+            { generation: 4, sourceGeneration: 4 },
+        ]);
+        expect(meta_reloads(panel).at(-1)).toMatchObject({
+            generation: 4,
+            sourceGeneration: 4,
+            meta: { sheets: [{ rowCount: 1 }] },
+        });
     });
 
     it('does not deduplicate a same-digest watcher after failed reload delivery', async () => {

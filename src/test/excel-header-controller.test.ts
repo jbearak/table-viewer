@@ -12,7 +12,7 @@ import type {
     WorkbookMeta,
 } from '../data-source/interface';
 import type { AuthorityFileStateStore, FileStateStore } from '../state';
-import type { PerFileState, StoredPerFileState } from '../types';
+import type { HostMessage, PerFileState, StoredPerFileState } from '../types';
 import * as vscode_mock from './mocks/vscode';
 import { with_in_memory_authority_transactions } from '../state-authority';
 
@@ -953,12 +953,27 @@ describe('Excel first-row header controller', () => {
         vi.useRealTimers();
 
         expect(terminal_attempts).toBe(3);
-        expect(post_spy.mock.calls.filter(([message]) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'metaReload'
-        ))).toHaveLength(7);
+        const reload_attempts = post_spy.mock.calls
+            .map(([message]) => message)
+            .filter((message): message is Extract<HostMessage, { type: 'metaReload' }> => (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'metaReload'
+            ));
+        expect(reload_attempts).toHaveLength(7);
+        expect(reload_attempts.map((message) => [
+            message.generation,
+            message.sourceGeneration,
+        ])).toEqual([
+            [initial.generation + 1, initial.sourceGeneration + 1],
+            [initial.generation + 1, initial.sourceGeneration + 1],
+            [initial.generation + 1, initial.sourceGeneration + 1],
+            [initial.generation + 2, initial.sourceGeneration + 2],
+            [initial.generation + 3, initial.sourceGeneration + 3],
+            [initial.generation + 4, initial.sourceGeneration + 4],
+            [initial.generation + 5, initial.sourceGeneration + 5],
+        ]);
         const recovery = messages_of(panel, 'metaReloadRecovery').at(-1)!;
         expect(recovery).toMatchObject({
             projectionChange: 'excelHeader',
