@@ -28,9 +28,10 @@ export function versioned_state_store(initial: StoredPerFileState = {}) {
             file_path,
             expected_revision,
             state,
+            validate,
         ): Promise<FileStateCompareAndSetResult> {
             const current = snapshot(file_path);
-            if (current.revision !== expected_revision) {
+            if (current.revision !== expected_revision || (validate && !validate())) {
                 return { type: 'conflict', snapshot: current };
             }
             const revision = expected_revision + 1;

@@ -15,6 +15,7 @@ import {
     type WorkbookSnapshotDiagnostics,
     type WorkbookSnapshotIdentity,
     type WorkbookSnapshotReason,
+    type NormalizedPerFileState,
 } from './viewer-snapshot';
 
 export type PanelSessionLifecycle = 'awaitingReady' | 'ready' | 'active' | 'disposed';
@@ -383,6 +384,18 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
 
     current_adoption(): PanelAdoption | undefined {
         return this._lifecycle === 'disposed' ? undefined : this.current?.adoption;
+    }
+
+    /** Detached immutable state from the exact current acknowledged delivery. */
+    acknowledged_state_snapshot(
+        identity: WorkbookSnapshotIdentity,
+    ): Readonly<NormalizedPerFileState> | undefined {
+        if (!this.acknowledged_current()) return undefined;
+        const acknowledged = this.acknowledged;
+        if (!acknowledged || !identities_equal(acknowledged.snapshot.identity, identity)) {
+            return undefined;
+        }
+        return deep_clone_and_freeze(acknowledged.snapshot.state);
     }
 
     /**

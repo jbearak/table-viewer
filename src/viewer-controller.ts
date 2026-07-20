@@ -50,6 +50,15 @@ import {
 } from './types';
 import { sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
+import {
+    apply_layout_state_patch,
+    derive_layout_state_patch,
+} from './layout-state-patch';
+import {
+    complete_normalized_per_file_state,
+    type NormalizedPerFileState,
+    type WorkbookSnapshotIdentity,
+} from './viewer-snapshot';
 
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
  *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
@@ -130,6 +139,19 @@ function same_snapshot_identity(
         && left.stateRevision === right.stateRevision
         && left.sourceBasis.physicalRevision === right.sourceBasis.physicalRevision
         && left.sourceBasis.projectionRevision === right.sourceBasis.projectionRevision;
+}
+
+function sheet_state_arrays_equal(
+    left: readonly unknown[] | undefined,
+    right: readonly unknown[] | undefined,
+): boolean {
+    const count = Math.max(left?.length ?? 0, right?.length ?? 0);
+    for (let index = 0; index < count; index += 1) {
+        if (JSON.stringify(left?.[index]) !== JSON.stringify(right?.[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 function same_file_authority_basis(
@@ -234,6 +256,11 @@ export function attach_viewer(
     let save_command_pending = false;
     let save_write_pending = false;
     let pending_edit_writes: Promise<void> = Promise.resolve();
+    let layout_write_tail: Promise<void> = Promise.resolve();
+    let layout_basis: {
+        identity: WorkbookSnapshotIdentity;
+        state: NormalizedPerFileState;
+    } | undefined;
     let reload_retry_attempts = 0;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
     let refresh_retry_wait: {
@@ -513,6 +540,106 @@ export function attach_viewer(
                 return result.snapshot;
             }
             snapshot = result.snapshot;
+        }
+    }
+
+    type StateChangedMessage = Extract<WebviewMessage, { type: 'stateChanged' }>;
+
+    function layout_write_is_current(
+        message: StateChangedMessage,
+        expected_authority: number,
+    ): boolean {
+        const acknowledged_identity = session.acknowledged_identity();
+        return !disposed
+            && core !== undefined
+            && file_coordinator.state_write_is_current(expected_authority)
+            && source_authority.authorityRevision === expected_authority
+            && message.snapshotIdentity.authority.revision === expected_authority
+            && message.sourceGeneration === core.source_generation
+            && acknowledged_identity !== undefined
+            && same_snapshot_identity(message.snapshotIdentity, acknowledged_identity);
+    }
+
+    function enqueue_layout_write(operation: () => Promise<void>): Promise<void> {
+        const write = layout_write_tail.catch(() => {}).then(operation);
+        layout_write_tail = write.catch(() => {});
+        return write;
+    }
+
+    async function persist_layout_state(
+        message: StateChangedMessage,
+        expected_authority: number,
+    ): Promise<void> {
+        if (!layout_write_is_current(message, expected_authority) || !source) return;
+        const sheet_names = source.meta().sheets.map((sheet) => sheet.name);
+        if (
+            !layout_basis
+            || !same_snapshot_identity(layout_basis.identity, message.snapshotIdentity)
+        ) {
+            const acknowledged_state = session.acknowledged_state_snapshot(
+                message.snapshotIdentity,
+            );
+            if (!acknowledged_state) return;
+            layout_basis = {
+                identity: structuredClone(message.snapshotIdentity),
+                state: complete_normalized_per_file_state(
+                    acknowledged_state,
+                    sheet_names,
+                ),
+            };
+        }
+        const basis = layout_basis;
+        const incoming = complete_normalized_per_file_state(message.state, sheet_names);
+        const patch = derive_layout_state_patch(basis.state, incoming);
+        const next_basis = complete_normalized_per_file_state(
+            apply_layout_state_patch(basis.state, patch),
+            sheet_names,
+        );
+        let reconciled = false;
+        await update_file_state((current) => {
+            if (!layout_write_is_current(message, expected_authority)) return current;
+            reconciled = true;
+            const sheets = source?.meta().sheets;
+            if (!sheets) return current;
+            const current_transforms = current.transforms;
+            const current_visibility = current.columnVisibility;
+            const transforms = sheets.map((sheet, index) =>
+                sanitize_transform_state(
+                    current_transforms?.[index],
+                    sheet.columnCount,
+                    transform_schema_for_sheet(sheet),
+                ));
+            const column_visibility = sheets.map((sheet, index) =>
+                sanitize_column_visibility_state(
+                    current_visibility?.[index],
+                    sheet.columnCount,
+                    transform_schema_for_sheet(sheet),
+                ));
+            const transforms_changed = !sheet_state_arrays_equal(
+                transforms,
+                current_transforms,
+            );
+            const visibility_changed = !sheet_state_arrays_equal(
+                column_visibility,
+                current_visibility,
+            );
+            const host_state = transforms_changed || visibility_changed
+                ? {
+                    ...current,
+                    ...(transforms_changed ? { transforms } : {}),
+                    ...(visibility_changed
+                        ? { columnVisibility: column_visibility }
+                        : {}),
+                }
+                : current;
+            return apply_layout_state_patch(host_state, patch);
+        }, sheet_names, () => layout_write_is_current(message, expected_authority));
+        if (
+            reconciled
+            && layout_basis === basis
+            && layout_write_is_current(message, expected_authority)
+        ) {
+            basis.state = next_basis;
         }
     }
 
@@ -1724,89 +1851,10 @@ export function attach_viewer(
                 return;
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
-                const acknowledged_identity = session.acknowledged_identity();
-                if (
-                    acknowledged_identity === undefined
-                    || msg.snapshotIdentity.authority.revision !== expected_authority
-                    || !same_snapshot_identity(msg.snapshotIdentity, acknowledged_identity)
-                ) return;
-                await update_file_state((current) => {
-                        if (
-                            disposed
-                            || !core
-                            || !file_coordinator.state_write_is_current(expected_authority)
-                            || source_authority.authorityRevision !== expected_authority
-                            || msg.snapshotIdentity.authority.revision !== expected_authority
-                            || msg.sourceGeneration !== core.source_generation
-                            || session.acknowledged_identity() === undefined
-                            || !same_snapshot_identity(
-                                msg.snapshotIdentity,
-                                session.acknowledged_identity()!,
-                            )
-                        ) {
-                            return current;
-                        }
-                        const next = { ...msg.state };
-                    // Transform preferences are host-owned. A delayed debounced
-                    // snapshot must never resurrect a durable Cancel tombstone.
-                    // Re-sanitize the host-owned value, though, so the webview's
-                    // intentional cleanup after a schema change is durable.
-                    const current_transforms = current.transforms;
-                    next.transforms = source
-                        ? source.meta().sheets.map((sheet, index) =>
-                            sanitize_transform_state(
-                                current_transforms?.[index],
-                                sheet.columnCount,
-                                transform_schema_for_sheet(sheet),
-                            ))
-                        : current_transforms;
-                    const current_visibility = current.columnVisibility;
-                    next.columnVisibility = source
-                        ? source.meta().sheets.map((sheet, index) =>
-                            sanitize_column_visibility_state(
-                                current_visibility?.[index],
-                                sheet.columnCount,
-                                transform_schema_for_sheet(sheet),
-                            ))
-                        : current_visibility;
-                    // Pending edits are host-owned for every profile. Only the
-                    // edit-session owner path may change them; previews/nonowners
-                    // cannot resurrect a cleared durable map.
-                    if (current.pendingEdits) {
-                        next.pendingEdits = current.pendingEdits;
-                    } else {
-                        delete next.pendingEdits;
-                    }
-                    // Excel header overrides are host-owned. A delayed debounced
-                    // layout snapshot from this or another tab must not undo one.
-                    if (current.excelFirstRowHeaders) {
-                        next.excelFirstRowHeaders = current.excelFirstRowHeaders;
-                    } else {
-                        delete next.excelFirstRowHeaders;
-                    }
-                    if (current.excelFirstRowHeaderActive) {
-                        next.excelFirstRowHeaderActive = current.excelFirstRowHeaderActive;
-                    } else {
-                        delete next.excelFirstRowHeaderActive;
-                    }
-                    if (current.excelFirstRowHeaderVersion === 1) {
-                        next.excelFirstRowHeaderVersion = 1;
-                    } else {
-                        delete next.excelFirstRowHeaderVersion;
-                    }
-                    return next;
-                }, undefined, () => (
-                    !disposed
-                    && file_coordinator.state_write_is_current(expected_authority)
-                    && source_authority.authorityRevision === expected_authority
-                    && msg.snapshotIdentity.authority.revision === expected_authority
-                    && msg.sourceGeneration === core?.source_generation
-                    && session.acknowledged_identity() !== undefined
-                    && same_snapshot_identity(
-                        msg.snapshotIdentity,
-                        session.acknowledged_identity()!,
-                    )
-                ));
+                const message = structuredClone(msg);
+                await enqueue_layout_write(
+                    () => persist_layout_state(message, expected_authority),
+                );
                 return;
             }
             case 'setExcelFirstRowHeader': {

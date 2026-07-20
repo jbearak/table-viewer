@@ -206,6 +206,44 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(empty.session.lifecycle).toBe('active');
     });
 
+    it('exposes detached state only for the exact current acknowledged delivery', async () => {
+        const { session, posted } = make_session();
+        const source = adoption({
+            stateSnapshot: {
+                revision: 9,
+                state: { columnWidths: [{ 0: 144 }], rowHeights: [{ 0: 20 }] },
+            },
+        });
+        session.replace_adoption(source);
+        session.ready();
+        await settle();
+        const delivered = snapshot(posted);
+        expect(session.acknowledged_state_snapshot(delivered.identity)).toBeUndefined();
+        ack(session, delivered);
+        expect(session.acknowledged_state_snapshot({
+            ...delivered.identity,
+            stateRevision: delivered.identity.stateRevision + 1,
+        })).toBeUndefined();
+
+        const first = session.acknowledged_state_snapshot(delivered.identity);
+        const second = session.acknowledged_state_snapshot(delivered.identity);
+        expect(first).toEqual(delivered.state);
+        expect(first).not.toBe(second);
+        expect(first).not.toBe(delivered.state);
+        expect(Object.isFrozen(first)).toBe(true);
+        expect(Object.isFrozen(first?.columnWidths)).toBe(true);
+
+        session.update_state_snapshot({
+            revision: 10,
+            state: { columnWidths: [{ 0: 200 }], rowHeights: [{ 0: 30 }] },
+        });
+        expect(session.acknowledged_state_snapshot(delivered.identity)?.columnWidths)
+            .toEqual([{ 0: 144 }]);
+
+        session.dispose();
+        expect(session.acknowledged_state_snapshot(delivered.identity)).toBeUndefined();
+    });
+
     it('returns ready when the initial-source callback installs synchronously', async () => {
         const source = adoption();
         const needs = vi.fn();

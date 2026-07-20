@@ -56,6 +56,37 @@ class FailingTransformSource extends StubSource {
     }
 }
 
+class TwoSheetSource extends StubSource {
+    override meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [
+                {
+                    name: 'Sheet1',
+                    rowCount: 1,
+                    columnCount: 2,
+                    merges: [],
+                    hasFormatting: false,
+                },
+                {
+                    name: 'Sheet2',
+                    rowCount: 1,
+                    columnCount: 2,
+                    merges: [],
+                    hasFormatting: false,
+                },
+            ],
+        };
+    }
+}
+
+function two_sheet_profile(): ViewerProfile {
+    return {
+        editing: false,
+        build_source: async () => new TwoSheetSource(),
+    };
+}
+
 function open_csv_table(
     file_uri: vscode.Uri,
     store: FileStateStore,
@@ -463,6 +494,336 @@ describe('CSV edit sessions', () => {
         const replay = latest_snapshot(panel);
         expect(replay.identity.stateRevision).toBe(2);
         expect(replay.state.columnWidths).toEqual([{ 0: 166 }]);
+        expect(replay.state.rowHeights).toEqual([{ 0: 41 }]);
+    });
+
+    it('derives initial intent from the exact ACK and preserves unseen peer layout', async () => {
+        const file_path = '/tmp/exact-acked-layout-basis.csv';
+        const versioned = state_store({
+            columnWidths: [{ 0: 100 }],
+            rowHeights: [{ 0: 20 }],
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        const acknowledged = latest_snapshot(panel);
+
+        const peer = await versioned.store.compare_and_set(
+            file_path,
+            versioned.revision(file_path),
+            {
+                columnWidths: [{ 0: 100 }],
+                rowHeights: [{ 0: 30 }],
+            },
+        );
+        expect(peer.type).toBe('committed');
+        await panel.__receive({
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: acknowledged.sourceGeneration,
+            state: undefined,
+        } as never);
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: acknowledged.sourceGeneration,
+            snapshotIdentity: acknowledged.identity,
+            state: {
+                ...acknowledged.state,
+                columnWidths: [{ 0: 120 }],
+            },
+        });
+
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 120 }]);
+        expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 30 }]);
+    });
+
+    it('skips empty and already-satisfied CAS while advancing the rolling basis', async () => {
+        const file_path = '/tmp/layout-semantic-noop.csv';
+        const versioned = state_store({ columnWidths: [{ 0: 100 }] });
+        let compare_attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                compare_attempts += 1;
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const acknowledged = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: acknowledged.sourceGeneration,
+            snapshotIdentity: acknowledged.identity,
+            state: acknowledged.state,
+        });
+        expect(compare_attempts).toBe(0);
+
+        const peer = await versioned.store.compare_and_set(
+            file_path,
+            versioned.revision(file_path),
+            { columnWidths: [{ 0: 120 }] },
+        );
+        expect(peer.type).toBe('committed');
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: acknowledged.sourceGeneration,
+            snapshotIdentity: acknowledged.identity,
+            state: { ...acknowledged.state, columnWidths: [{ 0: 120 }] },
+        });
+        expect(compare_attempts).toBe(0);
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 120 }]);
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: acknowledged.sourceGeneration,
+            snapshotIdentity: acknowledged.identity,
+            state: { ...acknowledged.state, columnWidths: [{ 0: 100 }] },
+        });
+        expect(compare_attempts).toBe(1);
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 100 }]);
+    });
+
+    it('merges disjoint layout changes from two tabs that read the same revision', async () => {
+        const file_path = '/tmp/disjoint-layout-tabs.csv';
+        const versioned = state_store();
+        const reads_ready = deferred();
+        let coordinate_reads = false;
+        let coordinated_reads = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (!coordinate_reads) return snapshot;
+                coordinated_reads += 1;
+                if (coordinated_reads === 2) reads_ready.resolve();
+                await reads_ready.promise;
+                return snapshot;
+            },
+        };
+        const first = open_csv_table(uri(file_path), store, two_sheet_profile());
+        const second = open_csv_table(uri(file_path), store, two_sheet_profile());
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const first_snapshot = latest_snapshot(first);
+        const second_snapshot = latest_snapshot(second);
+        coordinate_reads = true;
+
+        await Promise.all([
+            first.__receive({
+                type: 'stateChanged',
+                sourceGeneration: first_snapshot.sourceGeneration,
+                snapshotIdentity: first_snapshot.identity,
+                state: {
+                    ...first_snapshot.state,
+                    columnWidths: [{ 0: 144 }],
+                },
+            }),
+            second.__receive({
+                type: 'stateChanged',
+                sourceGeneration: second_snapshot.sourceGeneration,
+                snapshotIdentity: second_snapshot.identity,
+                state: {
+                    ...second_snapshot.state,
+                    rowHeights: [undefined, { 0: 41 }],
+                },
+            }),
+        ]);
+
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 144 }]);
+        expect(versioned.get_state(file_path).rowHeights).toEqual([
+            undefined,
+            { 0: 41 },
+        ]);
+    });
+
+    it('retries one fixed layout patch after a CAS conflict without losing peer state', async () => {
+        const file_path = '/tmp/layout-patch-conflict.csv';
+        const versioned = state_store({
+            columnWidths: [{ 0: 100 }],
+            excelFirstRowHeaders: { Sheet1: 'on' },
+        });
+        let inject_conflict = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (inject_conflict) {
+                    inject_conflict = false;
+                    const external = await versioned.store.compare_and_set(
+                        path,
+                        expected,
+                        {
+                            columnWidths: [{ 0: 100, 1: 155 }],
+                            rowHeights: [{ 0: 37 }],
+                            excelFirstRowHeaders: { Sheet1: 'off' },
+                        },
+                    );
+                    if (external.type !== 'committed') throw new Error('Expected conflict.');
+                    return { type: 'conflict', snapshot: external.snapshot };
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: {
+                ...initial.state,
+                columnWidths: [{ 0: 120 }],
+            },
+        });
+
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{
+            0: 120,
+            1: 155,
+        }]);
+        expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 37 }]);
+        expect(versioned.get_state(file_path).excelFirstRowHeaders).toEqual({
+            Sheet1: 'off',
+        });
+    });
+
+    it('preserves concurrent per-sheet keys when the panel deletes its known values', async () => {
+        const file_path = '/tmp/layout-map-deletions.csv';
+        const versioned = state_store({
+            columnWidths: [{ 0: 100 }, { 0: 200 }],
+            rowHeights: [{ 0: 20 }],
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store, two_sheet_profile());
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+        const external = await versioned.store.compare_and_set(
+            file_path,
+            versioned.revision(file_path),
+            {
+                columnWidths: [{ 0: 100, 1: 150 }, { 0: 200 }],
+                rowHeights: [{ 0: 20, 1: 31 }],
+            },
+        );
+        expect(external.type).toBe('committed');
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: {
+                ...initial.state,
+                columnWidths: [undefined, { 0: 220 }],
+                rowHeights: [],
+            },
+        });
+
+        expect(versioned.get_state(file_path).columnWidths).toEqual([
+            { 1: 150 },
+            { 0: 220 },
+        ]);
+        expect(versioned.get_state(file_path).rowHeights).toEqual([{ 1: 31 }]);
+    });
+
+    it('serializes rapid same-panel layout writes in message order', async () => {
+        const file_path = '/tmp/ordered-layout-writes.csv';
+        const versioned = state_store();
+        const first_started = deferred();
+        const release_first = deferred();
+        let attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                attempts += 1;
+                if (attempts === 1) {
+                    first_started.resolve();
+                    await release_first.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+        const first = panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: { ...initial.state, columnWidths: [{ 0: 140 }] },
+        });
+        await first_started.promise;
+        const second = panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: { ...initial.state, columnWidths: [{ 0: 180 }] },
+        });
+        await flush_promises();
+        expect(attempts).toBe(1);
+
+        release_first.resolve();
+        await Promise.all([first, second]);
+        expect(attempts).toBe(2);
+        expect(versioned.get_state(file_path).columnWidths).toEqual([{ 0: 180 }]);
+    });
+
+    it('rejects stale layout sources and aborts an in-flight write after disposal', async () => {
+        const file_path = '/tmp/fenced-layout-write.csv';
+        const versioned = state_store();
+        const compare_started = deferred();
+        const compare_gate = deferred();
+        let block_compare = false;
+        let compare_attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                compare_attempts += 1;
+                if (block_compare) {
+                    compare_started.resolve();
+                    await compare_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration + 1,
+            snapshotIdentity: initial.identity,
+            state: { ...initial.state, columnWidths: [{ 0: 120 }] },
+        });
+        await panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: {
+                ...initial.identity,
+                authority: {
+                    ...initial.identity.authority,
+                    revision: initial.identity.authority.revision + 1,
+                },
+            },
+            state: { ...initial.state, columnWidths: [{ 0: 130 }] },
+        });
+        expect(compare_attempts).toBe(0);
+
+        block_compare = true;
+        const pending = panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: { ...initial.state, columnWidths: [{ 0: 140 }] },
+        });
+        await compare_started.promise;
+        panel.dispose();
+        compare_gate.resolve();
+        await pending;
+
+        expect(versioned.get_state(file_path).columnWidths).toBeUndefined();
     });
 
     it('cannot restore pending edits after save clearing and a new ready epoch', async () => {
