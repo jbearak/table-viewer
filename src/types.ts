@@ -57,8 +57,17 @@ export type FilterOperator =
     | 'lessThan'
     | 'lessThanOrEqual'
     | 'between'
+    | 'notBetween'
     | 'isEmpty'
     | 'isNotEmpty';
+
+export type RangeFilterOperator = 'between' | 'notBetween';
+
+export function is_range_filter_operator(
+    operator: FilterOperator,
+): operator is RangeFilterOperator {
+    return operator === 'between' || operator === 'notBetween';
+}
 
 export interface FilterEntry {
     id: string;

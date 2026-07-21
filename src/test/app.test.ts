@@ -3195,12 +3195,16 @@ describe('sorting and filtering', () => {
         expect(request).toMatchObject({
             sheetIndex: 0, columnIndex: 0, generation: 1, sourceGeneration: 1,
         });
-        expect(document.body.textContent).toContain('Loading distribution…');
+        // Histogram UI is gated to range operators; request still fires on open.
+        expect(document.body.textContent).not.toContain('Loading distribution…');
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
             requestId: request.requestId, generation: 1, sourceGeneration: 1,
             bins: [{ lo: 0, hi: 10, count: 3 }],
         });
+        // Ready bins promote a pristine draft to Between and show the chart.
+        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
+            .toBe('between');
         expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
 
         await click_button('Cancel');
@@ -3209,6 +3213,8 @@ describe('sorting and filtering', () => {
         expect(post_message.mock.calls.some(
             ([message]) => message.type === 'requestFilterHistogram',
         )).toBe(false);
+        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
+            .toBe('between');
         expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
     });
 
@@ -3228,7 +3234,7 @@ describe('sorting and filtering', () => {
         const transform = latest_transform_request(post_message);
         await acknowledge_transform(transform, 2);
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
-        expect(document.body.textContent).toContain('Loading distribution…');
+        expect(document.body.textContent).not.toContain('Loading distribution…');
 
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
@@ -3237,6 +3243,8 @@ describe('sorting and filtering', () => {
             sourceGeneration: histogram.sourceGeneration,
             bins: [{ lo: 0, hi: 1, count: 5 }],
         });
+        expect((document.querySelector('#filter-condition') as HTMLSelectElement).value)
+            .toBe('between');
         expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
 
         await click_button('Cancel');
@@ -3271,6 +3279,12 @@ describe('sorting and filtering', () => {
             bins: [],
             error: 'The view changed before this histogram request arrived.',
         });
+        // Error is held in state; switch to a range operator to surface it.
+        const select = document.querySelector('#filter-condition') as HTMLSelectElement;
+        await act(async () => {
+            select.value = 'between';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
         expect(document.body.textContent).toContain(
             'Distribution unavailable: The view changed before this histogram request arrived.',
         );
@@ -3298,8 +3312,9 @@ describe('sorting and filtering', () => {
             requestId: first.requestId, generation: 1, sourceGeneration: 1,
             bins: [{ lo: 0, hi: 1, count: 99 }],
         });
+        // Still waiting on column 1; no chart bars yet and loading is range-gated.
         expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
-        expect(document.body.textContent).toContain('Loading distribution…');
+        expect(document.body.textContent).not.toContain('Loading distribution…');
 
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
@@ -3307,12 +3322,17 @@ describe('sorting and filtering', () => {
             bins: [{ lo: 0, hi: 1, count: 42 }],
         });
         expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
-        expect(document.body.textContent).toContain('Loading distribution…');
 
         await dispatch_host_message({
             type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
             requestId: second.requestId, generation: 1, sourceGeneration: 1,
             bins: [],
+        });
+        // Empty bins leave the draft on Contains; switch to Between to see status.
+        const select = document.querySelector('#filter-condition') as HTMLSelectElement;
+        await act(async () => {
+            select.value = 'between';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
         });
         expect(document.body.textContent).toContain('No numeric values to chart.');
     });
