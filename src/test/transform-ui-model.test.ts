@@ -42,7 +42,7 @@ describe('transform UI model', () => {
             lessThan: 'Amount < 5',
             lessThanOrEqual: 'Amount ≤ 5',
             between: 'Amount 5–9',
-            notBetween: 'Amount not 5–9',
+            notBetween: 'Amount not in 5–9',
             isEmpty: 'Amount is empty',
             isNotEmpty: 'Amount is not empty',
         };

@@ -970,6 +970,18 @@ describe('table transforms', () => {
             null,
             { ...filter('notBetween', '10'), secondValue: '20' },
         )).toBe(false);
+        expect(matches_filter(
+            cell('12', 'number'),
+            { ...filter('between', '20'), secondValue: '10' },
+        )).toBe(true);
+        expect(matches_filter(
+            cell('5', 'number'),
+            { ...filter('notBetween', '20'), secondValue: '10' },
+        )).toBe(true);
+        expect(matches_filter(
+            cell('12', 'number'),
+            { ...filter('notBetween', '20'), secondValue: '10' },
+        )).toBe(false);
     });
 
     it('rejects invalid numeric filter operands instead of comparing them as text', async () => {

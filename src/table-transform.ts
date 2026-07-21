@@ -5,7 +5,7 @@ import type {
     SheetTransformState,
     SortDirection,
 } from './types';
-import { transform_is_active } from './types';
+import { is_range_filter_operator, transform_is_active } from './types';
 
 // Keep each synchronous source read bounded so cancellation can interrupt a
 // transform inside the old 1,000-row scan interval.
@@ -550,12 +550,6 @@ const NUMERIC_FILTER_OPERATORS = new Set<FilterEntry['operator']>([
     'notBetween',
 ]);
 
-function is_range_filter_operator(
-    operator: FilterEntry['operator'],
-): operator is 'between' | 'notBetween' {
-    return operator === 'between' || operator === 'notBetween';
-}
-
 function compile_filter_group(
     entries: readonly FilterEntry[],
     numeric_column: boolean,
@@ -597,27 +591,37 @@ function compile_filter(
 
     const raw_rhs = entry.value ?? '';
     if (is_range_filter_operator(entry.operator)) {
-        const first = compile_comparison_operand(
+        let lower = compile_comparison_operand(
             raw_rhs,
             numeric_column,
             strict_numeric_operands,
             instrumentation,
         );
-        const second = compile_comparison_operand(
+        let upper = compile_comparison_operand(
             entry.secondValue ?? '',
             numeric_column,
             strict_numeric_operands,
             instrumentation,
         );
+        // Reversed bounds still describe the same inclusive interval.
+        if (compare_compiled_filter_operand(
+            upper.text,
+            upper.numeric,
+            lower,
+        ) < 0) {
+            const swapped = lower;
+            lower = upper;
+            upper = swapped;
+        }
         const outside = entry.operator === 'notBetween';
         return {
-            needsNumericKey: first.numeric !== undefined
-                || second.numeric !== undefined,
+            needsNumericKey: lower.numeric !== undefined
+                || upper.numeric !== undefined,
             matches: (raw, numeric_key) => {
                 if (raw === null) return false;
                 const in_range =
-                    compare_compiled_filter_operand(raw, numeric_key, first) >= 0
-                    && compare_compiled_filter_operand(raw, numeric_key, second) <= 0;
+                    compare_compiled_filter_operand(raw, numeric_key, lower) >= 0
+                    && compare_compiled_filter_operand(raw, numeric_key, upper) <= 0;
                 return outside ? !in_range : in_range;
             },
         };

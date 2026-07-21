@@ -11,6 +11,8 @@ export type FilterHistogramProps = {
     bins: readonly HistogramBin[];
     lo: number;
     hi: number;
+    /** When true, emphasize bars outside [lo, hi] (Not between). */
+    invert_selection?: boolean;
     on_change: (lo: number, hi: number) => void;
 };
 
@@ -58,6 +60,7 @@ export function FilterHistogram({
     bins,
     lo,
     hi,
+    invert_selection = false,
     on_change,
 }: FilterHistogramProps): React.JSX.Element | null {
     const svg_ref = useRef<SVGSVGElement>(null);
@@ -77,7 +80,7 @@ export function FilterHistogram({
     }, []);
 
     // Drag reads live lo/hi/bins/on_change from a ref so the window listeners
-    // stay stable across re-renders (Raven invariant).
+    // stay stable across re-renders (Raven invariant: sync during render).
     const live = useRef({ bins, d_min, d_max, lo, hi, on_change, get_svg_x });
     live.current = { bins, d_min, d_max, lo, hi, on_change, get_svg_x };
 
@@ -159,7 +162,8 @@ export function FilterHistogram({
             {bins.map((bin, index) => {
                 const bar_h = Math.round(((BAR_BOTTOM - 4) * bin.count) / max_count);
                 const x = MARGIN_X + index * bin_width;
-                const in_range = bin.lo >= lo && bin.hi <= hi;
+                const inside = bin.lo >= lo && bin.hi <= hi;
+                const emphasized = invert_selection ? !inside : inside;
                 return (
                     <rect
                         key={`${bin.lo}:${bin.hi}:${index}`}
@@ -167,7 +171,7 @@ export function FilterHistogram({
                         y={BAR_BOTTOM - bar_h}
                         width={Math.max(1, bin_width - 1)}
                         height={bar_h}
-                        className={in_range ? 'filter-histogram-bar in-range' : 'filter-histogram-bar'}
+                        className={emphasized ? 'filter-histogram-bar in-range' : 'filter-histogram-bar'}
                     >
                         <title>{`${bin.lo} – ${bin.hi}: ${bin.count}`}</title>
                     </rect>
@@ -200,7 +204,7 @@ export function FilterHistogram({
                 aria-valuenow={lo}
                 onPointerDown={start_drag('lo')}
                 onKeyDown={on_key_down('lo')}
-                style={{ cursor: 'ew-resize', outline: 'none' }}
+                style={{ cursor: 'ew-resize' }}
             />
             <circle
                 cx={hi_x}
@@ -215,7 +219,7 @@ export function FilterHistogram({
                 aria-valuenow={hi}
                 onPointerDown={start_drag('hi')}
                 onKeyDown={on_key_down('hi')}
-                style={{ cursor: 'ew-resize', outline: 'none' }}
+                style={{ cursor: 'ew-resize' }}
             />
         </svg>
     );

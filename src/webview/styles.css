@@ -861,10 +861,18 @@ body {
     stroke-width: 2;
 }
 
-.filter-histogram-thumb:hover,
-.filter-histogram-thumb:focus {
+.filter-histogram-thumb:hover {
     fill: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.filter-histogram-thumb:focus {
     outline: none;
+}
+
+.filter-histogram-thumb:focus-visible {
+    fill: var(--vscode-button-hoverBackground, #1177bb);
+    outline: 2px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 2px;
 }
 
 .filter-histogram-status {

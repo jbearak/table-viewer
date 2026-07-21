@@ -252,6 +252,28 @@ describe('FilterPopover', () => {
         void upper;
     });
 
+    it('preserves a single typed bound when brushing the other end', () => {
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'between', value: '1', secondValue: '',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        expect((document.querySelector('input[aria-label="Lower value"]') as HTMLInputElement).value)
+            .toBe('1');
+        const hi_thumb = document.querySelector('[role="slider"][aria-label="Upper value"]') as SVGElement;
+        act(() => {
+            hi_thumb.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+        });
+        const lower = (document.querySelector('input[aria-label="Lower value"]') as HTMLInputElement).value;
+        const upper = (document.querySelector('input[aria-label="Upper value"]') as HTMLInputElement).value;
+        expect(lower).toBe('1');
+        expect(upper).not.toBe('');
+        expect(Number(upper)).toBeLessThanOrEqual(2);
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'between', value: '1', secondValue: upper,
+        }));
+    });
+
     it('preserves bounds when switching Between and Not between', () => {
         const { on_apply } = render_popover([{
             id: 'f', colIndex: 1, operator: 'between', value: '1', secondValue: '2',

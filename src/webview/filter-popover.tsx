@@ -142,20 +142,28 @@ export function FilterPopover({
         set_draft(next);
     };
 
+    const update_range_bounds = (lo: number, hi: number) => {
+        user_edited_ref.current = true;
+        set_draft((current) => ({
+            ...current,
+            value: String(lo),
+            secondValue: String(hi),
+        }));
+    };
+
     const range_lo = parse_range_bound(draft.value);
     const range_hi = parse_range_bound(draft.secondValue);
     const ready_bins = histogram.status === 'ready' ? histogram.bins : null;
     const domain_ready = ready_bins !== null && ready_bins.length > 0;
-    const histo_lo = domain_ready
-        ? (range_lo !== undefined && range_hi !== undefined
-            ? Math.min(range_lo, range_hi)
-            : domain_min(ready_bins))
+    // Per-side domain fallback: a single typed bound must survive brushing.
+    const raw_histo_lo = domain_ready
+        ? (range_lo !== undefined ? range_lo : domain_min(ready_bins))
         : 0;
-    const histo_hi = domain_ready
-        ? (range_lo !== undefined && range_hi !== undefined
-            ? Math.max(range_lo, range_hi)
-            : domain_max(ready_bins))
+    const raw_histo_hi = domain_ready
+        ? (range_hi !== undefined ? range_hi : domain_max(ready_bins))
         : 0;
+    const histo_lo = Math.min(raw_histo_lo, raw_histo_hi);
+    const histo_hi = Math.max(raw_histo_lo, raw_histo_hi);
 
     return (
         <div
@@ -236,11 +244,8 @@ export function FilterPopover({
                         histogram={histogram}
                         lo={histo_lo}
                         hi={histo_hi}
-                        on_change={(lo, hi) => update_draft({
-                            ...draft,
-                            value: String(lo),
-                            secondValue: String(hi),
-                        })}
+                        invert_selection={draft.operator === 'notBetween'}
+                        on_change={update_range_bounds}
                     />
                 )}
                 {needs_value && (
@@ -278,11 +283,13 @@ function FilterHistogramStatus({
     histogram,
     lo,
     hi,
+    invert_selection = false,
     on_change,
 }: {
     histogram: NonNullable<FilterPopoverProps['histogram']>;
     lo: number;
     hi: number;
+    invert_selection?: boolean;
     on_change: (lo: number, hi: number) => void;
 }): React.JSX.Element {
     if (histogram.status === 'loading') {
@@ -307,6 +314,7 @@ function FilterHistogramStatus({
             bins={histogram.bins}
             lo={lo}
             hi={hi}
+            invert_selection={invert_selection}
             on_change={on_change}
         />
     );

@@ -6,6 +6,9 @@ import type {
     SortKey,
     TransformIntent,
 } from '../types';
+import { is_range_filter_operator } from '../types';
+
+export { is_range_filter_operator };
 
 export const RAW_VALUE_TRANSFORM_DESCRIPTION =
     'Sorting and filtering use raw cell values, not formatted display text.';
@@ -32,12 +35,6 @@ export function new_filter_id(): string {
         return crypto.randomUUID();
     }
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
-export function is_range_filter_operator(
-    operator: FilterOperator,
-): operator is 'between' | 'notBetween' {
-    return operator === 'between' || operator === 'notBetween';
 }
 
 export function filter_draft_for_column(
@@ -90,7 +87,7 @@ export function filter_summary(
         case 'lessThan': return `${name} < ${entry.value ?? ''}`;
         case 'lessThanOrEqual': return `${name} ≤ ${entry.value ?? ''}`;
         case 'between': return `${name} ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
-        case 'notBetween': return `${name} not ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
+        case 'notBetween': return `${name} not in ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
         case 'isEmpty': return `${name} is empty`;
         case 'isNotEmpty': return `${name} is not empty`;
     }

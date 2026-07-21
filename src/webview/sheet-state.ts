@@ -7,6 +7,7 @@ import type {
     SortKey,
     StoredPerFileState,
 } from '../types';
+import { is_range_filter_operator } from '../types';
 import { sanitize_column_visibility_state } from './column-projection';
 
 export function clamp_sheet_index(
@@ -134,7 +135,8 @@ export function sanitize_transform_state(
             && entry.operator !== 'isNotEmpty';
         if (needs_value && typeof entry.value !== 'string') continue;
         if (
-            (entry.operator === 'between' || entry.operator === 'notBetween')
+            typeof entry.operator === 'string'
+            && is_range_filter_operator(entry.operator as FilterEntry['operator'])
             && typeof entry.secondValue !== 'string'
         ) {
             continue;
