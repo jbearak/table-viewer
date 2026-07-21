@@ -42,6 +42,23 @@ export class ColumnarStore {
         return out;
     }
 
+    /** Materialize full rows by absolute index without visiting intervening rows. */
+    read_rows_indexed(row_indices: ArrayLike<number>): (RenderedCell | null)[][] {
+        for (let position = 0; position < row_indices.length; position++) {
+            const row = row_indices[position];
+            if (!Number.isInteger(row) || row < 0 || row >= this.rows) {
+                throw new RangeError(`row index ${row} out of range (${this.rows} rows)`);
+            }
+        }
+        return Array.from(row_indices, (row) => {
+            const cells: (RenderedCell | null)[] = [];
+            for (let column = 0; column < this.cols; column++) {
+                cells.push(this.read_cell(row, column));
+            }
+            return cells;
+        });
+    }
+
     /** Materialize a compact projection without visiting unrelated cells. */
     read_columns(
         start_row: number,

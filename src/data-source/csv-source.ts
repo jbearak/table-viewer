@@ -2,6 +2,7 @@
 import type {
     ColumnWindow,
     DataSource,
+    IndexedRows,
     RenderedCell,
     RowWindow,
     WorkbookMeta,
@@ -176,6 +177,51 @@ export class CsvDataSource implements DataSource {
             rows.push(this.to_cells(parsed[i] ?? []));
         }
         return { startRow: start, rows };
+    }
+
+    read_rows_indexed(sheet_index: number, row_indices: ArrayLike<number>): IndexedRows {
+        if (sheet_index !== 0) {
+            throw new RangeError(`sheet index ${sheet_index} out of range (1 sheet)`);
+        }
+        const requested = Array.from(row_indices);
+        for (const row of requested) {
+            if (!Number.isInteger(row) || row < 0 || row >= this._rowCount) {
+                throw new RangeError(
+                    `row index ${row} out of range (${this._rowCount} rows)`,
+                );
+            }
+        }
+        if (requested.length === 0) return { rows: [] };
+
+        // Parse only consecutive requested runs. Sorting unique indices lets
+        // duplicate/random/reverse requests share decoding work without ever
+        // widening a read across an unrequested sparse gap.
+        const unique = [...new Set(requested)].sort((a, b) => a - b);
+        const materialized = new Map<number, (RenderedCell | null)[]>();
+        let position = 0;
+        while (position < unique.length) {
+            const first = unique[position];
+            let run_length = 1;
+            while (
+                position + run_length < unique.length
+                && unique[position + run_length] === first + run_length
+            ) {
+                run_length += 1;
+            }
+            const physical_start = first + this._dataStart;
+            const physical_end = first + run_length - 1 + this._dataStart;
+            const byte_start = this.index.offsetOf(physical_start);
+            const byte_end = this.index.endOffsetOf(physical_end);
+            const parsed = split_csv_rows(
+                this.decoder.decode(this.buf.subarray(byte_start, byte_end)),
+                this.delimiter,
+            );
+            for (let offset = 0; offset < run_length; offset++) {
+                materialized.set(first + offset, this.to_cells(parsed[offset] ?? []));
+            }
+            position += run_length;
+        }
+        return { rows: requested.map((row) => materialized.get(row)!) };
     }
 
     read_columns(

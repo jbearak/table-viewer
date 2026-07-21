@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
     ColumnWindow,
     DataSource,
@@ -954,6 +954,20 @@ describe('table transforms', () => {
             Uint32Array.from([2, 0, 1]),
         );
         expect(result.rows.map((row) => row[0]?.raw)).toEqual(['two', 'zero', 'one']);
+    });
+
+    it('uses the sequential reader for an identity window', () => {
+        const indexed = vi.fn(() => ({ rows: [] }));
+        const source = Object.assign(
+            new Source([[cell('zero')], [cell('one')]]),
+            { read_rows_indexed: indexed },
+        );
+        const sequential = vi.spyOn(source, 'read_rows');
+
+        expect(transformed_window(source, 0, 0, 2, undefined).rows
+            .map((row) => row[0]?.raw)).toEqual(['zero', 'one']);
+        expect(sequential).toHaveBeenCalledOnce();
+        expect(indexed).not.toHaveBeenCalled();
     });
 
     it('flattens merged semantics without inventing covered-cell values', async () => {

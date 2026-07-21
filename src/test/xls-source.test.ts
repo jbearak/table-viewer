@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { XlsDataSource } from '../data-source/xls-source';
 import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
 import { parse_xls } from '../parse-xls';
 import type { RenderedCell } from '../data-source/interface';
+import { transformed_window } from '../table-transform';
 
 const load = (name: string) => Buffer.from(readFileSync(join(__dirname, 'fixtures', name)));
 
@@ -33,6 +34,43 @@ describe('XlsDataSource', () => {
         const full = ds.read_rows(0, 0, 3).rows;
         const selected = ds.read_columns(0, 0, 3, [3, 0]).rows;
         expect(selected).toEqual(full.map((row) => [row[3] ?? null, row[0] ?? null]));
+    });
+    it('read_rows_indexed preserves full-row values, order, and duplicates', () => {
+        const ds = new XlsDataSource(load('basic.xls'));
+        const full = ds.read_rows(0, 0, 3).rows;
+        expect(ds.read_rows_indexed(0, Uint32Array.from([2, 0, 2])).rows)
+            .toEqual([full[2], full[0], full[2]]);
+        expect(ds.read_rows_indexed(0, []).rows).toEqual([]);
+        expect(() => ds.read_rows_indexed(0, [3])).toThrow(RangeError);
+        expect(() => ds.read_rows_indexed(0.5, [])).toThrow(RangeError);
+        expect(() => ds.read_rows_indexed(Number.NaN, [])).toThrow(RangeError);
+
+        const indices = Uint32Array.from(
+            { length: 100 },
+            (_, position) => [2, 0, 1, 2, 1][position % 5],
+        );
+        const indexed = vi.spyOn(ds, 'read_rows_indexed');
+        const sequential = vi.spyOn(ds, 'read_rows');
+        expect(transformed_window(ds, 0, 0, 100, indices).rows)
+            .toEqual(Array.from(indices, (row) => full[row]));
+        expect(indexed).toHaveBeenCalledTimes(1);
+        expect(sequential).not.toHaveBeenCalled();
+    });
+
+    it('serves 100 projected header rows with one indexed base call', () => {
+        const physical = new XlsDataSource(load('basic.xls'));
+        const ds = new ExcelHeaderDataSource(physical);
+        const full = ds.read_rows(0, 0, 2).rows;
+        const indexed = vi.spyOn(physical, 'read_rows_indexed');
+        const sequential = vi.spyOn(physical, 'read_rows');
+        const indices = Uint32Array.from(
+            { length: 100 },
+            (_, position) => position % 3 === 0 ? 1 : 0,
+        );
+        expect(transformed_window(ds, 0, 0, 100, indices).rows)
+            .toEqual(Array.from(indices, (row) => full[row]));
+        expect(indexed).toHaveBeenCalledTimes(1);
+        expect(sequential).not.toHaveBeenCalled();
     });
     it('preserves merges in meta', () => {
         const ds = new XlsDataSource(load('merged.xls'));

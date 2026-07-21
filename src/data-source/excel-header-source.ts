@@ -2,12 +2,13 @@ import type {
     ColumnWindow,
     DataSource,
     ExcelHeaderOverride,
+    IndexedRows,
     RenderedCell,
     RowWindow,
     SheetMeta,
     WorkbookMeta,
 } from './interface';
-import { read_source_columns } from './interface';
+import { read_source_columns, read_source_rows_indexed } from './interface';
 import type { MergeRange } from '../types';
 import { sanitize_excel_header_overrides } from '../types';
 
@@ -141,6 +142,29 @@ export class ExcelHeaderDataSource implements DataSource {
             available,
         );
         return { startRow: start, rows: physical.rows.slice(0, available) };
+    }
+
+    read_rows_indexed(sheet_index: number, row_indices: ArrayLike<number>): IndexedRows {
+        const projection = this.sheets[sheet_index];
+        if (!projection) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        const requested = Array.from(row_indices);
+        const row_count = header_active(projection, projection.override)
+            ? Math.max(0, projection.physical.rowCount - 1)
+            : projection.physical.rowCount;
+        for (const row of requested) {
+            if (!Number.isInteger(row) || row < 0 || row >= row_count) {
+                throw new RangeError(`row index ${row} out of range (${row_count} rows)`);
+            }
+        }
+        if (requested.length === 0) return { rows: [] };
+        const physical_indices = header_active(projection, projection.override)
+            ? requested.map((row) => row + 1)
+            : requested;
+        return read_source_rows_indexed(this.base, sheet_index, physical_indices);
     }
 
     read_columns(
