@@ -547,7 +547,14 @@ const NUMERIC_FILTER_OPERATORS = new Set<FilterEntry['operator']>([
     'lessThan',
     'lessThanOrEqual',
     'between',
+    'notBetween',
 ]);
+
+function is_range_filter_operator(
+    operator: FilterEntry['operator'],
+): operator is 'between' | 'notBetween' {
+    return operator === 'between' || operator === 'notBetween';
+}
 
 function compile_filter_group(
     entries: readonly FilterEntry[],
@@ -589,7 +596,7 @@ function compile_filter(
     }
 
     const raw_rhs = entry.value ?? '';
-    if (entry.operator === 'between') {
+    if (is_range_filter_operator(entry.operator)) {
         const first = compile_comparison_operand(
             raw_rhs,
             numeric_column,
@@ -602,12 +609,17 @@ function compile_filter(
             strict_numeric_operands,
             instrumentation,
         );
+        const outside = entry.operator === 'notBetween';
         return {
             needsNumericKey: first.numeric !== undefined
                 || second.numeric !== undefined,
-            matches: (raw, numeric_key) => raw !== null
-                && compare_compiled_filter_operand(raw, numeric_key, first) >= 0
-                && compare_compiled_filter_operand(raw, numeric_key, second) <= 0,
+            matches: (raw, numeric_key) => {
+                if (raw === null) return false;
+                const in_range =
+                    compare_compiled_filter_operand(raw, numeric_key, first) >= 0
+                    && compare_compiled_filter_operand(raw, numeric_key, second) <= 0;
+                return outside ? !in_range : in_range;
+            },
         };
     }
 
@@ -995,7 +1007,7 @@ function validate_filter_operands(
             );
         }
         if (
-            entry.operator === 'between'
+            is_range_filter_operator(entry.operator)
             && !finite_number_text(entry.secondValue)
         ) {
             throw new InvalidNumericFilterOperandError(

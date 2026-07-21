@@ -57,6 +57,7 @@ export type FilterOperator =
     | 'lessThan'
     | 'lessThanOrEqual'
     | 'between'
+    | 'notBetween'
     | 'isEmpty'
     | 'isNotEmpty';
 

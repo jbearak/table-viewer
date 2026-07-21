@@ -109,7 +109,7 @@ export function sanitize_transform_state(
     const operators = new Set([
         'contains', 'notContains', 'equals', 'notEquals', 'startsWith',
         'endsWith', 'greaterThan', 'greaterThanOrEqual', 'lessThan',
-        'lessThanOrEqual', 'between', 'isEmpty', 'isNotEmpty',
+        'lessThanOrEqual', 'between', 'notBetween', 'isEmpty', 'isNotEmpty',
     ]);
     for (const item of candidate.filters) {
         if (!item || typeof item !== 'object') continue;
@@ -133,7 +133,10 @@ export function sanitize_transform_state(
         const needs_value = entry.operator !== 'isEmpty'
             && entry.operator !== 'isNotEmpty';
         if (needs_value && typeof entry.value !== 'string') continue;
-        if (entry.operator === 'between' && typeof entry.secondValue !== 'string') {
+        if (
+            (entry.operator === 'between' || entry.operator === 'notBetween')
+            && typeof entry.secondValue !== 'string'
+        ) {
             continue;
         }
         seen_filter_ids.add(entry.id);

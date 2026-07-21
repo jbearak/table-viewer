@@ -29,7 +29,7 @@ function entry(operator: FilterOperator, value = '5', secondValue = '9'): Filter
 }
 
 describe('transform UI model', () => {
-    it('summarizes all 13 existing operators compactly', () => {
+    it('summarizes all existing operators compactly', () => {
         const expected: Record<FilterOperator, string> = {
             contains: 'Amount contains “5”',
             notContains: 'Amount does not contain “5”',
@@ -42,6 +42,7 @@ describe('transform UI model', () => {
             lessThan: 'Amount < 5',
             lessThanOrEqual: 'Amount ≤ 5',
             between: 'Amount 5–9',
+            notBetween: 'Amount not 5–9',
             isEmpty: 'Amount is empty',
             isNotEmpty: 'Amount is not empty',
         };
@@ -61,6 +62,18 @@ describe('transform UI model', () => {
             enabled: false,
         };
         expect(filter_draft_for_column(2, [existing])).toEqual(existing);
+    });
+
+    it('seeds preferred operator for new drafts', () => {
+        const draft = filter_draft_for_column(4, [], 'between');
+        expect(draft).toMatchObject({
+            colIndex: 4,
+            operator: 'between',
+            value: '',
+            secondValue: '',
+            caseSensitive: false,
+            enabled: true,
+        });
     });
 
     it('enforces one filter per source column while preserving edited identity', () => {

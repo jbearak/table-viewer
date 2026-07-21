@@ -954,6 +954,22 @@ describe('table transforms', () => {
             cell('12', 'number'),
             { ...filter('between', '10'), secondValue: '20' },
         )).toBe(true);
+        expect(matches_filter(
+            cell('12', 'number'),
+            { ...filter('notBetween', '10'), secondValue: '20' },
+        )).toBe(false);
+        expect(matches_filter(
+            cell('5', 'number'),
+            { ...filter('notBetween', '10'), secondValue: '20' },
+        )).toBe(true);
+        expect(matches_filter(
+            cell('10', 'number'),
+            { ...filter('notBetween', '10'), secondValue: '20' },
+        )).toBe(false);
+        expect(matches_filter(
+            null,
+            { ...filter('notBetween', '10'), secondValue: '20' },
+        )).toBe(false);
     });
 
     it('rejects invalid numeric filter operands instead of comparing them as text', async () => {

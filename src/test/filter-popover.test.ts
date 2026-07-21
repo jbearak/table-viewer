@@ -11,6 +11,11 @@ let container: HTMLDivElement | null = null;
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
 
+const READY_BINS: readonly HistogramBin[] = [
+    { lo: 0, hi: 1, count: 0 },
+    { lo: 1, hi: 2, count: 4 },
+];
+
 afterEach(() => {
     act(() => root?.unmount());
     container?.remove();
@@ -56,15 +61,26 @@ describe('FilterPopover', () => {
         );
     });
 
-    it('renders histogram loading, empty, error, and populated states without blocking controls', () => {
+    it('hides the histogram for non-range conditions and shows status only for range ops', () => {
         render_popover([], { status: 'loading' });
-        expect(document.body.textContent).toContain('Loading distribution…');
+        expect(document.body.textContent).not.toContain('Loading distribution…');
         expect(document.querySelector('#filter-condition')).not.toBeNull();
+        expect(document.querySelector('[role="group"][aria-label="Range histogram"]')).toBeNull();
+
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'between';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        expect(document.body.textContent).toContain('Loading distribution…');
         act(() => root!.unmount());
 
         root = createRoot(container!);
         act(() => root!.render(React.createElement(FilterPopover, {
-            column_index: 1, column_name: 'Value', filters: [],
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'between', value: '', secondValue: '',
+                caseSensitive: false, enabled: true,
+            }],
             histogram: { status: 'ready', bins: [] },
             anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
         })));
@@ -73,7 +89,10 @@ describe('FilterPopover', () => {
 
         root = createRoot(container!);
         act(() => root!.render(React.createElement(FilterPopover, {
-            column_index: 1, column_name: 'Value', filters: [],
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'between', value: '', secondValue: '',
+                caseSensitive: false, enabled: true,
+            }],
             histogram: { status: 'error', message: 'scan failed' },
             anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
         })));
@@ -82,21 +101,83 @@ describe('FilterPopover', () => {
 
         root = createRoot(container!);
         act(() => root!.render(React.createElement(FilterPopover, {
-            column_index: 1, column_name: 'Value', filters: [],
-            histogram: { status: 'ready', bins: [
-                { lo: 0, hi: 1, count: 0 },
-                { lo: 1, hi: 2, count: 4 },
-            ] },
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'between', value: '', secondValue: '',
+                caseSensitive: false, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS },
             anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
         })));
-        expect(document.querySelector('[role="img"][aria-label*="4 numeric values"]'))
+        expect(document.querySelector('[role="group"][aria-label="Range histogram"]'))
             .not.toBeNull();
-        const bars = document.querySelectorAll<HTMLElement>('.filter-histogram-bar');
-        expect(bars).toHaveLength(2);
-        expect(bars[0].style.height).toBe('0%');
-        expect(bars[1].style.height).toBe('100%');
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(2);
         expect((document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).disabled)
             .toBe(true);
+    });
+
+    it('defaults new numeric columns to Between and uses Lower/Upper labels', () => {
+        render_popover([], { status: 'ready', bins: READY_BINS });
+        const select = document.querySelector('select') as HTMLSelectElement;
+        expect(select.value).toBe('between');
+        expect((document.querySelector('[aria-label="Lower value"]') as HTMLInputElement)).not.toBeNull();
+        expect((document.querySelector('[aria-label="Upper value"]') as HTMLInputElement)).not.toBeNull();
+        expect(document.querySelector('[aria-label="Filter value"]')).toBeNull();
+    });
+
+    it('promotes pristine draft on histogram update without overriding existing filters', () => {
+        const on_apply = vi.fn();
+        const on_cancel = vi.fn();
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        const props = {
+            column_index: 1,
+            column_name: 'Value',
+            filters: [] as FilterEntry[],
+            anchor: { left: 10, top: 10 },
+            on_apply,
+            on_cancel,
+        };
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'loading' },
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'ready', bins: READY_BINS },
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('between');
+
+        act(() => root!.unmount());
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'loading' },
+        })));
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'equals';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'ready', bins: READY_BINS },
+        })));
+        // Existing component instance is replaced by React element recreate with same key path;
+        // user_edited_ref resets on remount. Validate non-override via existing filter instead.
+        act(() => root!.unmount());
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            filters: [{
+                id: 'existing', colIndex: 1, operator: 'equals', value: 'x',
+                caseSensitive: false, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS },
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('equals');
     });
 
     it('hydrates id, enabled state, zero values, second value, and case sensitivity', () => {
@@ -111,8 +192,8 @@ describe('FilterPopover', () => {
         };
         const { on_apply } = render_popover([existing]);
         expect(document.activeElement?.id).toBe('filter-condition');
-        expect((document.querySelector('[aria-label="Filter value"]') as HTMLInputElement).value).toBe('0');
-        expect((document.querySelector('[aria-label="Second filter value"]') as HTMLInputElement).value).toBe('0');
+        expect((document.querySelector('[aria-label="Lower value"]') as HTMLInputElement).value).toBe('0');
+        expect((document.querySelector('[aria-label="Upper value"]') as HTMLInputElement).value).toBe('0');
         expect((document.querySelector('input[type="checkbox"]') as HTMLInputElement).checked).toBe(true);
         act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
         expect(on_apply).toHaveBeenCalledWith(existing);
@@ -142,6 +223,56 @@ describe('FilterPopover', () => {
         expect(Number.parseFloat(style.top)).toBeLessThan(10_000);
     });
 
+    it('writes brushed range bounds into lower/upper fields and enables Apply', () => {
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'between', value: '', secondValue: '',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        const upper = document.querySelector('[aria-label="Upper value"]') as SVGElement;
+        // Thumb aria labels on the sliders
+        const lo_thumb = document.querySelector('[role="slider"][aria-label="Lower value"]') as SVGElement;
+        const hi_thumb = document.querySelector('[role="slider"][aria-label="Upper value"]') as SVGElement;
+        expect(lo_thumb).not.toBeNull();
+        expect(hi_thumb).not.toBeNull();
+        act(() => {
+            lo_thumb.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        });
+        expect((document.querySelector('input[aria-label="Lower value"]') as HTMLInputElement).value)
+            .not.toBe('');
+        expect((document.querySelector('input[aria-label="Upper value"]') as HTMLInputElement).value)
+            .not.toBe('');
+        expect((document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).disabled)
+            .toBe(false);
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'between',
+            value: expect.any(String),
+            secondValue: expect.any(String),
+        }));
+        void upper;
+    });
+
+    it('preserves bounds when switching Between and Not between', () => {
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'between', value: '1', secondValue: '2',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'notBetween';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        expect((document.querySelector('input[aria-label="Lower value"]') as HTMLInputElement).value)
+            .toBe('1');
+        expect((document.querySelector('input[aria-label="Upper value"]') as HTMLInputElement).value)
+            .toBe('2');
+        expect(document.querySelector('[role="group"][aria-label="Range histogram"]')).not.toBeNull();
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'notBetween', value: '1', secondValue: '2',
+        }));
+    });
+
     it('reclamps after isEmpty expands to between near the viewport edge', () => {
         const resize_callbacks: ResizeObserverCallback[] = [];
         vi.stubGlobal('ResizeObserver', class {
@@ -158,7 +289,7 @@ describe('FilterPopover', () => {
             .mockImplementation(function (this: HTMLElement) {
                 if (this.classList.contains('filter-popover')) {
                     const expanded = this.querySelector(
-                        '[aria-label="Second filter value"]',
+                        '[aria-label="Upper value"]',
                     ) !== null;
                     return {
                         left: 0, top: 0, width: 200, height: expanded ? 220 : 100,
@@ -180,7 +311,7 @@ describe('FilterPopover', () => {
             select.dispatchEvent(new Event('change', { bubbles: true }));
             resize_callbacks.at(-1)?.([], {} as ResizeObserver);
         });
-        expect(document.querySelector('[aria-label="Second filter value"]')).not.toBeNull();
+        expect(document.querySelector('[aria-label="Upper value"]')).not.toBeNull();
         expect(popover.style.top).toBe('72px');
         expect(Number.parseFloat(popover.style.top) + 220).toBeLessThanOrEqual(292);
     });

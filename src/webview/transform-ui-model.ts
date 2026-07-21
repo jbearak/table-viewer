@@ -22,6 +22,7 @@ export const FILTER_OPTIONS: readonly { value: FilterOperator; label: string }[]
     { value: 'lessThan', label: 'Less than' },
     { value: 'lessThanOrEqual', label: 'Less than or equal' },
     { value: 'between', label: 'Between (inclusive)' },
+    { value: 'notBetween', label: 'Not between (inclusive bounds)' },
     { value: 'isEmpty', label: 'Is empty' },
     { value: 'isNotEmpty', label: 'Is not empty' },
 ] as const;
@@ -33,9 +34,16 @@ export function new_filter_id(): string {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+export function is_range_filter_operator(
+    operator: FilterOperator,
+): operator is 'between' | 'notBetween' {
+    return operator === 'between' || operator === 'notBetween';
+}
+
 export function filter_draft_for_column(
     col_index: number,
     filters: readonly FilterEntry[],
+    preferred_operator: FilterOperator = 'contains',
 ): FilterEntry {
     const existing = filters.find((entry) => entry.colIndex === col_index);
     if (existing) {
@@ -48,12 +56,21 @@ export function filter_draft_for_column(
     return {
         id: new_filter_id(),
         colIndex: col_index,
-        operator: 'contains',
+        operator: preferred_operator,
         value: '',
         secondValue: '',
         caseSensitive: false,
         enabled: true,
     };
+}
+
+/** True while a brand-new draft is still the untouched default seed. */
+export function is_pristine_default_filter_draft(entry: FilterEntry): boolean {
+    return entry.operator === 'contains'
+        && (entry.value ?? '') === ''
+        && (entry.secondValue ?? '') === ''
+        && entry.caseSensitive === false
+        && entry.enabled === true;
 }
 
 export function filter_summary(
@@ -73,6 +90,7 @@ export function filter_summary(
         case 'lessThan': return `${name} < ${entry.value ?? ''}`;
         case 'lessThanOrEqual': return `${name} ≤ ${entry.value ?? ''}`;
         case 'between': return `${name} ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
+        case 'notBetween': return `${name} not ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
         case 'isEmpty': return `${name} is empty`;
         case 'isNotEmpty': return `${name} is not empty`;
     }

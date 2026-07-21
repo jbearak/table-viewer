@@ -1,9 +1,12 @@
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
+import { FilterHistogram, domain_max, domain_min } from './filter-histogram';
 import {
     FILTER_OPTIONS,
     RAW_VALUE_TRANSFORM_DESCRIPTION,
     filter_draft_for_column,
+    is_pristine_default_filter_draft,
+    is_range_filter_operator,
 } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
@@ -21,6 +24,20 @@ export interface FilterPopoverProps {
     on_cancel: (reason: FilterPopoverDismissReason) => void;
 }
 
+function preferred_operator_from_histogram(
+    histogram: NonNullable<FilterPopoverProps['histogram']>,
+): FilterOperator {
+    return histogram.status === 'ready' && histogram.bins.length > 0
+        ? 'between'
+        : 'contains';
+}
+
+function parse_range_bound(value: string | undefined): number | undefined {
+    if (value === undefined || value.trim() === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export function FilterPopover({
     column_index,
     column_name,
@@ -30,12 +47,18 @@ export function FilterPopover({
     on_apply,
     on_cancel,
 }: FilterPopoverProps): React.JSX.Element {
+    const existing = filters.some((entry) => entry.colIndex === column_index);
     const [draft, set_draft] = useState<FilterEntry>(() =>
-        filter_draft_for_column(column_index, filters));
+        filter_draft_for_column(
+            column_index,
+            filters,
+            existing ? 'contains' : preferred_operator_from_histogram(histogram),
+        ));
     const [coords, set_coords] = useState(anchor);
     const popover_ref = useRef<HTMLDivElement>(null);
     const first_control_ref = useRef<HTMLSelectElement>(null);
     const layout_dismissed_ref = useRef(false);
+    const user_edited_ref = useRef(existing);
     const description_id = useId();
     use_dismiss(popover_ref, on_cancel);
 
@@ -94,8 +117,18 @@ export function FilterPopover({
         first_control_ref.current?.focus();
     }, []);
 
+    // Promote pristine Contains drafts to Between once a numeric histogram arrives.
+    useEffect(() => {
+        if (existing || user_edited_ref.current) return;
+        if (histogram.status !== 'ready' || histogram.bins.length === 0) return;
+        set_draft((current) => {
+            if (!is_pristine_default_filter_draft(current)) return current;
+            return { ...current, operator: 'between' };
+        });
+    }, [existing, histogram]);
+
     const needs_value = draft.operator !== 'isEmpty' && draft.operator !== 'isNotEmpty';
-    const needs_second = draft.operator === 'between';
+    const needs_second = is_range_filter_operator(draft.operator);
     const can_apply = !needs_value
         || ((draft.value ?? '').length > 0
             && (!needs_second || (draft.secondValue ?? '').length > 0));
@@ -103,6 +136,26 @@ export function FilterPopover({
         if (!can_apply) return;
         on_apply({ ...draft });
     };
+
+    const update_draft = (next: FilterEntry) => {
+        user_edited_ref.current = true;
+        set_draft(next);
+    };
+
+    const range_lo = parse_range_bound(draft.value);
+    const range_hi = parse_range_bound(draft.secondValue);
+    const ready_bins = histogram.status === 'ready' ? histogram.bins : null;
+    const domain_ready = ready_bins !== null && ready_bins.length > 0;
+    const histo_lo = domain_ready
+        ? (range_lo !== undefined && range_hi !== undefined
+            ? Math.min(range_lo, range_hi)
+            : domain_min(ready_bins))
+        : 0;
+    const histo_hi = domain_ready
+        ? (range_lo !== undefined && range_hi !== undefined
+            ? Math.max(range_lo, range_hi)
+            : domain_max(ready_bins))
+        : 0;
 
     return (
         <div
@@ -140,7 +193,6 @@ export function FilterPopover({
                 <p id={description_id} className="transform-value-description">
                     {RAW_VALUE_TRANSFORM_DESCRIPTION}
                 </p>
-                <FilterHistogram histogram={histogram} />
                 <label className="filter-popover-field-label" htmlFor="filter-condition">
                     Condition
                 </label>
@@ -149,7 +201,7 @@ export function FilterPopover({
                     id="filter-condition"
                     className="filter-popover-select"
                     value={draft.operator}
-                    onChange={(event) => set_draft({
+                    onChange={(event) => update_draft({
                         ...draft,
                         operator: event.target.value as FilterOperator,
                     })}
@@ -161,21 +213,33 @@ export function FilterPopover({
                 {needs_value && (
                     <input
                         className="filter-popover-input"
-                        aria-label="Filter value"
-                        placeholder="Value"
+                        aria-label={needs_second ? 'Lower value' : 'Filter value'}
+                        placeholder={needs_second ? 'Lower value' : 'Value'}
                         value={draft.value ?? ''}
-                        onChange={(event) => set_draft({ ...draft, value: event.target.value })}
+                        onChange={(event) => update_draft({ ...draft, value: event.target.value })}
                     />
                 )}
                 {needs_second && (
                     <input
                         className="filter-popover-input"
-                        aria-label="Second filter value"
+                        aria-label="Upper value"
                         placeholder="Upper value"
                         value={draft.secondValue ?? ''}
-                        onChange={(event) => set_draft({
+                        onChange={(event) => update_draft({
                             ...draft,
                             secondValue: event.target.value,
+                        })}
+                    />
+                )}
+                {needs_second && (
+                    <FilterHistogramStatus
+                        histogram={histogram}
+                        lo={histo_lo}
+                        hi={histo_hi}
+                        on_change={(lo, hi) => update_draft({
+                            ...draft,
+                            value: String(lo),
+                            secondValue: String(hi),
                         })}
                     />
                 )}
@@ -184,7 +248,7 @@ export function FilterPopover({
                         <input
                             type="checkbox"
                             checked={draft.caseSensitive}
-                            onChange={(event) => set_draft({
+                            onChange={(event) => update_draft({
                                 ...draft,
                                 caseSensitive: event.target.checked,
                             })}
@@ -210,10 +274,16 @@ export function FilterPopover({
     );
 }
 
-function FilterHistogram({
+function FilterHistogramStatus({
     histogram,
+    lo,
+    hi,
+    on_change,
 }: {
     histogram: NonNullable<FilterPopoverProps['histogram']>;
+    lo: number;
+    hi: number;
+    on_change: (lo: number, hi: number) => void;
 }): React.JSX.Element {
     if (histogram.status === 'loading') {
         return <div className="filter-histogram-status" role="status">Loading distribution…</div>;
@@ -232,26 +302,12 @@ function FilterHistogram({
             </div>
         );
     }
-    const max_count = Math.max(1, ...histogram.bins.map((bin) => bin.count));
-    const total = histogram.bins.reduce((sum, bin) => sum + bin.count, 0);
     return (
-        <div
-            className="filter-histogram"
-            role="img"
-            aria-label={`Distribution of ${total} numeric values from ${histogram.bins[0].lo} to ${histogram.bins.at(-1)!.hi}`}
-        >
-            {histogram.bins.map((bin, index) => (
-                <span
-                    key={`${bin.lo}:${bin.hi}:${index}`}
-                    className="filter-histogram-bar"
-                    style={{
-                        height: bin.count === 0
-                            ? '0%'
-                            : `${Math.max(2, (bin.count / max_count) * 100)}%`,
-                    }}
-                    title={`${bin.lo} – ${bin.hi}: ${bin.count}`}
-                />
-            ))}
-        </div>
+        <FilterHistogram
+            bins={histogram.bins}
+            lo={lo}
+            hi={hi}
+            on_change={on_change}
+        />
     );
 }

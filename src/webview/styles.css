@@ -832,19 +832,39 @@ body {
 }
 
 .filter-histogram {
-    display: flex;
-    align-items: end;
-    gap: 1px;
-    height: 56px;
-    padding: 4px 3px 0;
-    border-bottom: 1px solid var(--vscode-panel-border, #555);
+    overflow: visible;
+    margin-top: 2px;
 }
 
 .filter-histogram-bar {
-    flex: 1 1 0;
-    min-width: 1px;
-    background: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    opacity: 0.35;
+}
+
+.filter-histogram-bar.in-range {
     opacity: 0.8;
+}
+
+.filter-histogram-axis {
+    stroke: var(--vscode-panel-border, rgba(128, 128, 128, 0.5));
+    stroke-width: 1;
+}
+
+.filter-histogram-range {
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    opacity: 0.4;
+}
+
+.filter-histogram-thumb {
+    fill: var(--vscode-button-background, #0e639c);
+    stroke: var(--vscode-editor-background, #1e1e1e);
+    stroke-width: 2;
+}
+
+.filter-histogram-thumb:hover,
+.filter-histogram-thumb:focus {
+    fill: var(--vscode-button-hoverBackground, #1177bb);
+    outline: none;
 }
 
 .filter-histogram-status {
