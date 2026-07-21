@@ -287,12 +287,43 @@ describe('table transforms', () => {
                 ),
                 filters: [],
             },
-            cancel_at_checkpoint(5),
+            // Three setup/scan checkpoints, 66 numeric-column preparation
+            // checkpoints, one pre-filter checkpoint, then the key-build one.
+            cancel_at_checkpoint(71),
             instrumentation,
         )).rejects.toMatchObject({ name: 'AbortError' });
 
         expect(instrumentation.numericSortKeyBuilds).toBe(4096);
         expect(instrumentation.numericSortKeyBuilds).toBeLessThan(width);
+    });
+
+    it('cancels while preparing arrays for a very wide numeric sort', async () => {
+        const width = 4200;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source([
+            Array.from({ length: width }, (_, column) => cell(String(column))),
+        ]);
+
+        await expect(compute_transform(
+            source,
+            0,
+            {
+                sort: Array.from(
+                    { length: width },
+                    (_, colIndex) => ({ colIndex, direction: 'asc' as const }),
+                ),
+                filters: [],
+            },
+            // Checkpoints 1-3 cover setup and scanning, 4 precedes the first
+            // key array, and 5 interrupts before the 65th key array.
+            cancel_at_checkpoint(5),
+            instrumentation,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(0);
     });
 
     it('keeps mixed canonical and number-fallback keys transitive near 2^53', async () => {

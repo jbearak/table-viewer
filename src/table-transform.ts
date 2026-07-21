@@ -11,6 +11,7 @@ import { transform_is_active } from './types';
 // transform inside the old 1,000-row scan interval.
 const SCAN_ROWS_PER_CHECKPOINT = 128;
 const FILTER_ROWS_PER_CHECKPOINT = 1000;
+const SORT_COLUMNS_PER_CHECKPOINT = 64;
 const SORT_KEY_BUILDS_PER_CHECKPOINT = 4096;
 const SORT_CHUNK_ROWS = 2048;
 const SORT_OPERATIONS_PER_CHECKPOINT = 4096;
@@ -110,7 +111,11 @@ export async function compute_transform(
     }
 
     validate_filter_operands(state, values);
-    const numeric_sort_columns = prepare_numeric_sort_columns(state, values);
+    const numeric_sort_columns = await prepare_numeric_sort_columns(
+        state,
+        values,
+        is_cancelled,
+    );
     const survivors: number[] = [];
     let numeric_sort_key_builds_since_checkpoint = 0;
     await cancellation_checkpoint(is_cancelled);
@@ -193,19 +198,29 @@ export async function compute_transform(
     };
 }
 
-function prepare_numeric_sort_columns(
+async function prepare_numeric_sort_columns(
     state: SheetTransformState,
     columns: Map<number, TransformColumn>,
-): TransformColumn[] {
+    is_cancelled: () => boolean,
+): Promise<TransformColumn[]> {
     const result: TransformColumn[] = [];
     const prepared = new Set<number>();
+    let numeric_columns_since_checkpoint = SORT_COLUMNS_PER_CHECKPOINT;
     for (const sort of state.sort) {
         if (prepared.has(sort.colIndex)) continue;
         prepared.add(sort.colIndex);
         const column = columns.get(sort.colIndex)!;
         if (!column.numeric || !column.foundValue) continue;
+        if (
+            numeric_columns_since_checkpoint
+            >= SORT_COLUMNS_PER_CHECKPOINT
+        ) {
+            await cancellation_checkpoint(is_cancelled);
+            numeric_columns_since_checkpoint = 0;
+        }
         column.numericSortKeys = new Array(column.values.length);
         result.push(column);
+        numeric_columns_since_checkpoint += 1;
     }
     return result;
 }
