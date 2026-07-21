@@ -74,7 +74,7 @@ body {
     font-family: inherit;
 }
 
-.toggle:not([aria-disabled="true"]):hover {
+.toggle:not(.active):not([aria-disabled="true"]):hover {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
@@ -93,6 +93,11 @@ body {
     background: var(--vscode-button-background, #0e639c);
     color: var(--vscode-button-foreground, #fff);
     border-color: var(--vscode-button-background, #0e639c);
+}
+
+.toggle.active:not(.has-unsaved):not([aria-disabled="true"]):hover {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+    border-color: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 .toggle:focus-visible:not(:disabled) {

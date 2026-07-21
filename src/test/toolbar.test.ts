@@ -81,6 +81,22 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     };
 }
 
+describe('toolbar toggle colors', () => {
+    it('keeps active button hover colors on the button palette', () => {
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+
+        expect(css).toContain(
+            '.toggle:not(.active):not([aria-disabled="true"]):hover',
+        );
+        expect(css).toMatch(
+            /\.toggle\.active:not\(\.has-unsaved\):not\(\[aria-disabled="true"\]\):hover\s*\{[^}]*--vscode-button-hoverBackground[^}]*\}/,
+        );
+    });
+});
+
 function cleanup() {
     act(() => {
         root?.unmount();
