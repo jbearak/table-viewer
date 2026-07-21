@@ -8,7 +8,7 @@ import type {
     FileStateSnapshot,
     FileStateStore,
 } from './state';
-import type { PerFileState } from './types';
+import type { PerFileState, StoredPerFileState } from './types';
 
 interface FallbackCopyProvenance {
     id: string;
@@ -97,6 +97,10 @@ function is_authority_store(store: FileStateStore): store is AuthorityFileStateS
         && typeof candidate.cleanup_authority_transactions === 'function';
 }
 
+function states_equal(left: StoredPerFileState, right: PerFileState): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+
 export function read_authority(
     store: FileStateStore,
     path: string,
@@ -155,7 +159,10 @@ export async function finalize_authority(
         };
     }
     let snapshot = current;
-    if (stage.nextState) {
+    if (
+        stage.nextState !== undefined
+        && !states_equal(current.state, stage.nextState)
+    ) {
         const committed = await store.compare_and_set(
             path,
             current.revision,

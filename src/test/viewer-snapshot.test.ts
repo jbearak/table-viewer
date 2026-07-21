@@ -203,12 +203,7 @@ describe('snapshot classification', () => {
         ...overrides,
     });
 
-    it.each([
-        'capability-only delivery',
-        'result-only delivery',
-        'same-authority generation change',
-        'new ready receiver epoch',
-    ])('applies a new same-basis identity for %s', () => {
+    it('applies a newer delivery with equal authority and semantic basis', () => {
         expect(classify_snapshot(identity(2), identity(1))).toBe('applied');
     });
 

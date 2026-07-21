@@ -1094,6 +1094,33 @@ describe('file coordinator Task 10 invariants', () => {
         release_authority_fallback(first, '/provider-key');
     });
 
+    it('does not advance the fallback state revision for an unchanged staged state', async () => {
+        const path = '/unchanged.xlsx';
+        const base = mapped_state_store({ [path]: { activeSheetIndex: 4 } });
+        const compare_and_set = vi.fn(base.backing.compare_and_set.bind(base.backing));
+        base.backing.compare_and_set = compare_and_set;
+        const initial = await base.store.read(path);
+
+        await expect(stage_authority(base.store, path, {
+            id: 'unchanged-projection', kind: 'projection', ordinal: 1,
+            expectedStateRevision: initial.revision, expectedCommitSequence: 0,
+            nextState: { activeSheetIndex: 4 },
+        })).resolves.toEqual({ type: 'staged' });
+
+        await expect(finalize_authority(base.store, path, 'unchanged-projection'))
+            .resolves.toMatchObject({
+                type: 'finalized',
+                snapshot: initial,
+                authority: {
+                    commitSequence: 1,
+                    authorityRevision: 1,
+                    projectionRevision: 1,
+                },
+            });
+        expect(compare_and_set).not.toHaveBeenCalled();
+        await expect(base.store.read(path)).resolves.toEqual(initial);
+    });
+
     it('preserves fallback authority and recovery stages through delegated provider copying', async () => {
         const legacy = '/legacy-provider.xlsx';
         const provider = '/provider-key';
