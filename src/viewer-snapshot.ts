@@ -9,6 +9,7 @@ import {
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
     transform_schema_for_sheet,
+    type CsvSaveLifecycle,
     type PerFileState,
     type ScrollPosition,
     type StoredPerFileState,
@@ -72,6 +73,8 @@ export interface WorkbookSnapshotCapabilities {
     readonly csvEditable: boolean;
     readonly csvEditingSupported: boolean;
     readonly csvEditSessionId?: string;
+    /** Monotonic host projection for the complete panel save lifecycle. */
+    readonly csvSaveLifecycle: CsvSaveLifecycle;
 }
 
 export interface NormalizedPerFileState extends PerFileState {

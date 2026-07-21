@@ -7,6 +7,7 @@ import type {
 } from './viewer-snapshot';
 import {
     EMPTY_TRANSFORM,
+    transform_is_active,
     transform_schema_for_sheet,
     type HostMessage,
     type SheetTransformState,
@@ -28,7 +29,16 @@ type SetTransformMessage = Extract<WebviewMessage, { type: 'setTransform' }>;
 type TransformCommit = (
     message: SetTransformMessage,
     state: SheetTransformState,
+    receiverEpoch: number,
 ) => Promise<void>;
+
+type TransformOperationToken = number;
+let next_transform_operation_token = 0;
+
+function allocate_transform_operation_token(): TransformOperationToken {
+    next_transform_operation_token += 1;
+    return next_transform_operation_token;
+}
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
 
@@ -40,6 +50,19 @@ export interface ViewerPanelSnapshotMaterial {
 export type AdoptSourceResult =
     | { type: 'adopted' }
     | { type: 'refused' };
+
+interface PreparedTransformChange {
+    readonly sheetIndex: number;
+    readonly state: SheetTransformState;
+    readonly indices?: Uint32Array;
+}
+
+export interface PreparedTransformReconciliation {
+    readonly sourceEpoch: number;
+    readonly receiverEpoch: number;
+    readonly generation: number;
+    readonly changes: readonly PreparedTransformChange[];
+}
 
 /**
  * Protocol engine shared by the xlsx/xls custom editor and the CSV panel.
@@ -61,9 +84,10 @@ export class ViewerPanelCore {
     private readonly max_cached_pages: number;
     private readonly transform_indices = new Map<number, Uint32Array>();
     private readonly transform_states = new Map<number, SheetTransformState>();
-    private readonly transform_sequences = new Map<number, number>();
-    private readonly transforms_in_flight = new Set<number>();
+    private readonly transform_operations = new Map<number, TransformOperationToken>();
+    private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
     private source_epoch = 0;
+    private receiver_epoch = 0;
     private _source_generation = 1;
     private disposed = false;
     private readonly on_transform_commit?: TransformCommit;
@@ -93,6 +117,19 @@ export class ViewerPanelCore {
             || this.transform_indices.size > 0;
     }
 
+    get has_active_transform(): boolean {
+        return [...this.transform_states.values()].some(transform_is_active);
+    }
+
+    /**
+     * Invalidate unfinished work owned by an older webview receiver without
+     * disturbing transforms that were already installed for the current source.
+     */
+    begin_receiver_epoch(receiver_epoch: number): void {
+        if (this.disposed || this.receiver_epoch === receiver_epoch) return;
+        this.receiver_epoch = receiver_epoch;
+    }
+
     /**
      * Adopt a new physical source or logical projection without posting metadata.
      * Object identity is deliberately irrelevant: an in-place Excel projection is
@@ -106,7 +143,7 @@ export class ViewerPanelCore {
         this._source_generation += 1;
         this.transform_indices.clear();
         this.transform_states.clear();
-        this.transform_sequences.clear();
+        this.transform_operations.clear();
         this.transforms_in_flight.clear();
         this.cache.clear();
         return { type: 'adopted' };
@@ -115,7 +152,7 @@ export class ViewerPanelCore {
     /** Cancel asynchronous work before disposal. Adoption cancels atomically. */
     private cancel_pending(): void {
         this.source_epoch += 1;
-        this.transform_sequences.clear();
+        this.transform_operations.clear();
         this.transforms_in_flight.clear();
     }
 
@@ -153,9 +190,107 @@ export class ViewerPanelCore {
         }
     }
 
+    /** Prepare host-owned transform state without changing the installed view. */
+    async prepare_transform_reconciliation(
+        states: readonly (SheetTransformState | undefined)[],
+        is_cancelled: () => boolean,
+    ): Promise<PreparedTransformReconciliation | undefined> {
+        const source_epoch = this.source_epoch;
+        const receiver_epoch = this.receiver_epoch;
+        const generation = this._generation;
+        const sheets = this.source.meta().sheets;
+        const changes: PreparedTransformChange[] = [];
+        for (let sheet_index = 0; sheet_index < sheets.length; sheet_index += 1) {
+            if (this.disposed || this.source_epoch !== source_epoch || is_cancelled()) {
+                return undefined;
+            }
+            const state = states[sheet_index] ?? EMPTY_TRANSFORM;
+            const installed = this.transform_states.get(sheet_index) ?? EMPTY_TRANSFORM;
+            if (transform_states_equal(installed, state)) continue;
+            let result;
+            try {
+                result = await compute_transform(
+                    this.source,
+                    sheet_index,
+                    state,
+                    () => this.disposed
+                        || this.source_epoch !== source_epoch
+                        || this.receiver_epoch !== receiver_epoch
+                        || is_cancelled(),
+                );
+            } catch (error) {
+                if (
+                    error instanceof Error
+                    && error.name === 'AbortError'
+                    && (
+                        this.disposed
+                        || this.source_epoch !== source_epoch
+                        || this.receiver_epoch !== receiver_epoch
+                        || is_cancelled()
+                    )
+                ) return undefined;
+                throw error;
+            }
+            if (
+                this.disposed
+                || this.source_epoch !== source_epoch
+                || this.receiver_epoch !== receiver_epoch
+                || is_cancelled()
+            ) return undefined;
+            changes.push({
+                sheetIndex: sheet_index,
+                state: clone_transform(state),
+                ...(result.indices ? { indices: result.indices } : {}),
+            });
+        }
+        return {
+            sourceEpoch: source_epoch,
+            receiverEpoch: receiver_epoch,
+            generation,
+            changes,
+        };
+    }
+
+    /** Install a prepared reconciliation only while its full core basis is stable. */
+    commit_transform_reconciliation(
+        prepared: PreparedTransformReconciliation,
+    ): boolean {
+        if (
+            this.disposed
+            || this.source_epoch !== prepared.sourceEpoch
+            || this.receiver_epoch !== prepared.receiverEpoch
+            || this._generation !== prepared.generation
+        ) return false;
+        for (const change of prepared.changes) {
+            if (change.indices) {
+                this.transform_indices.set(change.sheetIndex, change.indices);
+            } else {
+                this.transform_indices.delete(change.sheetIndex);
+            }
+            this.transform_states.set(change.sheetIndex, clone_transform(change.state));
+            this._generation += 1;
+        }
+        if (prepared.changes.length > 0) this.cache.clear();
+        return true;
+    }
+
+    /** Reconcile directly for callers that already own a stable external basis. */
+    async reconcile_transforms(
+        states: readonly (SheetTransformState | undefined)[],
+        is_cancelled: () => boolean,
+    ): Promise<boolean> {
+        const prepared = await this.prepare_transform_reconciliation(
+            states,
+            is_cancelled,
+        );
+        return prepared !== undefined
+            && this.commit_transform_reconciliation(prepared);
+    }
+
     private async handle_set_transform(
         msg: SetTransformMessage,
     ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
         const sheet = this.source.meta().sheets[msg.sheetIndex];
         if (!sheet) {
             await this.post({
@@ -168,7 +303,7 @@ export class ViewerPanelCore {
                 sourceGeneration: this._source_generation,
                 intent: msg.intent,
                 error: `Sheet index ${msg.sheetIndex} is out of range.`,
-            });
+            }, receiver_epoch);
             return;
         }
         if (msg.sourceGeneration !== this._source_generation) {
@@ -176,6 +311,7 @@ export class ViewerPanelCore {
                 msg,
                 sheet.rowCount,
                 'The source changed before this sort/filter request arrived.',
+                receiver_epoch,
             );
             return;
         }
@@ -187,26 +323,52 @@ export class ViewerPanelCore {
                 msg,
                 sheet.rowCount,
                 'The saved sort/filter no longer matches this sheet.',
+                receiver_epoch,
             );
             return;
         }
 
         const installed_state = this.transform_states.get(msg.sheetIndex);
         if (
+            msg.intent === 'restore'
+            && installed_state
+            && transform_states_equal(installed_state, msg.state)
+        ) {
+            await this.post({
+                type: 'transformApplied',
+                sheetIndex: msg.sheetIndex,
+                state: clone_transform(installed_state),
+                rowCount: this.transform_indices.get(msg.sheetIndex)?.length
+                    ?? sheet.rowCount,
+                requestId: msg.requestId,
+                generation: this._generation,
+                sourceGeneration: this._source_generation,
+                intent: msg.intent,
+            }, receiver_epoch);
+            return;
+        }
+        if (
             msg.intent === 'cancel'
             && installed_state
             && transform_states_equal(installed_state, msg.state)
         ) {
-            const sequence = (this.transform_sequences.get(msg.sheetIndex) ?? 0) + 1;
-            this.transform_sequences.set(msg.sheetIndex, sequence);
+            const operation_token = allocate_transform_operation_token();
+            this.transform_operations.set(msg.sheetIndex, operation_token);
             const source_epoch = this.source_epoch;
-            this.transforms_in_flight.add(msg.sheetIndex);
-            const is_cancelled = () =>
+            this.transforms_in_flight.set(msg.sheetIndex, operation_token);
+            const source_request_is_current = () =>
                 this.source_epoch !== source_epoch
-                || this.transform_sequences.get(msg.sheetIndex) !== sequence;
+                    ? false
+                    : this.transform_operations.get(msg.sheetIndex) === operation_token;
+            const receiver_is_current = () => this.receiver_epoch === receiver_epoch;
             try {
-                await this.on_transform_commit?.(msg, clone_transform(msg.state));
-                if (is_cancelled()) return;
+                if (!source_request_is_current() || !receiver_is_current()) return;
+                await this.on_transform_commit?.(
+                    msg,
+                    clone_transform(msg.state),
+                    receiver_epoch,
+                );
+                if (!source_request_is_current()) return;
                 await this.post({
                     type: 'transformApplied',
                     sheetIndex: msg.sheetIndex,
@@ -216,9 +378,9 @@ export class ViewerPanelCore {
                     generation: this._generation,
                     sourceGeneration: this._source_generation,
                     intent: msg.intent,
-                });
+                }, receiver_epoch);
             } catch (error) {
-                if (is_cancelled()) return;
+                if (!source_request_is_current()) return;
                 await this.post({
                     type: 'transformApplied',
                     sheetIndex: msg.sheetIndex,
@@ -229,37 +391,46 @@ export class ViewerPanelCore {
                     sourceGeneration: this._source_generation,
                     intent: msg.intent,
                     error: error instanceof Error ? error.message : String(error),
-                });
+                }, receiver_epoch);
             } finally {
-                if (this.transform_sequences.get(msg.sheetIndex) === sequence) {
+                if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                     this.transforms_in_flight.delete(msg.sheetIndex);
                 }
             }
             return;
         }
 
-        const sequence = (this.transform_sequences.get(msg.sheetIndex) ?? 0) + 1;
-        this.transform_sequences.set(msg.sheetIndex, sequence);
+        const operation_token = allocate_transform_operation_token();
+        this.transform_operations.set(msg.sheetIndex, operation_token);
         const source_epoch = this.source_epoch;
-        this.transforms_in_flight.add(msg.sheetIndex);
-        const is_cancelled = () =>
-            this.source_epoch !== source_epoch
-            || this.transform_sequences.get(msg.sheetIndex) !== sequence;
+        this.transforms_in_flight.set(msg.sheetIndex, operation_token);
+        const source_request_is_current = () => this.source_epoch === source_epoch
+            && this.transform_operations.get(msg.sheetIndex) === operation_token;
+        const receiver_is_current = () => this.receiver_epoch === receiver_epoch;
+        const compute_is_cancelled = () =>
+            !source_request_is_current() || !receiver_is_current();
 
         try {
             const result = await compute_transform(
                 this.source,
                 msg.sheetIndex,
                 msg.state,
-                is_cancelled,
+                compute_is_cancelled,
             );
-            if (is_cancelled()) return;
+            if (compute_is_cancelled()) return;
 
             // Transform preferences are host-owned. In particular, an explicit
             // Cancel must be durably recorded before its terminal acknowledgement
             // so close/reopen cannot resurrect the cancelled restore.
-            await this.on_transform_commit?.(msg, clone_transform(msg.state));
-            if (is_cancelled()) return;
+            await this.on_transform_commit?.(
+                msg,
+                clone_transform(msg.state),
+                receiver_epoch,
+            );
+            if (
+                !source_request_is_current()
+                || (msg.intent === 'restore' && !receiver_is_current())
+            ) return;
 
             if (result.indices) {
                 this.transform_indices.set(msg.sheetIndex, result.indices);
@@ -278,9 +449,12 @@ export class ViewerPanelCore {
                 generation: this._generation,
                 sourceGeneration: this._source_generation,
                 intent: msg.intent,
-            });
+            }, receiver_epoch);
         } catch (error) {
-            if (is_cancelled()) {
+            if (
+                !source_request_is_current()
+                || (msg.intent === 'restore' && !receiver_is_current())
+            ) {
                 return;
             }
             const previous = this.transform_states.get(msg.sheetIndex)
@@ -297,9 +471,9 @@ export class ViewerPanelCore {
                 sourceGeneration: this._source_generation,
                 intent: msg.intent,
                 error: error instanceof Error ? error.message : String(error),
-            });
+            }, receiver_epoch);
         } finally {
-            if (this.transform_sequences.get(msg.sheetIndex) === sequence) {
+            if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                 this.transforms_in_flight.delete(msg.sheetIndex);
             }
         }
@@ -318,6 +492,7 @@ export class ViewerPanelCore {
         msg: SetTransformMessage,
         natural_row_count: number,
         error: string,
+        receiver_epoch = this.receiver_epoch,
     ): Promise<boolean> {
         const previous = this.transform_states.get(msg.sheetIndex)
             ?? EMPTY_TRANSFORM;
@@ -332,7 +507,7 @@ export class ViewerPanelCore {
             sourceGeneration: this._source_generation,
             intent: msg.intent,
             error,
-        });
+        }, receiver_epoch);
     }
 
     private async handle_row_request(
@@ -391,8 +566,11 @@ export class ViewerPanelCore {
         }
     }
 
-    private post(message: HostMessage): Promise<boolean> {
-        if (this.disposed) return Promise.resolve(false);
+    private post(message: HostMessage, receiver_epoch?: number): Promise<boolean> {
+        if (
+            this.disposed
+            || (receiver_epoch !== undefined && receiver_epoch !== this.receiver_epoch)
+        ) return Promise.resolve(false);
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
 }
@@ -440,6 +618,12 @@ export function adopt_source_into_core(
 }
 
 function transform_states_equal(left: SheetTransformState, right: SheetTransformState): boolean {
+    if (
+        left.sort.length === 0
+        && left.filters.length === 0
+        && right.sort.length === 0
+        && right.filters.length === 0
+    ) return true;
     return left.schema === right.schema
         && left.sort.length === right.sort.length
         && left.sort.every((key, index) => (

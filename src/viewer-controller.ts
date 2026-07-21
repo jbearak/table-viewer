@@ -43,7 +43,12 @@ import { SourceCandidate } from './source-candidate';
 import {
     sanitize_excel_header_overrides,
     transform_has_entries,
+    transform_is_active,
     transform_schema_for_sheet,
+    type ActiveCsvSaveLifecycle,
+    type CsvSaveLifecycle,
+    type CsvSaveOperation,
+    type HostMessage,
     type PerFileState,
     type SheetTransformState,
     type WebviewMessage,
@@ -89,7 +94,9 @@ export interface ViewerProfile {
 
 type CsvEditFilePhase =
     | { type: 'free' }
+    | { type: 'claiming'; claim: symbol; token: symbol }
     | { type: 'owned'; token: symbol }
+    | { type: 'releasing'; release: symbol; token: symbol }
     | { type: 'cleanupPending'; operation: symbol }
     | { type: 'uncertain'; operation: symbol };
 
@@ -98,6 +105,15 @@ type CsvEditStateSubscriber = (snapshot?: Readonly<FileStateSnapshot>) => void;
 interface CsvEditFileState {
     attachments: number;
     phase: CsvEditFilePhase;
+    /** Synchronously admitted transform work across every panel for this file. */
+    readonly transformOperations: Set<symbol>;
+    /** Panels whose current core has an active row transform installed. */
+    readonly activeTransformPanels: Set<symbol>;
+    /** Latest observed durable transform authority, ordered by file-state revision. */
+    durableTransform: { revision: number; active: boolean };
+    /** Failed operation retired by a session transition until its state is removed. */
+    failedSaveTombstone?: CsvSaveOperation;
+    failedSaveCleanup?: Promise<void>;
     /** State revisions at or below this boundary predate a completed edit clear. */
     clearedStateRevision?: number;
     recovery?: Promise<boolean>;
@@ -108,10 +124,18 @@ interface CsvEditFileState {
 // particular, releasing one panel after a successful write must not allow a
 // sibling panel to reclaim durable edits that have not yet been cleared.
 const csv_edit_file_states = new Map<string, CsvEditFileState>();
+let next_edit_session_host_epoch = 0;
+
+function allocate_edit_session_id(file_key: string): string {
+    next_edit_session_host_epoch += 1;
+    return `${file_key}:host:${next_edit_session_host_epoch}`;
+}
+
 const RELOAD_RETRY_COUNT = 3;
 const RELOAD_RETRY_MS = 50;
 const READY_STATE_RETRY_COUNT = 3;
 const READY_STATE_RETRY_MS = 50;
+const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
 
 function content_digest(bytes: Uint8Array): string {
@@ -129,9 +153,26 @@ interface PanelLoadRequest {
     readonly refreshEvent?: FileRefreshEvent;
 }
 
+interface CsvSaveHostOperation {
+    readonly identity: CsvSaveOperation;
+    phase: 'preparing' | 'accepted' | 'writing';
+}
+
+interface TransformAuthority {
+    readonly authorityRevision: number;
+    readonly receiverEpoch: number;
+    readonly completion: Promise<void>;
+    readonly resolveCompletion: () => void;
+}
+
+interface ReceiverRequest {
+    readonly requestId: string;
+    readonly receiverEpoch: number;
+}
+
 function same_snapshot_identity(
-    left: Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity'],
-    right: Extract<WebviewMessage, { type: 'stateChanged' }>['snapshotIdentity'],
+    left: WorkbookSnapshotIdentity,
+    right: WorkbookSnapshotIdentity,
 ): boolean {
     return left.deliveryId === right.deliveryId
         && left.authority.fileId === right.authority.fileId
@@ -226,6 +267,9 @@ export function attach_viewer(
     profile: ViewerProfile,
 ): vscode.Disposable {
     const file_path = uri.fsPath;
+    // VS Code may make panel.webview throw as soon as the panel is disposed.
+    // Capture the live transport once; every later post is liveness-gated below.
+    const webview = panel.webview;
     const disposables: vscode.Disposable[] = [];
     const durable_state_store = state_store;
     const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
@@ -238,6 +282,9 @@ export function attach_viewer(
         file_edit_state = {
             attachments: 0,
             phase: { type: 'free' },
+            transformOperations: new Set(),
+            activeTransformPanels: new Set(),
+            durableTransform: { revision: -1, active: false },
             subscribers: new Set(),
         };
         csv_edit_file_states.set(file_key, file_edit_state);
@@ -249,13 +296,32 @@ export function attach_viewer(
     let core: ViewerPanelCore | undefined;
     let source: DataSource | undefined;
     let source_authority = file_coordinator.authority();
-    const transform_authorities = new Map<string, number>();
+    const transform_authorities = new Map<
+        Extract<WebviewMessage, { type: 'setTransform' }>,
+        TransformAuthority
+    >();
+    const latest_transform_authority_by_sheet = new Map<number, TransformAuthority>();
+    const transform_commit_barriers = new Set<TransformAuthority>();
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
-    let save_command_pending = false;
-    let save_write_pending = false;
+    let active_save_operation: CsvSaveHostOperation | undefined;
+    let save_lifecycle: CsvSaveLifecycle = Object.freeze({
+        revision: 0,
+        state: 'idle',
+    });
+    let active_edit_session_request: ReceiverRequest | undefined;
+    let active_edit_claim: symbol | undefined;
+    let active_save_dialog_request: (ReceiverRequest & {
+        readonly editSessionId: string;
+    }) | undefined;
     let pending_edit_writes: Promise<void> = Promise.resolve();
+    const pending_edit_admissions = new Set<symbol>();
+    let active_edit_release: {
+        readonly editSessionId: string;
+        readonly release: symbol;
+        readonly completion: Promise<void>;
+    } | undefined;
     let layout_write_tail: Promise<void> = Promise.resolve();
     let layout_basis: {
         identity: WorkbookSnapshotIdentity;
@@ -277,7 +343,7 @@ export function attach_viewer(
     }>();
     let current_edit_cleanup_waiter: symbol | undefined;
     const edit_session_token = Symbol(file_key);
-    let next_edit_session_epoch = 1;
+    const transform_panel_token = Symbol(file_key);
     let active_edit_session_id: string | undefined;
     const excel_header_subscriber_token = Symbol(file_key);
     const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
@@ -286,8 +352,24 @@ export function attach_viewer(
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
 
+    function post_to_receiver(
+        message: HostMessage,
+        receiver_epoch?: number,
+    ): Promise<boolean> {
+        if (
+            disposed
+            || (receiver_epoch !== undefined
+                && receiver_epoch !== session.current_receiver_epoch)
+        ) return Promise.resolve(false);
+        try {
+            return Promise.resolve(webview.postMessage(message)).catch(() => false);
+        } catch {
+            return Promise.resolve(false);
+        }
+    }
+
     const session = new PanelSession({
-        postMessage: (message) => panel.webview.postMessage(message),
+        postMessage: (message) => post_to_receiver(message),
         onNeedsResyncSource: () => { void refresh_panel_source(true); },
         onCurrentAdoptionAcknowledged: (adoption) => {
             if (disposed || session.current_adoption() !== adoption) return;
@@ -342,6 +424,9 @@ export function attach_viewer(
                 // Preserve the setup failure while completing best-effort teardown.
             }
         };
+        cleanup(() => {
+            file_edit_state?.activeTransformPanels.delete(transform_panel_token);
+        });
         cleanup(() => session.dispose());
         for (const disposable of [...disposables].reverse()) {
             cleanup(() => disposable.dispose());
@@ -349,10 +434,7 @@ export function attach_viewer(
         cleanup(() => file_coordinator.dispose());
         if (file_edit_state) {
             file_edit_state.attachments = Math.max(0, file_edit_state.attachments - 1);
-            if (
-                file_edit_state.attachments === 0
-                && file_edit_state.phase.type === 'free'
-            ) csv_edit_file_states.delete(file_key);
+            delete_shared_edit_state_if_unused();
         }
         throw error;
     };
@@ -394,10 +476,133 @@ export function attach_viewer(
         return phase.type === 'cleanupPending' || phase.type === 'uncertain';
     }
 
+    function transform_blocks_editing(): boolean {
+        return !!file_edit_state && (
+            file_edit_state.transformOperations.size > 0
+            || file_edit_state.activeTransformPanels.size > 0
+            || file_edit_state.durableTransform.active
+        );
+    }
+
     function editing_available_for_panel(): boolean {
         const phase = edit_phase();
-        return phase.type === 'free'
-            || (phase.type === 'owned' && phase.token === edit_session_token);
+        return !transform_blocks_editing() && (
+            phase.type === 'free'
+            || (phase.type === 'owned' && phase.token === edit_session_token)
+        );
+    }
+
+    function shared_edit_state_is_unused(): boolean {
+        return !!file_edit_state
+            && file_edit_state.attachments === 0
+            && file_edit_state.phase.type === 'free'
+            && file_edit_state.transformOperations.size === 0
+            && file_edit_state.activeTransformPanels.size === 0
+            && file_edit_state.failedSaveTombstone === undefined
+            && file_edit_state.failedSaveCleanup === undefined
+            && file_edit_state.recovery === undefined;
+    }
+
+    function delete_shared_edit_state_if_unused(): void {
+        if (shared_edit_state_is_unused()) csv_edit_file_states.delete(file_key);
+    }
+
+    function observe_durable_transform(snapshot: Readonly<FileStateSnapshot>): void {
+        if (
+            !file_edit_state
+            || snapshot.revision < file_edit_state.durableTransform.revision
+        ) return;
+        const state = snapshot.state as PerFileState;
+        file_edit_state.durableTransform = {
+            revision: snapshot.revision,
+            active: state.transforms?.some(transform_is_active) ?? false,
+        };
+    }
+
+    function sync_active_transform_panel(): void {
+        if (!file_edit_state) return;
+        if (core?.has_active_transform) {
+            file_edit_state.activeTransformPanels.add(transform_panel_token);
+        } else {
+            file_edit_state.activeTransformPanels.delete(transform_panel_token);
+        }
+    }
+
+    function begin_transform_admission(): symbol | undefined {
+        if (!file_edit_state) return Symbol(file_key);
+        if (file_edit_state.phase.type !== 'free') return undefined;
+        const operation = Symbol(file_key);
+        file_edit_state.transformOperations.add(operation);
+        return operation;
+    }
+
+    function finish_transform_admission(operation: symbol): void {
+        if (!file_edit_state) return;
+        sync_active_transform_panel();
+        file_edit_state.transformOperations.delete(operation);
+        delete_shared_edit_state_if_unused();
+    }
+
+    function projected_save_lifecycle(): CsvSaveLifecycle {
+        return save_lifecycle;
+    }
+
+    function begin_save_lifecycle(
+        operation: CsvSaveOperation,
+    ): ActiveCsvSaveLifecycle {
+        const lifecycle = Object.freeze<ActiveCsvSaveLifecycle>({
+            revision: save_lifecycle.revision + 1,
+            state: 'active',
+            operation,
+        });
+        save_lifecycle = lifecycle;
+        recapture_edit_capabilities();
+        return lifecycle;
+    }
+
+    function finish_save_lifecycle(
+        operation: CsvSaveOperation,
+        state: 'failed',
+    ): Extract<CsvSaveLifecycle, { state: 'failed' }>;
+    function finish_save_lifecycle(
+        operation: CsvSaveOperation,
+        state: 'succeeded',
+    ): Extract<CsvSaveLifecycle, { state: 'succeeded' }>;
+    function finish_save_lifecycle(
+        operation: CsvSaveOperation,
+        state: 'failed' | 'succeeded',
+    ): Extract<CsvSaveLifecycle, { state: 'failed' | 'succeeded' }> {
+        const lifecycle = Object.freeze({
+            revision: save_lifecycle.revision + 1,
+            state,
+            operation,
+        });
+        save_lifecycle = lifecycle;
+        recapture_edit_capabilities();
+        return lifecycle;
+    }
+
+    function retire_save_lifecycle(
+        edit_session_id?: string,
+        terminal_state?: 'failed' | 'succeeded',
+    ): boolean {
+        if (save_lifecycle.state === 'idle' || save_lifecycle.state === 'active') {
+            return false;
+        }
+        if (
+            terminal_state !== undefined
+            && save_lifecycle.state !== terminal_state
+        ) return false;
+        if (
+            edit_session_id !== undefined
+            && save_lifecycle.operation.editSessionId !== edit_session_id
+        ) return false;
+        save_lifecycle = Object.freeze({
+            revision: save_lifecycle.revision + 1,
+            state: 'idle',
+        });
+        recapture_edit_capabilities();
+        return true;
     }
 
     function notify_edit_state(snapshot?: Readonly<FileStateSnapshot>): void {
@@ -416,35 +621,162 @@ export function attach_viewer(
         return phase.type === 'owned' && phase.token === edit_session_token;
     }
 
-    function try_claim_edit_session(notify = true): boolean {
-        if (!file_edit_state) return false;
+    function save_operation_is_current(operation: CsvSaveHostOperation): boolean {
+        return active_save_operation === operation
+            && edit_message_is_current(operation.identity.editSessionId);
+    }
+
+    function recapture_edit_capabilities(deliver = false): void {
+        session.recapture_current_projection({ deliver });
+    }
+
+    function reserve_edit_claim(): symbol | undefined {
+        if (!file_edit_state || transform_blocks_editing()) return undefined;
+        const phase = file_edit_state.phase;
+        if (phase.type === 'owned' && phase.token === edit_session_token) {
+            return undefined;
+        }
+        if (phase.type !== 'free') return undefined;
+        const claim = Symbol(file_key);
+        file_edit_state.phase = {
+            type: 'claiming',
+            claim,
+            token: edit_session_token,
+        };
+        active_edit_claim = claim;
+        notify_edit_state();
+        return claim;
+    }
+
+    function cancel_edit_claim(claim: symbol | undefined): void {
+        if (!file_edit_state || claim === undefined) return;
+        const phase = file_edit_state.phase;
+        if (phase.type !== 'claiming' || phase.claim !== claim) return;
+        if (active_edit_claim === claim) active_edit_claim = undefined;
+        file_edit_state.phase = { type: 'free' };
+        notify_edit_state();
+        delete_shared_edit_state_if_unused();
+    }
+
+    function try_claim_edit_session(
+        notify = true,
+        claim?: symbol,
+    ): boolean {
+        if (!file_edit_state || transform_blocks_editing()) return false;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned') {
             if (phase.token !== edit_session_token) return false;
-            active_edit_session_id ??= `${file_key}:${next_edit_session_epoch++}`;
+            active_edit_session_id ??= allocate_edit_session_id(file_key);
             return true;
         }
-        if (phase.type !== 'free') return false;
-        active_edit_session_id = `${file_key}:${next_edit_session_epoch++}`;
+        if (
+            phase.type === 'claiming'
+            && claim !== undefined
+            && phase.claim === claim
+            && phase.token === edit_session_token
+        ) {
+            if (active_edit_claim === claim) active_edit_claim = undefined;
+            active_edit_session_id = allocate_edit_session_id(file_key);
+            file_edit_state.phase = { type: 'owned', token: edit_session_token };
+            if (notify) notify_edit_state();
+            return true;
+        }
+        if (phase.type !== 'free' || claim !== undefined) return false;
+        retire_save_lifecycle(undefined);
+        active_edit_session_id = allocate_edit_session_id(file_key);
         file_edit_state.phase = { type: 'owned', token: edit_session_token };
         if (notify) notify_edit_state();
         return true;
     }
 
-    function release_edit_session(): void {
-        if (save_write_pending) return;
-        if (file_edit_state && owns_edit_session()) {
-            active_edit_session_id = undefined;
-            file_edit_state.phase = { type: 'free' };
-            notify_edit_state();
+    function release_edit_session(
+        edit_session_id = active_edit_session_id,
+    ): Promise<void> {
+        if (!edit_session_id || !file_edit_state) return Promise.resolve();
+        if (
+            active_edit_release
+            && active_edit_release.editSessionId === edit_session_id
+        ) return active_edit_release.completion;
+        if (!edit_message_is_current(edit_session_id)) return Promise.resolve();
+
+        const save_operation = active_save_operation;
+        if (
+            save_operation
+            && save_operation.identity.editSessionId === edit_session_id
+        ) {
+            if (save_operation.phase === 'writing') return Promise.resolve();
+            active_save_operation = undefined;
+            const lifecycle = finish_save_lifecycle(save_operation.identity, 'failed');
+            if (!disposed) {
+                void post_to_receiver({
+                    type: 'saveResult',
+                    success: false,
+                    lifecycle,
+                });
+            }
         }
+        if (
+            save_lifecycle.state === 'failed'
+            && save_lifecycle.operation.editSessionId === edit_session_id
+        ) {
+            file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+            retire_save_lifecycle(edit_session_id, 'failed');
+        }
+
+        // Fence later messages synchronously, but retain the exact session/token
+        // authority needed by every pending-edit write admitted before this boundary.
+        const release = Symbol(file_key);
+        file_edit_state.phase = {
+            type: 'releasing',
+            release,
+            token: edit_session_token,
+        };
+        notify_edit_state();
+        const admitted_writes = pending_edit_writes;
+        const completion = (async () => {
+            try {
+                await admitted_writes;
+            } catch (error) {
+                console.error('Failed to settle admitted CSV edits before release', error);
+            } finally {
+                if (
+                    file_edit_state?.phase.type === 'releasing'
+                    && file_edit_state.phase.release === release
+                    && active_edit_session_id === edit_session_id
+                ) {
+                    active_edit_session_id = undefined;
+                    file_edit_state.phase = { type: 'free' };
+                    notify_edit_state();
+                    void ensure_failed_save_cleanup();
+                    delete_shared_edit_state_if_unused();
+                }
+                if (active_edit_release?.release === release) {
+                    active_edit_release = undefined;
+                }
+            }
+        })();
+        active_edit_release = { editSessionId: edit_session_id, release, completion };
+        return completion;
     }
 
-    function begin_edit_cleanup(): symbol | undefined {
-        if (!file_edit_state || !owns_edit_session()) return undefined;
+    function begin_edit_cleanup(
+        edit_session_id: string,
+        save_operation?: CsvSaveHostOperation,
+    ): symbol | undefined {
+        if (
+            !file_edit_state
+            || !edit_message_is_current(edit_session_id)
+            || (save_operation !== undefined && (
+                active_save_operation !== save_operation
+                || save_operation.phase !== 'writing'
+            ))
+        ) return undefined;
+        if (save_operation === undefined && active_save_operation) return undefined;
         const operation = Symbol(file_key);
+        active_save_operation = undefined;
         active_edit_session_id = undefined;
         file_edit_state.phase = { type: 'cleanupPending', operation };
+        recapture_edit_capabilities();
         return operation;
     }
 
@@ -463,15 +795,87 @@ export function attach_viewer(
             ? { type: 'free' }
             : { type: 'uncertain', operation };
         if (success && cleared_snapshot !== undefined) {
+            observe_durable_transform(cleared_snapshot);
             file_edit_state.clearedStateRevision = Math.max(
                 file_edit_state.clearedStateRevision ?? -1,
                 cleared_snapshot.revision,
             );
+            retire_save_lifecycle(undefined, 'succeeded');
         }
         notify_edit_state(cleared_snapshot);
-        if (success && file_edit_state.attachments === 0) {
-            csv_edit_file_states.delete(file_key);
+        if (success) delete_shared_edit_state_if_unused();
+    }
+
+    function strip_operation_owned_pending_edits(
+        pending_edits: PerFileState['pendingEdits'],
+        operation: CsvSaveOperation,
+    ): PerFileState['pendingEdits'] {
+        if (!pending_edits) return undefined;
+        const retained = Object.fromEntries(
+            Object.entries(pending_edits).filter(([key, pending]) => {
+                const owned = operation.dirtyEdits[key];
+                if (!owned) return true;
+                return typeof pending === 'string'
+                    ? pending !== owned.value
+                    : pending.value !== owned.value || pending.base !== owned.base;
+            }),
+        );
+        return Object.keys(retained).length > 0 ? retained : undefined;
+    }
+
+    function pending_edits_for_current_session(
+        pending_edits: PerFileState['pendingEdits'],
+    ): PerFileState['pendingEdits'] {
+        let projected = pending_edits;
+        if (save_lifecycle.state !== 'idle') {
+            if (
+                save_lifecycle.state !== 'succeeded'
+                && save_lifecycle.operation.editSessionId === active_edit_session_id
+            ) return projected;
+            projected = strip_operation_owned_pending_edits(
+                projected,
+                save_lifecycle.operation,
+            );
         }
+        const tombstone = file_edit_state?.failedSaveTombstone;
+        if (tombstone && tombstone.editSessionId !== active_edit_session_id) {
+            projected = strip_operation_owned_pending_edits(projected, tombstone);
+        }
+        return projected;
+    }
+
+    function ensure_failed_save_cleanup(): Promise<void> {
+        if (!file_edit_state?.failedSaveTombstone) return Promise.resolve();
+        if (file_edit_state.failedSaveCleanup) return file_edit_state.failedSaveCleanup;
+        const operation = file_edit_state.failedSaveTombstone;
+        let cleanup!: Promise<void>;
+        cleanup = (async () => {
+            try {
+                const committed = await update_file_state((current) => {
+                    const pending_edits = strip_operation_owned_pending_edits(
+                        current.pendingEdits,
+                        operation,
+                    );
+                    if (pending_edits === current.pendingEdits) return current;
+                    if (pending_edits) return { ...current, pendingEdits: pending_edits };
+                    const { pendingEdits: _drop, ...rest } = current;
+                    return rest;
+                });
+                if (file_edit_state?.failedSaveTombstone === operation) {
+                    file_edit_state.failedSaveTombstone = undefined;
+                }
+                if (committed) notify_edit_state(committed);
+            } catch (error) {
+                console.error('Failed to clear retired CSV save state', error);
+            } finally {
+                if (file_edit_state?.failedSaveCleanup === cleanup) {
+                    file_edit_state.failedSaveCleanup = undefined;
+                    delete_shared_edit_state_if_unused();
+                }
+            }
+        })();
+        file_edit_state.failedSaveCleanup = cleanup;
+        return cleanup;
     }
 
     /** Project durable state for this panel without mutating shared authority. */
@@ -479,6 +883,7 @@ export function attach_viewer(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): FileStateSnapshot {
+        observe_durable_transform(snapshot);
         const state = snapshot.state as PerFileState;
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
@@ -491,7 +896,18 @@ export function attach_viewer(
             && profile.editing
             && (owns_edit_session() || (allow_claim && try_claim_edit_session(false)))
         ) {
-            return { revision: snapshot.revision, state };
+            const pending_edits = pending_edits_for_current_session(state.pendingEdits);
+            if (pending_edits === state.pendingEdits) {
+                return { revision: snapshot.revision, state };
+            }
+            if (pending_edits) {
+                return {
+                    revision: snapshot.revision,
+                    state: { ...state, pendingEdits: pending_edits },
+                };
+            }
+            const { pendingEdits: _drop, ...rest } = state;
+            return { revision: snapshot.revision, state: rest };
         }
         const { pendingEdits: _drop, ...rest } = state;
         return { revision: snapshot.revision, state: rest };
@@ -500,8 +916,9 @@ export function attach_viewer(
     function update_session_state_material(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
-    ): void {
-        session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
+    ): boolean {
+        observe_durable_transform(snapshot);
+        return session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
     }
 
     async function refresh_session_state_material(
@@ -515,6 +932,7 @@ export function attach_viewer(
     async function read_file_state(touch = true): Promise<FileStateSnapshot> {
         await file_coordinator.state_ready();
         const snapshot = await state_store.read(state_path);
+        observe_durable_transform(snapshot);
         if (touch) await state_store.touch(state_path);
         return snapshot;
     }
@@ -524,8 +942,9 @@ export function attach_viewer(
         sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
         validate?: () => boolean,
     ): Promise<FileStateSnapshot | undefined> {
-        let snapshot = await read_file_state();
+        let snapshot = await read_file_state(false);
         for (;;) {
+            if (validate && !validate()) return undefined;
             const current = normalize_host_state(snapshot.state, sheet_names);
             const next = updater(current);
             if (next === current) return undefined;
@@ -536,9 +955,11 @@ export function attach_viewer(
                 validate,
             );
             if (result.type === 'committed') {
+                observe_durable_transform(result.snapshot);
                 if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
+            if (validate && !validate()) return undefined;
             snapshot = result.snapshot;
         }
     }
@@ -645,19 +1066,24 @@ export function attach_viewer(
 
     type EditStateWriteResult =
         | { type: 'committed'; snapshot: FileStateSnapshot }
-        | { type: 'unchanged' }
+        | { type: 'unchanged'; snapshot: FileStateSnapshot }
         | { type: 'aborted' };
 
     async function update_edit_session_state(
         edit_session_id: string,
+        admission: symbol,
         updater: (current: PerFileState) => PerFileState,
     ): Promise<EditStateWriteResult> {
-        const is_current = () => (
-            !disposed
-            && edit_message_is_current(edit_session_id)
-            && edit_phase().type === 'owned'
-        );
-        let snapshot = await read_file_state();
+        const is_current = () => {
+            if (
+                active_edit_session_id !== edit_session_id
+                || !pending_edit_admissions.has(admission)
+            ) return false;
+            const phase = edit_phase();
+            return (phase.type === 'owned' || phase.type === 'releasing')
+                && phase.token === edit_session_token;
+        };
+        let snapshot = await read_file_state(false);
         for (;;) {
             if (!is_current()) return { type: 'aborted' };
             const current = normalize_host_state(
@@ -665,7 +1091,10 @@ export function attach_viewer(
                 source?.meta().sheets.map((sheet) => sheet.name) ?? [],
             );
             const next = updater(current);
-            if (next === current) return { type: 'unchanged' };
+            if (next === current) {
+                if (!disposed) update_session_state_material(snapshot);
+                return { type: 'unchanged', snapshot };
+            }
             const result = await state_store.compare_and_set(
                 state_path,
                 snapshot.revision,
@@ -673,7 +1102,8 @@ export function attach_viewer(
                 is_current,
             );
             if (result.type === 'committed') {
-                if (is_current()) update_session_state_material(result.snapshot);
+                observe_durable_transform(result.snapshot);
+                if (!disposed && is_current()) update_session_state_material(result.snapshot);
                 return { type: 'committed', snapshot: result.snapshot };
             }
             if (!is_current()) return { type: 'aborted' };
@@ -681,45 +1111,104 @@ export function attach_viewer(
         }
     }
 
+    function transform_authority_is_current(
+        message: Extract<WebviewMessage, { type: 'setTransform' }>,
+        authority: TransformAuthority,
+    ): boolean {
+        return !disposed
+            && session.current_receiver_epoch === authority.receiverEpoch
+            && transform_authorities.get(message) === authority
+            && latest_transform_authority_by_sheet.get(message.sheetIndex) === authority
+            && file_coordinator.state_write_is_current(authority.authorityRevision)
+            && source_authority.authorityRevision === authority.authorityRevision
+            && message.sourceGeneration === core?.source_generation;
+    }
+
+    async function reconcile_transform_terminal(
+        message: Extract<WebviewMessage, { type: 'setTransform' }>,
+        authority: TransformAuthority,
+    ): Promise<void> {
+        for (let attempt = 0; attempt < READY_STATE_REBASE_COUNT; attempt += 1) {
+            if (!transform_authority_is_current(message, authority)) return;
+            const reconciliation_core = core;
+            const reconciliation_adoption = session.current_adoption();
+            if (!reconciliation_core || !reconciliation_adoption) return;
+            const source_generation = reconciliation_core.source_generation;
+            const snapshot = await read_file_state(false);
+            if (!transform_authority_is_current(message, authority)) return;
+            const sheets = reconciliation_core.snapshot_material().core.meta.sheets;
+            const durable = normalize_host_state(
+                snapshot.state,
+                sheets.map((sheet) => sheet.name),
+            );
+            const transforms = sheets.map((sheet, index) => sanitize_transform_state(
+                durable.transforms?.[index],
+                sheet.columnCount,
+                transform_schema_for_sheet(sheet),
+            ));
+            const prepared = await reconciliation_core.prepare_transform_reconciliation(
+                transforms,
+                () => !transform_authority_is_current(message, authority)
+                    || core !== reconciliation_core
+                    || session.current_adoption() !== reconciliation_adoption
+                    || reconciliation_core.source_generation !== source_generation,
+            );
+            if (!prepared) return;
+            const confirmed = await read_file_state(false);
+            if (!transform_authority_is_current(message, authority)) return;
+            if (confirmed.revision !== snapshot.revision) continue;
+            if (
+                core !== reconciliation_core
+                || session.current_adoption() !== reconciliation_adoption
+                || reconciliation_core.source_generation !== source_generation
+            ) continue;
+            update_session_state_material(confirmed, false);
+            const generation = reconciliation_core.generation;
+            if (!reconciliation_core.commit_transform_reconciliation(prepared)) continue;
+            sync_active_transform_panel();
+            if (reconciliation_core.generation !== generation) {
+                session.recapture_current_projection({ deliver: true });
+            }
+            return;
+        }
+        console.error('Failed to reconcile durable table transforms after a terminal operation');
+    }
+
     async function persist_transform_commit(
         message: Extract<WebviewMessage, { type: 'setTransform' }>,
         state: SheetTransformState,
+        receiver_epoch: number,
     ): Promise<void> {
         // Restores merely recompute host-owned preferences. Only explicit user
         // actions can replace those preferences, and the core awaits this write
         // before posting its terminal acknowledgement.
         if (message.intent === 'restore') return;
-        const expected_authority = transform_authorities.get(message.requestId);
-        if (expected_authority === undefined) return;
+        const authority = transform_authorities.get(message);
+        if (!authority || authority.receiverEpoch !== receiver_epoch) return;
+        const transform_is_current_before_commit = () =>
+            authority.receiverEpoch === receiver_epoch
+            && transform_authority_is_current(message, authority);
+        transform_commit_barriers.add(authority);
         const committed = await update_file_state((current) => {
             const sheet = source?.meta().sheets[message.sheetIndex];
-                if (
-                    disposed
-                    || !core
-                    || !file_coordinator.state_write_is_current(expected_authority)
-                    || source_authority.authorityRevision !== expected_authority
-                    || message.sourceGeneration !== core.source_generation
-                    || !sheet
-                    || (transform_has_entries(state)
-                        && state.schema !== transform_schema_for_sheet(sheet))
-                ) {
-                    return current;
+            if (
+                !transform_is_current_before_commit()
+                || !sheet
+                || (transform_has_entries(state)
+                    && state.schema !== transform_schema_for_sheet(sheet))
+            ) {
+                return current;
+            }
+            const transforms = [...(current.transforms ?? [])];
+            transforms[message.sheetIndex] = transform_has_entries(state)
+                ? {
+                    ...state,
+                    sort: state.sort.map((key) => ({ ...key })),
+                    filters: state.filters.map((entry) => ({ ...entry })),
                 }
-                const transforms = [...(current.transforms ?? [])];
-                transforms[message.sheetIndex] = transform_has_entries(state)
-                    ? {
-                        ...state,
-                        sort: state.sort.map((key) => ({ ...key })),
-                        filters: state.filters.map((entry) => ({ ...entry })),
-                    }
-                    : undefined;
+                : undefined;
             return { ...current, transforms };
-        }, undefined, () => (
-            !disposed
-            && file_coordinator.state_write_is_current(expected_authority)
-            && source_authority.authorityRevision === expected_authority
-            && message.sourceGeneration === core?.source_generation
-        ));
+        }, undefined, transform_is_current_before_commit);
         if (!committed) {
             throw new Error('The source changed before this sort/filter could be saved.');
         }
@@ -1025,6 +1514,7 @@ export function attach_viewer(
                 next,
                 { onTransformCommit: persist_transform_commit },
                 (installed) => {
+                    installed.begin_receiver_epoch(session.current_receiver_epoch);
                     const material = installed.snapshot_material();
                     const adoption_state = project_state_for_panel(
                         projected_state ?? committed.receipt.stateSnapshot,
@@ -1049,6 +1539,7 @@ export function attach_viewer(
                                 csvEditable: profile.editing
                                     && editing_available_for_panel()
                                     && !next.truncationMessage,
+                                csvSaveLifecycle: projected_save_lifecycle(),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
@@ -1059,6 +1550,7 @@ export function attach_viewer(
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
+                    sync_active_transform_panel();
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
                         adopted = next;
@@ -1182,6 +1674,7 @@ export function attach_viewer(
                                         csvEditable: profile.editing
                                             && editing_available_for_panel()
                                             && !source!.truncationMessage,
+                                        csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
                                             : {}),
@@ -1276,6 +1769,7 @@ export function attach_viewer(
             void recovery.finally(() => {
                 if (file_edit_state?.recovery === recovery) {
                     file_edit_state.recovery = undefined;
+                    delete_shared_edit_state_if_unused();
                 }
             });
         }
@@ -1656,6 +2150,11 @@ export function attach_viewer(
             && edit_session_id === active_edit_session_id;
     }
 
+    function receiver_request_is_current(request: ReceiverRequest): boolean {
+        return !disposed
+            && request.receiverEpoch === session.current_receiver_epoch;
+    }
+
     // A save/cleanup promise can outlive its panel: writing saves stay pinned to
     // completion after disposal so durable edit state is cleared correctly. Their
     // user-facing notifications, however, must be gated on liveness — popping a
@@ -1669,128 +2168,210 @@ export function attach_viewer(
         void vscode.window.showErrorMessage(message);
     }
 
-    async function handle_save(
-        edits: Record<string, string>,
-        edit_session_id: string,
-    ): Promise<void> {
-        if (!edit_message_is_current(edit_session_id) || save_command_pending) {
-            void panel.webview.postMessage({ type: 'saveResult', success: false });
+    function finish_save_failure(
+        operation: CsvSaveHostOperation,
+        warning?: string,
+        error?: unknown,
+    ): void {
+        if (!save_operation_is_current(operation)) return;
+        active_save_operation = undefined;
+        const lifecycle = finish_save_lifecycle(operation.identity, 'failed');
+        if (warning) show_owner_warning(warning);
+        if (error !== undefined) {
+            show_owner_error(
+                `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        void post_to_receiver({
+            type: 'saveResult',
+            success: false,
+            lifecycle,
+        });
+    }
+
+    function clone_save_operation(input: CsvSaveOperation): CsvSaveOperation {
+        const dirty_edits = Object.fromEntries(
+            Object.entries(input.dirtyEdits).map(([key, entry]) => [
+                key,
+                Object.freeze({ value: entry.value, base: entry.base }),
+            ]),
+        );
+        return Object.freeze({
+            editSessionId: input.editSessionId,
+            saveRequestId: input.saveRequestId,
+            edits: Object.freeze({ ...input.edits }),
+            dirtyEdits: Object.freeze(dirty_edits),
+        });
+    }
+
+    async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
+        const committed = await update_file_state((current) => ({
+            ...current,
+            pendingEdits: Object.fromEntries(
+                Object.entries(operation.identity.dirtyEdits).map(([key, entry]) => [
+                    key,
+                    { value: entry.value, base: entry.base },
+                ]),
+            ),
+        }), undefined, () => save_operation_is_current(operation));
+        if (!committed || !save_operation_is_current(operation)) {
+            throw new Error('The save operation changed before its edits were accepted.');
+        }
+        notify_edit_state(committed);
+    }
+
+    async function handle_save(input: CsvSaveOperation): Promise<void> {
+        const receiver_epoch = session.current_receiver_epoch;
+        const identity = clone_save_operation(input);
+        if (active_save_operation) return;
+        if (!edit_message_is_current(identity.editSessionId)) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            void post_to_receiver({
+                type: 'saveResult',
+                success: false,
+                lifecycle,
+            }, receiver_epoch);
             return;
         }
-        // Fence all later pending-edit messages synchronously, then settle every
-        // accepted pre-boundary persistence write before validating/serializing.
-        save_command_pending = true;
-        let content: string;
-        let post_save_reservation: { cancel(): void } | undefined;
-        try {
-            await pending_edit_writes;
-            const current_adoption = session.current_adoption();
-            const expected_digest = session.acknowledged_physical_digest();
-            const src = source;
-            if (
-                edit_cleanup_blocked()
-                || !profile.editing
-                || !owns_edit_session()
-                || !src
-                || !!src.truncationMessage
-                || expected_digest === undefined
-                || !session.acknowledged_current()
-                || current_adoption?.resources.source !== src
-                || current_adoption.resources.core !== core
-                || source_authority.authorityRevision
-                    !== file_coordinator.authority().authorityRevision
-            ) {
-                save_command_pending = false;
-                show_owner_warning(
-                    'The table view is still refreshing. Please try saving again.');
-                void panel.webview.postMessage({ type: 'saveResult', success: false });
-                return;
-            }
 
-            const acknowledged_source = src;
+        const current_adoption = session.current_adoption();
+        const expected_digest = session.acknowledged_physical_digest();
+        const src = source;
+        const expected_authority = source_authority.authorityRevision;
+        if (
+            edit_cleanup_blocked()
+            || !profile.editing
+            || !src
+            || !!src.truncationMessage
+            || expected_digest === undefined
+            || !session.acknowledged_current()
+            || current_adoption?.resources.source !== src
+            || current_adoption.resources.core !== core
+            || expected_authority !== file_coordinator.authority().authorityRevision
+        ) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            show_owner_warning(
+                'The table view is still refreshing. Please try saving again.',
+            );
+            void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
+
+        let content: string;
+        try {
             const SAVE_WINDOW = 10_000;
-            const row_count = acknowledged_source.meta().sheets[0].rowCount;
+            const row_count = src.meta().sheets[0].rowCount;
             function* row_windows(): Generator<(RenderedCell | null)[]> {
                 for (let start = 0; start < row_count; start += SAVE_WINDOW) {
-                    const { rows } = acknowledged_source.read_rows(0, start, SAVE_WINDOW);
+                    const { rows } = src!.read_rows(0, start, SAVE_WINDOW);
                     for (const row of rows) yield row;
                 }
             }
-            // Serialize only from the exact source/core adoption acknowledged by
-            // this panel. serialize_csv restores the promoted CSV header line.
             content = serialize_csv(
-                row_windows(), get_delimiter(file_path), edits,
-                acknowledged_source.originalColumnCounts,
-                acknowledged_source.lineEnding,
-                acknowledged_source.headerLine);
+                row_windows(),
+                get_delimiter(file_path),
+                identity.edits,
+                src.originalColumnCounts,
+                src.lineEnding,
+                src.headerLine,
+            );
+        } catch (error) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            show_owner_error(
+                `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
+
+        const operation: CsvSaveHostOperation = {
+            identity,
+            phase: 'preparing',
+        };
+        active_save_operation = operation;
+        const active_lifecycle = begin_save_lifecycle(identity);
+        void post_to_receiver({
+            type: 'saveOperationStarted',
+            lifecycle: active_lifecycle,
+        }, receiver_epoch);
+
+        let post_save_reservation: { cancel(): void } | undefined;
+        try {
+            await pending_edit_writes.catch(() => {});
+            if (!save_operation_is_current(operation)) return;
+            await persist_accepted_save(operation);
+            operation.phase = 'accepted';
 
             const current_stat = await vscode.workspace.fs.stat(uri);
+            if (!save_operation_is_current(operation)) return;
             const max_mib = get_max_file_size_mib();
             assert_safe_file_size(current_stat.size, max_mib);
+
             const current_raw = await vscode.workspace.fs.readFile(uri);
+            if (!save_operation_is_current(operation)) return;
             assert_safe_file_size(current_raw.byteLength, max_mib);
+
             const verified_stat = await vscode.workspace.fs.stat(uri);
+            if (!save_operation_is_current(operation)) return;
             const snapshot_changed = current_stat.mtime !== verified_stat.mtime
                 || current_stat.size !== verified_stat.size;
             if (
                 snapshot_changed
                 || content_digest(current_raw) !== expected_digest
-                || !owns_edit_session()
-                || !session.acknowledged_current()
-                || session.current_adoption() !== current_adoption
-                || current_adoption.resources.source !== src
-                || current_adoption.resources.core !== core
-                || source_authority.authorityRevision
-                    !== file_coordinator.authority().authorityRevision
+                || source_authority.authorityRevision !== expected_authority
+                || expected_authority !== file_coordinator.authority().authorityRevision
             ) {
                 show_owner_warning(
-                    'File was modified externally. Please review the changes and try again.');
-                // A conflict performs only panel-local forced recovery. The external
-                // editor's watcher event independently refreshes every attachment;
-                // no write occurred, so this must not create a postSave episode.
-                await refresh_panel_source(true, 'recovery');
-                save_command_pending = false;
-                void panel.webview.postMessage({ type: 'saveResult', success: false });
+                    'File was modified externally. Please review the changes and try again.',
+                );
+                // This remains the explicitly known pre-check/pre-write TOCTOU:
+                // watcher coordination does not close the final filesystem gap.
+                if (!disposed) await refresh_panel_source(true, 'recovery');
+                if (!save_operation_is_current(operation)) return;
+                finish_save_failure(operation);
                 return;
             }
 
-            // Hold a synchronously queued own-write watcher batch until the
-            // successful postSave request can absorb it into one canonical episode.
             post_save_reservation = refresh_subscription.reserve_post_save();
-            save_write_pending = true;
-            // Known limitation: an external writer can still win the interval after
-            // the final check and before/during writeFile. Phase 5.3 deliberately
-            // does not claim that watcher coordination closes this pre-write TOCTOU.
-            await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
+            operation.phase = 'writing';
+            // Once this call starts, release/discard/disposal cannot transfer the
+            // edit epoch until durable completion and cleanup ownership transfer.
+            await vscode.workspace.fs.writeFile(
+                uri,
+                new TextEncoder().encode(content),
+            );
         } catch (error) {
-            save_command_pending = false;
-            save_write_pending = false;
+            if (active_save_operation !== operation) return;
+            active_save_operation = undefined;
             post_save_reservation?.cancel();
+            const lifecycle = finish_save_lifecycle(identity, 'failed');
             if (disposed) {
-                release_edit_session();
-                if (
-                    file_edit_state
-                    && file_edit_state.attachments === 0
-                    && file_edit_state.phase.type === 'free'
-                ) {
-                    csv_edit_file_states.delete(file_key);
-                }
+                await release_edit_session(identity.editSessionId);
+                delete_shared_edit_state_if_unused();
+                return;
             }
             show_owner_error(
-                `Failed to save: ${error instanceof Error ? error.message : String(error)}`);
-            void panel.webview.postMessage({ type: 'saveResult', success: false });
+                `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            void post_to_receiver({
+                type: 'saveResult',
+                success: false,
+                lifecycle,
+            });
             return;
         }
 
-        save_write_pending = false;
-        // writeFile completed: atomically block all file attachments from claiming
-        // or projecting durable edits before reporting the irrevocable disk success.
-        let cleanup_operation = begin_edit_cleanup();
+        // writeFile completed: atomically prevent every attachment from claiming
+        // or projecting edits until the durable pending-state clear finishes.
+        const succeeded_lifecycle = finish_save_lifecycle(identity, 'succeeded');
+        let cleanup_operation = begin_edit_cleanup(identity.editSessionId, operation);
         if (!cleanup_operation) {
-            // The write still succeeded. This can only indicate an internal ownership
-            // invariant failure, so conservatively block the file and still attempt
-            // the durable cleanup.
             cleanup_operation = Symbol(file_key);
+            active_save_operation = undefined;
+            active_edit_session_id = undefined;
             if (file_edit_state) {
                 file_edit_state.phase = {
                     type: 'cleanupPending',
@@ -1799,24 +2380,25 @@ export function attach_viewer(
             }
             console.error('CSV save lost edit ownership after writeFile');
         }
-        // Exactly one terminal result is posted immediately, while GridShell is
-        // still mounted to clear its save-in-flight state. Neither durable-state
-        // cleanup nor the requesting panel's parser can emit a later failure.
-        void panel.webview.postMessage({ type: 'saveResult', success: true });
-        void panel.webview.postMessage({
+
+        void post_to_receiver({
+            type: 'saveResult',
+            success: true,
+            lifecycle: succeeded_lifecycle,
+        });
+        void post_to_receiver({
             type: 'editSessionRevoked',
             reason: 'saved',
+            lifecycle: succeeded_lifecycle,
         });
         notify_edit_state();
 
-        void refresh_subscription.request('postSave').then((refresh) => {
-            if (refresh.type === 'disposed') {
-                console.warn('CSV save refresh was skipped because the panel was disposed');
-            }
-        }).catch((error) => {
+        void refresh_subscription.request('postSave').catch((error) => {
+            if (disposed) return;
             console.error('Post-save refresh request failed (file was written)', error);
             show_owner_warning(
-                'The file was saved, but Table Viewer could not refresh the table view.');
+                'The file was saved, but Table Viewer could not refresh the table view.',
+            );
         });
 
         void clear_pending_edits().then((snapshot) => {
@@ -1824,14 +2406,16 @@ export function attach_viewer(
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
             finish_edit_cleanup(cleanup_operation, false);
+            if (disposed) return;
             console.error('CSV save succeeded but pending-edit cleanup failed', error);
             show_owner_warning(
-                'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.');
+                'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.',
+            );
         });
     }
 
     try {
-        disposables.push(panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
+        disposables.push(webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
         if (disposed) return;
         if (
             msg.type !== 'ready'
@@ -1843,20 +2427,182 @@ export function attach_viewer(
         switch (msg.type) {
             case 'ready': {
                 const begun = session.begin_ready();
-                if (begun.hasSource) {
-                    const state_snapshot = await read_state_for_ready_epoch(
-                        begun.receiverEpoch,
-                    );
-                    if (
-                        disposed
-                        || !session.ready_epoch_is_current(begun.receiverEpoch)
-                    ) return;
-                    if (state_snapshot) {
-                        update_session_state_material(state_snapshot, true);
+                // This must happen before the first await: an older receiver's
+                // compute or CAS continuation cannot overtake the new snapshot.
+                core?.begin_receiver_epoch(begun.receiverEpoch);
+                active_edit_session_request = undefined;
+                cancel_edit_claim(active_edit_claim);
+                active_save_dialog_request = undefined;
+                let needs_initial_source = false;
+                try {
+                    const older_commit_barriers = [...transform_commit_barriers]
+                        .filter((barrier) => barrier.receiverEpoch < begun.receiverEpoch)
+                        .map((barrier) => barrier.completion);
+                    if (older_commit_barriers.length > 0) {
+                        await Promise.allSettled(older_commit_barriers);
                     }
+                    let ready_rebases = 0;
+                    while (
+                        begun.hasSource
+                        && !disposed
+                        && session.ready_epoch_is_current(begun.receiverEpoch)
+                        && ready_rebases < READY_STATE_REBASE_COUNT
+                    ) {
+                        ready_rebases += 1;
+                        const ready_adoption = session.current_adoption();
+                        const ready_core = core;
+                        const ready_source_generation = ready_core?.source_generation;
+                        if (!ready_adoption || !ready_core) break;
+                        const state_snapshot = await read_state_for_ready_epoch(
+                            begun.receiverEpoch,
+                        );
+                        if (!state_snapshot) break;
+                        if (
+                            disposed
+                            || !session.ready_epoch_is_current(begun.receiverEpoch)
+                        ) break;
+                        if (
+                            session.current_adoption() !== ready_adoption
+                            || core !== ready_core
+                            || ready_core.source_generation !== ready_source_generation
+                        ) continue;
+
+                        const transform_admission = profile.editing
+                            ? begin_transform_admission()
+                            : Symbol(file_key);
+                        if (!transform_admission) {
+                            // Edit ownership intentionally keeps the installed view
+                            // natural, but ready must still cross a serialized revision
+                            // barrier before publishing its state material.
+                            const confirmed = await read_state_for_ready_epoch(
+                                begun.receiverEpoch,
+                            );
+                            if (!confirmed) break;
+                            if (
+                                disposed
+                                || !session.ready_epoch_is_current(begun.receiverEpoch)
+                                || session.current_adoption() !== ready_adoption
+                                || core !== ready_core
+                                || ready_core.source_generation !== ready_source_generation
+                            ) continue;
+                            if (confirmed.revision !== state_snapshot.revision) continue;
+                            update_session_state_material(confirmed, false);
+                            break;
+                        }
+                        let reconciled = false;
+                        try {
+                            const sheets = ready_core.snapshot_material().core.meta.sheets;
+                            const durable = normalize_host_state(
+                                state_snapshot.state,
+                                sheets.map((sheet) => sheet.name),
+                            );
+                            const transforms = sheets.map((sheet, index) => (
+                                sanitize_transform_state(
+                                    durable.transforms?.[index],
+                                    sheet.columnCount,
+                                    transform_schema_for_sheet(sheet),
+                                )
+                            ));
+                            const prepared = await ready_core.prepare_transform_reconciliation(
+                                transforms,
+                                () => disposed
+                                    || core !== ready_core
+                                    || session.current_adoption() !== ready_adoption
+                                    || !session.ready_epoch_is_current(
+                                        begun.receiverEpoch,
+                                    ),
+                            );
+                            if (!prepared) continue;
+                            const confirmed = await read_state_for_ready_epoch(
+                                begun.receiverEpoch,
+                            );
+                            if (!confirmed) break;
+                            if (confirmed.revision !== state_snapshot.revision) continue;
+                            if (
+                                file_edit_state
+                                && file_edit_state.durableTransform.revision
+                                    > confirmed.revision
+                            ) continue;
+                            if (
+                                disposed
+                                || !session.ready_epoch_is_current(begun.receiverEpoch)
+                                || session.current_adoption() !== ready_adoption
+                                || core !== ready_core
+                                || ready_core.source_generation !== ready_source_generation
+                            ) continue;
+                            if (!update_session_state_material(confirmed, false)) continue;
+                            reconciled = ready_core.commit_transform_reconciliation(prepared);
+                        } catch (error) {
+                            console.error(
+                                'Failed to reconcile table transforms before ready; using retained view',
+                                error,
+                            );
+                            let confirmed: FileStateSnapshot | undefined;
+                            try {
+                                confirmed = await read_state_for_ready_epoch(
+                                    begun.receiverEpoch,
+                                );
+                            } catch (confirmation_error) {
+                                console.error(
+                                    'Failed to confirm table state after ready reconciliation error',
+                                    confirmation_error,
+                                );
+                                continue;
+                            }
+                            if (!confirmed) break;
+                            if (confirmed.revision !== state_snapshot.revision) continue;
+                            if (
+                                disposed
+                                || !session.ready_epoch_is_current(begun.receiverEpoch)
+                                || session.current_adoption() !== ready_adoption
+                                || core !== ready_core
+                                || ready_core.source_generation !== ready_source_generation
+                            ) continue;
+                            update_session_state_material(confirmed, false);
+                            break;
+                        } finally {
+                            if (profile.editing) {
+                                finish_transform_admission(transform_admission);
+                            }
+                        }
+                        if (!reconciled) continue;
+                        update_session_state_material(state_snapshot, true);
+                        break;
+                    }
+                    if (
+                        ready_rebases >= READY_STATE_REBASE_COUNT
+                        && !disposed
+                        && session.ready_epoch_is_current(begun.receiverEpoch)
+                    ) {
+                        try {
+                            const latest = await read_state_for_ready_epoch(
+                                begun.receiverEpoch,
+                            );
+                            const confirmed = latest
+                                ? await read_state_for_ready_epoch(begun.receiverEpoch)
+                                : undefined;
+                            if (
+                                latest
+                                && confirmed
+                                && latest.revision === confirmed.revision
+                                && !disposed
+                                && session.ready_epoch_is_current(begun.receiverEpoch)
+                            ) update_session_state_material(confirmed, false);
+                        } catch (error) {
+                            console.error(
+                                'Failed to confirm the latest table state after ready rebases',
+                                error,
+                            );
+                        }
+                        console.error(
+                            'Table viewer state kept changing during ready; using retained state',
+                        );
+                    }
+                } finally {
+                    const ready = session.complete_ready(begun.receiverEpoch);
+                    needs_initial_source = ready.type === 'needsInitialSource';
                 }
-                const ready = session.complete_ready(begun.receiverEpoch);
-                if (ready.type === 'needsInitialSource') await send_initial_data();
+                if (needs_initial_source) await send_initial_data();
                 return;
             }
             case 'snapshotApplied':
@@ -1939,34 +2685,51 @@ export function attach_viewer(
                 return;
             }
             case 'setColumnVisibility': {
+                const message = structuredClone(msg);
+                const receiver_epoch = session.current_receiver_epoch;
                 const expected_authority = source_authority.authorityRevision;
-                await update_file_state((current) => {
-                        if (
-                            !source
-                            || !core
-                            || !file_coordinator.state_write_is_current(expected_authority)
-                            || source_authority.authorityRevision !== expected_authority
-                            || msg.sourceGeneration !== core.source_generation
-                        ) {
-                            return current;
-                        }
-                        const sheet = source.meta().sheets[msg.sheetIndex];
-                        if (!sheet || sheet.name !== msg.sheetName) return current;
-                        const columnVisibility = [...(current.columnVisibility ?? [])];
-                        columnVisibility[msg.sheetIndex] = sanitize_column_visibility_state(
-                            msg.state,
-                            sheet.columnCount,
-                            transform_schema_for_sheet(sheet),
-                        );
+                const visibility_is_current = () => {
+                    const acknowledged = session.acknowledged_identity();
+                    return !disposed
+                        && session.current_receiver_epoch === receiver_epoch
+                        && acknowledged !== undefined
+                        && same_snapshot_identity(message.snapshotIdentity, acknowledged)
+                        && file_coordinator.state_write_is_current(expected_authority)
+                        && source_authority.authorityRevision === expected_authority
+                        && message.snapshotIdentity.authority.revision === expected_authority
+                        && message.sourceGeneration === core?.source_generation;
+                };
+                const committed = await update_file_state((current) => {
+                    if (!visibility_is_current() || !source || !core) return current;
+                    const sheet = source.meta().sheets[message.sheetIndex];
+                    if (!sheet || sheet.name !== message.sheetName) return current;
+                    const columnVisibility = [...(current.columnVisibility ?? [])];
+                    columnVisibility[message.sheetIndex] = sanitize_column_visibility_state(
+                        message.state,
+                        sheet.columnCount,
+                        transform_schema_for_sheet(sheet),
+                    );
                     return { ...current, columnVisibility };
-                }, undefined, () => (
-                    file_coordinator.state_write_is_current(expected_authority)
-                    && source_authority.authorityRevision === expected_authority
-                    && msg.sourceGeneration === core?.source_generation
-                ));
+                }, undefined, visibility_is_current);
+                if (committed && visibility_is_current()) {
+                    session.update_state_snapshot(
+                        project_state_for_panel(committed),
+                        { deliver: true },
+                    );
+                }
                 return;
             }
             case 'requestEditSession': {
+                cancel_edit_claim(active_edit_claim);
+                const request: ReceiverRequest = {
+                    requestId: msg.requestId,
+                    receiverEpoch: session.current_receiver_epoch,
+                };
+                active_edit_session_request = request;
+                const request_is_current = () => (
+                    active_edit_session_request === request
+                    && receiver_request_is_current(request)
+                );
                 const recovery_waiter = edit_phase().type === 'uncertain'
                     ? Symbol(file_key)
                     : undefined;
@@ -1985,78 +2748,166 @@ export function attach_viewer(
                 if (current_edit_cleanup_waiter === recovery_waiter) {
                     current_edit_cleanup_waiter = undefined;
                 }
-                if (disposed) return;
-                const phase = edit_phase();
-                const cleanup_blocked = phase.type === 'cleanupPending'
+                if (!request_is_current()) return;
+                let phase = edit_phase();
+                let cleanup_blocked = phase.type === 'cleanupPending'
                     || phase.type === 'uncertain';
-                const can_edit = recovery_authorized
-                    && !disposed
+                const already_owned = phase.type === 'owned'
+                    && phase.token === edit_session_token;
+                let can_edit = recovery_authorized
                     && profile.editing
                     && !cleanup_blocked
+                    && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !(core?.has_transform_work ?? false);
+                    && !transform_blocks_editing();
                 const denied_by_owner = can_edit
-                    && phase.type === 'owned'
-                    && phase.token !== edit_session_token;
+                    && ((phase.type === 'owned' && phase.token !== edit_session_token)
+                        || phase.type === 'claiming');
+                const claim = can_edit && !denied_by_owner && !already_owned
+                    ? reserve_edit_claim()
+                    : undefined;
+                const reserved_or_owned = already_owned || claim !== undefined;
+                let edit_state: FileStateSnapshot | undefined;
+                try {
+                    if (can_edit && reserved_or_owned) {
+                        await ensure_failed_save_cleanup();
+                    }
+                    edit_state = can_edit && reserved_or_owned
+                        ? await read_file_state()
+                        : undefined;
+                } catch (error) {
+                    cancel_edit_claim(claim);
+                    console.error('Failed to read CSV edit-session state', error);
+                    if (!request_is_current()) return;
+                    active_edit_session_request = undefined;
+                    void post_to_receiver({
+                        type: 'editSessionResult',
+                        requestId: request.requestId,
+                        granted: false,
+                    }, request.receiverEpoch);
+                    return;
+                }
+                if (!request_is_current()) {
+                    cancel_edit_claim(claim);
+                    return;
+                }
+                phase = edit_phase();
+                cleanup_blocked = phase.type === 'cleanupPending'
+                    || phase.type === 'uncertain';
+                can_edit = recovery_authorized
+                    && profile.editing
+                    && !cleanup_blocked
+                    && active_save_operation === undefined
+                    && !!source
+                    && !source.truncationMessage
+                    && !transform_blocks_editing();
+                const owner_still_available = already_owned
+                    ? phase.type === 'owned' && phase.token === edit_session_token
+                    : phase.type === 'claiming' && phase.claim === claim;
+                const granted = can_edit
+                    && owner_still_available
+                    && try_claim_edit_session(true, claim);
+                if (!granted) cancel_edit_claim(claim);
+                if (edit_state) update_session_state_material(edit_state);
                 const denied_by_transform = profile.editing
                     && !!source
                     && !source.truncationMessage
-                    && (core?.has_transform_work ?? false);
-                if (can_edit && !denied_by_owner) save_command_pending = false;
-                const granted = can_edit && !denied_by_owner && try_claim_edit_session();
-                const edit_state = granted ? await read_file_state() : undefined;
-                if (edit_state) update_session_state_material(edit_state);
+                    && transform_blocks_editing();
                 const pendingEdits = granted
-                    ? (edit_state?.state as PerFileState | undefined)?.pendingEdits
+                    ? pending_edits_for_current_session(
+                        (edit_state?.state as PerFileState | undefined)?.pendingEdits,
+                    )
                     : undefined;
-                panel.webview.postMessage({
+                if (!request_is_current()) return;
+                active_edit_session_request = undefined;
+                void post_to_receiver({
                     type: 'editSessionResult',
+                    requestId: request.requestId,
                     granted,
                     ...(granted && active_edit_session_id
                         ? { editSessionId: active_edit_session_id }
                         : {}),
                     ...(pendingEdits ? { pendingEdits } : {}),
-                });
+                }, request.receiverEpoch);
                 if (cleanup_blocked) {
-                    vscode.window.showWarningMessage(
+                    show_owner_warning(
                         'Editing is temporarily unavailable while saved edit state is being cleared.');
                 } else if (denied_by_owner) {
-                    vscode.window.showWarningMessage(
+                    show_owner_warning(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
-                    vscode.window.showWarningMessage(
+                    show_owner_warning(
                         'Clear sorting and filters before entering edit mode.');
                 }
                 return;
             }
-            case 'setTransform':
-                if (profile.editing && owns_edit_session()) {
+            case 'setTransform': {
+                const transform_admission = profile.editing
+                    ? begin_transform_admission()
+                    : Symbol(file_key);
+                if (!transform_admission) {
                     await core?.reject_transform(
                         msg,
                         'Exit edit mode before sorting or filtering.',
                     );
                     return;
                 }
-                transform_authorities.set(
-                    msg.requestId,
-                    source_authority.authorityRevision,
+                let resolve_completion!: () => void;
+                const completion = new Promise<void>((resolve) => {
+                    resolve_completion = resolve;
+                });
+                const transform_authority: TransformAuthority = {
+                    authorityRevision: source_authority.authorityRevision,
+                    receiverEpoch: session.current_receiver_epoch,
+                    completion,
+                    resolveCompletion: resolve_completion,
+                };
+                transform_authorities.set(msg, transform_authority);
+                latest_transform_authority_by_sheet.set(
+                    msg.sheetIndex,
+                    transform_authority,
                 );
                 try {
                     await core?.handle_message(msg);
+                    try {
+                        await reconcile_transform_terminal(msg, transform_authority);
+                    } catch (error) {
+                        console.error(
+                            'Failed to reconcile durable table transforms after a terminal operation',
+                            error,
+                        );
+                    }
                 } finally {
-                    transform_authorities.delete(msg.requestId);
+                    if (transform_authorities.get(msg) === transform_authority) {
+                        transform_authorities.delete(msg);
+                    }
+                    if (
+                        latest_transform_authority_by_sheet.get(msg.sheetIndex)
+                        === transform_authority
+                    ) latest_transform_authority_by_sheet.delete(msg.sheetIndex);
+                    transform_commit_barriers.delete(transform_authority);
+                    transform_authority.resolveCompletion();
+                    if (profile.editing) {
+                        finish_transform_admission(transform_admission);
+                    }
                 }
                 return;
+            }
             case 'releaseEditSession':
-                if (profile.editing) {
-                    release_edit_session();
-                    await refresh_session_state_material(false);
+                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                    active_save_dialog_request = undefined;
+                    await release_edit_session(msg.editSessionId);
+                    if (!disposed) await refresh_session_state_material(false);
                 }
                 return;
             case 'discardEditSession':
-                if (profile.editing && owns_edit_session()) {
-                    const operation = begin_edit_cleanup();
+                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                    const writing = active_save_operation?.phase === 'writing'
+                        && active_save_operation.identity.editSessionId === msg.editSessionId;
+                    if (writing) return;
+                    active_save_dialog_request = undefined;
+                    const operation = begin_edit_cleanup(msg.editSessionId);
                     if (!operation) return;
                     notify_edit_state();
                     try {
@@ -2075,44 +2926,68 @@ export function attach_viewer(
                 vscode.window.showWarningMessage(msg.message);
                 return;
             case 'saveCsv':
-                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
-                    await handle_save(msg.edits, msg.editSessionId);
-                } else if (profile.editing) {
-                    panel.webview.postMessage({ type: 'saveResult', success: false });
-                }
+                if (profile.editing) await handle_save(msg.operation);
                 return;
             case 'pendingEditsChanged': {
-                if (!profile.editing || save_command_pending) return;
+                if (!profile.editing || active_save_operation) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
                 const edit_session_id = msg.editSessionId;
+                const edits = msg.edits ? structuredClone(msg.edits) : null;
+                const admission = Symbol(edit_session_id);
+                pending_edit_admissions.add(admission);
                 const write = pending_edit_writes.catch(() => {}).then(async () => {
-                    if (!edit_message_is_current(edit_session_id)) return;
-                    if (msg.edits) {
-                        const edits = msg.edits;
-                        await update_edit_session_state(edit_session_id, (current) => ({
-                            ...current,
-                            pendingEdits: edits,
-                        }));
-                    } else {
-                        await update_edit_session_state(edit_session_id, (current) => {
-                            if (!current.pendingEdits) return current;
-                            const { pendingEdits: _drop, ...rest } = current;
-                            return rest;
-                        });
+                    const result = edits
+                        ? await update_edit_session_state(
+                            edit_session_id,
+                            admission,
+                            (current) => ({ ...current, pendingEdits: edits }),
+                        )
+                        : await update_edit_session_state(
+                            edit_session_id,
+                            admission,
+                            (current) => {
+                                if (!current.pendingEdits) return current;
+                                const { pendingEdits: _drop, ...rest } = current;
+                                return rest;
+                            },
+                        );
+                    if (result.type !== 'aborted') {
+                        if (file_edit_state) {
+                            file_edit_state.failedSaveTombstone = undefined;
+                        }
+                        retire_save_lifecycle(undefined, 'failed');
+                        notify_edit_state(result.snapshot);
+                        delete_shared_edit_state_if_unused();
                     }
+                }).finally(() => {
+                    pending_edit_admissions.delete(admission);
                 });
                 pending_edit_writes = write;
                 await write;
                 return;
             }
             case 'showSaveDialog': {
-                if (!profile.editing || !owns_edit_session()) return;
+                if (!profile.editing || !edit_message_is_current(msg.editSessionId)) return;
+                const request = {
+                    requestId: msg.requestId,
+                    receiverEpoch: session.current_receiver_epoch,
+                    editSessionId: msg.editSessionId,
+                } as const;
+                active_save_dialog_request = request;
                 const choice = await vscode.window.showWarningMessage(
                     'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
-                panel.webview.postMessage({
+                if (
+                    active_save_dialog_request !== request
+                    || !receiver_request_is_current(request)
+                    || !edit_message_is_current(request.editSessionId)
+                ) return;
+                active_save_dialog_request = undefined;
+                void post_to_receiver({
                     type: 'saveDialogResult',
+                    requestId: request.requestId,
+                    editSessionId: request.editSessionId,
                     choice: choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel',
-                });
+                }, request.receiverEpoch);
                 return;
             }
             default:
@@ -2137,6 +3012,8 @@ export function attach_viewer(
             cancel_refresh_retry_wait();
             cancel_ready_state_retry_waits();
             cancel_edit_cleanup_waiters();
+            active_edit_session_request = undefined;
+            active_save_dialog_request = undefined;
             header_receipt_queue.length = 0;
             let first_error: unknown;
             const cleanup = (action: () => void) => {
@@ -2146,7 +3023,11 @@ export function attach_viewer(
                     first_error ??= error;
                 }
             };
-            cleanup(release_edit_session);
+            cleanup(() => cancel_edit_claim(active_edit_claim));
+            cleanup(() => { void release_edit_session(); });
+            cleanup(() => {
+                file_edit_state?.activeTransformPanels.delete(transform_panel_token);
+            });
             cleanup(() => session.dispose());
             core = undefined;
             source = undefined;
@@ -2154,12 +3035,7 @@ export function attach_viewer(
             cleanup(() => file_coordinator.dispose());
             if (file_edit_state) {
                 file_edit_state.attachments = Math.max(0, file_edit_state.attachments - 1);
-                if (
-                    file_edit_state.attachments === 0
-                    && file_edit_state.phase.type === 'free'
-                ) {
-                    csv_edit_file_states.delete(file_key);
-                }
+                delete_shared_edit_state_if_unused();
             }
             if (first_error !== undefined) throw first_error;
         },

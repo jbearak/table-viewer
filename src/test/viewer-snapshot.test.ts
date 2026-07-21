@@ -71,6 +71,7 @@ describe('workbook snapshot builder', () => {
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' },
             },
             diagnostics: { truncationMessage: null },
         });
@@ -93,6 +94,7 @@ describe('workbook snapshot builder', () => {
         expect(snapshot.capabilities).toEqual({
             csvEditable: false,
             csvEditingSupported: false,
+            csvSaveLifecycle: { revision: 0, state: 'idle' },
         });
     });
 
@@ -122,6 +124,7 @@ describe('workbook snapshot builder', () => {
         const capabilities = {
             csvEditable: false,
             csvEditingSupported: false,
+            csvSaveLifecycle: { revision: 0, state: 'idle' as const },
         };
         const diagnostics = { truncationMessage: 'Rows were truncated.' as string | null };
         const commandResult: RetainedSnapshotCommandResult = {

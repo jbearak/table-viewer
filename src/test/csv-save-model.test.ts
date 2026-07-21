@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { collect_save_edits } from '../webview/csv-save-model';
+import {
+    collect_exact_dirty_edits,
+    collect_save_edits,
+} from '../webview/csv-save-model';
 
 const dirty = (entries: Record<string, string>) =>
     new Map(Object.entries(entries).map(([k, v]) => [k, { value: v, base: '' }]));
@@ -41,5 +44,28 @@ describe('collect_save_edits', () => {
             original: 'orig',
         });
         expect(out).toEqual({});
+    });
+});
+
+describe('collect_exact_dirty_edits', () => {
+    it('preserves committed bases and folds the open overlay with its exact base', () => {
+        const exact = collect_exact_dirty_edits(new Map([
+            ['0:0', { value: 'committed', base: 'committed-base' }],
+        ]), {
+            key: '1:2',
+            value: 'overlay',
+            original: 'overlay-base',
+        });
+
+        expect(exact).toEqual({
+            '0:0': { value: 'committed', base: 'committed-base' },
+            '1:2': { value: 'overlay', base: 'overlay-base' },
+        });
+    });
+
+    it('refuses acceptance while any conflict base is unresolved', () => {
+        expect(collect_exact_dirty_edits(new Map([
+            ['0:0', { value: 'draft', base: '', base_pending: true }],
+        ]), null)).toBeUndefined();
     });
 });

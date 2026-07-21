@@ -124,6 +124,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' as const },
             },
         }),
         ...overrides,
@@ -1176,6 +1177,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 capabilities: {
                     csvEditable: editable,
                     csvEditingSupported: true,
+                    csvSaveLifecycle: { revision: 0, state: 'idle' },
                 },
             }),
         });
@@ -1222,6 +1224,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' as const },
             },
         };
         const mutable = adoption({ ...source, project: () => projection });

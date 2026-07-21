@@ -240,6 +240,7 @@ describe('Excel workbook snapshot controller', () => {
         expect(initial.capabilities).toEqual({
             csvEditable: false,
             csvEditingSupported: false,
+            csvSaveLifecycle: { revision: 0, state: 'idle' },
         });
         expect(builds.count).toBe(1);
     });

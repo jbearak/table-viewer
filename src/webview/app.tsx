@@ -11,6 +11,9 @@ import {
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    type CsvDirtyMap,
+    type CsvSaveLifecycle,
+    type CsvSaveOperation,
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
@@ -42,6 +45,14 @@ import {
     trim_sheet_state_array,
     sanitize_transform_state,
 } from './sheet-state';
+import {
+    INITIAL_CSV_SAVE_PROJECTION,
+    csv_save_operations_equal,
+    propose_csv_save,
+    reduce_csv_save_projection,
+    resolve_csv_save_hydration,
+    type CsvSaveProjection,
+} from './csv-save-lifecycle';
 import { column_letter } from './grid-model';
 import {
     create_column_projection,
@@ -133,9 +144,23 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
-    const [csv_edit_session_id, set_csv_edit_session_id] = useState<string>();
-    const [edit_mode, set_edit_mode] = useState(false);
+    const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
+    const csv_edit_session_id_ref = useRef<string>();
+    const set_csv_edit_session_id = useCallback((next: string | undefined) => {
+        csv_edit_session_id_ref.current = next;
+        set_csv_edit_session_id_state(next);
+    }, []);
+    const [edit_mode, set_edit_mode_state] = useState(false);
+    const edit_mode_ref = useRef(false);
+    const set_edit_mode = useCallback((next: boolean) => {
+        edit_mode_ref.current = next;
+        set_edit_mode_state(next);
+    }, []);
     const [edit_session_pending, set_edit_session_pending] = useState(false);
+    const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
+    const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
+        INITIAL_CSV_SAVE_PROJECTION.authoritative,
+    );
     const [transforms, set_transforms] = useState<
         (SheetTransformState | undefined)[]
     >([]);
@@ -187,18 +212,40 @@ export function App(): React.JSX.Element {
     // True between posting a save (from the exit dialog) and its saveResult, so a
     // successful save then completes the deferred exit from edit mode.
     const pending_exit_ref = useRef(false);
-    const pending_exit_save_succeeded_ref = useRef(false);
     const auto_fit_active_ref = useRef<boolean[]>([]);
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
     >([]);
     const transform_request_seq_ref = useRef(0);
+    const transform_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const edit_request_seq_ref = useRef(0);
+    const edit_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const save_request_seq_ref = useRef(0);
+    const save_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const dialog_request_seq_ref = useRef(0);
     const excel_header_request_seq_ref = useRef(0);
     const excel_header_request_prefix_ref = useRef(
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    const pending_edit_request_ref = useRef<string | null>(null);
+    const pending_save_dialog_ref = useRef<{
+        requestId: string;
+        editSessionId: string;
+    } | null>(null);
+    const save_projection_ref = useRef<CsvSaveProjection>(
+        INITIAL_CSV_SAVE_PROJECTION,
+    );
     const latest_live_edits_ref = useRef<PerFileState['pendingEdits']>(undefined);
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
@@ -231,7 +278,12 @@ export function App(): React.JSX.Element {
         intent: TransformIntent,
         origin: TransformOrigin = 'toolbar',
     ) => {
-        const request_id = `${sheet_index}:${++transform_request_seq_ref.current}`;
+        const request_id = [
+            'transform',
+            transform_request_prefix_ref.current,
+            sheet_index,
+            ++transform_request_seq_ref.current,
+        ].join(':');
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
@@ -261,8 +313,13 @@ export function App(): React.JSX.Element {
     }, []);
 
     const release_edit_session = useCallback(() => {
-        vscode_api.postMessage({ type: 'releaseEditSession' });
-    }, []);
+        if (!csv_edit_session_id) return;
+        pending_save_dialog_ref.current = null;
+        vscode_api.postMessage({
+            type: 'releaseEditSession',
+            editSessionId: csv_edit_session_id,
+        });
+    }, [csv_edit_session_id]);
 
     const leave_edit_mode = useCallback(() => {
         set_edit_mode(false);
@@ -270,9 +327,112 @@ export function App(): React.JSX.Element {
     }, [release_edit_session]);
 
     const discard_edit_session = useCallback(() => {
+        if (!csv_edit_session_id) return;
+        pending_save_dialog_ref.current = null;
         set_edit_mode(false);
-        vscode_api.postMessage({ type: 'discardEditSession' });
+        vscode_api.postMessage({
+            type: 'discardEditSession',
+            editSessionId: csv_edit_session_id,
+        });
+    }, [csv_edit_session_id]);
+
+    const begin_save_operation = useCallback((
+        edits: Record<string, string>,
+        dirty_edits: CsvDirtyMap,
+    ): CsvSaveOperation | undefined => {
+        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        const operation = Object.freeze<CsvSaveOperation>({
+            editSessionId: csv_edit_session_id,
+            saveRequestId: [
+                'save',
+                save_request_prefix_ref.current,
+                ++save_request_seq_ref.current,
+            ].join(':'),
+            edits: Object.freeze({ ...edits }),
+            dirtyEdits: Object.freeze(Object.fromEntries(
+                Object.entries(dirty_edits).map(([key, entry]) => [
+                    key,
+                    Object.freeze({ value: entry.value, base: entry.base }),
+                ]),
+            )),
+        });
+        const projection = propose_csv_save(save_projection_ref.current, operation);
+        save_projection_ref.current = projection;
+        set_save_operation(operation);
+        return operation;
+    }, [csv_edit_session_id]);
+
+    const reset_save_projection = useCallback(() => {
+        save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
+        set_save_lifecycle(INITIAL_CSV_SAVE_PROJECTION.authoritative);
+        set_save_operation(undefined);
     }, []);
+
+    const apply_save_lifecycle = useCallback((incoming: CsvSaveLifecycle) => {
+        const previous = save_projection_ref.current;
+        const next = reduce_csv_save_projection(previous, incoming);
+        if (next === previous) return { previous, next, changed: false };
+        save_projection_ref.current = next;
+        set_save_lifecycle(next.authoritative);
+        set_save_operation(next.operation);
+
+        const current_session_id = csv_edit_session_id_ref.current;
+        if (incoming.state === 'active') {
+            if (
+                incoming.operation.editSessionId === current_session_id
+                && csv_save_operations_equal(next.operation, incoming.operation)
+            ) {
+                const hydrated = resolve_csv_save_hydration(
+                    next,
+                    current_session_id,
+                    latest_live_edits_ref.current,
+                );
+                latest_live_edits_ref.current = hydrated;
+                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+            }
+        } else if (incoming.state === 'idle') {
+            if (
+                previous.operation
+                && !next.operation
+                && previous.operation.editSessionId === current_session_id
+            ) {
+                latest_live_edits_ref.current = previous.operation.dirtyEdits;
+                set_initial_edits({ ...previous.operation.dirtyEdits });
+                pending_exit_ref.current = false;
+            }
+        } else if (
+            !previous.operation
+            || csv_save_operations_equal(previous.operation, incoming.operation)
+        ) {
+            if (incoming.state === 'failed') {
+                if (incoming.operation.editSessionId === current_session_id) {
+                    const hydrated = resolve_csv_save_hydration(
+                        next,
+                        current_session_id,
+                        latest_live_edits_ref.current,
+                    );
+                    latest_live_edits_ref.current = hydrated;
+                    set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                    pending_exit_ref.current = false;
+                }
+            } else if (
+                current_session_id === undefined
+                || incoming.operation.editSessionId === current_session_id
+            ) {
+                const hydrated = resolve_csv_save_hydration(
+                    next,
+                    current_session_id,
+                    latest_live_edits_ref.current,
+                );
+                latest_live_edits_ref.current = hydrated;
+                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                set_csv_edit_session_id(undefined);
+                set_edit_session_pending(false);
+                set_edit_mode(false);
+            }
+        }
+        return { previous, next, changed: true };
+    }, [set_csv_edit_session_id, set_edit_mode]);
 
     useEffect(() => {
         auto_fit_active_ref.current = auto_fit_active;
@@ -308,6 +468,10 @@ export function App(): React.JSX.Element {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
+            if (msg.type === 'saveOperationStarted') {
+                apply_save_lifecycle(msg.lifecycle);
+            }
+
             if (msg.type === 'workbookSnapshot') {
                 const { snapshot } = msg;
                 const previous_native_identity = last_applied_snapshot_ref.current;
@@ -320,10 +484,21 @@ export function App(): React.JSX.Element {
                     last_applied_snapshot_ref.current,
                 );
                 if (cross_file_initial && disposition === 'applied') {
+                    reset_save_projection();
                     pending_excel_header_ref.current = null;
                     set_pending_excel_header(null);
                     set_excel_header_status('');
                 }
+                const same_file = previous_native_identity?.authority.fileId
+                    === snapshot.identity.authority.fileId;
+                // Save lifecycle authority has its own monotonic clock. A stale
+                // workbook projection from the current file may still carry the
+                // terminal save state that this receiver otherwise missed.
+                const save_transition = disposition === 'applied' || same_file
+                    ? apply_save_lifecycle(
+                        snapshot.capabilities.csvSaveLifecycle,
+                    )
+                    : undefined;
                 const process_command_result = (
                     result: RetainedSnapshotCommandResult | undefined,
                 ) => {
@@ -371,6 +546,9 @@ export function App(): React.JSX.Element {
                 process_command_result(snapshot.commandResult);
 
                 if (disposition === 'applied') {
+                    // Every applied snapshot is lifecycle-relevant, including the
+                    // first snapshot for a newly selected file.
+                    const applied_save_transition = save_transition!;
                     last_applied_snapshot_ref.current = snapshot.identity;
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets = new Map(
@@ -396,11 +574,20 @@ export function App(): React.JSX.Element {
                                 snapshot.meta,
                             )
                             : undefined;
+                    const snapshot_edit_session_id =
+                        snapshot.capabilities.csvEditSessionId;
+                    const refresh_editing_current_session =
+                        snapshot.presentation === 'refresh'
+                        && edit_mode_ref.current
+                        && csv_edit_session_id_ref.current === snapshot_edit_session_id;
                     const refresh_edits = snapshot.presentation === 'refresh'
-                        && edit_mode
-                            ? refresh_authoritative_state?.pendingEdits
-                            : undefined;
-                    if (snapshot.presentation === 'refresh' && edit_mode) {
+                        ? resolve_csv_save_hydration(
+                            applied_save_transition.next,
+                            snapshot_edit_session_id,
+                            refresh_authoritative_state?.pendingEdits,
+                        )
+                        : undefined;
+                    if (refresh_editing_current_session) {
                         latest_live_edits_ref.current = refresh_edits;
                         set_initial_edits(refresh_edits);
                     }
@@ -425,7 +612,11 @@ export function App(): React.JSX.Element {
                     set_generation(snapshot.generation);
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
-                    set_edit_session_pending(false);
+                    if (snapshot.presentation === 'initial') {
+                        set_edit_session_pending(false);
+                        pending_edit_request_ref.current = null;
+                        pending_save_dialog_ref.current = null;
+                    }
                     set_source_epoch((n) => n + 1);
                     auto_fit_active_ref.current = [];
                     auto_fit_snapshot_ref.current = [];
@@ -474,16 +665,31 @@ export function App(): React.JSX.Element {
                                 : snapshot.configuration.defaultTabOrientation === 'vertical',
                         );
                         state_ref.current = normalized;
-                        const restored_edits = normalized.pendingEdits;
-                        latest_live_edits_ref.current = restored_edits;
-                        set_initial_edits(restored_edits);
+                        const restored_edits = resolve_csv_save_hydration(
+                            applied_save_transition.next,
+                            snapshot_edit_session_id,
+                            normalized.pendingEdits,
+                        );
+                        const exact_session_succeeded =
+                            applied_save_transition.next.authoritative.state === 'succeeded'
+                            && applied_save_transition.next.authoritative.operation.editSessionId
+                                === snapshot_edit_session_id;
+                        const owns_clean_or_dirty_session =
+                            snapshot_edit_session_id !== undefined
+                            && snapshot.capabilities.csvEditable
+                            && !exact_session_succeeded;
+                        const hydrated_edits = owns_clean_or_dirty_session
+                            ? restored_edits ?? {}
+                            : restored_edits;
+                        latest_live_edits_ref.current = hydrated_edits;
+                        set_initial_edits(hydrated_edits);
                         set_edit_mode(
-                            !!restored_edits && snapshot.capabilities.csvEditable,
+                            owns_clean_or_dirty_session
+                            || restored_edits !== undefined,
                         );
                         set_editing_status(null);
                         set_dismissed_conflict_signature(null);
                         pending_exit_ref.current = false;
-                        pending_exit_save_succeeded_ref.current = false;
                     } else {
                         const sheet_count = snapshot.meta.sheets.length;
                         const authoritative_state = refresh_authoritative_state!;
@@ -551,7 +757,9 @@ export function App(): React.JSX.Element {
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
                             activeSheetIndex: authoritative_state.activeSheetIndex,
-                            ...(edit_mode ? { pendingEdits: refresh_edits } : {}),
+                            ...(refresh_editing_current_session
+                                ? { pendingEdits: refresh_edits }
+                                : {}),
                         };
                     }
                     set_truncation_message(snapshot.truncationMessage);
@@ -671,10 +879,11 @@ export function App(): React.JSX.Element {
         return () => window.removeEventListener('message', handler);
     }, [
         active_sheet_index,
+        apply_save_lifecycle,
         clear_pending_preview_scroll,
-        edit_mode,
         persist_immediate,
         queue_preview_scroll,
+        reset_save_projection,
     ]);
 
     useEffect(() => {
@@ -861,13 +1070,32 @@ export function App(): React.JSX.Element {
                 return;
             }
             set_edit_session_pending(true);
-            vscode_api.postMessage({ type: 'requestEditSession' });
+            const request_id = [
+                'edit',
+                edit_request_prefix_ref.current,
+                ++edit_request_seq_ref.current,
+            ].join(':');
+            pending_edit_request_ref.current = request_id;
+            vscode_api.postMessage({
+                type: 'requestEditSession',
+                requestId: request_id,
+            });
             return;
         }
         // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
         // dialog (handled below); otherwise exit immediately.
         if (editing_ref.current?.has_uncommitted_changes()) {
-            vscode_api.postMessage({ type: 'showSaveDialog' });
+            if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
+            const request = {
+                requestId: [
+                    'dialog',
+                    edit_request_prefix_ref.current,
+                    ++dialog_request_seq_ref.current,
+                ].join(':'),
+                editSessionId: csv_edit_session_id,
+            };
+            pending_save_dialog_ref.current = request;
+            vscode_api.postMessage({ type: 'showSaveDialog', ...request });
             return;
         }
         leave_edit_mode();
@@ -878,6 +1106,7 @@ export function App(): React.JSX.Element {
         pending_transforms,
         edit_session_pending,
         active_sheet_index,
+        csv_edit_session_id,
     ]);
 
     const handle_transform_change = useCallback(
@@ -1020,61 +1249,37 @@ export function App(): React.JSX.Element {
         request_transform,
     ]);
 
-    // React to the host's save-dialog choice (from the exit flow) and to the save
-    // outcome. GridShell separately clears the dirty map on a successful save; here
-    // we only complete a deferred exit from edit mode.
-    //
-    // Reset all pending-exit bookkeeping and leave edit mode. Called once a
-    // save-on-exit has succeeded and no uncommitted work remains. Refs and
-    // setters are stable, so this keeps one identity for the component's life.
-    const finish_pending_exit = useCallback(() => {
-        pending_exit_ref.current = false;
-        pending_exit_save_succeeded_ref.current = false;
-        leave_edit_mode();
-    }, [leave_edit_mode]);
-
-    // A deferred exit completes once the save acked and no uncommitted work (dirty
-    // map or open overlay) remains. Shared by the saveResult handler and the
-    // editing-status effect so the predicate can't drift between them.
-    const can_finish_pending_exit = useCallback(
-        () =>
-            pending_exit_ref.current &&
-            pending_exit_save_succeeded_ref.current &&
-            !(editing_ref.current?.has_uncommitted_changes() ?? false),
-        [],
-    );
-
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
             if (msg.type === 'editSessionResult') {
+                if (pending_edit_request_ref.current !== msg.requestId) return;
+                pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
-                if (msg.granted) {
+                if (msg.granted && msg.editSessionId) {
                     set_csv_edit_session_id(msg.editSessionId);
-                    if (msg.pendingEdits) {
-                        latest_live_edits_ref.current = msg.pendingEdits;
-                        set_initial_edits(msg.pendingEdits);
-                        set_load_epoch((n) => n + 1);
-                    }
+                    // The grant owns the complete pending-edit projection, including
+                    // authoritative absence. Always cross a hydration boundary so a
+                    // previously mounted editing hook cannot retain another session.
+                    latest_live_edits_ref.current = msg.pendingEdits;
+                    set_initial_edits(msg.pendingEdits);
+                    set_load_epoch((n) => n + 1);
                     set_edit_mode(true);
                 } else {
                     pending_exit_ref.current = false;
-                    pending_exit_save_succeeded_ref.current = false;
                     set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
                 }
             } else if (msg.type === 'editSessionRevoked') {
-                // The host has crossed the disk-success boundary and now owns
-                // cleanup. Drop all local edit restoration state without posting a
-                // release or stale pending-edit snapshot back to the host.
-                latest_live_edits_ref.current = undefined;
-                pending_exit_ref.current = false;
-                pending_exit_save_succeeded_ref.current = false;
-                set_edit_session_pending(false);
-                set_initial_edits(undefined);
-                set_csv_edit_session_id(undefined);
-                set_edit_mode(false);
+                apply_save_lifecycle(msg.lifecycle);
             } else if (msg.type === 'saveDialogResult') {
+                const pending_dialog = pending_save_dialog_ref.current;
+                if (
+                    !pending_dialog
+                    || pending_dialog.requestId !== msg.requestId
+                    || pending_dialog.editSessionId !== msg.editSessionId
+                ) return;
+                pending_save_dialog_ref.current = null;
                 if (msg.choice === 'save') {
                     const editing = editing_ref.current;
                     // request_save() has side effects, so it must be evaluated first.
@@ -1089,27 +1294,20 @@ export function App(): React.JSX.Element {
                 }
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
-                if (pending_exit_ref.current) {
-                    if (msg.success) {
-                        pending_exit_save_succeeded_ref.current = true;
-                        // If everything is already clean, finish now; otherwise the
-                        // editing-status effect completes the exit once the dirty
-                        // map and any open overlay later go clean.
-                        if (can_finish_pending_exit()) {
-                            finish_pending_exit();
-                        }
-                    } else if (!pending_exit_save_succeeded_ref.current) {
-                        pending_exit_ref.current = false;
-                    }
+                const operation = save_projection_ref.current.operation;
+                const matching = !operation
+                    || csv_save_operations_equal(operation, msg.lifecycle.operation);
+                apply_save_lifecycle(msg.lifecycle);
+                if (matching) {
+                    pending_exit_ref.current = false;
                 }
             }
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
     }, [
-        can_finish_pending_exit,
+        apply_save_lifecycle,
         discard_edit_session,
-        finish_pending_exit,
         leave_edit_mode,
     ]);
 
@@ -1128,16 +1326,6 @@ export function App(): React.JSX.Element {
             : undefined;
         set_editing_status(status);
     }, []);
-
-    // Single completion trigger for a save-on-exit. GridShell now reports both the
-    // committed-dirty state (is_dirty) and the open overlay's dirtiness
-    // (has_live_uncommitted), so this effect re-runs on every transition that can
-    // make editing clean — no polling interval needed.
-    useEffect(() => {
-        if (can_finish_pending_exit()) {
-            finish_pending_exit();
-        }
-    }, [editing_status?.is_dirty, editing_status?.has_live_uncommitted]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
@@ -1183,7 +1371,8 @@ export function App(): React.JSX.Element {
         updater: ColumnVisibilityUpdater,
     ) => {
         const sheet = meta?.sheets[active_sheet_index];
-        if (!sheet) return;
+        const snapshot_identity = snapshot_identity_ref.current;
+        if (!sheet || !snapshot_identity) return;
         const schema = transform_schema_for_sheet(sheet);
         const current = sanitize_column_visibility_state(
             state_ref.current.columnVisibility?.[active_sheet_index],
@@ -1217,6 +1406,7 @@ export function App(): React.JSX.Element {
             sheetName: sheet.name,
             state: next_sheet_visibility,
             sourceGeneration: source_generation_ref.current,
+            snapshotIdentity: snapshot_identity,
         });
         persist_immediate();
     }, [
@@ -1470,6 +1660,9 @@ export function App(): React.JSX.Element {
             edit_mode={edit_mode}
             csv_editable={csv_editable}
             edit_session_id={csv_edit_session_id}
+            save_operation={save_operation}
+            save_lifecycle={save_lifecycle}
+            on_save_request={begin_save_operation}
             initial_edits={initial_edits}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

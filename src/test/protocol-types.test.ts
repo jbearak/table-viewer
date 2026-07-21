@@ -90,6 +90,7 @@ describe('paginated protocol message shapes', () => {
                 capabilities: {
                     csvEditable: false,
                     csvEditingSupported: false,
+                    csvSaveLifecycle: { revision: 0, state: 'idle' },
                 },
                 truncationMessage: null,
                 commandResult: {
@@ -227,9 +228,29 @@ describe('paginated protocol message shapes', () => {
             sheetName: 'People',
             state: undefined,
             sourceGeneration: 3,
+            snapshotIdentity: {
+                deliveryId: 12,
+                authority: { fileId: 'file:people.xlsx', revision: 9 },
+                stateRevision: 44,
+                sourceBasis: {
+                    physicalRevision: 7,
+                    projectionRevision: 2,
+                },
+            },
         };
         expect(request.type).toBe('setExcelFirstRowHeader');
         expect(visibility.type).toBe('setColumnVisibility');
+        expect(visibility.snapshotIdentity.deliveryId).toBe(12);
+    });
+
+    it('rejects setColumnVisibility without a snapshot identity at compile time', () => {
+        type Visibility = Extract<WebviewMessage, { type: 'setColumnVisibility' }>;
+        type IdentitylessVisibility = Omit<Visibility, 'snapshotIdentity'>;
+        type MissingIdentityIsAccepted = IdentitylessVisibility extends Visibility
+            ? true
+            : false;
+        const proof: MissingIdentityIsAccepted = false;
+        expect(proof).toBe(false);
     });
 
     it('WebviewMessage carries a requestRows variant', () => {

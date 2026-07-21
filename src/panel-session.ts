@@ -254,6 +254,10 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         return this._lifecycle;
     }
 
+    get current_receiver_epoch(): number {
+        return this.receiver_epoch;
+    }
+
     /**
      * Start a receiver epoch synchronously. This immediately invalidates every old
      * post continuation, retry, and ACK timer, but deliberately posts nothing until

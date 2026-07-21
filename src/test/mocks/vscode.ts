@@ -179,6 +179,7 @@ function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
 function make_panel(title: string): MockWebviewPanel {
     const message_handlers: MessageHandler[] = [];
     const dispose_handlers: (() => unknown)[] = [];
+    let protocol_sequence = 0;
     const panel: MockWebviewPanel = {
         title,
         webview: {
@@ -228,21 +229,119 @@ function make_panel(title: string): MockWebviewPanel {
                 typeof forwarded === 'object'
                 && forwarded !== null
                 && 'type' in forwarded
-                && (forwarded.type === 'saveCsv' || forwarded.type === 'pendingEditsChanged')
-                && !('editSessionId' in forwarded)
+                && forwarded.type === 'requestEditSession'
+                && !('requestId' in forwarded)
             ) {
-                const grant = [...panel.__messages].reverse().find((candidate) => (
+                forwarded = {
+                    ...forwarded,
+                    requestId: `test-edit-request:${++protocol_sequence}`,
+                };
+            }
+            const latest_grant = () => [...panel.__messages].reverse().find((candidate) => (
+                typeof candidate === 'object'
+                && candidate !== null
+                && 'type' in candidate
+                && candidate.type === 'editSessionResult'
+                && 'granted' in candidate
+                && candidate.granted === true
+                && 'editSessionId' in candidate
+            )) as { editSessionId?: string } | undefined;
+            const latest_snapshot_identity = () => {
+                const snapshot = [...panel.__messages].reverse().find((candidate) => (
                     typeof candidate === 'object'
                     && candidate !== null
                     && 'type' in candidate
-                    && candidate.type === 'editSessionResult'
-                    && 'granted' in candidate
-                    && candidate.granted === true
-                    && 'editSessionId' in candidate
-                )) as { editSessionId?: string } | undefined;
+                    && candidate.type === 'workbookSnapshot'
+                )) as { snapshot?: { identity?: unknown } } | undefined;
+                return snapshot?.snapshot?.identity;
+            };
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && (forwarded.type === 'saveCsv' || forwarded.type === 'pendingEditsChanged')
+                && !('editSessionId' in forwarded)
+            ) {
+                const grant = latest_grant();
                 if (grant?.editSessionId) {
                     forwarded = { ...forwarded, editSessionId: grant.editSessionId };
                 }
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'saveCsv'
+                && !('saveRequestId' in forwarded)
+            ) {
+                forwarded = {
+                    ...forwarded,
+                    saveRequestId: `test-save-request:${++protocol_sequence}`,
+                };
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'saveCsv'
+                && !('operation' in forwarded)
+            ) {
+                const legacy = forwarded as {
+                    editSessionId?: string;
+                    saveRequestId?: string;
+                    edits?: Record<string, string>;
+                };
+                const edits = legacy.edits ?? {};
+                forwarded = {
+                    type: 'saveCsv',
+                    operation: {
+                        editSessionId: legacy.editSessionId ?? '',
+                        saveRequestId: legacy.saveRequestId ?? '',
+                        edits,
+                        dirtyEdits: Object.fromEntries(
+                            Object.entries(edits).map(([key, value]) => [
+                                key,
+                                { value, base: 'a' },
+                            ]),
+                        ),
+                    },
+                };
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && (
+                    forwarded.type === 'releaseEditSession'
+                    || forwarded.type === 'discardEditSession'
+                    || forwarded.type === 'showSaveDialog'
+                )
+                && !('editSessionId' in forwarded)
+            ) {
+                const editSessionId = latest_grant()?.editSessionId;
+                if (editSessionId) forwarded = { ...forwarded, editSessionId };
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'showSaveDialog'
+                && !('requestId' in forwarded)
+            ) {
+                forwarded = {
+                    ...forwarded,
+                    requestId: `test-dialog-request:${++protocol_sequence}`,
+                };
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'setColumnVisibility'
+                && !('snapshotIdentity' in forwarded)
+            ) {
+                const snapshotIdentity = latest_snapshot_identity();
+                if (snapshotIdentity) forwarded = { ...forwarded, snapshotIdentity };
             }
             await Promise.all(message_handlers.map((handler) => handler(forwarded)));
         },

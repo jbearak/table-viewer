@@ -377,6 +377,132 @@ describe('ViewerPanelCore', () => {
             .toBe(false);
     });
 
+    it('cancels receiver-owned transform compute synchronously on a new epoch', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const work = core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'old-receiver',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        // compute_transform has reached its first cooperative checkpoint.
+        core.begin_receiver_epoch(2);
+        await work;
+
+        expect(core.generation).toBe(1);
+        expect(core.has_transform_work).toBe(false);
+        expect(posted.some((message) => message.type === 'transformApplied'))
+            .toBe(false);
+    });
+
+    it('installs a committed transform after receiver turnover without delivering its terminal', async () => {
+        const { panel, posted } = make_panel();
+        const commit_started = deferred();
+        const release_commit = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'old-receiver') {
+                    commit_started.resolve();
+                    await release_commit.promise;
+                }
+            },
+        });
+        core.begin_receiver_epoch(1);
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'installed',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        const installed_generation = core.generation;
+        posted.length = 0;
+
+        const old_work = core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'old-receiver',
+            generation: installed_generation, sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        await commit_started.promise;
+        core.begin_receiver_epoch(2);
+        release_commit.resolve();
+        await old_work;
+
+        expect(core.generation).toBe(installed_generation + 1);
+        expect(posted.some((message) => message.type === 'transformApplied'))
+            .toBe(false);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 2,
+            requestId: 'committed', generation: installed_generation + 1,
+        });
+        const rows = posted.find((message) => message.type === 'rowData');
+        expect(rows.rows.map((row: RenderedCell[]) => row[0].raw)).toEqual(['0', '1']);
+    });
+
+    it('does not let old receiver cleanup clear newer same-sheet work', async () => {
+        const { panel } = make_panel();
+        const a_started = deferred();
+        const a_gate = deferred();
+        const b_started = deferred();
+        const b_gate = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'A') {
+                    a_started.resolve();
+                    await a_gate.promise;
+                } else if (message.requestId === 'B') {
+                    b_started.resolve();
+                    await b_gate.promise;
+                }
+            },
+        });
+        core.begin_receiver_epoch(1);
+        const request = (requestId: string, direction: 'asc' | 'desc') => ({
+            type: 'setTransform' as const,
+            sheetIndex: 0,
+            requestId,
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user' as const,
+            state: {
+                sort: [{ colIndex: 0, direction }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        const a = core.handle_message(request('A', 'desc'));
+        await a_started.promise;
+        core.begin_receiver_epoch(2);
+        const b = core.handle_message(request('B', 'asc'));
+        await b_started.promise;
+
+        a_gate.resolve();
+        await a;
+        expect(core.has_transform_work).toBe(true);
+
+        b_gate.resolve();
+        await b;
+        expect(core.has_transform_work).toBe(true);
+        expect(core.generation).toBe(2);
+    });
+
     it('terminally acknowledges an unrelated AbortError from the source', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new UnrelatedAbortErrorSource(5));
@@ -400,6 +526,41 @@ describe('ViewerPanelCore', () => {
             error: 'source aborted unexpectedly',
         }));
         expect(core.has_transform_work).toBe(false);
+    });
+
+    it('prepares ready reconciliation without mutating the installed view', async () => {
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const prepared = await core.prepare_transform_reconciliation([{
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        }], () => false);
+
+        expect(prepared).toBeDefined();
+        expect(core.generation).toBe(1);
+        expect(core.has_active_transform).toBe(false);
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(true);
+        expect(core.generation).toBe(2);
+        expect(core.has_active_transform).toBe(true);
+    });
+
+    it('rejects a prepared reconciliation after source adoption', async () => {
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const prepared = await core.prepare_transform_reconciliation([{
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        }], () => false);
+        expect(prepared).toBeDefined();
+
+        core.adopt_source(new StubSource(5));
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(false);
+        expect(core.has_active_transform).toBe(false);
+        expect(core.generation).toBe(2);
     });
 
     it('refuses source installation on a disposed core without closing either source', () => {

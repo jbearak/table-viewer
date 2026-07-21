@@ -3,7 +3,13 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { HostMessage, SheetTransformState, WebviewMessage } from '../types';
+import type {
+    CsvSaveLifecycle,
+    CsvSaveOperation,
+    HostMessage,
+    SheetTransformState,
+    WebviewMessage,
+} from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 
@@ -45,6 +51,22 @@ vi.mock('../webview/grid-shell', () => ({
         merges: { startRow: number }[];
         edit_mode?: boolean;
         edit_session_id?: string;
+        save_operation?: {
+            editSessionId: string;
+            saveRequestId: string;
+            edits: Readonly<Record<string, string>>;
+            dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
+        };
+        save_lifecycle?: CsvSaveLifecycle;
+        on_save_request?: (
+            edits: Record<string, string>,
+            dirtyEdits: Record<string, { value: string; base: string }>,
+        ) => {
+            editSessionId: string;
+            saveRequestId: string;
+            edits: Readonly<Record<string, string>>;
+            dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
+        } | undefined;
         initial_edits?: Record<string, string | { value: string; base: string }>;
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
@@ -119,7 +141,16 @@ vi.mock('../webview/grid-shell', () => ({
         }, [props.initial_edits, props.on_editing_change]);
         if (props.editing_ref) {
             props.editing_ref.current = {
-                request_save: grid_shell_mock.request_save,
+                request_save: () => {
+                    const result = grid_shell_mock.request_save();
+                    if (!props.save_operation) {
+                        props.on_save_request?.(
+                            { '0:0': 'dirty' },
+                            { '0:0': { value: 'dirty', base: 'base' } },
+                        );
+                    }
+                    return result;
+                },
                 clear_dirty: grid_shell_mock.clear_dirty,
                 discard_conflicted: grid_shell_mock.discard_conflicted,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
@@ -206,6 +237,8 @@ vi.mock('../webview/grid-shell', () => ({
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+let active_post_message: ReturnType<typeof vi.fn> | undefined;
+let save_lifecycle_revision = 0;
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -225,6 +258,7 @@ function make_meta(sheet_names: string[], has_formatting = true): WorkbookMeta {
 async function render_app() {
     vi.resetModules();
     const post_message = vi.fn();
+    active_post_message = post_message;
 
     vi.stubGlobal('acquireVsCodeApi', () => ({
         postMessage: post_message,
@@ -245,7 +279,77 @@ async function render_app() {
     return { post_message };
 }
 
-async function dispatch_host_message(msg: HostMessage) {
+async function dispatch_host_message(input: HostMessage | Record<string, unknown>) {
+    let msg = input as Record<string, unknown>;
+    const outgoing = active_post_message?.mock.calls.map((call) => call[0]) ?? [];
+    if (msg.type === 'editSessionResult' && msg.requestId === undefined) {
+        const request = [...outgoing].reverse().find((candidate) => (
+            candidate?.type === 'requestEditSession'
+        ));
+        msg = {
+            ...msg,
+            requestId: request?.requestId ?? 'legacy-edit-request',
+            ...(msg.granted === true && msg.editSessionId === undefined
+                ? { editSessionId: 'test-edit-session' }
+                : {}),
+        };
+    } else if (msg.type === 'saveDialogResult' && msg.requestId === undefined) {
+        const request = [...outgoing].reverse().find((candidate) => (
+            candidate?.type === 'showSaveDialog'
+        ));
+        msg = {
+            ...msg,
+            requestId: request?.requestId ?? 'legacy-dialog-request',
+            editSessionId: request?.editSessionId ?? 'test-edit-session',
+        };
+    } else if (msg.type === 'saveOperationStarted' && msg.lifecycle === undefined) {
+        const operation = msg.operation as Record<string, unknown>;
+        msg = {
+            type: msg.type,
+            lifecycle: {
+                revision: ++save_lifecycle_revision,
+                state: 'active',
+                operation: {
+                    ...operation,
+                    dirtyEdits: operation.dirtyEdits
+                        ?? Object.fromEntries(Object.entries(
+                            (operation.edits ?? {}) as Record<string, string>,
+                        ).map(([key, value]) => [key, { value, base: 'base' }])),
+                },
+            },
+        };
+    } else if (
+        (msg.type === 'saveResult' || msg.type === 'editSessionRevoked')
+        && msg.lifecycle === undefined
+    ) {
+        const operation = grid_shell_mock.latest_props?.save_operation as {
+            editSessionId: string;
+            saveRequestId: string;
+            edits: Record<string, string>;
+            dirtyEdits: Record<string, { value: string; base: string }>;
+        } | undefined;
+        const terminal_operation = {
+            editSessionId: msg.editSessionId ?? operation?.editSessionId
+                ?? 'test-edit-session',
+            saveRequestId: msg.saveRequestId ?? operation?.saveRequestId
+                ?? 'legacy-save-request',
+            edits: operation?.edits ?? { '0:0': 'dirty' },
+            dirtyEdits: operation?.dirtyEdits
+                ?? { '0:0': { value: 'dirty', base: 'base' } },
+        };
+        msg = {
+            type: msg.type,
+            ...(msg.reason ? { reason: msg.reason } : {}),
+            ...(msg.success !== undefined ? { success: msg.success } : {}),
+            lifecycle: {
+                revision: ++save_lifecycle_revision,
+                state: msg.type === 'editSessionRevoked' || msg.success === true
+                    ? 'succeeded'
+                    : 'failed',
+                operation: terminal_operation,
+            },
+        };
+    }
     await act(async () => {
         window.dispatchEvent(new MessageEvent('message', { data: msg }));
     });
@@ -327,7 +431,10 @@ async function enter_edit_mode(
     edit_session_id = 'test-edit-session',
 ) {
     await click_button('Edit');
-    expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+    expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'requestEditSession',
+        requestId: expect.any(String),
+    }));
     await dispatch_host_message({
         type: 'editSessionResult',
         granted: true,
@@ -431,6 +538,8 @@ function workbook_snapshot_message(
                 csvEditable: false,
                 csvEditingSupported: false,
                 ...capabilities,
+                csvSaveLifecycle: capabilities?.csvSaveLifecycle
+                    ?? { revision: 0, state: 'idle' },
             },
             truncationMessage: null,
             identity: {
@@ -458,6 +567,8 @@ function cleanup() {
     root = null;
     container?.remove();
     container = null;
+    active_post_message = undefined;
+    save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     grid_shell_mock.is_dirty = false;
     grid_shell_mock.has_live_uncommitted = false;
@@ -1779,14 +1890,15 @@ describe('column visibility projection', () => {
         meta.sheets[0].columnCount = 3;
         meta.sheets[0].columnNames = ['Name', 'Value', 'Notes'];
         meta.sheets[1].columnCount = 2;
-        await dispatch_host_message(initial_snapshot_message(meta, {
+        const initial = initial_snapshot_message(meta, {
             state: {
                 columnVisibility: [undefined, {
                     hiddenColumns: [1],
                     schema: '["Sheet2",2,null]',
                 }],
             },
-        }));
+        });
+        await dispatch_host_message(initial);
         post_message.mockClear();
         const mount_id = grid_stub().getAttribute('data-mount-id');
         const generation = grid_stub().getAttribute('data-generation');
@@ -1814,6 +1926,7 @@ describe('column visibility projection', () => {
             sheetIndex: 0,
             sheetName: 'Sheet1',
             sourceGeneration: 1,
+            snapshotIdentity: initial.snapshot.identity,
             state: {
                 hiddenColumns: [1],
                 schema: '["Sheet1",3,["Name","Value","Notes"]]',
@@ -1849,6 +1962,7 @@ describe('column visibility projection', () => {
             sheetName: 'Sheet1',
             state: undefined,
             sourceGeneration: 1,
+            snapshotIdentity: initial.snapshot.identity,
         });
         const restored = post_message.mock.calls.at(-1)![0];
         expect(restored.type).toBe('stateChanged');
@@ -2170,12 +2284,16 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showSaveDialog',
+        }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
 
         expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
-        expect(post_message).toHaveBeenCalledWith({ type: 'discardEditSession' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'discardEditSession',
+        }));
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
@@ -2192,14 +2310,16 @@ describe('edit mode save exit', () => {
         const first_mount_id = grid_stub().getAttribute('data-mount-id');
 
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
 
         const pendingEdits = { '0:0': { value: 'restored', base: 'base' } };
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
             pendingEdits,
-        } as HostMessage);
+        });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_stub().getAttribute('data-initial-edits')).toBe(
@@ -2208,7 +2328,67 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
     });
 
-    it('does not clear pending edits when capability ID arrives before the session grant', async () => {
+    it('restores a clean owned edit session after receiver recreation', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'clean-owned-session',
+                },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.edit_session_id).toBe('clean-owned-session');
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual({});
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe('{}');
+    });
+
+    it('clears stale initial edits and remounts when a granted session has none', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            },
+        ));
+
+        await click_button('Edit');
+        const stale = { '0:0': { value: 'stale', base: 'old-base' } };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'old-session',
+            pendingEdits: stale,
+        });
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(stale);
+
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        await click_button('Edit');
+        const before_grant = grid_stub().getAttribute('data-mount-id');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'new-session',
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_grant);
+        expect(post_message.mock.calls.filter(([message]) => (
+            (message as { type?: string }).type === 'requestEditSession'
+        ))).toHaveLength(2);
+    });
+
+    it('ignores an unsolicited session grant after a capability refresh', async () => {
         grid_shell_mock.emit_pending_edits_on_mount = true;
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -2245,14 +2425,10 @@ describe('edit mode save exit', () => {
             editSessionId: 'session-new',
             pendingEdits,
         });
-        expect(post_message).toHaveBeenCalledWith({
-            type: 'pendingEditsChanged',
-            editSessionId: 'session-new',
-            edits: pendingEdits,
-        });
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
-            JSON.stringify(pendingEdits),
-        );
+        expect(post_message.mock.calls.some(([message]) => (
+            (message as { type?: string }).type === 'pendingEditsChanged'
+        ))).toBe(false);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('drops edit mode and pending restoration when the host revokes a saved session', async () => {
@@ -2265,6 +2441,7 @@ describe('edit mode save exit', () => {
                 },
             })
         );
+        await click_button('Edit');
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
@@ -2273,16 +2450,29 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
-        await dispatch_host_message({ type: 'editSessionRevoked', reason: 'saved' });
+        const operation = {
+            editSessionId: 'test-edit-session',
+            saveRequestId: 'save:matching',
+            edits: { '0:0': 'draft' },
+        };
+        await dispatch_host_message({ type: 'saveOperationStarted', operation });
+        await dispatch_host_message({
+            type: 'editSessionRevoked',
+            reason: 'saved',
+            editSessionId: operation.editSessionId,
+            saveRequestId: operation.saveRequestId,
+        });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        expect(post_message).not.toHaveBeenCalledWith({ type: 'releaseEditSession' });
+        expect(post_message.mock.calls.some(([message]) => (
+            (message as { type?: string }).type === 'releaseEditSession'
+        ))).toBe(false);
         expect(post_message.mock.calls.some(([message]) => (
             (message as { type?: string }).type === 'pendingEditsChanged'
         ))).toBe(false);
     });
 
-    it('stays in edit mode when cleanup recovery enables capability before granting', async () => {
+    it('ignores an unsolicited grant when cleanup recovery enables capability', async () => {
         await render_app();
         const meta = make_meta(['Sheet1'], false);
         await dispatch_host_message(workbook_snapshot_message(meta, {
@@ -2307,7 +2497,7 @@ describe('edit mode save exit', () => {
         }));
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('disables the edit toolbar while GridShell is saving', async () => {
@@ -2328,7 +2518,333 @@ describe('edit mode save exit', () => {
         expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
     });
 
-    it('stays in edit mode when save is requested while dirty work is already saving', async () => {
+    it('retains the exact save guard across a generation remount', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        const before_mount = grid_stub().getAttribute('data-mount-id');
+
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const operation = grid_shell_mock.latest_props?.save_operation as {
+            editSessionId: string;
+            saveRequestId: string;
+        };
+        expect(operation.saveRequestId).toEqual(expect.any(String));
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 2,
+            sourceGeneration: 2,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: operation.editSessionId,
+            },
+        }));
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_mount);
+        expect(grid_shell_mock.latest_props?.save_operation).toMatchObject(operation);
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            editSessionId: operation.editSessionId,
+            saveRequestId: 'stale-save',
+        });
+        expect(grid_shell_mock.latest_props?.save_operation).toMatchObject(operation);
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            ...operation,
+        });
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+    });
+
+    it('keeps a local save locked through delayed idle before exact active acceptance', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        const previous: CsvSaveOperation = {
+            editSessionId: 'session-delayed-idle',
+            saveRequestId: 'failed-r2',
+            edits: { '0:0': 'old' },
+            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        };
+        await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: previous.editSessionId,
+                csvSaveLifecycle: {
+                    revision: 2,
+                    state: 'failed',
+                    operation: previous,
+                },
+            },
+        }));
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const proposed = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(proposed.saveRequestId).toEqual(expect.any(String));
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { pendingEdits: proposed.dirtyEdits },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: proposed.editSessionId,
+                csvSaveLifecycle: { revision: 3, state: 'idle' },
+            },
+        }));
+        expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(proposed.dirtyEdits);
+
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 4, state: 'active', operation: proposed },
+        });
+        expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(proposed.dirtyEdits);
+    });
+
+    it('applies a newer save terminal carried by a stale same-file snapshot', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+            identity: {
+                deliveryId: 10,
+                authority: { fileId: 'file:test', revision: 10 },
+                stateRevision: 10,
+                sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
+            },
+        }));
+        await enter_edit_mode(post_message);
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: operation.editSessionId,
+                csvSaveLifecycle: {
+                    revision: 2,
+                    state: 'failed',
+                    operation,
+                },
+            },
+            identity: {
+                deliveryId: 9,
+                authority: { fileId: 'file:test', revision: 9 },
+                stateRevision: 9,
+                sourceBasis: { physicalRevision: 9, projectionRevision: 0 },
+            },
+        }));
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(
+            operation.dirtyEdits,
+        );
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+    });
+
+    it('rehydrates an exact failed operation even when durable pending state is absent', async () => {
+        const operation: CsvSaveOperation = {
+            editSessionId: 'failed-session',
+            saveRequestId: 'failed-before-acceptance',
+            edits: { '0:0': 'overlay' },
+            dirtyEdits: {
+                '0:0': { value: 'overlay', base: 'exact-base' },
+            },
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: operation.editSessionId,
+                    csvSaveLifecycle: {
+                        revision: 2,
+                        state: 'failed',
+                        operation,
+                    },
+                },
+            },
+        ));
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(
+            operation.dirtyEdits,
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('does not hydrate a failed operation over a different current session', async () => {
+        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const failed: CsvSaveOperation = {
+            editSessionId: 'old-session',
+            saveRequestId: 'old-failure',
+            edits: { '0:0': 'old' },
+            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: newer },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'new-session',
+                    csvSaveLifecycle: {
+                        revision: 3,
+                        state: 'failed',
+                        operation: failed,
+                    },
+                },
+            },
+        ));
+
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(newer);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('tombstones stale pending edits for a succeeded current session', async () => {
+        const succeeded: CsvSaveOperation = {
+            editSessionId: 'saved-session',
+            saveRequestId: 'saved-operation',
+            edits: { '0:0': 'saved' },
+            dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: succeeded.dirtyEdits },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: succeeded.editSessionId,
+                    csvSaveLifecycle: {
+                        revision: 4,
+                        state: 'succeeded',
+                        operation: succeeded,
+                    },
+                },
+            },
+        ));
+
+        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('keeps saved entries cleared across reliable success, remount, and edit reacquisition', async () => {
+        const operation: CsvSaveOperation = {
+            editSessionId: 'saved-session',
+            saveRequestId: 'saved-operation',
+            edits: { '0:0': 'saved' },
+            dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+        };
+        const lifecycle = {
+            revision: 4,
+            state: 'succeeded' as const,
+            operation,
+        };
+        const { post_message } = await render_app();
+
+        // Both direct terminal messages are absent. The reliable snapshot alone
+        // must tombstone the accepted pending map.
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: operation.dirtyEdits },
+                capabilities: {
+                    csvEditable: false,
+                    csvEditingSupported: true,
+                    csvSaveLifecycle: lifecycle,
+                },
+            },
+        ));
+        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        const initial_mount = grid_stub().getAttribute('data-mount-id');
+
+        // Cleanup can arrive with the same lifecycle revision. A generation
+        // remount must still consume the authoritative empty state.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: undefined },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvSaveLifecycle: lifecycle,
+                },
+            },
+        ));
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(initial_mount);
+        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+
+        post_message.mockClear();
+        await click_button('Edit');
+        const request = post_message.mock.calls.find(
+            ([message]) => (message as { type?: string }).type === 'requestEditSession',
+        )?.[0] as { requestId: string };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            requestId: request.requestId,
+            granted: true,
+            editSessionId: 'new-session',
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+    });
+
+    it('preserves pending edits for a newer session after an older success', async () => {
+        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const succeeded: CsvSaveOperation = {
+            editSessionId: 'old-session',
+            saveRequestId: 'old-success',
+            edits: { '0:0': 'old' },
+            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        };
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: newer },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'new-session',
+                    csvSaveLifecycle: {
+                        revision: 4,
+                        state: 'succeeded',
+                        operation: succeeded,
+                    },
+                },
+            },
+        ));
+
+        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(newer);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('honors an authoritative success while local editing status is stale', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -2348,7 +2864,7 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
 
@@ -2356,7 +2872,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({ type: 'saveResult', success: true });
         await report_grid_editing(true);
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('exits edit mode after a busy save-on-exit succeeds with no remaining dirty work', async () => {
@@ -2379,7 +2895,7 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
@@ -2390,7 +2906,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
-    it('stays in edit mode after save success when only a live editor remains uncommitted', async () => {
+    it('discards an operation-owned live overlay after save success', async () => {
         grid_shell_mock.is_dirty = false;
         grid_shell_mock.has_uncommitted_changes = true;
         grid_shell_mock.request_save.mockReturnValue(false);
@@ -2411,14 +2927,14 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
 
         await dispatch_host_message({ type: 'saveResult', success: true });
 
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('exits after a successful save once a still-open overlay later resolves clean (no timer)', async () => {
@@ -2442,12 +2958,13 @@ describe('edit mode save exit', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         await dispatch_host_message({ type: 'saveResult', success: true });
-        // Overlay is still open and uncommitted: must stay in edit mode.
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        // The accepted operation owns the overlay, so success is terminal even if
+        // a stale editing-status report still says it is open.
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
 
         // The overlay commits/clears — GridShell reports the live-editor state
         // going clean. The editing-status effect (not a timer) completes the exit.
@@ -2475,11 +2992,11 @@ describe('edit mode save exit', () => {
         await report_grid_editing(false, true);
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         await dispatch_host_message({ type: 'saveResult', success: true });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
 
         // A stray failed save after success must not cancel the pending exit;
         // when the overlay later resolves clean, the exit still completes.
@@ -2508,11 +3025,11 @@ describe('edit mode save exit', () => {
         await report_grid_editing(false, true);
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'showSaveDialog' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         await dispatch_host_message({ type: 'saveResult', success: true });
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
 
         // A fresh document arrives (resetting pending-exit bookkeeping) and brings
         // restored edits, so edit mode re-engages. The earlier pending exit must
@@ -2554,7 +3071,7 @@ describe('edit mode save exit', () => {
         await click_button('Discard All');
 
         expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
-        expect(post_message).toHaveBeenCalledWith({ type: 'discardEditSession' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'discardEditSession' }));
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 });
@@ -2653,7 +3170,7 @@ describe('sorting and filtering', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith({ type: 'requestEditSession' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'requestEditSession' }));
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
@@ -2711,6 +3228,36 @@ describe('sorting and filtering', () => {
         const cancel = post_message.mock.calls.map((call) => call[0])
             .find((message) => message.type === 'setTransform');
         expect(cancel.state.filters).toEqual([disabled]);
+    });
+
+    it('keeps a new transform pending when an old receiver terminal arrives', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        await dispatch_host_message(initial_snapshot_message(meta));
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const old_request = latest_transform_request(post_message);
+
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-header-transform') as HTMLButtonElement
+        ).click());
+        const current_request = latest_transform_request(post_message);
+        expect(current_request.requestId).not.toBe(old_request.requestId);
+
+        await acknowledge_transform(old_request, 99);
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(true);
+
+        await acknowledge_transform(current_request, 2);
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
     });
 
     it('suppresses semantically unchanged transform requests without remounting', async () => {

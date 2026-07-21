@@ -1,14 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
+import type { ExtensionContext } from 'vscode';
 import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
-import type { FileStateSnapshot, FileStateStore } from '../state';
+import {
+    create_file_state_store,
+    type FileStateSnapshot,
+    type FileStateStore,
+} from '../state';
 import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { file_coordinator_registry_size } from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
-import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
+import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
 const enc = new TextEncoder();
 
@@ -53,6 +58,25 @@ class StubSource implements DataSource {
 class FailingTransformSource extends StubSource {
     override read_rows(): RowWindow {
         throw new Error('column read failed');
+    }
+}
+
+class SignallingInvalidFilterSource extends StubSource {
+    constructor(private readonly on_read: () => void) {
+        super();
+    }
+    override read_rows(): RowWindow {
+        this.on_read();
+        return {
+            startRow: 0,
+            rows: [[{
+                raw: '1',
+                rawType: 'number',
+                formatted: '1',
+                bold: false,
+                italic: false,
+            }]],
+        };
     }
 }
 
@@ -128,6 +152,7 @@ function edit_session_results(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
         (message): message is {
             type: string;
+            requestId?: string;
             granted: boolean;
             editSessionId?: string;
             pendingEdits?: PerFileState['pendingEdits'];
@@ -137,7 +162,7 @@ function edit_session_results(panel: { __messages: unknown[] }) {
             && 'type' in message
             && message.type === 'editSessionResult'
         )
-    ).map(({ editSessionId: _session, ...message }) => message);
+    ).map(({ editSessionId: _session, requestId: _request, ...message }) => message);
 }
 
 function latest_edit_session_message(panel: { __messages: unknown[] }) {
@@ -154,24 +179,14 @@ function latest_edit_session_message(panel: { __messages: unknown[] }) {
     ));
 }
 
-function latest_snapshot(panel: { __messages: unknown[] }): {
-    generation: number;
-    sourceGeneration: number;
-    state: PerFileState;
-    identity: WorkbookSnapshotIdentity;
-} {
+function latest_snapshot(panel: { __messages: unknown[] }): WorkbookSnapshot {
     const message = [...panel.__messages].reverse().find((candidate) => (
         typeof candidate === 'object'
         && candidate !== null
         && 'type' in candidate
         && candidate.type === 'workbookSnapshot'
         && 'snapshot' in candidate
-    )) as { snapshot: {
-        generation: number;
-        sourceGeneration: number;
-        state: PerFileState;
-        identity: WorkbookSnapshotIdentity;
-    } };
+    )) as { snapshot: WorkbookSnapshot };
     return message.snapshot;
 }
 
@@ -399,11 +414,15 @@ describe('CSV edit sessions', () => {
         )).length;
         const older = deferred<FileStateSnapshot>();
         const newer = deferred<FileStateSnapshot>();
-        queued.push(older, newer);
+        const newer_confirmation = deferred<FileStateSnapshot>();
+        queued.push(older, newer, newer_confirmation);
 
         const older_ready = panel.__receive({ type: 'ready' });
         const newer_ready = panel.__receive({ type: 'ready' });
-        newer.resolve({ revision: 3, state: { columnWidths: [{ 0: 203 }] } });
+        const newer_state = { revision: 3, state: { columnWidths: [{ 0: 203 }] } };
+        newer.resolve(newer_state);
+        await Promise.resolve();
+        newer_confirmation.resolve(newer_state);
         await newer_ready;
         older.resolve({ revision: 3, state: { columnWidths: [{ 0: 102 }] } });
         await older_ready;
@@ -523,13 +542,15 @@ describe('CSV edit sessions', () => {
             sourceGeneration: acknowledged.sourceGeneration,
             state: undefined,
         } as never);
+        await flush_promises();
+        const visibility_snapshot = latest_snapshot(panel);
 
         await panel.__receive({
             type: 'stateChanged',
-            sourceGeneration: acknowledged.sourceGeneration,
-            snapshotIdentity: acknowledged.identity,
+            sourceGeneration: visibility_snapshot.sourceGeneration,
+            snapshotIdentity: visibility_snapshot.identity,
             state: {
-                ...acknowledged.state,
+                ...visibility_snapshot.state,
                 columnWidths: [{ 0: 120 }],
             },
         });
@@ -843,6 +864,93 @@ describe('CSV edit sessions', () => {
         expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
     });
 
+    it.each(['read', 'touch'] as const)(
+        'denies the exact edit request when state %s rejects after claim reservation',
+        async (failure) => {
+            const file_path = `/tmp/edit-request-${failure}-rejection.csv`;
+            const versioned = state_store();
+            let reject_state_io = false;
+            const store: FileStateStore = {
+                ...versioned.store,
+                async read(path) {
+                    if (reject_state_io && failure === 'read') {
+                        throw new Error('edit state read rejected');
+                    }
+                    return versioned.store.read(path);
+                },
+                async touch(path) {
+                    if (reject_state_io && failure === 'touch') {
+                        throw new Error('edit state touch rejected');
+                    }
+                    return versioned.store.touch(path);
+                },
+            };
+            const panel = open_csv_table(uri(file_path), store);
+            const sibling = open_csv_table(uri(file_path), store);
+            await panel.__receive({ type: 'ready' });
+            await sibling.__receive({ type: 'ready' });
+            reject_state_io = true;
+            const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+            await expect(panel.__receive({
+                type: 'requestEditSession',
+                requestId: `request-${failure}`,
+            })).resolves.toBeUndefined();
+            const result = [...panel.__messages].reverse().find((message) => (
+                typeof message === 'object'
+                && message !== null
+                && 'type' in message
+                && message.type === 'editSessionResult'
+            ));
+            expect(result).toEqual({
+                type: 'editSessionResult',
+                requestId: `request-${failure}`,
+                granted: false,
+            });
+            expect(error).toHaveBeenCalledWith(
+                'Failed to read CSV edit-session state',
+                expect.any(Error),
+            );
+
+            reject_state_io = false;
+            await sibling.__receive({
+                type: 'requestEditSession',
+                requestId: `sibling-${failure}`,
+            });
+            expect(edit_session_results(sibling).at(-1)?.granted).toBe(true);
+        },
+    );
+
+    it('projects a clean owned session across receiver reload and preserves exclusion', async () => {
+        const file_path = '/tmp/clean-session-receiver-reload.csv';
+        const shared = state_store();
+        const owner = open_csv_table(uri(file_path), shared.store);
+        const sibling = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+
+        owner.__messages.length = 0;
+        await owner.__receive({ type: 'ready' });
+        const restored = latest_snapshot(owner);
+        expect(restored.capabilities).toMatchObject({
+            csvEditable: true,
+            csvEditSessionId: session_id,
+        });
+        expect(restored.state.pendingEdits).toBeUndefined();
+
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'blocked' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(false);
+
+        await owner.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_id,
+        });
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'recovered' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(true);
+    });
+
     it('reacquires with a new edit epoch and rejects delayed messages from the old session', async () => {
         const file_path = '/tmp/reacquired-edit-epoch.csv';
         const state = state_store();
@@ -912,60 +1020,224 @@ describe('CSV edit sessions', () => {
         ))).toHaveLength(2);
     });
 
-    it('aborts an old epoch when ownership changes between state read and CAS', async () => {
-        const file_path = '/tmp/pending-cas-epoch-race.csv';
+    it('drains an admitted dirty update before release transfers ownership', async () => {
+        const file_path = '/tmp/pending-release-drain.csv';
         const versioned = state_store();
-        const old_cas_started = deferred();
-        const old_cas_gate = deferred();
-        let block_old = true;
+        const compare_started = deferred();
+        const compare_gate = deferred();
         const store: FileStateStore = {
             ...versioned.store,
             async compare_and_set(path, expected, next, validate) {
-                const pending = next.pendingEdits?.['0:0'];
-                if (
-                    block_old
-                    && typeof pending === 'object'
-                    && pending?.value === 'old owner'
-                ) {
-                    block_old = false;
-                    old_cas_started.resolve();
-                    await old_cas_gate.promise;
+                if (next.pendingEdits?.['0:0']) {
+                    compare_started.resolve();
+                    await compare_gate.promise;
                 }
                 return versioned.store.compare_and_set(path, expected, next, validate);
             },
         };
-        const old_owner = open_csv_table(uri(file_path), store);
-        const new_owner = open_csv_table(uri(file_path), store);
-        await old_owner.__receive({ type: 'ready' });
-        await new_owner.__receive({ type: 'ready' });
-        await old_owner.__receive({ type: 'requestEditSession' });
-        const old_session = latest_edit_session_message(old_owner)!.editSessionId!;
+        const owner = open_csv_table(uri(file_path), store);
+        const sibling = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
 
-        const stale_write = old_owner.__receive({
+        const pending = owner.__receive({
             type: 'pendingEditsChanged',
-            editSessionId: old_session,
-            edits: { '0:0': { value: 'old owner', base: 'a' } },
+            editSessionId: session_id,
+            edits: { '0:0': { value: 'latest', base: 'a' } },
         });
-        await old_cas_started.promise;
-        await old_owner.__receive({ type: 'releaseEditSession' });
-        old_owner.dispose();
+        await compare_started.promise;
+        const release = owner.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_id,
+        });
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'blocked' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(false);
 
-        await new_owner.__receive({ type: 'requestEditSession' });
-        const new_session = latest_edit_session_message(new_owner)!.editSessionId!;
-        await new_owner.__receive({
+        compare_gate.resolve();
+        await Promise.all([pending, release]);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'latest', base: 'a' },
+        });
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'after-drain' });
+        expect(edit_session_results(sibling).at(-1)).toMatchObject({
+            granted: true,
+            pendingEdits: { '0:0': { value: 'latest', base: 'a' } },
+        });
+    });
+
+    it('drains an admitted null clear before release transfers ownership', async () => {
+        const file_path = '/tmp/pending-clear-release-drain.csv';
+        const versioned = state_store({
+            pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
+        });
+        const clear_started = deferred();
+        const clear_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (!next.pendingEdits) {
+                    clear_started.resolve();
+                    await clear_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        const sibling = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+
+        const clear = owner.__receive({
             type: 'pendingEditsChanged',
-            editSessionId: new_session,
-            edits: { '0:0': { value: 'new owner', base: 'a' } },
+            editSessionId: session_id,
+            edits: null,
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
-            '0:0': { value: 'new owner', base: 'a' },
+        await clear_started.promise;
+        const release = owner.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_id,
         });
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'blocked' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(false);
 
-        old_cas_gate.resolve();
-        await stale_write;
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
-            '0:0': { value: 'new owner', base: 'a' },
+        clear_gate.resolve();
+        await Promise.all([clear, release]);
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'after-clear' });
+        expect(edit_session_results(sibling).at(-1)).toEqual({
+            type: 'editSessionResult',
+            granted: true,
         });
+    });
+
+    it('keeps admitted pending persistence alive after panel disposal', async () => {
+        const file_path = '/tmp/pending-disposal-drain.csv';
+        const versioned = state_store();
+        const compare_started = deferred();
+        const compare_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits) {
+                    compare_started.resolve();
+                    await compare_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        const sibling = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const pending = owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { '0:0': { value: 'survives-close', base: 'a' } },
+        });
+        await compare_started.promise;
+
+        owner.dispose();
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'blocked' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(false);
+        compare_gate.resolve();
+        await pending;
+        await flush_promises();
+
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'survives-close', base: 'a' },
+        });
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'after-close' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(true);
+    });
+
+    it('drains multiple admitted pending maps in message order', async () => {
+        const file_path = '/tmp/multiple-pending-release-drain.csv';
+        const versioned = state_store();
+        const first_started = deferred();
+        const first_gate = deferred();
+        let attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                attempts += 1;
+                if (attempts === 1) {
+                    first_started.resolve();
+                    await first_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const first = owner.__receive({
+            type: 'pendingEditsChanged', editSessionId: session_id,
+            edits: { '0:0': { value: 'first', base: 'a' } },
+        });
+        await first_started.promise;
+        const second = owner.__receive({
+            type: 'pendingEditsChanged', editSessionId: session_id,
+            edits: { '0:0': { value: 'second', base: 'a' } },
+        });
+        const release = owner.__receive({
+            type: 'releaseEditSession', editSessionId: session_id,
+        });
+        await flush_promises();
+        expect(attempts).toBe(1);
+
+        first_gate.resolve();
+        await Promise.all([first, second, release]);
+        expect(attempts).toBe(2);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'second', base: 'a' },
+        });
+    });
+
+    it('releases ownership after admitted pending persistence rejects', async () => {
+        const file_path = '/tmp/rejected-pending-release-drain.csv';
+        const versioned = state_store();
+        const compare_started = deferred();
+        const compare_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set() {
+                compare_started.resolve();
+                await compare_gate.promise;
+                throw new Error('pending storage rejected');
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        const sibling = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const pending = owner.__receive({
+            type: 'pendingEditsChanged', editSessionId: session_id,
+            edits: { '0:0': { value: 'rejected', base: 'a' } },
+        });
+        await compare_started.promise;
+        const release = owner.__receive({
+            type: 'releaseEditSession', editSessionId: session_id,
+        });
+        compare_gate.resolve();
+        await expect(pending).rejects.toThrow('pending storage rejected');
+        await expect(release).resolves.toBeUndefined();
+        expect(error).toHaveBeenCalledWith(
+            'Failed to settle admitted CSV edits before release',
+            expect.any(Error),
+        );
+
+        await sibling.__receive({ type: 'requestEditSession', requestId: 'after-rejection' });
+        expect(edit_session_results(sibling).at(-1)?.granted).toBe(true);
     });
 
     it('settles accepted pending-edit persistence before writing a save', async () => {
@@ -1004,7 +1276,121 @@ describe('CSV edit sessions', () => {
 
         pending_gate.resolve();
         await Promise.all([pending, save, write_started.promise]);
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('keeps an accepted overlay save across ready and restores exact bases on write failure', async () => {
+        const file_path = '/tmp/accepted-overlay-remount.csv';
+        const versioned = state_store();
+        const acceptance_started = deferred();
+        const acceptance_gate = deferred();
+        const stat = vi.fn(async () => ({ size: 4, mtime: 1 }));
+        const read = vi.fn(async () => enc.encode('h\na\n'));
+        const write = vi.fn(async () => { throw new Error('disk unavailable'); });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits?.['0:0'] && next.pendingEdits?.['0:1']) {
+                    acceptance_started.resolve();
+                    await acceptance_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        vscode_mock.__setStatImplementation(stat);
+        vscode_mock.__setReadFileImplementation(read);
+        vscode_mock.__setWriteFileImplementation(write);
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        stat.mockClear();
+        read.mockClear();
+
+        const operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'save-overlay',
+            edits: { '0:0': 'overlay', '0:1': 'committed' },
+            dirtyEdits: {
+                '0:0': { value: 'overlay', base: 'overlay-base' },
+                '0:1': { value: 'committed', base: 'committed-base' },
+            },
+        };
+        const save = panel.__receive({ type: 'saveCsv', operation });
+        await acceptance_started.promise;
+        expect(stat).not.toHaveBeenCalled();
+        expect(read).not.toHaveBeenCalled();
+        expect(write).not.toHaveBeenCalled();
+
+        await panel.__receive({ type: 'ready' });
+        const remounted = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
+            capabilities: { csvSaveLifecycle: { state: string; operation?: unknown } };
+        };
+        expect(remounted.capabilities.csvSaveLifecycle).toMatchObject({
+            state: 'active',
+            operation,
+        });
+
+        acceptance_gate.resolve();
+        await save;
+
+        expect(write).toHaveBeenCalledTimes(1);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(operation.dirtyEdits);
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: false,
+            lifecycle: expect.objectContaining({
+                state: 'failed',
+                operation,
+            }),
+        }));
+    });
+
+    it('retries exact acceptance after the last pending-edit write rejected', async () => {
+        const file_path = '/tmp/rejected-pending-before-acceptance.csv';
+        const versioned = state_store();
+        let pending_attempts = 0;
+        const write_started = deferred();
+        const write_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits) {
+                    pending_attempts += 1;
+                    if (pending_attempts === 1) {
+                        throw new Error('earlier pending write failed');
+                    }
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        vscode_mock.__setWriteFileImplementation(async () => {
+            write_started.resolve();
+            await write_gate.promise;
+        });
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        await expect(panel.__receive({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'old', base: 'old-base' } },
+        })).rejects.toThrow('earlier pending write failed');
+
+        const operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'retry-accepted-map',
+            edits: { '0:0': 'exact' },
+            dirtyEdits: { '0:0': { value: 'exact', base: 'exact-base' } },
+        };
+        const save = panel.__receive({ type: 'saveCsv', operation });
+        await write_started.promise;
+
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(
+            operation.dirtyEdits,
+        );
+        write_gate.resolve();
+        await save;
     });
 
     it('ignores late pending-edit messages after save submission', async () => {
@@ -1033,7 +1419,210 @@ describe('CSV edit sessions', () => {
         await save;
         await flush_promises();
         expect(state.get_state(file_path).pendingEdits).toBeUndefined();
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('retires succeeded lifecycle only after durable pending edits are cleared', async () => {
+        const file_path = '/tmp/succeeded-lifecycle-cleanup.csv';
+        const versioned = state_store();
+        const cleanup_started = deferred();
+        const cleanup_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    cleanup_started.resolve();
+                    await cleanup_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save',
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+            },
+        });
+        await cleanup_started.promise;
+        panel.__messages.length = 0;
+        await panel.__receive({ type: 'ready' });
+        const pending = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
+            capabilities: { csvSaveLifecycle: { revision: number; state: string } };
+        };
+        expect(pending.capabilities.csvSaveLifecycle.state).toBe('succeeded');
+        expect(pending.state.pendingEdits).toBeUndefined();
+
+        cleanup_gate.resolve();
+        await flush_promises();
+        panel.__messages.length = 0;
+        await panel.__receive({ type: 'ready' });
+        const cleared = latest_snapshot(panel) as typeof pending;
+        expect(cleared.state.pendingEdits).toBeUndefined();
+        expect(cleared.capabilities.csvSaveLifecycle).toEqual({
+            revision: pending.capabilities.csvSaveLifecycle.revision + 1,
+            state: 'idle',
+        });
+    });
+
+    it('retires a failed save after newer pending edits are accepted', async () => {
+        const file_path = '/tmp/failed-save-newer-pending.csv';
+        const versioned = state_store();
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('write failed');
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit-a' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save-a',
+                edits: { '0:0': 'A' },
+                dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+            },
+        });
+        const failed = [...panel.__messages].reverse().find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'saveResult'
+        )) as { lifecycle: { revision: number; state: string } };
+        expect(failed.lifecycle.state).toBe('failed');
+
+        const newer = { '0:0': { value: 'B', base: 'a' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: edit_session_id,
+            edits: newer,
+        });
+        panel.__messages.length = 0;
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
+            capabilities: { csvSaveLifecycle: { revision: number; state: string } };
+        };
+        expect(snapshot.state.pendingEdits).toEqual(newer);
+        expect(snapshot.capabilities.csvSaveLifecycle).toEqual({
+            revision: failed.lifecycle.revision + 1,
+            state: 'idle',
+        });
+    });
+
+    it('keeps a failed operation as a tombstone outside its original session', async () => {
+        const file_path = '/tmp/failed-save-later-session.csv';
+        const versioned = state_store();
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('write failed');
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-a' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'failed-a',
+                edits: { '0:0': 'A' },
+                dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+            },
+        });
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_a,
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        const grant_b = latest_edit_session_message(panel)!;
+        const session_b = grant_b.editSessionId!;
+        expect(session_b).not.toBe(session_a);
+        expect(grant_b.pendingEdits).toBeUndefined();
+        panel.__messages.length = 0;
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
+            capabilities: {
+                csvEditSessionId?: string;
+                csvSaveLifecycle: { state: string; operation?: { editSessionId: string } };
+            };
+        };
+        expect(snapshot.capabilities.csvEditSessionId).toBe(session_b);
+        expect(snapshot.state.pendingEdits).toBeUndefined();
+        expect(snapshot.capabilities.csvSaveLifecycle).toMatchObject({ state: 'idle' });
+        expect(snapshot.capabilities.csvSaveLifecycle.operation).toBeUndefined();
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+
+        const newer = { '0:0': { value: 'B', base: 'a' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_b,
+            edits: newer,
+        });
+        panel.__messages.length = 0;
+        await panel.__receive({ type: 'ready' });
+        const superseded = latest_snapshot(panel) as typeof snapshot;
+        expect(superseded.state.pendingEdits).toEqual(newer);
+        expect(superseded.capabilities.csvSaveLifecycle).toMatchObject({ state: 'idle' });
+    });
+
+    it('does not hydrate a failed save tombstone into a later panel session', async () => {
+        const file_path = '/tmp/cross-panel-edit-session-id-collision.csv';
+        const versioned = state_store();
+        let reject_cleanup = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (reject_cleanup && !next.pendingEdits) {
+                    throw new Error('retired save cleanup rejected');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('save write rejected');
+        });
+        const first = open_csv_table(uri(file_path), store);
+        const second = open_csv_table(uri(file_path), store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        await first.__receive({ type: 'requestEditSession', requestId: 'first' });
+        const first_session = latest_edit_session_message(first)!.editSessionId!;
+        const failed_map = { '0:0': { value: 'panel-a', base: 'a' } };
+        await first.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: first_session,
+                saveRequestId: 'panel-a-failed-save',
+                edits: { '0:0': 'panel-a' },
+                dirtyEdits: failed_map,
+            },
+        });
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(failed_map);
+
+        reject_cleanup = true;
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        await first.__receive({
+            type: 'releaseEditSession',
+            editSessionId: first_session,
+        });
+        await flush_promises();
+        expect(error).toHaveBeenCalledWith(
+            'Failed to clear retired CSV save state',
+            expect.any(Error),
+        );
+
+        await second.__receive({ type: 'requestEditSession', requestId: 'second' });
+        const second_grant = latest_edit_session_message(second)!;
+        expect(second_grant.granted).toBe(true);
+        expect(second_grant.editSessionId).not.toBe(first_session);
+        expect(second_grant.pendingEdits).toBeUndefined();
     });
 
     it('suppresses the cleanup-failure warning when the saving panel is disposed', async () => {
@@ -1074,7 +1663,7 @@ describe('CSV edit sessions', () => {
         await flush_promises();
 
         // Disk write already succeeded; only the pinned cleanup remains.
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
         warning.mockClear();
         panel.dispose();
         cleanup_gate.resolve();
@@ -1118,7 +1707,7 @@ describe('CSV edit sessions', () => {
         await peer.__receive({ type: 'requestEditSession' });
         await panel.__receive({ type: 'ready' });
 
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
         expect(edit_session_results(peer).at(-1)).toEqual({
             type: 'editSessionResult',
@@ -1170,12 +1759,12 @@ describe('CSV edit sessions', () => {
         await cleanup_started.promise;
         await flush_promises();
 
-        expect(owner.__messages).toContainEqual({
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
             type: 'editSessionRevoked',
             reason: 'saved',
-        });
+        }));
         expect(owner.__messages.filter((message: any) => message?.type === 'saveResult'))
-            .toEqual([{ type: 'saveResult', success: true }]);
+            .toEqual([expect.objectContaining({ type: 'saveResult', success: true })]);
         const peer_refresh = [...peer.__messages].reverse().find((message: any) => (
             message?.type === 'workbookSnapshot'
             && message.snapshot.presentation === 'refresh'
@@ -1297,6 +1886,42 @@ describe('CSV edit sessions', () => {
         expect(edit_session_results(disposed_waiter).some((result) => result.granted)).toBe(false);
     });
 
+    it('deletes free shared edit state after the last recovery attachment disposes', async () => {
+        const file_path = '/tmp/last-attachment-recovery-cleanup.csv';
+        const cleanup = uncertain_cleanup_store({
+            pendingEdits: { '0:0': { value: 'saved', base: 'a' } },
+        });
+        const owner = open_csv_table(uri(file_path), cleanup.store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
+
+        const recovery = owner.__receive({
+            type: 'requestEditSession',
+            requestId: 'recovering-owner',
+        });
+        await cleanup.recovery_started.promise;
+        owner.dispose();
+        await recovery;
+        cleanup.recovery_gate.resolve();
+        await flush_promises();
+
+        // A fresh store for the same path makes a leaked clearedStateRevision
+        // observable: the new revision-zero pending map would be hidden.
+        const fresh_pending = { '0:0': { value: 'fresh', base: 'fresh-base' } };
+        const fresh = state_store({ pendingEdits: fresh_pending });
+        const replacement = open_csv_table(uri(file_path), fresh.store);
+        await replacement.__receive({ type: 'ready' });
+        await replacement.__receive({
+            type: 'requestEditSession',
+            requestId: 'replacement',
+        });
+        const grant = latest_edit_session_message(replacement)!;
+        expect(grant.granted).toBe(true);
+        expect(grant.pendingEdits).toEqual(fresh_pending);
+    });
+
     it('allows exactly one live waiter to claim a shared cleanup recovery', async () => {
         const file_path = '/tmp/shared-cleanup-waiters.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
@@ -1349,6 +1974,57 @@ describe('CSV edit sessions', () => {
         await waiter.__receive({ type: 'requestEditSession' });
         expect(edit_session_results(waiter).at(-1)?.granted).toBe(true);
         vi.useRealTimers();
+    });
+
+    it('releases ownership when a disposed accepted save ends in an external conflict', async () => {
+        const file_path = '/tmp/disposed-accepted-conflict.csv';
+        const versioned = state_store();
+        const verification_started = deferred();
+        const verification_gate = deferred();
+        let bytes = enc.encode('h\na\n');
+        let gate_verification = false;
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            if (gate_verification) {
+                gate_verification = false;
+                verification_started.resolve();
+                await verification_gate.promise;
+            }
+            return bytes;
+        });
+        const owner = open_csv_table(uri(file_path), versioned.store);
+        const peer = open_csv_table(uri(file_path), versioned.store);
+        await owner.__receive({ type: 'ready' });
+        await peer.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession', requestId: 'owner-edit' });
+        const edit_session_id = latest_edit_session_message(owner)!.editSessionId!;
+
+        gate_verification = true;
+        const save = owner.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'accepted-before-dispose',
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+            },
+        });
+        await verification_started.promise;
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'saved', base: 'a' },
+        });
+
+        owner.dispose();
+        bytes = enc.encode('h\nb\n');
+        verification_gate.resolve();
+        await save;
+
+        await peer.__receive({ type: 'requestEditSession', requestId: 'peer-edit' });
+        expect(edit_session_results(peer).at(-1)).toEqual({
+            type: 'editSessionResult',
+            granted: true,
+        });
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
     it('finishes file cleanup after the saving owner is disposed', async () => {
@@ -1496,6 +2172,137 @@ describe('CSV edit sessions', () => {
             },
         } as never);
         expect(state.get_state(file_path).columnVisibility).toEqual([undefined]);
+    });
+
+    it('cancels an old receiver visibility write before it can commit', async () => {
+        const file_path = '/tmp/obsolete-receiver-visibility.csv';
+        const versioned = state_store();
+        const stale_read_started = deferred();
+        const stale_read_gate = deferred();
+        let block_next_read = false;
+        let compare_attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (block_next_read) {
+                    block_next_read = false;
+                    stale_read_started.resolve();
+                    await stale_read_gate.promise;
+                }
+                return snapshot;
+            },
+            async compare_and_set(path, expected, next, validate) {
+                compare_attempts += 1;
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const old_receiver = latest_snapshot(panel);
+
+        block_next_read = true;
+        const visibility = panel.__receive({
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: old_receiver.sourceGeneration,
+            snapshotIdentity: old_receiver.identity,
+            state: { visibleColumns: [], schema: '["Sheet1",1,["h"]]' },
+        });
+        await stale_read_started.promise;
+        const replacement_ready = panel.__receive({ type: 'ready' });
+        stale_read_gate.resolve();
+        await Promise.all([visibility, replacement_ready]);
+
+        expect(compare_attempts).toBe(0);
+        expect(versioned.revision(file_path)).toBe(0);
+        expect(versioned.get_state(file_path).columnVisibility).toBeUndefined();
+    });
+
+    it('rebases a transform-blocked replacement ready and cancels a conflicting old visibility retry', async () => {
+        const file_path = '/tmp/ready-visibility-conflict-rebase.csv';
+        const versioned = state_store();
+        const visibility_cas_started = deferred();
+        const visibility_cas_gate = deferred();
+        const stale_ready_read_started = deferred();
+        const stale_ready_read_gate = deferred();
+        let block_visibility_cas = true;
+        let capture_ready_read = false;
+        let visibility_conflicts = 0;
+        let visibility_compare_attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (capture_ready_read) {
+                    capture_ready_read = false;
+                    stale_ready_read_started.resolve();
+                    await stale_ready_read_gate.promise;
+                }
+                return snapshot;
+            },
+            async compare_and_set(path, expected, next, validate) {
+                if (next.columnVisibility?.[0] && block_visibility_cas) {
+                    block_visibility_cas = false;
+                    visibility_compare_attempts += 1;
+                    visibility_cas_started.resolve();
+                    await visibility_cas_gate.promise;
+                    const result = await versioned.store.compare_and_set(
+                        path,
+                        expected,
+                        next,
+                        validate,
+                    );
+                    if (result.type === 'conflict') visibility_conflicts += 1;
+                    return result;
+                }
+                if (next.columnVisibility?.[0]) visibility_compare_attempts += 1;
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const receiver = open_csv_table(uri(file_path), store);
+        const actor = open_csv_table(uri(file_path), store);
+        await receiver.__receive({ type: 'ready' });
+        await actor.__receive({ type: 'ready' });
+        await receiver.__receive({ type: 'requestEditSession', requestId: 'owner' });
+        await flush_promises();
+        const old_receiver = latest_snapshot(receiver);
+        const actor_snapshot = latest_snapshot(actor);
+
+        const visibility = receiver.__receive({
+            type: 'setColumnVisibility',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: old_receiver.sourceGeneration,
+            snapshotIdentity: old_receiver.identity,
+            state: { visibleColumns: [], schema: '["Sheet1",1,["h"]]' },
+        });
+        await visibility_cas_started.promise;
+
+        capture_ready_read = true;
+        const replacement_ready = receiver.__receive({ type: 'ready' });
+        await stale_ready_read_started.promise;
+        await actor.__receive({
+            type: 'stateChanged',
+            sourceGeneration: actor_snapshot.sourceGeneration,
+            snapshotIdentity: actor_snapshot.identity,
+            state: { ...actor_snapshot.state, rowHeights: [{ 0: 41 }] },
+        });
+        expect(versioned.revision(file_path)).toBe(1);
+
+        visibility_cas_gate.resolve();
+        await visibility;
+        stale_ready_read_gate.resolve();
+        await replacement_ready;
+
+        expect(visibility_conflicts).toBe(1);
+        expect(visibility_compare_attempts).toBe(1);
+        expect(versioned.revision(file_path)).toBe(1);
+        expect(versioned.get_state(file_path).columnVisibility).toEqual([]);
+        expect(versioned.get_state(file_path).rowHeights).toEqual([{ 0: 41 }]);
+        expect(latest_snapshot(receiver).state.rowHeights).toEqual([{ 0: 41 }]);
+        expect(latest_snapshot(receiver).state.columnVisibility).toEqual([undefined]);
     });
 
     it('durably removes host-owned transforms that no longer match the source schema', async () => {
@@ -1650,6 +2457,614 @@ describe('CSV edit sessions', () => {
             && message.type === 'transformApplied')).toBe(true);
     });
 
+    it('invalidates transform persistence when ready starts around CAS validation', async () => {
+        const file_path = '/tmp/ready-transform-cas.csv';
+        const versioned = state_store();
+        const cas_started = deferred();
+        const cas_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.transforms?.[0]) {
+                    cas_started.resolve();
+                    await cas_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = initial_snapshot(panel);
+        panel.__messages.length = 0;
+
+        const transform = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'receiver-1:0:1',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await cas_started.promise;
+        const ready = panel.__receive({ type: 'ready' });
+        cas_gate.resolve();
+        await Promise.all([transform, ready]);
+
+        expect(versioned.get_state(file_path).transforms).toBeUndefined();
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+        ))).toBe(false);
+        expect(latest_snapshot(panel).generation).toBe(snapshot.generation);
+    });
+
+    it('waits for a committed empty-transform install before completing ready', async () => {
+        const file_path = '/tmp/ready-empty-transform-barrier.csv';
+        let stored: unknown = {};
+        let block_update = false;
+        const update_started = deferred();
+        const update_gate = deferred();
+        const context = {
+            globalState: {
+                get: (_key: string, fallback: unknown) => stored ?? fallback,
+                async update(_key: string, value: unknown) {
+                    if (block_update) {
+                        block_update = false;
+                        update_started.resolve();
+                        await update_gate.promise;
+                    }
+                    stored = structuredClone(value);
+                },
+            },
+        } as unknown as ExtensionContext;
+        const store = create_file_state_store(context);
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'install-desc',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        const transformed = latest_snapshot(panel);
+        const applied = [...panel.__messages].reverse().find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+        )) as { generation: number; sourceGeneration: number };
+
+        panel.__messages.length = 0;
+        block_update = true;
+        const clear = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'clear-transform',
+            generation: applied.generation,
+            sourceGeneration: applied.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await update_started.promise;
+        const ready = panel.__receive({ type: 'ready' });
+        let ready_finished = false;
+        void ready.then(() => { ready_finished = true; });
+        await flush_promises();
+        expect(ready_finished).toBe(false);
+
+        update_gate.resolve();
+        await Promise.all([clear, ready]);
+
+        const durable = await store.read(file_path);
+        expect((durable.state as PerFileState).transforms).toEqual([undefined]);
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+            && (message as { requestId?: string }).requestId === 'clear-transform'
+        ))).toBe(false);
+        const ready_snapshot = latest_snapshot(panel);
+        expect(ready_snapshot.generation).toBe(applied.generation + 1);
+        expect(ready_snapshot.sourceGeneration).toBe(initial.sourceGeneration);
+        expect(transformed.sourceGeneration).toBe(initial.sourceGeneration);
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'natural',
+            generation: ready_snapshot.generation,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'natural',
+            rows: [
+                [expect.objectContaining({ raw: 'c' })],
+                [expect.objectContaining({ raw: 'a' })],
+                [expect.objectContaining({ raw: 'b' })],
+            ],
+        }));
+    });
+
+    it('reconciles a superseded durable transform when newer Cancel persistence fails', async () => {
+        const file_path = '/tmp/superseded-transform-cancel-failure.csv';
+        let stored: unknown = {};
+        let block_ascending = false;
+        let reject_descending = false;
+        const ascending_update_started = deferred();
+        const ascending_update_gate = deferred();
+        const context = {
+            globalState: {
+                get: (_key: string, fallback: unknown) => stored ?? fallback,
+                async update(_key: string, value: unknown) {
+                    const direction = (value as {
+                        entries?: Record<string, {
+                            state?: { transforms?: Array<{ sort?: Array<{ direction?: string }> }> };
+                        }>;
+                    }).entries?.[file_path]?.state?.transforms?.[0]?.sort?.[0]?.direction;
+                    if (block_ascending && direction === 'asc') {
+                        block_ascending = false;
+                        ascending_update_started.resolve();
+                        await ascending_update_gate.promise;
+                    }
+                    if (reject_descending && direction === 'desc') {
+                        reject_descending = false;
+                        throw new Error('cancel persistence rejected');
+                    }
+                    stored = structuredClone(value);
+                },
+            },
+        } as unknown as ExtensionContext;
+        const store = create_file_state_store(context);
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const initial = latest_snapshot(panel);
+        const schema = '["Sheet1",1,["h"]]';
+        const preferred = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema,
+        };
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'install-preferred',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: preferred,
+        });
+        const installed = [...panel.__messages].reverse().find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+            && (message as { requestId?: string }).requestId === 'install-preferred'
+        )) as { generation: number; sourceGeneration: number };
+
+        block_ascending = true;
+        const a = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'A',
+            generation: installed.generation,
+            sourceGeneration: installed.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema,
+            },
+        });
+        await ascending_update_started.promise;
+        reject_descending = true;
+        const cancel_b = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'Cancel-B',
+            generation: installed.generation,
+            sourceGeneration: installed.sourceGeneration,
+            intent: 'cancel',
+            state: preferred,
+        });
+        ascending_update_gate.resolve();
+        await Promise.all([a, cancel_b]);
+
+        const durable = await store.read(file_path);
+        expect((durable.state as PerFileState).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+        const converged = latest_snapshot(panel);
+        expect(converged.state.transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'converged-rows',
+            generation: converged.generation,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'converged-rows',
+            rows: [
+                [expect.objectContaining({ raw: 'a' })],
+                [expect.objectContaining({ raw: 'b' })],
+                [expect.objectContaining({ raw: 'c' })],
+            ],
+        }));
+    });
+
+    it('reconciles a cross-panel durable transform clear before ready completes', async () => {
+        const file_path = '/tmp/cross-panel-transform-clear.csv';
+        const shared = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const retaining = open_csv_table(uri(file_path), shared.store);
+        const clearing = open_csv_table(uri(file_path), shared.store);
+        await retaining.__receive({ type: 'ready' });
+        await clearing.__receive({ type: 'ready' });
+        const initial = latest_snapshot(retaining);
+
+        await retaining.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'retain-desc',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await clearing.__receive({ type: 'ready' });
+        const clearing_snapshot = latest_snapshot(clearing);
+        await clearing.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'durable-clear',
+            generation: clearing_snapshot.generation,
+            sourceGeneration: clearing_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(shared.get_state(file_path).transforms).toEqual([undefined]);
+
+        retaining.__messages.length = 0;
+        await retaining.__receive({ type: 'ready' });
+        const reconciled = latest_snapshot(retaining);
+        expect(reconciled.generation).toBe(initial.generation + 2);
+        expect(reconciled.sourceGeneration).toBe(initial.sourceGeneration);
+        await retaining.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'natural-after-clear',
+            generation: reconciled.generation,
+        });
+        expect(retaining.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'natural-after-clear',
+            rows: [
+                [expect.objectContaining({ raw: 'c' })],
+                [expect.objectContaining({ raw: 'a' })],
+                [expect.objectContaining({ raw: 'b' })],
+            ],
+        }));
+    });
+
+    it('revalidates durable state before installing a ready transform', async () => {
+        const file_path = '/tmp/ready-transform-revision-revalidation.csv';
+        const saved_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const versioned = state_store({ transforms: [saved_transform] });
+        const stale_confirmation_captured = deferred();
+        const stale_confirmation_gate = deferred();
+        let ready_read_count = 0;
+        let delay_stale_confirmation = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (delay_stale_confirmation) {
+                    ready_read_count += 1;
+                    if (ready_read_count === 2) {
+                        delay_stale_confirmation = false;
+                        stale_confirmation_captured.resolve();
+                        await stale_confirmation_gate.promise;
+                    }
+                }
+                return snapshot;
+            },
+        };
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const retaining = open_csv_table(uri(file_path), store);
+        const clearing = open_csv_table(uri(file_path), store);
+        await retaining.__receive({ type: 'ready' });
+        await clearing.__receive({ type: 'ready' });
+        const clearing_snapshot = latest_snapshot(clearing);
+
+        retaining.__messages.length = 0;
+        delay_stale_confirmation = true;
+        const ready = retaining.__receive({ type: 'ready' });
+        await stale_confirmation_captured.promise;
+        await clearing.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'clear-after-stale-confirmation-read',
+            generation: clearing_snapshot.generation,
+            sourceGeneration: clearing_snapshot.sourceGeneration,
+            intent: 'user',
+            state: { sort: [], filters: [], schema: saved_transform.schema },
+        });
+        stale_confirmation_gate.resolve();
+        await ready;
+
+        const settled = latest_snapshot(retaining);
+        expect(settled.state.transforms).toEqual([undefined]);
+        await retaining.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'stable-natural',
+            generation: settled.generation,
+        });
+        expect(retaining.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'stable-natural',
+            rows: [
+                [expect.objectContaining({ raw: 'c' })],
+                [expect.objectContaining({ raw: 'a' })],
+                [expect.objectContaining({ raw: 'b' })],
+            ],
+        }));
+    });
+
+    it('rebases ready after source replacement cancels transform reconciliation', async () => {
+        const file_path = '/tmp/ready-transform-source-rebase.csv';
+        const saved_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const versioned = state_store({ transforms: [saved_transform] });
+        const ready_read_started = deferred();
+        let signal_ready_read = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                const snapshot = await versioned.store.read(path);
+                if (signal_ready_read) {
+                    signal_ready_read = false;
+                    ready_read_started.resolve();
+                }
+                return snapshot;
+            },
+        };
+        let bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const before = latest_snapshot(panel);
+
+        panel.__messages.length = 0;
+        signal_ready_read = true;
+        const ready = panel.__receive({ type: 'ready' });
+        await ready_read_started.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        bytes = enc.encode('h\nz\ny\nx\n');
+        await vscode_mock.__getActiveWatchers()[0].__fireChange(uri(file_path) as never);
+        await ready;
+
+        const rebased = latest_snapshot(panel);
+        expect(rebased.sourceGeneration).toBeGreaterThan(before.sourceGeneration);
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'rebased-sorted',
+            generation: rebased.generation,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'rebased-sorted',
+            rows: [
+                [expect.objectContaining({ raw: 'x' })],
+                [expect.objectContaining({ raw: 'y' })],
+                [expect.objectContaining({ raw: 'z' })],
+            ],
+        }));
+
+        const delivered_generation = rebased.sourceGeneration;
+        bytes = enc.encode('h\nq\np\no\n');
+        await vscode_mock.__getActiveWatchers()[0].__fireChange(uri(file_path) as never);
+        await flush_promises();
+        expect(latest_snapshot(panel).sourceGeneration).toBeGreaterThan(delivered_generation);
+    });
+
+    it('rebases ready when a sibling commits while transform preparation later throws', async () => {
+        const file_path = '/tmp/ready-transform-throw-revision-rebase.csv';
+        const invalid_transform = {
+            sort: [],
+            filters: [{
+                id: 'invalid-numeric-filter',
+                colIndex: 0,
+                operator: 'greaterThan' as const,
+                value: 'not-a-number',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [invalid_transform] });
+        const scan_started = deferred();
+        let signal_scan = false;
+        const retaining_profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new SignallingInvalidFilterSource(() => {
+                    if (signal_scan) {
+                        signal_scan = false;
+                        scan_started.resolve();
+                    }
+                });
+            },
+        };
+        const sibling_profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new StubSource(); },
+        };
+        const retaining = open_csv_table(uri(file_path), versioned.store, retaining_profile);
+        const sibling = open_csv_table(uri(file_path), versioned.store, sibling_profile);
+        await retaining.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        const sibling_snapshot = latest_snapshot(sibling);
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        retaining.__messages.length = 0;
+        signal_scan = true;
+        const ready = retaining.__receive({ type: 'ready' });
+        await scan_started.promise;
+        await sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sibling-clears-invalid-transform',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: { sort: [], filters: [], schema: invalid_transform.schema },
+        });
+        await ready;
+
+        expect(versioned.get_state(file_path).transforms).toEqual([undefined]);
+        expect(latest_snapshot(retaining).state.transforms).toEqual([undefined]);
+        expect(error).toHaveBeenCalledWith(
+            expect.stringContaining('Failed to reconcile table transforms'),
+            expect.any(Error),
+        );
+    });
+
+    it('confirms an unchanged revision after reconciliation and confirmation-read errors', async () => {
+        const file_path = '/tmp/ready-transform-error-confirmation.csv';
+        const saved_transform = {
+            sort: [],
+            filters: [{
+                id: 'invalid-numeric-filter',
+                colIndex: 0,
+                operator: 'greaterThan' as const,
+                value: 'not-a-number',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [saved_transform] });
+        let reject_confirmation = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (reject_confirmation) {
+                    reject_confirmation = false;
+                    throw new Error('transient confirming read failure');
+                }
+                return versioned.store.read(path);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new SignallingInvalidFilterSource(() => {
+                    reject_confirmation = true;
+                });
+            },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        const before = sheet_meta_count(panel);
+
+        await panel.__receive({ type: 'ready' });
+        expect(sheet_meta_count(panel)).toBe(before + 1);
+        expect(latest_snapshot(panel).state.transforms).toEqual([saved_transform]);
+        expect(versioned.revision(file_path)).toBe(0);
+        expect(error).toHaveBeenCalledWith(
+            expect.stringContaining('Failed to reconcile table transforms'),
+            expect.any(Error),
+        );
+    });
+
+    it('completes the ready gate after transform reconciliation throws', async () => {
+        const file_path = '/tmp/ready-transform-error-gate.csv';
+        const saved_transform = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        };
+        const state = state_store({ transforms: [saved_transform] });
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new FailingTransformSource();
+            },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), state.store, profile);
+        await panel.__receive({ type: 'ready' });
+        const before = sheet_meta_count(panel);
+
+        await panel.__receive({ type: 'ready' });
+        expect(sheet_meta_count(panel)).toBe(before + 1);
+        await panel.__receive({ type: 'ready' });
+        expect(sheet_meta_count(panel)).toBe(before + 2);
+        expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
+        expect(error).toHaveBeenCalledWith(
+            expect.stringContaining('Failed to reconcile table transforms'),
+            expect.any(Error),
+        );
+    });
+
     it('keeps host-owned restore preferences after a restore read failure', async () => {
         const file_path = '/tmp/restore-failure.csv';
         const saved_transform = {
@@ -1713,6 +3128,183 @@ describe('CSV edit sessions', () => {
             && message.type === 'transformApplied',
         ) as { error?: string } | undefined;
         expect(response?.error).toContain('Exit edit mode');
+    });
+
+    it('rejects a sibling transform while another panel owns CSV editing', async () => {
+        const file_path = '/tmp/cross-panel-owned-transform.csv';
+        const shared = state_store();
+        const owner = open_csv_table(uri(file_path), shared.store);
+        const sibling = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const sibling_snapshot = latest_snapshot(sibling);
+
+        await sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sibling-during-edit',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+
+        expect(shared.get_state(file_path).transforms).toBeUndefined();
+        expect(sibling.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sibling-during-edit',
+            error: expect.stringContaining('edit mode'),
+        }));
+    });
+
+    it('reserves an edit claim before state I/O so a sibling transform cannot overtake it', async () => {
+        const file_path = '/tmp/edit-claim-transform-race.csv';
+        const versioned = state_store();
+        const read_started = deferred();
+        const read_gate = deferred();
+        let block_read = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (block_read) {
+                    block_read = false;
+                    read_started.resolve();
+                    await read_gate.promise;
+                }
+                return versioned.store.read(path);
+            },
+        };
+        const claimant = open_csv_table(uri(file_path), store);
+        const sibling = open_csv_table(uri(file_path), store);
+        await claimant.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        const sibling_snapshot = latest_snapshot(sibling);
+
+        block_read = true;
+        const claim = claimant.__receive({ type: 'requestEditSession' } as never);
+        await read_started.promise;
+        await sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'overtaking-transform',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        read_gate.resolve();
+        await claim;
+
+        expect(edit_session_results(claimant).at(-1)).toEqual({
+            type: 'editSessionResult', granted: true,
+        });
+        expect(versioned.get_state(file_path).transforms).toBeUndefined();
+        expect(sibling.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'overtaking-transform',
+            error: expect.stringContaining('edit mode'),
+        }));
+    });
+
+    it('does not grant a sibling edit claim while transform work is admitted or installed', async () => {
+        const file_path = '/tmp/cross-panel-transform-edit-race.csv';
+        const shared = state_store();
+        const transformer = open_csv_table(uri(file_path), shared.store);
+        const claimant = open_csv_table(uri(file_path), shared.store);
+        await transformer.__receive({ type: 'ready' });
+        await claimant.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(transformer);
+
+        const transform = transformer.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'admitted-transform',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await claimant.__receive({ type: 'requestEditSession' } as never);
+        await transform;
+        await claimant.__receive({ type: 'requestEditSession' } as never);
+
+        expect(edit_session_results(claimant)).toEqual([
+            { type: 'editSessionResult', granted: false },
+            { type: 'editSessionResult', granted: false },
+        ]);
+    });
+
+    it('keeps ready natural during an owned edit session and saves the same physical row', async () => {
+        const file_path = '/tmp/edit-transform-row-identity.csv';
+        const shared = state_store();
+        let bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const owner = open_csv_table(uri(file_path), shared.store);
+        const sibling = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const edit_session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const sibling_snapshot = latest_snapshot(sibling);
+
+        await sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-while-owned',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        owner.__messages.length = 0;
+        await owner.__receive({ type: 'ready' });
+        const remounted = latest_snapshot(owner);
+        await owner.__receive({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+            requestId: 'natural-owned-rows', generation: remounted.generation,
+        });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'natural-owned-rows',
+            rows: [
+                [expect.objectContaining({ raw: 'c' })],
+                [expect.objectContaining({ raw: 'a' })],
+                [expect.objectContaining({ raw: 'b' })],
+            ],
+        }));
+
+        await owner.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save-natural-row',
+                edits: { '0:0': 'edited-c' },
+                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+            },
+        });
+        await flush_promises();
+        expect(new TextDecoder().decode(bytes)).toBe('h\nedited-c\na\nb\n');
     });
 
     it('does not grant edit mode while a transform is computing', async () => {
@@ -1870,6 +3462,7 @@ describe('CSV edit sessions', () => {
         await first.__receive({ type: 'ready' });
         await second.__receive({ type: 'ready' });
         first.dispose();
+        await flush_promises();
 
         await second.__receive({ type: 'requestEditSession' } as never);
 

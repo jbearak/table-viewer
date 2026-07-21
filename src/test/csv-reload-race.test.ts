@@ -160,14 +160,14 @@ describe('CSV reload races', () => {
         const delivered = workbook_snapshots(panel).at(-1)!;
 
         await panel.__receive({ type: 'saveCsv', edits: {} });
-        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+        expect(panel.__messages.at(-1)).toEqual(expect.objectContaining({ type: 'saveResult', success: false }));
         await panel.__receive({
             type: 'snapshotApplied',
             identity: { ...delivered.identity, deliveryId: 999 },
             disposition: 'applied',
         });
         await panel.__receive({ type: 'saveCsv', edits: {} });
-        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+        expect(panel.__messages.at(-1)).toEqual(expect.objectContaining({ type: 'saveResult', success: false }));
 
         await panel.__receive({
             type: 'snapshotApplied',
@@ -175,7 +175,7 @@ describe('CSV reload races', () => {
             disposition: 'duplicate',
         });
         await panel.__receive({ type: 'saveCsv', edits: {} });
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
     it('mock event disposables unregister handlers', async () => {
@@ -948,7 +948,7 @@ describe('CSV reload races', () => {
         await older_reload;
 
         await panel.__receive({ type: 'saveCsv', edits: {} });
-        expect(panel.__messages.at(-1)).toEqual({ type: 'saveResult', success: false });
+        expect(panel.__messages.at(-1)).toEqual(expect.objectContaining({ type: 'saveResult', success: false }));
 
         // The same B digest must not deduplicate: only a B metadata post can mark
         // this adoption delivered. The third event therefore reparses and posts.
@@ -1485,7 +1485,7 @@ describe('CSV reload races', () => {
         for (const panel of [owner, peer, preview]) {
             expect(source_refresh_snapshots(panel)[0].meta.sheets[0].rowCount).toBe(1);
         }
-        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
         expect(peer.__messages.some((message: any) => message?.type === 'saveResult')).toBe(false);
         expect(preview.__messages.some((message: any) => message?.type === 'saveResult')).toBe(false);
         vi.useRealTimers();
@@ -1516,7 +1516,7 @@ describe('CSV reload races', () => {
 
         expect(builds).toBe(2);
         expect(source_refresh_snapshots(panel)).toHaveLength(1);
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
     it('deduplicates a delayed own watcher only for panels that ACKed postSave', async () => {
@@ -1598,7 +1598,7 @@ describe('CSV reload races', () => {
         await save;
         await flush_promises();
 
-        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
         expect(source_refresh_snapshots(owner)).toHaveLength(1);
         peer.dispose();
     });
@@ -1631,7 +1631,7 @@ describe('CSV reload races', () => {
         await save;
 
         const results = owner.__messages.filter((message: any) => message?.type === 'saveResult');
-        expect(results).toEqual([{ type: 'saveResult', success: true }]);
+        expect(results).toEqual([expect.objectContaining({ type: 'saveResult', success: true })]);
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
         vi.useRealTimers();
     });
@@ -1663,7 +1663,7 @@ describe('CSV reload races', () => {
         await vi.advanceTimersByTimeAsync(500);
         await save;
 
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
         expect(source_refresh_snapshots(panel)).toHaveLength(0);
         expect(warning).toHaveBeenCalledTimes(1);
         expect(initial.meta.sheets[0].rowCount).toBe(1);
@@ -1723,15 +1723,35 @@ describe('CSV reload races', () => {
             requestId: 'external-wins',
             rows: [[expect.objectContaining({ raw: 'other' })]],
         }));
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: true });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
-    it('emits one success even when the panel is disposed after writeFile', async () => {
+    it('finishes durable cleanup when disposal makes panel.webview throw', async () => {
         const file_path = '/tmp/save-disposal.csv';
+        const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
+        const versioned = versioned_state_store({ pendingEdits });
+        const store = with_in_memory_authority_transactions(versioned.store);
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => bytes);
-        const panel = open_csv_table(uri(file_path));
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const live_webview = panel.webview;
+        let getter_disposed = false;
+        Object.defineProperty(panel, 'webview', {
+            configurable: true,
+            get() {
+                if (getter_disposed) throw new Error('panel.webview accessed after disposal');
+                return live_webview;
+            },
+        });
+        panel.onDidDispose(() => { getter_disposed = true; });
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri(file_path),
+            store,
+            csv_table_profile(),
+        );
+        panel.onDidDispose(() => controller.dispose());
         vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
             bytes = new Uint8Array(content);
             panel.dispose();
@@ -1740,9 +1760,11 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'requestEditSession' });
 
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await flush_promises();
 
         expect(panel.__messages.filter((message: any) => message?.type === 'saveResult'))
-            .toEqual([{ type: 'saveResult', success: true }]);
+            .toEqual([]);
+        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
     it('releases a disposed owner when writeFile rejects', async () => {
@@ -1776,10 +1798,14 @@ describe('CSV reload races', () => {
         const replacement = open_csv_table(uri(file_path));
         await replacement.__receive({ type: 'ready' });
         await replacement.__receive({ type: 'requestEditSession' });
-        expect(replacement.__messages).toContainEqual(expect.objectContaining({
+        const grant = [...replacement.__messages].reverse().find((message: any) => (
+            message?.type === 'editSessionResult'
+        ));
+        expect(grant).toEqual(expect.objectContaining({
             type: 'editSessionResult',
             granted: true,
         }));
+        expect(grant).not.toHaveProperty('pendingEdits');
     });
 
     it('refuses a same-size same-mtime external edit before saving', async () => {
@@ -1799,7 +1825,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'requestEditSession' });
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
 
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: false });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: false }));
         expect(warning_spy).toHaveBeenCalledWith(
             expect.stringContaining('modified externally'),
         );
@@ -1835,7 +1861,7 @@ describe('CSV reload races', () => {
 
         await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
 
-        expect(owner.__messages).toContainEqual({ type: 'saveResult', success: false });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: false }));
         expect(owner_builds).toBe(2);
         expect(peer_builds).toBe(1);
         expect(source_refresh_snapshots(owner)).toHaveLength(1);
@@ -1863,7 +1889,7 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'requestEditSession' });
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
 
-        expect(panel.__messages).toContainEqual({ type: 'saveResult', success: false });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: false }));
     });
 
     it('reports a save conflict cleanly even when the post-conflict reload fails', async () => {
@@ -1896,7 +1922,7 @@ describe('CSV reload races', () => {
                 && (m as { type: string }).type === 'saveResult'
             ),
         );
-        expect(results).toEqual([{ type: 'saveResult', success: false }]);
+        expect(results).toEqual([expect.objectContaining({ type: 'saveResult', success: false })]);
         // Only the "modified externally" warning — no generic save-failure error.
         expect(error_spy).not.toHaveBeenCalled();
     });

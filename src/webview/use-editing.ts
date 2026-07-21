@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { read_overlay_editor_value } from './live-editor';
+import type { CsvDirtyEntry } from '../types';
 
 export interface EditingCell {
     row: number;
@@ -7,9 +8,7 @@ export interface EditingCell {
     value: string;
 }
 
-export interface DirtyEntry {
-    value: string;
-    base: string;
+export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
     // old-format string edit restored while its page was evicted). Conflict
     // detection skips such entries until the page loads and `base` is captured.
@@ -204,6 +203,16 @@ export function use_editing(
         set_dirty_cells(new Map());
     }, []);
 
+    const replace_dirty = useCallback((entries: Readonly<Record<string, CsvDirtyEntry>>) => {
+        has_pending_base_ref.current = false;
+        set_dirty_cells(new Map(
+            Object.entries(entries).map(([key, entry]) => [
+                key,
+                { value: entry.value, base: entry.base },
+            ]),
+        ));
+    }, []);
+
     const clear_dirty_keys = useCallback((keys: Set<string>) => {
         set_dirty_cells((prev) => {
             const next = new Map(prev);
@@ -301,10 +310,6 @@ export function use_editing(
         return keys;
     }, [dirty_cells, get_cell_raw]);
 
-    // Flag set before posting saveCsv so consumers can distinguish save-triggered
-    // reloads from external file changes.
-    const save_in_flight_ref = useRef(false);
-
     // Close any open editor when the data reloads (token bump) — whether from our
     // own save or an external change. Dirty edits are preserved either way so the
     // user never silently loses unsaved work; conflict detection then flags any
@@ -339,9 +344,9 @@ export function use_editing(
         commit_edit,
         cancel_edit,
         clear_dirty,
+        replace_dirty,
         clear_dirty_keys,
         clear_dirty_saved_edits,
-        save_in_flight_ref,
         get_display_value,
         get_active_editor_value,
         conflicted_keys,

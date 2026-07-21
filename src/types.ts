@@ -122,7 +122,7 @@ export interface PerFileState {
     scrollPosition?: (ScrollPosition | undefined)[];
     activeSheetIndex?: number;
     tabOrientation?: 'horizontal' | 'vertical' | null;
-    pendingEdits?: Record<string, string | { value: string; base: string }>;
+    pendingEdits?: Record<string, string | CsvDirtyEntry>;
     /** Explicit Excel first-row choices keyed by worksheet name. Missing = auto. */
     excelFirstRowHeaders?: Record<string, ExcelHeaderOverride>;
     /** Last effective projection by worksheet name, used to detect closed-view changes. */
@@ -170,15 +170,44 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
+/** Exact conflict-preserving entry durably owned by the CSV edit session. */
+export interface CsvDirtyEntry {
+    readonly value: string;
+    readonly base: string;
+}
+
+export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
+
+/** Immutable identity and payload for one accepted CSV save operation. */
+export interface CsvSaveOperation {
+    readonly editSessionId: string;
+    readonly saveRequestId: string;
+    readonly edits: Readonly<Record<string, string>>;
+    readonly dirtyEdits: CsvDirtyMap;
+}
+
+export type CsvSaveLifecycle =
+    | { readonly revision: number; readonly state: 'idle' }
+    | { readonly revision: number; readonly state: 'active'; readonly operation: CsvSaveOperation }
+    | { readonly revision: number; readonly state: 'failed'; readonly operation: CsvSaveOperation }
+    | { readonly revision: number; readonly state: 'succeeded'; readonly operation: CsvSaveOperation };
+
+export type ActiveCsvSaveLifecycle = Extract<CsvSaveLifecycle, { state: 'active' }>;
+export type TerminalCsvSaveLifecycle = Extract<
+    CsvSaveLifecycle,
+    { state: 'failed' | 'succeeded' }
+>;
+
 /** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
-    | { type: 'saveResult'; success: boolean }
-    | { type: 'editSessionResult'; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
-    | { type: 'editSessionRevoked'; reason: 'saved' | 'cleanupUncertain' }
-    | { type: 'saveDialogResult'; choice: 'save' | 'discard' | 'cancel' }
+    | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
+    | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle }
+    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
+    | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
+    | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 
 /** Messages from webview to extension host */
@@ -188,15 +217,15 @@ export type WebviewMessage =
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
-    | { type: 'requestEditSession' }
-    | { type: 'releaseEditSession' }
-    | { type: 'discardEditSession' }
-    | { type: 'saveCsv'; edits: Record<string, string>; editSessionId: string }
-    | { type: 'showSaveDialog' }
+    | { type: 'requestEditSession'; requestId: string }
+    | { type: 'releaseEditSession'; editSessionId: string }
+    | { type: 'discardEditSession'; editSessionId: string }
+    | { type: 'saveCsv'; operation: CsvSaveOperation }
+    | { type: 'showSaveDialog'; editSessionId: string; requestId: string }
     | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
-    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number };
+    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };
