@@ -1,6 +1,6 @@
 # Table Viewer
 
-Viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files in VS Code.
+Fast, full-featured viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files in VS Code, with persistent layouts, sorting, filtering, and auto-refresh.
 
 ## Why
 
@@ -9,7 +9,8 @@ If you work with scripts that output tables — R, Stata, Python, or anything el
 Existing solutions were slow, didn't work the way I wanted, or both. I wanted a viewer that:
 
 - **Auto-refreshes** when the file changes on disk, without losing my place
-- **Remembers layout** — column widths, row heights, scroll position, and active sheet — across reloads and sessions
+- **Remembers layout** — column widths, row heights, hidden columns, scroll position, and active sheet — across reloads and sessions
+- **Lets me explore results** — promote headers, sort and filter rows, and hide irrelevant columns — without changing the underlying file
 - **Lets me toggle formatting** so I can see raw values (`3.14159265358979`) or formatted output (`3.14`) with one click
 - **Lives in VS Code** so it works the same whether I'm local or on a remote host via SSH
 - **Uses VS Code's theme** so it doesn't look out of place
@@ -59,6 +60,7 @@ Table Viewer is the result.
 - Keyboard shortcuts operate on the focused column: `Shift+Alt+A` / `D` sort, `Shift+Alt+F` filters, `Shift+Alt+X` clears its filter, and `Shift+Alt+0` / `9` clear all sorts or filters
 - Multiple enabled filters are combined, while disabled filters remain available for later reuse
 - Sorts and filters are view-only, persist per file and sheet, and are recomputed after reloads
+- Sorting and filtering use raw cell values rather than formatted display text
 - Empty values sort last in both directions
 - When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
 - Sorting and filtering are unavailable during CSV/TSV edit mode and in synchronized preview panes; column visibility remains available in every mode
