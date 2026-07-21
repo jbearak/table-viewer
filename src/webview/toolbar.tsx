@@ -174,14 +174,18 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 )}
             </div>
             <div ref={actions_ref} className="toolbar-actions">
-                {props.show_formatting_button && (
+                {props.show_edit_button && (
                     <ToolbarButton
-                        label="Formatting"
-                        active={props.show_formatting}
-                        tooltip_text={props.show_formatting
-                            ? 'Show raw cell values.'
-                            : 'Show formatted cell values.'}
-                        onClick={props.on_toggle_formatting}
+                        label="Edit"
+                        active={props.edit_mode}
+                        tooltip_text={props.edit_disabled
+                            ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
+                            : props.edit_mode
+                            ? 'Exit edit mode.'
+                            : 'Enter edit mode to modify cell values.'}
+                        onClick={props.on_toggle_edit_mode}
+                        extra_class={props.is_dirty ? 'has-unsaved' : undefined}
+                        disabled={props.edit_disabled}
                     />
                 )}
                 {props.show_excel_header_button && (
@@ -201,14 +205,14 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                         focusable_when_disabled
                     />
                 )}
-                {props.show_vertical_tabs_button && (
+                {props.show_formatting_button && (
                     <ToolbarButton
-                        label="Vertical Tabs"
-                        active={props.vertical_tabs}
-                        tooltip_text={props.vertical_tabs
-                            ? 'Move sheet tabs above the table.'
-                            : 'Move sheet tabs to the left of the table.'}
-                        onClick={props.on_toggle_tab_orientation}
+                        label="Formatting"
+                        active={props.show_formatting}
+                        tooltip_text={props.show_formatting
+                            ? 'Show raw cell values.'
+                            : 'Show formatted cell values.'}
+                        onClick={props.on_toggle_formatting}
                     />
                 )}
                 <ColumnVisibilityControl
@@ -226,18 +230,14 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     onClick={props.on_toggle_auto_fit}
                     disabled={props.auto_fit_disabled}
                 />
-                {props.show_edit_button && (
+                {props.show_vertical_tabs_button && (
                     <ToolbarButton
-                        label="Edit"
-                        active={props.edit_mode}
-                        tooltip_text={props.edit_disabled
-                            ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
-                            : props.edit_mode
-                            ? 'Exit edit mode.'
-                            : 'Enter edit mode to modify cell values.'}
-                        onClick={props.on_toggle_edit_mode}
-                        extra_class={props.is_dirty ? 'has-unsaved' : undefined}
-                        disabled={props.edit_disabled}
+                        label="Vertical Tabs"
+                        active={props.vertical_tabs}
+                        tooltip_text={props.vertical_tabs
+                            ? 'Move sheet tabs above the table.'
+                            : 'Move sheet tabs to the left of the table.'}
+                        onClick={props.on_toggle_tab_orientation}
                     />
                 )}
             </div>

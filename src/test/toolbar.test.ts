@@ -157,6 +157,26 @@ afterEach(() => {
 });
 
 describe('Toolbar', () => {
+    it('orders actions from content editing through table and tab layout', () => {
+        const { container } = render_toolbar({
+            show_edit_button: true,
+            show_excel_header_button: true,
+        });
+
+        const labels = Array.from(
+            container.querySelectorAll<HTMLButtonElement>('.toolbar-actions button'),
+            (button) => button.textContent,
+        );
+        expect(labels).toEqual([
+            'Edit',
+            'First Row as Header',
+            'Formatting',
+            'Columns',
+            'Auto-fit Columns',
+            'Vertical Tabs',
+        ]);
+    });
+
     it('explains raw-value transform semantics before any sort or filter is active', () => {
         const { container } = render_toolbar({
             transform: { sort: [], filters: [] },
