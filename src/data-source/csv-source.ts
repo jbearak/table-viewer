@@ -1,5 +1,11 @@
 // src/data-source/csv-source.ts
-import type { DataSource, RenderedCell, RowWindow, WorkbookMeta } from './interface';
+import type {
+    ColumnWindow,
+    DataSource,
+    RenderedCell,
+    RowWindow,
+    WorkbookMeta,
+} from './interface';
 import { build_line_index, build_line_map, split_csv_rows, type LineIndex } from './line-index';
 
 /**
@@ -172,6 +178,38 @@ export class CsvDataSource implements DataSource {
         return { startRow: start, rows };
     }
 
+    read_columns(
+        _sheet: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        for (const column of column_indices) {
+            if (!Number.isInteger(column) || column < 0 || column >= this._colCount) {
+                throw new RangeError(
+                    `column index ${column} out of range (${this._colCount} columns)`,
+                );
+            }
+        }
+        const start = Math.max(0, Math.min(start_row, this._rowCount));
+        const end = Math.min(start + count, this._rowCount);
+        if (start >= end) return { startRow: start, rows: [] };
+
+        const byte_start = this.index.offsetOf(start + this._dataStart);
+        const byte_end = this.index.endOffsetOf(end - 1 + this._dataStart);
+        const fragment = this.decoder.decode(this.buf.subarray(byte_start, byte_end));
+        const parsed = split_csv_selected_columns(
+            fragment,
+            this.delimiter,
+            column_indices,
+        );
+        const rows: (RenderedCell | null)[][] = [];
+        for (let index = 0; index < end - start; index++) {
+            rows.push(this.to_selected_cells(parsed[index] ?? []));
+        }
+        return { startRow: start, rows };
+    }
+
     /**
      * Row -> 0-based source-line map for the CSV preview pane's scroll sync.
      * Built from the same row boundaries as the grid (so its length always equals
@@ -200,6 +238,102 @@ export class CsvDataSource implements DataSource {
         }
         return cells;
     }
+
+    private to_selected_cells(row: string[]): (RenderedCell | null)[] {
+        return row.map((value) => value === '' ? null : {
+            raw: value,
+            formatted: value,
+            bold: false,
+            italic: false,
+            rawType: 'string',
+        });
+    }
+}
+
+/** Parse every row boundary but retain text only for requested fields. CSV is
+ * inherently sequential, so delimiters and quote state must still be scanned;
+ * avoiding string accumulation and cell creation for unrequested fields keeps
+ * transform materialization proportional to selected columns rather than sheet
+ * width. Requested order and duplicates are preserved. */
+function split_csv_selected_columns(
+    text: string,
+    delimiter: string,
+    column_indices: readonly number[],
+): string[][] {
+    const requested_positions = new Map<number, number[]>();
+    for (let position = 0; position < column_indices.length; position++) {
+        const column = column_indices[position];
+        const positions = requested_positions.get(column);
+        if (positions) positions.push(position);
+        else requested_positions.set(column, [position]);
+    }
+
+    const rows: string[][] = [];
+    let selected = new Array<string>(column_indices.length).fill('');
+    let field = '';
+    let field_index = 0;
+    let requested = requested_positions.get(0);
+    let in_quotes = false;
+    let field_start = true;
+    let row_dirty = false;
+
+    const end_field = () => {
+        if (requested) {
+            for (const position of requested) selected[position] = field;
+        }
+        field = '';
+        field_index += 1;
+        requested = requested_positions.get(field_index);
+        field_start = true;
+    };
+    const end_row = () => {
+        end_field();
+        rows.push(selected);
+        selected = new Array<string>(column_indices.length).fill('');
+        field_index = 0;
+        requested = requested_positions.get(0);
+        row_dirty = false;
+    };
+
+    for (let index = 0; index < text.length; index++) {
+        const character = text[index];
+        if (in_quotes) {
+            if (character === '"') {
+                if (index + 1 < text.length && text[index + 1] === '"') {
+                    if (requested) field += '"';
+                    index += 1;
+                    continue;
+                }
+                in_quotes = false;
+                continue;
+            }
+            if (requested) field += character;
+            continue;
+        }
+        if (character === '"' && field_start) {
+            in_quotes = true;
+            field_start = false;
+            row_dirty = true;
+            continue;
+        }
+        if (character === delimiter) {
+            end_field();
+            row_dirty = true;
+            continue;
+        }
+        if (character === '\n' || character === '\r') {
+            if (character === '\r' && index + 1 < text.length && text[index + 1] === '\n') {
+                index += 1;
+            }
+            end_row();
+            continue;
+        }
+        if (requested) field += character;
+        field_start = false;
+        row_dirty = true;
+    }
+    if (row_dirty) end_row();
+    return rows;
 }
 
 const LF = 0x0a; // \n

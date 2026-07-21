@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { RenderedCell, RowWindow, SheetMeta, WorkbookMeta, DataSource } from '../data-source/interface';
+import { read_source_columns } from '../data-source/interface';
 
 describe('data-source interface shapes', () => {
     it('RenderedCell allows null raw and string formatted', () => {
@@ -26,6 +27,27 @@ describe('data-source interface shapes', () => {
             close: () => {},
         };
         expect(ds.meta().sheets).toEqual([]);
+    });
+    it('projects full rows for legacy sources without read_columns', () => {
+        const ds: DataSource = {
+            meta: () => ({ hasFormatting: false, sheets: [] }),
+            read_rows: () => ({
+                startRow: 4,
+                rows: [[
+                    { raw: 'a', formatted: 'a', bold: false, italic: false },
+                    null,
+                    { raw: 'c', formatted: 'c', bold: false, italic: false },
+                ]],
+            }),
+            close: () => {},
+        };
+        expect(read_source_columns(ds, 0, 4, 1, [2, 0])).toEqual({
+            startRow: 4,
+            rows: [[
+                { raw: 'c', formatted: 'c', bold: false, italic: false },
+                { raw: 'a', formatted: 'a', bold: false, italic: false },
+            ]],
+        });
     });
     it('DataSource carries optional diagnostics read polymorphically by panel-core', () => {
         const ds: DataSource = {

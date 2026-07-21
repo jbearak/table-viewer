@@ -1,4 +1,5 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
+import { read_source_columns } from './data-source/interface';
 import type { HistogramBin } from './types';
 
 const BIN_COUNT = 50;
@@ -44,13 +45,15 @@ export async function compute_column_histogram(
     let count = 0;
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = source.read_rows(
+        const window = read_source_columns(
+            source,
             sheet_index,
             start,
             Math.min(ROW_BATCH_SIZE, sheet.rowCount - start),
+            [column_index],
         );
         for (const row of window.rows) {
-            const value = finite_numeric_value(row[column_index]);
+            const value = finite_numeric_value(row[0]);
             if (value === undefined) continue;
             min = Math.min(min, value);
             max = Math.max(max, value);
@@ -77,13 +80,15 @@ export async function compute_column_histogram(
     }));
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = source.read_rows(
+        const window = read_source_columns(
+            source,
             sheet_index,
             start,
             Math.min(ROW_BATCH_SIZE, sheet.rowCount - start),
+            [column_index],
         );
         for (const row of window.rows) {
-            const value = finite_numeric_value(row[column_index]);
+            const value = finite_numeric_value(row[0]);
             if (value === undefined) continue;
             const fraction = Number.isFinite(span)
                 ? (value - min) / span

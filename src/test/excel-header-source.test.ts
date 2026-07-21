@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
 import type {
+    ColumnWindow,
     DataSource,
     RenderedCell,
     RowWindow,
@@ -30,6 +31,11 @@ function cell(
 class StubSource implements DataSource {
     closed = false;
     readonly read_requests: Array<{ start: number; count: number }> = [];
+    readonly column_requests: Array<{
+        start: number;
+        count: number;
+        columns: number[];
+    }> = [];
 
     constructor(
         private readonly rows: (RenderedCell | null)[][],
@@ -62,6 +68,21 @@ class StubSource implements DataSource {
         };
     }
 
+    read_columns(
+        _sheet: number,
+        start: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        this.column_requests.push({ start, count, columns: [...column_indices] });
+        const clamped = Math.max(0, Math.min(start, this.rows.length));
+        return {
+            startRow: clamped,
+            rows: this.rows.slice(clamped, clamped + Math.max(0, count)).map((row) =>
+                column_indices.map((column) => row[column] ?? null)),
+        };
+    }
+
     close(): void {
         this.closed = true;
     }
@@ -87,6 +108,33 @@ describe('ExcelHeaderDataSource', () => {
                 [expect.objectContaining({ raw: 'Alice' }), expect.objectContaining({ raw: '30' }), expect.objectContaining({ raw: 'true' })],
                 [expect.objectContaining({ raw: 'Bob' }), expect.objectContaining({ raw: '25' }), expect.objectContaining({ raw: 'false' })],
             ],
+        });
+    });
+
+    it('forwards compact column reads with active and inactive row projection', () => {
+        const base = new StubSource([
+            [cell('Name'), cell('Age'), cell('City')],
+            [cell('Alice'), cell(30), cell('Boston')],
+            [cell('Bob'), cell(25), cell('Paris')],
+        ]);
+        const ds = new ExcelHeaderDataSource(base);
+
+        expect(ds.read_columns(0, 0, 2, [2, 0])).toMatchObject({
+            startRow: 0,
+            rows: [
+                [expect.objectContaining({ raw: 'Boston' }), expect.objectContaining({ raw: 'Alice' })],
+                [expect.objectContaining({ raw: 'Paris' }), expect.objectContaining({ raw: 'Bob' })],
+            ],
+        });
+        expect(base.column_requests.at(-1)).toEqual({
+            start: 1, count: 2, columns: [2, 0],
+        });
+
+        ds.set_override('Sheet1', 'off');
+        expect(ds.read_columns(0, 0, 1, [2, 0]).rows[0].map((value) => value?.raw))
+            .toEqual(['City', 'Name']);
+        expect(base.column_requests.at(-1)).toEqual({
+            start: 0, count: 1, columns: [2, 0],
         });
     });
 

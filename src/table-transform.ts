@@ -1,4 +1,5 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
+import { read_source_columns } from './data-source/interface';
 import type {
     FilterEntry,
     SheetTransformState,
@@ -6,7 +7,9 @@ import type {
 } from './types';
 import { transform_is_active } from './types';
 
-const SCAN_ROWS = 1000;
+// Keep each synchronous source read bounded so cancellation can interrupt a
+// transform inside the old 1,000-row scan interval.
+const SCAN_ROWS_PER_CHECKPOINT = 128;
 const FILTER_ROWS_PER_CHECKPOINT = 1000;
 const SORT_CHUNK_ROWS = 2048;
 const SORT_OPERATIONS_PER_CHECKPOINT = 4096;
@@ -56,17 +59,24 @@ export async function compute_transform(
     }
     await cancellation_checkpoint(is_cancelled);
 
-    for (let start = 0; start < sheet.rowCount; start += SCAN_ROWS) {
-        const rows = source.read_rows(
+    for (
+        let start = 0;
+        start < sheet.rowCount;
+        start += SCAN_ROWS_PER_CHECKPOINT
+    ) {
+        const rows = read_source_columns(
+            source,
             sheet_index,
             start,
-            Math.min(SCAN_ROWS, sheet.rowCount - start),
+            Math.min(SCAN_ROWS_PER_CHECKPOINT, sheet.rowCount - start),
+            columns,
         ).rows;
         for (let offset = 0; offset < rows.length; offset++) {
             const source_row = start + offset;
-            for (const col of columns) {
+            for (let selected = 0; selected < columns.length; selected++) {
+                const col = columns[selected];
                 const target = values.get(col)!;
-                const source_cell = rows[offset]?.[col] ?? null;
+                const source_cell = rows[offset]?.[selected] ?? null;
                 const raw = raw_value(source_cell);
                 target.values[source_row] = raw;
                 if (raw !== null) {

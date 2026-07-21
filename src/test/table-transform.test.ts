@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+    ColumnWindow,
     DataSource,
     RenderedCell,
     RowWindow,
@@ -26,6 +27,8 @@ const cell = (
 
 class Source implements DataSource {
     read_calls = 0;
+    materialized_cells = 0;
+    readonly selected_columns: number[][] = [];
 
     constructor(
         readonly rows: (RenderedCell | null)[][],
@@ -47,10 +50,26 @@ class Source implements DataSource {
 
     read_rows(_sheet: number, start: number, count: number): RowWindow {
         this.read_calls += 1;
+        const rows = this.rows.slice(start, start + count);
+        this.materialized_cells += rows.reduce((total, row) => total + row.length, 0);
         return {
             startRow: start,
-            rows: this.rows.slice(start, start + count),
+            rows,
         };
+    }
+
+    read_columns(
+        _sheet: number,
+        start: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        this.read_calls += 1;
+        this.selected_columns.push([...column_indices]);
+        const rows = this.rows.slice(start, start + count).map((row) =>
+            column_indices.map((column) => row[column] ?? null));
+        this.materialized_cells += rows.length * column_indices.length;
+        return { startRow: start, rows };
     }
 
     close(): void {}
@@ -275,6 +294,34 @@ describe('table transforms', () => {
         expect(scan_source.read_calls).toBe(1);
     });
 
+    it('materializes only active columns and checkpoints within the old 1,000-row batch', async () => {
+        const width = 2_000;
+        const rows = Array.from({ length: 1_000 }, (_, row) => {
+            const cells = new Array<RenderedCell | null>(width);
+            cells[width - 1] = cell(String(row));
+            return cells;
+        });
+        const source = new Source(rows);
+
+        const result = await compute_transform(source, 0, {
+            sort: [{ colIndex: width - 1, direction: 'desc' }],
+            filters: [],
+        });
+        expect(result.rowCount).toBe(1_000);
+        expect(source.selected_columns.every((columns) =>
+            columns.length === 1 && columns[0] === width - 1)).toBe(true);
+        expect(source.materialized_cells).toBe(1_000);
+
+        const cancelled = new Source(rows);
+        await expect(compute_transform(cancelled, 0, {
+            sort: [{ colIndex: width - 1, direction: 'asc' }],
+            filters: [],
+        }, cancel_at_checkpoint(4))).rejects.toMatchObject({ name: 'AbortError' });
+        expect(cancelled.read_calls).toBe(2);
+        expect(cancelled.materialized_cells).toBe(256);
+        expect(cancelled.materialized_cells).toBeLessThan(1_000);
+    });
+
     it('cancels cooperatively during filtering, sorting, and compaction', async () => {
         const rows = Array.from(
             { length: 3000 },
@@ -285,26 +332,26 @@ describe('table transforms', () => {
             filters: [filter('greaterThanOrEqual', '1')],
         };
 
-        // Checkpoints: setup 1-2, three source chunks 3-5, filter start 6,
-        // filter chunks 7-9, two bounded sort runs 10-11, merge/copy 12-13,
-        // compaction allocation/copy 14-15.
+        // Checkpoints: setup 1-2, 24 source slices 3-26, filter start 27,
+        // filter chunks 28-30, two bounded sort runs 31-32, merge/copy 33-34,
+        // compaction allocation/copy 35-36.
         await expect(compute_transform(
             new Source(rows),
             0,
             state,
-            cancel_at_checkpoint(7),
+            cancel_at_checkpoint(28),
         )).rejects.toMatchObject({ name: 'AbortError' });
         await expect(compute_transform(
             new Source(rows),
             0,
             state,
-            cancel_at_checkpoint(10),
+            cancel_at_checkpoint(31),
         )).rejects.toMatchObject({ name: 'AbortError' });
         await expect(compute_transform(
             new Source(rows),
             0,
             state,
-            cancel_at_checkpoint(15),
+            cancel_at_checkpoint(36),
         )).rejects.toMatchObject({ name: 'AbortError' });
     });
 

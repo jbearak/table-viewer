@@ -59,6 +59,27 @@ describe('CsvDataSource', () => {
         expect(w.rows[0][0]?.raw).toBe('1');
         expect(w.rows[1][1]?.raw).toBe('4');
     });
+    it('read_columns preserves requested order without materializing full-width rows', () => {
+        const ds = new CsvDataSource(enc(
+            'a,"ignored, field",c,d\n1,"multi\nline",3\n4,5,6,7\n',
+        ), ',', 10000);
+        const selected = ds.read_columns(0, 0, 3, [3, 0, 3]);
+        expect(selected.startRow).toBe(0);
+        expect(selected.rows.every((row) => row.length === 3)).toBe(true);
+        expect(selected.rows.map((row) => row.map((value) => value?.raw ?? null)))
+            .toEqual([
+                ['d', 'a', 'd'],
+                [null, '1', null],
+                ['7', '4', '7'],
+            ]);
+        expect(ds.read_columns(0, 0, 3, [1, 3]).rows.map((row) =>
+            row.map((value) => value?.raw ?? null)))
+            .toEqual([
+                ['ignored, field', 'd'],
+                ['multi\nline', null],
+                ['5', '7'],
+            ]);
+    });
     it('pads short rows to columnCount with null', () => {
         const ds = new CsvDataSource(enc('a,b,c\n1\n'), ',', 10000);
         const w = ds.read_rows(0, 1, 1);

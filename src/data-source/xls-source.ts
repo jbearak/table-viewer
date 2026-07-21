@@ -11,7 +11,7 @@
 
 import { parse_xls_streaming } from '../parse-xls';
 import { ColumnarStore } from './columnar-store';
-import type { DataSource, RowWindow, WorkbookMeta } from './interface';
+import type { ColumnWindow, DataSource, RowWindow, WorkbookMeta } from './interface';
 import type { MergeRange } from '../types';
 
 interface SheetEntry {
@@ -85,6 +85,23 @@ export class XlsDataSource implements DataSource {
         // at (an out-of-range start_row would otherwise desync the two).
         const clamped = Math.max(0, Math.min(start_row, s.store.rowCount));
         return { startRow: clamped, rows: s.store.read_window(clamped, count) };
+    }
+
+    read_columns(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        if (sheet_index < 0 || sheet_index >= this.sheets.length) {
+            throw new RangeError(`sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`);
+        }
+        const sheet = this.sheets[sheet_index];
+        const start = Math.max(0, Math.min(start_row, sheet.store.rowCount));
+        return {
+            startRow: start,
+            rows: sheet.store.read_columns(start, count, column_indices),
+        };
     }
 
     close(): void { /* GC */ }
