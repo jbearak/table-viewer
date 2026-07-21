@@ -756,6 +756,187 @@ describe('table transforms', () => {
         })).resolves.toMatchObject({ indices: Uint32Array.from([0, 2, 3]) });
     });
 
+    it('compiles numeric filter operands once per filter rather than per row', async () => {
+        const measure = async (row_count: number) => {
+            const instrumentation: TransformSortInstrumentation = {
+                numericSortKeyBuilds: 0,
+                numericSortComparisons: 0,
+            };
+            const source = new Source(Array.from(
+                { length: row_count },
+                (_, row) => [cell(String(row + 1))],
+            ));
+            const result = await compute_transform(
+                source,
+                0,
+                {
+                    sort: [],
+                    filters: [
+                        filter('greaterThanOrEqual', '-0'),
+                        filter('lessThanOrEqual', '9.007199254740993e15'),
+                        {
+                            ...filter('between', '0.1e1'),
+                            secondValue: '9007199254740993',
+                        },
+                    ],
+                },
+                undefined,
+                instrumentation,
+            );
+            expect(result.rowCount).toBe(row_count);
+            return instrumentation;
+        };
+
+        const small = await measure(7);
+        const large = await measure(2_007);
+        for (const [row_count, instrumentation] of [
+            [7, small],
+            [2_007, large],
+        ] as const) {
+            // One invariant build for each relation and two for the range.
+            expect(instrumentation.numericFilterOperandKeyBuilds).toBe(4);
+            expect(instrumentation.filterOperandCaseFolds ?? 0).toBe(0);
+            // All three predicates share one lazily built exact LHS per row.
+            expect(instrumentation.numericFilterRowKeyBuilds).toBe(row_count);
+            expect(instrumentation.filterRowCaseFolds ?? 0).toBe(0);
+        }
+    });
+
+    it('case-folds text operands once and only folds rows for text predicates', async () => {
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const result = await compute_transform(
+            new Source(Array.from(
+                { length: 257 },
+                (_, row) => [cell(row % 2 === 0 ? 'ÄPFEL' : 'Birne')],
+            )),
+            0,
+            {
+                sort: [],
+                filters: [
+                    filter('startsWith', 'äpf'),
+                    filter('notContains', 'zzz'),
+                ],
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect(result.rowCount).toBe(129);
+        expect(instrumentation.filterOperandCaseFolds).toBe(2);
+        expect(instrumentation.numericFilterOperandKeyBuilds ?? 0).toBe(0);
+        // The second predicate is reached only by rows passing the first.
+        expect(instrumentation.filterRowCaseFolds).toBe(257 + 129);
+        expect(instrumentation.numericFilterRowKeyBuilds ?? 0).toBe(0);
+    });
+
+    it('builds a numeric row key lazily after earlier predicates pass', async () => {
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const result = await compute_transform(
+            new Source(Array.from(
+                { length: 20 },
+                (_, row) => [cell(String(row + 1))],
+            )),
+            0,
+            {
+                sort: [],
+                filters: [
+                    filter('contains', '1'),
+                    filter('greaterThan', '0'),
+                ],
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect(result.rowCount).toBe(11);
+        expect(instrumentation.filterOperandCaseFolds).toBe(1);
+        expect(instrumentation.numericFilterOperandKeyBuilds).toBe(1);
+        expect(instrumentation.filterRowCaseFolds).toBe(20);
+        expect(instrumentation.numericFilterRowKeyBuilds).toBe(11);
+    });
+
+    it('compiles every filter operator with its existing missing and case semantics', () => {
+        const insensitive = (operator: FilterEntry['operator'], value?: string) =>
+            filter(operator, value);
+        const cases: Array<[
+            RenderedCell | null,
+            FilterEntry,
+            boolean,
+        ]> = [
+            [cell('Alphabet'), insensitive('contains', 'PHA'), true],
+            [cell('Alphabet'), insensitive('notContains', 'zzz'), true],
+            [cell('Alphabet'), insensitive('equals', 'alphabet'), true],
+            [cell('Alphabet'), insensitive('notEquals', 'beta'), true],
+            [cell('Alphabet'), insensitive('startsWith', 'ALP'), true],
+            [cell('Alphabet'), insensitive('endsWith', 'BET'), true],
+            [cell('Zulu'), insensitive('greaterThan', 'Middle'), true],
+            [cell('Middle'), insensitive('greaterThanOrEqual', 'Middle'), true],
+            [cell('Alpha'), insensitive('lessThan', 'Middle'), true],
+            [cell('Middle'), insensitive('lessThanOrEqual', 'Middle'), true],
+            [cell('Middle'), {
+                ...insensitive('between', 'Alpha'),
+                secondValue: 'Zulu',
+            }, true],
+            [null, insensitive('isEmpty'), true],
+            [cell('value'), insensitive('isNotEmpty'), true],
+            [null, insensitive('notContains', 'x'), false],
+            [cell('Alphabet'), {
+                ...insensitive('equals', 'alphabet'),
+                caseSensitive: true,
+            }, false],
+        ];
+
+        for (const [value, entry, expected] of cases) {
+            expect(matches_filter(value, entry), entry.operator).toBe(expected);
+        }
+    });
+
+    it('keeps exact mixed-notation filtering, signed zero, and numeric inference', async () => {
+        const source = new Source([
+            [cell('9.007199254740992e15')],
+            [cell('9007199254740992.5')],
+            [cell('9007199254740993')],
+            [cell('-0e+300')],
+            [cell('0.0')],
+        ]);
+        const apply = (entry: FilterEntry) => compute_transform(source, 0, {
+            sort: [],
+            filters: [entry],
+        });
+
+        await expect(apply(filter('equals', '9007199254740992')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([0]) });
+        await expect(apply(filter('notEquals', '9.007199254740992e15')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([1, 2, 3, 4]) });
+        await expect(apply(filter('greaterThan', '9007199254740992.5')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([2]) });
+        await expect(apply(filter('greaterThanOrEqual', '9007199254740992.5')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([1, 2]) });
+        await expect(apply(filter('lessThan', '0')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([]) });
+        await expect(apply(filter('lessThanOrEqual', '-0')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([3, 4]) });
+
+        const identifiers = new Source([
+            [cell('02')],
+            [cell('2')],
+        ]);
+        await expect(compute_transform(identifiers, 0, {
+            sort: [], filters: [filter('equals', '2')],
+        })).resolves.toMatchObject({ indices: Uint32Array.from([1]) });
+
+        expect(matches_filter(
+            cell('2.', 'number'),
+            filter('equals', '2e0'),
+        )).toBe(true);
+    });
+
     it('treats empty strings and nulls consistently as missing', () => {
         const empty_string = cell('', 'string');
         expect(matches_filter(empty_string, filter('isEmpty'))).toBe(true);
@@ -782,6 +963,14 @@ describe('table transforms', () => {
         await expect(compute_transform(source, 0, {
             sort: [],
             filters: [filter('greaterThan', 'not-a-number')],
+        })).rejects.toThrow('finite numbers');
+
+        await expect(compute_transform(source, 0, {
+            sort: [],
+            filters: [{
+                ...filter('between', '1'),
+                secondValue: 'Infinity',
+            }],
         })).rejects.toThrow('finite numbers');
     });
 

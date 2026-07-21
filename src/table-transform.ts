@@ -53,6 +53,14 @@ interface MutableTransformColumn {
 export interface TransformSortInstrumentation {
     numericSortKeyBuilds: number;
     numericSortComparisons: number;
+    /** Exact numeric RHS keys built while compiling predicates for a request. */
+    numericFilterOperandKeyBuilds?: number;
+    /** Case folds performed on insensitive text RHS operands. */
+    filterOperandCaseFolds?: number;
+    /** Case folds performed on row values while evaluating text predicates. */
+    filterRowCaseFolds?: number;
+    /** Exact numeric row keys built while evaluating numeric predicates. */
+    numericFilterRowKeyBuilds?: number;
     /** Reused key objects and maximum entries retained by any one interner. */
     numericSortKeyReuses?: number;
     numericSortKeyInternPeakEntries?: number;
@@ -120,17 +128,30 @@ export async function compute_transform(
                     sort_instrumentation,
                 );
                 try {
-                    validate_filter_operands(filters, column);
+                    const compiled = compile_filter_group(
+                        filters,
+                        column.numeric && column.foundValue,
+                        true,
+                        sort_instrumentation,
+                    );
                     let group_survivors = 0;
                     for (let row = 0; row < sheet.rowCount; row++) {
                         if (first_group || survivor_mask[row] === 1) {
+                            const raw = column.values[row] ?? null;
+                            let numeric_key: NumericSortKey | undefined;
                             let matches = true;
-                            for (const filter of filters) {
-                                if (!matches_filter_value(
-                                    column.values[row] ?? null,
-                                    filter,
-                                    column.numeric && column.foundValue,
-                                )) {
+                            for (const predicate of compiled.predicates) {
+                                if (
+                                    raw !== null
+                                    && predicate.needsNumericKey
+                                    && numeric_key === undefined
+                                ) {
+                                    numeric_key = build_numeric_filter_row_key(
+                                        raw,
+                                        sort_instrumentation,
+                                    );
+                                }
+                                if (!predicate.matches(raw, numeric_key)) {
                                     matches = false;
                                     break;
                                 }
@@ -478,70 +499,298 @@ export function matches_filter(
     entry: FilterEntry,
 ): boolean {
     const raw = raw_value(cell);
-    return matches_filter_value(
-        raw,
-        entry,
+    const compiled = compile_filter_group(
+        [entry],
         raw !== null && cell_can_be_numeric(cell),
+        false,
     );
+    const predicate = compiled.predicates[0];
+    const numeric_key = raw !== null && predicate.needsNumericKey
+        ? build_numeric_filter_row_key(raw)
+        : undefined;
+    return predicate.matches(raw, numeric_key);
 }
 
-function matches_filter_value(
-    raw: string | null,
+interface CompiledFilterPredicate {
+    readonly needsNumericKey: boolean;
+    readonly matches: (
+        raw: string | null,
+        numeric_key: NumericSortKey | undefined,
+    ) => boolean;
+}
+
+interface CompiledFilterGroup {
+    readonly predicates: readonly CompiledFilterPredicate[];
+}
+
+const NUMERIC_FILTER_OPERATORS = new Set<FilterEntry['operator']>([
+    'equals',
+    'notEquals',
+    'greaterThan',
+    'greaterThanOrEqual',
+    'lessThan',
+    'lessThanOrEqual',
+    'between',
+]);
+
+function compile_filter_group(
+    entries: readonly FilterEntry[],
+    numeric_column: boolean,
+    strict_numeric_operands: boolean,
+    instrumentation?: TransformSortInstrumentation,
+): CompiledFilterGroup {
+    if (strict_numeric_operands) {
+        validate_filter_operands(entries, numeric_column);
+    }
+    return {
+        predicates: entries.map((entry) => compile_filter(
+            entry,
+            numeric_column,
+            strict_numeric_operands,
+            instrumentation,
+        )),
+    };
+}
+
+function compile_filter(
     entry: FilterEntry,
     numeric_column: boolean,
-): boolean {
-    const missing = raw === null;
-    if (entry.operator === 'isEmpty') return missing;
-    // Sight's correction to Raven's stale include-missing bug.
-    if (entry.operator === 'isNotEmpty') return !missing;
-    if (missing) return false;
+    strict_numeric_operands: boolean,
+    instrumentation?: TransformSortInstrumentation,
+): CompiledFilterPredicate {
+    if (entry.operator === 'isEmpty') {
+        return {
+            needsNumericKey: false,
+            matches: (raw) => raw === null,
+        };
+    }
+    if (entry.operator === 'isNotEmpty') {
+        // Sight's correction to Raven's stale include-missing bug.
+        return {
+            needsNumericKey: false,
+            matches: (raw) => raw !== null,
+        };
+    }
 
-    const value = raw!;
-    const lhs = entry.caseSensitive ? value : value.toLocaleLowerCase();
     const raw_rhs = entry.value ?? '';
-    const rhs = entry.caseSensitive ? raw_rhs : raw_rhs.toLocaleLowerCase();
+    if (entry.operator === 'between') {
+        const first = compile_comparison_operand(
+            raw_rhs,
+            numeric_column,
+            strict_numeric_operands,
+            instrumentation,
+        );
+        const second = compile_comparison_operand(
+            entry.secondValue ?? '',
+            numeric_column,
+            strict_numeric_operands,
+            instrumentation,
+        );
+        return {
+            needsNumericKey: first.numeric !== undefined
+                || second.numeric !== undefined,
+            matches: (raw, numeric_key) => raw !== null
+                && compare_compiled_filter_operand(raw, numeric_key, first) >= 0
+                && compare_compiled_filter_operand(raw, numeric_key, second) <= 0,
+        };
+    }
+
+    if (
+        numeric_column
+        && is_numeric_comparison_operator(entry.operator)
+        && numeric_operand_is_usable(raw_rhs, strict_numeric_operands)
+    ) {
+        const numeric_rhs = compile_numeric_filter_operand(
+            raw_rhs,
+            instrumentation,
+        );
+        const compare = numeric_comparison(entry.operator);
+        return {
+            needsNumericKey: true,
+            matches: (raw, numeric_key) => raw !== null
+                && compare(compare_numeric_sort_keys(
+                    numeric_key!,
+                    numeric_rhs,
+                )),
+        };
+    }
+
+    const compile_text_value = () => {
+        const rhs = entry.caseSensitive
+            ? raw_rhs
+            : raw_rhs.toLocaleLowerCase();
+        if (!entry.caseSensitive && instrumentation) {
+            instrumentation.filterOperandCaseFolds =
+                (instrumentation.filterOperandCaseFolds ?? 0) + 1;
+        }
+        const row_value = (raw: string | null): string | null => {
+            if (raw === null || entry.caseSensitive) return raw;
+            if (instrumentation) {
+                instrumentation.filterRowCaseFolds =
+                    (instrumentation.filterRowCaseFolds ?? 0) + 1;
+            }
+            return raw.toLocaleLowerCase();
+        };
+        return { rhs, row_value };
+    };
 
     switch (entry.operator) {
-        case 'contains':
-            return lhs.includes(rhs);
-        case 'notContains':
-            return !lhs.includes(rhs);
-        case 'equals':
-            if (numeric_column && Number.isFinite(Number(raw_rhs))) {
-                return compare_numeric_text(value, raw_rhs) === 0;
-            }
-            return lhs === rhs;
-        case 'notEquals':
-            if (numeric_column && Number.isFinite(Number(raw_rhs))) {
-                return compare_numeric_text(value, raw_rhs) !== 0;
-            }
-            return lhs !== rhs;
-        case 'startsWith':
-            return lhs.startsWith(rhs);
-        case 'endsWith':
-            return lhs.endsWith(rhs);
-        case 'greaterThan':
-            return compare_filter_values(value, raw_rhs, numeric_column) > 0;
-        case 'greaterThanOrEqual':
-            return compare_filter_values(value, raw_rhs, numeric_column) >= 0;
-        case 'lessThan':
-            return compare_filter_values(value, raw_rhs, numeric_column) < 0;
-        case 'lessThanOrEqual':
-            return compare_filter_values(value, raw_rhs, numeric_column) <= 0;
-        case 'between': {
-            const lo = compare_filter_values(value, raw_rhs, numeric_column);
-            const hi = compare_filter_values(
-                value,
-                entry.secondValue ?? '',
-                numeric_column,
-            );
-            return lo >= 0 && hi <= 0;
+        case 'contains': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter((raw) => row_value(raw)?.includes(rhs) ?? false);
         }
+        case 'notContains': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter(
+                (raw) => raw !== null && !row_value(raw)!.includes(rhs),
+            );
+        }
+        case 'equals': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter((raw) => row_value(raw) === rhs);
+        }
+        case 'notEquals': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter(
+                (raw) => raw !== null && row_value(raw) !== rhs,
+            );
+        }
+        case 'startsWith': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter(
+                (raw) => row_value(raw)?.startsWith(rhs) ?? false,
+            );
+        }
+        case 'endsWith': {
+            const { rhs, row_value } = compile_text_value();
+            return text_filter((raw) => row_value(raw)?.endsWith(rhs) ?? false);
+        }
+        case 'greaterThan':
+            return text_relational_filter(raw_rhs, (value) => value > 0);
+        case 'greaterThanOrEqual':
+            return text_relational_filter(raw_rhs, (value) => value >= 0);
+        case 'lessThan':
+            return text_relational_filter(raw_rhs, (value) => value < 0);
+        case 'lessThanOrEqual':
+            return text_relational_filter(raw_rhs, (value) => value <= 0);
         default: {
             const exhaustive: never = entry.operator;
             throw new Error(`Unhandled filter operator ${exhaustive}`);
         }
     }
+}
+
+type NumericComparisonOperator =
+    | 'equals'
+    | 'notEquals'
+    | 'greaterThan'
+    | 'greaterThanOrEqual'
+    | 'lessThan'
+    | 'lessThanOrEqual';
+
+function numeric_comparison(
+    operator: NumericComparisonOperator,
+): (comparison: number) => boolean {
+    switch (operator) {
+        case 'equals': return (value) => value === 0;
+        case 'notEquals': return (value) => value !== 0;
+        case 'greaterThan': return (value) => value > 0;
+        case 'greaterThanOrEqual': return (value) => value >= 0;
+        case 'lessThan': return (value) => value < 0;
+        case 'lessThanOrEqual': return (value) => value <= 0;
+        default: {
+            const exhaustive: never = operator;
+            throw new Error(`Unhandled numeric filter operator ${exhaustive}`);
+        }
+    }
+}
+
+function is_numeric_comparison_operator(
+    operator: FilterEntry['operator'],
+): operator is NumericComparisonOperator {
+    return operator === 'equals'
+        || operator === 'notEquals'
+        || operator === 'greaterThan'
+        || operator === 'greaterThanOrEqual'
+        || operator === 'lessThan'
+        || operator === 'lessThanOrEqual';
+}
+
+function text_relational_filter(
+    rhs: string,
+    accepts: (comparison: number) => boolean,
+): CompiledFilterPredicate {
+    return text_filter(
+        (raw) => raw !== null && accepts(COLLATOR.compare(raw, rhs)),
+    );
+}
+
+function text_filter(
+    matches: CompiledFilterPredicate['matches'],
+): CompiledFilterPredicate {
+    return { needsNumericKey: false, matches };
+}
+
+interface CompiledComparisonOperand {
+    readonly text: string;
+    readonly numeric: NumericSortKey | undefined;
+}
+
+function compile_comparison_operand(
+    value: string,
+    numeric_column: boolean,
+    strict_numeric_operands: boolean,
+    instrumentation?: TransformSortInstrumentation,
+): CompiledComparisonOperand {
+    if (
+        numeric_column
+        && numeric_operand_is_usable(value, strict_numeric_operands)
+    ) {
+        return {
+            text: value,
+            numeric: compile_numeric_filter_operand(value, instrumentation),
+        };
+    }
+    return { text: value, numeric: undefined };
+}
+
+function compare_compiled_filter_operand(
+    raw: string,
+    numeric_key: NumericSortKey | undefined,
+    operand: CompiledComparisonOperand,
+): number {
+    return operand.numeric
+        ? compare_numeric_sort_keys(numeric_key!, operand.numeric)
+        : COLLATOR.compare(raw, operand.text);
+}
+
+function numeric_operand_is_usable(
+    value: string,
+    strict: boolean,
+): boolean {
+    return strict ? finite_number_text(value) : Number.isFinite(Number(value));
+}
+
+function compile_numeric_filter_operand(
+    value: string,
+    instrumentation?: TransformSortInstrumentation,
+): NumericSortKey {
+    if (instrumentation) {
+        instrumentation.numericFilterOperandKeyBuilds =
+            (instrumentation.numericFilterOperandKeyBuilds ?? 0) + 1;
+    }
+    return build_numeric_sort_key(value);
+}
+
+function build_numeric_filter_row_key(
+    raw: string,
+    instrumentation?: TransformSortInstrumentation,
+): NumericSortKey {
+    if (instrumentation) {
+        instrumentation.numericFilterRowKeyBuilds =
+            (instrumentation.numericFilterRowKeyBuilds ?? 0) + 1;
+    }
+    return build_numeric_sort_key(raw);
 }
 
 export function transformed_window(
@@ -582,18 +831,6 @@ function validate_column(col: number, count: number): void {
     if (!Number.isInteger(col) || col < 0 || col >= count) {
         throw new RangeError(`column index ${col} out of range`);
     }
-}
-
-function compare_filter_values(
-    value: string,
-    rhs: string,
-    numeric_column: boolean,
-): number {
-    const rhs_number = Number(rhs);
-    if (numeric_column && Number.isFinite(rhs_number)) {
-        return compare_numeric_text(value, rhs);
-    }
-    return COLLATOR.compare(value, rhs);
 }
 
 function compare_numeric_text(a: string, b: string): number {
@@ -729,20 +966,11 @@ function compare_decimal_magnitudes(a: ExactDecimal, b: ExactDecimal): number {
 
 function validate_filter_operands(
     filters: readonly FilterEntry[],
-    column: TransformColumn,
+    numeric_column: boolean,
 ): void {
-    const numeric_operators = new Set<FilterEntry['operator']>([
-        'equals',
-        'notEquals',
-        'greaterThan',
-        'greaterThanOrEqual',
-        'lessThan',
-        'lessThanOrEqual',
-        'between',
-    ]);
-    if (!column.numeric || !column.foundValue) return;
+    if (!numeric_column) return;
     for (const entry of filters) {
-        if (!numeric_operators.has(entry.operator)) continue;
+        if (!NUMERIC_FILTER_OPERATORS.has(entry.operator)) continue;
         if (!finite_number_text(entry.value)) {
             throw new Error('Numeric filter values must be finite numbers.');
         }
