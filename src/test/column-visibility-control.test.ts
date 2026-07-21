@@ -111,6 +111,7 @@ describe('ColumnVisibilityControl', () => {
         render_control();
         expect(trigger().getAttribute('aria-haspopup')).toBe('dialog');
         expect(trigger().getAttribute('aria-expanded')).toBe('false');
+        expect(trigger().classList.contains('active')).toBe(true);
         expect(trigger().querySelector('.hidden-count-badge')?.textContent).toBe('1');
 
         act(() => trigger().click());
@@ -119,6 +120,26 @@ describe('ColumnVisibilityControl', () => {
         expect(document.querySelector('[role="dialog"]')?.getAttribute('aria-label'))
             .toBe('Choose visible columns');
         expect(document.activeElement).toBe(search());
+    });
+
+    it('uses active styling for hidden columns, not for popup visibility', () => {
+        const rendered = render_control({
+            hidden_count: 0,
+            is_visible: () => true,
+        });
+        expect(trigger().classList.contains('active')).toBe(false);
+
+        act(() => trigger().click());
+        expect(trigger().getAttribute('aria-expanded')).toBe('true');
+        expect(trigger().classList.contains('active')).toBe(false);
+
+        rendered.rerender({ hidden_count: 2 });
+        expect(trigger().classList.contains('active')).toBe(true);
+        expect(trigger().querySelector('.hidden-count-badge')?.textContent).toBe('2');
+
+        act(() => trigger().click());
+        expect(trigger().getAttribute('aria-expanded')).toBe('false');
+        expect(trigger().classList.contains('active')).toBe(true);
     });
 
     it('searches case-insensitively by displayed name and spreadsheet letter', () => {
