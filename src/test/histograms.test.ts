@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
+import type {
+    ColumnWindow,
+    DataSource,
+    RowWindow,
+    WorkbookMeta,
+} from '../data-source/interface';
 import { compute_column_histogram } from '../histograms';
 
 class HistogramSource implements DataSource {
+    readonly selected_columns: number[][] = [];
     constructor(private readonly values: (string | null)[]) {}
     meta(): WorkbookMeta {
         return {
@@ -21,13 +27,31 @@ class HistogramSource implements DataSource {
             ]),
         };
     }
+    read_columns(
+        _sheet: number,
+        start: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        this.selected_columns.push([...column_indices]);
+        const rows = this.values.slice(start, start + count).map((raw) => {
+            const cell = raw === null
+                ? null
+                : { raw, formatted: raw, bold: false, italic: false };
+            return column_indices.map(() => cell);
+        });
+        return { startRow: start, rows };
+    }
     close(): void {}
 }
 
 describe('compute_column_histogram', () => {
     it('builds 50 bounded bins and ignores blank, nonnumeric, and nonfinite values', async () => {
+        const source = new HistogramSource([
+            '0', '25', '50', '75', '100', null, '', 'word', 'Infinity',
+        ]);
         const bins = await compute_column_histogram(
-            new HistogramSource(['0', '25', '50', '75', '100', null, '', 'word', 'Infinity']),
+            source,
             0,
             0,
             () => false,
@@ -36,6 +60,7 @@ describe('compute_column_histogram', () => {
         expect(bins[0].lo).toBe(0);
         expect(bins.at(-1)?.hi).toBe(100);
         expect(bins.reduce((total, bin) => total + bin.count, 0)).toBe(5);
+        expect(source.selected_columns).toEqual([[0], [0]]);
     });
 
     it('returns one bin for a constant column and no bins without numeric values', async () => {

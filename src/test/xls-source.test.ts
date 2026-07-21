@@ -28,6 +28,12 @@ describe('XlsDataSource', () => {
             }
         }
     });
+    it('read_columns matches full-row raw types and formatting', () => {
+        const ds = new XlsDataSource(load('basic.xls'));
+        const full = ds.read_rows(0, 0, 3).rows;
+        const selected = ds.read_columns(0, 0, 3, [3, 0]).rows;
+        expect(selected).toEqual(full.map((row) => [row[3] ?? null, row[0] ?? null]));
+    });
     it('preserves merges in meta', () => {
         const ds = new XlsDataSource(load('merged.xls'));
         expect(ds.meta().sheets[0].merges.length).toBeGreaterThan(0);
@@ -70,6 +76,8 @@ describe('XlsDataSource', () => {
         expect(inventory.columnNames).toEqual(['Product', 'Price', 'Quantity']);
         expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Alice');
         expect(ds.read_rows(0, 0, 1).rows[0][3]?.rawType).toBe('date');
+        expect(ds.read_columns(0, 0, 1, [3, 0]).rows[0].map((value) => value?.raw))
+            .toEqual([ds.read_rows(0, 0, 1).rows[0][3]?.raw, 'Alice']);
 
         ds.set_override('People', 'off');
         expect(ds.meta().sheets[0].rowCount).toBe(3);

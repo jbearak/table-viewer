@@ -17,6 +17,14 @@ export interface RowWindow {
     rows: (RenderedCell | null)[][];  // rows[i][col]; outer length <= requested count
 }
 
+/** A compact projection of a row window onto caller-selected columns.
+ * `rows[i][j]` is the cell from `column_indices[j]`; cells from other columns
+ * are never materialized. */
+export interface ColumnWindow {
+    startRow: number;
+    rows: (RenderedCell | null)[][];
+}
+
 export type ExcelHeaderOverride = 'on' | 'off';
 
 export interface ExcelFirstRowHeaderMeta {
@@ -51,6 +59,15 @@ export interface DataSource {
     meta(): WorkbookMeta;
     /** Materialize a window of rows for one sheet. count may overshoot rowCount. */
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow;
+    /** Materialize only the requested columns, in the supplied order. Optional
+     *  for third-party/test sources; callers use read_source_columns for a
+     *  compatibility fallback. */
+    read_columns?(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow;
     /** Release buffers/handles. */
     close(): void;
 
@@ -69,4 +86,29 @@ export interface DataSource {
     headerLine?: string;
     /** CSV save path: detected line terminator, so re-serialization round-trips. */
     lineEnding?: '\r\n' | '\r' | '\n';
+}
+
+/** Read a compact column projection, falling back to full rows for legacy
+ * DataSource implementations. Concrete built-in sources implement the
+ * selective path so transforms do not materialize unrelated cells. */
+export function read_source_columns(
+    source: DataSource,
+    sheet_index: number,
+    start_row: number,
+    count: number,
+    column_indices: readonly number[],
+): ColumnWindow {
+    if (source.read_columns) {
+        return source.read_columns(
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+        );
+    }
+    const window = source.read_rows(sheet_index, start_row, count);
+    return {
+        startRow: window.startRow,
+        rows: window.rows.map((row) => column_indices.map((column) => row[column] ?? null)),
+    };
 }

@@ -42,6 +42,43 @@ export class ColumnarStore {
         return out;
     }
 
+    /** Materialize a compact projection without visiting unrelated cells. */
+    read_columns(
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): (RenderedCell | null)[][] {
+        for (const column of column_indices) {
+            if (!Number.isInteger(column) || column < 0 || column >= this.cols) {
+                throw new RangeError(`column index ${column} out of range (${this.cols} columns)`);
+            }
+        }
+        const start = Math.max(0, Math.min(start_row, this.rows));
+        const end = Math.min(start + count, this.rows);
+        const out: (RenderedCell | null)[][] = [];
+        for (let r = start; r < end; r++) {
+            const row: (RenderedCell | null)[] = [];
+            for (const c of column_indices) {
+                row.push(this.read_cell(r, c));
+            }
+            out.push(row);
+        }
+        return out;
+    }
+
+    private read_cell(row: number, column: number): RenderedCell | null {
+        const index = row * this.cols + column;
+        if (this.rawIdx[index] === NULL_IDX) return null;
+        const flags = this.flags[index];
+        return {
+            raw: this.pool[this.rawIdx[index]],
+            formatted: this.pool[this.fmtIdx[index]],
+            bold: (flags & BOLD) !== 0,
+            italic: (flags & ITALIC) !== 0,
+            rawType: decode_type(this.types[index]),
+        };
+    }
+
     static Builder = class {
         private readonly pool: string[] = [''];           // index 0 = ""
         private readonly poolMap = new Map<string, number>([['', 0]]);

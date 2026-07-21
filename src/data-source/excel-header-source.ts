@@ -1,4 +1,5 @@
 import type {
+    ColumnWindow,
     DataSource,
     ExcelHeaderOverride,
     RenderedCell,
@@ -6,6 +7,7 @@ import type {
     SheetMeta,
     WorkbookMeta,
 } from './interface';
+import { read_source_columns } from './interface';
 import type { MergeRange } from '../types';
 import { sanitize_excel_header_overrides } from '../types';
 
@@ -137,6 +139,42 @@ export class ExcelHeaderDataSource implements DataSource {
             sheet_index,
             start + 1,
             available,
+        );
+        return { startRow: start, rows: physical.rows.slice(0, available) };
+    }
+
+    read_columns(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        const projection = this.sheets[sheet_index];
+        if (!projection) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        if (!header_active(projection, projection.override)) {
+            return read_source_columns(
+                this.base,
+                sheet_index,
+                start_row,
+                count,
+                column_indices,
+            );
+        }
+
+        const row_count = Math.max(0, projection.physical.rowCount - 1);
+        const start = Math.max(0, Math.min(start_row, row_count));
+        const available = Math.min(Math.max(0, count), row_count - start);
+        if (available <= 0) return { startRow: start, rows: [] };
+        const physical = read_source_columns(
+            this.base,
+            sheet_index,
+            start + 1,
+            available,
+            column_indices,
         );
         return { startRow: start, rows: physical.rows.slice(0, available) };
     }
