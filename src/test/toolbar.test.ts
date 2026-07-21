@@ -529,6 +529,9 @@ describe('Toolbar', () => {
             });
             const toolbar = container.querySelector('.toolbar') as HTMLElement;
             const chips = container.querySelector('.toolbar-chips') as HTMLElement;
+            const semantics = container.querySelector(
+                '.toolbar-transform-semantics',
+            ) as HTMLElement;
             const sort = container.querySelector('.sort-strip') as HTMLElement;
             const filter = container.querySelector('.filter-strip') as HTMLElement;
             const notice = container.querySelector('.toolbar-merge-notice') as HTMLElement;
@@ -537,6 +540,14 @@ describe('Toolbar', () => {
             expect(toolbar.classList.contains('is-wrapped')).toBe(true);
             expect(getComputedStyle(chips).flexWrap).toBe('wrap');
             expect(getComputedStyle(chips).overflow).toBe('visible');
+            expect(getComputedStyle(semantics).flexShrink).toBe('1');
+            expect(getComputedStyle(semantics).minWidth).toBe('0px');
+            expect(getComputedStyle(semantics).whiteSpace).toBe('normal');
+            expect(getComputedStyle(semantics).overflowWrap).toBe('anywhere');
+            const semantics_description = semantics.getAttribute('aria-describedby');
+            expect(document.getElementById(semantics_description!)?.textContent).toBe(
+                'Sorting and filtering use raw cell values, not formatted display text.',
+            );
             expect(getComputedStyle(sort).flexShrink).toBe('1');
             expect(getComputedStyle(filter).flexShrink).toBe('1');
             expect(getComputedStyle(sort).minWidth).not.toBe('0px');

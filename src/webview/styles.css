@@ -622,14 +622,16 @@ body {
 }
 
 .toolbar-transform-semantics {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
+    min-width: 0;
     padding: 2px 7px;
     border-radius: 10px;
     background: var(--vscode-badge-background, #4d4d4d);
     color: var(--vscode-badge-foreground, #fff);
     font-size: 11px;
     line-height: 18px;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    white-space: normal;
 }
 
 .sort-strip-label,
