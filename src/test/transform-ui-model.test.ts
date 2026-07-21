@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { FilterEntry, FilterOperator } from '../types';
 import {
     append_sort,
+    filter_column_kind_from_histogram,
     filter_draft_for_column,
     filter_options_for_draft,
     filter_options_for_kind,
@@ -91,6 +92,14 @@ describe('transform UI model', () => {
         expect(operator_supports_case_sensitive('equals', 'unknown')).toBe(true);
         expect(operator_supports_case_sensitive('between')).toBe(false);
         expect(operator_supports_case_sensitive('isEmpty')).toBe(false);
+        expect(filter_column_kind_from_histogram({ status: 'loading' })).toBe('unknown');
+        expect(filter_column_kind_from_histogram({
+            status: 'error', message: 'scan failed',
+        })).toBe('unknown');
+        expect(filter_column_kind_from_histogram({ status: 'ready', bins: [] })).toBe('text');
+        expect(filter_column_kind_from_histogram({
+            status: 'ready', bins: [{ lo: 0, hi: 1, count: 1 }],
+        })).toBe('numeric');
     });
 
     it('summarizes all existing operators compactly', () => {

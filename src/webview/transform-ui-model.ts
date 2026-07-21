@@ -89,6 +89,23 @@ export function operator_supports_case_sensitive(
     return kind !== 'numeric' && CASE_SENSITIVE_OPERATORS.has(operator);
 }
 
+export type FilterHistogramStatus =
+    | { status: 'loading' }
+    | { status: 'ready'; bins: readonly { lo: number; hi: number; count: number }[] }
+    | { status: 'error'; message: string };
+
+/**
+ * Infer column kind only once the histogram settles.
+ * loading/error stay unknown so the full operator list remains available;
+ * ready bins ⇒ numeric; ready empty ⇒ text.
+ */
+export function filter_column_kind_from_histogram(
+    histogram: FilterHistogramStatus,
+): FilterColumnKind {
+    if (histogram.status === 'loading' || histogram.status === 'error') return 'unknown';
+    return histogram.bins.length > 0 ? 'numeric' : 'text';
+}
+
 export function new_filter_id(): string {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
         return crypto.randomUUID();

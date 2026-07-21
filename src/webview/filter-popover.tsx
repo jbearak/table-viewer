@@ -2,12 +2,12 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
 import { FilterHistogram, domain_max, domain_min } from './filter-histogram';
 import {
+    filter_column_kind_from_histogram,
     filter_draft_for_column,
     filter_options_for_draft,
     is_pristine_default_filter_draft,
     is_range_filter_operator,
     operator_supports_case_sensitive,
-    type FilterColumnKind,
 } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
@@ -31,18 +31,6 @@ function preferred_operator_from_histogram(
     return filter_column_kind_from_histogram(histogram) === 'numeric'
         ? 'between'
         : 'contains';
-}
-
-/**
- * Infer column kind only once the histogram settles.
- * loading/error stay unknown so the full operator list remains available;
- * ready bins ⇒ numeric; ready empty ⇒ text.
- */
-function filter_column_kind_from_histogram(
-    histogram: NonNullable<FilterPopoverProps['histogram']>,
-): FilterColumnKind {
-    if (histogram.status === 'loading' || histogram.status === 'error') return 'unknown';
-    return histogram.bins.length > 0 ? 'numeric' : 'text';
 }
 
 function parse_range_bound(value: string | undefined): number | undefined {
