@@ -11,11 +11,10 @@ import { transform_is_active } from './types';
 // transform inside the old 1,000-row scan interval.
 const SCAN_ROWS_PER_CHECKPOINT = 128;
 const FILTER_ROWS_PER_CHECKPOINT = 1000;
-const SORT_COLUMNS_PER_CHECKPOINT = 64;
 const SORT_KEY_BUILDS_PER_CHECKPOINT = 4096;
 const SORT_CHUNK_ROWS = 2048;
 const SORT_OPERATIONS_PER_CHECKPOINT = 4096;
-const COMPACT_ROWS_PER_CHECKPOINT = 4096;
+const NUMERIC_KEY_INTERN_LIMIT = 1024;
 const COLLATOR = new Intl.Collator(undefined, {
     sensitivity: 'variant',
     numeric: true,
@@ -42,9 +41,7 @@ export interface TransformColumnCache {
     ): void;
 }
 
-interface TransformColumn extends CachedTransformColumn {
-    numericSortKeys?: (NumericSortKey | undefined)[];
-}
+type TransformColumn = CachedTransformColumn;
 
 interface MutableTransformColumn {
     values: (string | null | undefined)[];
@@ -56,6 +53,27 @@ interface MutableTransformColumn {
 export interface TransformSortInstrumentation {
     numericSortKeyBuilds: number;
     numericSortComparisons: number;
+    /** Reused key objects and maximum entries retained by any one interner. */
+    numericSortKeyReuses?: number;
+    numericSortKeyInternPeakEntries?: number;
+    /** Reference slots in request-local numeric-key arrays. */
+    numericSortKeySlots?: number;
+    peakNumericSortKeySlots?: number;
+    /**
+     * Reference slots visible through columns used by the active request.
+     * This is not total cache ownership, object memory, or process RSS.
+     */
+    transformColumnValueSlots?: number;
+    peakTransformColumnValueSlots?: number;
+    /** Exact accounting for live request-local Uint32 index buffers. */
+    indexBufferAllocations?: number;
+    indexBufferReleases?: number;
+    indexBufferCount?: number;
+    indexBufferBytes?: number;
+    peakIndexBufferCount?: number;
+    peakIndexBufferBytes?: number;
+    survivorMaskBytes?: number;
+    peakSurvivorMaskBytes?: number;
 }
 
 export async function compute_transform(
@@ -74,198 +92,325 @@ export async function compute_transform(
         return { indices: undefined, rowCount: sheet.rowCount };
     }
 
-    const columns = needed_columns(state, sheet.columnCount);
+    // Validate every referenced index before acquiring or publishing any column.
+    needed_columns(state, sheet.columnCount);
     await cancellation_checkpoint(is_cancelled);
-    const values = new Map<number, TransformColumn>();
-    const missing = new Map<number, MutableTransformColumn>();
-    for (const col of columns) {
-        const cached = column_cache?.get(sheet_index, col);
-        if (cached) {
-            values.set(col, { ...cached });
-            continue;
-        }
-        const column = {
-            // Sparse allocation avoids an eager, uncancellable O(rows × columns)
-            // null-fill. Every source row is assigned during the scan below.
-            values: new Array(sheet.rowCount),
-            numeric: true,
-            foundValue: false,
-        };
-        missing.set(col, column);
-        values.set(col, column);
-    }
-    await cancellation_checkpoint(is_cancelled);
-
-    const missing_columns = [...missing.keys()];
-    if (missing_columns.length > 0) {
-        for (
-            let start = 0;
-            start < sheet.rowCount;
-            start += SCAN_ROWS_PER_CHECKPOINT
-        ) {
-            const rows = read_source_columns(
-                source,
-                sheet_index,
-                start,
-                Math.min(SCAN_ROWS_PER_CHECKPOINT, sheet.rowCount - start),
-                missing_columns,
-            ).rows;
-            for (let offset = 0; offset < rows.length; offset++) {
-                const source_row = start + offset;
-                for (let selected = 0; selected < missing_columns.length; selected++) {
-                    const col = missing_columns[selected];
-                    const target = missing.get(col)!;
-                    const source_cell = rows[offset]?.[selected] ?? null;
-                    const raw = raw_value(source_cell);
-                    target.values[source_row] = raw;
-                    if (raw !== null) {
-                        target.foundValue = true;
-                        if (
-                            source_cell?.rawType === 'boolean'
-                            || (
-                                source_cell?.rawType === 'number'
-                                && !Number.isFinite(Number(raw))
-                            )
-                            || (
-                                source_cell?.rawType !== 'number'
-                                && !canonical_numeric_string(raw)
-                            )
-                        ) {
-                            target.numeric = false;
+    let survivors: Uint32Array | undefined;
+    let survivor_mask: Uint8Array | undefined;
+    let returned_result = false;
+    try {
+        const filter_groups = group_enabled_filters(state.filters);
+        let survivor_count = sheet.rowCount;
+        if (filter_groups.size > 0) {
+            await cancellation_checkpoint(is_cancelled);
+            survivor_mask = allocate_survivor_mask(
+                sheet.rowCount,
+                sort_instrumentation,
+            );
+            survivor_count = 0;
+            let first_group = true;
+            for (const [column_index, filters] of filter_groups) {
+                const column = await acquire_transform_column(
+                    source,
+                    sheet_index,
+                    column_index,
+                    sheet.rowCount,
+                    column_cache,
+                    is_cancelled,
+                    sort_instrumentation,
+                );
+                try {
+                    validate_filter_operands(filters, column);
+                    let group_survivors = 0;
+                    for (let row = 0; row < sheet.rowCount; row++) {
+                        if (first_group || survivor_mask[row] === 1) {
+                            let matches = true;
+                            for (const filter of filters) {
+                                if (!matches_filter_value(
+                                    column.values[row] ?? null,
+                                    filter,
+                                    column.numeric && column.foundValue,
+                                )) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            survivor_mask[row] = matches ? 1 : 0;
+                            if (matches) group_survivors += 1;
+                        }
+                        if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+                            await cancellation_checkpoint(is_cancelled);
                         }
                     }
-                }
-            }
-            await cancellation_checkpoint(is_cancelled);
-        }
-
-        // The final scan-chunk checkpoint above proves the extraction complete
-        // and current before publication. The cached column never owns
-        // request-local numeric sort keys and is not mutated after publication.
-        for (const [col, column] of missing) {
-            const cached: CachedTransformColumn = Object.freeze({
-                values: Object.freeze(column.values),
-                numeric: column.numeric,
-                foundValue: column.foundValue,
-            });
-            values.set(col, { ...cached });
-            column_cache?.set(sheet_index, col, cached);
-        }
-    }
-
-    validate_filter_operands(state, values);
-    const numeric_sort_columns = await prepare_numeric_sort_columns(
-        state,
-        values,
-        is_cancelled,
-    );
-    const survivors: number[] = [];
-    let numeric_sort_key_builds_since_checkpoint = 0;
-    await cancellation_checkpoint(is_cancelled);
-    for (let row = 0; row < sheet.rowCount; row++) {
-        let matches = true;
-        for (const filter of state.filters) {
-            if (!filter.enabled) continue;
-            const column = values.get(filter.colIndex);
-            if (!matches_filter_value(
-                column?.values[row] ?? null,
-                filter,
-                !!column?.numeric && column.foundValue,
-            )) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) {
-            survivors.push(row);
-            for (const column of numeric_sort_columns) {
-                const raw = column.values[row];
-                if (raw !== null && raw !== undefined) {
-                    column.numericSortKeys![row] = build_numeric_sort_key(raw);
-                    if (sort_instrumentation) {
-                        sort_instrumentation.numericSortKeyBuilds += 1;
-                    }
-                    numeric_sort_key_builds_since_checkpoint += 1;
-                    if (
-                        numeric_sort_key_builds_since_checkpoint
-                        >= SORT_KEY_BUILDS_PER_CHECKPOINT
-                    ) {
+                    if (sheet.rowCount % FILTER_ROWS_PER_CHECKPOINT !== 0) {
                         await cancellation_checkpoint(is_cancelled);
-                        numeric_sort_key_builds_since_checkpoint = 0;
                     }
+                    survivor_count = group_survivors;
+                    first_group = false;
+                } finally {
+                    release_transform_column(column, sort_instrumentation);
                 }
             }
         }
-        if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+
+        await cancellation_checkpoint(is_cancelled);
+        survivors = allocate_index_buffer(survivor_count, sort_instrumentation);
+        let survivor_position = 0;
+        for (let row = 0; row < sheet.rowCount; row++) {
+            if (!survivor_mask || survivor_mask[row] === 1) {
+                survivors[survivor_position++] = row;
+            }
+            if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+                await cancellation_checkpoint(is_cancelled);
+            }
+        }
+        if (sheet.rowCount % FILTER_ROWS_PER_CHECKPOINT !== 0) {
             await cancellation_checkpoint(is_cancelled);
-            numeric_sort_key_builds_since_checkpoint = 0;
+        }
+        if (survivor_mask) {
+            release_survivor_mask(survivor_mask, sort_instrumentation);
+            survivor_mask = undefined;
+        }
+        if (survivors.length < 2) {
+            returned_result = true;
+            return { indices: survivors, rowCount: survivor_count };
+        }
+
+        // Stable passes run from least to most significant key. Because the
+        // input starts in source-row order and equality returns zero, this is
+        // equivalent to the former multi-key comparator including source ties.
+        for (let key_index = state.sort.length - 1; key_index >= 0; key_index--) {
+            const key = state.sort[key_index];
+            const column = await acquire_transform_column(
+                source,
+                sheet_index,
+                key.colIndex,
+                sheet.rowCount,
+                column_cache,
+                is_cancelled,
+                sort_instrumentation,
+            );
+            let numeric_keys: NumericColumnKeys | undefined;
+            try {
+                if (column.numeric && column.foundValue) {
+                    numeric_keys = await prepare_numeric_column_keys(
+                        column,
+                        survivors,
+                        sheet.rowCount,
+                        is_cancelled,
+                        sort_instrumentation,
+                    );
+                }
+                const compare_rows = (a: number, b: number): number =>
+                    numeric_keys
+                        ? compare_precomputed_numeric_values(
+                            column,
+                            numeric_keys,
+                            a,
+                            b,
+                            key.direction,
+                            sort_instrumentation,
+                        )
+                        : compare_values(
+                            column.values[a] ?? null,
+                            column.values[b] ?? null,
+                            key.direction,
+                            false,
+                        );
+                survivors = await cooperative_stable_sort(
+                    survivors,
+                    compare_rows,
+                    is_cancelled,
+                    sort_instrumentation,
+                );
+            } finally {
+                release_numeric_column_keys(numeric_keys, sort_instrumentation);
+                release_transform_column(column, sort_instrumentation);
+            }
+        }
+
+        returned_result = true;
+        return { indices: survivors, rowCount: survivor_count };
+    } finally {
+        if (survivor_mask) {
+            release_survivor_mask(survivor_mask, sort_instrumentation);
+        }
+        if (!returned_result && survivors) {
+            release_index_buffer(survivors, sort_instrumentation);
         }
     }
-    if (sheet.rowCount % FILTER_ROWS_PER_CHECKPOINT !== 0) {
+}
+
+function group_enabled_filters(
+    filters: readonly FilterEntry[],
+): Map<number, FilterEntry[]> {
+    const groups = new Map<number, FilterEntry[]>();
+    for (const filter of filters) {
+        if (!filter.enabled) continue;
+        const group = groups.get(filter.colIndex);
+        if (group) group.push(filter);
+        else groups.set(filter.colIndex, [filter]);
+    }
+    return groups;
+}
+
+async function acquire_transform_column(
+    source: DataSource,
+    sheet_index: number,
+    column_index: number,
+    row_count: number,
+    column_cache: TransformColumnCache | undefined,
+    is_cancelled: () => boolean,
+    instrumentation?: TransformSortInstrumentation,
+): Promise<TransformColumn> {
+    const cached = column_cache?.get(sheet_index, column_index);
+    if (cached) {
+        const column = { ...cached };
+        track_transform_column(column, instrumentation);
+        return column;
+    }
+
+    await cancellation_checkpoint(is_cancelled);
+    const mutable: MutableTransformColumn = {
+        values: new Array(row_count),
+        numeric: true,
+        foundValue: false,
+    };
+    for (let start = 0; start < row_count; start += SCAN_ROWS_PER_CHECKPOINT) {
+        const rows = read_source_columns(
+            source,
+            sheet_index,
+            start,
+            Math.min(SCAN_ROWS_PER_CHECKPOINT, row_count - start),
+            [column_index],
+        ).rows;
+        for (let offset = 0; offset < rows.length; offset++) {
+            const source_cell = rows[offset]?.[0] ?? null;
+            const raw = raw_value(source_cell);
+            mutable.values[start + offset] = raw;
+            if (raw !== null) {
+                mutable.foundValue = true;
+                if (
+                    source_cell?.rawType === 'boolean'
+                    || (
+                        source_cell?.rawType === 'number'
+                        && !Number.isFinite(Number(raw))
+                    )
+                    || (
+                        source_cell?.rawType !== 'number'
+                        && !canonical_numeric_string(raw)
+                    )
+                ) mutable.numeric = false;
+            }
+        }
         await cancellation_checkpoint(is_cancelled);
     }
 
-    if (state.sort.length > 0) {
-        const compare_rows = (a: number, b: number): number => {
-            for (const key of state.sort) {
-                const column = values.get(key.colIndex)!;
-                const result = column.numericSortKeys
-                    ? compare_precomputed_numeric_values(
-                        column,
-                        a,
-                        b,
-                        key.direction,
-                        sort_instrumentation,
-                    )
-                    : compare_values(
-                        column.values[a] ?? null,
-                        column.values[b] ?? null,
-                        key.direction,
-                        false,
-                    );
-                if (result !== 0) return result;
-            }
-            return a - b;
-        };
-        await cooperative_stable_sort(
-            survivors,
-            compare_rows,
-            is_cancelled,
-        );
-    }
-
-    const indices = await compact_indices(survivors, is_cancelled);
-    return {
-        indices,
-        rowCount: survivors.length,
-    };
+    // The request holds only this one active column. The cache deliberately
+    // retains published columns across requests and owns its separate bound.
+    const published: CachedTransformColumn = Object.freeze({
+        values: Object.freeze(mutable.values),
+        numeric: mutable.numeric,
+        foundValue: mutable.foundValue,
+    });
+    column_cache?.set(sheet_index, column_index, published);
+    const column = { ...published };
+    track_transform_column(column, instrumentation);
+    return column;
 }
 
-async function prepare_numeric_sort_columns(
-    state: SheetTransformState,
-    columns: Map<number, TransformColumn>,
+function track_transform_column(
+    column: TransformColumn,
+    instrumentation?: TransformSortInstrumentation,
+): void {
+    if (!instrumentation) return;
+    instrumentation.transformColumnValueSlots =
+        (instrumentation.transformColumnValueSlots ?? 0) + column.values.length;
+    instrumentation.peakTransformColumnValueSlots = Math.max(
+        instrumentation.peakTransformColumnValueSlots ?? 0,
+        instrumentation.transformColumnValueSlots,
+    );
+}
+
+function release_transform_column(
+    column: TransformColumn,
+    instrumentation?: TransformSortInstrumentation,
+): void {
+    if (!instrumentation) return;
+    instrumentation.transformColumnValueSlots =
+        (instrumentation.transformColumnValueSlots ?? 0) - column.values.length;
+}
+
+interface NumericColumnKeys {
+    readonly keys: (NumericSortKey | undefined)[];
+    readonly rowPositions?: Uint32Array;
+    readonly interner: NumericSortKeyInterner;
+}
+
+async function prepare_numeric_column_keys(
+    column: TransformColumn,
+    survivors: Uint32Array,
+    row_count: number,
     is_cancelled: () => boolean,
-): Promise<TransformColumn[]> {
-    const result: TransformColumn[] = [];
-    const prepared = new Set<number>();
-    let numeric_columns_since_checkpoint = SORT_COLUMNS_PER_CHECKPOINT;
-    for (const sort of state.sort) {
-        if (prepared.has(sort.colIndex)) continue;
-        prepared.add(sort.colIndex);
-        const column = columns.get(sort.colIndex)!;
-        if (!column.numeric || !column.foundValue) continue;
-        if (
-            numeric_columns_since_checkpoint
-            >= SORT_COLUMNS_PER_CHECKPOINT
-        ) {
-            await cancellation_checkpoint(is_cancelled);
-            numeric_columns_since_checkpoint = 0;
-        }
-        column.numericSortKeys = new Array(column.values.length);
-        result.push(column);
-        numeric_columns_since_checkpoint += 1;
+    instrumentation?: TransformSortInstrumentation,
+): Promise<NumericColumnKeys> {
+    // Exact all-unique inputs inherently retain one parsed key per survivor for
+    // this pass. Processing sort columns sequentially bounds that peak to one
+    // column; the bounded interner adds at most NUMERIC_KEY_INTERN_LIMIT refs.
+    const compact = survivors.length > 0 && survivors.length <= row_count / 2;
+    const state: NumericColumnKeys = {
+        keys: new Array(compact ? survivors.length : row_count),
+        rowPositions: compact
+            ? allocate_index_buffer(row_count, instrumentation)
+            : undefined,
+        interner: new NumericSortKeyInterner(),
+    };
+    if (instrumentation) {
+        instrumentation.numericSortKeySlots =
+            (instrumentation.numericSortKeySlots ?? 0) + state.keys.length;
+        instrumentation.peakNumericSortKeySlots = Math.max(
+            instrumentation.peakNumericSortKeySlots ?? 0,
+            instrumentation.numericSortKeySlots,
+        );
     }
-    return result;
+    try {
+        let survivor_iterations = 0;
+        for (let position = 0; position < survivors.length; position++) {
+            const row = survivors[position];
+            const raw = column.values[row];
+            if (state.rowPositions) state.rowPositions[row] = position + 1;
+            if (raw !== null && raw !== undefined) {
+                state.keys[state.rowPositions ? position : row] =
+                    state.interner.get(raw, instrumentation);
+            }
+            survivor_iterations += 1;
+            if (survivor_iterations >= SORT_KEY_BUILDS_PER_CHECKPOINT) {
+                survivor_iterations = 0;
+                await cancellation_checkpoint(is_cancelled);
+            }
+        }
+        if (survivor_iterations > 0 || survivors.length === 0) {
+            await cancellation_checkpoint(is_cancelled);
+        }
+        return state;
+    } catch (error) {
+        release_numeric_column_keys(state, instrumentation);
+        throw error;
+    }
+}
+
+function release_numeric_column_keys(
+    state: NumericColumnKeys | undefined,
+    instrumentation?: TransformSortInstrumentation,
+): void {
+    if (!state) return;
+    if (state.rowPositions) {
+        release_index_buffer(state.rowPositions, instrumentation);
+    }
+    if (instrumentation) {
+        instrumentation.numericSortKeySlots =
+            (instrumentation.numericSortKeySlots ?? 0) - state.keys.length;
+    }
 }
 
 export function compare_cells(
@@ -304,6 +449,7 @@ function compare_values(
 
 function compare_precomputed_numeric_values(
     column: TransformColumn,
+    keys: NumericColumnKeys,
     a_row: number,
     b_row: number,
     direction: SortDirection,
@@ -318,9 +464,11 @@ function compare_precomputed_numeric_values(
     if (b_missing) return -1;
 
     if (instrumentation) instrumentation.numericSortComparisons += 1;
+    const a_key_index = keys.rowPositions ? keys.rowPositions[a_row] - 1 : a_row;
+    const b_key_index = keys.rowPositions ? keys.rowPositions[b_row] - 1 : b_row;
     const ascending = compare_numeric_sort_keys(
-        column.numericSortKeys![a_row]!,
-        column.numericSortKeys![b_row]!,
+        keys.keys[a_key_index]!,
+        keys.keys[b_key_index]!,
     );
     return direction === 'asc' ? ascending : -ascending;
 }
@@ -485,6 +633,55 @@ interface ExactDecimal {
 
 type NumericSortKey = ExactDecimal;
 
+/**
+ * Reuses exact keys for repeated raw values without retaining an entry for
+ * every distinct value. The last-value fast path remains useful after the
+ * bounded table fills, while all-unique inputs retain at most the fixed cap.
+ */
+class NumericSortKeyInterner {
+    private readonly entries = new Map<string, NumericSortKey>();
+    private lastRaw: string | undefined;
+    private lastKey: NumericSortKey | undefined;
+
+    get(
+        raw: string,
+        instrumentation?: TransformSortInstrumentation,
+    ): NumericSortKey {
+        if (raw === this.lastRaw) {
+            if (instrumentation) {
+                instrumentation.numericSortKeyReuses =
+                    (instrumentation.numericSortKeyReuses ?? 0) + 1;
+            }
+            return this.lastKey!;
+        }
+        const existing = this.entries.get(raw);
+        if (existing) {
+            this.lastRaw = raw;
+            this.lastKey = existing;
+            if (instrumentation) {
+                instrumentation.numericSortKeyReuses =
+                    (instrumentation.numericSortKeyReuses ?? 0) + 1;
+            }
+            return existing;
+        }
+
+        const key = build_numeric_sort_key(raw);
+        if (instrumentation) instrumentation.numericSortKeyBuilds += 1;
+        if (this.entries.size < NUMERIC_KEY_INTERN_LIMIT) {
+            this.entries.set(raw, key);
+            if (instrumentation) {
+                instrumentation.numericSortKeyInternPeakEntries = Math.max(
+                    instrumentation.numericSortKeyInternPeakEntries ?? 0,
+                    this.entries.size,
+                );
+            }
+        }
+        this.lastRaw = raw;
+        this.lastKey = key;
+        return key;
+    }
+}
+
 function parse_canonical_decimal(value: string): ExactDecimal | undefined {
     const match = /^([+-]?)(0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value);
     if (!match) return undefined;
@@ -549,8 +746,8 @@ function compare_decimal_magnitudes(a: ExactDecimal, b: ExactDecimal): number {
 }
 
 function validate_filter_operands(
-    state: SheetTransformState,
-    columns: Map<number, TransformColumn>,
+    filters: readonly FilterEntry[],
+    column: TransformColumn,
 ): void {
     const numeric_operators = new Set<FilterEntry['operator']>([
         'equals',
@@ -561,10 +758,9 @@ function validate_filter_operands(
         'lessThanOrEqual',
         'between',
     ]);
-    for (const entry of state.filters) {
-        if (!entry.enabled || !numeric_operators.has(entry.operator)) continue;
-        const column = columns.get(entry.colIndex);
-        if (!column || !column.numeric || !column.foundValue) continue;
+    if (!column.numeric || !column.foundValue) return;
+    for (const entry of filters) {
+        if (!numeric_operators.has(entry.operator)) continue;
         if (!finite_number_text(entry.value)) {
             throw new Error('Numeric filter values must be finite numbers.');
         }
@@ -606,13 +802,14 @@ function canonical_numeric_string(value: string): boolean {
 }
 
 async function cooperative_stable_sort(
-    rows: number[],
+    rows: Uint32Array,
     compare: (a: number, b: number) => number,
     is_cancelled: () => boolean,
-): Promise<void> {
+    instrumentation?: TransformSortInstrumentation,
+): Promise<Uint32Array> {
     if (rows.length < 2) {
         await cancellation_checkpoint(is_cancelled);
-        return;
+        return rows;
     }
 
     // Native sort remains useful for small bounded runs. Global ordering is then
@@ -620,85 +817,134 @@ async function cooperative_stable_sort(
     // block for a large sheet.
     for (let start = 0; start < rows.length; start += SORT_CHUNK_ROWS) {
         const end = Math.min(start + SORT_CHUNK_ROWS, rows.length);
-        const sorted_chunk = rows.slice(start, end).sort(compare);
-        for (let offset = 0; offset < sorted_chunk.length; offset++) {
-            rows[start + offset] = sorted_chunk[offset];
-        }
+        rows.subarray(start, end).sort(compare);
         await cancellation_checkpoint(is_cancelled);
     }
 
-    if (rows.length <= SORT_CHUNK_ROWS) return;
+    if (rows.length <= SORT_CHUNK_ROWS) return rows;
 
     let source = rows;
-    let target = new Array<number>(rows.length);
-    for (
-        let width = SORT_CHUNK_ROWS;
-        width < rows.length;
-        width *= 2
-    ) {
-        let operations = 0;
-        for (let left = 0; left < rows.length; left += width * 2) {
-            const middle = Math.min(left + width, rows.length);
-            const right = Math.min(left + width * 2, rows.length);
-            let a = left;
-            let b = middle;
-            let out = left;
-            while (a < middle && b < right) {
-                target[out++] = compare(source[a], source[b]) <= 0
-                    ? source[a++]
-                    : source[b++];
-                operations += 1;
-                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
-                    operations = 0;
-                    await cancellation_checkpoint(is_cancelled);
+    const scratch = allocate_index_buffer(rows.length, instrumentation);
+    let target = scratch;
+    let returned_buffer = false;
+    try {
+        for (
+            let width = SORT_CHUNK_ROWS;
+            width < rows.length;
+            width *= 2
+        ) {
+            let operations = 0;
+            for (let left = 0; left < rows.length; left += width * 2) {
+                const middle = Math.min(left + width, rows.length);
+                const right = Math.min(left + width * 2, rows.length);
+                let a = left;
+                let b = middle;
+                let out = left;
+                while (a < middle && b < right) {
+                    target[out++] = compare(source[a], source[b]) <= 0
+                        ? source[a++]
+                        : source[b++];
+                    operations += 1;
+                    if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                        operations = 0;
+                        await cancellation_checkpoint(is_cancelled);
+                    }
+                }
+                while (a < middle) {
+                    target[out++] = source[a++];
+                    operations += 1;
+                    if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                        operations = 0;
+                        await cancellation_checkpoint(is_cancelled);
+                    }
+                }
+                while (b < right) {
+                    target[out++] = source[b++];
+                    operations += 1;
+                    if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
+                        operations = 0;
+                        await cancellation_checkpoint(is_cancelled);
+                    }
                 }
             }
-            while (a < middle) {
-                target[out++] = source[a++];
-                operations += 1;
-                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
-                    operations = 0;
-                    await cancellation_checkpoint(is_cancelled);
-                }
-            }
-            while (b < right) {
-                target[out++] = source[b++];
-                operations += 1;
-                if (operations >= SORT_OPERATIONS_PER_CHECKPOINT) {
-                    operations = 0;
-                    await cancellation_checkpoint(is_cancelled);
-                }
-            }
+            if (operations > 0) await cancellation_checkpoint(is_cancelled);
+            [source, target] = [target, source];
         }
-        if (operations > 0) await cancellation_checkpoint(is_cancelled);
-        [source, target] = [target, source];
-    }
 
-    if (source !== rows) {
-        for (let start = 0; start < rows.length; start += COMPACT_ROWS_PER_CHECKPOINT) {
-            const end = Math.min(start + COMPACT_ROWS_PER_CHECKPOINT, rows.length);
-            for (let index = start; index < end; index++) {
-                rows[index] = source[index];
-            }
-            await cancellation_checkpoint(is_cancelled);
+        // The caller adopts the buffer containing the last merge pass. Logically
+        // release the other buffer immediately; no final full-size copy is needed.
+        release_index_buffer(target, instrumentation);
+        returned_buffer = true;
+        return source;
+    } finally {
+        if (!returned_buffer) {
+            // On cancellation/comparator failure, the caller still owns `rows`.
+            release_index_buffer(scratch, instrumentation);
         }
     }
 }
 
-async function compact_indices(
-    rows: number[],
-    is_cancelled: () => boolean,
-): Promise<Uint32Array> {
-    await cancellation_checkpoint(is_cancelled);
-    const indices = new Uint32Array(rows.length);
-    for (let start = 0; start < rows.length; start += COMPACT_ROWS_PER_CHECKPOINT) {
-        const end = Math.min(start + COMPACT_ROWS_PER_CHECKPOINT, rows.length);
-        for (let index = start; index < end; index++) {
-            indices[index] = rows[index];
-        }
-        await cancellation_checkpoint(is_cancelled);
+function allocate_index_buffer(
+    length: number,
+    instrumentation?: TransformSortInstrumentation,
+): Uint32Array {
+    const result = new Uint32Array(length);
+    if (instrumentation) {
+        const bytes = result.byteLength;
+        instrumentation.indexBufferAllocations =
+            (instrumentation.indexBufferAllocations ?? 0) + 1;
+        instrumentation.indexBufferCount =
+            (instrumentation.indexBufferCount ?? 0) + 1;
+        instrumentation.indexBufferBytes =
+            (instrumentation.indexBufferBytes ?? 0) + bytes;
+        instrumentation.peakIndexBufferCount = Math.max(
+            instrumentation.peakIndexBufferCount ?? 0,
+            instrumentation.indexBufferCount,
+        );
+        instrumentation.peakIndexBufferBytes = Math.max(
+            instrumentation.peakIndexBufferBytes ?? 0,
+            instrumentation.indexBufferBytes,
+        );
     }
-    return indices;
+    return result;
+}
+
+function allocate_survivor_mask(
+    length: number,
+    instrumentation?: TransformSortInstrumentation,
+): Uint8Array {
+    const result = new Uint8Array(length);
+    if (instrumentation) {
+        instrumentation.survivorMaskBytes =
+            (instrumentation.survivorMaskBytes ?? 0) + result.byteLength;
+        instrumentation.peakSurvivorMaskBytes = Math.max(
+            instrumentation.peakSurvivorMaskBytes ?? 0,
+            instrumentation.survivorMaskBytes,
+        );
+    }
+    return result;
+}
+
+function release_survivor_mask(
+    mask: Uint8Array,
+    instrumentation?: TransformSortInstrumentation,
+): void {
+    if (!instrumentation) return;
+    instrumentation.survivorMaskBytes =
+        (instrumentation.survivorMaskBytes ?? 0) - mask.byteLength;
+}
+
+function release_index_buffer(
+    buffer: Uint32Array,
+    instrumentation?: TransformSortInstrumentation,
+): void {
+    if (!instrumentation) return;
+    instrumentation.indexBufferReleases =
+        (instrumentation.indexBufferReleases ?? 0) + 1;
+    instrumentation.indexBufferCount =
+        (instrumentation.indexBufferCount ?? 0) - 1;
+    instrumentation.indexBufferBytes =
+        (instrumentation.indexBufferBytes ?? 0) - buffer.byteLength;
 }
 
 async function cancellation_checkpoint(
