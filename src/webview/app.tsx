@@ -18,6 +18,7 @@ import {
     type HostMessage,
     type SheetTransformState,
     type FilterEntry,
+    type HistogramBin,
     type SheetColumnVisibilityState,
     type TransformIntent,
 } from '../types';
@@ -71,6 +72,9 @@ type ColumnVisibilityUpdater = (
 ) => SheetColumnVisibilityState | undefined;
 
 type TransformOrigin = 'grid' | 'toolbar' | 'restore';
+type FilterHistogramState = { status: 'loading' }
+    | { status: 'ready'; bins: readonly HistogramBin[] }
+    | { status: 'error'; message: string };
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
@@ -178,6 +182,10 @@ export function App(): React.JSX.Element {
         restore_focus: () => void;
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
+    const [filter_histogram, set_filter_histogram] = useState<{
+        key: string;
+        value: FilterHistogramState;
+    }>({ key: '', value: { status: 'loading' } });
     const [pending_preview_scroll, set_pending_preview_scroll] =
         useState<PendingPreviewScroll | null>(null);
     const [grid_focus_restore, set_grid_focus_restore] = useState<{
@@ -221,6 +229,11 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
+    const histogram_request_seq_ref = useRef(0);
+    const histogram_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
     const edit_request_seq_ref = useRef(0);
     const edit_request_prefix_ref = useRef(
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
@@ -254,6 +267,15 @@ export function App(): React.JSX.Element {
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    const histogram_cache_ref = useRef(new Map<string, readonly HistogramBin[]>());
+    const pending_histogram_ref = useRef<{
+        requestId: string;
+        key: string;
+        sheetIndex: number;
+        columnIndex: number;
+        generation: number;
+        sourceGeneration: number;
+    } | null>(null);
     const snapshot_identity_ref = useRef<WorkbookSnapshotIdentity | null>(null);
     const last_applied_snapshot_ref = useRef<WorkbookSnapshotIdentity | null>(null);
     const processed_snapshot_results_ref = useRef(new Set<string>());
@@ -468,6 +490,31 @@ export function App(): React.JSX.Element {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
+            if (msg.type === 'filterHistogram') {
+                const pending = pending_histogram_ref.current;
+                if (!pending || pending.requestId !== msg.requestId) return;
+                if (
+                    pending.sheetIndex !== msg.sheetIndex
+                    || pending.columnIndex !== msg.columnIndex
+                    || pending.generation !== msg.generation
+                    || pending.sourceGeneration !== msg.sourceGeneration
+                    || source_generation_ref.current !== msg.sourceGeneration
+                ) return;
+                pending_histogram_ref.current = null;
+                if (msg.error) {
+                    set_filter_histogram({
+                        key: pending.key,
+                        value: { status: 'error', message: msg.error },
+                    });
+                } else {
+                    histogram_cache_ref.current.set(pending.key, msg.bins);
+                    set_filter_histogram({
+                        key: pending.key,
+                        value: { status: 'ready', bins: msg.bins },
+                    });
+                }
+            }
+
             if (msg.type === 'saveOperationStarted') {
                 apply_save_lifecycle(msg.lifecycle);
             }
@@ -609,6 +656,13 @@ export function App(): React.JSX.Element {
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
+                    if (
+                        snapshot.presentation === 'initial'
+                        || source_generation_ref.current !== snapshot.sourceGeneration
+                    ) {
+                        histogram_cache_ref.current.clear();
+                        set_filter_histogram({ key: '', value: { status: 'loading' } });
+                    }
                     set_generation(snapshot.generation);
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
@@ -1197,6 +1251,52 @@ export function App(): React.JSX.Element {
         open_filter_editor(column_index, anchor, restore_focus, 'grid');
     }, [open_filter_editor]);
 
+    useEffect(() => {
+        if (!filter_editor) return;
+        const sheet_index = active_sheet_index;
+        const column_index = filter_editor.column_index;
+        const request_generation = generation_ref.current;
+        const request_source_generation = source_generation_ref.current;
+        const key = `${request_source_generation}:${sheet_index}:${column_index}`;
+        const cached = histogram_cache_ref.current.get(key);
+        if (cached) {
+            set_filter_histogram({ key, value: { status: 'ready', bins: cached } });
+            return;
+        }
+
+        const request_id = [
+            'histogram',
+            histogram_request_prefix_ref.current,
+            ++histogram_request_seq_ref.current,
+        ].join(':');
+        const pending = {
+            requestId: request_id,
+            key,
+            sheetIndex: sheet_index,
+            columnIndex: column_index,
+            generation: request_generation,
+            sourceGeneration: request_source_generation,
+        };
+        pending_histogram_ref.current = pending;
+        set_filter_histogram({ key, value: { status: 'loading' } });
+        vscode_api.postMessage({
+            type: 'requestFilterHistogram',
+            sheetIndex: sheet_index,
+            columnIndex: column_index,
+            requestId: request_id,
+            generation: request_generation,
+            sourceGeneration: request_source_generation,
+        });
+        return () => {
+            if (pending_histogram_ref.current !== pending) return;
+            pending_histogram_ref.current = null;
+            vscode_api.postMessage({
+                type: 'cancelFilterHistogram',
+                requestId: request_id,
+            });
+        };
+    }, [active_sheet_index, filter_editor, source_epoch]);
+
     const close_filter_editor = useCallback((restore_focus = true) => {
         const restore = filter_editor?.restore_focus;
         set_filter_editor(null);
@@ -1775,12 +1875,15 @@ export function App(): React.JSX.Element {
             />
             {filter_editor && (
                 <FilterPopover
-                    key={filter_editor.column_index}
+                    key={`${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`}
                     column_index={filter_editor.column_index}
                     column_name={column_names[filter_editor.column_index]
                         ?? `Column ${filter_editor.column_index + 1}`}
                     filters={visible_transform.filters}
                     anchor={filter_editor.anchor}
+                    histogram={filter_histogram.key === `${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`
+                        ? filter_histogram.value
+                        : { status: 'loading' }}
                     on_apply={apply_filter_editor}
                     on_cancel={(reason) => close_filter_editor(
                         reason === 'escape' || reason === 'explicit',

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ViewerPanelCore, adopt_source_into_core } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
+import type { WebviewMessage } from '../types';
 
 class StubSource implements DataSource {
     read_rows_calls = 0;
@@ -127,6 +128,161 @@ describe('ViewerPanelCore', () => {
         await core.handle_message({ ...base, requestId: 'a' });
         await core.handle_message({ ...base, requestId: 'b' });
         expect(src.read_rows_calls).toBe(1);
+    });
+
+    it('computes histograms lazily, caches by source/sheet/column, and reuses across view generations', async () => {
+        const { panel, posted } = make_panel();
+        const src = new StubSource(5);
+        const core = new ViewerPanelCore(panel, src);
+        expect(src.read_rows_calls).toBe(0);
+
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'hist-1', generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
+        expect(src.read_rows_calls).toBe(2);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'hist-1', sheetIndex: 0,
+            columnIndex: 0, sourceGeneration: 1,
+        });
+        expect(posted.at(-1).bins.reduce(
+            (total: number, bin: { count: number }) => total + bin.count,
+            0,
+        )).toBe(5);
+
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'sort',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        expect(src.read_rows_calls).toBe(3);
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'hist-2', generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
+        expect(src.read_rows_calls).toBe(3);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'hist-2', generation: core.generation,
+        });
+    });
+
+    it('invalidates histogram cache on source adoption', async () => {
+        const { panel } = make_panel();
+        const first = new StubSource(2);
+        const second = new StubSource(3);
+        const core = new ViewerPanelCore(panel, first);
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'first', generation: 1, sourceGeneration: 1,
+        });
+        core.adopt_source(second);
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'second', generation: 2, sourceGeneration: 2,
+        });
+        expect(first.read_rows_calls).toBe(2);
+        expect(second.read_rows_calls).toBe(2);
+    });
+
+    it('finishes and caches a source-valid histogram across a concurrent view generation bump', async () => {
+        const { panel, posted } = make_panel();
+        const src = new StubSource(1_001);
+        const core = new ViewerPanelCore(panel, src);
+        const histogram = core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'in-flight', generation: 1, sourceGeneration: 1,
+        });
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'view-bump',
+            generation: 1, sourceGeneration: 1, intent: 'user',
+            state: { sort: [], filters: [] },
+        });
+        expect(core.generation).toBe(2);
+        await histogram;
+        expect(posted.find((message) => message.requestId === 'in-flight'))
+            .toMatchObject({
+                type: 'filterHistogram', generation: 1, sourceGeneration: 1,
+            });
+        const reads_after_compute = src.read_rows_calls;
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'reuse', generation: 2, sourceGeneration: 1,
+        });
+        expect(src.read_rows_calls).toBe(reads_after_compute);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'reuse', generation: 2,
+        });
+    });
+
+    it('fences cancelled, source-stale, and receiver-stale histogram results', async () => {
+        const scenarios = ['editor', 'source', 'receiver'] as const;
+        for (const scenario of scenarios) {
+            const { panel, posted } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(1_001));
+            const pending = core.handle_message({
+                type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+                requestId: scenario, generation: 1, sourceGeneration: 1,
+            });
+            if (scenario === 'editor') {
+                await core.handle_message({ type: 'cancelFilterHistogram', requestId: scenario });
+            } else if (scenario === 'source') {
+                core.adopt_source(new StubSource());
+            } else {
+                core.begin_receiver_epoch(1);
+            }
+            await pending;
+            expect(posted.some((message) => message.type === 'filterHistogram')).toBe(false);
+        }
+    });
+
+    it('rejects histogram requests with stale generations or invalid coordinates', async () => {
+        const { panel, posted } = make_panel();
+        const src = new StubSource();
+        const core = new ViewerPanelCore(panel, src);
+        for (const request of [
+            { requestId: 'generation', generation: 0, sourceGeneration: 1, sheetIndex: 0, columnIndex: 0 },
+            { requestId: 'source', generation: 1, sourceGeneration: 0, sheetIndex: 0, columnIndex: 0 },
+            { requestId: 'sheet', generation: 1, sourceGeneration: 1, sheetIndex: 8, columnIndex: 0 },
+            { requestId: 'column', generation: 1, sourceGeneration: 1, sheetIndex: 0, columnIndex: 8 },
+            { requestId: 'negative-sheet', generation: 1, sourceGeneration: 1, sheetIndex: -1, columnIndex: 0 },
+            { requestId: 'fractional-sheet', generation: 1, sourceGeneration: 1, sheetIndex: 0.5, columnIndex: 0 },
+            { requestId: 'string-sheet', generation: 1, sourceGeneration: 1, sheetIndex: '0', columnIndex: 0 },
+        ]) {
+            await core.handle_message({
+                type: 'requestFilterHistogram',
+                ...request,
+            } as Extract<WebviewMessage, { type: 'requestFilterHistogram' }>);
+        }
+        expect(posted).toHaveLength(7);
+        expect(posted.every((message) =>
+            message.type === 'filterHistogram' && typeof message.error === 'string'))
+            .toBe(true);
+        expect(src.read_rows_calls).toBe(0);
+    });
+
+    it('echoes the request tuple when a delayed histogram request is view-stale', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource());
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'bump',
+            generation: 1, sourceGeneration: 1, intent: 'user',
+            state: { sort: [], filters: [] },
+        });
+        expect(core.generation).toBe(2);
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'delayed', generation: 1, sourceGeneration: 1,
+        });
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'delayed',
+            generation: 1, sourceGeneration: 1,
+            error: 'The view changed before this histogram request arrived.',
+        });
     });
 
     it('physical replacement advances both generations and clears cache exactly once', async () => {

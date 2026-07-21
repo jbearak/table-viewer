@@ -806,6 +806,32 @@ body {
     overflow-y: auto;
 }
 
+.filter-histogram {
+    display: flex;
+    align-items: end;
+    gap: 1px;
+    height: 56px;
+    padding: 4px 3px 0;
+    border-bottom: 1px solid var(--vscode-panel-border, #555);
+}
+
+.filter-histogram-bar {
+    flex: 1 1 0;
+    min-width: 1px;
+    background: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    opacity: 0.8;
+}
+
+.filter-histogram-status {
+    min-height: 28px;
+    color: var(--vscode-descriptionForeground, #aaa);
+    font-size: 11px;
+}
+
+.filter-histogram-error {
+    color: var(--vscode-errorForeground, #f48771);
+}
+
 .filter-popover-field-label {
     color: var(--vscode-descriptionForeground, inherit);
     font-size: 11px;

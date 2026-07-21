@@ -426,6 +426,31 @@ async function open_columns() {
         .not.toBeNull();
 }
 
+async function open_grid_filter(column_index = 0) {
+    const open_filter = grid_shell_mock.latest_props?.on_open_filter as (
+        source_column: number,
+        anchor: { left: number; top: number },
+        restore_focus: () => void,
+    ) => void;
+    await act(async () => open_filter(
+        column_index,
+        { left: 20, top: 20 },
+        vi.fn(),
+    ));
+}
+
+function latest_histogram_request(post_message: ReturnType<typeof vi.fn>) {
+    const request = post_message.mock.calls
+        .map((call) => call[0] as WebviewMessage)
+        .filter((message): message is Extract<
+            WebviewMessage,
+            { type: 'requestFilterHistogram' }
+        > => message.type === 'requestFilterHistogram')
+        .at(-1);
+    expect(request).toBeDefined();
+    return request!;
+}
+
 async function enter_edit_mode(
     post_message: ReturnType<typeof vi.fn>,
     edit_session_id = 'test-edit-session',
@@ -3157,6 +3182,166 @@ describe('preview mode', () => {
 });
 
 describe('sorting and filtering', () => {
+    it('requests a histogram only when the editor opens and reuses a completed source-scoped result', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        expect(post_message.mock.calls.some(
+            ([message]) => message.type === 'requestFilterHistogram',
+        )).toBe(false);
+
+        await open_grid_filter();
+        const request = latest_histogram_request(post_message);
+        expect(request).toMatchObject({
+            sheetIndex: 0, columnIndex: 0, generation: 1, sourceGeneration: 1,
+        });
+        expect(document.body.textContent).toContain('Loading distribution…');
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: request.requestId, generation: 1, sourceGeneration: 1,
+            bins: [{ lo: 0, hi: 10, count: 3 }],
+        });
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+
+        await click_button('Cancel');
+        post_message.mockClear();
+        await open_grid_filter();
+        expect(post_message.mock.calls.some(
+            ([message]) => message.type === 'requestFilterHistogram',
+        )).toBe(false);
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+    });
+
+    it('accepts and reuses an in-flight source-valid histogram after a transform-only generation bump', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        await open_grid_filter();
+        const histogram = latest_histogram_request(post_message);
+
+        const change_transform = grid_shell_mock.latest_props?.on_transform_change as (
+            state: SheetTransformState,
+        ) => void;
+        await act(async () => change_transform({
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+        }));
+        const transform = latest_transform_request(post_message);
+        await acknowledge_transform(transform, 2);
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(document.body.textContent).toContain('Loading distribution…');
+
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: histogram.requestId,
+            generation: histogram.generation,
+            sourceGeneration: histogram.sourceGeneration,
+            bins: [{ lo: 0, hi: 1, count: 5 }],
+        });
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+
+        await click_button('Cancel');
+        post_message.mockClear();
+        await open_grid_filter();
+        expect(post_message.mock.calls.some(
+            ([message]) => message.type === 'requestFilterHistogram',
+        )).toBe(false);
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(1);
+    });
+
+    it('settles a delayed view-stale histogram terminal that echoes its request tuple', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        await open_grid_filter();
+        const histogram = latest_histogram_request(post_message);
+
+        const change_transform = grid_shell_mock.latest_props?.on_transform_change as (
+            state: SheetTransformState,
+        ) => void;
+        await act(async () => change_transform({
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: histogram.sheetIndex,
+            columnIndex: histogram.columnIndex, requestId: histogram.requestId,
+            generation: histogram.generation,
+            sourceGeneration: histogram.sourceGeneration,
+            bins: [],
+            error: 'The view changed before this histogram request arrived.',
+        });
+        expect(document.body.textContent).toContain(
+            'Distribution unavailable: The view changed before this histogram request arrived.',
+        );
+        expect(document.body.textContent).not.toContain('Loading distribution…');
+    });
+
+    it('cancels when the editor target changes and ignores late mismatched results', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        meta.sheets[0] = { ...meta.sheets[0], columnCount: 2 };
+        await dispatch_host_message(initial_snapshot_message(meta));
+        post_message.mockClear();
+
+        await open_grid_filter(0);
+        const first = latest_histogram_request(post_message);
+        await open_grid_filter(1);
+        const second = latest_histogram_request(post_message);
+        expect(second.columnIndex).toBe(1);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'cancelFilterHistogram', requestId: first.requestId,
+        });
+
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: first.requestId, generation: 1, sourceGeneration: 1,
+            bins: [{ lo: 0, hi: 1, count: 99 }],
+        });
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
+        expect(document.body.textContent).toContain('Loading distribution…');
+
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: second.requestId, generation: 1, sourceGeneration: 1,
+            bins: [{ lo: 0, hi: 1, count: 42 }],
+        });
+        expect(document.querySelectorAll('.filter-histogram-bar')).toHaveLength(0);
+        expect(document.body.textContent).toContain('Loading distribution…');
+
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 1,
+            requestId: second.requestId, generation: 1, sourceGeneration: 1,
+            bins: [],
+        });
+        expect(document.body.textContent).toContain('No numeric values to chart.');
+    });
+
+    it('invalidates cached histograms on source generation change and fences the old response', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        await open_grid_filter();
+        const old_request = latest_histogram_request(post_message);
+
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: old_request.requestId, generation: 1, sourceGeneration: 1,
+            bins: [{ lo: 0, hi: 1, count: 7 }],
+        });
+        expect(document.querySelector('.filter-popover')).toBeNull();
+
+        post_message.mockClear();
+        await open_grid_filter();
+        const new_request = latest_histogram_request(post_message);
+        expect(new_request).toMatchObject({ generation: 2, sourceGeneration: 2 });
+        expect(new_request.requestId).not.toBe(old_request.requestId);
+    });
+
     it('disables transform controls while an edit-session request is pending', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
