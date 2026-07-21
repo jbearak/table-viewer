@@ -56,6 +56,22 @@ describe('transform UI model', () => {
             'isEmpty',
             'isNotEmpty',
         ]);
+        expect(filter_options_for_kind('orderedText').map((option) => option.value)).toEqual([
+            'contains',
+            'notContains',
+            'equals',
+            'notEquals',
+            'startsWith',
+            'endsWith',
+            'greaterThan',
+            'greaterThanOrEqual',
+            'lessThan',
+            'lessThanOrEqual',
+            'between',
+            'notBetween',
+            'isEmpty',
+            'isNotEmpty',
+        ]);
         expect(filter_options_for_kind('unknown').map((option) => option.value)).toEqual([
             'contains',
             'notContains',
@@ -89,6 +105,9 @@ describe('transform UI model', () => {
         expect(operator_supports_case_sensitive('contains')).toBe(true);
         expect(operator_supports_case_sensitive('equals', 'text')).toBe(true);
         expect(operator_supports_case_sensitive('equals', 'numeric')).toBe(false);
+        expect(operator_supports_case_sensitive('contains', 'numeric')).toBe(true);
+        expect(operator_supports_case_sensitive('notEquals', 'numeric')).toBe(false);
+        expect(operator_supports_case_sensitive('equals', 'orderedText')).toBe(true);
         expect(operator_supports_case_sensitive('equals', 'unknown')).toBe(true);
         expect(operator_supports_case_sensitive('between')).toBe(false);
         expect(operator_supports_case_sensitive('isEmpty')).toBe(false);
@@ -97,6 +116,12 @@ describe('transform UI model', () => {
             status: 'error', message: 'scan failed',
         })).toBe('unknown');
         expect(filter_column_kind_from_histogram({ status: 'ready', bins: [] })).toBe('text');
+        expect(filter_column_kind_from_histogram({
+            status: 'ready', bins: [], columnKind: 'orderedText',
+        })).toBe('orderedText');
+        expect(filter_column_kind_from_histogram({
+            status: 'ready', bins: [{ lo: 0, hi: 1, count: 1 }], columnKind: 'text',
+        })).toBe('text');
         expect(filter_column_kind_from_histogram({
             status: 'ready', bins: [{ lo: 0, hi: 1, count: 1 }],
         })).toBe('numeric');

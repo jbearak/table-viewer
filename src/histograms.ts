@@ -1,15 +1,67 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import { read_source_columns } from './data-source/interface';
-import type { HistogramBin } from './types';
+import type { FilterColumnKind, HistogramBin } from './types';
 
 const BIN_COUNT = 50;
 const ROW_BATCH_SIZE = 1_000;
+
+export interface ColumnHistogram {
+    bins: HistogramBin[];
+    columnKind: FilterColumnKind;
+}
 
 function finite_numeric_value(cell: RenderedCell | null | undefined): number | undefined {
     const raw = cell?.raw;
     if (raw === null || raw === undefined || raw.trim().length === 0) return undefined;
     const value = Number(raw);
     return Number.isFinite(value) ? value : undefined;
+}
+
+function raw_value(cell: RenderedCell | null | undefined): string | null {
+    const raw = cell?.raw;
+    return raw === null || raw === undefined || raw === '' ? null : raw;
+}
+
+function canonical_numeric_string(value: string): boolean {
+    if (value.trim() !== value) return false;
+    if (!/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) {
+        return false;
+    }
+    return Number.isFinite(Number(value));
+}
+
+function cell_can_be_numeric(cell: RenderedCell | null | undefined): boolean {
+    const raw = raw_value(cell);
+    if (raw === null || cell?.rawType === 'boolean') return false;
+    if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
+    if (cell?.rawType === 'string' || cell?.rawType === 'date') return false;
+    return canonical_numeric_string(raw);
+}
+
+function iso_date_string(value: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-][0-2]\d:?[0-5]\d)?)?$/.test(value)) {
+        return false;
+    }
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp);
+}
+
+function classify_value(
+    cell: RenderedCell | null | undefined,
+): 'numeric' | 'orderedText' | 'text' | undefined {
+    const raw = raw_value(cell);
+    if (raw === null) return undefined;
+    if (cell?.rawType === 'date' || iso_date_string(raw)) return 'orderedText';
+    if (cell_can_be_numeric(cell)) return 'numeric';
+    return 'text';
+}
+
+function combine_kind(
+    current: FilterColumnKind,
+    next: 'numeric' | 'orderedText' | 'text',
+): FilterColumnKind {
+    if (current === 'unknown') return next;
+    return current === next ? current : 'text';
 }
 
 async function yield_to_host(): Promise<void> {
@@ -34,7 +86,7 @@ export async function compute_column_histogram(
     sheet_index: number,
     column_index: number,
     is_cancelled: () => boolean,
-): Promise<HistogramBin[]> {
+): Promise<ColumnHistogram> {
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet || column_index < 0 || column_index >= sheet.columnCount) {
         throw new RangeError('Histogram column is out of range.');
@@ -43,6 +95,7 @@ export async function compute_column_histogram(
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
+    let columnKind: FilterColumnKind = 'unknown';
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
         const window = read_source_columns(
@@ -53,7 +106,12 @@ export async function compute_column_histogram(
             [column_index],
         );
         for (const row of window.rows) {
-            const value = finite_numeric_value(row[0]);
+            const cell = row[0];
+            const classified = classify_value(cell);
+            if (classified !== undefined) {
+                columnKind = combine_kind(columnKind, classified);
+            }
+            const value = cell_can_be_numeric(cell) ? finite_numeric_value(cell) : undefined;
             if (value === undefined) continue;
             min = Math.min(min, value);
             max = Math.max(max, value);
@@ -63,8 +121,9 @@ export async function compute_column_histogram(
     }
 
     if (is_cancelled()) throw abort_error();
-    if (count === 0) return [];
-    if (min === max) return [{ lo: min, hi: max, count }];
+    if (columnKind !== 'numeric') return { bins: [], columnKind };
+    if (count === 0) return { bins: [], columnKind };
+    if (min === max) return { bins: [{ lo: min, hi: max, count }], columnKind };
 
     const span = max - min;
     const boundary = (index: number) => {
@@ -102,5 +161,5 @@ export async function compute_column_histogram(
         await yield_to_host();
     }
     if (is_cancelled()) throw abort_error();
-    return bins;
+    return { bins, columnKind };
 }

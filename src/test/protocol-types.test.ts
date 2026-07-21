@@ -41,6 +41,7 @@ describe('paginated protocol message shapes', () => {
             generation: 7,
             sourceGeneration: 5,
             bins: [{ lo: 0, hi: 1, count: 3 }],
+            columnKind: 'numeric',
         };
         const cancel: WebviewMessage = {
             type: 'cancelFilterHistogram',

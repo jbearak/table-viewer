@@ -12,6 +12,7 @@ import {
     transform_is_active,
     transform_schema_for_sheet,
     type CsvDirtyMap,
+    type FilterColumnKind,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type PerFileState,
@@ -73,7 +74,7 @@ type ColumnVisibilityUpdater = (
 
 type TransformOrigin = 'grid' | 'toolbar' | 'restore';
 type FilterHistogramState = { status: 'loading' }
-    | { status: 'ready'; bins: readonly HistogramBin[] }
+    | { status: 'ready'; bins: readonly HistogramBin[]; columnKind: FilterColumnKind }
     | { status: 'error'; message: string };
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
@@ -267,7 +268,10 @@ export function App(): React.JSX.Element {
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
-    const histogram_cache_ref = useRef(new Map<string, readonly HistogramBin[]>());
+    const histogram_cache_ref = useRef(new Map<string, {
+        bins: readonly HistogramBin[];
+        columnKind: FilterColumnKind;
+    }>());
     const pending_histogram_ref = useRef<{
         requestId: string;
         key: string;
@@ -507,10 +511,17 @@ export function App(): React.JSX.Element {
                         value: { status: 'error', message: msg.error },
                     });
                 } else {
-                    histogram_cache_ref.current.set(pending.key, msg.bins);
+                    histogram_cache_ref.current.set(pending.key, {
+                        bins: msg.bins,
+                        columnKind: msg.columnKind ?? 'unknown',
+                    });
                     set_filter_histogram({
                         key: pending.key,
-                        value: { status: 'ready', bins: msg.bins },
+                        value: {
+                            status: 'ready',
+                            bins: msg.bins,
+                            columnKind: msg.columnKind ?? 'unknown',
+                        },
                     });
                 }
             }
@@ -1260,7 +1271,14 @@ export function App(): React.JSX.Element {
         const key = `${request_source_generation}:${sheet_index}:${column_index}`;
         const cached = histogram_cache_ref.current.get(key);
         if (cached) {
-            set_filter_histogram({ key, value: { status: 'ready', bins: cached } });
+            set_filter_histogram({
+                key,
+                value: {
+                    status: 'ready',
+                    bins: cached.bins,
+                    columnKind: cached.columnKind,
+                },
+            });
             return;
         }
 

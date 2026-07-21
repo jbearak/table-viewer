@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
+import type { FilterColumnKind, FilterEntry, FilterOperator, HistogramBin } from '../types';
 import { FilterHistogram, domain_max, domain_min } from './filter-histogram';
 import {
     filter_column_kind_from_histogram,
@@ -19,7 +19,7 @@ export interface FilterPopoverProps {
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
     histogram?: { status: 'loading' }
-        | { status: 'ready'; bins: readonly HistogramBin[] }
+        | { status: 'ready'; bins: readonly HistogramBin[]; columnKind?: FilterColumnKind }
         | { status: 'error'; message: string };
     on_apply: (entry: FilterEntry) => void;
     on_cancel: (reason: FilterPopoverDismissReason) => void;

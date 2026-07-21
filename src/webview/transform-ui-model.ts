@@ -1,4 +1,5 @@
 import type {
+    FilterColumnKind,
     FilterEntry,
     FilterOperator,
     SheetTransformState,
@@ -10,7 +11,6 @@ import { is_range_filter_operator } from '../types';
 
 export { is_range_filter_operator };
 
-export type FilterColumnKind = 'numeric' | 'text' | 'unknown';
 
 export type FilterOption = { value: FilterOperator; label: string };
 
@@ -55,6 +55,23 @@ const TEXT_FILTER_OPERATORS: readonly FilterOperator[] = [
     'isNotEmpty',
 ];
 
+const ORDERED_TEXT_FILTER_OPERATORS: readonly FilterOperator[] = [
+    'contains',
+    'notContains',
+    'equals',
+    'notEquals',
+    'startsWith',
+    'endsWith',
+    'greaterThan',
+    'greaterThanOrEqual',
+    'lessThan',
+    'lessThanOrEqual',
+    'between',
+    'notBetween',
+    'isEmpty',
+    'isNotEmpty',
+];
+
 const CASE_SENSITIVE_OPERATORS: ReadonlySet<FilterOperator> = new Set([
     'contains',
     'notContains',
@@ -66,7 +83,13 @@ const CASE_SENSITIVE_OPERATORS: ReadonlySet<FilterOperator> = new Set([
 
 export function filter_options_for_kind(kind: FilterColumnKind): readonly FilterOption[] {
     if (kind === 'unknown') return FILTER_OPTIONS;
-    const allowed = new Set(kind === 'numeric' ? NUMERIC_FILTER_OPERATORS : TEXT_FILTER_OPERATORS);
+    const allowed = new Set(
+        kind === 'numeric'
+            ? NUMERIC_FILTER_OPERATORS
+            : kind === 'orderedText'
+            ? ORDERED_TEXT_FILTER_OPERATORS
+            : TEXT_FILTER_OPERATORS,
+    );
     return FILTER_OPTIONS.filter((option) => allowed.has(option.value));
 }
 
@@ -86,12 +109,13 @@ export function operator_supports_case_sensitive(
     operator: FilterOperator,
     kind: FilterColumnKind = 'text',
 ): boolean {
-    return kind !== 'numeric' && CASE_SENSITIVE_OPERATORS.has(operator);
+    return !(kind === 'numeric' && (operator === 'equals' || operator === 'notEquals'))
+        && CASE_SENSITIVE_OPERATORS.has(operator);
 }
 
 export type FilterHistogramStatus =
     | { status: 'loading' }
-    | { status: 'ready'; bins: readonly { lo: number; hi: number; count: number }[] }
+    | { status: 'ready'; bins: readonly { lo: number; hi: number; count: number }[]; columnKind?: FilterColumnKind }
     | { status: 'error'; message: string };
 
 /**
@@ -103,7 +127,7 @@ export function filter_column_kind_from_histogram(
     histogram: FilterHistogramStatus,
 ): FilterColumnKind {
     if (histogram.status === 'loading' || histogram.status === 'error') return 'unknown';
-    return histogram.bins.length > 0 ? 'numeric' : 'text';
+    return histogram.columnKind ?? (histogram.bins.length > 0 ? 'numeric' : 'text');
 }
 
 export function new_filter_id(): string {

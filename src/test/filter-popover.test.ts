@@ -28,7 +28,7 @@ afterEach(() => {
 function render_popover(
     filters: FilterEntry[] = [],
     histogram?: { status: 'loading' }
-        | { status: 'ready'; bins: readonly HistogramBin[] }
+        | { status: 'ready'; bins: readonly HistogramBin[]; columnKind?: import('../types').FilterColumnKind }
         | { status: 'error'; message: string },
 ) {
     const on_apply = vi.fn();
@@ -122,6 +122,21 @@ describe('FilterPopover', () => {
 
         root = createRoot(container!);
         act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'ready', bins: [], columnKind: 'orderedText' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toContain('contains');
+        expect(options).toContain('between');
+        expect(options).toContain('greaterThan');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [{
                 id: 'f', colIndex: 1, operator: 'contains', value: 'x',
                 caseSensitive: false, enabled: true,
@@ -166,7 +181,7 @@ describe('FilterPopover', () => {
                 id: 'f', colIndex: 1, operator: 'equals', value: '1',
                 caseSensitive: true, enabled: true,
             }],
-            histogram: { status: 'ready', bins: READY_BINS },
+            histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
             anchor: { left: 10, top: 10 }, on_apply, on_cancel: vi.fn(),
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('equals');
@@ -176,6 +191,21 @@ describe('FilterPopover', () => {
         expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
             operator: 'equals', value: '1', caseSensitive: true,
         }));
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'contains', value: 'A',
+                caseSensitive: true, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+        expect(document.body.textContent).toContain('Case sensitive');
+        expect((document.querySelector('input[type="checkbox"]') as HTMLInputElement).checked)
+            .toBe(true);
         act(() => root!.unmount());
 
         root = createRoot(container!);

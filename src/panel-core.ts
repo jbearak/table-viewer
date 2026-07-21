@@ -16,6 +16,7 @@ import {
     EMPTY_TRANSFORM,
     transform_is_active,
     transform_schema_for_sheet,
+    type FilterColumnKind,
     type HistogramBin,
     type HostMessage,
     type SheetTransformState,
@@ -166,7 +167,7 @@ export class ViewerPanelCore {
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
-    private readonly histogram_cache = new Map<string, HistogramBin[]>();
+    private readonly histogram_cache = new Map<string, { bins: HistogramBin[]; columnKind: FilterColumnKind }>();
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private source_epoch = 0;
     private receiver_epoch = 0;
@@ -315,6 +316,7 @@ export class ViewerPanelCore {
                 sheetIndex: msg.sheetIndex,
                 columnIndex: msg.columnIndex,
                 bins: [],
+                columnKind: 'unknown',
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
@@ -333,19 +335,20 @@ export class ViewerPanelCore {
         const cache_key = `${this._source_generation}:${msg.sheetIndex}:${msg.columnIndex}`;
         try {
             const cached = this.histogram_cache.get(cache_key);
-            const bins = cached ?? await compute_column_histogram(
+            const histogram = cached ?? await compute_column_histogram(
                 this.source,
                 msg.sheetIndex,
                 msg.columnIndex,
                 is_cancelled,
             );
             if (is_cancelled()) return;
-            if (!cached) this.histogram_cache.set(cache_key, bins);
+            if (!cached) this.histogram_cache.set(cache_key, histogram);
             await this.post({
                 type: 'filterHistogram',
                 sheetIndex: msg.sheetIndex,
                 columnIndex: msg.columnIndex,
-                bins,
+                bins: histogram.bins,
+                columnKind: histogram.columnKind,
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
@@ -357,6 +360,7 @@ export class ViewerPanelCore {
                 sheetIndex: msg.sheetIndex,
                 columnIndex: msg.columnIndex,
                 bins: [],
+                columnKind: 'unknown',
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
