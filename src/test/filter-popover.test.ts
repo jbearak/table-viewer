@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FilterEntry, HistogramBin } from '../types';
+import type { FilterEntry, HistogramBin, SheetTransformState } from '../types';
 import { FilterPopover } from '../webview/filter-popover';
 
 let root: Root | null = null;
@@ -474,6 +474,33 @@ describe('FilterPopover', () => {
         expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
             operator: 'notBetween', value: '1', secondValue: '2',
         }));
+    });
+
+    it('does not suppress a notBetween upper-bound-only edit', async () => {
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: vi.fn(),
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { transforms_semantically_equal } = await import('../webview/app');
+        const current: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 1, operator: 'notBetween', value: '10', secondValue: '20',
+                caseSensitive: false, enabled: true,
+            }],
+        };
+        const edited: SheetTransformState = {
+            ...current,
+            filters: [{ ...current.filters[0], secondValue: '30' }],
+        };
+        const request_transform = vi.fn();
+
+        if (!transforms_semantically_equal(current, edited)) {
+            request_transform(edited);
+        }
+
+        expect(request_transform).toHaveBeenCalledWith(edited);
     });
 
     it('reclamps after isEmpty expands to between near the viewport edge', () => {

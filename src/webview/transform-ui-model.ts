@@ -14,83 +14,83 @@ export { is_range_filter_operator };
 
 export type FilterOption = { value: FilterOperator; label: string };
 
-export const FILTER_OPTIONS: readonly FilterOption[] = [
-    { value: 'contains', label: 'Contains' },
-    { value: 'notContains', label: 'Does not contain' },
-    { value: 'equals', label: 'Equals' },
-    { value: 'notEquals', label: 'Does not equal' },
-    { value: 'startsWith', label: 'Starts with' },
-    { value: 'endsWith', label: 'Ends with' },
-    { value: 'greaterThan', label: 'Greater than' },
-    { value: 'greaterThanOrEqual', label: 'Greater than or equal' },
-    { value: 'lessThan', label: 'Less than' },
-    { value: 'lessThanOrEqual', label: 'Less than or equal' },
-    { value: 'between', label: 'Between (inclusive)' },
-    { value: 'notBetween', label: 'Not between (inclusive bounds)' },
-    { value: 'isEmpty', label: 'Is empty' },
-    { value: 'isNotEmpty', label: 'Is not empty' },
-] as const;
+type KnownFilterColumnKind = Exclude<FilterColumnKind, 'unknown'>;
+type FilterOperatorMetadata = FilterOption & {
+    columnKinds: readonly KnownFilterColumnKind[];
+    supportsCaseSensitive: boolean;
+};
 
-const NUMERIC_FILTER_OPERATORS: readonly FilterOperator[] = [
-    'equals',
-    'notEquals',
-    'greaterThan',
-    'greaterThanOrEqual',
-    'lessThan',
-    'lessThanOrEqual',
-    'between',
-    'notBetween',
-    'isEmpty',
-    'isNotEmpty',
+const FILTER_OPERATOR_METADATA: readonly FilterOperatorMetadata[] = [
+    {
+        value: 'contains', label: 'Contains',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'notContains', label: 'Does not contain',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'equals', label: 'Equals',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'notEquals', label: 'Does not equal',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'startsWith', label: 'Starts with',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'endsWith', label: 'Ends with',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'greaterThan', label: 'Greater than',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'greaterThanOrEqual', label: 'Greater than or equal',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'lessThan', label: 'Less than',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'lessThanOrEqual', label: 'Less than or equal',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'between', label: 'Between (inclusive)',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'notBetween', label: 'Not between (inclusive bounds)',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'isEmpty', label: 'Is empty',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'isNotEmpty', label: 'Is not empty',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
 ];
 
-const TEXT_FILTER_OPERATORS: readonly FilterOperator[] = [
-    'contains',
-    'notContains',
-    'equals',
-    'notEquals',
-    'startsWith',
-    'endsWith',
-    'isEmpty',
-    'isNotEmpty',
-];
+const FILTER_OPERATOR_METADATA_BY_VALUE = new Map(
+    FILTER_OPERATOR_METADATA.map((metadata) => [metadata.value, metadata] as const),
+);
 
-const ORDERED_TEXT_FILTER_OPERATORS: readonly FilterOperator[] = [
-    'contains',
-    'notContains',
-    'equals',
-    'notEquals',
-    'startsWith',
-    'endsWith',
-    'greaterThan',
-    'greaterThanOrEqual',
-    'lessThan',
-    'lessThanOrEqual',
-    'between',
-    'notBetween',
-    'isEmpty',
-    'isNotEmpty',
-];
-
-const CASE_SENSITIVE_OPERATORS: ReadonlySet<FilterOperator> = new Set([
-    'contains',
-    'notContains',
-    'equals',
-    'notEquals',
-    'startsWith',
-    'endsWith',
-]);
+export const FILTER_OPTIONS: readonly FilterOption[] = FILTER_OPERATOR_METADATA.map(
+    ({ value, label }) => ({ value, label }),
+);
 
 export function filter_options_for_kind(kind: FilterColumnKind): readonly FilterOption[] {
     if (kind === 'unknown') return FILTER_OPTIONS;
-    const allowed = new Set(
-        kind === 'numeric'
-            ? NUMERIC_FILTER_OPERATORS
-            : kind === 'orderedText'
-            ? ORDERED_TEXT_FILTER_OPERATORS
-            : TEXT_FILTER_OPERATORS,
-    );
-    return FILTER_OPTIONS.filter((option) => allowed.has(option.value));
+    return FILTER_OPTIONS.filter((option) =>
+        FILTER_OPERATOR_METADATA_BY_VALUE.get(option.value)?.columnKinds.includes(kind));
 }
 
 /** Kind options plus the current operator when it falls outside the kind list. */
@@ -110,7 +110,7 @@ export function operator_supports_case_sensitive(
     kind: FilterColumnKind = 'text',
 ): boolean {
     return !(kind === 'numeric' && (operator === 'equals' || operator === 'notEquals'))
-        && CASE_SENSITIVE_OPERATORS.has(operator);
+        && FILTER_OPERATOR_METADATA_BY_VALUE.get(operator)?.supportsCaseSensitive === true;
 }
 
 export type FilterHistogramStatus =

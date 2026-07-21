@@ -8,6 +8,7 @@ import React, {
 } from 'react';
 import {
     EMPTY_TRANSFORM,
+    is_range_filter_operator,
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
@@ -89,7 +90,7 @@ function column_visibility_equal(
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function transforms_semantically_equal(
+export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
 ): boolean {
@@ -109,7 +110,7 @@ function transforms_semantically_equal(
             return {
                 ...base,
                 value: entry.value ?? '',
-                secondValue: entry.operator === 'between'
+                secondValue: is_range_filter_operator(entry.operator)
                     ? entry.secondValue ?? ''
                     : undefined,
                 caseSensitive: entry.caseSensitive,

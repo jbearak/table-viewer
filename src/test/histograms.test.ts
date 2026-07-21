@@ -127,6 +127,18 @@ describe('compute_column_histogram', () => {
         )).resolves.toMatchObject({ columnKind: 'text' });
     });
 
+    it('stops scanning when the column kind becomes text', async () => {
+        const source = new HistogramSource([
+            '1',
+            'label',
+            ...Array.from({ length: 1_999 }, (_, index) => String(index + 2)),
+        ]);
+        await expect(compute_column_histogram(
+            source, 0, 0, () => false,
+        )).resolves.toEqual({ bins: [], columnKind: 'text' });
+        expect(source.selected_columns).toEqual([[0]]);
+    });
+
     it('classifies raw and ISO date columns as ordered text', async () => {
         await expect(compute_column_histogram(
             new HistogramSource([{ raw: '2026-07-21', rawType: 'date' }]),

@@ -1,6 +1,10 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import { read_source_columns } from './data-source/interface';
 import type { FilterColumnKind, HistogramBin } from './types';
+import {
+    canonical_numeric_string,
+    raw_value,
+} from './transform-values';
 
 const BIN_COUNT = 50;
 const ROW_BATCH_SIZE = 1_000;
@@ -17,36 +21,6 @@ function finite_numeric_value(cell: RenderedCell | null | undefined): number | u
     return Number.isFinite(value) ? value : undefined;
 }
 
-function raw_value(cell: RenderedCell | null | undefined): string | null {
-    const raw = cell?.raw;
-    // Match finite_numeric_value: whitespace-only cells are empty, not text.
-    return raw === null || raw === undefined || raw.trim().length === 0
-        ? null
-        : raw;
-}
-
-function canonical_numeric_string(value: string): boolean {
-    if (value.trim() !== value) return false;
-    if (!/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) {
-        return false;
-    }
-    return Number.isFinite(Number(value));
-}
-
-/**
- * Align with transform column scanning (acquire_transform_column):
- * CSV cells are rawType:'string', but pure canonical number text is still numeric.
- * Dates are never numeric here; classify_value maps them to orderedText.
- */
-function cell_can_be_numeric(cell: RenderedCell | null | undefined): boolean {
-    const raw = raw_value(cell);
-    if (raw === null || cell?.rawType === 'boolean' || cell?.rawType === 'date') {
-        return false;
-    }
-    if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
-    return canonical_numeric_string(raw);
-}
-
 function iso_date_string(value: string): boolean {
     if (!/^\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-][0-2]\d:?[0-5]\d)?)?$/.test(value)) {
         return false;
@@ -55,14 +29,30 @@ function iso_date_string(value: string): boolean {
     return Number.isFinite(timestamp);
 }
 
+type ClassifiedValue =
+    | { kind: 'numeric'; numericValue: number }
+    | { kind: 'orderedText' | 'text' }
+    | undefined;
+
 function classify_value(
     cell: RenderedCell | null | undefined,
-): 'numeric' | 'orderedText' | 'text' | undefined {
+): ClassifiedValue {
     const raw = raw_value(cell);
     if (raw === null) return undefined;
-    if (cell?.rawType === 'date' || iso_date_string(raw)) return 'orderedText';
-    if (cell_can_be_numeric(cell)) return 'numeric';
-    return 'text';
+    if (cell?.rawType === 'date' || iso_date_string(raw)) {
+        return { kind: 'orderedText' };
+    }
+    if (cell?.rawType === 'boolean') return { kind: 'text' };
+    if (cell?.rawType === 'number') {
+        const numericValue = Number(raw);
+        return Number.isFinite(numericValue)
+            ? { kind: 'numeric', numericValue }
+            : { kind: 'text' };
+    }
+    if (canonical_numeric_string(raw)) {
+        return { kind: 'numeric', numericValue: Number(raw) };
+    }
+    return { kind: 'text' };
 }
 
 function combine_kind(
@@ -115,13 +105,14 @@ export async function compute_column_histogram(
             [column_index],
         );
         for (const row of window.rows) {
-            const cell = row[0];
-            const classified = classify_value(cell);
-            if (classified !== undefined) {
-                columnKind = combine_kind(columnKind, classified);
+            const classified = classify_value(row[0]);
+            if (classified === undefined) continue;
+            columnKind = combine_kind(columnKind, classified.kind);
+            if (columnKind === 'text') {
+                return { bins: [], columnKind };
             }
-            const value = cell_can_be_numeric(cell) ? finite_numeric_value(cell) : undefined;
-            if (value === undefined) continue;
+            if (classified.kind !== 'numeric') continue;
+            const value = classified.numericValue;
             min = Math.min(min, value);
             max = Math.max(max, value);
             count += 1;
