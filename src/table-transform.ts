@@ -11,6 +11,8 @@ import { transform_is_active } from './types';
 // transform inside the old 1,000-row scan interval.
 const SCAN_ROWS_PER_CHECKPOINT = 128;
 const FILTER_ROWS_PER_CHECKPOINT = 1000;
+const SORT_COLUMNS_PER_CHECKPOINT = 64;
+const SORT_KEY_BUILDS_PER_CHECKPOINT = 4096;
 const SORT_CHUNK_ROWS = 2048;
 const SORT_OPERATIONS_PER_CHECKPOINT = 4096;
 const COMPACT_ROWS_PER_CHECKPOINT = 4096;
@@ -29,6 +31,13 @@ interface TransformColumn {
     values: (string | null | undefined)[];
     numeric: boolean;
     foundValue: boolean;
+    numericSortKeys?: (NumericSortKey | undefined)[];
+}
+
+/** Optional cumulative counters for deterministic transform performance tests. */
+export interface TransformSortInstrumentation {
+    numericSortKeyBuilds: number;
+    numericSortComparisons: number;
 }
 
 export async function compute_transform(
@@ -36,6 +45,7 @@ export async function compute_transform(
     sheet_index: number,
     state: SheetTransformState,
     is_cancelled: () => boolean = () => false,
+    sort_instrumentation?: TransformSortInstrumentation,
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet) {
@@ -101,7 +111,13 @@ export async function compute_transform(
     }
 
     validate_filter_operands(state, values);
+    const numeric_sort_columns = await prepare_numeric_sort_columns(
+        state,
+        values,
+        is_cancelled,
+    );
     const survivors: number[] = [];
+    let numeric_sort_key_builds_since_checkpoint = 0;
     await cancellation_checkpoint(is_cancelled);
     for (let row = 0; row < sheet.rowCount; row++) {
         let matches = true;
@@ -117,9 +133,29 @@ export async function compute_transform(
                 break;
             }
         }
-        if (matches) survivors.push(row);
+        if (matches) {
+            survivors.push(row);
+            for (const column of numeric_sort_columns) {
+                const raw = column.values[row];
+                if (raw !== null && raw !== undefined) {
+                    column.numericSortKeys![row] = build_numeric_sort_key(raw);
+                    if (sort_instrumentation) {
+                        sort_instrumentation.numericSortKeyBuilds += 1;
+                    }
+                    numeric_sort_key_builds_since_checkpoint += 1;
+                    if (
+                        numeric_sort_key_builds_since_checkpoint
+                        >= SORT_KEY_BUILDS_PER_CHECKPOINT
+                    ) {
+                        await cancellation_checkpoint(is_cancelled);
+                        numeric_sort_key_builds_since_checkpoint = 0;
+                    }
+                }
+            }
+        }
         if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
             await cancellation_checkpoint(is_cancelled);
+            numeric_sort_key_builds_since_checkpoint = 0;
         }
     }
     if (sheet.rowCount % FILTER_ROWS_PER_CHECKPOINT !== 0) {
@@ -130,12 +166,20 @@ export async function compute_transform(
         const compare_rows = (a: number, b: number): number => {
             for (const key of state.sort) {
                 const column = values.get(key.colIndex)!;
-                const result = compare_values(
-                    column.values[a] ?? null,
-                    column.values[b] ?? null,
-                    key.direction,
-                    column.numeric && column.foundValue,
-                );
+                const result = column.numericSortKeys
+                    ? compare_precomputed_numeric_values(
+                        column,
+                        a,
+                        b,
+                        key.direction,
+                        sort_instrumentation,
+                    )
+                    : compare_values(
+                        column.values[a] ?? null,
+                        column.values[b] ?? null,
+                        key.direction,
+                        false,
+                    );
                 if (result !== 0) return result;
             }
             return a - b;
@@ -152,6 +196,33 @@ export async function compute_transform(
         indices,
         rowCount: survivors.length,
     };
+}
+
+async function prepare_numeric_sort_columns(
+    state: SheetTransformState,
+    columns: Map<number, TransformColumn>,
+    is_cancelled: () => boolean,
+): Promise<TransformColumn[]> {
+    const result: TransformColumn[] = [];
+    const prepared = new Set<number>();
+    let numeric_columns_since_checkpoint = SORT_COLUMNS_PER_CHECKPOINT;
+    for (const sort of state.sort) {
+        if (prepared.has(sort.colIndex)) continue;
+        prepared.add(sort.colIndex);
+        const column = columns.get(sort.colIndex)!;
+        if (!column.numeric || !column.foundValue) continue;
+        if (
+            numeric_columns_since_checkpoint
+            >= SORT_COLUMNS_PER_CHECKPOINT
+        ) {
+            await cancellation_checkpoint(is_cancelled);
+            numeric_columns_since_checkpoint = 0;
+        }
+        column.numericSortKeys = new Array(column.values.length);
+        result.push(column);
+        numeric_columns_since_checkpoint += 1;
+    }
+    return result;
 }
 
 export function compare_cells(
@@ -185,6 +256,29 @@ function compare_values(
     const ascending = numeric
         ? compare_numeric_text(a, b)
         : COLLATOR.compare(a, b);
+    return direction === 'asc' ? ascending : -ascending;
+}
+
+function compare_precomputed_numeric_values(
+    column: TransformColumn,
+    a_row: number,
+    b_row: number,
+    direction: SortDirection,
+    instrumentation?: TransformSortInstrumentation,
+): number {
+    const a = column.values[a_row] ?? null;
+    const b = column.values[b_row] ?? null;
+    const a_missing = a === null;
+    const b_missing = b === null;
+    if (a_missing && b_missing) return 0;
+    if (a_missing) return 1;
+    if (b_missing) return -1;
+
+    if (instrumentation) instrumentation.numericSortComparisons += 1;
+    const ascending = compare_numeric_sort_keys(
+        column.numericSortKeys![a_row]!,
+        column.numericSortKeys![b_row]!,
+    );
     return direction === 'asc' ? ascending : -ascending;
 }
 
@@ -339,20 +433,29 @@ function compare_numeric_text(a: string, b: string): number {
 }
 
 interface ExactDecimal {
-    sign: -1 | 0 | 1;
+    readonly sign: -1 | 0 | 1;
     /** Significant decimal digits with leading and trailing zeroes removed. */
-    digits: string;
-    /** Power of ten applied to `digits`. */
-    exponent: bigint;
+    readonly digits: string;
+    /** Decimal digit count plus exponent, precomputed for hot comparisons. */
+    readonly magnitude: bigint;
 }
+
+type NumericSortKey = ExactDecimal;
 
 function parse_canonical_decimal(value: string): ExactDecimal | undefined {
     const match = /^([+-]?)(0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value);
-    if (!match || !Number.isFinite(Number(value))) return undefined;
+    if (!match) return undefined;
+    if (!Number.isFinite(Number(value))) return undefined;
 
     const fraction = match[3] ?? '';
     let digits = `${match[2]}${fraction}`.replace(/^0+/, '');
-    if (digits === '') return { sign: 0, digits: '', exponent: 0n };
+    if (digits === '') {
+        return {
+            sign: 0,
+            digits: '',
+            magnitude: 0n,
+        };
+    }
 
     const trailing_zeroes = digits.length - digits.replace(/0+$/, '').length;
     if (trailing_zeroes > 0) digits = digits.slice(0, -trailing_zeroes);
@@ -362,8 +465,22 @@ function parse_canonical_decimal(value: string): ExactDecimal | undefined {
     return {
         sign: match[1] === '-' ? -1 : 1,
         digits,
-        exponent,
+        magnitude: BigInt(digits.length) + exponent,
     };
+}
+
+function build_numeric_sort_key(value: string): NumericSortKey {
+    const exact = parse_canonical_decimal(value);
+    if (exact) return exact;
+
+    // Finite rawType:number cells may use non-canonical text such as `1.` or
+    // `.5`. Canonicalize their actual IEEE-754 value once so every key shares
+    // the same exact, transitive comparison domain.
+    return parse_canonical_decimal(String(Number(value)))!;
+}
+
+function compare_numeric_sort_keys(a: NumericSortKey, b: NumericSortKey): number {
+    return compare_exact_decimals(a, b);
 }
 
 function compare_exact_decimals(a: ExactDecimal, b: ExactDecimal): number {
@@ -375,10 +492,8 @@ function compare_exact_decimals(a: ExactDecimal, b: ExactDecimal): number {
 }
 
 function compare_decimal_magnitudes(a: ExactDecimal, b: ExactDecimal): number {
-    const a_magnitude = BigInt(a.digits.length) + a.exponent;
-    const b_magnitude = BigInt(b.digits.length) + b.exponent;
-    if (a_magnitude !== b_magnitude) {
-        return a_magnitude < b_magnitude ? -1 : 1;
+    if (a.magnitude !== b.magnitude) {
+        return a.magnitude < b.magnitude ? -1 : 1;
     }
 
     const length = Math.max(a.digits.length, b.digits.length);

@@ -13,6 +13,7 @@ import {
     transformed_window,
 } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
+import type { TransformSortInstrumentation } from '../table-transform';
 
 const cell = (
     raw: string,
@@ -197,6 +198,177 @@ describe('table transforms', () => {
 
         // Rows 1 and 4 are numerically equal, so their source order is stable.
         expect([...result.indices!]).toEqual([1, 4, 2, 0, 3]);
+    });
+
+    it('builds exact numeric sort keys once per cell rather than per comparison', async () => {
+        const size = 4096;
+        const reverse_bits = (value: number): number => {
+            let result = 0;
+            for (let bit = 0; bit < 12; bit++) {
+                result = (result << 1) | ((value >>> bit) & 1);
+            }
+            return result;
+        };
+        const rows = Array.from({ length: size }, (_, source_row) => {
+            const ordinal = reverse_bits(source_row);
+            const integer = String(9007199254740992n + BigInt(ordinal));
+            const raw = ordinal % 3 === 0
+                ? integer
+                : ordinal % 3 === 1
+                    ? `${integer}.0`
+                    : `${integer[0]}.${integer.slice(1)}e15`;
+            return [cell(raw)];
+        });
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+
+        const result = await compute_transform(
+            new Source(rows),
+            0,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            undefined,
+            instrumentation,
+        );
+
+        expect([...result.indices!]).toEqual(Array.from(
+            { length: size },
+            (_, ordinal) => reverse_bits(ordinal),
+        ));
+        expect(instrumentation.numericSortKeyBuilds).toBe(size);
+        expect(instrumentation.numericSortComparisons).toBeGreaterThan(size * 4);
+    });
+
+    it('builds numeric sort keys only for surviving nonmissing cells', async () => {
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source([
+            [cell('4'), cell('keep')],
+            [null, cell('keep')],
+            [cell('2'), cell('drop')],
+            [cell('3'), cell('keep')],
+        ]);
+
+        const result = await compute_transform(
+            source,
+            0,
+            {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [filter('equals', 'keep', 1)],
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect([...result.indices!]).toEqual([3, 0, 1]);
+        expect(instrumentation.numericSortKeyBuilds).toBe(2);
+    });
+
+    it('cancels key precomputation within a single wide multi-key row', async () => {
+        const width = 4200;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source([
+            Array.from({ length: width }, (_, column) => cell(String(column))),
+        ]);
+
+        await expect(compute_transform(
+            source,
+            0,
+            {
+                sort: Array.from(
+                    { length: width },
+                    (_, colIndex) => ({ colIndex, direction: 'asc' as const }),
+                ),
+                filters: [],
+            },
+            // Three setup/scan checkpoints, 66 numeric-column preparation
+            // checkpoints, one pre-filter checkpoint, then the key-build one.
+            cancel_at_checkpoint(71),
+            instrumentation,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(4096);
+        expect(instrumentation.numericSortKeyBuilds).toBeLessThan(width);
+    });
+
+    it('cancels while preparing arrays for a very wide numeric sort', async () => {
+        const width = 4200;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source([
+            Array.from({ length: width }, (_, column) => cell(String(column))),
+        ]);
+
+        await expect(compute_transform(
+            source,
+            0,
+            {
+                sort: Array.from(
+                    { length: width },
+                    (_, colIndex) => ({ colIndex, direction: 'asc' as const }),
+                ),
+                filters: [],
+            },
+            // Checkpoints 1-3 cover setup and scanning, 4 precedes the first
+            // key array, and 5 interrupts before the 65th key array.
+            cancel_at_checkpoint(5),
+            instrumentation,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(0);
+    });
+
+    it('keeps mixed canonical and number-fallback keys transitive near 2^53', async () => {
+        const values = [
+            cell('9007199254740992'),
+            cell('9007199254740993.', 'number'),
+            cell('9007199254740993'),
+        ];
+        const permutations = [
+            [0, 1, 2], [0, 2, 1], [1, 0, 2],
+            [1, 2, 0], [2, 0, 1], [2, 1, 0],
+        ];
+
+        for (const permutation of permutations) {
+            const source = new Source(permutation.map((index) => [values[index]]));
+            const result = await compute_transform(source, 0, {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            });
+            const expected = permutation
+                .map((value, source_row) => ({ value, source_row }))
+                .filter(({ value }) => value !== 2)
+                .map(({ source_row }) => source_row);
+            expected.push(permutation.indexOf(2));
+            expect([...result.indices!]).toEqual(expected);
+        }
+    });
+
+    it('preserves signed zero and exact ordering at finite exponent extremes', async () => {
+        const source = new Source([
+            [cell('-0e+300')],
+            [cell('0.0')],
+            [cell('1e-308')],
+            [cell('-1e-308')],
+            [cell('1e308')],
+            [cell('-1e308')],
+            [cell('10000000000000001e-324')],
+            [cell('10000000000000000e-324')],
+        ]);
+        const result = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
+
+        expect([...result.indices!]).toEqual([5, 3, 0, 1, 2, 7, 6, 4]);
     });
 
     it('uses exact canonical integers for numeric equality, relations, and ranges', async () => {
