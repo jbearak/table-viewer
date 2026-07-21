@@ -159,6 +159,27 @@ describe('table transforms', () => {
         expect([...result.indices!]).toEqual([1, 4, 2, 3, 0]);
     });
 
+    it('sorts mixed canonical integers, decimals, and scientific notation exactly', async () => {
+        const integer = cell('9007199254740993');
+        const scientific = cell('9.007199254740992e15');
+        expect(compare_cells(integer, scientific, 'asc', true)).toBeGreaterThan(0);
+
+        const source = new Source([
+            [integer],
+            [scientific],
+            [cell('9007199254740992.5')],
+            [cell('9.007199254740993e15')],
+            [cell('9007199254740992')],
+        ]);
+        const result = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
+
+        // Rows 1 and 4 are numerically equal, so their source order is stable.
+        expect([...result.indices!]).toEqual([1, 4, 2, 0, 3]);
+    });
+
     it('uses exact canonical integers for numeric equality, relations, and ranges', async () => {
         const source = new Source([
             [cell('9007199254740992')],
@@ -181,6 +202,28 @@ describe('table transforms', () => {
             ...filter('between', '9007199254740993'),
             secondValue: '9223372036854775807',
         })).resolves.toMatchObject({ indices: Uint32Array.from([1, 2]) });
+    });
+
+    it('filters mixed canonical integers, decimals, and scientific notation exactly', async () => {
+        const source = new Source([
+            [cell('9007199254740993')],
+            [cell('9.007199254740992e15')],
+            [cell('9007199254740992.5')],
+            [cell('9.007199254740993e15')],
+        ]);
+        const apply = (entry: FilterEntry) => compute_transform(source, 0, {
+            sort: [],
+            filters: [entry],
+        });
+
+        await expect(apply(filter('equals', '9.007199254740993e15')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([0, 3]) });
+        await expect(apply(filter('greaterThan', '9.007199254740992e15')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([0, 2, 3]) });
+        await expect(apply({
+            ...filter('between', '9.0071992547409925e15'),
+            secondValue: '9007199254740993',
+        })).resolves.toMatchObject({ indices: Uint32Array.from([0, 2, 3]) });
     });
 
     it('treats empty strings and nulls consistently as missing', () => {

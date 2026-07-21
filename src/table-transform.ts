@@ -320,16 +320,64 @@ function compare_filter_values(
 }
 
 function compare_numeric_text(a: string, b: string): number {
-    if (canonical_integer_string(a) && canonical_integer_string(b)) {
-        const a_integer = BigInt(a);
-        const b_integer = BigInt(b);
-        return a_integer < b_integer ? -1 : a_integer > b_integer ? 1 : 0;
+    const a_decimal = parse_canonical_decimal(a);
+    const b_decimal = parse_canonical_decimal(b);
+    if (a_decimal && b_decimal) {
+        return compare_exact_decimals(a_decimal, b_decimal);
     }
     return Math.sign(Number(a) - Number(b));
 }
 
-function canonical_integer_string(value: string): boolean {
-    return /^[+-]?(?:0|[1-9]\d*)$/.test(value);
+interface ExactDecimal {
+    sign: -1 | 0 | 1;
+    /** Significant decimal digits with leading and trailing zeroes removed. */
+    digits: string;
+    /** Power of ten applied to `digits`. */
+    exponent: bigint;
+}
+
+function parse_canonical_decimal(value: string): ExactDecimal | undefined {
+    const match = /^([+-]?)(0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value);
+    if (!match || !Number.isFinite(Number(value))) return undefined;
+
+    const fraction = match[3] ?? '';
+    let digits = `${match[2]}${fraction}`.replace(/^0+/, '');
+    if (digits === '') return { sign: 0, digits: '', exponent: 0n };
+
+    const trailing_zeroes = digits.length - digits.replace(/0+$/, '').length;
+    if (trailing_zeroes > 0) digits = digits.slice(0, -trailing_zeroes);
+    const exponent = BigInt(match[4] ?? '0')
+        - BigInt(fraction.length)
+        + BigInt(trailing_zeroes);
+    return {
+        sign: match[1] === '-' ? -1 : 1,
+        digits,
+        exponent,
+    };
+}
+
+function compare_exact_decimals(a: ExactDecimal, b: ExactDecimal): number {
+    if (a.sign !== b.sign) return a.sign < b.sign ? -1 : 1;
+    if (a.sign === 0) return 0;
+
+    const magnitude = compare_decimal_magnitudes(a, b);
+    return a.sign === 1 ? magnitude : -magnitude;
+}
+
+function compare_decimal_magnitudes(a: ExactDecimal, b: ExactDecimal): number {
+    const a_magnitude = BigInt(a.digits.length) + a.exponent;
+    const b_magnitude = BigInt(b.digits.length) + b.exponent;
+    if (a_magnitude !== b_magnitude) {
+        return a_magnitude < b_magnitude ? -1 : 1;
+    }
+
+    const length = Math.max(a.digits.length, b.digits.length);
+    for (let index = 0; index < length; index++) {
+        const a_digit = a.digits.charCodeAt(index) || 48;
+        const b_digit = b.digits.charCodeAt(index) || 48;
+        if (a_digit !== b_digit) return a_digit < b_digit ? -1 : 1;
+    }
+    return 0;
 }
 
 function validate_filter_operands(
