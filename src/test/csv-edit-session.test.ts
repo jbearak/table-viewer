@@ -14,6 +14,7 @@ import * as vscode_mock from './mocks/vscode';
 import { file_coordinator_registry_size } from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snapshot';
+import { InvalidPersistedTransformError } from '../panel-core';
 
 const enc = new TextEncoder();
 
@@ -3019,10 +3020,200 @@ describe('CSV edit sessions', () => {
 
         expect(versioned.get_state(file_path).transforms).toEqual([undefined]);
         expect(latest_snapshot(retaining).state.transforms).toEqual([undefined]);
-        expect(error).toHaveBeenCalledWith(
-            expect.stringContaining('Failed to reconcile table transforms'),
-            expect.any(Error),
+        expect(error).not.toHaveBeenCalled();
+    });
+
+    it('durably removes only the invalid numeric transform and does not retry it on reopen', async () => {
+        const file_path = '/tmp/invalid-saved-numeric-filter.csv';
+        const invalid = {
+            sort: [],
+            filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'not-a-number', caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        };
+        const other = {
+            sort: [{ colIndex: 1, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet2",2,null]',
+        };
+        const versioned = state_store({
+            transforms: [invalid, other],
+            columnWidths: [{ 0: 123 }, { 1: 234 }],
+        });
+        let reads = 0;
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new class extends TwoSheetSource {
+                    override read_rows(sheet: number, start: number, count: number) {
+                        reads += 1;
+                        if (sheet === 0) {
+                            return {
+                                startRow: 0,
+                                rows: [[{
+                                    raw: '1', rawType: 'number' as const, formatted: '1',
+                                    bold: false, italic: false,
+                                }, null]],
+                            };
+                        }
+                        return super.read_rows(sheet, start, count);
+                    }
+                }();
+            },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), versioned.store, profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+
+        expect(versioned.get_state(file_path)).toMatchObject({
+            transforms: [undefined, other],
+            columnWidths: [{ 0: 123 }, { 1: 234 }],
+        });
+        const reads_after_cleanup = reads;
+        await panel.__receive({ type: 'ready' });
+        expect(reads).toBe(reads_after_cleanup);
+        expect(error).not.toHaveBeenCalled();
+        expect(latest_snapshot(panel).state.transforms).toEqual([undefined, other]);
+    });
+
+    it('cleans more than the ready rebase limit of independently invalid sheets', async () => {
+        const file_path = '/tmp/many-invalid-saved-filters.csv';
+        const sheet_count = 20;
+        const transforms = Array.from({ length: sheet_count }, (_, index) => ({
+            sort: [],
+            filters: [{
+                id: `invalid-${index}`, colIndex: 0,
+                operator: 'greaterThan' as const, value: 'bad',
+                caseSensitive: false, enabled: true,
+            }],
+            schema: JSON.stringify([`Sheet${index + 1}`, 1, null]),
+        }));
+        const versioned = state_store({ transforms });
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new class extends StubSource {
+                    override meta(): WorkbookMeta {
+                        return {
+                            hasFormatting: false,
+                            sheets: Array.from({ length: sheet_count }, (_, index) => ({
+                                name: `Sheet${index + 1}`,
+                                rowCount: 1,
+                                columnCount: 1,
+                                merges: [],
+                                hasFormatting: false,
+                            })),
+                        };
+                    }
+                    override read_rows(sheet: number): RowWindow {
+                        return {
+                            startRow: 0,
+                            rows: [[{
+                                raw: String(sheet), rawType: 'number',
+                                formatted: String(sheet), bold: false, italic: false,
+                            }]],
+                        };
+                    }
+                }();
+            },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), versioned.store, profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+
+        expect(versioned.get_state(file_path).transforms)
+            .toEqual(Array.from({ length: sheet_count }, () => undefined));
+        expect(versioned.revision(file_path)).toBe(sheet_count);
+        expect(error).not.toHaveBeenCalledWith(
+            expect.stringContaining('kept changing during ready'),
         );
+    });
+
+    it('bounds repeated invalid-state reintroduction on one sheet during ready', async () => {
+        const file_path = '/tmp/reintroduced-invalid-ready-filter.csv';
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [invalid] });
+        let cleanup_commits = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const result = await versioned.store.compare_and_set(
+                    path, expected, next, validate,
+                );
+                if (result.type === 'committed' && next.transforms?.[0] === undefined) {
+                    cleanup_commits += 1;
+                    const current = await versioned.store.read(path);
+                    await versioned.store.compare_and_set(path, current.revision, {
+                        ...(current.state as PerFileState), transforms: [invalid],
+                    });
+                }
+                return result;
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+
+        // One credited forward-progress cleanup, then the 16 normal rebases.
+        expect(cleanup_commits).toBe(17);
+        expect(versioned.get_state(file_path).transforms).toEqual([invalid]);
+        expect(error).toHaveBeenCalledWith(
+            'Table viewer state kept changing during ready; using retained state',
+        );
+    });
+
+    it('keeps invalid ready state after cleanup persistence fails and clears it on retry', async () => {
+        const file_path = '/tmp/ready-invalid-cleanup-retry.csv';
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [invalid] });
+        let fail_cleanup = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (fail_cleanup && next.transforms?.[0] === undefined) {
+                    fail_cleanup = false;
+                    throw new Error('transient ready cleanup persistence failure');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'ready' });
+        expect(versioned.get_state(file_path).transforms).toEqual([invalid]);
+        expect(latest_snapshot(panel).state.transforms).toEqual([invalid]);
+        expect(error).toHaveBeenCalledWith(
+            'Failed to clear an invalid saved table transform',
+            expect.objectContaining({ message: 'transient ready cleanup persistence failure' }),
+        );
+
+        await panel.__receive({ type: 'ready' });
+        expect(versioned.get_state(file_path).transforms).toEqual([undefined]);
+        expect(latest_snapshot(panel).state.transforms).toEqual([undefined]);
     });
 
     it('confirms an unchanged revision after reconciliation and confirmation-read errors', async () => {
@@ -3140,6 +3331,253 @@ describe('CSV edit sessions', () => {
         ) as { error?: string };
         expect(ack.error).toContain('column read failed');
         expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
+    });
+
+    it('cleans an explicit invalid numeric restore before acknowledging it', async () => {
+        const file_path = '/tmp/explicit-invalid-restore.csv';
+        const saved_transform = {
+            // Deliberately reverse insertion order from sanitizer output. CAS
+            // ownership must use transform semantics, not JSON object order.
+            schema: '["Sheet1",1,null]',
+            filters: [{
+                enabled: true, caseSensitive: false, value: 'bad',
+                operator: 'greaterThan' as const, colIndex: 0, id: 'invalid',
+            }],
+            sort: [],
+        };
+        const state = state_store({ transforms: [saved_transform] });
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const panel = open_csv_table(uri(file_path), state.store, profile);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        panel.__messages.length = 0;
+
+        await panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'invalid-restore',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore', state: saved_transform,
+        });
+
+        const ack = panel.__messages.find((message) =>
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'transformApplied') as
+            { state: unknown; error?: string };
+        expect(ack.state).toEqual({ sort: [], filters: [] });
+        expect(ack.error).toBeUndefined();
+        expect(state.get_state(file_path).transforms).toEqual([undefined]);
+    });
+
+    it('reports an explicit cleanup persistence failure and recovers on retry', async () => {
+        const file_path = '/tmp/explicit-invalid-restore-cleanup-retry.csv';
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [invalid] });
+        let fail_cleanup = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (fail_cleanup && next.transforms?.[0] === undefined) {
+                    fail_cleanup = false;
+                    throw new Error('transient cleanup persistence failure');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const restore = (requestId: string) => panel.__receive({
+            type: 'setTransform' as const, sheetIndex: 0, requestId,
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore' as const, state: invalid,
+        });
+
+        panel.__messages.length = 0;
+        await restore('failed-cleanup');
+        const failed = panel.__messages.find((message) =>
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'transformApplied') as
+            { state: unknown; error?: string };
+        expect(failed.state).toEqual({ sort: [], filters: [] });
+        expect(failed.error).toContain('finite numbers');
+        expect(versioned.get_state(file_path).transforms).toEqual([invalid]);
+        expect(error).toHaveBeenCalledWith(
+            'Failed to clear an invalid saved table transform',
+            expect.objectContaining({ message: 'transient cleanup persistence failure' }),
+        );
+
+        panel.__messages.length = 0;
+        await restore('successful-retry');
+        const recovered = panel.__messages.find((message) =>
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'transformApplied') as
+            { error?: string };
+        expect(recovered.error).toBeUndefined();
+        expect(versioned.get_state(file_path).transforms).toEqual([undefined]);
+    });
+
+    it('does not clear the same invalid saved filter from a different sheet', async () => {
+        const file_path = '/tmp/one-sheet-invalid-restore-cleanup.csv';
+        const filter = {
+            id: 'same-invalid', colIndex: 0, operator: 'greaterThan' as const,
+            value: 'bad', caseSensitive: false, enabled: true,
+        };
+        const first = {
+            sort: [], filters: [filter], schema: '["Sheet1",2,null]',
+        };
+        const second = {
+            sort: [], filters: [filter], schema: '["Sheet2",2,null]',
+        };
+        const state = state_store({ transforms: [first, second] });
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                return new class extends TwoSheetSource {
+                    override read_rows(sheet: number): RowWindow {
+                        return {
+                            startRow: 0,
+                            rows: [[{
+                                raw: String(sheet + 1), rawType: 'number',
+                                formatted: String(sheet + 1), bold: false, italic: false,
+                            }, null]],
+                        };
+                    }
+                }();
+            },
+        };
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), state.store, profile);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'first-sheet-only',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore', state: first,
+        });
+
+        expect(state.get_state(file_path).transforms).toEqual([undefined, second]);
+        expect(error).toHaveBeenCalledWith(
+            expect.stringContaining('Failed to reconcile durable table transforms'),
+            expect.any(InvalidPersistedTransformError),
+        );
+    });
+
+    it('adopts a newer transform that wins the invalid-restore cleanup CAS', async () => {
+        const file_path = '/tmp/invalid-restore-cas-winner.csv';
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        const winner = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [], schema: invalid.schema,
+        };
+        const versioned = state_store({ transforms: [invalid], rowHeights: [{ 0: 27 }] });
+        let inject_winner = true;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (inject_winner && next.transforms?.[0] === undefined) {
+                    inject_winner = false;
+                    const current = await versioned.store.read(path);
+                    await versioned.store.compare_and_set(path, current.revision, {
+                        ...(current.state as PerFileState),
+                        transforms: [winner],
+                    });
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        panel.__messages.length = 0;
+
+        await panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'losing-restore',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore', state: invalid,
+        });
+
+        expect(versioned.get_state(file_path)).toMatchObject({
+            transforms: [winner], rowHeights: [{ 0: 27 }],
+        });
+        const ack = panel.__messages.find((message) =>
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'transformApplied') as
+            { error?: string };
+        expect(ack.error).toBeUndefined();
+    });
+
+    it('retries invalid-restore cleanup after an unrelated CAS winner', async () => {
+        const file_path = '/tmp/invalid-restore-cas-retry.csv';
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        const versioned = state_store({ transforms: [invalid] });
+        let cleanup_attempts = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.transforms?.[0] === undefined) {
+                    cleanup_attempts += 1;
+                    if (cleanup_attempts === 1) {
+                        const current = await versioned.store.read(path);
+                        await versioned.store.compare_and_set(path, current.revision, {
+                            ...(current.state as PerFileState),
+                            columnWidths: [{ 0: 144 }],
+                        });
+                    }
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() { return new SignallingInvalidFilterSource(() => {}); },
+        };
+        const panel = open_csv_table(uri(file_path), store, profile);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'retry-restore',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore', state: invalid,
+        });
+
+        expect(cleanup_attempts).toBe(2);
+        expect(versioned.get_state(file_path)).toMatchObject({
+            transforms: [undefined],
+            columnWidths: [{ 0: 144 }],
+        });
     });
 
     it('rejects transforms while an edit session is owned', async () => {

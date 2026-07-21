@@ -3,6 +3,7 @@ import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram } from './histograms';
 import {
     compute_transform,
+    InvalidNumericFilterOperandError,
     transformed_window,
     type CachedTransformColumn,
     type TransformColumnCache,
@@ -38,6 +39,29 @@ type TransformCommit = (
     state: SheetTransformState,
     receiverEpoch: number,
 ) => Promise<void>;
+
+/** Typed reconciliation failure for one persisted transform and its retained view. */
+export class InvalidPersistedTransformError extends Error {
+    constructor(
+        readonly sheetIndex: number,
+        readonly invalidState: SheetTransformState,
+        readonly retainedState: SheetTransformState,
+        readonly operandError: InvalidNumericFilterOperandError,
+    ) {
+        super(operandError.message, { cause: operandError });
+        this.name = 'InvalidPersistedTransformError';
+    }
+}
+
+/**
+ * Gives the host authority layer a chance to durably recover a failed restore.
+ * `true` means the invalid candidate was replaced or superseded by a newer winner.
+ */
+type InvalidRestoreCleanup = (
+    message: SetTransformMessage,
+    error: InvalidPersistedTransformError,
+    receiverEpoch: number,
+) => Promise<boolean>;
 
 type TransformOperationToken = number;
 let next_transform_operation_token = 0;
@@ -149,6 +173,7 @@ export class ViewerPanelCore {
     private _source_generation = 1;
     private disposed = false;
     private readonly on_transform_commit?: TransformCommit;
+    private readonly on_invalid_restore?: InvalidRestoreCleanup;
 
     constructor(
         private readonly panel: PanelLike,
@@ -157,6 +182,7 @@ export class ViewerPanelCore {
             maxCachedPages?: number;
             maxCachedTransformCells?: number;
             onTransformCommit?: TransformCommit;
+            onInvalidRestore?: InvalidRestoreCleanup;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -164,6 +190,7 @@ export class ViewerPanelCore {
             opts?.maxCachedTransformCells ?? DEFAULT_MAX_CACHED_TRANSFORM_CELLS,
         );
         this.on_transform_commit = opts?.onTransformCommit;
+        this.on_invalid_restore = opts?.onInvalidRestore;
     }
 
     get generation(): number {
@@ -383,6 +410,14 @@ export class ViewerPanelCore {
                         || is_cancelled()
                     )
                 ) return undefined;
+                if (error instanceof InvalidNumericFilterOperandError) {
+                    throw new InvalidPersistedTransformError(
+                        sheet_index,
+                        clone_transform(state),
+                        clone_transform(installed),
+                        error,
+                    );
+                }
                 throw error;
             }
             if (
@@ -617,6 +652,31 @@ export class ViewerPanelCore {
                 ?? EMPTY_TRANSFORM;
             const previous_count = this.transform_indices.get(msg.sheetIndex)?.length
                 ?? sheet.rowCount;
+            const persisted_error = error instanceof InvalidNumericFilterOperandError
+                ? new InvalidPersistedTransformError(
+                    msg.sheetIndex,
+                    clone_transform(msg.state),
+                    clone_transform(previous),
+                    error,
+                )
+                : undefined;
+            let recovered = false;
+            if (msg.intent === 'restore' && persisted_error && this.on_invalid_restore) {
+                try {
+                    recovered = await this.on_invalid_restore(
+                        msg,
+                        persisted_error,
+                        receiver_epoch,
+                    );
+                } catch {
+                    // The original typed validation failure remains the useful
+                    // user-facing result; the controller logs persistence errors.
+                }
+            }
+            if (
+                !source_request_is_current()
+                || (msg.intent === 'restore' && !receiver_is_current())
+            ) return;
             await this.post({
                 type: 'transformApplied',
                 sheetIndex: msg.sheetIndex,
@@ -626,7 +686,9 @@ export class ViewerPanelCore {
                 generation: this._generation,
                 sourceGeneration: this._source_generation,
                 intent: msg.intent,
-                error: error instanceof Error ? error.message : String(error),
+                ...(recovered
+                    ? {}
+                    : { error: error instanceof Error ? error.message : String(error) }),
             }, receiver_epoch);
         } finally {
             if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
@@ -758,7 +820,10 @@ export function adopt_source_into_core(
     panel: PanelLike,
     previous: DataSource | undefined,
     next: DataSource,
-    opts?: { onTransformCommit?: TransformCommit },
+    opts?: {
+        onTransformCommit?: TransformCommit;
+        onInvalidRestore?: InvalidRestoreCleanup;
+    },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {
     let installed: ViewerPanelCore;
@@ -773,7 +838,11 @@ export function adopt_source_into_core(
     return { type: 'adopted', core: installed };
 }
 
-function transform_states_equal(left: SheetTransformState, right: SheetTransformState): boolean {
+/** Compare transform descriptors by their ordered semantic fields. */
+export function transform_states_equal(
+    left: SheetTransformState,
+    right: SheetTransformState,
+): boolean {
     if (
         left.sort.length === 0
         && left.filters.length === 0

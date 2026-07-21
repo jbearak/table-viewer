@@ -9,6 +9,7 @@ import type {
 import {
     compare_cells,
     compute_transform,
+    InvalidNumericFilterOperandError,
     matches_filter,
     transformed_window,
 } from '../table-transform';
@@ -963,7 +964,12 @@ describe('table transforms', () => {
         await expect(compute_transform(source, 0, {
             sort: [],
             filters: [filter('greaterThan', 'not-a-number')],
-        })).rejects.toThrow('finite numbers');
+        })).rejects.toMatchObject({
+            name: 'InvalidNumericFilterOperandError',
+            filterId: 'greaterThan-0',
+            operator: 'greaterThan',
+            operand: 'value',
+        } satisfies Partial<InvalidNumericFilterOperandError>);
 
         await expect(compute_transform(source, 0, {
             sort: [],
@@ -971,7 +977,10 @@ describe('table transforms', () => {
                 ...filter('between', '1'),
                 secondValue: 'Infinity',
             }],
-        })).rejects.toThrow('finite numbers');
+        })).rejects.toMatchObject({
+            name: 'InvalidNumericFilterOperandError',
+            operand: 'secondValue',
+        });
     });
 
     it('cancels cooperatively during allocation and source acquisition', async () => {
