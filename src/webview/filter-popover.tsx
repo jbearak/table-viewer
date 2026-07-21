@@ -1,12 +1,13 @@
-import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
 import { FilterHistogram, domain_max, domain_min } from './filter-histogram';
 import {
-    FILTER_OPTIONS,
-    RAW_VALUE_TRANSFORM_DESCRIPTION,
     filter_draft_for_column,
+    filter_options_for_draft,
     is_pristine_default_filter_draft,
     is_range_filter_operator,
+    operator_supports_case_sensitive,
+    type FilterColumnKind,
 } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
@@ -27,9 +28,21 @@ export interface FilterPopoverProps {
 function preferred_operator_from_histogram(
     histogram: NonNullable<FilterPopoverProps['histogram']>,
 ): FilterOperator {
-    return histogram.status === 'ready' && histogram.bins.length > 0
+    return filter_column_kind_from_histogram(histogram) === 'numeric'
         ? 'between'
         : 'contains';
+}
+
+/**
+ * Infer column kind only once the histogram settles.
+ * loading/error stay unknown so the full operator list remains available;
+ * ready bins ⇒ numeric; ready empty ⇒ text.
+ */
+function filter_column_kind_from_histogram(
+    histogram: NonNullable<FilterPopoverProps['histogram']>,
+): FilterColumnKind {
+    if (histogram.status === 'loading' || histogram.status === 'error') return 'unknown';
+    return histogram.bins.length > 0 ? 'numeric' : 'text';
 }
 
 function parse_range_bound(value: string | undefined): number | undefined {
@@ -59,7 +72,6 @@ export function FilterPopover({
     const first_control_ref = useRef<HTMLSelectElement>(null);
     const layout_dismissed_ref = useRef(false);
     const user_edited_ref = useRef(existing);
-    const description_id = useId();
     use_dismiss(popover_ref, on_cancel);
 
     useLayoutEffect(() => {
@@ -129,6 +141,9 @@ export function FilterPopover({
 
     const needs_value = draft.operator !== 'isEmpty' && draft.operator !== 'isNotEmpty';
     const needs_second = is_range_filter_operator(draft.operator);
+    const column_kind = filter_column_kind_from_histogram(histogram);
+    const show_case_sensitive = operator_supports_case_sensitive(draft.operator, column_kind);
+    const operator_options = filter_options_for_draft(column_kind, draft.operator);
     const can_apply = !needs_value
         || ((draft.value ?? '').length > 0
             && (!needs_second || (draft.secondValue ?? '').length > 0));
@@ -171,7 +186,6 @@ export function FilterPopover({
             className="filter-popover"
             role="dialog"
             aria-label={`Filter on ${column_name}`}
-            aria-describedby={description_id}
             style={{ left: coords.left, top: coords.top }}
             onKeyDown={(event) => {
                 const target = event.target;
@@ -198,9 +212,6 @@ export function FilterPopover({
                 <span className="filter-popover-colname">{column_name}</span>
             </div>
             <div className="filter-popover-body">
-                <p id={description_id} className="transform-value-description">
-                    {RAW_VALUE_TRANSFORM_DESCRIPTION}
-                </p>
                 <label className="filter-popover-field-label" htmlFor="filter-condition">
                     Condition
                 </label>
@@ -214,7 +225,7 @@ export function FilterPopover({
                         operator: event.target.value as FilterOperator,
                     })}
                 >
-                    {FILTER_OPTIONS.map((option) => (
+                    {operator_options.map((option) => (
                         <option key={option.value} value={option.value}>{option.label}</option>
                     ))}
                 </select>
@@ -248,7 +259,7 @@ export function FilterPopover({
                         on_change={update_range_bounds}
                     />
                 )}
-                {needs_value && (
+                {show_case_sensitive && (
                     <label className="filter-popover-check-row">
                         <input
                             type="checkbox"

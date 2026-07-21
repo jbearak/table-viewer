@@ -10,10 +10,11 @@ import { is_range_filter_operator } from '../types';
 
 export { is_range_filter_operator };
 
-export const RAW_VALUE_TRANSFORM_DESCRIPTION =
-    'Sorting and filtering use raw cell values, not formatted display text.';
+export type FilterColumnKind = 'numeric' | 'text' | 'unknown';
 
-export const FILTER_OPTIONS: readonly { value: FilterOperator; label: string }[] = [
+export type FilterOption = { value: FilterOperator; label: string };
+
+export const FILTER_OPTIONS: readonly FilterOption[] = [
     { value: 'contains', label: 'Contains' },
     { value: 'notContains', label: 'Does not contain' },
     { value: 'equals', label: 'Equals' },
@@ -29,6 +30,64 @@ export const FILTER_OPTIONS: readonly { value: FilterOperator; label: string }[]
     { value: 'isEmpty', label: 'Is empty' },
     { value: 'isNotEmpty', label: 'Is not empty' },
 ] as const;
+
+const NUMERIC_FILTER_OPERATORS: readonly FilterOperator[] = [
+    'equals',
+    'notEquals',
+    'greaterThan',
+    'greaterThanOrEqual',
+    'lessThan',
+    'lessThanOrEqual',
+    'between',
+    'notBetween',
+    'isEmpty',
+    'isNotEmpty',
+];
+
+const TEXT_FILTER_OPERATORS: readonly FilterOperator[] = [
+    'contains',
+    'notContains',
+    'equals',
+    'notEquals',
+    'startsWith',
+    'endsWith',
+    'isEmpty',
+    'isNotEmpty',
+];
+
+const CASE_SENSITIVE_OPERATORS: ReadonlySet<FilterOperator> = new Set([
+    'contains',
+    'notContains',
+    'equals',
+    'notEquals',
+    'startsWith',
+    'endsWith',
+]);
+
+export function filter_options_for_kind(kind: FilterColumnKind): readonly FilterOption[] {
+    if (kind === 'unknown') return FILTER_OPTIONS;
+    const allowed = new Set(kind === 'numeric' ? NUMERIC_FILTER_OPERATORS : TEXT_FILTER_OPERATORS);
+    return FILTER_OPTIONS.filter((option) => allowed.has(option.value));
+}
+
+/** Kind options plus the current operator when it falls outside the kind list. */
+export function filter_options_for_draft(
+    kind: FilterColumnKind,
+    current_operator: FilterOperator,
+): readonly FilterOption[] {
+    const options = filter_options_for_kind(kind);
+    if (options.some((option) => option.value === current_operator)) return options;
+    const extra = FILTER_OPTIONS.find((option) => option.value === current_operator);
+    return extra ? [...options, extra] : options;
+}
+
+/** Case sensitivity only applies to text comparisons; numeric equals ignores it. */
+export function operator_supports_case_sensitive(
+    operator: FilterOperator,
+    kind: FilterColumnKind = 'text',
+): boolean {
+    return kind !== 'numeric' && CASE_SENSITIVE_OPERATORS.has(operator);
+}
 
 export function new_filter_id(): string {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
