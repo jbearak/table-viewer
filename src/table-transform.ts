@@ -27,11 +27,29 @@ export interface TransformResult {
     rowCount: number;
 }
 
-interface TransformColumn {
+export interface CachedTransformColumn {
+    readonly values: readonly (string | null | undefined)[];
+    readonly numeric: boolean;
+    readonly foundValue: boolean;
+}
+
+export interface TransformColumnCache {
+    get(sheet_index: number, column_index: number): CachedTransformColumn | undefined;
+    set(
+        sheet_index: number,
+        column_index: number,
+        column: CachedTransformColumn,
+    ): void;
+}
+
+interface TransformColumn extends CachedTransformColumn {
+    numericSortKeys?: (NumericSortKey | undefined)[];
+}
+
+interface MutableTransformColumn {
     values: (string | null | undefined)[];
     numeric: boolean;
     foundValue: boolean;
-    numericSortKeys?: (NumericSortKey | undefined)[];
 }
 
 /** Optional cumulative counters for deterministic transform performance tests. */
@@ -46,6 +64,7 @@ export async function compute_transform(
     state: SheetTransformState,
     is_cancelled: () => boolean = () => false,
     sort_instrumentation?: TransformSortInstrumentation,
+    column_cache?: TransformColumnCache,
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet) {
@@ -58,56 +77,80 @@ export async function compute_transform(
     const columns = needed_columns(state, sheet.columnCount);
     await cancellation_checkpoint(is_cancelled);
     const values = new Map<number, TransformColumn>();
+    const missing = new Map<number, MutableTransformColumn>();
     for (const col of columns) {
-        values.set(col, {
+        const cached = column_cache?.get(sheet_index, col);
+        if (cached) {
+            values.set(col, { ...cached });
+            continue;
+        }
+        const column = {
             // Sparse allocation avoids an eager, uncancellable O(rows × columns)
             // null-fill. Every source row is assigned during the scan below.
             values: new Array(sheet.rowCount),
             numeric: true,
             foundValue: false,
-        });
+        };
+        missing.set(col, column);
+        values.set(col, column);
     }
     await cancellation_checkpoint(is_cancelled);
 
-    for (
-        let start = 0;
-        start < sheet.rowCount;
-        start += SCAN_ROWS_PER_CHECKPOINT
-    ) {
-        const rows = read_source_columns(
-            source,
-            sheet_index,
-            start,
-            Math.min(SCAN_ROWS_PER_CHECKPOINT, sheet.rowCount - start),
-            columns,
-        ).rows;
-        for (let offset = 0; offset < rows.length; offset++) {
-            const source_row = start + offset;
-            for (let selected = 0; selected < columns.length; selected++) {
-                const col = columns[selected];
-                const target = values.get(col)!;
-                const source_cell = rows[offset]?.[selected] ?? null;
-                const raw = raw_value(source_cell);
-                target.values[source_row] = raw;
-                if (raw !== null) {
-                    target.foundValue = true;
-                    if (
-                        source_cell?.rawType === 'boolean'
-                        || (
-                            source_cell?.rawType === 'number'
-                            && !Number.isFinite(Number(raw))
-                        )
-                        || (
-                            source_cell?.rawType !== 'number'
-                            && !canonical_numeric_string(raw)
-                        )
-                    ) {
-                        target.numeric = false;
+    const missing_columns = [...missing.keys()];
+    if (missing_columns.length > 0) {
+        for (
+            let start = 0;
+            start < sheet.rowCount;
+            start += SCAN_ROWS_PER_CHECKPOINT
+        ) {
+            const rows = read_source_columns(
+                source,
+                sheet_index,
+                start,
+                Math.min(SCAN_ROWS_PER_CHECKPOINT, sheet.rowCount - start),
+                missing_columns,
+            ).rows;
+            for (let offset = 0; offset < rows.length; offset++) {
+                const source_row = start + offset;
+                for (let selected = 0; selected < missing_columns.length; selected++) {
+                    const col = missing_columns[selected];
+                    const target = missing.get(col)!;
+                    const source_cell = rows[offset]?.[selected] ?? null;
+                    const raw = raw_value(source_cell);
+                    target.values[source_row] = raw;
+                    if (raw !== null) {
+                        target.foundValue = true;
+                        if (
+                            source_cell?.rawType === 'boolean'
+                            || (
+                                source_cell?.rawType === 'number'
+                                && !Number.isFinite(Number(raw))
+                            )
+                            || (
+                                source_cell?.rawType !== 'number'
+                                && !canonical_numeric_string(raw)
+                            )
+                        ) {
+                            target.numeric = false;
+                        }
                     }
                 }
             }
+            await cancellation_checkpoint(is_cancelled);
         }
-        await cancellation_checkpoint(is_cancelled);
+
+        // The final scan-chunk checkpoint above proves the extraction complete
+        // and current before publication. The cached column never owns
+        // request-local numeric sort keys and is not mutated after publication.
+        for (const [col, column] of missing) {
+            const cached: CachedTransformColumn = Object.freeze({
+                values: Object.freeze(column.values),
+                numeric: column.numeric,
+                foundValue: column.foundValue,
+            });
+            values.set(col, { ...cached });
+            column_cache?.set(sheet_index, col, cached);
+        }
     }
 
     validate_filter_operands(state, values);
