@@ -40,6 +40,7 @@ type TransformCommit = (
     receiverEpoch: number,
 ) => Promise<void>;
 
+/** Typed reconciliation failure for one persisted transform and its retained view. */
 export class InvalidPersistedTransformError extends Error {
     constructor(
         readonly sheetIndex: number,
@@ -52,6 +53,10 @@ export class InvalidPersistedTransformError extends Error {
     }
 }
 
+/**
+ * Gives the host authority layer a chance to durably recover a failed restore.
+ * `true` means the invalid candidate was replaced or superseded by a newer winner.
+ */
 type InvalidRestoreCleanup = (
     message: SetTransformMessage,
     error: InvalidPersistedTransformError,
@@ -833,6 +838,7 @@ export function adopt_source_into_core(
     return { type: 'adopted', core: installed };
 }
 
+/** Compare transform descriptors by their ordered semantic fields. */
 export function transform_states_equal(
     left: SheetTransformState,
     right: SheetTransformState,

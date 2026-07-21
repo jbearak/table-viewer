@@ -1185,6 +1185,7 @@ export function attach_viewer(
      * authority over a newer writer. A CAS conflict is re-read and either
      * retried for the same invalid candidate or adopted as the winner.
      */
+    /** Durable outcome used to distinguish owned repair from a concurrent winner. */
     type InvalidTransformCleanupResult = 'committed' | 'superseded' | 'failed';
 
     async function cleanup_invalid_persisted_transform(
@@ -1246,6 +1247,7 @@ export function attach_viewer(
         return 'failed';
     }
 
+    /** Recover an explicit restore only while its receiver and source authority remain current. */
     async function cleanup_invalid_restore(
         message: Extract<WebviewMessage, { type: 'setTransform' }>,
         error: InvalidPersistedTransformError,
