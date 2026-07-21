@@ -1,5 +1,6 @@
 import type { DataSource, RowWindow } from './data-source/interface';
 import { deep_clone_and_freeze } from './immutable';
+import { compute_column_histogram } from './histograms';
 import { compute_transform, transformed_window } from './table-transform';
 import type {
     WorkbookSnapshotCoreMaterial,
@@ -9,6 +10,7 @@ import {
     EMPTY_TRANSFORM,
     transform_is_active,
     transform_schema_for_sheet,
+    type HistogramBin,
     type HostMessage,
     type SheetTransformState,
     type WebviewMessage,
@@ -86,6 +88,8 @@ export class ViewerPanelCore {
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
+    private readonly histogram_cache = new Map<string, HistogramBin[]>();
+    private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private source_epoch = 0;
     private receiver_epoch = 0;
     private _source_generation = 1;
@@ -145,6 +149,8 @@ export class ViewerPanelCore {
         this.transform_states.clear();
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
+        this.histogram_cache.clear();
+        this.histogram_operations.clear();
         this.cache.clear();
         return { type: 'adopted' };
     }
@@ -154,6 +160,7 @@ export class ViewerPanelCore {
         this.source_epoch += 1;
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
+        this.histogram_operations.clear();
     }
 
     /** Clone and freeze all source-owned material needed by a future snapshot. */
@@ -177,6 +184,7 @@ export class ViewerPanelCore {
         this.cancel_pending();
         this.transform_indices.clear();
         this.transform_states.clear();
+        this.histogram_cache.clear();
         this.cache.clear();
     }
 
@@ -187,6 +195,90 @@ export class ViewerPanelCore {
             await this.handle_row_request(msg);
         } else if (msg.type === 'setTransform') {
             await this.handle_set_transform(msg);
+        } else if (msg.type === 'requestFilterHistogram') {
+            await this.handle_histogram_request(msg);
+        } else if (msg.type === 'cancelFilterHistogram') {
+            this.histogram_operations.delete(msg.requestId);
+        }
+    }
+
+    private async handle_histogram_request(
+        msg: Extract<WebviewMessage, { type: 'requestFilterHistogram' }>,
+    ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
+        const sheets = this.source.meta().sheets;
+        const sheet_index_is_valid = Number.isInteger(msg.sheetIndex)
+            && msg.sheetIndex >= 0
+            && msg.sheetIndex < sheets.length;
+        const sheet = sheet_index_is_valid ? sheets[msg.sheetIndex] : undefined;
+        const invalid = msg.generation !== this._generation
+            ? 'The view changed before this histogram request arrived.'
+            : msg.sourceGeneration !== this._source_generation
+            ? 'The source changed before this histogram request arrived.'
+            : !sheet
+            ? `Sheet index ${msg.sheetIndex} is out of range.`
+            : !Number.isInteger(msg.columnIndex)
+                || msg.columnIndex < 0
+                || msg.columnIndex >= sheet.columnCount
+            ? `Column index ${msg.columnIndex} is out of range.`
+            : undefined;
+        if (invalid) {
+            await this.post({
+                type: 'filterHistogram',
+                sheetIndex: msg.sheetIndex,
+                columnIndex: msg.columnIndex,
+                bins: [],
+                requestId: msg.requestId,
+                generation: msg.generation,
+                sourceGeneration: msg.sourceGeneration,
+                error: invalid,
+            }, receiver_epoch);
+            return;
+        }
+
+        const source_epoch = this.source_epoch;
+        const operation_token = allocate_transform_operation_token();
+        this.histogram_operations.set(msg.requestId, operation_token);
+        const is_cancelled = () => this.disposed
+            || this.source_epoch !== source_epoch
+            || this.receiver_epoch !== receiver_epoch
+            || this.histogram_operations.get(msg.requestId) !== operation_token;
+        const cache_key = `${this._source_generation}:${msg.sheetIndex}:${msg.columnIndex}`;
+        try {
+            const cached = this.histogram_cache.get(cache_key);
+            const bins = cached ?? await compute_column_histogram(
+                this.source,
+                msg.sheetIndex,
+                msg.columnIndex,
+                is_cancelled,
+            );
+            if (is_cancelled()) return;
+            if (!cached) this.histogram_cache.set(cache_key, bins);
+            await this.post({
+                type: 'filterHistogram',
+                sheetIndex: msg.sheetIndex,
+                columnIndex: msg.columnIndex,
+                bins,
+                requestId: msg.requestId,
+                generation: msg.generation,
+                sourceGeneration: msg.sourceGeneration,
+            }, receiver_epoch);
+        } catch (error) {
+            if (is_cancelled()) return;
+            await this.post({
+                type: 'filterHistogram',
+                sheetIndex: msg.sheetIndex,
+                columnIndex: msg.columnIndex,
+                bins: [],
+                requestId: msg.requestId,
+                generation: msg.generation,
+                sourceGeneration: msg.sourceGeneration,
+                error: error instanceof Error ? error.message : String(error),
+            }, receiver_epoch);
+        } finally {
+            if (this.histogram_operations.get(msg.requestId) === operation_token) {
+                this.histogram_operations.delete(msg.requestId);
+            }
         }
     }
 

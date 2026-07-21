@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { FilterEntry, FilterOperator } from '../types';
+import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
 import { FILTER_OPTIONS, filter_draft_for_column } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
@@ -10,6 +10,9 @@ export interface FilterPopoverProps {
     column_name: string;
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
+    histogram?: { status: 'loading' }
+        | { status: 'ready'; bins: readonly HistogramBin[] }
+        | { status: 'error'; message: string };
     on_apply: (entry: FilterEntry) => void;
     on_cancel: (reason: FilterPopoverDismissReason) => void;
 }
@@ -19,6 +22,7 @@ export function FilterPopover({
     column_name,
     filters,
     anchor,
+    histogram = { status: 'loading' },
     on_apply,
     on_cancel,
 }: FilterPopoverProps): React.JSX.Element {
@@ -127,6 +131,7 @@ export function FilterPopover({
                 <span className="filter-popover-colname">{column_name}</span>
             </div>
             <div className="filter-popover-body">
+                <FilterHistogram histogram={histogram} />
                 <label className="filter-popover-field-label" htmlFor="filter-condition">
                     Condition
                 </label>
@@ -192,6 +197,52 @@ export function FilterPopover({
                     Cancel
                 </button>
             </div>
+        </div>
+    );
+}
+
+function FilterHistogram({
+    histogram,
+}: {
+    histogram: NonNullable<FilterPopoverProps['histogram']>;
+}): React.JSX.Element {
+    if (histogram.status === 'loading') {
+        return <div className="filter-histogram-status" role="status">Loading distribution…</div>;
+    }
+    if (histogram.status === 'error') {
+        return (
+            <div className="filter-histogram-status filter-histogram-error" role="status">
+                Distribution unavailable: {histogram.message}
+            </div>
+        );
+    }
+    if (histogram.bins.length === 0) {
+        return (
+            <div className="filter-histogram-status" role="status">
+                No numeric values to chart.
+            </div>
+        );
+    }
+    const max_count = Math.max(1, ...histogram.bins.map((bin) => bin.count));
+    const total = histogram.bins.reduce((sum, bin) => sum + bin.count, 0);
+    return (
+        <div
+            className="filter-histogram"
+            role="img"
+            aria-label={`Distribution of ${total} numeric values from ${histogram.bins[0].lo} to ${histogram.bins.at(-1)!.hi}`}
+        >
+            {histogram.bins.map((bin, index) => (
+                <span
+                    key={`${bin.lo}:${bin.hi}:${index}`}
+                    className="filter-histogram-bar"
+                    style={{
+                        height: bin.count === 0
+                            ? '0%'
+                            : `${Math.max(2, (bin.count / max_count) * 100)}%`,
+                    }}
+                    title={`${bin.lo} – ${bin.hi}: ${bin.count}`}
+                />
+            ))}
         </div>
     );
 }

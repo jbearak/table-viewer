@@ -24,6 +24,38 @@ describe('paginated protocol message shapes', () => {
         sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
     };
 
+    it('fences lazy histogram requests and results by full source coordinates', () => {
+        const request: WebviewMessage = {
+            type: 'requestFilterHistogram',
+            sheetIndex: 2,
+            columnIndex: 4,
+            requestId: 'histogram:1',
+            generation: 7,
+            sourceGeneration: 5,
+        };
+        const result: HostMessage = {
+            type: 'filterHistogram',
+            sheetIndex: 2,
+            columnIndex: 4,
+            requestId: 'histogram:1',
+            generation: 7,
+            sourceGeneration: 5,
+            bins: [{ lo: 0, hi: 1, count: 3 }],
+        };
+        const cancel: WebviewMessage = {
+            type: 'cancelFilterHistogram',
+            requestId: request.requestId,
+        };
+        expect(result).toMatchObject({
+            sheetIndex: request.sheetIndex,
+            columnIndex: request.columnIndex,
+            requestId: request.requestId,
+            generation: request.generation,
+            sourceGeneration: request.sourceGeneration,
+        });
+        expect(cancel.requestId).toBe(request.requestId);
+    });
+
     it('rejects removed metadata discriminants at compile time', () => {
         type RemovedSheetMessage = `sheet${'Meta'}`;
         type RemovedReloadMessage = `meta${'Reload'}`;

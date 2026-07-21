@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FilterEntry } from '../types';
+import type { FilterEntry, HistogramBin } from '../types';
 import { FilterPopover } from '../webview/filter-popover';
 
 let root: Root | null = null;
@@ -20,7 +20,12 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-function render_popover(filters: FilterEntry[] = []) {
+function render_popover(
+    filters: FilterEntry[] = [],
+    histogram?: { status: 'loading' }
+        | { status: 'ready'; bins: readonly HistogramBin[] }
+        | { status: 'error'; message: string },
+) {
     const on_apply = vi.fn();
     const on_cancel = vi.fn();
     container = document.createElement('div');
@@ -30,6 +35,7 @@ function render_popover(filters: FilterEntry[] = []) {
         column_index: 1,
         column_name: 'Value',
         filters,
+        histogram,
         anchor: { left: 10_000, top: 10_000 },
         on_apply,
         on_cancel,
@@ -38,6 +44,49 @@ function render_popover(filters: FilterEntry[] = []) {
 }
 
 describe('FilterPopover', () => {
+    it('renders histogram loading, empty, error, and populated states without blocking controls', () => {
+        render_popover([], { status: 'loading' });
+        expect(document.body.textContent).toContain('Loading distribution…');
+        expect(document.querySelector('#filter-condition')).not.toBeNull();
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'ready', bins: [] },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect(document.body.textContent).toContain('No numeric values to chart.');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'error', message: 'scan failed' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect(document.body.textContent).toContain('Distribution unavailable: scan failed');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'ready', bins: [
+                { lo: 0, hi: 1, count: 0 },
+                { lo: 1, hi: 2, count: 4 },
+            ] },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect(document.querySelector('[role="img"][aria-label*="4 numeric values"]'))
+            .not.toBeNull();
+        const bars = document.querySelectorAll<HTMLElement>('.filter-histogram-bar');
+        expect(bars).toHaveLength(2);
+        expect(bars[0].style.height).toBe('0%');
+        expect(bars[1].style.height).toBe('100%');
+        expect((document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).disabled)
+            .toBe(true);
+    });
+
     it('hydrates id, enabled state, zero values, second value, and case sensitivity', () => {
         const existing: FilterEntry = {
             id: 'keep-me',
