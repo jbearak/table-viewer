@@ -13,7 +13,11 @@ import {
     transformed_window,
 } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
-import type { TransformSortInstrumentation } from '../table-transform';
+import type {
+    CachedTransformColumn,
+    TransformColumnCache,
+    TransformSortInstrumentation,
+} from '../table-transform';
 
 const cell = (
     raw: string,
@@ -267,45 +271,81 @@ describe('table transforms', () => {
         expect(instrumentation.numericSortKeyBuilds).toBe(2);
     });
 
-    it('cancels key precomputation within a single wide multi-key row', async () => {
-        const width = 4200;
+    it('cancels during bounded numeric key precomputation', async () => {
+        const size = 5000;
         const instrumentation: TransformSortInstrumentation = {
             numericSortKeyBuilds: 0,
             numericSortComparisons: 0,
         };
-        const source = new Source([
-            Array.from({ length: width }, (_, column) => cell(String(column))),
-        ]);
+        const source = new Source(Array.from(
+            { length: size },
+            (_, row) => [cell(String(size - row))],
+        ));
 
         await expect(compute_transform(
             source,
             0,
             {
-                sort: Array.from(
-                    { length: width },
-                    (_, colIndex) => ({ colIndex, direction: 'asc' as const }),
-                ),
+                sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],
             },
-            // Three setup/scan checkpoints, 66 numeric-column preparation
-            // checkpoints, one pre-filter checkpoint, then the key-build one.
-            cancel_at_checkpoint(71),
+            () => instrumentation.numericSortKeyBuilds >= 4096,
             instrumentation,
         )).rejects.toMatchObject({ name: 'AbortError' });
 
         expect(instrumentation.numericSortKeyBuilds).toBe(4096);
-        expect(instrumentation.numericSortKeyBuilds).toBeLessThan(width);
+        expect(instrumentation.numericSortKeyBuilds).toBeLessThan(size);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
+        expect(instrumentation.indexBufferCount).toBe(0);
     });
 
-    it('cancels while preparing arrays for a very wide numeric sort', async () => {
+    it('cancels key preparation across thousands of surviving missing values', async () => {
+        const size = 5001;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, row) => [
+                row === 0 ? cell('1') : null,
+                cell(row === 0 ? 'drop' : 'keep'),
+            ],
+        ));
+
+        await expect(compute_transform(
+            source,
+            0,
+            {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [filter('equals', 'keep', 1)],
+            },
+            () => (instrumentation.peakNumericSortKeySlots ?? 0) > 0,
+            instrumentation,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(0);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
+        expect(instrumentation.indexBufferCount).toBe(0);
+        expect(instrumentation.indexBufferBytes).toBe(0);
+        expect(instrumentation.survivorMaskBytes).toBe(0);
+    });
+
+    it('cancels during the first sequential sort-column scan', async () => {
         const width = 4200;
         const instrumentation: TransformSortInstrumentation = {
             numericSortKeyBuilds: 0,
             numericSortComparisons: 0,
         };
-        const source = new Source([
-            Array.from({ length: width }, (_, column) => cell(String(column))),
-        ]);
+        const source = new Source(Array.from(
+            { length: 2 },
+            (_, row) => Array.from(
+                { length: width },
+                (_, column) => cell(String(column + row)),
+            ),
+        ));
 
         await expect(compute_transform(
             source,
@@ -317,13 +357,312 @@ describe('table transforms', () => {
                 ),
                 filters: [],
             },
-            // Checkpoints 1-3 cover setup and scanning, 4 precedes the first
-            // key array, and 5 interrupts before the 65th key array.
+            // The least-significant key is acquired first. Checkpoint 5 follows
+            // its first bounded source scan.
             cancel_at_checkpoint(5),
             instrumentation,
         )).rejects.toMatchObject({ name: 'AbortError' });
 
         expect(instrumentation.numericSortKeyBuilds).toBe(0);
+        expect(source.read_calls).toBe(1);
+        expect(source.selected_columns).toEqual([[width - 1]]);
+        expect(instrumentation.indexBufferCount).toBe(0);
+        expect(instrumentation.transformColumnValueSlots ?? 0).toBe(0);
+    });
+
+    it('keeps cooperative sort index storage to two typed buffers', async () => {
+        const size = 5000;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [cell(`value-${size - index}`)],
+        ));
+
+        const result = await compute_transform(
+            source,
+            0,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            undefined,
+            instrumentation,
+        );
+
+        expect(result.indices).toBeInstanceOf(Uint32Array);
+        expect(instrumentation.indexBufferAllocations).toBe(2);
+        expect(instrumentation.indexBufferReleases).toBe(1);
+        expect(instrumentation.peakIndexBufferCount).toBe(2);
+        expect(instrumentation.peakIndexBufferBytes).toBe(size * 4 * 2);
+        expect(instrumentation.indexBufferCount).toBe(1);
+        expect(instrumentation.indexBufferBytes).toBe(size * 4);
+    });
+
+    it('allocates an exact survivor buffer for selective filters', async () => {
+        const size = 5000;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [cell(index < 5 ? 'keep' : 'drop')],
+        ));
+
+        const result = await compute_transform(
+            source,
+            0,
+            { sort: [], filters: [filter('equals', 'keep')] },
+            undefined,
+            instrumentation,
+        );
+
+        expect([...result.indices!]).toEqual([0, 1, 2, 3, 4]);
+        expect(instrumentation.indexBufferAllocations).toBe(1);
+        expect(instrumentation.peakIndexBufferCount).toBe(1);
+        expect(instrumentation.peakIndexBufferBytes).toBe(5 * 4);
+    });
+
+    it('compacts numeric-key slots for selective sorted filters', async () => {
+        const size = 5000;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [
+                cell(String(size - index)),
+                cell(index < 5 ? 'keep' : 'drop'),
+            ],
+        ));
+
+        const result = await compute_transform(
+            source,
+            0,
+            {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [filter('equals', 'keep', 1)],
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect([...result.indices!]).toEqual([4, 3, 2, 1, 0]);
+        expect(instrumentation.peakTransformColumnValueSlots).toBe(size);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
+        expect(instrumentation.peakNumericSortKeySlots).toBe(5);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+        expect(instrumentation.peakIndexBufferCount).toBe(2);
+        expect(instrumentation.peakIndexBufferBytes).toBe(size * 4 + 5 * 4);
+        expect(instrumentation.indexBufferCount).toBe(1);
+        expect(instrumentation.indexBufferBytes).toBe(5 * 4);
+    });
+
+    it('tracks the three-buffer peak for a large selective numeric sort', async () => {
+        const size = 6000;
+        const survivor_count = 3000;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [
+                cell(String(size - index)),
+                cell(index < survivor_count ? 'keep' : 'drop'),
+            ],
+        ));
+
+        const result = await compute_transform(
+            source,
+            0,
+            {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [filter('equals', 'keep', 1)],
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect(result.rowCount).toBe(survivor_count);
+        expect(result.indices![0]).toBe(survivor_count - 1);
+        expect(result.indices![survivor_count - 1]).toBe(0);
+        expect(instrumentation.peakNumericSortKeySlots).toBe(survivor_count);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+        expect(instrumentation.peakIndexBufferCount).toBe(3);
+        expect(instrumentation.peakIndexBufferBytes).toBe(
+            size * 4 + survivor_count * 4 * 2,
+        );
+        expect(instrumentation.indexBufferCount).toBe(1);
+        expect(instrumentation.indexBufferBytes).toBe(survivor_count * 4);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
+    });
+
+    it('holds one active transform column across many filters and sort keys', async () => {
+        const row_count = 256;
+        const column_count = 24;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: row_count },
+            (_, row) => Array.from(
+                { length: column_count },
+                (_, column) => cell(String((row + column) % 17)),
+            ),
+        ));
+
+        const result = await compute_transform(
+            source,
+            0,
+            {
+                filters: Array.from(
+                    { length: column_count },
+                    (_, colIndex) => filter('greaterThanOrEqual', '0', colIndex),
+                ),
+                sort: Array.from(
+                    { length: column_count },
+                    (_, colIndex) => ({ colIndex, direction: 'asc' as const }),
+                ),
+            },
+            undefined,
+            instrumentation,
+        );
+
+        expect(result.rowCount).toBe(row_count);
+        expect(instrumentation.peakTransformColumnValueSlots).toBe(row_count);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
+        expect(instrumentation.peakNumericSortKeySlots).toBe(row_count);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+    });
+
+    it('reacquires sequential transform columns from cache without rereading', async () => {
+        const row_count = 300;
+        const source = new Source(Array.from(
+            { length: row_count },
+            (_, row) => [cell(String(row % 7))],
+        ));
+        const stored = new Map<string, CachedTransformColumn>();
+        const cache: TransformColumnCache = {
+            get: (sheet, column) => stored.get(`${sheet}:${column}`),
+            set: (sheet, column, value) => {
+                stored.set(`${sheet}:${column}`, value);
+            },
+        };
+        const state: SheetTransformState = {
+            filters: [filter('greaterThanOrEqual', '0')],
+            sort: [{ colIndex: 0, direction: 'desc' }],
+        };
+
+        await compute_transform(source, 0, state, undefined, undefined, cache);
+        const first_read_count = source.read_calls;
+        expect(first_read_count).toBe(Math.ceil(row_count / 128));
+        await compute_transform(source, 0, state, undefined, undefined, cache);
+
+        expect(source.read_calls).toBe(first_read_count);
+        expect(stored.size).toBe(1);
+    });
+
+    it('skips sort-column acquisition for zero and singleton survivors', async () => {
+        const state: SheetTransformState = {
+            filters: [filter('equals', 'keep', 0)],
+            sort: [
+                { colIndex: 1, direction: 'asc' },
+                { colIndex: 2, direction: 'desc' },
+            ],
+        };
+        const make_source = (keep_row: number | undefined) => new Source(
+            Array.from({ length: 10 }, (_, row) => [
+                cell(row === keep_row ? 'keep' : 'drop'),
+                cell(String(10 - row)),
+                cell(String(row)),
+            ]),
+        );
+
+        const empty_source = make_source(undefined);
+        const empty = await compute_transform(empty_source, 0, state);
+        expect([...empty.indices!]).toEqual([]);
+        expect(empty_source.read_calls).toBe(1);
+        expect(empty_source.selected_columns).toEqual([[0]]);
+
+        const singleton_source = make_source(4);
+        const singleton = await compute_transform(singleton_source, 0, state);
+        expect([...singleton.indices!]).toEqual([4]);
+        expect(singleton_source.read_calls).toBe(1);
+        expect(singleton_source.selected_columns).toEqual([[0]]);
+    });
+
+    it('preserves stable multi-key order and missing-last across sort passes', async () => {
+        const source = new Source([
+            [cell('2'), cell('1')],
+            [cell('1'), null],
+            [cell('1'), cell('2')],
+            [cell('2'), null],
+            [cell('1'), cell('2')],
+            [cell('2'), cell('3')],
+        ]);
+
+        const result = await compute_transform(source, 0, {
+            sort: [
+                { colIndex: 0, direction: 'asc' },
+                { colIndex: 1, direction: 'desc' },
+            ],
+            filters: [],
+        });
+
+        // Equal rows 2 and 4 retain source order; missing secondary keys remain
+        // last inside each primary-key group even for descending direction.
+        expect([...result.indices!]).toEqual([2, 4, 1, 5, 0, 3]);
+    });
+
+    it('reuses repeated numeric keys with a bounded request-local table', async () => {
+        const size = 4096;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [cell(String(index % 16))],
+        ));
+
+        await compute_transform(
+            source,
+            0,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            undefined,
+            instrumentation,
+        );
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(16);
+        expect(instrumentation.numericSortKeyReuses).toBe(size - 16);
+        expect(instrumentation.numericSortKeyInternPeakEntries).toBe(16);
+    });
+
+    it('bounds numeric-key interning for all-unique inputs', async () => {
+        const size = 2048;
+        const instrumentation: TransformSortInstrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        };
+        const source = new Source(Array.from(
+            { length: size },
+            (_, index) => [cell(String(index + 1))],
+        ));
+
+        await compute_transform(
+            source,
+            0,
+            { sort: [{ colIndex: 0, direction: 'desc' }], filters: [] },
+            undefined,
+            instrumentation,
+        );
+
+        expect(instrumentation.numericSortKeyBuilds).toBe(size);
+        expect(instrumentation.numericSortKeyReuses ?? 0).toBe(0);
+        expect(instrumentation.numericSortKeyInternPeakEntries).toBe(1024);
     });
 
     it('keeps mixed canonical and number-fallback keys transitive near 2^53', async () => {
@@ -462,7 +801,7 @@ describe('table transforms', () => {
         await expect(compute_transform(scan_source, 0, {
             sort: [{ colIndex: 0, direction: 'asc' }],
             filters: [],
-        }, cancel_at_checkpoint(3))).rejects.toMatchObject({ name: 'AbortError' });
+        }, cancel_at_checkpoint(7))).rejects.toMatchObject({ name: 'AbortError' });
         expect(scan_source.read_calls).toBe(1);
     });
 
@@ -488,13 +827,13 @@ describe('table transforms', () => {
         await expect(compute_transform(cancelled, 0, {
             sort: [{ colIndex: width - 1, direction: 'asc' }],
             filters: [],
-        }, cancel_at_checkpoint(4))).rejects.toMatchObject({ name: 'AbortError' });
+        }, cancel_at_checkpoint(6))).rejects.toMatchObject({ name: 'AbortError' });
         expect(cancelled.read_calls).toBe(2);
         expect(cancelled.materialized_cells).toBe(256);
         expect(cancelled.materialized_cells).toBeLessThan(1_000);
     });
 
-    it('cancels cooperatively during filtering, sorting, and compaction', async () => {
+    it('cancels during native chunk sorting and cooperative merging', async () => {
         const rows = Array.from(
             { length: 3000 },
             (_, index) => [cell(String(3000 - index))],
@@ -504,27 +843,79 @@ describe('table transforms', () => {
             filters: [filter('greaterThanOrEqual', '1')],
         };
 
-        // Checkpoints: setup 1-2, 24 source slices 3-26, filter start 27,
-        // filter chunks 28-30, two bounded sort runs 31-32, merge/copy 33-34,
-        // compaction allocation/copy 35-36.
+        const run = async (
+            should_cancel: (instrumentation: TransformSortInstrumentation) => boolean,
+            expected_allocations: number,
+        ) => {
+            const instrumentation: TransformSortInstrumentation = {
+                numericSortKeyBuilds: 0,
+                numericSortComparisons: 0,
+            };
+            const source = new Source(rows);
+            await expect(compute_transform(
+                source,
+                0,
+                state,
+                () => should_cancel(instrumentation),
+                instrumentation,
+            )).rejects.toMatchObject({ name: 'AbortError' });
+            // Filter and sort reacquire the uncached column independently.
+            expect(source.read_calls).toBe(48);
+            expect(instrumentation.indexBufferAllocations).toBe(expected_allocations);
+            expect(instrumentation.indexBufferReleases).toBe(expected_allocations);
+            expect(instrumentation.indexBufferCount).toBe(0);
+            expect(instrumentation.indexBufferBytes ?? 0).toBe(0);
+            expect(instrumentation.numericSortKeySlots ?? 0).toBe(0);
+            expect(instrumentation.transformColumnValueSlots ?? 0).toBe(0);
+            expect(instrumentation.survivorMaskBytes ?? 0).toBe(0);
+        };
+
+        await run(
+            (instrumentation) => instrumentation.numericSortComparisons > 0
+                && instrumentation.indexBufferAllocations === 1,
+            1,
+        );
+        await run(
+            (instrumentation) => (instrumentation.indexBufferAllocations ?? 0) >= 2,
+            2,
+        );
+    });
+
+    it('releases all request-owned memory when a sort comparator throws', async () => {
+        const rows = Array.from(
+            { length: 3000 },
+            (_, index) => [cell(String(3000 - index))],
+        );
+        let comparisons = 0;
+        const instrumentation = {
+            numericSortKeyBuilds: 0,
+            numericSortComparisons: 0,
+        } as TransformSortInstrumentation;
+        Object.defineProperty(instrumentation, 'numericSortComparisons', {
+            configurable: true,
+            get: () => comparisons,
+            set: (value: number) => {
+                comparisons = value;
+                if ((instrumentation.indexBufferAllocations ?? 0) >= 2) {
+                    throw new Error('comparison failed');
+                }
+            },
+        });
+
         await expect(compute_transform(
             new Source(rows),
             0,
-            state,
-            cancel_at_checkpoint(28),
-        )).rejects.toMatchObject({ name: 'AbortError' });
-        await expect(compute_transform(
-            new Source(rows),
-            0,
-            state,
-            cancel_at_checkpoint(31),
-        )).rejects.toMatchObject({ name: 'AbortError' });
-        await expect(compute_transform(
-            new Source(rows),
-            0,
-            state,
-            cancel_at_checkpoint(36),
-        )).rejects.toMatchObject({ name: 'AbortError' });
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            undefined,
+            instrumentation,
+        )).rejects.toThrow('comparison failed');
+
+        expect(instrumentation.indexBufferAllocations).toBe(2);
+        expect(instrumentation.indexBufferReleases).toBe(2);
+        expect(instrumentation.indexBufferCount).toBe(0);
+        expect(instrumentation.indexBufferBytes).toBe(0);
+        expect(instrumentation.numericSortKeySlots).toBe(0);
+        expect(instrumentation.transformColumnValueSlots).toBe(0);
     });
 
     it('keeps stable source-row tie breaks across cooperative sort runs', async () => {

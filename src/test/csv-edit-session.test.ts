@@ -56,6 +56,14 @@ class StubSource implements DataSource {
 }
 
 class FailingTransformSource extends StubSource {
+    override meta(): WorkbookMeta {
+        const meta = super.meta();
+        return {
+            ...meta,
+            sheets: [{ ...meta.sheets[0], rowCount: 2 }],
+        };
+    }
+
     override read_rows(): RowWindow {
         throw new Error('column read failed');
     }
