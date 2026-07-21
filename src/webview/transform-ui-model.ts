@@ -7,6 +7,9 @@ import type {
     TransformIntent,
 } from '../types';
 
+export const RAW_VALUE_TRANSFORM_DESCRIPTION =
+    'Sorting and filtering use raw cell values, not formatted display text.';
+
 export const FILTER_OPTIONS: readonly { value: FilterOperator; label: string }[] = [
     { value: 'contains', label: 'Contains' },
     { value: 'notContains', label: 'Does not contain' },

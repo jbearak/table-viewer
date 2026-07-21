@@ -1,6 +1,10 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { FilterEntry, FilterOperator, HistogramBin } from '../types';
-import { FILTER_OPTIONS, filter_draft_for_column } from './transform-ui-model';
+import {
+    FILTER_OPTIONS,
+    RAW_VALUE_TRANSFORM_DESCRIPTION,
+    filter_draft_for_column,
+} from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
 export type FilterPopoverDismissReason = DismissReason | 'explicit' | 'layout';
@@ -32,6 +36,7 @@ export function FilterPopover({
     const popover_ref = useRef<HTMLDivElement>(null);
     const first_control_ref = useRef<HTMLSelectElement>(null);
     const layout_dismissed_ref = useRef(false);
+    const description_id = useId();
     use_dismiss(popover_ref, on_cancel);
 
     useLayoutEffect(() => {
@@ -105,6 +110,7 @@ export function FilterPopover({
             className="filter-popover"
             role="dialog"
             aria-label={`Filter on ${column_name}`}
+            aria-describedby={description_id}
             style={{ left: coords.left, top: coords.top }}
             onKeyDown={(event) => {
                 const target = event.target;
@@ -131,6 +137,9 @@ export function FilterPopover({
                 <span className="filter-popover-colname">{column_name}</span>
             </div>
             <div className="filter-popover-body">
+                <p id={description_id} className="transform-value-description">
+                    {RAW_VALUE_TRANSFORM_DESCRIPTION}
+                </p>
                 <FilterHistogram histogram={histogram} />
                 <label className="filter-popover-field-label" htmlFor="filter-condition">
                     Condition
