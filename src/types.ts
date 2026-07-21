@@ -85,6 +85,8 @@ export interface HistogramBin {
     count: number;
 }
 
+export type FilterColumnKind = 'numeric' | 'orderedText' | 'text' | 'unknown';
+
 export interface SheetTransformState {
     sort: SortKey[];
     filters: FilterEntry[];
@@ -223,7 +225,7 @@ export type HostMessage =
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
-    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; requestId: string; generation: number; sourceGeneration: number; error?: string }
+    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; requestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 
 /** Messages from webview to extension host */

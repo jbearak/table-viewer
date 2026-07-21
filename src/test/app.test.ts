@@ -3279,11 +3279,25 @@ describe('sorting and filtering', () => {
             bins: [],
             error: 'The view changed before this histogram request arrived.',
         });
-        // Error is held in state; switch to a range operator to surface it.
+        // Terminal errors only surface for range ops. Error kind stays unknown, so Between
+        // remains selectable without seeding a prior filter.
+        await click_button('Cancel');
+        post_message.mockClear();
+        await open_grid_filter();
+        const reopen = latest_histogram_request(post_message);
         const select = document.querySelector('#filter-condition') as HTMLSelectElement;
         await act(async () => {
             select.value = 'between';
             select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        // Errors are not cached; a new request fires and must be settled again.
+        await dispatch_host_message({
+            type: 'filterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: reopen.requestId,
+            generation: reopen.generation,
+            sourceGeneration: reopen.sourceGeneration,
+            bins: [],
+            error: 'The view changed before this histogram request arrived.',
         });
         expect(document.body.textContent).toContain(
             'Distribution unavailable: The view changed before this histogram request arrived.',
@@ -3328,12 +3342,25 @@ describe('sorting and filtering', () => {
             requestId: second.requestId, generation: 1, sourceGeneration: 1,
             bins: [],
         });
-        // Empty bins leave the draft on Contains; switch to Between to see status.
-        const select = document.querySelector('#filter-condition') as HTMLSelectElement;
-        await act(async () => {
-            select.value = 'between';
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-        });
+        // Empty bins keep the draft on Contains / text operators. Reopen with a seeded
+        // Between filter so the cached empty-chart status can render.
+        await click_button('Cancel');
+        const change_transform = grid_shell_mock.latest_props?.on_transform_change as (
+            state: SheetTransformState,
+        ) => void;
+        await act(async () => change_transform({
+            sort: [],
+            filters: [{
+                id: 'seed-between', colIndex: 1, operator: 'between',
+                value: '1', secondValue: '2', caseSensitive: false, enabled: true,
+            }],
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        post_message.mockClear();
+        await open_grid_filter(1);
+        expect(post_message.mock.calls.some(
+            ([message]) => message.type === 'requestFilterHistogram',
+        )).toBe(false);
         expect(document.body.textContent).toContain('No numeric values to chart.');
     });
 

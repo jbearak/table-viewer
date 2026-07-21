@@ -6,6 +6,11 @@ import type {
     SortDirection,
 } from './types';
 import { is_range_filter_operator, transform_is_active } from './types';
+import {
+    canonical_numeric_string,
+    cell_can_be_numeric,
+    raw_value,
+} from './transform-values';
 
 // Keep each synchronous source read bounded so cancellation can interrupt a
 // transform inside the old 1,000-row scan interval.
@@ -1027,28 +1032,6 @@ function finite_number_text(value: string | undefined): boolean {
     return value !== undefined
         && value.trim() !== ''
         && Number.isFinite(Number(value));
-}
-
-function raw_value(cell: RenderedCell | null | undefined): string | null {
-    return !cell || cell.raw === null || cell.raw === '' ? null : cell.raw;
-}
-
-function cell_can_be_numeric(
-    cell: RenderedCell | null | undefined,
-): boolean {
-    const raw = raw_value(cell);
-    if (raw === null || cell?.rawType === 'boolean') return false;
-    if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
-    if (cell?.rawType === 'string') return false;
-    return canonical_numeric_string(raw);
-}
-
-function canonical_numeric_string(value: string): boolean {
-    if (value.trim() !== value) return false;
-    if (!/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) {
-        return false;
-    }
-    return Number.isFinite(Number(value));
 }
 
 async function cooperative_stable_sort(

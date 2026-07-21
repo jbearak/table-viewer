@@ -177,26 +177,23 @@ describe('Toolbar', () => {
         ]);
     });
 
-    it('explains raw-value transform semantics before any sort or filter is active', () => {
+    it('does not show the Sort/filter raw-values pill when idle', () => {
         const { container } = render_toolbar({
             transform: { sort: [], filters: [] },
         });
         expect(container.querySelector('.sort-strip')).toBeNull();
         expect(container.querySelector('.filter-strip')).toBeNull();
-        const note = container.querySelector('[role="note"]') as HTMLElement;
-        expect(note.textContent).toBe('Sort/filter: raw values');
-        const description_id = note.getAttribute('aria-describedby');
-        expect(description_id).toBeTruthy();
+        expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
+        expect(container.querySelector('[role="note"]')).toBeNull();
         expect(container.querySelector('[role="toolbar"]')?.getAttribute('aria-describedby'))
-            .toBe(description_id);
-        const description = document.getElementById(description_id!);
-        expect(description?.textContent).toBe(
+            .toBeNull();
+        expect(container.textContent).not.toContain('Sort/filter: raw values');
+        expect(container.textContent).not.toContain(
             'Sorting and filtering use raw cell values, not formatted display text.',
         );
-        expect(description?.closest('.toolbar-chips')).toBeNull();
     });
 
-    it('excludes the hidden transform description from chip-width wrapping', () => {
+    it('does not include removed raw-value chrome in chip-width wrapping', () => {
         const scroll_width = Object.getOwnPropertyDescriptor(
             HTMLElement.prototype,
             'scrollWidth',
@@ -209,10 +206,7 @@ describe('Toolbar', () => {
             configurable: true,
             get(this: HTMLElement) {
                 if (this.classList.contains('toolbar-row-count')) return 70;
-                if (this.classList.contains('toolbar-transform-semantics')) return 80;
                 if (this.classList.contains('toolbar-item')) return 50;
-                if (this.classList.contains('sr-only')
-                    && this.textContent?.includes('Sorting and filtering')) return 1_000;
                 return 0;
             },
         });
@@ -226,6 +220,7 @@ describe('Toolbar', () => {
             const { container } = render_toolbar({
                 transform: { sort: [], filters: [] },
             });
+            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
             expect(container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
                 .toBe(false);
         } finally {
@@ -565,25 +560,15 @@ describe('Toolbar', () => {
             });
             const toolbar = container.querySelector('.toolbar') as HTMLElement;
             const chips = container.querySelector('.toolbar-chips') as HTMLElement;
-            const semantics = container.querySelector(
-                '.toolbar-transform-semantics',
-            ) as HTMLElement;
             const sort = container.querySelector('.sort-strip') as HTMLElement;
             const filter = container.querySelector('.filter-strip') as HTMLElement;
             const notice = container.querySelector('.toolbar-merge-notice') as HTMLElement;
             const actions = container.querySelector('.toolbar-actions') as HTMLElement;
 
             expect(toolbar.classList.contains('is-wrapped')).toBe(true);
+            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
             expect(getComputedStyle(chips).flexWrap).toBe('wrap');
             expect(getComputedStyle(chips).overflow).toBe('visible');
-            expect(getComputedStyle(semantics).flexShrink).toBe('1');
-            expect(getComputedStyle(semantics).minWidth).toBe('0px');
-            expect(getComputedStyle(semantics).whiteSpace).toBe('normal');
-            expect(getComputedStyle(semantics).overflowWrap).toBe('anywhere');
-            const semantics_description = semantics.getAttribute('aria-describedby');
-            expect(document.getElementById(semantics_description!)?.textContent).toBe(
-                'Sorting and filtering use raw cell values, not formatted display text.',
-            );
             expect(getComputedStyle(sort).flexShrink).toBe('1');
             expect(getComputedStyle(filter).flexShrink).toBe('1');
             expect(getComputedStyle(sort).minWidth).not.toBe('0px');

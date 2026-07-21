@@ -7,9 +7,11 @@ import type {
 } from '../data-source/interface';
 import { compute_column_histogram } from '../histograms';
 
+type HistogramCell = string | null | { raw: string; rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty' };
+
 class HistogramSource implements DataSource {
     readonly selected_columns: number[][] = [];
-    constructor(private readonly values: (string | null)[]) {}
+    constructor(private readonly values: HistogramCell[]) {}
     meta(): WorkbookMeta {
         return {
             hasFormatting: false,
@@ -22,9 +24,12 @@ class HistogramSource implements DataSource {
     read_rows(_sheet: number, start: number, count: number): RowWindow {
         return {
             startRow: start,
-            rows: this.values.slice(start, start + count).map((raw) => [
-                raw === null ? null : { raw, formatted: raw, bold: false, italic: false },
-            ]),
+            rows: this.values.slice(start, start + count).map((entry) => {
+                if (entry === null) return [null];
+                const raw = typeof entry === 'string' ? entry : entry.raw;
+                const rawType = typeof entry === 'string' ? undefined : entry.rawType;
+                return [{ raw, formatted: raw, bold: false, italic: false, rawType }];
+            }),
         };
     }
     read_columns(
@@ -34,10 +39,14 @@ class HistogramSource implements DataSource {
         column_indices: readonly number[],
     ): ColumnWindow {
         this.selected_columns.push([...column_indices]);
-        const rows = this.values.slice(start, start + count).map((raw) => {
-            const cell = raw === null
+        const rows = this.values.slice(start, start + count).map((entry) => {
+            const cell = entry === null
                 ? null
-                : { raw, formatted: raw, bold: false, italic: false };
+                : (() => {
+                    const raw = typeof entry === 'string' ? entry : entry.raw;
+                    const rawType = typeof entry === 'string' ? undefined : entry.rawType;
+                    return { raw, formatted: raw, bold: false, italic: false, rawType };
+                })();
             return column_indices.map(() => cell);
         });
         return { startRow: start, rows };
@@ -46,30 +55,103 @@ class HistogramSource implements DataSource {
 }
 
 describe('compute_column_histogram', () => {
-    it('builds 50 bounded bins and ignores blank, nonnumeric, and nonfinite values', async () => {
+    it('builds 50 bounded bins and ignores blank values', async () => {
         const source = new HistogramSource([
-            '0', '25', '50', '75', '100', null, '', 'word', 'Infinity',
+            '0', '25', '50', '75', '100', null, '',
         ]);
-        const bins = await compute_column_histogram(
+        const histogram = await compute_column_histogram(
             source,
             0,
             0,
             () => false,
         );
-        expect(bins).toHaveLength(50);
-        expect(bins[0].lo).toBe(0);
-        expect(bins.at(-1)?.hi).toBe(100);
-        expect(bins.reduce((total, bin) => total + bin.count, 0)).toBe(5);
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.bins).toHaveLength(50);
+        expect(histogram.bins[0].lo).toBe(0);
+        expect(histogram.bins.at(-1)?.hi).toBe(100);
+        expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(5);
         expect(source.selected_columns).toEqual([[0], [0]]);
     });
 
     it('returns one bin for a constant column and no bins without numeric values', async () => {
         await expect(compute_column_histogram(
             new HistogramSource(['4', '4', null]), 0, 0, () => false,
-        )).resolves.toEqual([{ lo: 4, hi: 4, count: 2 }]);
+        )).resolves.toEqual({
+            bins: [{ lo: 4, hi: 4, count: 2 }],
+            columnKind: 'numeric',
+        });
         await expect(compute_column_histogram(
             new HistogramSource(['text', '', null]), 0, 0, () => false,
-        )).resolves.toEqual([]);
+        )).resolves.toEqual({ bins: [], columnKind: 'text' });
+    });
+
+
+
+    it('treats CSV-like string rawType numbers as numeric and ignores whitespace-only cells', async () => {
+        await expect(compute_column_histogram(
+            new HistogramSource([
+                { raw: '1', rawType: 'string' },
+                { raw: '2.5', rawType: 'string' },
+                { raw: '   ', rawType: 'string' },
+                { raw: '', rawType: 'string' },
+                null,
+            ]),
+            0,
+            0,
+            () => false,
+        )).resolves.toMatchObject({
+            columnKind: 'numeric',
+            bins: expect.any(Array),
+        });
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                { raw: '0', rawType: 'string' },
+                { raw: '100', rawType: 'string' },
+                { raw: '	', rawType: 'string' },
+            ]),
+            0,
+            0,
+            () => false,
+        );
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.bins.length).toBeGreaterThan(0);
+        expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(2);
+    });
+
+    it('classifies mixed numeric/text and leading-zero identifiers as text', async () => {
+        await expect(compute_column_histogram(
+            new HistogramSource(['02139', '10001']), 0, 0, () => false,
+        )).resolves.toMatchObject({ columnKind: 'text', bins: [] });
+        await expect(compute_column_histogram(
+            new HistogramSource(['1', 'label', '2']), 0, 0, () => false,
+        )).resolves.toMatchObject({ columnKind: 'text' });
+    });
+
+    it('stops scanning when the column kind becomes text', async () => {
+        const source = new HistogramSource([
+            '1',
+            'label',
+            ...Array.from({ length: 1_999 }, (_, index) => String(index + 2)),
+        ]);
+        await expect(compute_column_histogram(
+            source, 0, 0, () => false,
+        )).resolves.toEqual({ bins: [], columnKind: 'text' });
+        expect(source.selected_columns).toEqual([[0]]);
+    });
+
+    it('classifies raw and ISO date columns as ordered text', async () => {
+        await expect(compute_column_histogram(
+            new HistogramSource([{ raw: '2026-07-21', rawType: 'date' }]),
+            0,
+            0,
+            () => false,
+        )).resolves.toEqual({ bins: [], columnKind: 'orderedText' });
+        await expect(compute_column_histogram(
+            new HistogramSource(['2026-07-21', '2026-07-22']),
+            0,
+            0,
+            () => false,
+        )).resolves.toEqual({ bins: [], columnKind: 'orderedText' });
     });
 
     it('checks cancellation between bounded row reads', async () => {
@@ -83,7 +165,7 @@ describe('compute_column_histogram', () => {
     });
 
     it('keeps extreme-range boundaries finite and monotone', async () => {
-        const bins = await compute_column_histogram(
+        const histogram = await compute_column_histogram(
             new HistogramSource([
                 String(-Number.MAX_VALUE),
                 '0',
@@ -93,6 +175,8 @@ describe('compute_column_histogram', () => {
             0,
             () => false,
         );
+        const { bins } = histogram;
+        expect(histogram.columnKind).toBe('numeric');
         expect(bins).toHaveLength(50);
         expect(bins[0].lo).toBe(-Number.MAX_VALUE);
         expect(bins.at(-1)?.hi).toBe(Number.MAX_VALUE);

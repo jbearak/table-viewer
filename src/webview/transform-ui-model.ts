@@ -1,4 +1,5 @@
 import type {
+    FilterColumnKind,
     FilterEntry,
     FilterOperator,
     SheetTransformState,
@@ -10,25 +11,124 @@ import { is_range_filter_operator } from '../types';
 
 export { is_range_filter_operator };
 
-export const RAW_VALUE_TRANSFORM_DESCRIPTION =
-    'Sorting and filtering use raw cell values, not formatted display text.';
 
-export const FILTER_OPTIONS: readonly { value: FilterOperator; label: string }[] = [
-    { value: 'contains', label: 'Contains' },
-    { value: 'notContains', label: 'Does not contain' },
-    { value: 'equals', label: 'Equals' },
-    { value: 'notEquals', label: 'Does not equal' },
-    { value: 'startsWith', label: 'Starts with' },
-    { value: 'endsWith', label: 'Ends with' },
-    { value: 'greaterThan', label: 'Greater than' },
-    { value: 'greaterThanOrEqual', label: 'Greater than or equal' },
-    { value: 'lessThan', label: 'Less than' },
-    { value: 'lessThanOrEqual', label: 'Less than or equal' },
-    { value: 'between', label: 'Between (inclusive)' },
-    { value: 'notBetween', label: 'Not between (inclusive bounds)' },
-    { value: 'isEmpty', label: 'Is empty' },
-    { value: 'isNotEmpty', label: 'Is not empty' },
-] as const;
+export type FilterOption = { value: FilterOperator; label: string };
+
+type KnownFilterColumnKind = Exclude<FilterColumnKind, 'unknown'>;
+type FilterOperatorMetadata = FilterOption & {
+    columnKinds: readonly KnownFilterColumnKind[];
+    supportsCaseSensitive: boolean;
+};
+
+const FILTER_OPERATOR_METADATA: readonly FilterOperatorMetadata[] = [
+    {
+        value: 'contains', label: 'Contains',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'notContains', label: 'Does not contain',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'equals', label: 'Equals',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'notEquals', label: 'Does not equal',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'startsWith', label: 'Starts with',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'endsWith', label: 'Ends with',
+        columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
+    },
+    {
+        value: 'greaterThan', label: 'Greater than',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'greaterThanOrEqual', label: 'Greater than or equal',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'lessThan', label: 'Less than',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'lessThanOrEqual', label: 'Less than or equal',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'between', label: 'Between (inclusive)',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'notBetween', label: 'Not between (inclusive bounds)',
+        columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'isEmpty', label: 'Is empty',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
+        value: 'isNotEmpty', label: 'Is not empty',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
+];
+
+const FILTER_OPERATOR_METADATA_BY_VALUE = new Map(
+    FILTER_OPERATOR_METADATA.map((metadata) => [metadata.value, metadata] as const),
+);
+
+export const FILTER_OPTIONS: readonly FilterOption[] = FILTER_OPERATOR_METADATA.map(
+    ({ value, label }) => ({ value, label }),
+);
+
+export function filter_options_for_kind(kind: FilterColumnKind): readonly FilterOption[] {
+    if (kind === 'unknown') return FILTER_OPTIONS;
+    return FILTER_OPTIONS.filter((option) =>
+        FILTER_OPERATOR_METADATA_BY_VALUE.get(option.value)?.columnKinds.includes(kind));
+}
+
+/** Kind options plus the current operator when it falls outside the kind list. */
+export function filter_options_for_draft(
+    kind: FilterColumnKind,
+    current_operator: FilterOperator,
+): readonly FilterOption[] {
+    const options = filter_options_for_kind(kind);
+    if (options.some((option) => option.value === current_operator)) return options;
+    const extra = FILTER_OPTIONS.find((option) => option.value === current_operator);
+    return extra ? [...options, extra] : options;
+}
+
+/** Case sensitivity only applies to text comparisons; numeric equals ignores it. */
+export function operator_supports_case_sensitive(
+    operator: FilterOperator,
+    kind: FilterColumnKind = 'text',
+): boolean {
+    return !(kind === 'numeric' && (operator === 'equals' || operator === 'notEquals'))
+        && FILTER_OPERATOR_METADATA_BY_VALUE.get(operator)?.supportsCaseSensitive === true;
+}
+
+export type FilterHistogramStatus =
+    | { status: 'loading' }
+    | { status: 'ready'; bins: readonly { lo: number; hi: number; count: number }[]; columnKind?: FilterColumnKind }
+    | { status: 'error'; message: string };
+
+/**
+ * Infer column kind only once the histogram settles.
+ * loading/error stay unknown so the full operator list remains available;
+ * ready bins ⇒ numeric; ready empty ⇒ text.
+ */
+export function filter_column_kind_from_histogram(
+    histogram: FilterHistogramStatus,
+): FilterColumnKind {
+    if (histogram.status === 'loading' || histogram.status === 'error') return 'unknown';
+    return histogram.columnKind ?? (histogram.bins.length > 0 ? 'numeric' : 'text');
+}
 
 export function new_filter_id(): string {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {

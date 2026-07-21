@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FilterEntry, HistogramBin } from '../types';
+import type { FilterEntry, HistogramBin, SheetTransformState } from '../types';
 import { FilterPopover } from '../webview/filter-popover';
 
 let root: Root | null = null;
@@ -28,7 +28,7 @@ afterEach(() => {
 function render_popover(
     filters: FilterEntry[] = [],
     histogram?: { status: 'loading' }
-        | { status: 'ready'; bins: readonly HistogramBin[] }
+        | { status: 'ready'; bins: readonly HistogramBin[]; columnKind?: import('../types').FilterColumnKind }
         | { status: 'error'; message: string },
 ) {
     const on_apply = vi.fn();
@@ -49,16 +49,176 @@ function render_popover(
 }
 
 describe('FilterPopover', () => {
-    it('visibly describes raw-value filter semantics and associates the description', () => {
+    it('does not show the raw-value transform description', () => {
         render_popover();
         const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
-        const description_id = dialog.getAttribute('aria-describedby');
-        expect(description_id).toBeTruthy();
-        const description = document.getElementById(description_id!);
-        expect(description?.classList.contains('transform-value-description')).toBe(true);
-        expect(description?.textContent).toBe(
+        expect(dialog.getAttribute('aria-describedby')).toBeNull();
+        expect(document.querySelector('.transform-value-description')).toBeNull();
+        expect(document.body.textContent).not.toContain(
             'Sorting and filtering use raw cell values, not formatted display text.',
         );
+    });
+
+    it('limits operator options by column kind and keeps out-of-kind operators selectable', () => {
+        render_popover([], { status: 'ready', bins: READY_BINS });
+        let options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toEqual([
+            'equals', 'notEquals', 'greaterThan', 'greaterThanOrEqual',
+            'lessThan', 'lessThanOrEqual', 'between', 'notBetween',
+            'isEmpty', 'isNotEmpty',
+        ]);
+        expect(options).not.toContain('contains');
+        act(() => root!.unmount());
+
+        // loading/error keep the full list until the histogram settles.
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'loading' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toContain('contains');
+        expect(options).toContain('between');
+        expect(options).toHaveLength(14);
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'error', message: 'scan failed' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toContain('between');
+        expect(options).toContain('greaterThan');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'ready', bins: [] },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toEqual([
+            'contains', 'notContains', 'equals', 'notEquals',
+            'startsWith', 'endsWith', 'isEmpty', 'isNotEmpty',
+        ]);
+        expect(options).not.toContain('between');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { status: 'ready', bins: [], columnKind: 'orderedText' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toContain('contains');
+        expect(options).toContain('between');
+        expect(options).toContain('greaterThan');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'contains', value: 'x',
+                caseSensitive: false, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options).toEqual([
+            'equals', 'notEquals', 'greaterThan', 'greaterThanOrEqual',
+            'lessThan', 'lessThanOrEqual', 'between', 'notBetween',
+            'isEmpty', 'isNotEmpty', 'contains',
+        ]);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+    });
+
+    it('shows Case sensitive only for text string comparisons', () => {
+        render_popover([], { status: 'loading' });
+        expect(document.body.textContent).toContain('Case sensitive');
+
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'isEmpty';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        expect(document.body.textContent).not.toContain('Case sensitive');
+
+        act(() => {
+            select.value = 'equals';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        expect(document.body.textContent).toContain('Case sensitive');
+        act(() => root!.unmount());
+
+        const on_apply = vi.fn();
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'equals', value: '1',
+                caseSensitive: true, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
+            anchor: { left: 10, top: 10 }, on_apply, on_cancel: vi.fn(),
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('equals');
+        expect(document.body.textContent).not.toContain('Case sensitive');
+        expect(document.querySelector('input[type="checkbox"]')).toBeNull();
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'equals', value: '1', caseSensitive: true,
+        }));
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'contains', value: 'A',
+                caseSensitive: true, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+        expect(document.body.textContent).toContain('Case sensitive');
+        expect((document.querySelector('input[type="checkbox"]') as HTMLInputElement).checked)
+            .toBe(true);
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'between', value: '1', secondValue: '2',
+                caseSensitive: true, enabled: true,
+            }],
+            histogram: { status: 'ready', bins: READY_BINS },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect(document.body.textContent).not.toContain('Case sensitive');
+        expect(document.querySelector('input[type="checkbox"]')).toBeNull();
     });
 
     it('hides the histogram for non-range conditions and shows status only for range ops', () => {
@@ -66,12 +226,18 @@ describe('FilterPopover', () => {
         expect(document.body.textContent).not.toContain('Loading distribution…');
         expect(document.querySelector('#filter-condition')).not.toBeNull();
         expect(document.querySelector('[role="group"][aria-label="Range histogram"]')).toBeNull();
+        act(() => root!.unmount());
 
-        const select = document.querySelector('select') as HTMLSelectElement;
-        act(() => {
-            select.value = 'between';
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-        });
+        // Between stays selectable for an existing range filter even while the histogram loads.
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [{
+                id: 'f', colIndex: 1, operator: 'between', value: '', secondValue: '',
+                caseSensitive: false, enabled: true,
+            }],
+            histogram: { status: 'loading' },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
         expect(document.body.textContent).toContain('Loading distribution…');
         act(() => root!.unmount());
 
@@ -184,7 +350,7 @@ describe('FilterPopover', () => {
         const existing: FilterEntry = {
             id: 'keep-me',
             colIndex: 1,
-            operator: 'between',
+            operator: 'equals',
             value: '0',
             secondValue: '0',
             caseSensitive: true,
@@ -192,9 +358,24 @@ describe('FilterPopover', () => {
         };
         const { on_apply } = render_popover([existing]);
         expect(document.activeElement?.id).toBe('filter-condition');
-        expect((document.querySelector('[aria-label="Lower value"]') as HTMLInputElement).value).toBe('0');
-        expect((document.querySelector('[aria-label="Upper value"]') as HTMLInputElement).value).toBe('0');
+        expect((document.querySelector('[aria-label="Filter value"]') as HTMLInputElement).value).toBe('0');
         expect((document.querySelector('input[type="checkbox"]') as HTMLInputElement).checked).toBe(true);
+        act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(existing);
+    });
+
+    it('preserves caseSensitive on apply when the checkbox is hidden for range ops', () => {
+        const existing: FilterEntry = {
+            id: 'keep-me',
+            colIndex: 1,
+            operator: 'between',
+            value: '0',
+            secondValue: '0',
+            caseSensitive: true,
+            enabled: false,
+        };
+        const { on_apply } = render_popover([existing], { status: 'ready', bins: READY_BINS });
+        expect(document.querySelector('input[type="checkbox"]')).toBeNull();
         act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
         expect(on_apply).toHaveBeenCalledWith(existing);
     });
@@ -295,6 +476,33 @@ describe('FilterPopover', () => {
         }));
     });
 
+    it('does not suppress a notBetween upper-bound-only edit', async () => {
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: vi.fn(),
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { transforms_semantically_equal } = await import('../webview/app');
+        const current: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 1, operator: 'notBetween', value: '10', secondValue: '20',
+                caseSensitive: false, enabled: true,
+            }],
+        };
+        const edited: SheetTransformState = {
+            ...current,
+            filters: [{ ...current.filters[0], secondValue: '30' }],
+        };
+        const request_transform = vi.fn();
+
+        if (!transforms_semantically_equal(current, edited)) {
+            request_transform(edited);
+        }
+
+        expect(request_transform).toHaveBeenCalledWith(edited);
+    });
+
     it('reclamps after isEmpty expands to between near the viewport edge', () => {
         const resize_callbacks: ResizeObserverCallback[] = [];
         vi.stubGlobal('ResizeObserver', class {
@@ -323,7 +531,7 @@ describe('FilterPopover', () => {
             });
         render_popover([{
             id: 'f', colIndex: 1, operator: 'isEmpty', caseSensitive: false, enabled: true,
-        }]);
+        }], { status: 'ready', bins: READY_BINS });
         const popover = document.querySelector('.filter-popover') as HTMLElement;
         expect(popover.style.top).toBe('192px');
 
@@ -365,7 +573,7 @@ describe('FilterPopover', () => {
             id: 'draft', colIndex: 1, operator: 'between', value: 'low',
             secondValue: 'high', caseSensitive: false, enabled: true,
         };
-        const { on_apply } = render_popover([existing]);
+        const { on_apply } = render_popover([existing], { status: 'ready', bins: READY_BINS });
         const select = document.querySelector('select') as HTMLSelectElement;
         act(() => {
             select.value = 'isEmpty';

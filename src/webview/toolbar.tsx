@@ -14,7 +14,6 @@ import {
 } from './column-visibility-control';
 import { FilterStrip } from './filter-strip';
 import { SortStrip } from './sort-strip';
-import { RAW_VALUE_TRANSFORM_DESCRIPTION } from './transform-ui-model';
 import { use_toolbar_wrap } from './use-toolbar-wrap';
 
 export interface ToolbarFocusHandle {
@@ -80,7 +79,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     const lead_ref = useRef<HTMLSpanElement>(null);
     const chips_ref = useRef<HTMLDivElement>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
-    const transform_description_id = useId();
     useImperativeHandle(focus_ref, () => ({
         focus: () => {
             const toolbar = toolbar_ref.current;
@@ -120,23 +118,12 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             role="toolbar"
             tabIndex={-1}
             aria-label="Table controls"
-            aria-describedby={transform_description_id}
         >
             <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
             <span className="sr-only" role="status" aria-live="polite">
                 {props.excel_header_status ?? ''}
             </span>
-            <span id={transform_description_id} className="sr-only">
-                {RAW_VALUE_TRANSFORM_DESCRIPTION}
-            </span>
             <div ref={chips_ref} className="toolbar-chips">
-                <span
-                    className="toolbar-transform-semantics"
-                    role="note"
-                    aria-describedby={transform_description_id}
-                >
-                    Sort/filter: raw values
-                </span>
                 <SortStrip
                     state={transform}
                     column_names={column_names}

@@ -233,13 +233,14 @@ export const ColumnVisibilityControl = forwardRef<
     const trigger_label = hidden_count > 0
         ? `Choose visible columns. ${hidden_count} column${hidden_count === 1 ? '' : 's'} hidden.`
         : 'Choose visible columns.';
+    const has_hidden_columns = hidden_count > 0;
 
     return (
         <div ref={boundary_ref} className="toolbar-item column-visibility-anchor">
             <button
                 ref={trigger_ref}
                 type="button"
-                className={`toggle column-visibility-trigger ${open ? 'active' : ''}`.trim()}
+                className={`toggle column-visibility-trigger ${has_hidden_columns ? 'active' : ''}`.trim()}
                 disabled={disabled}
                 aria-label={trigger_label}
                 aria-haspopup="dialog"
