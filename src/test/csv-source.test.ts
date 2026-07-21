@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { CsvDataSource } from '../data-source/csv-source';
 import { serialize_csv } from '../serialize-csv';
+import { transformed_window } from '../table-transform';
 import type { CellData } from '../types';
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -79,6 +80,60 @@ describe('CsvDataSource', () => {
                 ['multi\nline', null],
                 ['5', '7'],
             ]);
+    });
+    it('reads indexed rows with order, duplicates, padding, headers, and CSV parity', () => {
+        const ds = new CsvDataSource(enc(
+            'Name,Note,Value\n'
+            + 'café,"first\nline",1\n'
+            + 'Bob,plain\n'
+            + 'Chloé,"quoted, value",3\n',
+        ), ',', 10000, { firstRowIsHeader: true });
+        const indexed = ds.read_rows_indexed(0, Uint32Array.from([2, 0, 1, 2])).rows;
+        expect(indexed).toEqual([2, 0, 1, 2].map((row) =>
+            ds.read_rows(0, row, 1).rows[0]));
+        expect(indexed[0].map((value) => value?.raw ?? null))
+            .toEqual(['Chloé', 'quoted, value', '3']);
+        expect(indexed[1][1]?.raw).toBe('first\nline');
+        expect(indexed[2]).toHaveLength(3);
+        expect(indexed[2][2]).toBeNull();
+        expect(ds.read_rows_indexed(0, [])).toEqual({ rows: [] });
+        expect(() => ds.read_rows_indexed(0, [3])).toThrow(RangeError);
+        expect(() => ds.read_rows_indexed(1, [])).toThrow(RangeError);
+    });
+    it('serves reverse/random/duplicate 100-row transforms with one indexed call', () => {
+        const ds = new CsvDataSource(enc(Array.from(
+            { length: 200 },
+            (_, row) => `${row},value-${row}`,
+        ).join('\n')), ',', 10000);
+        const indices = Uint32Array.from(Array.from(
+            { length: 100 },
+            (_, position) => position % 11 === 0 ? 42 : (position * 73) % 200,
+        ).reverse());
+        const indexed = vi.spyOn(ds, 'read_rows_indexed');
+        const sequential = vi.spyOn(ds, 'read_rows');
+        const result = transformed_window(ds, 0, 0, 100, indices);
+        expect(result.rows.map((row) => row[0]?.raw))
+            .toEqual(Array.from(indices, String));
+        expect(indexed).toHaveBeenCalledTimes(1);
+        expect(sequential).not.toHaveBeenCalled();
+    });
+    it('does not decode the unrequested span between sparse indexed rows', () => {
+        const row_count = 5000;
+        const ds = new CsvDataSource(enc(Array.from(
+            { length: row_count },
+            (_, row) => `${row},${'x'.repeat(80)}`,
+        ).join('\n')), ',', row_count);
+        const decoder = vi.spyOn(
+            (ds as unknown as { decoder: TextDecoder }).decoder,
+            'decode',
+        );
+
+        expect(ds.read_rows_indexed(0, [0, row_count - 1]).rows
+            .map((row) => row[0]?.raw)).toEqual(['0', String(row_count - 1)]);
+        expect(decoder).toHaveBeenCalledTimes(2);
+        expect(decoder.mock.calls.every(
+            ([bytes]) => (bytes?.byteLength ?? 0) < 100,
+        )).toBe(true);
     });
     it('pads short rows to columnCount with null', () => {
         const ds = new CsvDataSource(enc('a,b,c\n1\n'), ',', 10000);

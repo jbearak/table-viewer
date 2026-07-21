@@ -138,6 +138,34 @@ describe('ExcelHeaderDataSource', () => {
         });
     });
 
+    it('projects indexed rows through the header offset and legacy fallback', () => {
+        const base = new StubSource([
+            [cell('Name'), cell('Age')],
+            [cell('Alice'), cell(30)],
+            [cell('Bob'), cell(25)],
+        ]);
+        const ds = new ExcelHeaderDataSource(base);
+        const before = base.read_requests.length;
+        expect(ds.read_rows_indexed(0, Uint32Array.from([1, 0, 1])).rows)
+            .toEqual([
+                [cell('Bob'), cell(25)],
+                [cell('Alice'), cell(30)],
+                [cell('Bob'), cell(25)],
+            ]);
+        expect(base.read_requests.slice(before)).toEqual([
+            { start: 2, count: 1 },
+            { start: 1, count: 2 },
+        ]);
+
+        const reads = base.read_requests.length;
+        expect(ds.read_rows_indexed(0, [])).toEqual({ rows: [] });
+        expect(() => ds.read_rows_indexed(0, [2])).toThrow(RangeError);
+        expect(base.read_requests).toHaveLength(reads);
+
+        ds.set_override('Sheet1', 'off');
+        expect(ds.read_rows_indexed(0, [0]).rows[0][0]?.raw).toBe('Name');
+    });
+
     it('keeps an ambiguous plain all-text first row as data', () => {
         const ds = new ExcelHeaderDataSource(new StubSource([
             [cell('Name'), cell('City')],

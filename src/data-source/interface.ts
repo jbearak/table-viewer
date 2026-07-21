@@ -17,6 +17,12 @@ export interface RowWindow {
     rows: (RenderedCell | null)[][];  // rows[i][col]; outer length <= requested count
 }
 
+/** Full rendered rows selected by absolute source index. Rows are returned in
+ * exactly the requested order; repeated indices produce repeated rows. */
+export interface IndexedRows {
+    rows: (RenderedCell | null)[][];
+}
+
 /** A compact projection of a row window onto caller-selected columns.
  * `rows[i][j]` is the cell from `column_indices[j]`; cells from other columns
  * are never materialized. */
@@ -59,6 +65,13 @@ export interface DataSource {
     meta(): WorkbookMeta;
     /** Materialize a window of rows for one sheet. count may overshoot rowCount. */
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow;
+    /** Materialize arbitrary absolute rows in requested order without reading
+     * the sparse span between them. Optional for third-party/test sources;
+     * callers use read_source_rows_indexed for a compatibility fallback. */
+    read_rows_indexed?(
+        sheet_index: number,
+        row_indices: ArrayLike<number>,
+    ): IndexedRows;
     /** Materialize only the requested columns, in the supplied order. Optional
      *  for third-party/test sources; callers use read_source_columns for a
      *  compatibility fallback. */
@@ -86,6 +99,49 @@ export interface DataSource {
     headerLine?: string;
     /** CSV save path: detected line terminator, so re-serialization round-trips. */
     lineEnding?: '\r\n' | '\r' | '\n';
+}
+
+/** Read arbitrary rows in requested order. Legacy sources are read as adjacent
+ * ascending runs: this may make several small read_rows calls, but never reads
+ * across gaps merely to reduce the call count. */
+export function read_source_rows_indexed(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+): IndexedRows {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) {
+        throw new RangeError(`sheet index ${sheet_index} out of range`);
+    }
+    for (let position = 0; position < row_indices.length; position++) {
+        const row = row_indices[position];
+        if (!Number.isInteger(row) || row < 0 || row >= sheet.rowCount) {
+            throw new RangeError(`row index ${row} out of range (${sheet.rowCount} rows)`);
+        }
+    }
+    if (row_indices.length === 0) return { rows: [] };
+    if (source.read_rows_indexed) {
+        return source.read_rows_indexed(sheet_index, row_indices);
+    }
+
+    const rows: (RenderedCell | null)[][] = [];
+    let position = 0;
+    while (position < row_indices.length) {
+        const source_start = row_indices[position];
+        let run_length = 1;
+        while (
+            position + run_length < row_indices.length
+            && row_indices[position + run_length] === source_start + run_length
+        ) {
+            run_length += 1;
+        }
+        const run = source.read_rows(sheet_index, source_start, run_length).rows;
+        for (let offset = 0; offset < run_length; offset++) {
+            rows.push(run[offset] ?? []);
+        }
+        position += run_length;
+    }
+    return { rows };
 }
 
 /** Read a compact column projection, falling back to full rows for legacy

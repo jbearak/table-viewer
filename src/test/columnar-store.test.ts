@@ -64,4 +64,21 @@ describe('ColumnarStore', () => {
         ]);
         expect(rows[1]).toEqual([null, null]);
     });
+    it('materializes arbitrary full rows in order with duplicates and types', () => {
+        const builder = new ColumnarStore.Builder(3, 2);
+        builder.set(0, 0, {
+            raw: '0', formatted: '$0', bold: true, italic: false, rawType: 'number',
+        });
+        builder.set(2, 1, {
+            raw: 'last', formatted: 'LAST', bold: false, italic: true, rawType: 'string',
+        });
+        const store = builder.build();
+        expect(store.read_rows_indexed(Uint32Array.from([2, 0, 2]))).toEqual([
+            [null, { raw: 'last', formatted: 'LAST', bold: false, italic: true, rawType: 'string' }],
+            [{ raw: '0', formatted: '$0', bold: true, italic: false, rawType: 'number' }, null],
+            [null, { raw: 'last', formatted: 'LAST', bold: false, italic: true, rawType: 'string' }],
+        ]);
+        expect(store.read_rows_indexed([])).toEqual([]);
+        expect(() => store.read_rows_indexed([3])).toThrow(RangeError);
+    });
 });

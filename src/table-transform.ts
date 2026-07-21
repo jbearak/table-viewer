@@ -1,5 +1,5 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
-import { read_source_columns } from './data-source/interface';
+import { read_source_columns, read_source_rows_indexed } from './data-source/interface';
 import type {
     FilterEntry,
     SheetTransformState,
@@ -554,29 +554,11 @@ export function transformed_window(
     if (!indices) return source.read_rows(sheet_index, start_row, count);
     const start = Math.max(0, Math.min(start_row, indices.length));
     const end = Math.min(start + Math.max(0, count), indices.length);
-    const rows: (RenderedCell | null)[][] = [];
-    let display_row = start;
-    while (display_row < end) {
-        const source_start = indices[display_row];
-        let run_length = 1;
-        while (
-            display_row + run_length < end
-            && indices[display_row + run_length]
-                === source_start + run_length
-        ) {
-            run_length += 1;
-        }
-        const run = source.read_rows(
-            sheet_index,
-            source_start,
-            run_length,
-        ).rows;
-        for (let offset = 0; offset < run_length; offset++) {
-            rows.push(run[offset] ?? []);
-        }
-        display_row += run_length;
-    }
-    return { startRow: start, rows };
+    const source_rows = indices.subarray(start, end);
+    return {
+        startRow: start,
+        rows: read_source_rows_indexed(source, sheet_index, source_rows).rows,
+    };
 }
 
 function needed_columns(
