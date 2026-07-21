@@ -646,6 +646,7 @@ function parse_sheet_working(
                 const raw = get_raw_numeric_cell_value(value, xf_index, xfs, format_map, datemode);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
+                    rawType: typeof raw === 'string' ? 'date' : undefined,
                     bold: style.bold, italic: style.italic,
                 });
                 break;
@@ -666,6 +667,7 @@ function parse_sheet_working(
                 const raw = get_raw_numeric_cell_value(value, xf_index, xfs, format_map, datemode);
                 cells.set(`${row}:${col}`, {
                     raw, formatted,
+                    rawType: typeof raw === 'string' ? 'date' : undefined,
                     bold: style.bold, italic: style.italic,
                 });
                 break;
@@ -687,6 +689,7 @@ function parse_sheet_working(
                     const raw = get_raw_numeric_cell_value(value, xf_index, xfs, format_map, datemode);
                     cells.set(`${row}:${c}`, {
                         raw, formatted,
+                        rawType: typeof raw === 'string' ? 'date' : undefined,
                         bold: style.bold, italic: style.italic,
                     });
                     pos += 6;
@@ -807,7 +810,13 @@ function parse_sheet_working(
                     const value = buf.readDoubleLE(6);
                     const formatted = format_value(value, xf_index, xfs, format_map, datemode);
                     const raw = get_raw_numeric_cell_value(value, xf_index, xfs, format_map, datemode);
-                    cells.set(key, { raw, formatted, bold: style.bold, italic: style.italic });
+                    cells.set(key, {
+                        raw,
+                        formatted,
+                        rawType: typeof raw === 'string' ? 'date' : undefined,
+                        bold: style.bold,
+                        italic: style.italic,
+                    });
                 }
                 break;
             }

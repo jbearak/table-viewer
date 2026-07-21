@@ -19,6 +19,7 @@ export interface ColumnVisibilityFocusHandle {
 export interface ColumnVisibilityControlProps {
     column_count: number;
     get_column_name: (source_index: number) => string;
+    duplicate_names: ReadonlySet<string>;
     is_visible: (source_index: number) => boolean;
     hidden_count: number;
     reset_key: string;
@@ -40,6 +41,7 @@ export const ColumnVisibilityControl = forwardRef<
 >(function ColumnVisibilityControl({
     column_count,
     get_column_name,
+    duplicate_names,
     is_visible,
     hidden_count,
     reset_key,
@@ -299,10 +301,12 @@ export const ColumnVisibilityControl = forwardRef<
                             const primary = option.display_name.length > 0
                                 ? option.display_name
                                 : '(blank)';
-                            const source_description = `Column ${option.source_letter} · source ${option.source_index + 1}`;
+                            const suffix = duplicate_names.has(primary)
+                                ? ` (column ${option.source_letter})`
+                                : '';
                             const accessible_name = primary === '(blank)'
-                                ? 'blank column'
-                                : primary;
+                                ? `blank column${suffix}`
+                                : `${primary}${suffix}`;
                             return (
                                 <label
                                     key={option.source_index}
@@ -311,14 +315,11 @@ export const ColumnVisibilityControl = forwardRef<
                                     <input
                                         type="checkbox"
                                         checked={visible}
-                                        aria-label={`${visible ? 'Hide' : 'Show'} ${accessible_name}; ${source_description}`}
+                                        aria-label={`${visible ? 'Hide' : 'Show'} ${accessible_name}`}
                                         onChange={() => on_toggle(option.source_index)}
                                     />
                                     <span className="column-visibility-name">
-                                        {primary}
-                                    </span>
-                                    <span className="column-visibility-source">
-                                        {source_description}
+                                        {primary}{suffix}
                                     </span>
                                 </label>
                             );

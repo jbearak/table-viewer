@@ -37,6 +37,14 @@ export interface ToolbarProps {
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
+    show_excel_header_button: boolean;
+    excel_header_active: boolean;
+    excel_header_automatic: boolean;
+    excel_header_pending: boolean;
+    excel_header_status?: string;
+    on_toggle_excel_header: () => void;
+    excel_header_disabled?: boolean;
+    excel_header_disabled_reason?: string;
     vertical_tabs: boolean;
     on_toggle_tab_orientation: () => void;
     show_vertical_tabs_button: boolean;
@@ -94,6 +102,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             props.merges_flattened,
             props.column_visibility.hidden_count,
             props.show_formatting_button,
+            props.show_excel_header_button,
+            props.excel_header_active,
+            props.excel_header_disabled,
             props.show_vertical_tabs_button,
             props.show_edit_button,
         ],
@@ -109,6 +120,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             aria-label="Table controls"
         >
             <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
+            <span className="sr-only" role="status" aria-live="polite">
+                {props.excel_header_status ?? ''}
+            </span>
             <div ref={chips_ref} className="toolbar-chips">
                 <SortStrip
                     state={transform}
@@ -155,6 +169,23 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                             ? 'Show raw cell values.'
                             : 'Show formatted cell values.'}
                         onClick={props.on_toggle_formatting}
+                    />
+                )}
+                {props.show_excel_header_button && (
+                    <ToolbarButton
+                        label="First Row as Header"
+                        active={props.excel_header_active}
+                        tooltip_text={props.excel_header_disabled
+                            ? (props.excel_header_disabled_reason
+                                ?? 'First-row headers are unavailable.')
+                            : props.excel_header_active
+                            ? props.excel_header_automatic
+                                ? 'Automatically using the first row as column names. Click to show it as data.'
+                                : 'Show the first row as data.'
+                            : 'Use the first row as column names.'}
+                        onClick={props.on_toggle_excel_header}
+                        disabled={props.excel_header_disabled}
+                        focusable_when_disabled
                     />
                 )}
                 {props.show_vertical_tabs_button && (
@@ -208,6 +239,7 @@ function ToolbarButton({
     onClick,
     extra_class,
     disabled = false,
+    focusable_when_disabled = false,
 }: {
     label: string;
     active: boolean;
@@ -215,6 +247,7 @@ function ToolbarButton({
     onClick: () => void;
     extra_class?: string;
     disabled?: boolean;
+    focusable_when_disabled?: boolean;
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
@@ -223,6 +256,7 @@ function ToolbarButton({
     const button_ref = useRef<HTMLButtonElement>(null);
     const tooltip_ref = useRef<HTMLDivElement>(null);
     const show_tooltip = is_hovered || is_focused;
+    const native_disabled = disabled && !focusable_when_disabled;
 
     useLayoutEffect(() => {
         if (!show_tooltip) return set_tooltip_style(undefined);
@@ -263,11 +297,11 @@ function ToolbarButton({
     return (
         <div
             className="toolbar-item"
-            tabIndex={disabled ? 0 : undefined}
-            role={disabled ? 'group' : undefined}
-            aria-label={disabled ? label : undefined}
-            aria-disabled={disabled || undefined}
-            aria-describedby={disabled && show_tooltip ? tooltip_id : undefined}
+            tabIndex={native_disabled ? 0 : undefined}
+            role={native_disabled ? 'group' : undefined}
+            aria-label={native_disabled ? label : undefined}
+            aria-disabled={native_disabled || undefined}
+            aria-describedby={native_disabled && show_tooltip ? tooltip_id : undefined}
             onMouseEnter={() => set_is_hovered(true)}
             onMouseLeave={() => set_is_hovered(false)}
             onFocus={() => set_is_focused(true)}
@@ -277,13 +311,16 @@ function ToolbarButton({
                 ref={button_ref}
                 type="button"
                 className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
-                disabled={disabled}
+                disabled={native_disabled}
+                aria-disabled={disabled || undefined}
                 onClick={(event) => {
+                    if (disabled) return;
                     set_is_hovered(false);
-                    if (event.nativeEvent instanceof PointerEvent) button_ref.current?.blur();
+                    if (event.detail > 0) button_ref.current?.blur();
                     onClick();
                 }}
-                aria-describedby={!disabled && show_tooltip ? tooltip_id : undefined}
+                aria-describedby={!native_disabled && show_tooltip ? tooltip_id : undefined}
+                aria-pressed={active}
             >
                 {label}
             </button>

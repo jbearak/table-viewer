@@ -4,6 +4,8 @@
  * folding rule is unit-tested without Glide or the DOM.
  */
 
+import type { CsvDirtyEntry, CsvDirtyMap } from '../types';
+
 /** A still-open editor's live value and the cell's persisted (original) text. */
 export interface LiveEdit {
     /** `"row:col"`. */
@@ -30,4 +32,26 @@ export function collect_save_edits(
         else delete edits[live.key];
     }
     return edits;
+}
+
+/** Freeze the complete dirty map, folding in the open overlay with its base. */
+export function collect_exact_dirty_edits(
+    dirty: ReadonlyMap<string, CsvDirtyEntry & { base_pending?: boolean }>,
+    live: LiveEdit | null,
+): CsvDirtyMap | undefined {
+    const entries: Record<string, CsvDirtyEntry> = {};
+    for (const [key, entry] of dirty) {
+        if (entry.base_pending) return undefined;
+        entries[key] = { value: entry.value, base: entry.base };
+    }
+    if (live) {
+        if (live.value !== live.original) {
+            entries[live.key] = { value: live.value, base: live.original };
+        } else {
+            delete entries[live.key];
+        }
+    }
+    return Object.freeze(Object.fromEntries(
+        Object.entries(entries).map(([key, entry]) => [key, Object.freeze(entry)]),
+    ));
 }

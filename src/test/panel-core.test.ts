@@ -55,26 +55,43 @@ function deferred<T = void>() {
     return { promise, resolve };
 }
 
-const ENVELOPE = { state: {}, defaultTabOrientation: 'horizontal' as const };
-
 describe('ViewerPanelCore', () => {
-    it('send_meta posts sheetMeta with the workbook meta and current generation', async () => {
+    it('starts at generation 1/sourceGeneration 1 without posting metadata', () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource());
-        await core.send_meta(ENVELOPE);
-        expect(posted[0].type).toBe('sheetMeta');
-        expect(posted[0].meta.sheets[0].rowCount).toBe(100);
-        expect(posted[0].generation).toBe(core.generation);
-        expect(posted[0].defaultTabOrientation).toBe('horizontal');
+        expect(core.generation).toBe(1);
+        expect(core.source_generation).toBe(1);
+        expect(posted).toHaveLength(0);
+        expect('send_meta' in core).toBe(false);
+        expect('send_meta_reload' in core).toBe(false);
+        expect('send_meta_recovery' in core).toBe(false);
     });
 
-    it('send_meta surfaces the source truncationMessage by default', async () => {
-        const { panel, posted } = make_panel();
-        const src = new StubSource();
-        src.truncationMessage = 'Showing 2 of 4 rows';
+    it('snapshot_material clones and freezes source metadata and diagnostics', () => {
+        const { panel } = make_panel();
+        const src = new StubSource(4);
+        src.truncationMessage = 'Showing 4 rows';
         const core = new ViewerPanelCore(panel, src);
-        await core.send_meta(ENVELOPE);
-        expect(posted[0].truncationMessage).toBe('Showing 2 of 4 rows');
+
+        const material = core.snapshot_material();
+        src.rowCount = 9;
+        src.truncationMessage = 'Changed later';
+
+        expect(material).toEqual({
+            core: {
+                generation: 1,
+                sourceGeneration: 1,
+                meta: {
+                    hasFormatting: false,
+                    sheets: [expect.objectContaining({ rowCount: 4 })],
+                },
+            },
+            diagnostics: { truncationMessage: 'Showing 4 rows' },
+        });
+        expect(Object.isFrozen(material)).toBe(true);
+        expect(Object.isFrozen(material.core.meta)).toBe(true);
+        expect(Object.isFrozen(material.core.meta.sheets)).toBe(true);
+        expect(Object.isFrozen(material.core.meta.sheets[0])).toBe(true);
     });
 
     it('answers requestRows with rowData carrying the same requestId and window', async () => {
@@ -96,7 +113,7 @@ describe('ViewerPanelCore', () => {
         const src = new StubSource();
         const core = new ViewerPanelCore(panel, src);
         const stale_generation = core.generation;
-        await core.send_meta_reload();
+        core.adopt_source(new StubSource());
         await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'old', generation: stale_generation });
         expect(posted.find((m) => m.type === 'rowData')).toBeUndefined();
         expect(src.read_rows_calls).toBe(0);
@@ -112,23 +129,51 @@ describe('ViewerPanelCore', () => {
         expect(src.read_rows_calls).toBe(1);
     });
 
-    it('send_meta_reload bumps generation, clears cache, and posts metaReload', async () => {
-        const { panel, posted } = make_panel();
+    it('physical replacement advances both generations and clears cache exactly once', async () => {
+        const { panel } = make_panel();
+        const previous = new StubSource();
+        const next = new StubSource();
+        const core = new ViewerPanelCore(panel, previous);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'before', generation: core.generation,
+        });
+
+        const result = adopt_source_into_core(core, panel, previous, next);
+        expect(result.type).toBe('adopted');
+        expect(core.generation).toBe(2);
+        expect(core.source_generation).toBe(2);
+        expect(core.generation).toBe(2);
+        expect(core.source_generation).toBe(2);
+
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'after', generation: core.generation,
+        });
+        expect(previous.read_rows_calls).toBe(1);
+        expect(next.read_rows_calls).toBe(1);
+    });
+
+    it('invalidates source and view generations when the same mutable source is reused', async () => {
+        const { panel } = make_panel();
         const src = new StubSource();
         const core = new ViewerPanelCore(panel, src);
-        // Prime the cache.
-        await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'a', generation: core.generation });
-        expect(src.read_rows_calls).toBe(1);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'before', generation: core.generation,
+        });
+        const view_generation = core.generation;
+        const source_generation = core.source_generation;
 
-        const g0 = core.generation;
-        await core.send_meta_reload();
-        expect(core.generation).toBe(g0 + 1);
-        const last = posted[posted.length - 1];
-        expect(last.type).toBe('metaReload');
-        expect(last.generation).toBe(g0 + 1);
+        const adopted = adopt_source_into_core(core, panel, src, src);
+        expect(adopted.type).toBe('adopted');
 
-        // Same window, new generation: cache was cleared, so read_rows runs again.
-        await core.handle_message({ type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5, requestId: 'c', generation: core.generation });
+        expect(core.source_generation).toBe(source_generation + 1);
+        expect(core.generation).toBe(view_generation + 1);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 5,
+            requestId: 'after', generation: core.generation,
+        });
         expect(src.read_rows_calls).toBe(2);
     });
 
@@ -225,8 +270,7 @@ describe('ViewerPanelCore', () => {
         const core = new ViewerPanelCore(panel, new StubSource(5));
         const stale_generation = core.generation;
         const stale_source_generation = core.source_generation;
-        core.set_source(new StubSource(5));
-        await core.send_meta_reload();
+        core.adopt_source(new StubSource(5));
 
         await core.handle_message({
             type: 'setTransform',
@@ -333,6 +377,132 @@ describe('ViewerPanelCore', () => {
             .toBe(false);
     });
 
+    it('cancels receiver-owned transform compute synchronously on a new epoch', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const work = core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'old-receiver',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        // compute_transform has reached its first cooperative checkpoint.
+        core.begin_receiver_epoch(2);
+        await work;
+
+        expect(core.generation).toBe(1);
+        expect(core.has_transform_work).toBe(false);
+        expect(posted.some((message) => message.type === 'transformApplied'))
+            .toBe(false);
+    });
+
+    it('installs a committed transform after receiver turnover without delivering its terminal', async () => {
+        const { panel, posted } = make_panel();
+        const commit_started = deferred();
+        const release_commit = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'old-receiver') {
+                    commit_started.resolve();
+                    await release_commit.promise;
+                }
+            },
+        });
+        core.begin_receiver_epoch(1);
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'installed',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        const installed_generation = core.generation;
+        posted.length = 0;
+
+        const old_work = core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'old-receiver',
+            generation: installed_generation, sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+        await commit_started.promise;
+        core.begin_receiver_epoch(2);
+        release_commit.resolve();
+        await old_work;
+
+        expect(core.generation).toBe(installed_generation + 1);
+        expect(posted.some((message) => message.type === 'transformApplied'))
+            .toBe(false);
+        await core.handle_message({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 2,
+            requestId: 'committed', generation: installed_generation + 1,
+        });
+        const rows = posted.find((message) => message.type === 'rowData');
+        expect(rows.rows.map((row: RenderedCell[]) => row[0].raw)).toEqual(['0', '1']);
+    });
+
+    it('does not let old receiver cleanup clear newer same-sheet work', async () => {
+        const { panel } = make_panel();
+        const a_started = deferred();
+        const a_gate = deferred();
+        const b_started = deferred();
+        const b_gate = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'A') {
+                    a_started.resolve();
+                    await a_gate.promise;
+                } else if (message.requestId === 'B') {
+                    b_started.resolve();
+                    await b_gate.promise;
+                }
+            },
+        });
+        core.begin_receiver_epoch(1);
+        const request = (requestId: string, direction: 'asc' | 'desc') => ({
+            type: 'setTransform' as const,
+            sheetIndex: 0,
+            requestId,
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user' as const,
+            state: {
+                sort: [{ colIndex: 0, direction }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            },
+        });
+
+        const a = core.handle_message(request('A', 'desc'));
+        await a_started.promise;
+        core.begin_receiver_epoch(2);
+        const b = core.handle_message(request('B', 'asc'));
+        await b_started.promise;
+
+        a_gate.resolve();
+        await a;
+        expect(core.has_transform_work).toBe(true);
+
+        b_gate.resolve();
+        await b;
+        expect(core.has_transform_work).toBe(true);
+        expect(core.generation).toBe(2);
+    });
+
     it('terminally acknowledges an unrelated AbortError from the source', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new UnrelatedAbortErrorSource(5));
@@ -358,6 +528,83 @@ describe('ViewerPanelCore', () => {
         expect(core.has_transform_work).toBe(false);
     });
 
+    it('prepares ready reconciliation without mutating the installed view', async () => {
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const prepared = await core.prepare_transform_reconciliation([{
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        }], () => false);
+
+        expect(prepared).toBeDefined();
+        expect(core.generation).toBe(1);
+        expect(core.has_active_transform).toBe(false);
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(true);
+        expect(core.generation).toBe(2);
+        expect(core.has_active_transform).toBe(true);
+    });
+
+    it('rejects a prepared reconciliation after source adoption', async () => {
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        core.begin_receiver_epoch(1);
+        const prepared = await core.prepare_transform_reconciliation([{
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        }], () => false);
+        expect(prepared).toBeDefined();
+
+        core.adopt_source(new StubSource(5));
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(false);
+        expect(core.has_active_transform).toBe(false);
+        expect(core.generation).toBe(2);
+    });
+
+    it('refuses source installation on a disposed core without closing either source', () => {
+        const { panel } = make_panel();
+        const previous = new CloseAwareSource();
+        const next = new CloseAwareSource();
+        const core = new ViewerPanelCore(panel, previous);
+        core.dispose();
+        const generation = core.generation;
+        const source_generation = core.source_generation;
+
+        const result = adopt_source_into_core(core, panel, previous, next);
+
+        expect(result).toEqual({ type: 'refused' });
+        expect(core.generation).toBe(generation);
+        expect(core.source_generation).toBe(source_generation);
+        expect(previous.closed).toBe(false);
+        expect(next.closed).toBe(false);
+    });
+
+    it('confirms installation before a throwing old-source close', async () => {
+        const { panel, posted } = make_panel();
+        const previous = new CloseAwareSource();
+        previous.close = () => { throw new Error('close failed'); };
+        const next = new StubSource(5);
+        const core = new ViewerPanelCore(panel, previous);
+        let installed: ViewerPanelCore | undefined;
+
+        expect(() => adopt_source_into_core(
+            core,
+            panel,
+            previous,
+            next,
+            undefined,
+            (accepted) => { installed = accepted; },
+        )).toThrow('close failed');
+
+        expect(installed).toBe(core);
+        expect(core.generation).toBe(2);
+        expect(core.source_generation).toBe(2);
+        expect(core.snapshot_material().core.meta.sheets[0].rowCount).toBe(5);
+        expect(posted).toHaveLength(0);
+    });
+
     it('cancels source work before closing a replaced source', async () => {
         const { panel, posted } = make_panel();
         const previous = new CloseAwareSource(2_001);
@@ -379,6 +626,12 @@ describe('ViewerPanelCore', () => {
             await new Promise<void>((resolve) => setImmediate(resolve));
         }
         expect(previous.read_rows_calls).toBe(1);
+        previous.close = () => {
+            expect(core.has_transform_work).toBe(false);
+            expect(core.generation).toBe(2);
+            expect(core.source_generation).toBe(2);
+            previous.closed = true;
+        };
 
         adopt_source_into_core(
             core,

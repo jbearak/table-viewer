@@ -11,6 +11,9 @@ import {
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    type CsvDirtyMap,
+    type CsvSaveLifecycle,
+    type CsvSaveOperation,
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
@@ -19,6 +22,13 @@ import {
     type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import {
+    classify_snapshot,
+    normalize_complete_per_file_state,
+    normalize_workbook_snapshot_state,
+    type RetainedSnapshotCommandResult,
+    type WorkbookSnapshotIdentity,
+} from '../viewer-snapshot';
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import { transform_progress_label, upsert_filter } from './transform-ui-model';
@@ -32,10 +42,17 @@ import {
 } from './grid-shell';
 import {
     clamp_sheet_index,
-    normalize_per_file_state,
     trim_sheet_state_array,
     sanitize_transform_state,
 } from './sheet-state';
+import {
+    INITIAL_CSV_SAVE_PROJECTION,
+    csv_save_operations_equal,
+    propose_csv_save,
+    reduce_csv_save_projection,
+    resolve_csv_save_hydration,
+    type CsvSaveProjection,
+} from './csv-save-lifecycle';
 import { column_letter } from './grid-model';
 import {
     create_column_projection,
@@ -98,19 +115,12 @@ function transforms_semantically_equal(
         === JSON.stringify(semantic_filters(right.filters));
 }
 
-/**
- * Webview root (Phase C). Consumes the paginated `sheetMeta`/`metaReload`
- * protocol (structure only — cells stream in later via the row loader inside
- * {@link GridShell}) and mounts the Glide canvas grid keyed by sheet index so a
- * sheet switch remounts (and clears) the loader. Editing, selection, row
- * resize, and canvas-measured auto-fit are restored in Phases D/E; here the grid
- * is read-only plain text + bold/italic.
- */
+/** Webview root for snapshot metadata plus paginated row delivery. */
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
-    // Bumped on every `sheetMeta` (a fresh document load — including the preview
-    // pane reusing its panel for a different file). Folded into the GridShell key
+    // Bumped on every initial snapshot (a fresh document load — including the
+    // preview pane reusing its panel for a different file). Folded into the GridShell key
     // so the row loader remounts clean; a new file can otherwise collide with the
     // previous one's generation (both start at 1) and surface stale cached pages.
     const [load_epoch, set_load_epoch] = useState(0);
@@ -134,8 +144,23 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
-    const [edit_mode, set_edit_mode] = useState(false);
+    const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
+    const csv_edit_session_id_ref = useRef<string>();
+    const set_csv_edit_session_id = useCallback((next: string | undefined) => {
+        csv_edit_session_id_ref.current = next;
+        set_csv_edit_session_id_state(next);
+    }, []);
+    const [edit_mode, set_edit_mode_state] = useState(false);
+    const edit_mode_ref = useRef(false);
+    const set_edit_mode = useCallback((next: boolean) => {
+        edit_mode_ref.current = next;
+        set_edit_mode_state(next);
+    }, []);
     const [edit_session_pending, set_edit_session_pending] = useState(false);
+    const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
+    const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
+        INITIAL_CSV_SAVE_PROJECTION.authoritative,
+    );
     const [transforms, set_transforms] = useState<
         (SheetTransformState | undefined)[]
     >([]);
@@ -145,6 +170,8 @@ export function App(): React.JSX.Element {
     const [effective_row_counts, set_effective_row_counts] = useState<number[]>([]);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
+    const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
+    const [excel_header_status, set_excel_header_status] = useState('');
     const [filter_editor, set_filter_editor] = useState<{
         column_index: number;
         anchor: { left: number; top: number };
@@ -185,18 +212,51 @@ export function App(): React.JSX.Element {
     // True between posting a save (from the exit dialog) and its saveResult, so a
     // successful save then completes the deferred exit from edit mode.
     const pending_exit_ref = useRef(false);
-    const pending_exit_save_succeeded_ref = useRef(false);
     const auto_fit_active_ref = useRef<boolean[]>([]);
     const auto_fit_snapshot_ref = useRef<
         (Record<number, number> | undefined)[]
     >([]);
     const transform_request_seq_ref = useRef(0);
+    const transform_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const edit_request_seq_ref = useRef(0);
+    const edit_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const save_request_seq_ref = useRef(0);
+    const save_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const dialog_request_seq_ref = useRef(0);
+    const excel_header_request_seq_ref = useRef(0);
+    const excel_header_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const pending_excel_header_ref = useRef<string | null>(null);
+    const pending_edit_request_ref = useRef<string | null>(null);
+    const pending_save_dialog_ref = useRef<{
+        requestId: string;
+        editSessionId: string;
+    } | null>(null);
+    const save_projection_ref = useRef<CsvSaveProjection>(
+        INITIAL_CSV_SAVE_PROJECTION,
+    );
+    const latest_live_edits_ref = useRef<PerFileState['pendingEdits']>(undefined);
+    const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    const snapshot_identity_ref = useRef<WorkbookSnapshotIdentity | null>(null);
+    const last_applied_snapshot_ref = useRef<WorkbookSnapshotIdentity | null>(null);
+    const processed_snapshot_results_ref = useRef(new Set<string>());
     const document_epoch_ref = useRef(0);
     const preview_mode_ref = useRef(false);
     const preview_scroll_sequence_ref = useRef(0);
@@ -206,7 +266,11 @@ export function App(): React.JSX.Element {
     const grid_focus_ref = useRef<GridFocusHandle | null>(null);
     const toolbar_focus_ref = useRef<ToolbarFocusHandle | null>(null);
 
-    const { persist_immediate } = use_state_sync(state_ref);
+    const { persist_immediate } = use_state_sync(
+        state_ref,
+        source_generation_ref,
+        snapshot_identity_ref,
+    );
 
     const request_transform = useCallback((
         sheet_index: number,
@@ -214,7 +278,12 @@ export function App(): React.JSX.Element {
         intent: TransformIntent,
         origin: TransformOrigin = 'toolbar',
     ) => {
-        const request_id = `${sheet_index}:${++transform_request_seq_ref.current}`;
+        const request_id = [
+            'transform',
+            transform_request_prefix_ref.current,
+            sheet_index,
+            ++transform_request_seq_ref.current,
+        ].join(':');
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
@@ -244,8 +313,13 @@ export function App(): React.JSX.Element {
     }, []);
 
     const release_edit_session = useCallback(() => {
-        vscode_api.postMessage({ type: 'releaseEditSession' });
-    }, []);
+        if (!csv_edit_session_id) return;
+        pending_save_dialog_ref.current = null;
+        vscode_api.postMessage({
+            type: 'releaseEditSession',
+            editSessionId: csv_edit_session_id,
+        });
+    }, [csv_edit_session_id]);
 
     const leave_edit_mode = useCallback(() => {
         set_edit_mode(false);
@@ -253,9 +327,112 @@ export function App(): React.JSX.Element {
     }, [release_edit_session]);
 
     const discard_edit_session = useCallback(() => {
+        if (!csv_edit_session_id) return;
+        pending_save_dialog_ref.current = null;
         set_edit_mode(false);
-        vscode_api.postMessage({ type: 'discardEditSession' });
+        vscode_api.postMessage({
+            type: 'discardEditSession',
+            editSessionId: csv_edit_session_id,
+        });
+    }, [csv_edit_session_id]);
+
+    const begin_save_operation = useCallback((
+        edits: Record<string, string>,
+        dirty_edits: CsvDirtyMap,
+    ): CsvSaveOperation | undefined => {
+        if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        const operation = Object.freeze<CsvSaveOperation>({
+            editSessionId: csv_edit_session_id,
+            saveRequestId: [
+                'save',
+                save_request_prefix_ref.current,
+                ++save_request_seq_ref.current,
+            ].join(':'),
+            edits: Object.freeze({ ...edits }),
+            dirtyEdits: Object.freeze(Object.fromEntries(
+                Object.entries(dirty_edits).map(([key, entry]) => [
+                    key,
+                    Object.freeze({ value: entry.value, base: entry.base }),
+                ]),
+            )),
+        });
+        const projection = propose_csv_save(save_projection_ref.current, operation);
+        save_projection_ref.current = projection;
+        set_save_operation(operation);
+        return operation;
+    }, [csv_edit_session_id]);
+
+    const reset_save_projection = useCallback(() => {
+        save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
+        set_save_lifecycle(INITIAL_CSV_SAVE_PROJECTION.authoritative);
+        set_save_operation(undefined);
     }, []);
+
+    const apply_save_lifecycle = useCallback((incoming: CsvSaveLifecycle) => {
+        const previous = save_projection_ref.current;
+        const next = reduce_csv_save_projection(previous, incoming);
+        if (next === previous) return { previous, next, changed: false };
+        save_projection_ref.current = next;
+        set_save_lifecycle(next.authoritative);
+        set_save_operation(next.operation);
+
+        const current_session_id = csv_edit_session_id_ref.current;
+        if (incoming.state === 'active') {
+            if (
+                incoming.operation.editSessionId === current_session_id
+                && csv_save_operations_equal(next.operation, incoming.operation)
+            ) {
+                const hydrated = resolve_csv_save_hydration(
+                    next,
+                    current_session_id,
+                    latest_live_edits_ref.current,
+                );
+                latest_live_edits_ref.current = hydrated;
+                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+            }
+        } else if (incoming.state === 'idle') {
+            if (
+                previous.operation
+                && !next.operation
+                && previous.operation.editSessionId === current_session_id
+            ) {
+                latest_live_edits_ref.current = previous.operation.dirtyEdits;
+                set_initial_edits({ ...previous.operation.dirtyEdits });
+                pending_exit_ref.current = false;
+            }
+        } else if (
+            !previous.operation
+            || csv_save_operations_equal(previous.operation, incoming.operation)
+        ) {
+            if (incoming.state === 'failed') {
+                if (incoming.operation.editSessionId === current_session_id) {
+                    const hydrated = resolve_csv_save_hydration(
+                        next,
+                        current_session_id,
+                        latest_live_edits_ref.current,
+                    );
+                    latest_live_edits_ref.current = hydrated;
+                    set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                    pending_exit_ref.current = false;
+                }
+            } else if (
+                current_session_id === undefined
+                || incoming.operation.editSessionId === current_session_id
+            ) {
+                const hydrated = resolve_csv_save_hydration(
+                    next,
+                    current_session_id,
+                    latest_live_edits_ref.current,
+                );
+                latest_live_edits_ref.current = hydrated;
+                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                set_csv_edit_session_id(undefined);
+                set_edit_session_pending(false);
+                set_edit_mode(false);
+            }
+        }
+        return { previous, next, changed: true };
+    }, [set_csv_edit_session_id, set_edit_mode]);
 
     useEffect(() => {
         auto_fit_active_ref.current = auto_fit_active;
@@ -291,179 +468,322 @@ export function App(): React.JSX.Element {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
-            if (msg.type === 'sheetMeta') {
-                document_epoch_ref.current += 1;
-                set_grid_focus_restore(null);
-                set_toolbar_focus_restore(null);
-                last_preview_visible_row_ref.current = null;
-                clear_pending_preview_scroll();
-                preview_mode_ref.current = msg.previewMode ?? false;
-                set_meta(msg.meta);
-                set_filter_editor(null);
-                set_generation(msg.generation);
-                generation_ref.current = msg.generation;
-                source_generation_ref.current = msg.sourceGeneration;
-                set_load_epoch((n) => n + 1);
-                set_source_epoch((n) => n + 1);
-                auto_fit_active_ref.current = [];
-                auto_fit_snapshot_ref.current = [];
-                set_auto_fit_active([]);
-                set_auto_fit_snapshot([]);
-                const s = normalize_per_file_state(
-                    msg.state,
-                    msg.meta.sheets.map((sheet) => sheet.name)
-                );
-                const normalized_transforms = s.transforms;
-                s.transforms = msg.meta.sheets.map((sheet, index) =>
-                    sanitize_transform_state(
-                        normalized_transforms?.[index],
-                        sheet.columnCount,
-                        transform_schema_for_sheet(sheet),
-                    ));
-                const transforms_were_sanitized =
-                    JSON.stringify(normalized_transforms ?? [])
-                    !== JSON.stringify(s.transforms);
-                const normalized_visibility = s.columnVisibility;
-                s.columnVisibility = msg.meta.sheets.map((sheet, index) =>
-                    sanitize_column_visibility_state(
-                        normalized_visibility?.[index],
-                        sheet.columnCount,
-                        transform_schema_for_sheet(sheet),
-                    ));
-                const visibility_was_sanitized =
-                    JSON.stringify(normalized_visibility ?? [])
-                    !== JSON.stringify(s.columnVisibility);
-                set_active_sheet_index(s.activeSheetIndex ?? 0);
-                set_column_widths(s.columnWidths ?? []);
-                set_column_visibility(s.columnVisibility ?? []);
-                set_row_heights(s.rowHeights ?? []);
-                set_transforms(s.transforms ?? []);
-                set_applied_transforms((s.transforms ?? []).map((state) => (
-                    state && !transform_is_active(state) ? state : undefined
-                )));
-                set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
-                set_pending_transforms([]);
-                set_pending_transform_labels([]);
-                pending_transform_request_ids_ref.current = [];
-                pending_transform_states_ref.current = [];
-                pending_transform_origins_ref.current = [];
-                transform_applied_for_source_ref.current = [];
-
-                const tab_orient = s.tabOrientation ?? null;
-                set_vertical_tabs(
-                    tab_orient !== null
-                        ? tab_orient === 'vertical'
-                        : msg.defaultTabOrientation === 'vertical'
-                );
-                state_ref.current = s;
-                if (transforms_were_sanitized || visibility_was_sanitized) {
-                    persist_immediate();
-                }
-                set_truncation_message(msg.truncationMessage ?? null);
-                set_preview_mode(msg.previewMode ?? false);
-                const can_edit = msg.csvEditable ?? false;
-                set_csv_editable(can_edit);
-                set_csv_editing_supported(msg.csvEditingSupported ?? false);
-                // A fresh document is read-only unless it carries restored pending
-                // edits, in which case we re-enter edit mode and feed them to the
-                // GridShell (which remounts via its key, reading initial_edits once).
-                const restored_edits = s.pendingEdits;
-                set_initial_edits(restored_edits);
-                set_edit_mode(!!restored_edits && can_edit);
-                set_edit_session_pending(false);
-                set_editing_status(null);
-                set_dismissed_conflict_signature(null);
-                pending_exit_ref.current = false;
-                pending_exit_save_succeeded_ref.current = false;
+            if (msg.type === 'saveOperationStarted') {
+                apply_save_lifecycle(msg.lifecycle);
             }
 
-            if (msg.type === 'metaReload') {
-                document_epoch_ref.current += 1;
-                set_grid_focus_restore(null);
-                set_toolbar_focus_restore(null);
-                if (
-                    preview_mode_ref.current
-                    && pending_preview_scroll_ref.current === null
-                    && last_preview_visible_row_ref.current !== null
-                ) {
-                    queue_preview_scroll(last_preview_visible_row_ref.current);
+            if (msg.type === 'workbookSnapshot') {
+                const { snapshot } = msg;
+                const previous_native_identity = last_applied_snapshot_ref.current;
+                const cross_file_initial = snapshot.presentation === 'initial'
+                    && previous_native_identity !== null
+                    && previous_native_identity.authority.fileId
+                        !== snapshot.identity.authority.fileId;
+                const disposition = classify_snapshot(
+                    snapshot.identity,
+                    last_applied_snapshot_ref.current,
+                );
+                if (cross_file_initial && disposition === 'applied') {
+                    reset_save_projection();
+                    pending_excel_header_ref.current = null;
+                    set_pending_excel_header(null);
+                    set_excel_header_status('');
                 }
-                set_meta(msg.meta);
-                set_filter_editor(null);
-                set_generation(msg.generation);
-                generation_ref.current = msg.generation;
-                source_generation_ref.current = msg.sourceGeneration;
-                set_edit_session_pending(false);
-                set_source_epoch((n) => n + 1);
-                auto_fit_active_ref.current = [];
-                auto_fit_snapshot_ref.current = [];
-                set_auto_fit_active([]);
-                set_auto_fit_snapshot([]);
-                const sheet_count = msg.meta.sheets.length;
-
-                set_column_widths((prev) =>
-                    trim_sheet_state_array(prev, sheet_count)
-                );
-                set_row_heights((prev) =>
-                    trim_sheet_state_array(prev, sheet_count)
-                );
-                set_effective_row_counts(msg.meta.sheets.map((sheet) => sheet.rowCount));
-                set_pending_transforms([]);
-                set_pending_transform_labels([]);
-                pending_transform_request_ids_ref.current = [];
-                pending_transform_states_ref.current = [];
-                pending_transform_origins_ref.current = [];
-                transform_applied_for_source_ref.current = [];
-                const next_transforms = msg.meta.sheets.map((sheet, index) =>
-                    sanitize_transform_state(
-                        state_ref.current.transforms?.[index],
-                        sheet.columnCount,
-                        transform_schema_for_sheet(sheet),
-                    ));
-                const next_column_visibility = msg.meta.sheets.map((sheet, index) =>
-                    sanitize_column_visibility_state(
-                        state_ref.current.columnVisibility?.[index],
-                        sheet.columnCount,
-                        transform_schema_for_sheet(sheet),
-                    ));
-                set_transforms(next_transforms);
-                set_column_visibility(next_column_visibility);
-                set_applied_transforms(next_transforms.map((state) => (
-                    state && !transform_is_active(state) ? state : undefined
-                )));
-
-                const next_active_sheet_index = clamp_sheet_index(
-                    active_sheet_index,
-                    sheet_count
-                );
-                set_active_sheet_index(next_active_sheet_index);
-
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: trim_sheet_state_array(
-                        state_ref.current.columnWidths,
-                        sheet_count
-                    ),
-                    rowHeights: trim_sheet_state_array(
-                        state_ref.current.rowHeights,
-                        sheet_count
-                    ),
-                    scrollPosition: trim_sheet_state_array(
-                        state_ref.current.scrollPosition,
-                        sheet_count
-                    ),
-                    transforms: next_transforms,
-                    columnVisibility: next_column_visibility,
-                    activeSheetIndex: next_active_sheet_index,
+                const same_file = previous_native_identity?.authority.fileId
+                    === snapshot.identity.authority.fileId;
+                // Save lifecycle authority has its own monotonic clock. A stale
+                // workbook projection from the current file may still carry the
+                // terminal save state that this receiver otherwise missed.
+                const save_transition = disposition === 'applied' || same_file
+                    ? apply_save_lifecycle(
+                        snapshot.capabilities.csvSaveLifecycle,
+                    )
+                    : undefined;
+                const process_command_result = (
+                    result: RetainedSnapshotCommandResult | undefined,
+                ) => {
+                    if (!result) return;
+                    const key = `${result.type}:${result.requestId}`;
+                    if (processed_snapshot_results_ref.current.has(key)) return;
+                    processed_snapshot_results_ref.current.add(key);
+                    while (processed_snapshot_results_ref.current.size > 128) {
+                        const oldest = processed_snapshot_results_ref.current.values().next().value;
+                        if (oldest === undefined) break;
+                        processed_snapshot_results_ref.current.delete(oldest);
+                    }
+                    if (
+                        result.type !== 'excelFirstRowHeader'
+                        || pending_excel_header_ref.current !== result.requestId
+                    ) return;
+                    pending_excel_header_ref.current = null;
+                    set_pending_excel_header(null);
+                    if (result.outcome === 'rejected') {
+                        set_excel_header_status('Column names were not updated.');
+                        if (result.error) {
+                            vscode_api.postMessage({
+                                type: 'showWarning',
+                                message: `Could not change the header row: ${result.error}`,
+                            });
+                        }
+                    } else if (result.outcome === 'recovered') {
+                        set_excel_header_status(
+                            'Column names were updated, but recovery was required.',
+                        );
+                        if (result.error) {
+                            vscode_api.postMessage({
+                                type: 'showWarning',
+                                message: `The header setting was saved after recovery: ${result.error}`,
+                            });
+                        }
+                    } else {
+                        set_excel_header_status('Column names updated.');
+                    }
                 };
-                set_truncation_message(msg.truncationMessage ?? null);
-                if (msg.csvEditable !== undefined) {
-                    set_csv_editable(msg.csvEditable);
+
+                // Retained results are independently idempotent: a duplicate or
+                // stale snapshot can still finish its matching command without
+                // rehydrating or regressing the UI.
+                process_command_result(snapshot.commandResult);
+
+                if (disposition === 'applied') {
+                    // Every applied snapshot is lifecycle-relevant, including the
+                    // first snapshot for a newly selected file.
+                    const applied_save_transition = save_transition!;
+                    last_applied_snapshot_ref.current = snapshot.identity;
+                    snapshot_identity_ref.current = snapshot.identity;
+                    const previous_sheets = new Map(
+                        (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
+                    );
+                    const header_changed = new Set<number>();
+                    snapshot.meta.sheets.forEach((sheet, index) => {
+                        const previous = previous_sheets.get(sheet.name);
+                        if (
+                            previous
+                            && previous.excelFirstRowHeader?.active
+                                !== sheet.excelFirstRowHeader?.active
+                        ) {
+                            header_changed.add(index);
+                        }
+                    });
+                    // Capture authoritative edits before generation/source updates
+                    // can remount the grid.
+                    const refresh_authoritative_state =
+                        snapshot.presentation === 'refresh'
+                            ? normalize_workbook_snapshot_state(
+                                snapshot.state,
+                                snapshot.meta,
+                            )
+                            : undefined;
+                    const snapshot_edit_session_id =
+                        snapshot.capabilities.csvEditSessionId;
+                    const refresh_editing_current_session =
+                        snapshot.presentation === 'refresh'
+                        && edit_mode_ref.current
+                        && csv_edit_session_id_ref.current === snapshot_edit_session_id;
+                    const refresh_edits = snapshot.presentation === 'refresh'
+                        ? resolve_csv_save_hydration(
+                            applied_save_transition.next,
+                            snapshot_edit_session_id,
+                            refresh_authoritative_state?.pendingEdits,
+                        )
+                        : undefined;
+                    if (refresh_editing_current_session) {
+                        latest_live_edits_ref.current = refresh_edits;
+                        set_initial_edits(refresh_edits);
+                    }
+                    document_epoch_ref.current += 1;
+                    set_grid_focus_restore(null);
+                    set_toolbar_focus_restore(null);
+                    if (snapshot.presentation === 'initial') {
+                        last_preview_visible_row_ref.current = null;
+                        clear_pending_preview_scroll();
+                    } else if (
+                        preview_mode_ref.current
+                        && pending_preview_scroll_ref.current === null
+                        && last_preview_visible_row_ref.current !== null
+                    ) {
+                        queue_preview_scroll(last_preview_visible_row_ref.current);
+                    }
+                    preview_mode_ref.current = snapshot.configuration.previewMode;
+                    set_preview_mode(snapshot.configuration.previewMode);
+                    meta_ref.current = snapshot.meta;
+                    set_meta(snapshot.meta);
+                    set_filter_editor(null);
+                    set_generation(snapshot.generation);
+                    generation_ref.current = snapshot.generation;
+                    source_generation_ref.current = snapshot.sourceGeneration;
+                    if (snapshot.presentation === 'initial') {
+                        set_edit_session_pending(false);
+                        pending_edit_request_ref.current = null;
+                        pending_save_dialog_ref.current = null;
+                    }
+                    set_source_epoch((n) => n + 1);
+                    auto_fit_active_ref.current = [];
+                    auto_fit_snapshot_ref.current = [];
+                    set_auto_fit_active([]);
+                    set_auto_fit_snapshot([]);
+                    set_pending_transforms([]);
+                    set_pending_transform_labels([]);
+                    pending_transform_request_ids_ref.current = [];
+                    pending_transform_states_ref.current = [];
+                    pending_transform_origins_ref.current = [];
+                    transform_applied_for_source_ref.current = [];
+
+                    let correction_required = false;
+                    if (snapshot.presentation === 'initial') {
+                        set_load_epoch((n) => n + 1);
+                        const normalized = normalize_workbook_snapshot_state(
+                            snapshot.state,
+                            snapshot.meta,
+                        );
+                        const base = normalize_complete_per_file_state(
+                            snapshot.state,
+                            snapshot.meta.sheets.map((sheet) => sheet.name),
+                        );
+                        correction_required = JSON.stringify({
+                            transforms: base.transforms ?? [],
+                            columnVisibility: base.columnVisibility ?? [],
+                        }) !== JSON.stringify({
+                            transforms: normalized.transforms,
+                            columnVisibility: normalized.columnVisibility,
+                        });
+                        set_active_sheet_index(normalized.activeSheetIndex);
+                        set_column_widths(normalized.columnWidths);
+                        set_column_visibility(normalized.columnVisibility);
+                        set_row_heights(normalized.rowHeights);
+                        set_transforms(normalized.transforms);
+                        set_applied_transforms(normalized.transforms.map((state) => (
+                            state && !transform_is_active(state) ? state : undefined
+                        )));
+                        set_effective_row_counts(
+                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
+                        );
+                        const tab_orient = normalized.tabOrientation;
+                        set_vertical_tabs(
+                            tab_orient !== null
+                                ? tab_orient === 'vertical'
+                                : snapshot.configuration.defaultTabOrientation === 'vertical',
+                        );
+                        state_ref.current = normalized;
+                        const restored_edits = resolve_csv_save_hydration(
+                            applied_save_transition.next,
+                            snapshot_edit_session_id,
+                            normalized.pendingEdits,
+                        );
+                        const exact_session_succeeded =
+                            applied_save_transition.next.authoritative.state === 'succeeded'
+                            && applied_save_transition.next.authoritative.operation.editSessionId
+                                === snapshot_edit_session_id;
+                        const owns_clean_or_dirty_session =
+                            snapshot_edit_session_id !== undefined
+                            && snapshot.capabilities.csvEditable
+                            && !exact_session_succeeded;
+                        const hydrated_edits = owns_clean_or_dirty_session
+                            ? restored_edits ?? {}
+                            : restored_edits;
+                        latest_live_edits_ref.current = hydrated_edits;
+                        set_initial_edits(hydrated_edits);
+                        set_edit_mode(
+                            owns_clean_or_dirty_session
+                            || restored_edits !== undefined,
+                        );
+                        set_editing_status(null);
+                        set_dismissed_conflict_signature(null);
+                        pending_exit_ref.current = false;
+                    } else {
+                        const sheet_count = snapshot.meta.sheets.length;
+                        const authoritative_state = refresh_authoritative_state!;
+                        const next_column_widths = trim_sheet_state_array(
+                            authoritative_state.columnWidths,
+                            sheet_count,
+                        );
+                        const next_row_heights = trim_sheet_state_array(
+                            authoritative_state.rowHeights,
+                            sheet_count,
+                        ).map((value, index) => (
+                            header_changed.has(index) ? undefined : value
+                        ));
+                        const next_scroll_position = trim_sheet_state_array(
+                            authoritative_state.scrollPosition,
+                            sheet_count,
+                        ).map((value, index) => (
+                            header_changed.has(index) ? undefined : value
+                        ));
+                        const next_transforms = snapshot.meta.sheets.map((sheet, index) =>
+                            sanitize_transform_state(
+                                authoritative_state.transforms[index],
+                                sheet.columnCount,
+                                transform_schema_for_sheet(sheet),
+                            ));
+                        const next_column_visibility = snapshot.meta.sheets.map(
+                            (sheet, index) => sanitize_column_visibility_state(
+                                authoritative_state.columnVisibility[index],
+                                sheet.columnCount,
+                                transform_schema_for_sheet(sheet),
+                            ),
+                        );
+                        const next_active_sheet_index = clamp_sheet_index(
+                            active_sheet_index,
+                            sheet_count,
+                        );
+                        correction_required = JSON.stringify({
+                            rowHeights: authoritative_state.rowHeights,
+                            scrollPosition: authoritative_state.scrollPosition,
+                            transforms: authoritative_state.transforms,
+                            columnVisibility: authoritative_state.columnVisibility,
+                        }) !== JSON.stringify({
+                            rowHeights: next_row_heights,
+                            scrollPosition: next_scroll_position,
+                            transforms: next_transforms,
+                            columnVisibility: next_column_visibility,
+                        });
+                        set_column_widths(next_column_widths);
+                        set_row_heights(next_row_heights);
+                        set_effective_row_counts(
+                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
+                        );
+                        set_transforms(next_transforms);
+                        set_column_visibility(next_column_visibility);
+                        set_applied_transforms(next_transforms.map((state) => (
+                            state && !transform_is_active(state) ? state : undefined
+                        )));
+                        set_active_sheet_index(next_active_sheet_index);
+                        state_ref.current = {
+                            ...state_ref.current,
+                            ...authoritative_state,
+                            columnWidths: next_column_widths,
+                            rowHeights: next_row_heights,
+                            scrollPosition: next_scroll_position,
+                            transforms: next_transforms,
+                            columnVisibility: next_column_visibility,
+                            activeSheetIndex: authoritative_state.activeSheetIndex,
+                            ...(refresh_editing_current_session
+                                ? { pendingEdits: refresh_edits }
+                                : {}),
+                        };
+                    }
+                    set_truncation_message(snapshot.truncationMessage);
+                    set_csv_editable(snapshot.capabilities.csvEditable);
+                    set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
+                    set_csv_editing_supported(
+                        snapshot.capabilities.csvEditingSupported,
+                    );
+
+                    // Acknowledge the exact delivered identity before an optional
+                    // corrective CAS write.
+                    vscode_api.postMessage({
+                        type: 'snapshotApplied',
+                        identity: snapshot.identity,
+                        disposition,
+                    });
+                    if (correction_required) persist_immediate();
+                } else {
+                    vscode_api.postMessage({
+                        type: 'snapshotApplied',
+                        identity: snapshot.identity,
+                        disposition,
+                    });
                 }
-                if (msg.csvEditingSupported !== undefined) {
-                    set_csv_editing_supported(msg.csvEditingSupported);
-                }
-                persist_immediate();
             }
 
             if (
@@ -559,9 +879,11 @@ export function App(): React.JSX.Element {
         return () => window.removeEventListener('message', handler);
     }, [
         active_sheet_index,
+        apply_save_lifecycle,
         clear_pending_preview_scroll,
         persist_immediate,
         queue_preview_scroll,
+        reset_save_projection,
     ]);
 
     useEffect(() => {
@@ -665,7 +987,7 @@ export function App(): React.JSX.Element {
     // host intentionally drops permutations on reload because matching schema
     // does not imply matching values.
     useEffect(() => {
-        if (!meta || preview_mode || edit_mode) return;
+        if (!meta || preview_mode || edit_mode || pending_excel_header !== null) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -687,6 +1009,7 @@ export function App(): React.JSX.Element {
         meta,
         preview_mode,
         edit_mode,
+        pending_excel_header,
         active_sheet_index,
         request_transform,
     ]);
@@ -710,6 +1033,29 @@ export function App(): React.JSX.Element {
         set_show_formatting((prev) => !prev);
     }, []);
 
+    const handle_toggle_excel_header = useCallback(() => {
+        const sheet = meta?.sheets[active_sheet_index];
+        const header = sheet?.excelFirstRowHeader;
+        if (!sheet || !header || pending_excel_header_ref.current) return;
+        const enabled = !header.active;
+        if (enabled && !header.available) return;
+        const request_id = `header:${excel_header_request_prefix_ref.current}:${
+            ++excel_header_request_seq_ref.current
+        }`;
+        pending_excel_header_ref.current = request_id;
+        set_pending_excel_header(request_id);
+        set_excel_header_status('Updating column names…');
+        vscode_api.postMessage({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: active_sheet_index,
+            sheetName: sheet.name,
+            enabled,
+            requestId: request_id,
+            generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+        });
+    }, [active_sheet_index, meta]);
+
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
             if (edit_session_pending) return;
@@ -724,13 +1070,32 @@ export function App(): React.JSX.Element {
                 return;
             }
             set_edit_session_pending(true);
-            vscode_api.postMessage({ type: 'requestEditSession' });
+            const request_id = [
+                'edit',
+                edit_request_prefix_ref.current,
+                ++edit_request_seq_ref.current,
+            ].join(':');
+            pending_edit_request_ref.current = request_id;
+            vscode_api.postMessage({
+                type: 'requestEditSession',
+                requestId: request_id,
+            });
             return;
         }
         // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
         // dialog (handled below); otherwise exit immediately.
         if (editing_ref.current?.has_uncommitted_changes()) {
-            vscode_api.postMessage({ type: 'showSaveDialog' });
+            if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
+            const request = {
+                requestId: [
+                    'dialog',
+                    edit_request_prefix_ref.current,
+                    ++dialog_request_seq_ref.current,
+                ].join(':'),
+                editSessionId: csv_edit_session_id,
+            };
+            pending_save_dialog_ref.current = request;
+            vscode_api.postMessage({ type: 'showSaveDialog', ...request });
             return;
         }
         leave_edit_mode();
@@ -741,11 +1106,17 @@ export function App(): React.JSX.Element {
         pending_transforms,
         edit_session_pending,
         active_sheet_index,
+        csv_edit_session_id,
     ]);
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            if (edit_mode || edit_session_pending || preview_mode) return false;
+            if (
+                edit_mode
+                || edit_session_pending
+                || preview_mode
+                || pending_excel_header_ref.current !== null
+            ) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -806,6 +1177,7 @@ export function App(): React.JSX.Element {
             edit_mode
             || edit_session_pending
             || preview_mode
+            || pending_excel_header_ref.current !== null
             || pending_transforms[active_sheet_index]
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
@@ -877,47 +1249,37 @@ export function App(): React.JSX.Element {
         request_transform,
     ]);
 
-    // React to the host's save-dialog choice (from the exit flow) and to the save
-    // outcome. GridShell separately clears the dirty map on a successful save; here
-    // we only complete a deferred exit from edit mode.
-    //
-    // Reset all pending-exit bookkeeping and leave edit mode. Called once a
-    // save-on-exit has succeeded and no uncommitted work remains. Refs and
-    // setters are stable, so this keeps one identity for the component's life.
-    const finish_pending_exit = useCallback(() => {
-        pending_exit_ref.current = false;
-        pending_exit_save_succeeded_ref.current = false;
-        leave_edit_mode();
-    }, [leave_edit_mode]);
-
-    // A deferred exit completes once the save acked and no uncommitted work (dirty
-    // map or open overlay) remains. Shared by the saveResult handler and the
-    // editing-status effect so the predicate can't drift between them.
-    const can_finish_pending_exit = useCallback(
-        () =>
-            pending_exit_ref.current &&
-            pending_exit_save_succeeded_ref.current &&
-            !(editing_ref.current?.has_uncommitted_changes() ?? false),
-        [],
-    );
-
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
             if (msg.type === 'editSessionResult') {
+                if (pending_edit_request_ref.current !== msg.requestId) return;
+                pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
-                if (msg.granted) {
-                    if (msg.pendingEdits) {
-                        set_initial_edits(msg.pendingEdits);
-                        set_load_epoch((n) => n + 1);
-                    }
+                if (msg.granted && msg.editSessionId) {
+                    set_csv_edit_session_id(msg.editSessionId);
+                    // The grant owns the complete pending-edit projection, including
+                    // authoritative absence. Always cross a hydration boundary so a
+                    // previously mounted editing hook cannot retain another session.
+                    latest_live_edits_ref.current = msg.pendingEdits;
+                    set_initial_edits(msg.pendingEdits);
+                    set_load_epoch((n) => n + 1);
                     set_edit_mode(true);
                 } else {
                     pending_exit_ref.current = false;
-                    pending_exit_save_succeeded_ref.current = false;
+                    set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
                 }
+            } else if (msg.type === 'editSessionRevoked') {
+                apply_save_lifecycle(msg.lifecycle);
             } else if (msg.type === 'saveDialogResult') {
+                const pending_dialog = pending_save_dialog_ref.current;
+                if (
+                    !pending_dialog
+                    || pending_dialog.requestId !== msg.requestId
+                    || pending_dialog.editSessionId !== msg.editSessionId
+                ) return;
+                pending_save_dialog_ref.current = null;
                 if (msg.choice === 'save') {
                     const editing = editing_ref.current;
                     // request_save() has side effects, so it must be evaluated first.
@@ -932,27 +1294,20 @@ export function App(): React.JSX.Element {
                 }
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
-                if (pending_exit_ref.current) {
-                    if (msg.success) {
-                        pending_exit_save_succeeded_ref.current = true;
-                        // If everything is already clean, finish now; otherwise the
-                        // editing-status effect completes the exit once the dirty
-                        // map and any open overlay later go clean.
-                        if (can_finish_pending_exit()) {
-                            finish_pending_exit();
-                        }
-                    } else if (!pending_exit_save_succeeded_ref.current) {
-                        pending_exit_ref.current = false;
-                    }
+                const operation = save_projection_ref.current.operation;
+                const matching = !operation
+                    || csv_save_operations_equal(operation, msg.lifecycle.operation);
+                apply_save_lifecycle(msg.lifecycle);
+                if (matching) {
+                    pending_exit_ref.current = false;
                 }
             }
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
     }, [
-        can_finish_pending_exit,
+        apply_save_lifecycle,
         discard_edit_session,
-        finish_pending_exit,
         leave_edit_mode,
     ]);
 
@@ -966,18 +1321,11 @@ export function App(): React.JSX.Element {
     // the toolbar dirty dot, pending-edit persistence, and conflict banner —
     // App-level concerns — can react.
     const handle_editing_change = useCallback((status: EditingStatus) => {
+        latest_live_edits_ref.current = Object.keys(status.edits).length > 0
+            ? status.edits
+            : undefined;
         set_editing_status(status);
     }, []);
-
-    // Single completion trigger for a save-on-exit. GridShell now reports both the
-    // committed-dirty state (is_dirty) and the open overlay's dirtiness
-    // (has_live_uncommitted), so this effect re-runs on every transition that can
-    // make editing clean — no polling interval needed.
-    useEffect(() => {
-        if (can_finish_pending_exit()) {
-            finish_pending_exit();
-        }
-    }, [editing_status?.is_dirty, editing_status?.has_live_uncommitted]);
 
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
@@ -1023,7 +1371,8 @@ export function App(): React.JSX.Element {
         updater: ColumnVisibilityUpdater,
     ) => {
         const sheet = meta?.sheets[active_sheet_index];
-        if (!sheet) return;
+        const snapshot_identity = snapshot_identity_ref.current;
+        if (!sheet || !snapshot_identity) return;
         const schema = transform_schema_for_sheet(sheet);
         const current = sanitize_column_visibility_state(
             state_ref.current.columnVisibility?.[active_sheet_index],
@@ -1054,7 +1403,10 @@ export function App(): React.JSX.Element {
         vscode_api.postMessage({
             type: 'setColumnVisibility',
             sheetIndex: active_sheet_index,
+            sheetName: sheet.name,
             state: next_sheet_visibility,
+            sourceGeneration: source_generation_ref.current,
+            snapshotIdentity: snapshot_identity,
         });
         persist_immediate();
     }, [
@@ -1203,6 +1555,16 @@ export function App(): React.JSX.Element {
         { length: current_sheet?.columnCount ?? 0 },
         (_, index) => current_sheet?.columnNames?.[index] || column_letter(index),
     ), [current_schema]);
+    const duplicate_column_names = useMemo(() => {
+        const seen = new Set<string>();
+        const duplicates = new Set<string>();
+        for (const name of column_names) {
+            const label = name.length > 0 ? name : '(blank)';
+            if (seen.has(label)) duplicates.add(label);
+            else seen.add(label);
+        }
+        return duplicates;
+    }, [column_names]);
     const get_column_name = useCallback(
         (source_index: number) => column_names[source_index] ?? column_letter(source_index),
         [column_names],
@@ -1239,6 +1601,7 @@ export function App(): React.JSX.Element {
         edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
     const applied_transform = applied_transforms[active_sheet_index];
     const transform_active = transform_is_active(applied_transform);
+    const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
         < current_sheet.columnCount;
@@ -1246,6 +1609,19 @@ export function App(): React.JSX.Element {
         current_sheet.merges.length > 0
         && (transform_active || has_hidden_columns);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
+    const excel_header = current_sheet.excelFirstRowHeader;
+    const excel_header_pending = pending_excel_header !== null;
+    const excel_header_disabled = !!excel_header && (
+        (!excel_header.available && !excel_header.active)
+        || any_transform_pending
+        || excel_header_pending
+    );
+    const excel_header_disabled_reason = !excel_header?.available
+        && !excel_header?.active
+        ? 'This sheet has no first row to use as column names.'
+        : excel_header_pending
+        ? 'Updating column names…'
+        : 'Wait for sorting and filtering to finish.';
     const effective_row_count =
         effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
     const visibility_reset_key = [
@@ -1283,6 +1659,10 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode}
             csv_editable={csv_editable}
+            edit_session_id={csv_edit_session_id}
+            save_operation={save_operation}
+            save_lifecycle={save_lifecycle}
+            on_save_request={begin_save_operation}
             initial_edits={initial_edits}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
@@ -1292,7 +1672,12 @@ export function App(): React.JSX.Element {
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
             transform_state={visible_transform}
-            transform_sections={!edit_mode && !edit_session_pending && !preview_mode}
+            transform_sections={
+                !edit_mode
+                && !edit_session_pending
+                && !preview_mode
+                && !excel_header_pending
+            }
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -1308,7 +1693,12 @@ export function App(): React.JSX.Element {
                 row_count={effective_row_count}
                 source_row_count={current_sheet.rowCount}
                 transform={visible_transform}
-                transform_disabled={edit_mode || edit_session_pending || preview_mode}
+                transform_disabled={
+                    edit_mode
+                    || edit_session_pending
+                    || preview_mode
+                    || excel_header_pending
+                }
                 transform_pending={transform_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 column_names={column_names}
@@ -1327,12 +1717,21 @@ export function App(): React.JSX.Element {
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
+                show_excel_header_button={excel_header !== undefined}
+                excel_header_active={excel_header?.active ?? false}
+                excel_header_automatic={excel_header?.mode === 'auto'}
+                excel_header_pending={excel_header_pending}
+                excel_header_status={excel_header_status}
+                on_toggle_excel_header={handle_toggle_excel_header}
+                excel_header_disabled={excel_header_disabled}
+                excel_header_disabled_reason={excel_header_disabled_reason}
                 vertical_tabs={vertical_tabs}
                 on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
                 column_visibility={{
                     column_count: current_sheet.columnCount,
                     get_column_name,
+                    duplicate_names: duplicate_column_names,
                     is_visible: (source_index) =>
                         current_column_projection.source_to_visible[source_index] !== undefined,
                     hidden_count: current_column_projection.hidden_count,
@@ -1357,14 +1756,17 @@ export function App(): React.JSX.Element {
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
                 edit_disabled={
-                    !edit_mode && (
+                    editing_status?.save_in_flight === true
+                    || (!edit_mode && (
                         edit_session_pending
                         || transform_active
                         || transform_pending
-                    )
+                    ))
                 }
                 edit_disabled_reason={
-                    edit_session_pending
+                    editing_status?.save_in_flight
+                        ? 'Saving changes.'
+                        : edit_session_pending
                         ? 'Waiting to enter edit mode.'
                         : transform_pending
                         ? 'Wait for sorting and filtering to finish.'

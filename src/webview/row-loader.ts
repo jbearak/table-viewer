@@ -54,7 +54,7 @@ export class RowLoader {
      *
      * When a sheet switch or reload (generation bump) clears the cache, the
      * currently-visible pages are immediately re-requested at the new
-     * generation. Without this, a `metaReload` that keeps the grid mounted
+     * generation. Without this, a snapshot refresh that keeps the grid mounted
      * would leave the visible region blank until the user happens to scroll
      * (Glide only re-fetches via `onVisibleRegionChanged`, which does not fire
      * when the region is unchanged). The first `configure` of a session has no

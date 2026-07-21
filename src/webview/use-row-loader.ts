@@ -21,7 +21,7 @@ export interface UseRowLoader {
  * shell uses to repaint freshly-loaded cells). On a sheet switch or reload the
  * cache is cleared and the loader immediately re-requests the currently-visible
  * region at the new generation (see {@link RowLoader.configure}), so a remount-
- * free `metaReload` never leaves the visible rows blank until the next scroll.
+ * generation refresh never leaves the visible rows blank until the next scroll.
  */
 export function use_row_loader(
     sheet_index: number,

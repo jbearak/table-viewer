@@ -1,14 +1,13 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import type * as vscode from 'vscode';
 import { register_table_viewer } from '../custom-editor';
-import type { FileStateStore } from '../state';
+import type { AuthorityFileStateStore } from '../state';
+import { with_in_memory_authority_transactions } from '../state-authority';
+import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 
-function state_store(): FileStateStore {
-    return {
-        get: () => ({}),
-        set: async () => {},
-    };
+function state_store(): AuthorityFileStateStore {
+    return with_in_memory_authority_transactions(versioned_state_store().store);
 }
 
 function context(): vscode.ExtensionContext {

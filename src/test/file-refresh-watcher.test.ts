@@ -1,0 +1,147 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as vscode_mock from './mocks/vscode';
+import { file_refresh_watch_identity } from '../file-refresh-watcher';
+import { VscodeFileRefreshWatcherFactory } from '../vscode-file-refresh-watcher';
+
+describe('VS Code file refresh watcher adapter', () => {
+    beforeEach(() => vscode_mock.__reset());
+
+    it('watches the exact retained directory and basename and maps all events', async () => {
+        const factory = new VscodeFileRefreshWatcherFactory();
+        const watcher = factory.create(file_refresh_watch_identity(
+            vscode_mock.Uri.file('C:\\Data\\Mixed Case\\Book.XLSX'),
+            'win32',
+        ));
+        const listener = vi.fn();
+        const subscription = watcher.on_event(listener);
+        const vscode_watcher = vscode_mock.__getWatchers()[0];
+        const pattern = vscode_watcher.__pattern as vscode_mock.RelativePattern;
+
+        expect(pattern.base.fsPath).toBe('C:\\Data\\Mixed Case');
+        expect(pattern.pattern).toBe('Book.XLSX');
+        await vscode_watcher.__fireChange();
+        await vscode_watcher.__fireCreate();
+        await vscode_watcher.__fireDelete();
+        await vscode_watcher.__fireChange(vscode_mock.Uri.file(
+            'c:\\data\\mixed case\\book.xlsx',
+        ));
+        expect(listener.mock.calls.map(([kind]) => kind)).toEqual([
+            'change',
+            'create',
+            'delete',
+            'change',
+        ]);
+
+        subscription.dispose();
+        await vscode_watcher.__fireChange();
+        expect(listener).toHaveBeenCalledTimes(4);
+
+        watcher.dispose();
+        watcher.dispose();
+        expect(vscode_watcher.__disposed).toBe(true);
+        expect(vscode_mock.__getActiveWatchers()).toEqual([]);
+        expect(vscode_mock.__getWatcherHistory()).toEqual([vscode_watcher]);
+    });
+
+    it('broad-watches and filters a POSIX basename containing a backslash', async () => {
+        const factory = new VscodeFileRefreshWatcherFactory();
+        const target_path = '/Volumes/Case/report\\final.csv';
+        const watcher = factory.create(file_refresh_watch_identity(
+            vscode_mock.Uri.file(target_path),
+            'darwin',
+        ));
+        const listener = vi.fn();
+        const subscription = watcher.on_event(listener);
+        const vscode_watcher = vscode_mock.__getWatchers()[0];
+        const pattern = vscode_watcher.__pattern as vscode_mock.RelativePattern;
+
+        expect(pattern.base.fsPath).toBe('/Volumes/Case');
+        expect(pattern.pattern).toBe('*');
+        await vscode_watcher.__fireChange(vscode_mock.Uri.file(target_path));
+        await vscode_watcher.__fireCreate(vscode_mock.Uri.file(target_path));
+        await vscode_watcher.__fireDelete(vscode_mock.Uri.file(target_path));
+        await vscode_watcher.__fireChange(vscode_mock.Uri.file('/Volumes/Case/reportfinal.csv'));
+        await vscode_watcher.__fireCreate(vscode_mock.Uri.file('/Volumes/Case/report\\other.csv'));
+        await vscode_watcher.__fireDelete(vscode_mock.Uri.file('/Volumes/Case/sub/report\\final.csv'));
+        await vscode_watcher.__fireChange(vscode_mock.Uri.file('/Volumes/Case/REPORT\\FINAL.CSV'));
+        expect(listener.mock.calls.map(([kind]) => kind)).toEqual([
+            'change',
+            'create',
+            'delete',
+        ]);
+
+        subscription.dispose();
+        await vscode_watcher.__fireChange(vscode_mock.Uri.file(target_path));
+        watcher.dispose();
+        expect(listener).toHaveBeenCalledTimes(3);
+        expect(vscode_watcher.__disposed).toBe(true);
+    });
+
+    it('preserves a provider RelativePattern base and filters full provider identity', async () => {
+        const target = vscode_mock.Uri.from({
+            scheme: 'memfs',
+            authority: 'workspace-a',
+            path: '/reports/book.csv',
+            query: 'branch=main',
+            fragment: 'view',
+            fsPath: '/same/book.csv',
+        });
+        const factory = new VscodeFileRefreshWatcherFactory();
+        const watcher = factory.create(file_refresh_watch_identity(target));
+        const listener = vi.fn();
+        watcher.on_event(listener);
+        const vscode_watcher = vscode_mock.__getWatchers()[0];
+        const pattern = vscode_watcher.__pattern as vscode_mock.RelativePattern;
+
+        expect(pattern.baseUri).toMatchObject({
+            scheme: 'memfs',
+            authority: 'workspace-a',
+            path: '/reports',
+            query: 'branch=main',
+            fragment: '',
+        });
+        await vscode_watcher.__fireChange(target.with({ fragment: 'other' }));
+        await vscode_watcher.__fireChange(vscode_mock.Uri.from({
+            scheme: 'memfs', authority: 'workspace-b', path: '/reports/book.csv',
+            query: 'branch=main', fragment: '', fsPath: '/same/book.csv',
+        }));
+        await vscode_watcher.__fireChange(vscode_mock.Uri.from({
+            scheme: 'otherfs', authority: 'workspace-a', path: '/reports/book.csv',
+            query: 'branch=main', fragment: '', fsPath: '/same/book.csv',
+        }));
+        expect(listener).toHaveBeenCalledTimes(1);
+        watcher.dispose();
+    });
+
+    it('disposes partial watcher registrations when construction fails', () => {
+        vscode_mock.__setWatcherRegistrationFailure('create');
+        const factory = new VscodeFileRefreshWatcherFactory();
+        expect(() => factory.create(file_refresh_watch_identity(
+            vscode_mock.Uri.file('/tmp/failure.csv'),
+        ))).toThrow('watch create registration failed');
+        expect(vscode_mock.__getWatcherHistory()).toHaveLength(1);
+        expect(vscode_mock.__getWatcherHistory()[0].__disposed).toBe(true);
+    });
+
+    it('continues best-effort disposal when the provider watcher throws', () => {
+        const factory = new VscodeFileRefreshWatcherFactory();
+        const watcher = factory.create(file_refresh_watch_identity(
+            vscode_mock.Uri.file('/tmp/dispose-failure.csv'),
+        ));
+        vscode_mock.__setWatcherDisposeFailure(true);
+        expect(() => watcher.dispose()).not.toThrow();
+        expect(vscode_mock.__getWatcherHistory()[0].__disposed).toBe(true);
+    });
+
+    it('escapes glob metacharacters in the literal basename', () => {
+        const factory = new VscodeFileRefreshWatcherFactory();
+        const watcher = factory.create(file_refresh_watch_identity(
+            vscode_mock.Uri.file('/tmp/[draft]*?{old,new}.csv'),
+            'linux',
+        ));
+        const pattern = vscode_mock.__getWatchers()[0].__pattern as vscode_mock.RelativePattern;
+        expect(pattern.base.fsPath).toBe('/tmp');
+        expect(pattern.pattern).toBe('[[]draft[]][*][?][{]old,new[}].csv');
+        watcher.dispose();
+    });
+});

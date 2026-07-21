@@ -96,6 +96,8 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
                 italic: cell.italic,
                 rawType: cell.raw === null
                     ? 'empty'
+                    : cell.rawType === 'date'
+                        ? 'date'
                     : typeof cell.raw === 'number'
                         ? 'number'
                         : typeof cell.raw === 'boolean'

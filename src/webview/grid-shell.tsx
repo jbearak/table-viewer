@@ -28,6 +28,9 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
+    type CsvDirtyMap,
+    type CsvSaveLifecycle,
+    type CsvSaveOperation,
     type MergeRange,
     type SheetTransformState,
     type SortDirection,
@@ -52,7 +55,15 @@ import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import { use_editing, type DirtyEntry } from './use-editing';
-import { collect_save_edits, type LiveEdit } from './csv-save-model';
+import {
+    collect_exact_dirty_edits,
+    collect_save_edits,
+    type LiveEdit,
+} from './csv-save-model';
+import {
+    csv_save_operations_equal,
+    resolve_csv_save_hydration,
+} from './csv-save-lifecycle';
 import {
     canvas_font,
     fit_column_widths,
@@ -108,6 +119,8 @@ export interface EditingStatus {
      *  edit the user hasn't committed yet. Observable (state-driven) so App can
      *  react to it without polling the DOM. */
     has_live_uncommitted: boolean;
+    /** True from the synchronous save boundary through its terminal result. */
+    save_in_flight: boolean;
     /** Live `"row:col" → {value, base}` dirty map, for persistence + save. */
     edits: Record<string, DirtyEntry>;
     /** Keys whose underlying cell drifted since the edit (external change). */
@@ -170,6 +183,14 @@ export interface GridShellProps {
     // ever touch the plain-cell path.
     edit_mode?: boolean;
     csv_editable?: boolean;
+    edit_session_id?: string;
+    /** App-owned operation survives generation-keyed GridShell remounts. */
+    save_operation?: CsvSaveOperation;
+    save_lifecycle?: CsvSaveLifecycle;
+    on_save_request?: (
+        edits: Record<string, string>,
+        dirty_edits: CsvDirtyMap,
+    ) => CsvSaveOperation | undefined;
     initial_edits?: Record<string, string | DirtyEntry>;
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
@@ -224,6 +245,10 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     csv_editable = false,
+    edit_session_id,
+    save_operation,
+    save_lifecycle = { revision: 0, state: 'idle' },
+    on_save_request = () => undefined,
     initial_edits,
     on_editing_change,
     editing_ref,
@@ -356,8 +381,31 @@ export function GridShell({
     );
 
     const { ensure_rows, get_row, sample_loaded_rows, version } = loader;
+    const lifecycle_operation = (
+        save_lifecycle.state === 'active'
+        || save_lifecycle.state === 'failed'
+    )
+        && save_lifecycle.operation.editSessionId === edit_session_id
+        ? save_lifecycle.operation
+        : undefined;
+    const restored_save_operation = save_operation?.editSessionId === edit_session_id
+        ? save_operation
+        : save_lifecycle.state === 'active'
+            ? lifecycle_operation
+            : undefined;
+    const editing_initial_edits = resolve_csv_save_hydration(
+        { authoritative: save_lifecycle, operation: save_operation },
+        edit_session_id,
+        initial_edits,
+    );
     // Values posted in the in-flight save; edit bases use these before reload.
-    const saved_edits_ref = useRef<Record<string, string>>({});
+    const saved_edits_ref = useRef<Record<string, string>>(
+        restored_save_operation ? { ...restored_save_operation.edits } : {},
+    );
+    const save_operation_ref = useRef<CsvSaveOperation | undefined>(
+        restored_save_operation,
+    );
+    const save_in_flight_ref = useRef(restored_save_operation !== undefined);
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against get_row's per-render identity; `version` in the deps
@@ -383,12 +431,92 @@ export function GridShell({
         conflicted_keys,
         commit_edit,
         clear_dirty,
+        replace_dirty,
         clear_dirty_keys,
-        clear_dirty_saved_edits,
         discard_conflicted,
-        save_in_flight_ref,
-    } = use_editing(get_cell_raw, generation, initial_edits);
-    const editable_cells = edit_mode && csv_editable;
+    } = use_editing(get_cell_raw, generation, editing_initial_edits);
+    const dirty_cells_ref = useRef(dirty_cells);
+    dirty_cells_ref.current = dirty_cells;
+    const applied_save_lifecycle_revision_ref = useRef(save_lifecycle.revision);
+    const [save_in_flight, set_save_in_flight] = useState(
+        restored_save_operation !== undefined,
+    );
+    const editable_cells = edit_mode && csv_editable && !save_in_flight;
+
+    useEffect(() => {
+        if (
+            !save_operation
+            || save_operation.editSessionId !== edit_session_id
+            || csv_save_operations_equal(save_operation_ref.current, save_operation)
+        ) return;
+        save_operation_ref.current = save_operation;
+        saved_edits_ref.current = { ...save_operation.edits };
+        save_in_flight_ref.current = true;
+        set_save_in_flight(true);
+    }, [edit_session_id, save_operation]);
+
+    const apply_save_lifecycle = useCallback((lifecycle: CsvSaveLifecycle) => {
+        if (lifecycle.revision <= applied_save_lifecycle_revision_ref.current) return;
+        applied_save_lifecycle_revision_ref.current = lifecycle.revision;
+        if (lifecycle.state === 'active') {
+            const operation = lifecycle.operation;
+            if (operation.editSessionId !== edit_session_id) return;
+            const locked = save_operation_ref.current;
+            if (locked && !csv_save_operations_equal(locked, operation)) return;
+            save_operation_ref.current = operation;
+            saved_edits_ref.current = { ...operation.edits };
+            const exact: CsvDirtyMap = Object.fromEntries(
+                Object.entries(operation.dirtyEdits),
+            );
+            dirty_cells_ref.current = new Map(Object.entries(exact));
+            replace_dirty(exact);
+            save_in_flight_ref.current = true;
+            set_save_in_flight(true);
+            return;
+        }
+
+        const operation = save_operation_ref.current;
+        // Idle carries no proposal identity, so it cannot settle an operation that
+        // may have been proposed after that idle projection was created.
+        if (lifecycle.state === 'idle' || !operation) return;
+        if (
+            lifecycle.state === 'failed'
+                ? lifecycle.operation.editSessionId !== edit_session_id
+                : edit_session_id !== undefined
+                    && lifecycle.operation.editSessionId !== edit_session_id
+        ) return;
+        if (!csv_save_operations_equal(lifecycle.operation, operation)) return;
+
+        const restore = (resolve_csv_save_hydration(
+            { authoritative: lifecycle },
+            edit_session_id,
+            Object.fromEntries(dirty_cells_ref.current),
+        ) ?? {}) as CsvDirtyMap;
+        dirty_cells_ref.current = new Map(Object.entries(restore));
+        replace_dirty(restore);
+        save_operation_ref.current = undefined;
+        saved_edits_ref.current = {};
+        save_in_flight_ref.current = false;
+        set_save_in_flight(false);
+    }, [edit_session_id, replace_dirty]);
+
+    useEffect(() => {
+        apply_save_lifecycle(save_lifecycle);
+    }, [apply_save_lifecycle, save_lifecycle]);
+
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data;
+            if (
+                msg?.type !== 'saveOperationStarted'
+                && msg?.type !== 'saveResult'
+                && msg?.type !== 'editSessionRevoked'
+            ) return;
+            apply_save_lifecycle(msg.lifecycle as CsvSaveLifecycle);
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [apply_save_lifecycle]);
 
     // Observable mirror of the open overlay's dirtiness (true when an open editor
     // differs from its base). Declared here so the editing-status effect below can
@@ -401,25 +529,26 @@ export function GridShell({
         on_editing_change?.({
             is_dirty: dirty_cells.size > 0,
             has_live_uncommitted: live_uncommitted,
+            save_in_flight,
             edits: Object.fromEntries(dirty_cells),
             conflicted: [...conflicted_keys],
         });
-    }, [dirty_cells, conflicted_keys, live_uncommitted, on_editing_change]);
+    }, [dirty_cells, conflicted_keys, live_uncommitted, on_editing_change, save_in_flight]);
 
     // Persist the dirty map to the host so edits survive a webview reload. Posting
     // null clears the stored state. Runs on the initial render too: a restored map
     // simply round-trips back (harmless), and an empty map posts null (already so).
     useEffect(() => {
+        if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
         vscode_api.postMessage({
             type: 'pendingEditsChanged',
+            editSessionId: edit_session_id,
             edits: dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
         });
-    }, [dirty_cells]);
+    }, [dirty_cells, edit_mode, edit_session_id, save_in_flight_ref]);
 
     // Mirrors read imperatively by the save handle (which must stay stable so the
     // ref App holds doesn't churn): the live dirty map and current selection.
-    const dirty_cells_ref = useRef(dirty_cells);
-    dirty_cells_ref.current = dirty_cells;
     // get_cell_content reads dirty/conflict state through refs so its identity
     // stays stable across edits — otherwise every commit would rebuild the
     // closure and invalidate Glide's whole per-cell cache. Targeted repaints
@@ -604,24 +733,69 @@ export function GridShell({
     // Collect committed dirty edits + any in-progress editor and post saveCsv.
     // Returns false (no message sent) when there is nothing to save.
     const request_save = useCallback((): boolean => {
-        if (save_in_flight_ref.current) return false;
-        const edits = collect_save_edits(dirty_cells_ref.current, read_live_edit());
-        const keys = Object.keys(edits);
-        if (keys.length === 0) return false;
-        saved_edits_ref.current = edits;
+        if (save_in_flight_ref.current || !edit_session_id) return false;
+        const live = read_live_edit();
+        const edits = collect_save_edits(dirty_cells_ref.current, live);
+        if (Object.keys(edits).length === 0) return false;
+        const dirty_edits = collect_exact_dirty_edits(dirty_cells_ref.current, live);
+        if (!dirty_edits) {
+            vscode_api.postMessage({
+                type: 'showWarning',
+                message: 'Load every edited row before saving so its conflict base can be verified.',
+            });
+            return false;
+        }
+        const operation = on_save_request(edits, dirty_edits);
+        if (
+            !operation
+            || operation.editSessionId !== edit_session_id
+            || operation.saveRequestId.length === 0
+        ) return false;
+        if (live) {
+            const [row, source_column] = live.key.split(':').map(Number);
+            if (Number.isInteger(row) && Number.isInteger(source_column)) {
+                // Accept the open editor's current value before closing the mutation
+                // boundary. React state may commit later, so mirror it immediately for
+                // all synchronous guards and failure restoration.
+                commit_edit(row, source_column, live.value);
+                const next = new Map(dirty_cells_ref.current);
+                if (live.value === live.original) next.delete(live.key);
+                else next.set(live.key, { value: live.value, base: live.original });
+                dirty_cells_ref.current = next;
+            }
+        }
+        save_operation_ref.current = operation;
+        saved_edits_ref.current = { ...operation.edits };
+        // This ref is the actual boundary: every mutation handler consults it before
+        // React has a chance to render the disabled grid.
         save_in_flight_ref.current = true;
-        vscode_api.postMessage({ type: 'saveCsv', edits });
+        set_save_in_flight(true);
+        set_live_uncommitted(false);
+        if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+        }
+        vscode_api.postMessage({
+            type: 'saveCsv',
+            operation,
+        });
         return true;
-    }, [read_live_edit, save_in_flight_ref]);
+    }, [
+        commit_edit,
+        edit_session_id,
+        on_save_request,
+        read_live_edit,
+        save_in_flight_ref,
+    ]);
 
     const commit_live_edit = useCallback((): void => {
+        if (save_in_flight_ref.current) return;
         const live = read_live_edit();
         if (!live) return;
         const [row, source_column] = live.key.split(':').map(Number);
         if (!Number.isInteger(row) || !Number.isInteger(source_column)) return;
         commit_edit(row, source_column, live.value);
         set_live_uncommitted(false);
-    }, [commit_edit, read_live_edit]);
+    }, [commit_edit, read_live_edit, save_in_flight_ref]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
         if (dirty_cells_ref.current.size > 0) return true;
@@ -643,31 +817,22 @@ export function GridShell({
         return () => window.removeEventListener('keydown', handler);
     }, [editable_cells, request_save]);
 
-    // Host reports the save outcome: clear the in-flight flag and, on success,
-    // drop exactly the keys we saved (concurrent edits to other cells survive).
-    useEffect(() => {
-        const handler = (e: MessageEvent) => {
-            const msg = e.data;
-            if (!msg || msg.type !== 'saveResult') return;
-            if (!save_in_flight_ref.current) return;
-            const saved_edits = saved_edits_ref.current;
-            saved_edits_ref.current = {};
-            save_in_flight_ref.current = false;
-            if (msg.success) {
-                clear_dirty_saved_edits(saved_edits);
-            }
-        };
-        window.addEventListener('message', handler);
-        return () => window.removeEventListener('message', handler);
-    }, [clear_dirty_saved_edits, save_in_flight_ref]);
+    const guarded_clear_dirty = useCallback(() => {
+        if (save_in_flight_ref.current) return;
+        clear_dirty();
+    }, [clear_dirty, save_in_flight_ref]);
+    const guarded_discard_conflicted = useCallback(() => {
+        if (save_in_flight_ref.current) return;
+        discard_conflicted();
+    }, [discard_conflicted, save_in_flight_ref]);
 
     // Expose the imperative actions to App through the ref it provides.
     useEffect(() => {
         if (!editing_ref) return;
         editing_ref.current = {
             request_save,
-            clear_dirty,
-            discard_conflicted,
+            clear_dirty: guarded_clear_dirty,
+            discard_conflicted: guarded_discard_conflicted,
             commit_live_edit,
             has_uncommitted_changes,
         };
@@ -677,8 +842,8 @@ export function GridShell({
     }, [
         editing_ref,
         request_save,
-        clear_dirty,
-        discard_conflicted,
+        guarded_clear_dirty,
+        guarded_discard_conflicted,
         commit_live_edit,
         has_uncommitted_changes,
     ]);
@@ -789,6 +954,7 @@ export function GridShell({
     // with the cell location, which we fold into the dirty map.
     const on_cell_edited = useCallback(
         (cell: Item, new_value: EditableGridCell) => {
+            if (save_in_flight_ref.current) return;
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return;
@@ -819,6 +985,7 @@ export function GridShell({
             on_row_resize,
             display_column_count,
             source_column_for_display,
+            save_in_flight_ref,
         ],
     );
 
@@ -834,24 +1001,29 @@ export function GridShell({
                 return () => set_live_uncommitted(false);
             }, []);
             const handle_change = (next: GridCell) => {
+                if (save_in_flight_ref.current) return;
                 props.onChange(next);
                 refresh_live_uncommitted();
             };
             return <CsvCellEditor {...props} onChange={handle_change} />;
         }
         return TrackingCsvCellEditor;
-    }, [refresh_live_uncommitted]);
+    }, [refresh_live_uncommitted, save_in_flight_ref]);
 
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Only consulted for editable Text cells.
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
         (cell) => {
-            if (!editable_cells || cell.kind !== GridCellKind.Text) return undefined;
+            if (
+                save_in_flight_ref.current
+                || !editable_cells
+                || cell.kind !== GridCellKind.Text
+            ) return undefined;
             // disablePadding/disableStyling: the editor carries its own
             // .cell-editor-input border + background, so suppress Glide's overlay box.
             return { editor: tracking_editor, disablePadding: true, disableStyling: true };
         },
-        [editable_cells, tracking_editor],
+        [editable_cells, save_in_flight_ref, tracking_editor],
     );
 
     const get_row_height = useCallback(
@@ -1065,10 +1237,11 @@ export function GridShell({
 
     const discard_edit = useCallback(
         (row: number, display_column: number, source_column: number) => {
+            if (save_in_flight_ref.current) return;
             clear_dirty_keys(new Set([`${row}:${source_column}`]));
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
-        [clear_dirty_keys],
+        [clear_dirty_keys, save_in_flight_ref],
     );
 
     const apply_column_sort = useCallback((
