@@ -19,7 +19,10 @@ function finite_numeric_value(cell: RenderedCell | null | undefined): number | u
 
 function raw_value(cell: RenderedCell | null | undefined): string | null {
     const raw = cell?.raw;
-    return raw === null || raw === undefined || raw === '' ? null : raw;
+    // Match finite_numeric_value: whitespace-only cells are empty, not text.
+    return raw === null || raw === undefined || raw.trim().length === 0
+        ? null
+        : raw;
 }
 
 function canonical_numeric_string(value: string): boolean {
@@ -30,11 +33,17 @@ function canonical_numeric_string(value: string): boolean {
     return Number.isFinite(Number(value));
 }
 
+/**
+ * Align with transform column scanning (acquire_transform_column):
+ * CSV cells are rawType:'string', but pure canonical number text is still numeric.
+ * Dates are never numeric here; classify_value maps them to orderedText.
+ */
 function cell_can_be_numeric(cell: RenderedCell | null | undefined): boolean {
     const raw = raw_value(cell);
-    if (raw === null || cell?.rawType === 'boolean') return false;
+    if (raw === null || cell?.rawType === 'boolean' || cell?.rawType === 'date') {
+        return false;
+    }
     if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
-    if (cell?.rawType === 'string' || cell?.rawType === 'date') return false;
     return canonical_numeric_string(raw);
 }
 

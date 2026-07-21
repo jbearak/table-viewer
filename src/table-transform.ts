@@ -1030,16 +1030,24 @@ function finite_number_text(value: string | undefined): boolean {
 }
 
 function raw_value(cell: RenderedCell | null | undefined): string | null {
-    return !cell || cell.raw === null || cell.raw === '' ? null : cell.raw;
+    const raw = cell?.raw;
+    // Whitespace-only cells are empty for sort/filter classification, matching
+    // histogram blank handling and common CSV export padding.
+    return raw === null || raw === undefined || raw.trim().length === 0
+        ? null
+        : raw;
 }
 
 function cell_can_be_numeric(
     cell: RenderedCell | null | undefined,
 ): boolean {
     const raw = raw_value(cell);
-    if (raw === null || cell?.rawType === 'boolean') return false;
+    if (raw === null || cell?.rawType === 'boolean' || cell?.rawType === 'date') {
+        return false;
+    }
     if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
-    if (cell?.rawType === 'string') return false;
+    // CSV marks every cell as string; still treat pure canonical number text
+    // as numeric, matching acquire_transform_column.
     return canonical_numeric_string(raw);
 }
 

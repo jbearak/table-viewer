@@ -24,9 +24,12 @@ class HistogramSource implements DataSource {
     read_rows(_sheet: number, start: number, count: number): RowWindow {
         return {
             startRow: start,
-            rows: this.values.slice(start, start + count).map((raw) => [
-                raw === null ? null : { raw, formatted: raw, bold: false, italic: false },
-            ]),
+            rows: this.values.slice(start, start + count).map((entry) => {
+                if (entry === null) return [null];
+                const raw = typeof entry === 'string' ? entry : entry.raw;
+                const rawType = typeof entry === 'string' ? undefined : entry.rawType;
+                return [{ raw, formatted: raw, bold: false, italic: false, rawType }];
+            }),
         };
     }
     read_columns(
@@ -82,6 +85,38 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({ bins: [], columnKind: 'text' });
     });
 
+
+
+    it('treats CSV-like string rawType numbers as numeric and ignores whitespace-only cells', async () => {
+        await expect(compute_column_histogram(
+            new HistogramSource([
+                { raw: '1', rawType: 'string' },
+                { raw: '2.5', rawType: 'string' },
+                { raw: '   ', rawType: 'string' },
+                { raw: '', rawType: 'string' },
+                null,
+            ]),
+            0,
+            0,
+            () => false,
+        )).resolves.toMatchObject({
+            columnKind: 'numeric',
+            bins: expect.any(Array),
+        });
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                { raw: '0', rawType: 'string' },
+                { raw: '100', rawType: 'string' },
+                { raw: '	', rawType: 'string' },
+            ]),
+            0,
+            0,
+            () => false,
+        );
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.bins.length).toBeGreaterThan(0);
+        expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(2);
+    });
 
     it('classifies mixed numeric/text and leading-zero identifiers as text', async () => {
         await expect(compute_column_histogram(

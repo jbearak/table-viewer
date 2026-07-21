@@ -140,17 +140,25 @@ describe('table transforms', () => {
             [cell('1.10')],
             [cell('1.2')],
             [cell('-2.5')],
+            [cell('   ')],
+            [cell('	')],
         ]);
         const decimal_result = await compute_transform(decimals, 0, {
             sort: [{ colIndex: 0, direction: 'asc' }],
             filters: [],
         });
-        expect([...decimal_result.indices!]).toEqual([2, 0, 1]);
+        // Whitespace-only cells are empty and sort last; remaining values are numeric.
+        expect([...decimal_result.indices!]).toEqual([2, 0, 1, 3, 4]);
         const equality_result = await compute_transform(decimals, 0, {
             sort: [],
             filters: [filter('equals', '1.1')],
         });
         expect([...equality_result.indices!]).toEqual([0]);
+        const range_result = await compute_transform(decimals, 0, {
+            sort: [],
+            filters: [{ ...filter('between', '1'), secondValue: '2' }],
+        });
+        expect([...range_result.indices!]).toEqual([0, 1]);
 
         const identifiers = new Source([
             [cell('002')],
