@@ -44,6 +44,58 @@ class UnrelatedAbortErrorSource extends StubSource {
     }
 }
 
+class TrackingColumnSource implements DataSource {
+    readonly column_reads: { sheet: number; start: number; columns: number[] }[] = [];
+    on_read?: () => void;
+
+    constructor(
+        private readonly row_count = 5,
+        private readonly sheet_count = 1,
+        private readonly column_count = 3,
+    ) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: Array.from({ length: this.sheet_count }, (_, sheet) => ({
+                name: `Sheet${sheet + 1}`,
+                rowCount: this.row_count,
+                columnCount: this.column_count,
+                merges: [],
+                hasFormatting: false,
+            })),
+        };
+    }
+
+    read_rows(sheet: number, start: number, count: number): RowWindow {
+        return this.read_columns(sheet, start, count, [
+            ...Array(this.column_count).keys(),
+        ]);
+    }
+
+    read_columns(
+        sheet: number,
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): RowWindow {
+        this.column_reads.push({ sheet, start, columns: [...columns] });
+        this.on_read?.();
+        const end = Math.min(start + count, this.row_count);
+        return {
+            startRow: start,
+            rows: Array.from({ length: end - start }, (_, offset) => (
+                columns.map((column) => {
+                    const raw = String((sheet + 1) * 1_000 + column * 100 + start + offset);
+                    return { raw, formatted: raw, bold: false, italic: false };
+                })
+            )),
+        };
+    }
+
+    close(): void {}
+}
+
 function make_panel() {
     const posted: any[] = [];
     const postMessage = vi.fn((m: any) => { posted.push(m); return Promise.resolve(true); });
@@ -393,6 +445,223 @@ describe('ViewerPanelCore', () => {
         const page = posted.find((message) => message.type === 'rowData');
         expect(page.rows.map((row: RenderedCell[]) => row[0].raw))
             .toEqual(['4', '3', '2']);
+    });
+
+    it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource();
+        const core = new ViewerPanelCore(panel, source);
+        const apply = (requestId: string, state: WebviewMessage & { type: 'setTransform' }) => (
+            core.handle_message({
+                ...state,
+                requestId,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+            })
+        );
+        const base = {
+            type: 'setTransform' as const,
+            sheetIndex: 0,
+            requestId: '',
+            generation: 0,
+            sourceGeneration: 0,
+            intent: 'user' as const,
+        };
+
+        await apply('first', {
+            ...base,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+        await apply('direction', {
+            ...base,
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+        await apply('new-column', {
+            ...base,
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [{
+                    id: 'filter-1',
+                    colIndex: 1, operator: 'greaterThan', value: '0',
+                    caseSensitive: false, enabled: true,
+                }],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([[0], [1]]);
+    });
+
+    it('shares transform columns with reconciliation and invalidates them on adoption', async () => {
+        const { panel } = make_panel();
+        const first = new TrackingColumnSource();
+        const second = new TrackingColumnSource();
+        const core = new ViewerPanelCore(panel, first);
+        const state = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }], filters: [],
+            schema: '["Sheet1",3,null]',
+        };
+
+        const prepared = await core.prepare_transform_reconciliation([state], () => false);
+        expect(prepared).toBeDefined();
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'reuse',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                ...state,
+                sort: [{ colIndex: 0, direction: 'desc' }],
+            },
+        });
+        expect(first.column_reads).toHaveLength(1);
+
+        core.adopt_source(second);
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'adopted',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state,
+        });
+        expect(second.column_reads.map((read) => read.columns)).toEqual([[0]]);
+    });
+
+    it('bounds retained transform columns by total cells using LRU eviction', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(3);
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedTransformCells: 6,
+        });
+        const apply = async (column: number, requestId: string) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: column, direction: 'asc' }], filters: [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+
+        await apply(0, 'zero');
+        await apply(1, 'one');
+        await apply(0, 'touch-zero');
+        await apply(2, 'two');
+        await apply(1, 'one-again');
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [2], [1],
+        ]);
+    });
+
+    it('keys retained transform columns by sheet as well as column', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(3, 2);
+        const core = new ViewerPanelCore(panel, source);
+        for (const sheetIndex of [0, 1, 0]) {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex,
+                requestId: `sheet-${sheetIndex}-${core.generation}`,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: 0, direction: sheetIndex === 0 ? 'asc' : 'desc' }],
+                    filters: [], schema: `["Sheet${sheetIndex + 1}",3,null]`,
+                },
+            });
+        }
+        expect(source.column_reads.map((read) => [read.sheet, read.columns])).toEqual([
+            [0, [0]], [1, [0]],
+        ]);
+    });
+
+    it('does not cache a partial scan canceled by receiver turnover', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(300);
+        const core = new ViewerPanelCore(panel, source);
+        core.begin_receiver_epoch(1);
+        source.on_read = () => {
+            source.on_read = undefined;
+            core.begin_receiver_epoch(2);
+        };
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'cancelled',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+        const reads_after_cancel = source.column_reads.length;
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'retry',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+
+        expect(reads_after_cancel).toBe(1);
+        expect(source.column_reads.length).toBe(4);
+    });
+
+    it('does not publish superseded partial columns and reuses the winning scan', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(300);
+        const core = new ViewerPanelCore(panel, source);
+        let winning: Promise<void> | undefined;
+        source.on_read = () => {
+            source.on_read = undefined;
+            winning = core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId: 'winning',
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'superseded',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+        await winning;
+        const reads_after_winner = source.column_reads.length;
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'cached',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'asc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+
+        expect(reads_after_winner).toBe(4);
+        expect(source.column_reads).toHaveLength(reads_after_winner);
+    });
+
+    it('reuses columns for legacy DataSource fallbacks without read_columns', async () => {
+        const { panel } = make_panel();
+        const source = new StubSource(5);
+        const core = new ViewerPanelCore(panel, source);
+        for (const direction of ['asc', 'desc'] as const) {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId: direction,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: 0, direction }], filters: [],
+                    schema: '["Sheet1",2,null]',
+                },
+            });
+        }
+        expect(source.read_rows_calls).toBe(1);
     });
 
     it('rolls back a failed transform without bumping generation', async () => {

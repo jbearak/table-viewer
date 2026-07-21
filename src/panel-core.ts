@@ -1,7 +1,12 @@
 import type { DataSource, RowWindow } from './data-source/interface';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram } from './histograms';
-import { compute_transform, transformed_window } from './table-transform';
+import {
+    compute_transform,
+    transformed_window,
+    type CachedTransformColumn,
+    type TransformColumnCache,
+} from './table-transform';
 import type {
     WorkbookSnapshotCoreMaterial,
     WorkbookSnapshotDiagnostics,
@@ -43,6 +48,54 @@ function allocate_transform_operation_token(): TransformOperationToken {
 }
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
+const DEFAULT_MAX_CACHED_TRANSFORM_CELLS = 1_000_000;
+
+class TransformColumnLruCache implements TransformColumnCache {
+    private readonly entries = new Map<string, CachedTransformColumn>();
+    private retained_cells = 0;
+
+    constructor(private readonly max_cells: number) {}
+
+    get(sheet_index: number, column_index: number): CachedTransformColumn | undefined {
+        const key = `${sheet_index}:${column_index}`;
+        const entry = this.entries.get(key);
+        if (!entry) return undefined;
+        this.entries.delete(key);
+        this.entries.set(key, entry);
+        return entry;
+    }
+
+    set(
+        sheet_index: number,
+        column_index: number,
+        column: CachedTransformColumn,
+    ): void {
+        const cells = column.values.length;
+        if (cells > this.max_cells || this.max_cells <= 0) return;
+        const key = `${sheet_index}:${column_index}`;
+        const previous = this.entries.get(key);
+        if (previous) {
+            this.retained_cells -= previous.values.length;
+            this.entries.delete(key);
+        }
+        while (
+            this.retained_cells + cells > this.max_cells
+            && this.entries.size > 0
+        ) {
+            const oldest_key = this.entries.keys().next().value as string;
+            const oldest = this.entries.get(oldest_key)!;
+            this.entries.delete(oldest_key);
+            this.retained_cells -= oldest.values.length;
+        }
+        this.entries.set(key, column);
+        this.retained_cells += cells;
+    }
+
+    clear(): void {
+        this.entries.clear();
+        this.retained_cells = 0;
+    }
+}
 
 export interface ViewerPanelSnapshotMaterial {
     readonly core: WorkbookSnapshotCoreMaterial;
@@ -84,6 +137,7 @@ export class ViewerPanelCore {
     private _generation = 1;
     private readonly cache = new Map<string, RowWindow>();
     private readonly max_cached_pages: number;
+    private readonly transform_column_cache: TransformColumnLruCache;
     private readonly transform_indices = new Map<number, Uint32Array>();
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
@@ -101,10 +155,14 @@ export class ViewerPanelCore {
         private source: DataSource,
         opts?: {
             maxCachedPages?: number;
+            maxCachedTransformCells?: number;
             onTransformCommit?: TransformCommit;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
+        this.transform_column_cache = new TransformColumnLruCache(
+            opts?.maxCachedTransformCells ?? DEFAULT_MAX_CACHED_TRANSFORM_CELLS,
+        );
         this.on_transform_commit = opts?.onTransformCommit;
     }
 
@@ -151,6 +209,7 @@ export class ViewerPanelCore {
         this.transforms_in_flight.clear();
         this.histogram_cache.clear();
         this.histogram_operations.clear();
+        this.transform_column_cache.clear();
         this.cache.clear();
         return { type: 'adopted' };
     }
@@ -185,6 +244,7 @@ export class ViewerPanelCore {
         this.transform_indices.clear();
         this.transform_states.clear();
         this.histogram_cache.clear();
+        this.transform_column_cache.clear();
         this.cache.clear();
     }
 
@@ -309,6 +369,8 @@ export class ViewerPanelCore {
                         || this.source_epoch !== source_epoch
                         || this.receiver_epoch !== receiver_epoch
                         || is_cancelled(),
+                    undefined,
+                    this.transform_column_cache,
                 );
             } catch (error) {
                 if (
@@ -508,6 +570,8 @@ export class ViewerPanelCore {
                 msg.sheetIndex,
                 msg.state,
                 compute_is_cancelled,
+                undefined,
+                this.transform_column_cache,
             );
             if (compute_is_cancelled()) return;
 
