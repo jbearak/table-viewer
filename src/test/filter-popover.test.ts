@@ -44,6 +44,18 @@ function render_popover(
 }
 
 describe('FilterPopover', () => {
+    it('visibly describes raw-value filter semantics and associates the description', () => {
+        render_popover();
+        const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+        const description_id = dialog.getAttribute('aria-describedby');
+        expect(description_id).toBeTruthy();
+        const description = document.getElementById(description_id!);
+        expect(description?.classList.contains('transform-value-description')).toBe(true);
+        expect(description?.textContent).toBe(
+            'Sorting and filtering use raw cell values, not formatted display text.',
+        );
+    });
+
     it('renders histogram loading, empty, error, and populated states without blocking controls', () => {
         render_popover([], { status: 'loading' });
         expect(document.body.textContent).toContain('Loading distribution…');

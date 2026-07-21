@@ -141,6 +141,71 @@ afterEach(() => {
 });
 
 describe('Toolbar', () => {
+    it('explains raw-value transform semantics before any sort or filter is active', () => {
+        const { container } = render_toolbar({
+            transform: { sort: [], filters: [] },
+        });
+        expect(container.querySelector('.sort-strip')).toBeNull();
+        expect(container.querySelector('.filter-strip')).toBeNull();
+        const note = container.querySelector('[role="note"]') as HTMLElement;
+        expect(note.textContent).toBe('Sort/filter: raw values');
+        const description_id = note.getAttribute('aria-describedby');
+        expect(description_id).toBeTruthy();
+        expect(container.querySelector('[role="toolbar"]')?.getAttribute('aria-describedby'))
+            .toBe(description_id);
+        const description = document.getElementById(description_id!);
+        expect(description?.textContent).toBe(
+            'Sorting and filtering use raw cell values, not formatted display text.',
+        );
+        expect(description?.closest('.toolbar-chips')).toBeNull();
+    });
+
+    it('excludes the hidden transform description from chip-width wrapping', () => {
+        const scroll_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'scrollWidth',
+        );
+        const client_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'clientWidth',
+        );
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                if (this.classList.contains('toolbar-row-count')) return 70;
+                if (this.classList.contains('toolbar-transform-semantics')) return 80;
+                if (this.classList.contains('toolbar-item')) return 50;
+                if (this.classList.contains('sr-only')
+                    && this.textContent?.includes('Sorting and filtering')) return 1_000;
+                return 0;
+            },
+        });
+        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                return this.classList.contains('toolbar') ? 400 : 0;
+            },
+        });
+        try {
+            const { container } = render_toolbar({
+                transform: { sort: [], filters: [] },
+            });
+            expect(container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
+                .toBe(false);
+        } finally {
+            if (scroll_width) {
+                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+            }
+            if (client_width) {
+                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+            }
+        }
+    });
+
     it('keeps the existing button labels and removes native title tooltips', () => {
         render_toolbar();
 
