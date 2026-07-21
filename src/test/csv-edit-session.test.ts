@@ -49,7 +49,7 @@ class StubSource implements DataSource {
             }],
         };
     }
-    read_rows(): RowWindow {
+    read_rows(_sheet: number, _start: number, _count: number): RowWindow {
         return { startRow: 0, rows: [[{ raw: 'a', formatted: 'a', bold: false, italic: false }]] };
     }
     close(): void {}
@@ -58,6 +58,37 @@ class StubSource implements DataSource {
 class FailingTransformSource extends StubSource {
     override read_rows(): RowWindow {
         throw new Error('column read failed');
+    }
+}
+
+class TrackingTransformSource extends StubSource {
+    reads = 0;
+
+    override meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 3,
+                columnCount: 1,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+    }
+
+    override read_rows(_sheet: number, start: number, count: number): RowWindow {
+        this.reads += 1;
+        const values = ['c', 'a', 'b'];
+        return {
+            startRow: start,
+            rows: values.slice(start, start + count).map((raw) => [{
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+            }]),
+        };
     }
 }
 
@@ -3524,6 +3555,134 @@ describe('CSV edit sessions', () => {
         const replay = latest_snapshot(panel);
         expect(replay.state.pendingEdits).toBeUndefined();
         expect(replay.state.columnWidths).toEqual([{ 0: 133 }]);
+    });
+
+    it('rejects current and stale transform injections at the preview host boundary', async () => {
+        const file_path = '/tmp/preview-transform-injection.csv';
+        const state = state_store({ columnWidths: [{ 0: 133 }] });
+        const source = new TrackingTransformSource();
+        const panel = open_csv_table(uri(file_path), state.store, {
+            editing: false,
+            previewMode: true,
+            build_source: async () => source,
+        });
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const revision = state.revision(file_path);
+        const message_count = panel.__messages.length;
+        const transform = {
+            type: 'setTransform' as const,
+            sheetIndex: 0,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' as const }],
+                filters: [],
+                schema: '["Sheet1",1,null]',
+            },
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user' as const,
+        };
+
+        await panel.__receive({ ...transform, requestId: 'injected-current' });
+        await panel.__receive({
+            ...transform,
+            requestId: 'injected-stale',
+            generation: snapshot.generation - 1,
+            sourceGeneration: snapshot.sourceGeneration - 1,
+        });
+
+        expect(source.reads).toBe(0);
+        expect(panel.__messages).toHaveLength(message_count);
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+        ))).toBe(false);
+        expect(state.revision(file_path)).toBe(revision);
+        expect(state.get_state(file_path)).toEqual({ columnWidths: [{ 0: 133 }] });
+        expect(latest_snapshot(panel)).toMatchObject({
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+        });
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'natural-preview-rows',
+            generation: snapshot.generation,
+        });
+        const rows = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'rowData'
+            && 'requestId' in message
+            && message.requestId === 'natural-preview-rows'
+        )) as { rows: Array<Array<{ raw: string }>> };
+        expect(rows.rows.map((row) => row[0].raw)).toEqual(['c', 'a', 'b']);
+    });
+
+    it('continues to apply transforms for a normal table profile', async () => {
+        const file_path = '/tmp/table-transform-positive-control.csv';
+        const state = state_store();
+        const source = new TrackingTransformSource();
+        const panel = open_csv_table(uri(file_path), state.store, {
+            editing: false,
+            build_source: async () => source,
+        });
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'normal-sort',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,null]',
+            },
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+        } as never);
+
+        const applied = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+            && 'requestId' in message
+            && message.requestId === 'normal-sort'
+        )) as { generation: number; sourceGeneration: number; error?: string };
+        expect(source.reads).toBeGreaterThan(0);
+        expect(applied.error).toBeUndefined();
+        expect(applied.generation).toBe(snapshot.generation + 1);
+        expect(applied.sourceGeneration).toBe(snapshot.sourceGeneration);
+        expect(state.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 3,
+            requestId: 'sorted-table-rows',
+            generation: applied.generation,
+        });
+        const rows = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'rowData'
+            && 'requestId' in message
+            && message.requestId === 'sorted-table-rows'
+        )) as { rows: Array<Array<{ raw: string }>> };
+        expect(rows.rows.map((row) => row[0].raw)).toEqual(['a', 'b', 'c']);
     });
 
     it('fences preview-originated source messages until the current adoption is ACKed', async () => {

@@ -2843,6 +2843,12 @@ export function attach_viewer(
                 return;
             }
             case 'setTransform': {
+                // Synchronized CSV preview relies on display rows retaining their
+                // natural source-row order so visibleRowChanged can index the
+                // source-line map directly. Treat previewMode as a host-side
+                // trust boundary: a stale or injected webview message must not
+                // reach transform admission, the core, or durable state.
+                if (profile.previewMode === true) return;
                 const transform_admission = profile.editing
                     ? begin_transform_admission()
                     : Symbol(file_key);
