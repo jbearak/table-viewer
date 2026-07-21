@@ -523,6 +523,22 @@ interface CompiledFilterGroup {
     readonly predicates: readonly CompiledFilterPredicate[];
 }
 
+/**
+ * A structurally valid filter cannot be evaluated in the exact numeric domain.
+ * Keep this distinct from source/read/cancellation failures: persisted-state
+ * recovery is allowed to discard only this durable preference error.
+ */
+export class InvalidNumericFilterOperandError extends Error {
+    constructor(
+        readonly filterId: string,
+        readonly operator: FilterEntry['operator'],
+        readonly operand: 'value' | 'secondValue',
+    ) {
+        super('Numeric filter values must be finite numbers.');
+        this.name = 'InvalidNumericFilterOperandError';
+    }
+}
+
 const NUMERIC_FILTER_OPERATORS = new Set<FilterEntry['operator']>([
     'equals',
     'notEquals',
@@ -972,13 +988,21 @@ function validate_filter_operands(
     for (const entry of filters) {
         if (!NUMERIC_FILTER_OPERATORS.has(entry.operator)) continue;
         if (!finite_number_text(entry.value)) {
-            throw new Error('Numeric filter values must be finite numbers.');
+            throw new InvalidNumericFilterOperandError(
+                entry.id,
+                entry.operator,
+                'value',
+            );
         }
         if (
             entry.operator === 'between'
             && !finite_number_text(entry.secondValue)
         ) {
-            throw new Error('Numeric filter values must be finite numbers.');
+            throw new InvalidNumericFilterOperandError(
+                entry.id,
+                entry.operator,
+                'secondValue',
+            );
         }
     }
 }

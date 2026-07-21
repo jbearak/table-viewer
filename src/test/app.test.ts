@@ -3520,6 +3520,40 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(empty_mount_id);
     });
 
+    it('does not warn or retry after the host recovers an invalid saved restore', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1']);
+        const invalid = {
+            sort: [], filters: [{
+                id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'bad', caseSensitive: false, enabled: true,
+            }], schema: '["Sheet1",1,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [invalid] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message({
+            type: 'transformApplied', sheetIndex: 0,
+            state: { sort: [], filters: [] }, rowCount: 1,
+            requestId: restore.requestId, generation: 1,
+            sourceGeneration: restore.sourceGeneration, intent: 'restore',
+        });
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((message) => message.type === 'showWarning')).toHaveLength(0);
+
+        post_message.mockClear();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: restore.sourceGeneration,
+            state: { transforms: [undefined] },
+        }));
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((message) => message.type === 'setTransform')).toHaveLength(0);
+        expect(post_message.mock.calls.map((call) => call[0])
+            .filter((message) => message.type === 'showWarning')).toHaveLength(0);
+    });
+
     it.each([
         ['grid shortcut', '.stub-shortcut-transform'],
         ['header menu', '.stub-header-transform'],

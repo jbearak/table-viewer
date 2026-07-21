@@ -8,7 +8,13 @@ import type {
     DataSource,
     RenderedCell,
 } from './data-source/interface';
-import { ViewerPanelCore, adopt_source_into_core, type PanelLike } from './panel-core';
+import {
+    InvalidPersistedTransformError,
+    ViewerPanelCore,
+    adopt_source_into_core,
+    transform_states_equal,
+    type PanelLike,
+} from './panel-core';
 import { PanelSession, type PanelAdoption } from './panel-session';
 import {
     get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib,
@@ -1174,6 +1180,94 @@ export function attach_viewer(
         console.error('Failed to reconcile durable table transforms after a terminal operation');
     }
 
+    /**
+     * Remove one unusable saved transform without granting an old restore
+     * authority over a newer writer. A CAS conflict is re-read and either
+     * retried for the same invalid candidate or adopted as the winner.
+     */
+    type InvalidTransformCleanupResult = 'committed' | 'superseded' | 'failed';
+
+    async function cleanup_invalid_persisted_transform(
+        error: InvalidPersistedTransformError,
+        is_current: () => boolean,
+    ): Promise<InvalidTransformCleanupResult> {
+        for (let attempt = 0; attempt < READY_STATE_REBASE_COUNT; attempt += 1) {
+            if (!is_current()) return 'failed';
+            const cleanup_core = core;
+            if (!cleanup_core) return 'failed';
+            const sheets = cleanup_core.snapshot_material().core.meta.sheets;
+            const sheet = sheets[error.sheetIndex];
+            if (!sheet) return 'failed';
+            const snapshot = await read_file_state(false);
+            if (!is_current() || core !== cleanup_core) return 'failed';
+            const current = normalize_host_state(
+                snapshot.state,
+                sheets.map((candidate) => candidate.name),
+            );
+            const current_transform = sanitize_transform_state(
+                current.transforms?.[error.sheetIndex],
+                sheet.columnCount,
+                transform_schema_for_sheet(sheet),
+            );
+            if (!current_transform
+                || !transform_states_equal(current_transform, error.invalidState)) {
+                if (!disposed && is_current() && core === cleanup_core) {
+                    update_session_state_material(snapshot, false);
+                }
+                return 'superseded';
+            }
+
+            const transforms = [...(current.transforms ?? [])];
+            transforms[error.sheetIndex] = transform_has_entries(error.retainedState)
+                ? {
+                    ...error.retainedState,
+                    sort: error.retainedState.sort.map((key) => ({ ...key })),
+                    filters: error.retainedState.filters.map((entry) => ({ ...entry })),
+                }
+                : undefined;
+            const result = await state_store.compare_and_set(
+                state_path,
+                snapshot.revision,
+                { ...current, transforms },
+                is_current,
+            );
+            if (result.type === 'committed') {
+                observe_durable_transform(result.snapshot);
+                if (!disposed && is_current()) {
+                    update_session_state_material(result.snapshot, false);
+                }
+                return 'committed';
+            }
+            observe_durable_transform(result.snapshot);
+            if (!disposed && is_current() && core === cleanup_core) {
+                update_session_state_material(result.snapshot, false);
+            }
+        }
+        return 'failed';
+    }
+
+    async function cleanup_invalid_restore(
+        message: Extract<WebviewMessage, { type: 'setTransform' }>,
+        error: InvalidPersistedTransformError,
+        receiver_epoch: number,
+    ): Promise<boolean> {
+        const authority = transform_authorities.get(message);
+        if (
+            message.intent !== 'restore'
+            || !authority
+            || authority.receiverEpoch !== receiver_epoch
+        ) return false;
+        const is_current = () => authority.receiverEpoch === receiver_epoch
+            && transform_authority_is_current(message, authority);
+        try {
+            return (await cleanup_invalid_persisted_transform(error, is_current))
+                !== 'failed';
+        } catch (cleanup_error) {
+            console.error('Failed to clear an invalid saved table transform', cleanup_error);
+            return false;
+        }
+    }
+
     async function persist_transform_commit(
         message: Extract<WebviewMessage, { type: 'setTransform' }>,
         state: SheetTransformState,
@@ -1512,7 +1606,10 @@ export function attach_viewer(
                 panel,
                 undefined,
                 next,
-                { onTransformCommit: persist_transform_commit },
+                {
+                    onTransformCommit: persist_transform_commit,
+                    onInvalidRestore: cleanup_invalid_restore,
+                },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
                     const material = installed.snapshot_material();
@@ -2442,6 +2539,7 @@ export function attach_viewer(
                         await Promise.allSettled(older_commit_barriers);
                     }
                     let ready_rebases = 0;
+                    const ready_cleaned_transform_sheets = new Set<number>();
                     while (
                         begun.hasSource
                         && !disposed
@@ -2533,6 +2631,50 @@ export function attach_viewer(
                             if (!update_session_state_material(confirmed, false)) continue;
                             reconciled = ready_core.commit_transform_reconciliation(prepared);
                         } catch (error) {
+                            if (error instanceof InvalidPersistedTransformError) {
+                                const cleanup_is_current = () => !disposed
+                                    && session.ready_epoch_is_current(begun.receiverEpoch)
+                                    && session.current_adoption() === ready_adoption
+                                    && core === ready_core
+                                    && ready_core.source_generation
+                                        === ready_source_generation
+                                    && file_coordinator.state_write_is_current(
+                                        source_authority.authorityRevision,
+                                    );
+                                let cleanup_result: InvalidTransformCleanupResult = 'failed';
+                                try {
+                                    cleanup_result = await cleanup_invalid_persisted_transform(
+                                        error,
+                                        cleanup_is_current,
+                                    );
+                                } catch (cleanup_error) {
+                                    console.error(
+                                        'Failed to clear an invalid saved table transform',
+                                        cleanup_error,
+                                    );
+                                }
+                                // Re-read and prepare the committed state (or a
+                                // concurrent winner); never publish this attempt's
+                                // stale durable material after recovery.
+                                if (cleanup_result !== 'failed') {
+                                    if (cleanup_result === 'committed') {
+                                        // Repairing one independently invalid sheet
+                                        // is forward progress, not external state
+                                        // churn. Credit each sheet once; repeated
+                                        // reintroduction on one sheet must remain
+                                        // bounded by the normal rebase budget.
+                                        if (!ready_cleaned_transform_sheets.has(
+                                            error.sheetIndex,
+                                        )) {
+                                            ready_cleaned_transform_sheets.add(
+                                                error.sheetIndex,
+                                            );
+                                            ready_rebases -= 1;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                             console.error(
                                 'Failed to reconcile table transforms before ready; using retained view',
                                 error,

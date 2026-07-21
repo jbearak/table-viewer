@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ViewerPanelCore, adopt_source_into_core } from '../panel-core';
+import {
+    InvalidPersistedTransformError,
+    ViewerPanelCore,
+    adopt_source_into_core,
+} from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import type { WebviewMessage } from '../types';
 
@@ -688,6 +692,141 @@ describe('ViewerPanelCore', () => {
         expect(applied.error).toContain('column index 99 out of range');
         expect(applied.state).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(generation);
+    });
+
+    it('offers only invalid numeric restores for durable cleanup and suppresses a recovered warning', async () => {
+        const { panel, posted } = make_panel();
+        const failures: InvalidPersistedTransformError[] = [];
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onInvalidRestore: async (_message, error) => {
+                failures.push(error);
+                return true;
+            },
+        });
+        const state = {
+            sort: [],
+            filters: [{
+                id: 'bad', colIndex: 0, operator: 'greaterThan' as const,
+                value: 'nope', caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        };
+
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'restore',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'restore', state,
+        });
+
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toMatchObject({
+            sheetIndex: 0,
+            invalidState: state,
+            retainedState: { sort: [], filters: [] },
+            operandError: { filterId: 'bad', operand: 'value' },
+        });
+        expect(posted.find((message) => message.type === 'transformApplied'))
+            .not.toHaveProperty('error');
+
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'user',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state,
+        });
+        expect(failures).toHaveLength(1);
+        expect(posted.find((message) =>
+            message.type === 'transformApplied' && message.requestId === 'user')?.error)
+            .toContain('finite numbers');
+    });
+
+    it('preserves an installed valid transform when a user submits an invalid numeric filter', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const valid = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        };
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'valid',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: valid,
+        });
+        const installed_generation = core.generation;
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'invalid-user',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [], filters: [{
+                    id: 'bad', colIndex: 0, operator: 'greaterThan', value: 'bad',
+                    caseSensitive: false, enabled: true,
+                }], schema: valid.schema,
+            },
+        });
+
+        const rejected = posted.find((message) =>
+            message.type === 'transformApplied' && message.requestId === 'invalid-user');
+        expect(rejected).toMatchObject({ state: valid });
+        expect(rejected?.error).toContain('finite numbers');
+        expect(core.generation).toBe(installed_generation);
+    });
+
+    it('keeps the prior valid view and reports an invalid restore when cleanup fails', async () => {
+        const { panel, posted } = make_panel();
+        const cleanup = vi.fn(async () => false);
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onInvalidRestore: cleanup,
+        });
+        const valid = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [], schema: '["Sheet1",2,null]',
+        };
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'valid-baseline',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: valid,
+        });
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'failed-restore-cleanup',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'restore', state: {
+                sort: [], filters: [{
+                    id: 'bad', colIndex: 0, operator: 'greaterThan', value: 'bad',
+                    caseSensitive: false, enabled: true,
+                }], schema: valid.schema,
+            },
+        });
+
+        expect(cleanup).toHaveBeenCalledOnce();
+        const failed = posted.find((message) =>
+            message.type === 'transformApplied'
+            && message.requestId === 'failed-restore-cleanup');
+        expect(failed).toMatchObject({ state: valid });
+        expect(failed?.error).toContain('finite numbers');
+    });
+
+    it('does not request invalid-restore cleanup after receiver cancellation', async () => {
+        const { panel, posted } = make_panel();
+        const cleanup = vi.fn(async () => true);
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            onInvalidRestore: cleanup,
+        });
+        core.begin_receiver_epoch(1);
+        const restore = core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'cancelled-restore',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'restore', state: {
+                sort: [], filters: [{
+                    id: 'bad', colIndex: 0, operator: 'greaterThan', value: 'bad',
+                    caseSensitive: false, enabled: true,
+                }], schema: '["Sheet1",2,null]',
+            },
+        });
+        core.begin_receiver_epoch(2);
+        await restore;
+
+        expect(cleanup).not.toHaveBeenCalled();
+        expect(posted.some((message) => message.type === 'transformApplied')).toBe(false);
     });
 
     it('rejects a stale transform request after the source generation changes', async () => {
