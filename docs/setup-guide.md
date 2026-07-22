@@ -6,8 +6,8 @@ You do not need to write code or already use VS Code. VS Code can simply be the 
 
 You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment:
 
-- [Garden Café sample workbook](examples/garden-cafe-sample.xlsx)
-- [Garden Café revised workbook](examples/garden-cafe-revised.xlsx)
+- [Garden Café sample workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-sample.xlsx)
+- [Garden Café revised workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-revised.xlsx)
 
 The two files have the same set of sheets and columns, but the revised version changes quantities, prices, and some row positions. That makes them useful for testing whether your view survives a new delivery.
 
@@ -33,7 +33,7 @@ Installing a downloaded extension is equally fine. Open the [latest Table Viewer
 
 ## 3. Open the sample workbook
 
-Download the [sample workbook](examples/garden-cafe-sample.xlsx), then open it from VS Code with **File → Open File…**. Excel files should open in Table Viewer automatically.
+Download the [sample workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-sample.xlsx), then open it from VS Code with **File → Open File…**. Excel files should open in Table Viewer automatically.
 
 > [!NOTE]
 > Table Viewer registers itself as VS Code's default editor for Excel files, so normally there is nothing to configure. If another Excel viewer is installed, VS Code may ask which editor to use; choose **Table Viewer**. To switch an already-open file, right-click its tab and choose **Reopen Editor With… → Table Viewer**. To change the default later, choose **Configure Default Editor** from that same editor picker.
@@ -78,7 +78,7 @@ This is the part Table Viewer is chiefly meant to make less annoying.
 2. Open `garden-cafe-working.xlsx` in Table Viewer.
 3. On **Coffee Shelf**, resize a column, hide **Origin**, keep the light-roast filter, select a different sheet-tab arrangement, and highlight a cell.
 4. Leave the workbook open in VS Code.
-5. Make a copy of [the revised workbook](examples/garden-cafe-revised.xlsx), rename that copy to `garden-cafe-working.xlsx`, and use it to replace the existing working file in the same folder.
+5. Make a copy of [the revised workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-revised.xlsx), rename that copy to `garden-cafe-working.xlsx`, and use it to replace the existing working file in the same folder.
 
 Table Viewer should refresh automatically. The data will change, while your compatible viewing choices remain in place. The important detail is that the revised workbook replaces the file at the same path; opening it under a different filename creates a separate saved view.
 
