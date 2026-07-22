@@ -11,7 +11,7 @@ VS Code is normally used with a folder open as a **workspace**. That is why its 
 For Table Viewer, the important parts are much simpler:
 
 - The large **editor area** is where each workbook opens in a tab.
-- The **Activity Bar** holds the row or column of icons along an edge of the window.
+- The **Activity Bar** is a strip of shortcuts along one edge of the VS Code window.
 - Selecting an Activity Bar icon opens the **Side Bar**. The file icon opens Explorer, the magnifying glass opens Search, and the blocks icon opens Extensions.
 
 The screenshots in the [setup and try-out guide](setup-guide.md) keep only those three Activity Bar views: Explorer, Search, and Extensions. You may see more icons, and that is completely normal.
