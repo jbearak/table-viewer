@@ -37,9 +37,9 @@ Use whichever route feels most familiar:
 - Drag the file from Finder or File Explorer onto an empty VS Code window.
 
 > [!NOTE]
-> `.xlsx` and `.xls` files open directly in Table Viewer and have the richest viewing support: multiple worksheets, merged cells, number and date formatting, and bold or italic text. They are read-only.
+> `.xlsx`, `.xls`, `.csv`, and `.tsv` files all open directly in Table Viewer by default.
 >
-> `.csv` and `.tsv` files open in VS Code's text editor by default. Use the table icon in the editor title bar, or right-click the tab and choose **Reopen Editor With… → Table Viewer**, for a single unformatted table that you can edit. CSV and TSV also support a synchronized side-by-side preview.
+> The Excel formats have the richest viewing support: multiple worksheets, merged cells, number and date formatting, and bold or italic text. They are read-only. CSV and TSV files are single unformatted tables that you can edit. You can also reopen them in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
 
 VS Code remembers open files when you close and reopen it. A file may therefore still be waiting in its tab the next time you start the app.
 
