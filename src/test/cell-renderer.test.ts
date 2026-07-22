@@ -103,6 +103,21 @@ describe('build_grid_cell — horizontal merges (native span)', () => {
         expect((c as { data: string }).data).toBe('Merged Header');
     });
 
+    it('applies the anchor visual background across the native span', () => {
+        for (const col of [0, 1, 2]) {
+            const c = build_grid_cell(
+                0,
+                col,
+                rows[0],
+                idx,
+                true,
+                { bg: 'rgba(255, 193, 7, 0.24)' },
+            );
+            expect((c as { themeOverride?: { bgCell?: string } }).themeOverride?.bgCell)
+                .toBe('rgba(255, 193, 7, 0.24)');
+        }
+    });
+
     it('covered cells echo the anchor content AND the same span', () => {
         // Critical: a covered column must return the anchor content + span so
         // Glide neither repaints blank over the anchor nor draws an empty span

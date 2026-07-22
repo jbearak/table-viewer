@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkbookMeta } from '../data-source/interface';
+import { cell_highlight_states_equal } from '../cell-highlights';
+import { transform_schema_for_sheet } from '../types';
 import type {
     FileAuthoritySnapshot,
     ProjectionAuthorityCommitReceipt,
@@ -7,6 +9,7 @@ import type {
 import {
     build_workbook_snapshot,
     classify_snapshot,
+    normalize_workbook_snapshot_state,
     type BuildWorkbookSnapshotInput,
     type RetainedSnapshotCommandResult,
     type WorkbookSnapshotIdentity,
@@ -104,6 +107,7 @@ describe('workbook snapshot builder', () => {
             sheets: [{
                 name: 'People',
                 rowCount: 3,
+                sourceRowCount: 3,
                 columnCount: 2,
                 merges: [{ startRow: 0, startCol: 0, endRow: 0, endCol: 1 }],
                 hasFormatting: true,
@@ -143,6 +147,7 @@ describe('workbook snapshot builder', () => {
                 authorityRevision: 2,
                 physicalRevision: 1,
                 projectionRevision: 1,
+                physicalDigest: 'digest',
             },
             state_snapshot: { state, revision: 9 },
             core: { generation: 4, sourceGeneration: 3, meta },
@@ -177,6 +182,7 @@ describe('workbook snapshot builder', () => {
             tabOrientation: null,
             transforms: [undefined],
             columnVisibility: [undefined],
+            cellHighlights: undefined,
             pendingEdits: { '0:0': 'Ada' },
             excelFirstRowHeaders: { People: 'on' },
         });
@@ -188,6 +194,145 @@ describe('workbook snapshot builder', () => {
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
+    });
+
+    it('restores and freezes canonical highlights for the authority digest', () => {
+        const sheet = {
+            name: 'People',
+            rowCount: 2,
+            sourceRowCount: 2,
+            columnCount: 2,
+            merges: [],
+            hasFormatting: false,
+            columnNames: ['Name', 'Age'],
+        };
+        const snapshot = build_workbook_snapshot({
+            deliveryId: 2,
+            canonicalFileId: '/book.xlsx',
+            source: 'observed',
+            authority: {
+                fileKey: '/book.xlsx',
+                commitSequence: 1,
+                authorityRevision: 1,
+                physicalRevision: 1,
+                projectionRevision: 0,
+                physicalDigest: 'digest-1',
+            },
+            state_snapshot: {
+                revision: 3,
+                state: {
+                    cellHighlights: {
+                        sourceDigest: 'digest-1',
+                        sheets: [{
+                            schema: transform_schema_for_sheet(sheet),
+                            cells: { '1:1': 'green', '0:0': 'yellow' },
+                        }],
+                    },
+                },
+            },
+            core: {
+                generation: 1,
+                sourceGeneration: 1,
+                meta: { sheets: [sheet], hasFormatting: false },
+            },
+            presentation: 'initial',
+            reason: 'ready',
+            configuration: {
+                defaultTabOrientation: 'horizontal',
+                previewMode: false,
+            },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' },
+            },
+            diagnostics: { truncationMessage: null },
+        });
+
+        expect(snapshot.state.cellHighlights).toEqual({
+            sourceDigest: 'digest-1',
+            sheets: [{
+                schema: transform_schema_for_sheet(sheet),
+                cells: { '0:0': 'yellow', '1:1': 'green' },
+            }],
+        });
+        expect(Object.isFrozen(snapshot.state.cellHighlights)).toBe(true);
+        expect(Object.isFrozen(snapshot.state.cellHighlights?.sheets[0]?.cells)).toBe(true);
+    });
+});
+
+describe('snapshot state normalization', () => {
+    it('drops stale digests and canonicalizes malformed cells to stable equality', () => {
+        const sheet = {
+            name: 'People',
+            rowCount: 2,
+            sourceRowCount: 2,
+            columnCount: 2,
+            merges: [],
+            hasFormatting: false,
+        };
+        const metadata: WorkbookMeta = { sheets: [sheet], hasFormatting: false };
+        const stored = {
+            cellHighlights: {
+                sourceDigest: 'digest-1',
+                sheets: [{
+                    schema: transform_schema_for_sheet(sheet),
+                    cells: {
+                        '1:1': 'green' as const,
+                        '0:0': 'yellow' as const,
+                        '2:0': 'blue' as const,
+                    },
+                }],
+            },
+        };
+
+        const normalized = normalize_workbook_snapshot_state(
+            stored,
+            metadata,
+            'digest-1',
+        );
+        expect(normalized.cellHighlights?.sheets[0]?.cells).toEqual({
+            '0:0': 'yellow',
+            '1:1': 'green',
+        });
+        const renormalized = normalize_workbook_snapshot_state(normalized, metadata);
+        expect(cell_highlight_states_equal(
+            normalized.cellHighlights,
+            renormalized.cellHighlights,
+        )).toBe(true);
+        expect(normalize_workbook_snapshot_state(
+            stored,
+            metadata,
+            'digest-2',
+        ).cellHighlights).toBeUndefined();
+    });
+
+    it('uses sourceRowCount when projected rowCount is smaller', () => {
+        const sheet = {
+            name: 'People',
+            rowCount: 1,
+            sourceRowCount: 2,
+            columnCount: 1,
+            merges: [],
+            hasFormatting: false,
+        };
+        const metadata = {
+            sheets: [sheet],
+            hasFormatting: false,
+        } as WorkbookMeta;
+        const normalized = normalize_workbook_snapshot_state({
+            cellHighlights: {
+                sourceDigest: 'digest-1',
+                sheets: [{
+                    schema: transform_schema_for_sheet(sheet),
+                    cells: { '1:0': 'pink' },
+                }],
+            },
+        }, metadata, 'digest-1');
+
+        expect(normalized.cellHighlights?.sheets[0]?.cells).toEqual({
+            '1:0': 'pink',
+        });
     });
 });
 

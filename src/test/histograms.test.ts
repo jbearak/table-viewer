@@ -16,7 +16,8 @@ class HistogramSource implements DataSource {
         return {
             hasFormatting: false,
             sheets: [{
-                name: 'Sheet1', rowCount: this.values.length, columnCount: 1,
+                name: 'Sheet1', rowCount: this.values.length,
+                sourceRowCount: this.values.length, columnCount: 1,
                 merges: [], hasFormatting: false,
             }],
         };

@@ -120,7 +120,12 @@ export function build_grid_cell(
             // cell of the span.
             const anchor_cell = cells ? cells[entry.startCol] : undefined;
             if (!anchor_cell) return { ...BLANK, span: [entry.startCol, entry.endCol] };
-            return text_cell(anchor_cell, show_formatting, [entry.startCol, entry.endCol]);
+            return text_cell(
+                anchor_cell,
+                show_formatting,
+                [entry.startCol, entry.endCol],
+                overlay,
+            );
         }
         // rowSpan > 1: the overlay paints content; keep the Glide cell blank.
         return BLANK;

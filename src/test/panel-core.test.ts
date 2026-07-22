@@ -14,7 +14,7 @@ class StubSource implements DataSource {
     meta(): WorkbookMeta {
         return {
             hasFormatting: false,
-            sheets: [{ name: 'Sheet1', rowCount: this.rowCount, columnCount: 2, merges: [], hasFormatting: false }],
+            sheets: [{ name: 'Sheet1', rowCount: this.rowCount, sourceRowCount: this.rowCount, columnCount: 2, merges: [], hasFormatting: false }],
         };
     }
     read_rows(_sheet: number, start: number, count: number): RowWindow {
@@ -64,6 +64,7 @@ class TrackingColumnSource implements DataSource {
             sheets: Array.from({ length: this.sheet_count }, (_, sheet) => ({
                 name: `Sheet${sheet + 1}`,
                 rowCount: this.row_count,
+                sourceRowCount: this.row_count,
                 columnCount: this.column_count,
                 merges: [],
                 hasFormatting: false,

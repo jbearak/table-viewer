@@ -62,11 +62,17 @@ import {
 import { sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 import {
+    cell_highlight_states_equal,
+    rebase_cell_highlight_digest,
+    reconcile_physical_cell_highlights,
+} from './cell-highlights';
+import {
     apply_layout_state_patch,
     derive_layout_state_patch,
 } from './layout-state-patch';
 import {
     complete_normalized_per_file_state,
+    normalize_workbook_snapshot_state,
     type NormalizedPerFileState,
     type WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
@@ -352,6 +358,7 @@ export function attach_viewer(
     const transform_panel_token = Symbol(file_key);
     let active_edit_session_id: string | undefined;
     const excel_header_subscriber_token = Symbol(file_key);
+    const cell_highlight_subscriber_token = Symbol(file_key);
     const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
     let header_receipt_processing = false;
     let header_refresh_scheduled = false;
@@ -1381,6 +1388,7 @@ export function attach_viewer(
         expected_authority_revision: number,
         already_verified = false,
         refresh_event?: FileRefreshEvent,
+        rebase_highlights_from_digest?: string,
     ): Promise<PhysicalAuthorityCommitResult> {
         if (
             !already_verified
@@ -1397,7 +1405,6 @@ export function attach_viewer(
         const planning_input = ds instanceof ExcelHeaderDataSource
             ? ds.planning_input()
             : undefined;
-        const sheet_names = planning_input?.sheets.map((sheet) => sheet.name) ?? [];
         try {
             for (;;) {
                 if (
@@ -1405,11 +1412,28 @@ export function attach_viewer(
                     || !file_coordinator.operation_is_current(token)
                 ) return { type: 'stale' };
                 const state_snapshot = await read_file_state(false);
+                const candidate_meta = ds.meta();
+                const normalized = normalize_host_state(
+                    state_snapshot.state,
+                    candidate_meta.sheets.map((sheet) => sheet.name),
+                );
                 const plan = planning_input
-                    ? plan_excel_candidate_state(
-                        normalize_host_state(state_snapshot.state, sheet_names),
-                        planning_input,
-                    )
+                    ? plan_excel_candidate_state(normalized, planning_input)
+                    : undefined;
+                const planned_state = plan?.state ?? normalized;
+                const highlight_meta = plan?.meta ?? candidate_meta;
+                const next_highlights = reconcile_physical_cell_highlights(
+                    planned_state.cellHighlights,
+                    highlight_meta,
+                    digest,
+                    rebase_highlights_from_digest,
+                );
+                const highlight_state_changed = !cell_highlight_states_equal(
+                    planned_state.cellHighlights,
+                    next_highlights,
+                );
+                const next_state = plan?.changed || highlight_state_changed
+                    ? { ...planned_state, cellHighlights: next_highlights }
                     : undefined;
                 const staged = await stage_authority(
                     durable_state_store,
@@ -1420,7 +1444,7 @@ export function attach_viewer(
                         ordinal: token.ordinal,
                         expectedStateRevision: state_snapshot.revision,
                         expectedCommitSequence: file_coordinator.authority().commitSequence,
-                        nextState: plan?.changed ? plan.state : undefined,
+                        nextState: next_state,
                         physicalDigest: digest,
                     },
                 );
@@ -1457,7 +1481,7 @@ export function attach_viewer(
                     basis: finalizationBasis,
                     expectedStateRevision: state_snapshot.revision,
                     previousState: state_snapshot.state,
-                    nextState: plan?.changed ? plan.state : undefined,
+                    nextState: next_state,
                     physicalDigest: digest,
                 };
                 file_coordinator.start_finalization(requested.turn);
@@ -1582,7 +1606,7 @@ export function attach_viewer(
         candidate: SourceCandidate,
         committed: Extract<PhysicalAuthorityCommitResult, { type: 'committed' }>,
         seq: number,
-        reason: 'ready' | 'fileReload' | 'recovery' = 'fileReload',
+        reason: 'ready' | 'fileReload' | 'recovery' | 'save' = 'fileReload',
         projected_state?: FileStateSnapshot,
         refresh_event?: FileRefreshEvent,
     ): DataSource | undefined {
@@ -1827,6 +1851,37 @@ export function attach_viewer(
         disposables.push(file_coordinator.subscribe_excel_headers(
             enqueue_excel_header_receipt,
         ));
+        disposables.push(file_coordinator.subscribe_cell_highlights((receipt) => {
+            if (disposed) return;
+            const relation = compare_authority(receipt.authority, source_authority);
+            if (relation === 'dominated') return;
+            const source_coordinates_are_compatible = relation === 'equal' || (
+                receipt.authority.physicalDigest === source_authority.physicalDigest
+                && receipt.authority.projectionRevision
+                    === source_authority.projectionRevision
+            );
+            if (!source_coordinates_are_compatible || !source || !core) {
+                void refresh_panel_source(true, 'recovery');
+                return;
+            }
+            const highlights = normalize_workbook_snapshot_state(
+                receipt.stateSnapshot.state,
+                source.meta(),
+                receipt.authority.physicalDigest ?? null,
+            ).cellHighlights;
+            update_session_state_material(receipt.stateSnapshot, false);
+            void post_to_receiver({
+                type: 'cellHighlightsChanged',
+                sheetIndex: receipt.sheetIndex,
+                ...(receipt.originToken === cell_highlight_subscriber_token
+                    ? { requestId: receipt.requestId }
+                    : {}),
+                stateRevision: receipt.stateSnapshot.revision,
+                physicalRevision: receipt.authority.physicalRevision,
+                state: highlights,
+                sourceGeneration: core.source_generation,
+            });
+        }));
     } catch (error) {
         return abort_setup(error);
     }
@@ -2397,6 +2452,8 @@ export function attach_viewer(
             lifecycle: active_lifecycle,
         }, receiver_epoch);
 
+        const saved_bytes = new TextEncoder().encode(content);
+        const saved_digest = content_digest(saved_bytes);
         let post_save_reservation: { cancel(): void } | undefined;
         try {
             await pending_edit_writes.catch(() => {});
@@ -2438,10 +2495,40 @@ export function attach_viewer(
             operation.phase = 'writing';
             // Once this call starts, release/discard/disposal cannot transfer the
             // edit epoch until durable completion and cleanup ownership transfer.
-            await vscode.workspace.fs.writeFile(
-                uri,
-                new TextEncoder().encode(content),
-            );
+            await vscode.workspace.fs.writeFile(uri, saved_bytes);
+
+            // The watcher is reserved across this write and CAS, so no post-save
+            // physical refresh can clear old-digest coordinates between them.
+            const before_rebase = await read_file_state(false);
+            const stored_highlights = (before_rebase.state as PerFileState).cellHighlights;
+            // update_file_state reports a no-op updater as undefined; a
+            // byte-identical save (saved_digest === expected_digest) is such a
+            // no-op and must count as success, not a validator failure.
+            let rebase_was_noop = false;
+            const rebased = stored_highlights?.sourceDigest === expected_digest
+                ? await update_file_state((current) => {
+                    if (!save_operation_is_current(operation)) return current;
+                    const highlights = rebase_cell_highlight_digest(
+                        current.cellHighlights,
+                        saved_digest,
+                        src.meta(),
+                    );
+                    if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
+                        rebase_was_noop = true;
+                        return current;
+                    }
+                    return { ...current, cellHighlights: highlights };
+                }, undefined, () => save_operation_is_current(operation)
+                    && source_authority.authorityRevision === expected_authority
+                    && file_coordinator.state_write_is_current(expected_authority))
+                    ?? (rebase_was_noop ? before_rebase : undefined)
+                : before_rebase;
+            if (!rebased || !save_operation_is_current(operation)) {
+                throw new Error(
+                    'The file was written, but its highlight state could not be rebased safely.',
+                );
+            }
+            update_session_state_material(rebased, false);
         } catch (error) {
             if (active_save_operation !== operation) return;
             active_save_operation = undefined;
@@ -2825,6 +2912,100 @@ export function attach_viewer(
                     });
                 } else if (result.type === 'rejected' && !disposed) {
                     fail(result.error);
+                }
+                return;
+            }
+            case 'applyCellHighlights': {
+                const message = structuredClone(msg);
+                const receiver_epoch = session.current_receiver_epoch;
+                const command_core = core;
+                const command_source = source;
+                const expected_authority = source_authority.authorityRevision;
+                const expected_physical_revision = source_authority.physicalRevision;
+                const expected_physical_digest = source_authority.physicalDigest;
+                const command_is_current = () => {
+                    const acknowledged = session.acknowledged_identity();
+                    return !disposed
+                        && profile.previewMode !== true
+                        && command_core !== undefined
+                        && command_source !== undefined
+                        && core === command_core
+                        && source === command_source
+                        && session.current_receiver_epoch === receiver_epoch
+                        && acknowledged !== undefined
+                        && same_snapshot_identity(message.snapshotIdentity, acknowledged)
+                        && message.generation === command_core.generation
+                        && message.sourceGeneration === command_core.source_generation
+                        && message.snapshotIdentity.authority.revision === expected_authority
+                        && message.snapshotIdentity.sourceBasis.physicalRevision
+                            === expected_physical_revision
+                        && source_authority.authorityRevision === expected_authority
+                        && source_authority.physicalRevision === expected_physical_revision
+                        && source_authority.physicalDigest === expected_physical_digest
+                        && file_coordinator.state_write_is_current(expected_authority);
+                };
+                const reject_highlight_command = async (error: string) => {
+                    let state = undefined;
+                    let state_revision = message.snapshotIdentity.stateRevision;
+                    const current_authority = file_coordinator.authority();
+                    const current_source = source ?? command_source;
+                    if (current_source && current_authority.physicalDigest) {
+                        try {
+                            const current = await read_file_state(false);
+                            state_revision = current.revision;
+                            state = normalize_workbook_snapshot_state(
+                                current.state,
+                                current_source.meta(),
+                                current_authority.physicalDigest,
+                            ).cellHighlights;
+                        } catch {
+                            // Return the latest known authority envelope when the
+                            // current durable state cannot be inspected safely.
+                        }
+                    }
+                    if (disposed || session.current_receiver_epoch !== receiver_epoch) return;
+                    void post_to_receiver({
+                        type: 'cellHighlightsChanged',
+                        sheetIndex: message.sheetIndex,
+                        requestId: message.requestId,
+                        stateRevision: state_revision,
+                        physicalRevision: current_authority.physicalRevision,
+                        state,
+                        sourceGeneration: core?.source_generation
+                            ?? command_core?.source_generation
+                            ?? message.sourceGeneration,
+                        error,
+                    }, receiver_epoch);
+                };
+                if (
+                    !command_source
+                    || !command_core
+                    || !expected_physical_digest
+                    || !command_is_current()
+                ) {
+                    await reject_highlight_command(
+                        profile.previewMode === true
+                            ? 'Cell highlights cannot be changed from a preview.'
+                            : 'The workbook changed before the highlight request arrived.',
+                    );
+                    return;
+                }
+                const result = await file_coordinator.apply_cell_highlights({
+                    ...message,
+                    originToken: cell_highlight_subscriber_token,
+                    expectedAuthorityRevision: expected_authority,
+                    expectedPhysicalRevision: expected_physical_revision,
+                    expectedPhysicalDigest: expected_physical_digest,
+                    meta: command_source.meta(),
+                    stateStore: durable_state_store,
+                    isCurrent: command_is_current,
+                    mapDisplayRowsToSource: (sheet_index, display_rows) =>
+                        command_core.map_display_rows_to_source(sheet_index, display_rows),
+                    displayRowForSource: (sheet_index, source_row) =>
+                        command_core.display_row_for_source(sheet_index, source_row),
+                });
+                if (result.type === 'rejected') {
+                    await reject_highlight_command(result.error);
                 }
                 return;
             }

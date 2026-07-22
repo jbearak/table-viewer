@@ -5,10 +5,12 @@ import type {
 } from './file-coordinator';
 import type { FileStateSnapshot } from './state';
 import { deep_clone_and_freeze } from './immutable';
+import { sanitize_cell_highlight_state } from './cell-highlights';
 import {
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
     transform_schema_for_sheet,
+    type CellHighlightState,
     type CsvSaveLifecycle,
     type PerFileState,
     type ScrollPosition,
@@ -85,6 +87,7 @@ export interface NormalizedPerFileState extends PerFileState {
     tabOrientation: 'horizontal' | 'vertical' | null;
     transforms: NonNullable<PerFileState['transforms']>;
     columnVisibility: NonNullable<PerFileState['columnVisibility']>;
+    cellHighlights?: CellHighlightState;
 }
 
 export interface WorkbookSnapshot {
@@ -169,6 +172,7 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,
+            authority.physicalDigest ?? null,
         ),
         configuration: input.configuration,
         capabilities: input.capabilities,
@@ -266,6 +270,7 @@ export function complete_normalized_per_file_state(
 export function normalize_workbook_snapshot_state(
     stored: StoredPerFileState,
     meta: WorkbookMeta,
+    expected_digest?: string | null,
 ): NormalizedPerFileState {
     const normalized = complete_normalized_per_file_state(
         stored,
@@ -283,9 +288,17 @@ export function normalize_workbook_snapshot_state(
             sheet.columnCount,
             transform_schema_for_sheet(sheet),
         ));
+    const cell_highlights = expected_digest === null
+        ? undefined
+        : sanitize_cell_highlight_state(
+            normalized.cellHighlights,
+            meta,
+            expected_digest,
+        );
     return {
         ...normalized,
         transforms,
         columnVisibility: column_visibility,
+        cellHighlights: cell_highlights,
     };
 }

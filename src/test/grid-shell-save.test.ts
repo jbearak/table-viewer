@@ -38,13 +38,14 @@ vi.mock('../webview/use-row-loader', () => ({
             { raw: row === 0 ? 'middle' : '', formatted: row === 0 ? 'middle' : '', bold: false, italic: false },
             { raw: row === 0 ? 'source-two' : '', formatted: row === 0 ? 'source-two' : '', bold: false, italic: false },
         ],
+        get_source_row: (row: number) => row,
         sample_loaded_rows: () => [],
         version: 0,
     }),
 }));
 
 vi.mock('../webview/vscode-theme', () => ({
-    use_vscode_theme: () => ({}),
+    use_vscode_theme: () => ({ theme: {}, highContrast: false }),
 }));
 
 vi.mock('../webview/merge-overlay', () => ({
@@ -102,6 +103,7 @@ async function render_grid(
         sheet_meta: {
             name: 'Sheet1',
             rowCount: 1,
+            sourceRowCount: 1,
             columnCount: 3,
             merges: [],
             hasFormatting: false,

@@ -15,6 +15,7 @@ import {
 import { FilterStrip } from './filter-strip';
 import { SortStrip } from './sort-strip';
 import { use_toolbar_wrap } from './use-toolbar-wrap';
+import { HighlightControl, type HighlightControlProps } from './highlight-control';
 
 export interface ToolbarFocusHandle {
     focus(): boolean;
@@ -49,6 +50,7 @@ export interface ToolbarProps {
     on_toggle_tab_orientation: () => void;
     show_vertical_tabs_button: boolean;
     column_visibility: ColumnVisibilityControlProps;
+    highlight?: HighlightControlProps;
     auto_fit_active: boolean;
     on_toggle_auto_fit: () => void;
     auto_fit_disabled?: boolean;
@@ -101,6 +103,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             props.transform_progress,
             props.merges_flattened,
             props.column_visibility.hidden_count,
+            props.highlight?.active_color,
+            props.highlight?.selection_available,
+            props.highlight?.pending,
             props.show_formatting_button,
             props.show_excel_header_button,
             props.excel_header_active,
@@ -206,6 +211,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ref={columns_ref}
                     {...props.column_visibility}
                 />
+                {props.highlight && <HighlightControl {...props.highlight} />}
                 <ToolbarButton
                     label="Auto-fit Columns"
                     active={props.auto_fit_active}

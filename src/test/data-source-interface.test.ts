@@ -15,7 +15,7 @@ describe('data-source interface shapes', () => {
     it('WorkbookMeta nests SheetMeta with merges', () => {
         const meta: WorkbookMeta = {
             hasFormatting: false,
-            sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
+            sheets: [{ name: 'Sheet1', rowCount: 3, sourceRowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
         };
         const s: SheetMeta = meta.sheets[0];
         expect(s.rowCount).toBe(3);
@@ -55,8 +55,8 @@ describe('data-source interface shapes', () => {
             meta: () => ({
                 hasFormatting: false,
                 sheets: [{
-                    name: 'Sheet1', rowCount: 200, columnCount: 1,
-                    merges: [], hasFormatting: false,
+                    name: 'Sheet1', rowCount: 200, sourceRowCount: 200,
+                    columnCount: 1, merges: [], hasFormatting: false,
                 }],
             }),
             read_rows: (_sheet, start, count) => {
@@ -93,8 +93,8 @@ describe('data-source interface shapes', () => {
             meta: () => ({
                 hasFormatting: false,
                 sheets: [{
-                    name: 'Sheet1', rowCount: 2, columnCount: 0,
-                    merges: [], hasFormatting: false,
+                    name: 'Sheet1', rowCount: 2, sourceRowCount: 2,
+                    columnCount: 0, merges: [], hasFormatting: false,
                 }],
             }),
             read_rows: () => { calls += 1; return { startRow: 0, rows: [] }; },

@@ -1,5 +1,9 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
-import { read_source_columns, read_source_rows_indexed } from './data-source/interface';
+import {
+    read_source_columns,
+    read_source_row_indices,
+    read_source_rows_indexed,
+} from './data-source/interface';
 import type {
     FilterEntry,
     SheetTransformState,
@@ -830,20 +834,42 @@ function build_numeric_filter_row_key(
     return build_numeric_sort_key(raw);
 }
 
+export interface TransformedRowWindow {
+    startRow: number;
+    rows: (RenderedCell | null)[][];
+    /** Canonical physical source row for each entry in rows. */
+    sourceRows: number[];
+}
+
 export function transformed_window(
     source: DataSource,
     sheet_index: number,
     start_row: number,
     count: number,
     indices: Uint32Array | undefined,
-): { startRow: number; rows: (RenderedCell | null)[][] } {
-    if (!indices) return source.read_rows(sheet_index, start_row, count);
+): TransformedRowWindow {
+    if (!indices) {
+        const window = source.read_rows(sheet_index, start_row, count);
+        const projected_rows = Uint32Array.from(
+            { length: window.rows.length },
+            (_, offset) => window.startRow + offset,
+        );
+        return {
+            ...window,
+            sourceRows: Array.from(
+                read_source_row_indices(source, sheet_index, projected_rows),
+            ),
+        };
+    }
     const start = Math.max(0, Math.min(start_row, indices.length));
     const end = Math.min(start + Math.max(0, count), indices.length);
-    const source_rows = indices.subarray(start, end);
+    const logical_rows = indices.subarray(start, end);
     return {
         startRow: start,
-        rows: read_source_rows_indexed(source, sheet_index, source_rows).rows,
+        rows: read_source_rows_indexed(source, sheet_index, logical_rows).rows,
+        sourceRows: Array.from(
+            read_source_row_indices(source, sheet_index, logical_rows),
+        ),
     };
 }
 

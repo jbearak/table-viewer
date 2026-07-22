@@ -35,6 +35,7 @@ class PhysicalSource implements DataSource {
             sheets: [{
                 name: this.name,
                 rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
                 columnCount: 2,
                 merges: [],
                 hasFormatting: false,
@@ -78,6 +79,10 @@ describe('pure Excel header state planning', () => {
                 schema: old_schema,
             }],
             columnVisibility: [{ hiddenColumns: [1], schema: old_schema }],
+            cellHighlights: {
+                sourceDigest: 'digest',
+                sheets: [{ schema: old_schema, cells: { '1:1': 'yellow' } }],
+            },
         };
 
         const plan = plan_excel_override_state(current, ds.planning_input(), 0, 'People', to)!;
@@ -91,6 +96,10 @@ describe('pure Excel header state planning', () => {
         const new_schema = transform_schema_for_sheet(plan.newSheet);
         expect(plan.state.transforms?.[0]?.schema).toBe(new_schema);
         expect(plan.state.columnVisibility?.[0]?.schema).toBe(new_schema);
+        expect(plan.state.cellHighlights?.sheets[0]).toEqual({
+            schema: new_schema,
+            cells: { '1:1': 'yellow' },
+        });
     });
 
     it('performs the first feature migration and preserves widths', () => {
@@ -216,7 +225,8 @@ describe('pure Excel header state planning', () => {
 
     it('does not migrate descriptors when sheet identity or count differs', () => {
         const old_sheet: SheetMeta = {
-            name: 'People', rowCount: 2, columnCount: 2, merges: [], hasFormatting: false,
+            name: 'People', rowCount: 2, sourceRowCount: 2,
+            columnCount: 2, merges: [], hasFormatting: false,
         };
         const entry = [{ sort: [], filters: [], schema: transform_schema_for_sheet(old_sheet) }];
         const renamed = { ...old_sheet, name: 'Renamed' };

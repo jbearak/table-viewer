@@ -21,7 +21,7 @@ type AssertNever<T extends never> = T;
 describe('paginated protocol message shapes', () => {
     const meta: WorkbookMeta = {
         hasFormatting: false,
-        sheets: [{ name: 'Sheet1', rowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
+        sheets: [{ name: 'Sheet1', rowCount: 3, sourceRowCount: 3, columnCount: 2, merges: [], hasFormatting: false }],
     };
 
     it('fences lazy histogram requests and results by full source coordinates', () => {
@@ -115,6 +115,7 @@ describe('paginated protocol message shapes', () => {
                     tabOrientation: null,
                     transforms: [],
                     columnVisibility: [],
+                    cellHighlights: undefined,
                 },
                 configuration: {
                     defaultTabOrientation: 'horizontal',
@@ -172,6 +173,7 @@ describe('paginated protocol message shapes', () => {
             sheetIndex: 0,
             startRow: 100,
             rows: [[cell, null]],
+            sourceRows: [147],
             requestId: 'req-1',
             generation: 3,
         };
@@ -180,6 +182,7 @@ describe('paginated protocol message shapes', () => {
             expect(msg.startRow).toBe(100);
             expect(msg.rows[0][0]?.raw).toBe('a');
             expect(msg.rows[0][1]).toBeNull();
+            expect(msg.sourceRows).toEqual([147]);
             expect(msg.requestId).toBe('req-1');
         }
     });
@@ -284,6 +287,39 @@ describe('paginated protocol message shapes', () => {
             : false;
         const proof: MissingIdentityIsAccepted = false;
         expect(proof).toBe(false);
+    });
+
+    it('uses compact cell highlight commands and authoritative change responses', () => {
+        const command: WebviewMessage = {
+            type: 'applyCellHighlights',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            selection: {
+                displayRows: [{ start: 2, end: 8 }, { start: 11, end: 11 }],
+                sourceColumns: [0, 2],
+            },
+            mutation: { type: 'set', color: 'pink' },
+            requestId: 'highlight:1',
+            generation: 5,
+            sourceGeneration: 4,
+            snapshotIdentity: {
+                deliveryId: 12,
+                authority: { fileId: 'file:people.xlsx', revision: 9 },
+                stateRevision: 44,
+                sourceBasis: { physicalRevision: 7, projectionRevision: 2 },
+            },
+        };
+        const response: HostMessage = {
+            type: 'cellHighlightsChanged',
+            sheetIndex: 0,
+            requestId: 'highlight:1',
+            stateRevision: 45,
+            physicalRevision: 7,
+            state: undefined,
+            sourceGeneration: 4,
+        };
+        expect(command.selection.displayRows).toHaveLength(2);
+        expect(response.requestId).toBe(command.requestId);
     });
 
     it('WebviewMessage carries a requestRows variant', () => {

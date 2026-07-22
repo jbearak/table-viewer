@@ -73,6 +73,19 @@ describe('sheet-state helpers', () => {
         ]);
     });
 
+    it('preserves cell highlights through unrelated sheet-state normalization', () => {
+        const cellHighlights = {
+            sourceDigest: 'digest',
+            sheets: [{ schema: 'schema', cells: { '2:1': 'yellow' as const } }],
+        };
+        const normalized = normalize_per_file_state({
+            rowHeights: [{ 0: 42 }],
+            cellHighlights,
+        }, ['Sheet1']);
+        expect(normalized.cellHighlights).toBe(cellHighlights);
+        expect(normalized.rowHeights).toEqual([{ 0: 42 }]);
+    });
+
     it('trims index-keyed arrays without re-keying by sheet name', () => {
         expect(
             trim_sheet_state_array([{ 0: 100 }, undefined, { 1: 80 }], 2)

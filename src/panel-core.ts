@@ -1,4 +1,8 @@
-import type { DataSource, RowWindow } from './data-source/interface';
+import type { DataSource } from './data-source/interface';
+import {
+    projected_row_for_source,
+    read_source_row_indices,
+} from './data-source/interface';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram } from './histograms';
 import {
@@ -7,6 +11,7 @@ import {
     transformed_window,
     type CachedTransformColumn,
     type TransformColumnCache,
+    type TransformedRowWindow,
 } from './table-transform';
 import type {
     WorkbookSnapshotCoreMaterial,
@@ -16,6 +21,7 @@ import {
     EMPTY_TRANSFORM,
     transform_is_active,
     transform_schema_for_sheet,
+    type DisplayRowInterval,
     type FilterColumnKind,
     type HistogramBin,
     type HostMessage,
@@ -160,10 +166,12 @@ export interface PreparedTransformReconciliation {
  */
 export class ViewerPanelCore {
     private _generation = 1;
-    private readonly cache = new Map<string, RowWindow>();
+    private readonly cache = new Map<string, TransformedRowWindow>();
     private readonly max_cached_pages: number;
     private readonly transform_column_cache: TransformColumnLruCache;
     private readonly transform_indices = new Map<number, Uint32Array>();
+    /** Projected source-row -> display-row, built lazily for transformed views. */
+    private readonly inverse_transform_indices = new Map<number, Int32Array>();
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
@@ -211,6 +219,75 @@ export class ViewerPanelCore {
         return [...this.transform_states.values()].some(transform_is_active);
     }
 
+    /** Map inclusive installed display-row intervals to canonical source rows. */
+    map_display_rows_to_source(
+        sheet_index: number,
+        intervals: readonly DisplayRowInterval[],
+    ): Uint32Array {
+        const sheet = this.source.meta().sheets[sheet_index];
+        if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+        const indices = this.transform_indices.get(sheet_index);
+        const display_count = indices?.length ?? sheet.rowCount;
+        let mapped_count = 0;
+        for (const interval of intervals) {
+            if (
+                !Number.isInteger(interval.start)
+                || !Number.isInteger(interval.end)
+                || interval.start < 0
+                || interval.end < interval.start
+                || interval.end >= display_count
+            ) {
+                throw new RangeError(
+                    `display row interval ${interval.start}-${interval.end} out of range (${display_count} rows)`,
+                );
+            }
+            mapped_count += interval.end - interval.start + 1;
+        }
+
+        const projected_rows = new Uint32Array(mapped_count);
+        let position = 0;
+        for (const interval of intervals) {
+            for (let display_row = interval.start; display_row <= interval.end; display_row++) {
+                projected_rows[position++] = indices ? indices[display_row] : display_row;
+            }
+        }
+        return read_source_row_indices(this.source, sheet_index, projected_rows);
+    }
+
+    /** Map a canonical source row into the installed display view. */
+    display_row_for_source(
+        sheet_index: number,
+        source_row: number,
+    ): number | undefined {
+        const sheet = this.source.meta().sheets[sheet_index];
+        if (
+            !sheet
+            || !Number.isInteger(source_row)
+            || source_row < 0
+            || source_row >= sheet.sourceRowCount
+        ) return undefined;
+        const projected_row = projected_row_for_source(
+            this.source,
+            sheet_index,
+            source_row,
+        );
+        if (projected_row === undefined) return undefined;
+        const indices = this.transform_indices.get(sheet_index);
+        if (!indices) return projected_row;
+
+        let inverse = this.inverse_transform_indices.get(sheet_index);
+        if (!inverse) {
+            inverse = new Int32Array(sheet.rowCount);
+            inverse.fill(-1);
+            for (let display_row = 0; display_row < indices.length; display_row++) {
+                inverse[indices[display_row]] = display_row;
+            }
+            this.inverse_transform_indices.set(sheet_index, inverse);
+        }
+        const display_row = inverse[projected_row];
+        return display_row >= 0 ? display_row : undefined;
+    }
+
     /**
      * Invalidate unfinished work owned by an older webview receiver without
      * disturbing transforms that were already installed for the current source.
@@ -232,6 +309,7 @@ export class ViewerPanelCore {
         this._generation += 1;
         this._source_generation += 1;
         this.transform_indices.clear();
+        this.inverse_transform_indices.clear();
         this.transform_states.clear();
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
@@ -270,6 +348,7 @@ export class ViewerPanelCore {
         this.disposed = true;
         this.cancel_pending();
         this.transform_indices.clear();
+        this.inverse_transform_indices.clear();
         this.transform_states.clear();
         this.histogram_cache.clear();
         this.transform_column_cache.clear();
@@ -460,6 +539,7 @@ export class ViewerPanelCore {
             } else {
                 this.transform_indices.delete(change.sheetIndex);
             }
+            this.inverse_transform_indices.delete(change.sheetIndex);
             this.transform_states.set(change.sheetIndex, clone_transform(change.state));
             this._generation += 1;
         }
@@ -632,6 +712,7 @@ export class ViewerPanelCore {
             } else {
                 this.transform_indices.delete(msg.sheetIndex);
             }
+            this.inverse_transform_indices.delete(msg.sheetIndex);
             this.transform_states.set(msg.sheetIndex, clone_transform(msg.state));
             this._generation += 1;
             this.cache.clear();
@@ -763,7 +844,7 @@ export class ViewerPanelCore {
                 // sheetIndex). Answer with an empty window instead of leaving the
                 // webview's request unresolved. The error is deterministic for a
                 // given key, so caching the empty result is safe.
-                window = { startRow: start_row, rows: [] };
+                window = { startRow: start_row, rows: [], sourceRows: [] };
             }
             this.cache.set(key, window);
             this.evict_excess();
@@ -774,6 +855,7 @@ export class ViewerPanelCore {
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
             rows: window.rows,
+            sourceRows: window.sourceRows,
             requestId: msg.requestId,
             generation: this._generation,
         });

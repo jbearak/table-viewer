@@ -21,8 +21,17 @@ function row_data(
     generation: number,
     requestId: string,
     count = PAGE_SIZE,
+    sourceRows = Array.from({ length: count }, (_, i) => startRow + i),
 ): RowData {
-    return { type: 'rowData', sheetIndex, startRow, rows: make_page(startRow, count), requestId, generation };
+    return {
+        type: 'rowData',
+        sheetIndex,
+        startRow,
+        rows: make_page(startRow, count),
+        sourceRows,
+        requestId,
+        generation,
+    };
 }
 
 function last_request(post: ReturnType<typeof vi.fn>, startRow?: number): RequestRows {
@@ -96,6 +105,67 @@ describe('RowLoader', () => {
         expect(post).toHaveBeenCalledTimes(1);
     });
 
+    it('keeps rendered rows aligned with their canonical source-row identities', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn());
+        loader.configure(0, 1000, 1);
+        loader.ensure_rows(0, 10);
+
+        const reply = row_data(
+            0,
+            0,
+            1,
+            last_request(post).requestId,
+            3,
+            [42, 7, 99],
+        );
+        expect(loader.on_row_data(reply)).toBe(true);
+        expect(loader.get_row(1)?.[0]?.raw).toBe('r1c0');
+        expect(loader.get_source_row(0)).toBe(42);
+        expect(loader.get_source_row(1)).toBe(7);
+        expect(loader.get_source_row(2)).toBe(99);
+        expect(loader.get_source_row(3)).toBeUndefined();
+    });
+
+    it('rejects mismatched rows and sourceRows atomically without consuming the request', () => {
+        const post = vi.fn();
+        const on_change = vi.fn();
+        const loader = new RowLoader(post, on_change);
+        loader.configure(0, 1000, 1);
+        loader.ensure_rows(0, 10);
+        const request_id = last_request(post).requestId;
+
+        expect(loader.on_row_data(row_data(0, 0, 1, request_id, 3, [10, 11]))).toBe(false);
+        expect(loader.page_count).toBe(0);
+        expect(loader.get_row(0)).toBeUndefined();
+        expect(loader.get_source_row(0)).toBeUndefined();
+        expect(on_change).not.toHaveBeenCalled();
+
+        expect(loader.on_row_data(row_data(0, 0, 1, request_id, 3, [10, 11, 12]))).toBe(true);
+        expect(loader.get_row(0)).toBeDefined();
+        expect(loader.get_source_row(0)).toBe(10);
+        expect(on_change).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects malformed source-row identities without consuming the request', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn());
+        loader.configure(0, 1000, 1);
+        loader.ensure_rows(0, 10);
+        const request_id = last_request(post).requestId;
+
+        expect(loader.on_row_data(row_data(0, 0, 1, request_id, 1, [-1]))).toBe(false);
+        expect(loader.get_row(0)).toBeUndefined();
+        expect(loader.get_source_row(0)).toBeUndefined();
+
+        const sparse_source_rows = new Array<number>(1);
+        expect(loader.on_row_data(row_data(0, 0, 1, request_id, 1, sparse_source_rows))).toBe(false);
+        expect(loader.get_row(0)).toBeUndefined();
+        expect(loader.get_source_row(0)).toBeUndefined();
+
+        expect(loader.on_row_data(row_data(0, 0, 1, request_id, 1, [25]))).toBe(true);
+    });
+
     it('drops rowData from a stale generation', () => {
         const post = vi.fn();
         const on_change = vi.fn();
@@ -123,9 +193,11 @@ describe('RowLoader', () => {
         loader.ensure_rows(0, 10);
         loader.on_row_data(reply_for(post, 0, 0, 1));
         expect(loader.get_row(0)).toBeDefined();
+        expect(loader.get_source_row(0)).toBe(0);
 
         loader.configure(1, 1000, 1); // sheet switch
         expect(loader.get_row(0)).toBeUndefined();
+        expect(loader.get_source_row(0)).toBeUndefined();
         loader.ensure_rows(0, 10);
         const last = post.mock.calls.at(-1)![0] as RequestRows;
         expect(last.sheetIndex).toBe(1);
@@ -138,9 +210,11 @@ describe('RowLoader', () => {
         loader.ensure_rows(0, 10);
         loader.on_row_data(reply_for(post, 0, 0, 1));
         expect(loader.get_row(0)).toBeDefined();
+        expect(loader.get_source_row(0)).toBe(0);
 
         loader.configure(0, 1000, 2); // reload bumps generation
         expect(loader.get_row(0)).toBeUndefined();
+        expect(loader.get_source_row(0)).toBeUndefined();
     });
 
     it('re-requests the current visible region after a generation bump', () => {
@@ -215,10 +289,35 @@ describe('RowLoader', () => {
             loader.on_row_data(reply_for(post, 0, start, 1));
         }
         expect(loader.page_count).toBe(3);
-        // Page 0 (oldest, not in viewport) was evicted.
+        // Page 0 (oldest, not in viewport) and its identities were evicted together.
         expect(loader.get_row(0)).toBeUndefined();
-        // The current viewport page survives.
+        expect(loader.get_source_row(0)).toBeUndefined();
+        // The current viewport page and its aligned identity survive.
         expect(loader.get_row(300)).toBeDefined();
+        expect(loader.get_source_row(300)).toBe(300);
+    });
+
+    it('touches a resident page as one LRU unit with its source-row identities', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn(), 2);
+        loader.configure(0, 100_000, 1);
+
+        for (const start of [0, 100]) {
+            loader.ensure_rows(start, start + 10);
+            const request_id = last_request(post, start).requestId;
+            loader.on_row_data(row_data(0, start, 1, request_id, 2, [start + 1000, start + 1001]));
+        }
+
+        loader.ensure_rows(0, 10); // Touch page 0; page 100 becomes least-recently-used.
+        loader.ensure_rows(200, 210);
+        loader.on_row_data(row_data(0, 200, 1, last_request(post, 200).requestId, 2, [1200, 1201]));
+
+        expect(loader.get_row(0)).toBeDefined();
+        expect(loader.get_source_row(0)).toBe(1000);
+        expect(loader.get_row(100)).toBeUndefined();
+        expect(loader.get_source_row(100)).toBeUndefined();
+        expect(loader.get_row(200)).toBeDefined();
+        expect(loader.get_source_row(200)).toBe(1200);
     });
 
     it('does not request pages past the row count', () => {

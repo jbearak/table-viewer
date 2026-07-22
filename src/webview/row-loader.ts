@@ -4,6 +4,12 @@ import { PAGE_SIZE, get_needed_page_starts } from './grid-model';
 
 type PostFn = (msg: WebviewMessage) => void;
 type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
+type Row = (RenderedCell | null)[];
+
+interface CachedPage {
+    readonly rows: Row[];
+    readonly source_rows: number[];
+}
 
 let next_loader_id = 0;
 
@@ -21,7 +27,7 @@ let next_loader_id = 0;
  *   evicted so the visible region always has a chance to stay resident.
  */
 export class RowLoader {
-    private readonly pages = new Map<number, (RenderedCell | null)[][]>();
+    private readonly pages = new Map<number, CachedPage>();
     private readonly pending = new Map<number, string>();
     private readonly loader_id = ++next_loader_id;
     private _generation = 1;
@@ -106,15 +112,28 @@ export class RowLoader {
         }
     }
 
-    /** Ingest a host `rowData` reply. Returns false (and ignores) when stale. */
+    /** Ingest a host `rowData` reply. Returns false (and ignores) when stale or malformed. */
     on_row_data(msg: RowDataMsg): boolean {
         if (msg.generation !== this._generation) return false;
         if (msg.sheetIndex !== this.sheet_index) return false;
         const start = msg.startRow;
         if (this.pending.get(start) !== msg.requestId) return false;
+        if (!Array.isArray(msg.rows) || !Array.isArray(msg.sourceRows)) return false;
+        if (msg.rows.length !== msg.sourceRows.length) return false;
+        for (let i = 0; i < msg.rows.length; i++) {
+            if (!(i in msg.rows) || !(i in msg.sourceRows)) return false;
+            if (!Array.isArray(msg.rows[i])) return false;
+            const source_row = msg.sourceRows[i];
+            if (!Number.isSafeInteger(source_row) || source_row < 0) return false;
+        }
+
+        const page: CachedPage = {
+            rows: msg.rows,
+            source_rows: msg.sourceRows,
+        };
         this.pending.delete(start);
         this.pages.delete(start); // re-insert to mark most-recently-used
-        this.pages.set(start, msg.rows);
+        this.pages.set(start, page);
         this.evict();
         this.on_change();
         return true;
@@ -125,30 +144,41 @@ export class RowLoader {
      * (column auto-fit measures loaded text only — it never forces a fetch).
      * Rows past `row_count` in a partial final page are excluded.
      */
-    sample_loaded_rows(max: number): (RenderedCell | null)[][] {
-        const out: (RenderedCell | null)[][] = [];
+    sample_loaded_rows(max: number): Row[] {
+        const out: Row[] = [];
         for (const [start, page] of this.pages) {
-            for (let i = 0; i < page.length; i++) {
+            for (let i = 0; i < page.rows.length; i++) {
                 if (out.length >= max) return out;
                 const abs = start + i;
                 if (this.row_count > 0 && abs >= this.row_count) break;
-                out.push(page[i]);
+                out.push(page.rows[i]);
             }
         }
         return out;
     }
 
-    /** Cells for an absolute row, or undefined while its page is loading. */
-    get_row(row: number): (RenderedCell | null)[] | undefined {
-        const start = Math.floor(row / PAGE_SIZE) * PAGE_SIZE;
-        const page = this.pages.get(start);
-        if (page === undefined) return undefined;
-        return page[row - start];
+    /** Cells for an absolute display row, or undefined while its page is loading. */
+    get_row(row: number): Row | undefined {
+        const location = this.locate(row);
+        return location?.page.rows[location.offset];
+    }
+
+    /** Canonical source-row identity for an absolute display row, when resident. */
+    get_source_row(row: number): number | undefined {
+        const location = this.locate(row);
+        return location?.page.source_rows[location.offset];
     }
 
     clear(): void {
         this.pages.clear();
         this.pending.clear();
+    }
+
+    private locate(row: number): { page: CachedPage; offset: number } | undefined {
+        const start = Math.floor(row / PAGE_SIZE) * PAGE_SIZE;
+        const page = this.pages.get(start);
+        if (page === undefined) return undefined;
+        return { page, offset: row - start };
     }
 
     private touch(start: number): void {

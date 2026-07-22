@@ -9,6 +9,8 @@ export { RowLoader };
 export interface UseRowLoader {
     ensure_rows(start_row: number, end_row: number): void;
     get_row(row: number): (RenderedCell | null)[] | undefined;
+    /** Canonical source-row identity for a resident display row. */
+    get_source_row(row: number): number | undefined;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
@@ -42,7 +44,9 @@ export function use_row_loader(
 
     useEffect(() => {
         const handler = (e: MessageEvent) => {
-            const msg = e.data as HostMessage;
+            const data: unknown = e.data;
+            if (data === null || typeof data !== 'object') return;
+            const msg = data as HostMessage;
             if (msg.type === 'rowData') loader.on_row_data(msg);
         };
         window.addEventListener('message', handler);
@@ -51,11 +55,13 @@ export function use_row_loader(
 
     const ensure_rows = useCallback((s: number, en: number) => loader.ensure_rows(s, en), [loader]);
     const get_row = useCallback((r: number) => loader.get_row(r), [loader]);
+    const get_source_row = useCallback((r: number) => loader.get_source_row(r), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
         ensure_rows,
         get_row,
+        get_source_row,
         sample_loaded_rows,
         version,
     };

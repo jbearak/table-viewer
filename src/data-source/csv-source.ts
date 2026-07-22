@@ -137,6 +137,7 @@ export class CsvDataSource implements DataSource {
             sheets: [{
                 name: 'Sheet1',
                 rowCount: this._rowCount,
+                sourceRowCount: this._rowCount,
                 columnCount: this._colCount,
                 merges: [],
                 hasFormatting: false,

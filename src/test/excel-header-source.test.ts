@@ -49,6 +49,7 @@ class StubSource implements DataSource {
             sheets: [{
                 name: this.name,
                 rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
                 columnCount: this.rows.reduce(
                     (max, row) => Math.max(max, row.length),
                     0,

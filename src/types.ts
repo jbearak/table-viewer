@@ -37,6 +37,12 @@ export interface MergeRange {
     endCol: number;
 }
 
+/** Inclusive interval in the installed display-row coordinate space. */
+export interface DisplayRowInterval {
+    start: number;
+    end: number;
+}
+
 export type SortDirection = 'asc' | 'desc';
 export type TransformIntent = 'restore' | 'user' | 'cancel';
 
@@ -103,6 +109,33 @@ export interface SheetColumnVisibilityState {
     schema?: string;
 }
 
+export const CELL_HIGHLIGHT_COLORS = ['yellow', 'green', 'blue', 'pink'] as const;
+export type CellHighlightColor = typeof CELL_HIGHLIGHT_COLORS[number];
+
+/** Compact rectangular-union selection: display-row runs crossed with sorted
+ * canonical source columns. Adjacent row runs must be coalesced by the sender. */
+export interface CellHighlightSelection {
+    displayRows: DisplayRowInterval[];
+    sourceColumns: number[];
+}
+
+export type CellHighlightMutation =
+    | { type: 'set'; color: CellHighlightColor }
+    | { type: 'clear' };
+
+export interface SheetCellHighlightState {
+    /** Same sheet/column identity fingerprint used by transforms and visibility. */
+    schema: string;
+    /** Canonical `"sourceRow:sourceColumn"` keys. */
+    cells: Record<string, CellHighlightColor>;
+}
+
+export interface CellHighlightState {
+    /** Physical file content to which these source-row coordinates are attached. */
+    sourceDigest: string;
+    sheets: (SheetCellHighlightState | undefined)[];
+}
+
 export const EMPTY_TRANSFORM: SheetTransformState = {
     sort: [],
     filters: [],
@@ -152,6 +185,8 @@ export interface PerFileState {
     /** Per-sheet hidden source columns. Display projections are derived and are
      *  deliberately never persisted. */
     columnVisibility?: (SheetColumnVisibilityState | undefined)[];
+    /** Sparse annotations keyed by canonical source row and source column. */
+    cellHighlights?: CellHighlightState;
 }
 
 export function sanitize_excel_header_overrides(
@@ -218,7 +253,7 @@ export type TerminalCsvSaveLifecycle = Extract<
 /** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
-    | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; requestId: string; generation: number }
+    | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle }
@@ -226,6 +261,7 @@ export type HostMessage =
     | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; requestId: string; generation: number; sourceGeneration: number; error?: string }
+    | { type: 'cellHighlightsChanged'; sheetIndex: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 
 /** Messages from webview to extension host */
@@ -248,4 +284,5 @@ export type WebviewMessage =
     | { type: 'cancelFilterHistogram'; requestId: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
-    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };
+    | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
+    | { type: 'applyCellHighlights'; sheetIndex: number; sheetName: string; selection: CellHighlightSelection; mutation: CellHighlightMutation; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };
