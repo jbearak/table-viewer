@@ -90,7 +90,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 - View choices are remembered per file and worksheet in VS Code's local extension storage.
 - Sorts and filters follow column names, so Table Viewer may discard them if a revised workbook no longer has a compatible column structure.
 - Highlights are positional annotations. They will reappear when temporarily missing rows, columns, or worksheets return, so you do not lose that time and effort.
-- CSV and TSV files can also be opened as tables; unlike Excel workbooks, they have an optional edit mode.
+- CSV and TSV files open directly in Table Viewer by default and, unlike Excel workbooks, have an optional edit mode. To edit one as plain text, select **Open in Text Editor** in the editor title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**.
 
 ## Troubleshooting
 
