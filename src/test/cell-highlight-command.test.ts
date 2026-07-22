@@ -147,24 +147,50 @@ describe('plan_cell_highlight_mutation', () => {
         });
     });
 
-    it('does not mutate current state and rejects a result exceeding the file cap', () => {
+    it('rejects additions but permits recolors and clears in loaded over-cap state', () => {
         const cells: Record<string, 'yellow'> = {};
-        for (let row = 0; row < MAX_HIGHLIGHTED_CELLS_PER_FILE; row++) cells[`${row}:0`] = 'yellow';
-        const largeSheet = { ...sheet, rowCount: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1, sourceRowCount: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1, columnCount: 2 };
+        for (let row = 0; row <= MAX_HIGHLIGHTED_CELLS_PER_FILE; row++) cells[`${row}:0`] = 'yellow';
+        const largeSheet = { ...sheet, rowCount: MAX_HIGHLIGHTED_CELLS_PER_FILE + 2, sourceRowCount: MAX_HIGHLIGHTED_CELLS_PER_FILE + 2, columnCount: 2 };
         const current: CellHighlightState = {
             sourceDigest: 'digest',
             sheets: [{ schema: transform_schema_for_sheet(largeSheet), cells }],
         };
         const result = plan_cell_highlight_mutation({
             sheetIndex: 0, sheetName: 'People',
-            selection: { displayRows: [{ start: MAX_HIGHLIGHTED_CELLS_PER_FILE, end: MAX_HIGHLIGHTED_CELLS_PER_FILE }], sourceColumns: [1] },
+            selection: { displayRows: [{ start: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1, end: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1 }], sourceColumns: [1] },
             mutation: { type: 'set', color: 'pink' },
         }, {
             current, meta: { sheets: [largeSheet], hasFormatting: false }, sourceDigest: 'digest',
-            mapDisplayRowsToSource: () => Uint32Array.from([MAX_HIGHLIGHTED_CELLS_PER_FILE]),
+            mapDisplayRowsToSource: () => Uint32Array.from([MAX_HIGHLIGHTED_CELLS_PER_FILE + 1]),
             displayRowForSource: (_sheet, sourceRow) => sourceRow,
         });
         expect(result.type).toBe('rejected');
-        expect(Object.keys(current.sheets[0]!.cells)).toHaveLength(MAX_HIGHLIGHTED_CELLS_PER_FILE);
+        expect(Object.keys(current.sheets[0]!.cells)).toHaveLength(MAX_HIGHLIGHTED_CELLS_PER_FILE + 1);
+
+        const recolored = plan_cell_highlight_mutation({
+            sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'pink' },
+        }, {
+            current, meta: { sheets: [largeSheet], hasFormatting: false }, sourceDigest: 'digest',
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: (_sheet, sourceRow) => sourceRow,
+        });
+        expect(recolored).toMatchObject({ type: 'applied', affectedCells: 1 });
+        if (recolored.type !== 'applied') throw new Error('Expected recolor to apply.');
+        expect(recolored.state?.sheets[0]?.cells['0:0']).toBe('pink');
+
+        const cleared = plan_cell_highlight_mutation({
+            sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'clear' },
+        }, {
+            current: recolored.state,
+            meta: { sheets: [largeSheet], hasFormatting: false },
+            sourceDigest: 'digest',
+            mapDisplayRowsToSource: () => { throw new Error('clear must stay sparse'); },
+            displayRowForSource: (_sheet, sourceRow) => sourceRow,
+        });
+        expect(cleared).toMatchObject({ type: 'applied', affectedCells: 1 });
     });
 });

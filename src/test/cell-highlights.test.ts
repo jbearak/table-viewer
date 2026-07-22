@@ -73,7 +73,7 @@ describe('cell highlight domain', () => {
         expect(() => cell_highlight_key(-1, 0)).toThrow(RangeError);
     });
 
-    it('sanitizes schema, bounds, colors, and deterministic key order', () => {
+    it('sanitizes structure, colors, and deterministic key order without pruning positions', () => {
         const sheet_meta = sheet();
         const sanitized = sanitize_sheet_cell_highlights({
             schema: transform_schema_for_sheet(sheet_meta),
@@ -86,7 +86,7 @@ describe('cell highlight domain', () => {
                 bad: 'yellow',
                 '1:1': 'orange',
             },
-        }, sheet_meta, transform_schema_for_sheet(sheet_meta));
+        });
 
         expect(sanitized).toEqual({
             schema: transform_schema_for_sheet(sheet_meta),
@@ -94,41 +94,40 @@ describe('cell highlight domain', () => {
                 '0:0': 'yellow',
                 '0:2': 'blue',
                 '2:1': 'pink',
+                '3:0': 'green',
+                '0:3': 'green',
             },
         });
-        expect(Object.keys(sanitized!.cells)).toEqual(['0:0', '0:2', '2:1']);
+        expect(Object.keys(sanitized!.cells)).toEqual([
+            '0:0', '0:2', '0:3', '2:1', '3:0',
+        ]);
         expect(sanitize_sheet_cell_highlights(
             { schema: 'stale', cells: { '0:0': 'yellow' } },
-            sheet_meta,
-            transform_schema_for_sheet(sheet_meta),
-        )).toBeUndefined();
+        )).toEqual({ schema: 'stale', cells: { '0:0': 'yellow' } });
     });
 
-    it('uses canonical sourceRowCount rather than projected rowCount', () => {
+    it('retains coordinates beyond both projected and physical bounds', () => {
         const projected = sheet({ rowCount: 2, sourceRowCount: 3 });
         expect(sanitize_cell_highlight_state(
             state({ '2:0': 'green', '3:0': 'blue' }, projected),
-            meta(projected),
-            'digest-1',
         )).toEqual({
             sourceDigest: 'digest-1',
             sheets: [{
                 schema: transform_schema_for_sheet(projected),
-                cells: { '2:0': 'green' },
+                cells: { '2:0': 'green', '3:0': 'blue' },
             }],
         });
     });
 
-    it('rejects stale digests and collapses empty sheets and workbooks', () => {
+    it('retains valid cells regardless of digest and collapses only invalid cells', () => {
         expect(sanitize_cell_highlight_state(
             state({ '0:0': 'yellow' }),
-            meta(),
-            'digest-2',
-        )).toBeUndefined();
+        )).toEqual(state({ '0:0': 'yellow' }));
         expect(sanitize_cell_highlight_state(
             state({ '9:9': 'yellow' }),
-            meta(),
-            'digest-1',
+        )).toEqual(state({ '9:9': 'yellow' }));
+        expect(sanitize_cell_highlight_state(
+            state({ bad: 'yellow', '0:0': 'orange' }),
         )).toBeUndefined();
     });
 
@@ -138,15 +137,11 @@ describe('cell highlight domain', () => {
         cells['0:0'] = 'yellow';
         expect(sanitize_cell_highlight_state(
             state(cells, sheet_meta),
-            meta(sheet_meta),
-            'digest-1',
         )).toBeDefined();
 
         const inherited_cells = Object.create({ '0:0': 'yellow' }) as Record<string, unknown>;
         expect(sanitize_cell_highlight_state(
             state(inherited_cells, sheet_meta),
-            meta(sheet_meta),
-            'digest-1',
         )).toBeUndefined();
     });
 
@@ -154,8 +149,6 @@ describe('cell highlight domain', () => {
         const sheet_meta = sheet();
         const current = sanitize_cell_highlight_state(
             state({ '0:0': 'yellow', '1:1': 'green' }, sheet_meta),
-            meta(sheet_meta),
-            'digest-1',
         );
         const next = apply_cell_highlight_patch(current, {
             sheetIndex: 0,
@@ -205,12 +198,12 @@ describe('cell highlight domain', () => {
         cells[`${MAX_HIGHLIGHTED_CELLS_PER_FILE}:0`] = 'yellow';
         expect(sanitize_cell_highlight_state(
             current,
-            meta(large_sheet),
-            'digest-1',
-        )).toBeUndefined();
+        )).toBeDefined();
+        expect(count_cell_highlights(sanitize_cell_highlight_state(current)))
+            .toBe(MAX_HIGHLIGHTED_CELLS_PER_FILE + 1);
     });
 
-    it('stops sanitizing later sheets as soon as the file cap is exceeded', () => {
+    it('retains later sheets when loaded state exceeds the file cap', () => {
         const large_sheet = sheet({
             name: 'Large',
             rowCount: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1,
@@ -226,18 +219,18 @@ describe('cell highlight domain', () => {
         const stored_sheets: unknown[] = [{
             schema: transform_schema_for_sheet(large_sheet),
             cells,
+        }, {
+            schema: transform_schema_for_sheet(later_sheet),
+            cells: { '0:0': 'blue' },
         }];
-        Object.defineProperty(stored_sheets, 1, {
-            get: () => { throw new Error('later sheet should not be read'); },
-        });
 
-        expect(sanitize_cell_highlight_state({
+        const sanitized = sanitize_cell_highlight_state({
             sourceDigest: 'digest-1',
             sheets: stored_sheets,
-        }, {
-            sheets: [large_sheet, later_sheet],
-            hasFormatting: false,
-        }, 'digest-1')).toBeUndefined();
+        });
+        expect(count_cell_highlights(sanitized))
+            .toBe(MAX_HIGHLIGHTED_CELLS_PER_FILE + 2);
+        expect(sanitized?.sheets[1]?.cells).toEqual({ '0:0': 'blue' });
     });
 
     it('rejects patch sheet indices outside the workbook', () => {
@@ -256,8 +249,6 @@ describe('cell highlight domain', () => {
         });
         const current = sanitize_cell_highlight_state(
             state({ '0:0': 'yellow', '2:0': 'green' }, old_sheet),
-            meta(old_sheet),
-            'digest-1',
         );
         const migrated = migrate_cell_highlight_schema(
             current,
@@ -269,13 +260,12 @@ describe('cell highlight domain', () => {
             sourceDigest: 'digest-1',
             sheets: [{
                 schema: transform_schema_for_sheet(new_sheet),
-                cells: { '0:0': 'yellow' },
+                cells: { '0:0': 'yellow', '2:0': 'green' },
             }],
         });
         expect(rebase_cell_highlight_digest(
             migrated,
             'digest-2',
-            meta(new_sheet),
         )?.sourceDigest).toBe('digest-2');
         expect(migrate_cell_highlight_schema(
             current,
@@ -285,43 +275,36 @@ describe('cell highlight domain', () => {
         )).toBe(current);
     });
 
-    it('sanitizes same-digest physical refreshes, clears external changes, and rebases controlled saves', () => {
+    it('retains and re-anchors highlights across all physical refreshes and saves', () => {
         const current = sanitize_cell_highlight_state(
             state({ '0:0': 'yellow', '9:0': 'green' }),
-            meta(sheet({ sourceRowCount: 10, rowCount: 10 })),
-            'digest-1',
         );
         expect(reconcile_physical_cell_highlights(
             current,
-            meta(),
             'digest-1',
-        )?.sheets[0]?.cells).toEqual({ '0:0': 'yellow' });
+        )?.sheets[0]?.cells).toEqual({ '0:0': 'yellow', '9:0': 'green' });
         expect(reconcile_physical_cell_highlights(
             current,
-            meta(),
             'external-digest',
-        )).toBeUndefined();
+        )).toMatchObject({
+            sourceDigest: 'external-digest',
+            sheets: [{ cells: { '0:0': 'yellow', '9:0': 'green' } }],
+        });
         expect(reconcile_physical_cell_highlights(
             current,
-            meta(),
             'saved-digest',
-            'digest-1',
         )).toMatchObject({
             sourceDigest: 'saved-digest',
-            sheets: [{ cells: { '0:0': 'yellow' } }],
+            sheets: [{ cells: { '0:0': 'yellow', '9:0': 'green' } }],
         });
     });
 
     it('compares semantically equal states independent of record insertion order', () => {
         const left = sanitize_cell_highlight_state(
             state({ '0:0': 'yellow', '1:1': 'green' }),
-            meta(),
-            'digest-1',
         );
         const right = sanitize_cell_highlight_state(
             state({ '1:1': 'green', '0:0': 'yellow' }),
-            meta(),
-            'digest-1',
         );
         expect(cell_highlight_states_equal(left, right)).toBe(true);
         expect(cell_highlight_states_equal(left, undefined)).toBe(false);

@@ -262,7 +262,7 @@ describe('workbook snapshot builder', () => {
 });
 
 describe('snapshot state normalization', () => {
-    it('drops stale digests and canonicalizes malformed cells to stable equality', () => {
+    it('projects stale-schema highlights positionally and canonicalizes malformed cells', () => {
         const sheet = {
             name: 'People',
             rowCount: 2,
@@ -276,11 +276,13 @@ describe('snapshot state normalization', () => {
             cellHighlights: {
                 sourceDigest: 'digest-1',
                 sheets: [{
-                    schema: transform_schema_for_sheet(sheet),
+                    schema: 'stale-schema',
                     cells: {
                         '1:1': 'green' as const,
                         '0:0': 'yellow' as const,
                         '2:0': 'blue' as const,
+                        bad: 'pink' as const,
+                        '0:1': 'orange' as never,
                     },
                 }],
             },
@@ -295,6 +297,8 @@ describe('snapshot state normalization', () => {
             '0:0': 'yellow',
             '1:1': 'green',
         });
+        expect(normalized.cellHighlights?.sheets[0]?.schema)
+            .toBe(transform_schema_for_sheet(sheet));
         const renormalized = normalize_workbook_snapshot_state(normalized, metadata);
         expect(cell_highlight_states_equal(
             normalized.cellHighlights,
@@ -304,7 +308,18 @@ describe('snapshot state normalization', () => {
             stored,
             metadata,
             'digest-2',
-        ).cellHighlights).toBeUndefined();
+        ).cellHighlights).toEqual({
+            sourceDigest: 'digest-2',
+            sheets: [{
+                schema: transform_schema_for_sheet(sheet),
+                cells: { '0:0': 'yellow', '1:1': 'green' },
+            }],
+        });
+        expect(normalize_workbook_snapshot_state(
+            stored,
+            metadata,
+            null,
+        ).cellHighlights?.sourceDigest).toBe('digest-1');
     });
 
     it('uses sourceRowCount when projected rowCount is smaller', () => {

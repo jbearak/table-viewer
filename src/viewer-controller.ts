@@ -1388,7 +1388,6 @@ export function attach_viewer(
         expected_authority_revision: number,
         already_verified = false,
         refresh_event?: FileRefreshEvent,
-        rebase_highlights_from_digest?: string,
     ): Promise<PhysicalAuthorityCommitResult> {
         if (
             !already_verified
@@ -1421,12 +1420,9 @@ export function attach_viewer(
                     ? plan_excel_candidate_state(normalized, planning_input)
                     : undefined;
                 const planned_state = plan?.state ?? normalized;
-                const highlight_meta = plan?.meta ?? candidate_meta;
                 const next_highlights = reconcile_physical_cell_highlights(
                     planned_state.cellHighlights,
-                    highlight_meta,
                     digest,
-                    rebase_highlights_from_digest,
                 );
                 const highlight_state_changed = !cell_highlight_states_equal(
                     planned_state.cellHighlights,
@@ -2497,21 +2493,20 @@ export function attach_viewer(
             // edit epoch until durable completion and cleanup ownership transfer.
             await vscode.workspace.fs.writeFile(uri, saved_bytes);
 
-            // The watcher is reserved across this write and CAS, so no post-save
-            // physical refresh can clear old-digest coordinates between them.
+            // The watcher is reserved across this write and CAS so the state
+            // rebase commits against the same save authority.
             const before_rebase = await read_file_state(false);
             const stored_highlights = (before_rebase.state as PerFileState).cellHighlights;
             // update_file_state reports a no-op updater as undefined; a
             // byte-identical save (saved_digest === expected_digest) is such a
             // no-op and must count as success, not a validator failure.
             let rebase_was_noop = false;
-            const rebased = stored_highlights?.sourceDigest === expected_digest
+            const rebased = stored_highlights
                 ? await update_file_state((current) => {
                     if (!save_operation_is_current(operation)) return current;
                     const highlights = rebase_cell_highlight_digest(
                         current.cellHighlights,
                         saved_digest,
-                        src.meta(),
                     );
                     if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
                         rebase_was_noop = true;
