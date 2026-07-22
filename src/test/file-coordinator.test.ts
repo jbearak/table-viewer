@@ -2819,6 +2819,238 @@ describe('file coordinator identity', () => {
         coordinator.dispose();
     });
 
+    it('clears all valid durable highlights while preserving unrelated raw state', async () => {
+        const path = '/tmp/clear-all-highlights.csv';
+        const mapped = mapped_state_store({
+            [path]: {
+                rowHeights: [{ 0: 31 }],
+                pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+                cellHighlights: {
+                    sourceDigest: 'stored-digest',
+                    sheets: [{
+                        schema: 'visible-and-oob',
+                        cells: { '0:0': 'yellow', '9:9': 'pink' },
+                    }, {
+                        schema: 'absent-sheet',
+                        cells: { '1:1': 'blue' },
+                    }],
+                },
+            },
+        });
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        const command = (requestId: string) => ({
+            requestId,
+            originToken: Symbol(requestId),
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [{
+                name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1,
+                merges: [], hasFormatting: false,
+            }] },
+            stateStore: mapped.store,
+            isCurrent: () => true,
+        });
+
+        const cleared = await coordinator.clear_all_cell_highlights(command('clear-all'));
+        expect(cleared).toMatchObject({
+            type: 'committed',
+            receipt: { scope: { type: 'all' }, affectedCells: 3 },
+        });
+        expect(mapped.value(path)).toMatchObject({
+            rowHeights: [{ 0: 31 }],
+            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+        });
+        expect((mapped.value(path) as any).cellHighlights).toBeUndefined();
+
+        const already_empty = await coordinator.clear_all_cell_highlights(command('empty'));
+        expect(already_empty).toMatchObject({
+            type: 'committed',
+            receipt: { scope: { type: 'all' }, affectedCells: 0 },
+        });
+        coordinator.dispose();
+    });
+
+    it('serializes apply and clear-all in shared highlight admission order', async () => {
+        const path = '/tmp/ordered-clear-all-highlights.csv';
+        const mapped = mapped_state_store();
+        const first = acquire_file_coordinator(path, mapped.store, 'linux');
+        const second = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(first, 'digest-a', mapped.store);
+        const basis = first.authority();
+        const meta = { hasFormatting: false, sheets: [{
+            name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1,
+            merges: [], hasFormatting: false,
+        }] };
+        let release_apply!: () => void;
+        const apply_gate = new Promise<void>((resolve) => { release_apply = resolve; });
+        let compare_calls = 0;
+        const deferred_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(...args) {
+                compare_calls += 1;
+                if (compare_calls === 1) await apply_gate;
+                return mapped.store.compare_and_set(...args);
+            },
+        };
+        const common = {
+            originToken: Symbol('origin'),
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta,
+            stateStore: deferred_store,
+            isCurrent: () => true,
+        };
+        const receipts: string[] = [];
+        const subscription = first.subscribe_cell_highlights((receipt) => {
+            receipts.push(receipt.requestId);
+        });
+        const apply = first.apply_cell_highlights({
+            ...common,
+            requestId: 'apply-before-clear',
+            sheetIndex: 0,
+            sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'green' },
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        await vi.waitFor(() => expect(compare_calls).toBe(1));
+        const clear = second.clear_all_cell_highlights({
+            ...common,
+            requestId: 'clear-after-apply',
+        });
+        release_apply();
+        expect((await apply).type).toBe('committed');
+        expect((await clear).type).toBe('committed');
+        expect((mapped.value(path) as any).cellHighlights).toBeUndefined();
+        expect(receipts).toEqual(['apply-before-clear', 'clear-after-apply']);
+
+        const clear_before_apply = first.clear_all_cell_highlights({
+            ...common,
+            requestId: 'clear-before-apply',
+        });
+        const apply_after_clear = second.apply_cell_highlights({
+            ...common,
+            requestId: 'apply-after-clear',
+            sheetIndex: 0,
+            sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'blue' },
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        expect((await clear_before_apply).type).toBe('committed');
+        expect((await apply_after_clear).type).toBe('committed');
+        expect((mapped.value(path) as any).cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'blue' });
+        expect(receipts.slice(-2)).toEqual(['clear-before-apply', 'apply-after-clear']);
+        subscription.dispose(); first.dispose(); second.dispose();
+    });
+
+    it('replans clear-all conflicts against the latest complete durable state', async () => {
+        const path = '/tmp/clear-all-conflict.csv';
+        const mapped = mapped_state_store({
+            [path]: {
+                cellHighlights: {
+                    sourceDigest: 'digest-a',
+                    sheets: [{ schema: 'stored', cells: { '0:0': 'yellow' } }],
+                },
+            },
+        });
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        let compare_calls = 0;
+        const conflicting_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(file_path, expected, next, validate) {
+                compare_calls += 1;
+                if (compare_calls === 1) {
+                    const peer = await mapped.store.compare_and_set(file_path, expected, {
+                        ...next,
+                        rowHeights: [{ 0: 44 }],
+                        cellHighlights: {
+                            sourceDigest: 'digest-a',
+                            sheets: [{
+                                schema: 'peer',
+                                cells: { '1:0': 'green', '9:0': 'pink' },
+                            }],
+                        },
+                    }, validate);
+                    if (peer.type !== 'committed') throw new Error('peer write failed');
+                    return { type: 'conflict', snapshot: peer.snapshot };
+                }
+                return mapped.store.compare_and_set(file_path, expected, next, validate);
+            },
+        };
+        const result = await coordinator.clear_all_cell_highlights({
+            requestId: 'conflicted-clear-all',
+            originToken: Symbol('origin'),
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [] },
+            stateStore: conflicting_store,
+            isCurrent: () => true,
+        });
+        expect(result).toMatchObject({
+            type: 'committed',
+            receipt: { affectedCells: 2, scope: { type: 'all' } },
+        });
+        expect(compare_calls).toBe(2);
+        expect(mapped.value(path)).toMatchObject({ rowHeights: [{ 0: 44 }] });
+        expect((mapped.value(path) as any).cellHighlights).toBeUndefined();
+        coordinator.dispose();
+    });
+
+    it('does not commit or publish stale clear-all commands', async () => {
+        const path = '/tmp/stale-clear-all-cas.csv';
+        const mapped = mapped_state_store({
+            [path]: {
+                cellHighlights: {
+                    sourceDigest: 'digest-a',
+                    sheets: [{ schema: 'stored', cells: { '0:0': 'yellow' } }],
+                },
+            },
+        });
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        let current = true;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        const deferred_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(file_path, expected, next, validate) {
+                await gate;
+                return mapped.store.compare_and_set(file_path, expected, next, validate);
+            },
+        };
+        const subscriber = vi.fn();
+        const subscription = coordinator.subscribe_cell_highlights(subscriber);
+        const pending = coordinator.clear_all_cell_highlights({
+            requestId: 'stale-clear-all',
+            originToken: Symbol('origin'),
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [] },
+            stateStore: deferred_store,
+            isCurrent: () => current,
+        });
+        await Promise.resolve();
+        current = false;
+        release();
+        expect((await pending).type).toBe('rejected');
+        expect((mapped.value(path) as any).cellHighlights).toBeDefined();
+        expect(subscriber).not.toHaveBeenCalled();
+        subscription.dispose(); coordinator.dispose();
+    });
+
     it('does not publish when a highlight command becomes stale during CAS', async () => {
         const path = '/tmp/stale-highlight-cas.csv';
         const mapped = mapped_state_store();

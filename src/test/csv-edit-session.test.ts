@@ -19,6 +19,10 @@ import { InvalidPersistedTransformError } from '../panel-core';
 
 const enc = new TextEncoder();
 
+function source_digest(bytes: Uint8Array): string {
+    return createHash('sha256').update(bytes).digest('hex');
+}
+
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
     const promise = new Promise<T>((done) => { resolve = done; });
@@ -1332,11 +1336,10 @@ describe('CSV edit sessions', () => {
         let conflict_injected = false;
         const post_conflict_read_started = deferred();
         const post_conflict_read_gate = deferred();
-        const digest = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
         const state = state_store({
             rowHeights: [{ 0: 29 }],
             cellHighlights: {
-                sourceDigest: digest(bytes),
+                sourceDigest: source_digest(bytes),
                 sheets: [{
                     schema: '["Sheet1",1,["h"]]',
                     cells: { '0:0': 'pink' },
@@ -1417,7 +1420,7 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path)).toMatchObject({
             rowHeights: [{ 0: 41 }],
             cellHighlights: {
-                sourceDigest: digest(bytes),
+                sourceDigest: source_digest(bytes),
                 sheets: [{ cells: { '9:0': 'blue' } }],
             },
         });
@@ -2240,9 +2243,166 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
-    it('publishes authoritative cell highlight changes to origin and sibling panels', async () => {
+    it('retains visible and dormant highlights across value-only external replacement', async () => {
+        const file_path = '/tmp/external-highlight-replacement.csv';
+        let bytes = enc.encode('h\na\n');
+        let mtime = 1;
+        const state = state_store({
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: { '0:0': 'yellow', '2:0': 'pink' },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime }));
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        expect(latest_snapshot(panel).state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'yellow' });
+
+        bytes = enc.encode('h\nz\n');
+        mtime += 1;
+        await vscode_mock.__getActiveWatchers()[0].__fireChange(uri(file_path) as never);
+        await flush_promises();
+
+        expect(state.get_state(file_path).cellHighlights).toMatchObject({
+            sourceDigest: source_digest(bytes),
+            sheets: [{ cells: { '0:0': 'yellow', '2:0': 'pink' } }],
+        });
+        expect(latest_snapshot(panel).state.cellHighlights).toMatchObject({
+            sourceDigest: source_digest(bytes),
+            sheets: [{ cells: { '0:0': 'yellow' } }],
+        });
+    });
+
+    it('reconciles stale highlight digests on reopen and remains stable on another reopen', async () => {
+        const file_path = '/tmp/reopen-stale-highlights.csv';
+        let bytes = enc.encode('h\na\n');
+        let mtime = 1;
+        const state = state_store({
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: { '0:0': 'green', '4:0': 'blue' },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime }));
+        const first = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        first.dispose();
+
+        bytes = enc.encode('h\nreplaced\n');
+        mtime += 1;
+        const reopened = open_csv_table(uri(file_path), state.store);
+        await reopened.__receive({ type: 'ready' });
+        expect(state.get_state(file_path).cellHighlights).toMatchObject({
+            sourceDigest: source_digest(bytes),
+            sheets: [{ cells: { '0:0': 'green', '4:0': 'blue' } }],
+        });
+        expect(latest_snapshot(reopened).state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'green' });
+        reopened.dispose();
+
+        const stable = open_csv_table(uri(file_path), state.store);
+        await stable.__receive({ type: 'ready' });
+        expect(state.get_state(file_path).cellHighlights).toMatchObject({
+            sourceDigest: source_digest(bytes),
+            sheets: [{ cells: { '0:0': 'green', '4:0': 'blue' } }],
+        });
+        expect(latest_snapshot(stable).state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'green' });
+    });
+
+    it('keeps full durable highlights through multi-panel layout echoes and refreshes', async () => {
+        const file_path = '/tmp/multi-panel-dormant-highlights.csv';
+        let bytes = enc.encode('h\na\n');
+        let mtime = 1;
+        const state = state_store({
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: { '0:0': 'yellow', '2:0': 'pink' },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime }));
+        const first = open_csv_table(uri(file_path), state.store);
+        const second = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const first_snapshot = latest_snapshot(first);
+        const second_snapshot = latest_snapshot(second);
+        expect(first_snapshot.state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'yellow' });
+        expect(second_snapshot.state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'yellow' });
+        await first.__receive({
+            type: 'snapshotApplied',
+            identity: first_snapshot.identity,
+            disposition: 'applied',
+        });
+        await second.__receive({
+            type: 'snapshotApplied',
+            identity: second_snapshot.identity,
+            disposition: 'applied',
+        });
+        await first.__receive({
+            type: 'stateChanged',
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+            state: {
+                ...first_snapshot.state,
+                columnWidths: [{ 0: 177 }],
+            },
+        });
+        expect(state.get_state(file_path)).toMatchObject({
+            columnWidths: [{ 0: 177 }],
+            cellHighlights: {
+                sheets: [{ cells: { '0:0': 'yellow', '2:0': 'pink' } }],
+            },
+        });
+
+        bytes = enc.encode('h\na\nb\nc\n');
+        mtime += 1;
+        await vscode_mock.__getActiveWatchers()[0].__fireChange(uri(file_path) as never);
+        await flush_promises();
+        expect(state.get_state(file_path).cellHighlights).toMatchObject({
+            sourceDigest: source_digest(bytes),
+            sheets: [{ cells: { '0:0': 'yellow', '2:0': 'pink' } }],
+        });
+        expect(latest_snapshot(first).state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'yellow', '2:0': 'pink' });
+        expect(latest_snapshot(second).state.cellHighlights?.sheets[0]?.cells)
+            .toEqual({ '0:0': 'yellow', '2:0': 'pink' });
+    });
+
+    it('publishes exact authoritative selection clears to origin and sibling panels', async () => {
         const file_path = '/tmp/two-panel-highlights.csv';
-        const state = state_store({ rowHeights: [{ 0: 28 }] });
+        const bytes = enc.encode('h\na\nb\n');
+        const state = state_store({
+            rowHeights: [{ 0: 28 }],
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: {
+                        '0:0': 'yellow',
+                        '1:0': 'green',
+                        '9:0': 'pink',
+                    },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
         const first = open_csv_table(uri(file_path), state.store);
         const second = open_csv_table(uri(file_path), state.store);
         await first.__receive({ type: 'ready' });
@@ -2265,8 +2425,8 @@ describe('CSV edit sessions', () => {
             sheetIndex: 0,
             sheetName: 'Sheet1',
             selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
-            mutation: { type: 'set', color: 'blue' },
-            requestId: 'highlight:origin',
+            mutation: { type: 'clear' },
+            requestId: 'highlight:clear',
             generation: first_snapshot.generation,
             sourceGeneration: first_snapshot.sourceGeneration,
             snapshotIdentity: first_snapshot.identity,
@@ -2275,7 +2435,9 @@ describe('CSV edit sessions', () => {
 
         expect(state.get_state(file_path)).toMatchObject({
             rowHeights: [{ 0: 28 }],
-            cellHighlights: { sheets: [{ cells: { '0:0': 'blue' } }] },
+            cellHighlights: {
+                sheets: [{ cells: { '1:0': 'green', '9:0': 'pink' } }],
+            },
         });
         const origin = first.__messages.filter((message: any) => (
             message?.type === 'cellHighlightsChanged'
@@ -2284,9 +2446,9 @@ describe('CSV edit sessions', () => {
             message?.type === 'cellHighlightsChanged'
         )).at(-1) as any;
         expect(origin).toMatchObject({
-            requestId: 'highlight:origin',
+            requestId: 'highlight:clear',
             sheetIndex: 0,
-            state: { sheets: [{ cells: { '0:0': 'blue' } }] },
+            state: { sheets: [{ cells: { '1:0': 'green' } }] },
         });
         expect(sibling).toMatchObject({
             sheetIndex: 0,
@@ -2295,6 +2457,96 @@ describe('CSV edit sessions', () => {
             state: origin.state,
         });
         expect(sibling.requestId).toBeUndefined();
+    });
+
+    it('rejects stale clear-all then clears full durable state for both panels', async () => {
+        const file_path = '/tmp/two-panel-clear-all-highlights.csv';
+        const bytes = enc.encode('h\na\nb\n');
+        const state = state_store({
+            rowHeights: [{ 0: 36 }],
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: { '0:0': 'yellow', '9:0': 'pink' },
+                }, {
+                    schema: 'absent-sheet',
+                    cells: { '0:0': 'blue' },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        const first = open_csv_table(uri(file_path), state.store);
+        const second = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const first_snapshot = latest_snapshot(first);
+        const second_snapshot = latest_snapshot(second);
+        await first.__receive({
+            type: 'snapshotApplied',
+            identity: first_snapshot.identity,
+            disposition: 'applied',
+        });
+        await second.__receive({
+            type: 'snapshotApplied',
+            identity: second_snapshot.identity,
+            disposition: 'applied',
+        });
+
+        await first.__receive({
+            type: 'clearAllCellHighlights',
+            requestId: 'clear-all:stale',
+            generation: first_snapshot.generation + 1,
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+        });
+        const rejected = first.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === 'clear-all:stale'
+        )).at(-1) as any;
+        expect(rejected).toMatchObject({
+            state: { sheets: [{ cells: { '0:0': 'yellow' } }] },
+            error: 'The workbook changed before the highlight request arrived.',
+        });
+        expect(rejected.sheetIndex).toBeUndefined();
+        expect(state.get_state(file_path).cellHighlights?.sheets[1]?.cells)
+            .toEqual({ '0:0': 'blue' });
+
+        await first.__receive({
+            type: 'clearAllCellHighlights',
+            requestId: 'clear-all:current',
+            generation: first_snapshot.generation,
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+        });
+        await flush_promises();
+        expect(state.get_state(file_path)).toMatchObject({
+            rowHeights: [{ 0: 36 }],
+        });
+        expect(state.get_state(file_path).cellHighlights).toBeUndefined();
+
+        const origin = first.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === 'clear-all:current'
+        )).at(-1) as any;
+        const sibling = second.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === undefined
+            && message.state === undefined
+        )).at(-1) as any;
+        expect(origin).toMatchObject({
+            state: undefined,
+            stateRevision: expect.any(Number),
+            physicalRevision: first_snapshot.identity.sourceBasis.physicalRevision,
+        });
+        expect(origin.sheetIndex).toBeUndefined();
+        expect(sibling).toMatchObject({
+            state: undefined,
+            stateRevision: origin.stateRevision,
+            physicalRevision: origin.physicalRevision,
+        });
+        expect(sibling.sheetIndex).toBeUndefined();
     });
 
     it('rejects stale, wrong-sheet, and preview highlight authorities without mutation', async () => {

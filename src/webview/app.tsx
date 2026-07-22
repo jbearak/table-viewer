@@ -1566,6 +1566,30 @@ export function App(): React.JSX.Element {
         });
     }, [active_sheet_index]);
 
+    const handle_clear_all_highlights = useCallback(() => {
+        const identity = snapshot_identity_ref.current;
+        if (
+            !identity
+            || preview_mode_ref.current
+            || pending_highlight_request_ref.current
+        ) return;
+        const request_id = [
+            'highlight',
+            highlight_request_prefix_ref.current,
+            ++highlight_request_seq_ref.current,
+        ].join(':');
+        pending_highlight_request_ref.current = request_id;
+        set_highlight_request_pending(true);
+        set_highlight_status('Updating cell highlights…');
+        vscode_api.postMessage({
+            type: 'clearAllCellHighlights',
+            requestId: request_id,
+            generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+            snapshotIdentity: identity,
+        });
+    }, []);
+
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
             const next = !prev;
@@ -1976,6 +2000,7 @@ export function App(): React.JSX.Element {
                     on_color_change: set_active_highlight_color,
                     on_apply: () => highlight_ref.current?.apply(active_highlight_color),
                     on_clear: () => highlight_ref.current?.clear(),
+                    on_clear_all: handle_clear_all_highlights,
                     selection_available: highlight_selection_available,
                     pending: highlight_request_pending,
                     disabled: preview_mode,

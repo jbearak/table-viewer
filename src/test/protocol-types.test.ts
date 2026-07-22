@@ -318,8 +318,25 @@ describe('paginated protocol message shapes', () => {
             state: undefined,
             sourceGeneration: 4,
         };
+        const clear_all: WebviewMessage = {
+            type: 'clearAllCellHighlights',
+            requestId: 'highlight:all',
+            generation: 5,
+            sourceGeneration: 4,
+            snapshotIdentity: command.snapshotIdentity,
+        };
+        const clear_all_response: HostMessage = {
+            type: 'cellHighlightsChanged',
+            requestId: 'highlight:all',
+            stateRevision: 46,
+            physicalRevision: 7,
+            state: undefined,
+            sourceGeneration: 4,
+        };
         expect(command.selection.displayRows).toHaveLength(2);
         expect(response.requestId).toBe(command.requestId);
+        expect(clear_all.type).toBe('clearAllCellHighlights');
+        expect(clear_all_response.sheetIndex).toBeUndefined();
     });
 
     it('WebviewMessage carries a requestRows variant', () => {

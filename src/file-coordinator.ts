@@ -5,6 +5,10 @@ import {
     type CellHighlightCommandInput,
 } from './cell-highlight-command';
 import {
+    count_cell_highlights,
+    sanitize_cell_highlight_state,
+} from './cell-highlights';
+import {
     canonical_file_key,
     type FileRefreshWatcher,
     type FileRefreshWatcherEventKind,
@@ -128,14 +132,16 @@ export type ExcelHeaderSubscriber = (receipt: ExcelHeaderOperationReceipt) => vo
 
 export interface CellHighlightCommitReceipt {
     readonly requestId: string;
-    readonly sheetIndex: number;
+    readonly scope:
+        | { readonly type: 'selection'; readonly sheetIndex: number }
+        | { readonly type: 'all' };
     readonly originToken: symbol;
     readonly authority: FileAuthoritySnapshot;
     readonly stateSnapshot: Readonly<FileStateSnapshot>;
     readonly affectedCells: number;
 }
 
-export interface ApplyCellHighlightsCommand extends CellHighlightCommandInput {
+export interface CellHighlightAuthorityCommandBase {
     readonly requestId: string;
     readonly originToken: symbol;
     readonly expectedAuthorityRevision: number;
@@ -144,9 +150,15 @@ export interface ApplyCellHighlightsCommand extends CellHighlightCommandInput {
     readonly meta: WorkbookMeta;
     readonly stateStore: AuthorityFileStateStore;
     readonly isCurrent: () => boolean;
+}
+
+export interface ApplyCellHighlightsCommand
+    extends CellHighlightAuthorityCommandBase, CellHighlightCommandInput {
     readonly mapDisplayRowsToSource: Parameters<typeof plan_cell_highlight_mutation>[1]['mapDisplayRowsToSource'];
     readonly displayRowForSource: Parameters<typeof plan_cell_highlight_mutation>[1]['displayRowForSource'];
 }
+
+export type ClearAllCellHighlightsCommand = CellHighlightAuthorityCommandBase;
 
 export type CellHighlightCommitResult =
     | { readonly type: 'committed'; readonly receipt: CellHighlightCommitReceipt }
@@ -721,6 +733,7 @@ export interface FileCoordinatorAttachment {
     commit_excel_header(command: CommitExcelHeaderCommand): Promise<ExcelHeaderCommitResult>;
     subscribe_excel_headers(listener: ExcelHeaderSubscriber): { dispose(): void };
     apply_cell_highlights(command: ApplyCellHighlightsCommand): Promise<CellHighlightCommitResult>;
+    clear_all_cell_highlights(command: ClearAllCellHighlightsCommand): Promise<CellHighlightCommitResult>;
     subscribe_cell_highlights(listener: CellHighlightSubscriber): { dispose(): void };
     subscribe_refresh(
         listener: FileRefreshSubscriber,
@@ -740,6 +753,126 @@ export function acquire_file_coordinator(
     entry.attachments += 1;
     void register_store(entry, identity, state_store).catch(() => {});
     let disposed = false;
+
+    const execute_cell_highlight_command = (
+        command: ApplyCellHighlightsCommand | ClearAllCellHighlightsCommand,
+    ): Promise<CellHighlightCommitResult> => {
+        if (disposed) {
+            return Promise.resolve({
+                type: 'rejected',
+                error: 'The table view is no longer available.',
+            });
+        }
+        const predecessor = entry.cellHighlightTail;
+        let release!: () => void;
+        entry.cellHighlightTail = new Promise<void>((resolve) => { release = resolve; });
+        entry.operations += 1;
+
+        const run = async (): Promise<CellHighlightCommitResult> => {
+            await predecessor;
+            await register_store(entry, identity, state_store);
+            const basis_is_current = () => {
+                const current = snapshot(entry);
+                return command.isCurrent()
+                    && current.authorityRevision === command.expectedAuthorityRevision
+                    && current.physicalRevision === command.expectedPhysicalRevision
+                    && current.physicalDigest === command.expectedPhysicalDigest
+                    && entry.activeTurn?.phase !== 'finalizing';
+            };
+            if (!basis_is_current()) {
+                return { type: 'rejected', error: 'The workbook changed before the highlights could be saved.' };
+            }
+            let state_snapshot = await command.stateStore.read(entry.statePath);
+            for (let conflicts = 0; conflicts < 16; conflicts += 1) {
+                if (!basis_is_current()) {
+                    return { type: 'rejected', error: 'The workbook changed before the highlights could be saved.' };
+                }
+
+                let next: PerFileState;
+                let changed: boolean;
+                let affected_cells: number;
+                let scope: CellHighlightCommitReceipt['scope'];
+                if ('selection' in command) {
+                    const current = normalize_host_state(
+                        state_snapshot.state,
+                        command.meta.sheets.map((sheet) => sheet.name),
+                    );
+                    const plan = plan_cell_highlight_mutation(command, {
+                        current: current.cellHighlights,
+                        meta: command.meta,
+                        sourceDigest: command.expectedPhysicalDigest,
+                        mapDisplayRowsToSource: command.mapDisplayRowsToSource,
+                        displayRowForSource: command.displayRowForSource,
+                    });
+                    if (plan.type === 'rejected') return plan;
+                    next = { ...current, cellHighlights: plan.state };
+                    changed = JSON.stringify(current.cellHighlights)
+                        !== JSON.stringify(plan.state);
+                    affected_cells = plan.affectedCells;
+                    scope = { type: 'selection', sheetIndex: command.sheetIndex };
+                } else {
+                    const current = state_snapshot.state as PerFileState;
+                    affected_cells = count_cell_highlights(
+                        sanitize_cell_highlight_state(current.cellHighlights),
+                    );
+                    next = { ...current, cellHighlights: undefined };
+                    changed = current.cellHighlights !== undefined;
+                    scope = { type: 'all' };
+                }
+
+                let committed: Readonly<FileStateSnapshot>;
+                if (!changed) {
+                    committed = state_snapshot;
+                } else {
+                    const result = await command.stateStore.compare_and_set(
+                        entry.statePath,
+                        state_snapshot.revision,
+                        next,
+                        basis_is_current,
+                    );
+                    if (result.type === 'conflict') {
+                        state_snapshot = result.snapshot;
+                        continue;
+                    }
+                    committed = result.snapshot;
+                }
+                if (!basis_is_current()) {
+                    return { type: 'rejected', error: 'The workbook changed before the highlights could be published.' };
+                }
+                const receipt: CellHighlightCommitReceipt = Object.freeze({
+                    requestId: command.requestId,
+                    scope: Object.freeze(scope),
+                    originToken: command.originToken,
+                    authority: snapshot(entry),
+                    stateSnapshot: deep_clone_and_freeze(committed),
+                    affectedCells: affected_cells,
+                });
+                for (const subscriber of [...entry.cellHighlightSubscribers]) {
+                    try {
+                        void Promise.resolve(subscriber(receipt)).catch((error) => {
+                            console.error('Failed to publish cell highlights', error);
+                        });
+                    } catch (error) {
+                        console.error('Failed to publish cell highlights', error);
+                    }
+                }
+                return { type: 'committed', receipt };
+            }
+            return { type: 'rejected', error: 'The highlight state kept changing before it could be saved.' };
+        };
+        // Callers await this promise directly; map unexpected store failures
+        // to a rejected result instead of escaping the message handler.
+        return run().catch((error): CellHighlightCommitResult => ({
+            type: 'rejected',
+            error: error instanceof Error
+                ? error.message
+                : 'The highlight change could not be saved.',
+        })).finally(() => {
+            release();
+            entry.operations -= 1;
+            cleanup(entry);
+        });
+    };
 
     const attachment: FileCoordinatorAttachment = {
         statePath: entry.statePath,
@@ -1206,101 +1339,11 @@ export function acquire_file_coordinator(
         },
 
         apply_cell_highlights(command) {
-            if (disposed) {
-                return Promise.resolve({
-                    type: 'rejected',
-                    error: 'The table view is no longer available.',
-                });
-            }
-            const predecessor = entry.cellHighlightTail;
-            let release!: () => void;
-            entry.cellHighlightTail = new Promise<void>((resolve) => { release = resolve; });
-            entry.operations += 1;
+            return execute_cell_highlight_command(command);
+        },
 
-            const run = async (): Promise<CellHighlightCommitResult> => {
-                await predecessor;
-                await register_store(entry, identity, state_store);
-                const basis_is_current = () => {
-                    const current = snapshot(entry);
-                    return command.isCurrent()
-                        && current.authorityRevision === command.expectedAuthorityRevision
-                        && current.physicalRevision === command.expectedPhysicalRevision
-                        && current.physicalDigest === command.expectedPhysicalDigest
-                        && entry.activeTurn?.phase !== 'finalizing';
-                };
-                if (!basis_is_current()) {
-                    return { type: 'rejected', error: 'The workbook changed before the highlights could be saved.' };
-                }
-                let state_snapshot = await command.stateStore.read(entry.statePath);
-                for (let conflicts = 0; conflicts < 16; conflicts += 1) {
-                    if (!basis_is_current()) {
-                        return { type: 'rejected', error: 'The workbook changed before the highlights could be saved.' };
-                    }
-                    const current = normalize_host_state(
-                        state_snapshot.state,
-                        command.meta.sheets.map((sheet) => sheet.name),
-                    );
-                    const plan = plan_cell_highlight_mutation(command, {
-                        current: current.cellHighlights,
-                        meta: command.meta,
-                        sourceDigest: command.expectedPhysicalDigest,
-                        mapDisplayRowsToSource: command.mapDisplayRowsToSource,
-                        displayRowForSource: command.displayRowForSource,
-                    });
-                    if (plan.type === 'rejected') return plan;
-                    const next = { ...current, cellHighlights: plan.state };
-                    let committed: Readonly<FileStateSnapshot>;
-                    if (JSON.stringify(current.cellHighlights) === JSON.stringify(plan.state)) {
-                        committed = state_snapshot;
-                    } else {
-                        const result = await command.stateStore.compare_and_set(
-                            entry.statePath,
-                            state_snapshot.revision,
-                            next,
-                            basis_is_current,
-                        );
-                        if (result.type === 'conflict') {
-                            state_snapshot = result.snapshot;
-                            continue;
-                        }
-                        committed = result.snapshot;
-                    }
-                    if (!basis_is_current()) {
-                        return { type: 'rejected', error: 'The workbook changed before the highlights could be published.' };
-                    }
-                    const receipt: CellHighlightCommitReceipt = Object.freeze({
-                        requestId: command.requestId,
-                        sheetIndex: command.sheetIndex,
-                        originToken: command.originToken,
-                        authority: snapshot(entry),
-                        stateSnapshot: deep_clone_and_freeze(committed),
-                        affectedCells: plan.affectedCells,
-                    });
-                    for (const subscriber of [...entry.cellHighlightSubscribers]) {
-                        try {
-                            void Promise.resolve(subscriber(receipt)).catch((error) => {
-                                console.error('Failed to publish cell highlights', error);
-                            });
-                        } catch (error) {
-                            console.error('Failed to publish cell highlights', error);
-                        }
-                    }
-                    return { type: 'committed', receipt };
-                }
-                return { type: 'rejected', error: 'The highlight state kept changing before it could be saved.' };
-            };
-            // Callers await this promise directly; map unexpected store failures
-            // to a rejected result instead of escaping the message handler.
-            return run().catch((error): CellHighlightCommitResult => ({
-                type: 'rejected',
-                error: error instanceof Error
-                    ? error.message
-                    : 'The highlight change could not be saved.',
-            })).finally(() => {
-                release();
-                entry.operations -= 1;
-                cleanup(entry);
-            });
+        clear_all_cell_highlights(command) {
+            return execute_cell_highlight_command(command);
         },
 
         subscribe_cell_highlights(listener) {
