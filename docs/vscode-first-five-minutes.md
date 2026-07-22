@@ -6,7 +6,9 @@ This page is optional. The default VS Code layout works with Table Viewer, and e
 
 ## Why I use VS Code
 
-VS Code is a practical common denominator: it was again the most-used developer environment among respondents to the [2025 Stack Overflow Developer Survey](https://survey.stackoverflow.co/2025/technology/), and the same editor works on macOS, Windows, and Linux. I needed something everyone on my team could use for both Stata and R, rather than asking people on different operating systems—or using different statistical languages—to adopt different tools.
+VS Code is a practical common denominator: it was again the most-used developer environment among respondents to the [2025 Stack Overflow Developer Survey](https://survey.stackoverflow.co/2025/technology/), and the same editor works on macOS, Windows, and Linux. I wanted everyone on my team—especially people still learning their way around a code editor—to learn one set of tools, share what they learned, and help one another whether they worked in Stata or R.
+
+The [**Remote - SSH** extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) was equally important. VNC shows you another computer's entire desktop and sends your mouse and keyboard actions back to it. With Remote - SSH, the VS Code window stays on your own computer; your files stay on the remote server, and commands, extensions, and computations run there. It usually feels much more like using a normal local app, while still letting the team keep data and demanding work on a shared or more powerful machine.
 
 My [**Sight – Stata Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.sight) and [**Raven – R Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) extensions bring those languages into VS Code. Their data viewers share some code with Table Viewer, deliberately giving you a similar grid and familiar controls whether you open an Excel file with Table Viewer, inspect a Stata dataset with Sight, or look at an R data frame with Raven.
 
