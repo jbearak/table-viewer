@@ -57,7 +57,8 @@ export function FilterPopover({
         ));
     const [coords, set_coords] = useState(anchor);
     const popover_ref = useRef<HTMLDivElement>(null);
-    const first_control_ref = useRef<HTMLSelectElement>(null);
+    const condition_ref = useRef<HTMLSelectElement>(null);
+    const first_value_ref = useRef<HTMLInputElement>(null);
     const layout_dismissed_ref = useRef(false);
     const user_edited_ref = useRef(existing);
     use_dismiss(popover_ref, on_cancel);
@@ -114,7 +115,7 @@ export function FilterPopover({
     }, [on_cancel]);
 
     useEffect(() => {
-        first_control_ref.current?.focus();
+        (first_value_ref.current ?? condition_ref.current)?.focus();
     }, []);
 
     // Promote pristine Contains drafts to Between once a numeric histogram arrives.
@@ -204,7 +205,7 @@ export function FilterPopover({
                     Condition
                 </label>
                 <select
-                    ref={first_control_ref}
+                    ref={condition_ref}
                     id="filter-condition"
                     className="filter-popover-select"
                     value={draft.operator}
@@ -219,6 +220,7 @@ export function FilterPopover({
                 </select>
                 {needs_value && (
                     <input
+                        ref={first_value_ref}
                         className="filter-popover-input"
                         aria-label={needs_second ? 'Lower value' : 'Filter value'}
                         placeholder={needs_second ? 'Lower value' : 'Value'}
