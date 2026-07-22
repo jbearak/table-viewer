@@ -219,6 +219,13 @@ describe('sheet-state helpers', () => {
             filters: [entry({ excludedValues: 'a,b' })],
         }, 1)).toBeUndefined();
 
+        // A non-empty list whose entries are all garbage is corrupt state, not
+        // an "exclude nothing" filter — reject rather than match everything.
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [entry({ excludedValues: [7, {}, undefined] })],
+        }, 1)).toBeUndefined();
+
         // An empty list is valid (explicit include-everything filter).
         expect(sanitize_transform_state({
             sort: [],

@@ -192,6 +192,9 @@ function sanitize_excluded_values(
         if (item === null || typeof item === 'string') unique.add(item);
         if (unique.size === MAX_PERSISTED_EXCLUDED_VALUES) break;
     }
+    // A non-empty list where every entry is garbage is corrupt state, not an
+    // "exclude nothing" filter — reject it rather than match everything.
+    if (unique.size === 0 && value.length > 0) return undefined;
     return [...unique];
 }
 
