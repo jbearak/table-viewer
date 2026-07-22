@@ -4,7 +4,7 @@ Table Viewer opens Excel workbooks inside VS Code and remembers how you like to 
 
 You do not need to write code or already use VS Code. VS Code can simply be the app that hosts Table Viewer.
 
-You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment without risking a real file:
+You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment:
 
 - [Garden Café sample workbook](examples/garden-cafe-sample.xlsx)
 - [Garden Café revised workbook](examples/garden-cafe-revised.xlsx)
