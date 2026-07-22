@@ -527,6 +527,34 @@ describe('FilterPopover', () => {
         expect(request_transform).toHaveBeenCalledWith(edited);
     });
 
+    it('treats reordered isOneOf exclusion sets as equal, including null vs empty string', async () => {
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: vi.fn(),
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { transforms_semantically_equal } = await import('../webview/app');
+        const entry = (excluded: (string | null)[]): SheetTransformState => ({
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 1, operator: 'isOneOf',
+                excludedValues: excluded, caseSensitive: false, enabled: true,
+            }],
+        });
+        expect(transforms_semantically_equal(entry(['', null]), entry([null, ''])))
+            .toBe(true);
+        // Composed vs decomposed e-acute are collation-equal but distinct raw
+        // values; reordering them must not read as a semantic change.
+        const composed = '\u00e9';
+        const decomposed = 'e\u0301';
+        expect(transforms_semantically_equal(
+            entry([composed, decomposed]),
+            entry([decomposed, composed]),
+        )).toBe(true);
+        expect(transforms_semantically_equal(entry(['']), entry([null])))
+            .toBe(false);
+    });
+
     it('reclamps after isEmpty expands to between near the viewport edge', () => {
         const resize_callbacks: ResizeObserverCallback[] = [];
         vi.stubGlobal('ResizeObserver', class {
@@ -846,6 +874,20 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         });
         select_is_one_of();
         expect(checkbox_labels()).toEqual(['(Blanks) (text value)', '(Blanks)']);
+    });
+
+    it('does not apply on Enter in the checklist search input', () => {
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: ['beta'],
+            caseSensitive: false, enabled: true,
+        }], TEXT_READY);
+        const search = document.querySelector('.filter-value-search') as HTMLInputElement;
+        search.focus();
+        act(() => search.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', bubbles: true,
+        })));
+        expect(on_apply).not.toHaveBeenCalled();
     });
 
     it('focuses the checklist search for a saved isOneOf filter', () => {

@@ -29,7 +29,7 @@ Table Viewer is the result.
 - Bold and italic text styling from Excel formatting
 - Conservatively detects Excel column-name rows, with a per-sheet **First Row as Header** override remembered for each file
 - Stable, multi-column sorting with missing values kept last
-- Per-column filters for text, comparisons, ranges, and empty/non-empty values
+- Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
 
 **Auto-refresh**
 - Watches the file on disk and reloads automatically when it changes

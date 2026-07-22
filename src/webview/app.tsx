@@ -116,8 +116,17 @@ export function transforms_semantically_equal(
             if (entry.operator === 'isOneOf') {
                 return {
                     ...base,
+                    // Total order with null first and code-unit string compare, so
+                    // equal exclusion sets always serialize identically (locale
+                    // collation can tie distinct strings, e.g. '' vs null or
+                    // composed vs decomposed Unicode).
                     excludedValues: [...(entry.excludedValues ?? [])].sort(
-                        (a, b) => (a ?? '').localeCompare(b ?? ''),
+                        (a, b) => {
+                            if (a === b) return 0;
+                            if (a === null) return -1;
+                            if (b === null) return 1;
+                            return a < b ? -1 : 1;
+                        },
                     ),
                 };
             }

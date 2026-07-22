@@ -227,7 +227,8 @@ export function FilterPopover({
                     target instanceof HTMLButtonElement
                     || target instanceof HTMLSelectElement
                     || input_type === 'checkbox'
-                    || input_type === 'radio';
+                    || input_type === 'radio'
+                    || input_type === 'search';
                 if (
                     event.key === 'Enter'
                     && can_apply
