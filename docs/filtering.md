@@ -17,9 +17,11 @@ For a number column, the editor also shows a small chart of the column's values.
 
 After you apply a filter, it appears as a control above the table. From there you can edit, temporarily disable, re-enable, or remove it. A disabled filter is remembered but does not hide any rows.
 
-You can filter more than one column at a time. For example, if **Country** is filtered to Canada and **Year** is filtered to 2025, only rows matching both filters stay visible.
+The column header's right-click menu offers the same actions for that column's filter: **Edit filter…**, **Clear filter on this column**, and — when any filter is active — **Clear all filters**.
 
-To remove the filter on the focused column, press `Shift+Alt+X`. To remove every filter on the worksheet, press `Shift+Alt+9`.
+If you prefer the keyboard, `Shift+Alt+X` clears the filter on the focused column, and `Shift+Alt+9` clears every filter on the worksheet.
+
+You can filter more than one column at a time. For example, if **Country** is filtered to Canada and **Year** is filtered to 2025, only rows matching both filters stay visible.
 
 ## Conditions
 
