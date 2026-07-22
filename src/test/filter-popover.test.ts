@@ -28,7 +28,13 @@ afterEach(() => {
 function render_popover(
     filters: FilterEntry[] = [],
     histogram?: { status: 'loading' }
-        | { status: 'ready'; bins: readonly HistogramBin[]; columnKind?: import('../types').FilterColumnKind }
+        | {
+            status: 'ready';
+            bins: readonly HistogramBin[];
+            columnKind?: import('../types').FilterColumnKind;
+            distinctValues?: readonly (string | null)[];
+            distinctValuesExceeded?: boolean;
+        }
         | { status: 'error'; message: string },
 ) {
     const on_apply = vi.fn();
@@ -640,5 +646,214 @@ describe('FilterPopover', () => {
         act(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
         expect(on_cancel).toHaveBeenNthCalledWith(2, 'outside');
         expect(on_apply).not.toHaveBeenCalled();
+    });
+});
+
+describe('FilterPopover value checklist (isOneOf)', () => {
+    const TEXT_READY = {
+        status: 'ready',
+        bins: [],
+        columnKind: 'text',
+        distinctValues: ['alpha', 'beta', null],
+        distinctValuesExceeded: false,
+    } as const;
+
+    const select_is_one_of = () => {
+        const select = document.querySelector('select') as HTMLSelectElement;
+        act(() => {
+            select.value = 'isOneOf';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+    };
+
+    const checkbox_labels = () => Array.from(
+        document.querySelectorAll('.filter-value-item .filter-value-name'),
+        (span) => span.textContent,
+    );
+
+    it('offers Is one of only when a complete distinct list is available', () => {
+        render_popover([], TEXT_READY);
+        const options = () => Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options()).toContain('isOneOf');
+        act(() => root!.unmount());
+
+        for (const histogram of [
+            { status: 'loading' } as const,
+            { status: 'error', message: 'scan failed' } as const,
+            { ...TEXT_READY, distinctValues: [], distinctValuesExceeded: true },
+        ]) {
+            root = createRoot(container!);
+            act(() => root!.render(React.createElement(FilterPopover, {
+                column_index: 1, column_name: 'Value', filters: [],
+                histogram,
+                anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            })));
+            expect(options()).not.toContain('isOneOf');
+            act(() => root!.unmount());
+        }
+        root = null;
+    });
+
+    it('swaps in the checklist, hides value input and case sensitivity', () => {
+        render_popover([], TEXT_READY);
+        select_is_one_of();
+        expect(document.querySelector('.filter-value-list')).not.toBeNull();
+        expect(document.querySelector('.filter-popover-input')).toBeNull();
+        expect(document.body.textContent).not.toContain('Case sensitive');
+        expect(checkbox_labels()).toEqual(['alpha', 'beta', '(Blanks)']);
+    });
+
+    it('unchecking values excludes them and Apply emits a canonical entry', () => {
+        const { on_apply } = render_popover([], TEXT_READY);
+        select_is_one_of();
+
+        const apply_button = document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement;
+        // Nothing deselected yet: applying would be a no-op filter.
+        expect(apply_button.disabled).toBe(true);
+
+        const boxes = () => Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[];
+        expect(boxes().every((box) => box.checked)).toBe(true);
+        act(() => boxes()[1].click());
+        act(() => boxes()[2].click());
+        expect(boxes()[1].checked).toBe(false);
+        expect(boxes()[2].checked).toBe(false);
+
+        expect(apply_button.disabled).toBe(false);
+        act(() => apply_button.click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'isOneOf',
+            excludedValues: ['beta', null],
+            caseSensitive: false,
+            value: undefined,
+            secondValue: undefined,
+        }));
+    });
+
+    it('searches values and supports check/uncheck all across the full set', () => {
+        render_popover([], TEXT_READY);
+        select_is_one_of();
+
+        const search = document.querySelector('.filter-value-search') as HTMLInputElement;
+        const set_search = (value: string) => act(() => {
+            const setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value',
+            )!.set!;
+            setter.call(search, value);
+            search.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        set_search('alp');
+        expect(checkbox_labels()).toEqual(['alpha']);
+        set_search('blank');
+        expect(checkbox_labels()).toEqual(['(Blanks)']);
+        set_search('no such value');
+        expect(document.body.textContent).toContain('No matching values');
+        set_search('');
+
+        // Uncheck all excludes every value even while a search was active.
+        act(() => (Array.from(document.querySelectorAll('.filter-value-action'))
+            .find((button) => button.textContent === 'Uncheck all') as HTMLButtonElement)
+            .click());
+        const boxes = Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[];
+        expect(boxes.every((box) => !box.checked)).toBe(true);
+
+        act(() => (Array.from(document.querySelectorAll('.filter-value-action'))
+            .find((button) => button.textContent === 'Check all') as HTMLButtonElement)
+            .click());
+        expect((Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[]).every((box) => box.checked)).toBe(true);
+    });
+
+    it('restores checked state from a saved filter and keeps stale exclusions listed', () => {
+        render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: ['beta', 'removed-from-file'],
+            caseSensitive: false, enabled: true,
+        }], TEXT_READY);
+        expect((document.querySelector('select') as HTMLSelectElement).value)
+            .toBe('isOneOf');
+        expect(checkbox_labels()).toEqual([
+            'alpha', 'beta', '(Blanks)', 'removed-from-file',
+        ]);
+        const boxes = Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[];
+        expect(boxes.map((box) => box.checked)).toEqual([true, false, true, false]);
+    });
+
+    it('keeps a saved over-cap filter editable through its stored exclusions', () => {
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: ['old'],
+            caseSensitive: false, enabled: true,
+        }], {
+            status: 'ready', bins: [], columnKind: 'text',
+            distinctValues: [], distinctValuesExceeded: true,
+        });
+        expect((document.querySelector('select') as HTMLSelectElement).value)
+            .toBe('isOneOf');
+        expect(document.body.textContent).toContain('too many distinct values');
+        expect(checkbox_labels()).toEqual(['old']);
+
+        const apply_button = document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement;
+        expect(apply_button.disabled).toBe(false);
+        act(() => apply_button.click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'isOneOf',
+            excludedValues: ['old'],
+        }));
+    });
+
+    it('lets an over-cap filter undo re-checking its last stored exclusion', () => {
+        render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: ['old'],
+            caseSensitive: false, enabled: true,
+        }], {
+            status: 'ready', bins: [], columnKind: 'text',
+            distinctValues: [], distinctValuesExceeded: true,
+        });
+        const box = () => document.querySelector(
+            '.filter-value-item input',
+        ) as HTMLInputElement;
+        act(() => box().click());
+        // Re-checking the only exclusion must keep the checklist mounted so
+        // the toggle can be reversed without reopening the popover.
+        expect(box()).not.toBeNull();
+        expect(box().checked).toBe(true);
+        act(() => box().click());
+        expect(box().checked).toBe(false);
+        expect((document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it('distinguishes a real "(Blanks)" text value from the blank entry', () => {
+        render_popover([], {
+            status: 'ready', bins: [], columnKind: 'text',
+            distinctValues: ['(Blanks)', null], distinctValuesExceeded: false,
+        });
+        select_is_one_of();
+        expect(checkbox_labels()).toEqual(['(Blanks) (text value)', '(Blanks)']);
+    });
+
+    it('focuses the checklist search for a saved isOneOf filter', () => {
+        render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: ['beta'],
+            caseSensitive: false, enabled: true,
+        }], TEXT_READY);
+        expect(document.activeElement?.className).toBe('filter-value-search');
     });
 });

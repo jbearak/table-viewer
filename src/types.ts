@@ -65,7 +65,8 @@ export type FilterOperator =
     | 'between'
     | 'notBetween'
     | 'isEmpty'
-    | 'isNotEmpty';
+    | 'isNotEmpty'
+    | 'isOneOf';
 
 export type RangeFilterOperator = 'between' | 'notBetween';
 
@@ -81,9 +82,16 @@ export interface FilterEntry {
     operator: FilterOperator;
     value?: string;
     secondValue?: string;
+    /** `isOneOf` only: exact raw values that must NOT match. `null` excludes
+     *  blanks. Storing exclusions keeps values that appear later visible. */
+    excludedValues?: (string | null)[];
     caseSensitive: boolean;
     enabled: boolean;
 }
+
+/** Checklist entries above this cap are never offered; a partial value list
+ *  must not masquerade as complete. Blanks count as one entry. */
+export const FILTER_DISTINCT_VALUE_LIMIT = 1_000;
 
 export interface HistogramBin {
     lo: number;
@@ -260,7 +268,7 @@ export type HostMessage =
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
-    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; requestId: string; generation: number; sourceGeneration: number; error?: string }
+    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
 

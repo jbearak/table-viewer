@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { FilterColumnKind, FilterEntry, FilterOperator, HistogramBin } from '../types';
+import type { FilterEntry, FilterOperator } from '../types';
 import { FilterHistogram, domain_max, domain_min } from './filter-histogram';
+import { FilterValueChecklist } from './filter-value-checklist';
 import {
     filter_column_kind_from_histogram,
     filter_draft_for_column,
@@ -8,6 +9,7 @@ import {
     is_pristine_default_filter_draft,
     is_range_filter_operator,
     operator_supports_case_sensitive,
+    type FilterHistogramStatus,
 } from './transform-ui-model';
 import { use_dismiss, type DismissReason } from './use-dismiss';
 
@@ -18,9 +20,7 @@ export interface FilterPopoverProps {
     column_name: string;
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
-    histogram?: { status: 'loading' }
-        | { status: 'ready'; bins: readonly HistogramBin[]; columnKind?: FilterColumnKind }
-        | { status: 'error'; message: string };
+    histogram?: FilterHistogramStatus;
     on_apply: (entry: FilterEntry) => void;
     on_cancel: (reason: FilterPopoverDismissReason) => void;
 }
@@ -59,6 +59,7 @@ export function FilterPopover({
     const popover_ref = useRef<HTMLDivElement>(null);
     const condition_ref = useRef<HTMLSelectElement>(null);
     const first_value_ref = useRef<HTMLInputElement>(null);
+    const value_search_ref = useRef<HTMLInputElement>(null);
     const layout_dismissed_ref = useRef(false);
     const user_edited_ref = useRef(existing);
     use_dismiss(popover_ref, on_cancel);
@@ -115,7 +116,9 @@ export function FilterPopover({
     }, [on_cancel]);
 
     useEffect(() => {
-        (first_value_ref.current ?? condition_ref.current)?.focus();
+        (value_search_ref.current
+            ?? first_value_ref.current
+            ?? condition_ref.current)?.focus();
     }, []);
 
     // Promote pristine Contains drafts to Between once a numeric histogram arrives.
@@ -128,22 +131,61 @@ export function FilterPopover({
         });
     }, [existing, histogram]);
 
-    const needs_value = draft.operator !== 'isEmpty' && draft.operator !== 'isNotEmpty';
+    const uses_value_list = draft.operator === 'isOneOf';
+    const value_list_ready = histogram.status === 'ready'
+        && histogram.distinctValuesExceeded !== true;
+    const value_list_available = value_list_ready
+        && (histogram.distinctValues?.length ?? 0) > 0;
+    const needs_value = !uses_value_list
+        && draft.operator !== 'isEmpty'
+        && draft.operator !== 'isNotEmpty';
     const needs_second = is_range_filter_operator(draft.operator);
     const column_kind = filter_column_kind_from_histogram(histogram);
     const show_case_sensitive = operator_supports_case_sensitive(draft.operator, column_kind);
-    const operator_options = filter_options_for_draft(column_kind, draft.operator);
-    const can_apply = !needs_value
-        || ((draft.value ?? '').length > 0
-            && (!needs_second || (draft.secondValue ?? '').length > 0));
+    const operator_options = filter_options_for_draft(
+        column_kind,
+        draft.operator,
+        value_list_available,
+    );
+    // An all-checked value list matches every row: applying it would only
+    // leave a confusing no-op chip behind. Settled state is required so a
+    // late histogram cannot invalidate what the user saw; an over-cap column
+    // still lets a saved filter's remaining exclusions be re-applied.
+    const can_apply = uses_value_list
+        ? histogram.status === 'ready' && (draft.excludedValues?.length ?? 0) > 0
+        : !needs_value
+            || ((draft.value ?? '').length > 0
+                && (!needs_second || (draft.secondValue ?? '').length > 0));
     const apply = () => {
         if (!can_apply) return;
-        on_apply({ ...draft });
+        on_apply({
+            ...draft,
+            value: uses_value_list ? undefined : draft.value,
+            secondValue: uses_value_list ? undefined : draft.secondValue,
+            excludedValues: uses_value_list ? draft.excludedValues : undefined,
+            caseSensitive: uses_value_list ? false : draft.caseSensitive,
+        });
     };
 
     const update_draft = (next: FilterEntry) => {
         user_edited_ref.current = true;
         set_draft(next);
+    };
+
+    const update_operator = (operator: FilterOperator) => {
+        // Keep typed inputs and checklist choices in the transient draft so
+        // switching operators back and forth before Apply loses nothing.
+        update_draft({
+            ...draft,
+            operator,
+            excludedValues: operator === 'isOneOf'
+                ? draft.excludedValues ?? []
+                : draft.excludedValues,
+        });
+        if (operator === 'isOneOf') {
+            // Focus after the checklist mounts.
+            window.setTimeout(() => value_search_ref.current?.focus(), 0);
+        }
     };
 
     const update_range_bounds = (lo: number, hi: number) => {
@@ -209,15 +251,24 @@ export function FilterPopover({
                     id="filter-condition"
                     className="filter-popover-select"
                     value={draft.operator}
-                    onChange={(event) => update_draft({
-                        ...draft,
-                        operator: event.target.value as FilterOperator,
-                    })}
+                    onChange={(event) =>
+                        update_operator(event.target.value as FilterOperator)}
                 >
                     {operator_options.map((option) => (
                         <option key={option.value} value={option.value}>{option.label}</option>
                     ))}
                 </select>
+                {uses_value_list && (
+                    <FilterValueChecklistStatus
+                        histogram={histogram}
+                        excluded_values={draft.excludedValues ?? []}
+                        search_ref={value_search_ref}
+                        on_change={(excluded_values) => update_draft({
+                            ...draft,
+                            excludedValues: excluded_values,
+                        })}
+                    />
+                )}
                 {needs_value && (
                     <input
                         ref={first_value_ref}
@@ -277,6 +328,58 @@ export function FilterPopover({
                 </button>
             </div>
         </div>
+    );
+}
+
+function FilterValueChecklistStatus({
+    histogram,
+    excluded_values,
+    search_ref,
+    on_change,
+}: {
+    histogram: NonNullable<FilterPopoverProps['histogram']>;
+    excluded_values: readonly (string | null)[];
+    search_ref: React.RefObject<HTMLInputElement>;
+    on_change: (excluded_values: (string | null)[]) => void;
+}): React.JSX.Element {
+    if (histogram.status === 'loading') {
+        return <div className="filter-value-status" role="status">Loading values…</div>;
+    }
+    if (histogram.status === 'error') {
+        return (
+            <div className="filter-value-status filter-value-error" role="status">
+                Values unavailable: {histogram.message}
+            </div>
+        );
+    }
+    if (histogram.distinctValuesExceeded === true) {
+        // Only a saved filter can reach this state (new drafts never see the
+        // operator). Its stored exclusions stay editable; unchecked values
+        // from a partial list are never offered. The checklist stays mounted
+        // even once every exclusion is re-checked — its captured universe is
+        // what lets that last toggle be undone.
+        return (
+            <>
+                <div className="filter-value-status" role="status">
+                    This column has too many distinct values to list.
+                    Only previously excluded values are shown.
+                </div>
+                <FilterValueChecklist
+                    ref={search_ref}
+                    values={[]}
+                    excluded_values={excluded_values}
+                    on_change={on_change}
+                />
+            </>
+        );
+    }
+    return (
+        <FilterValueChecklist
+            ref={search_ref}
+            values={histogram.distinctValues ?? []}
+            excluded_values={excluded_values}
+            on_change={on_change}
+        />
     );
 }
 

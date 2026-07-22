@@ -70,6 +70,10 @@ const FILTER_OPERATOR_METADATA: readonly FilterOperatorMetadata[] = [
         columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
     },
     {
+        value: 'isOneOf', label: 'Is one of',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
         value: 'isEmpty', label: 'Is empty',
         columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
     },
@@ -87,18 +91,28 @@ export const FILTER_OPTIONS: readonly FilterOption[] = FILTER_OPERATOR_METADATA.
     ({ value, label }) => ({ value, label }),
 );
 
-export function filter_options_for_kind(kind: FilterColumnKind): readonly FilterOption[] {
-    if (kind === 'unknown') return FILTER_OPTIONS;
-    return FILTER_OPTIONS.filter((option) =>
-        FILTER_OPERATOR_METADATA_BY_VALUE.get(option.value)?.columnKinds.includes(kind));
+export function filter_options_for_kind(
+    kind: FilterColumnKind,
+    value_list_available = false,
+): readonly FilterOption[] {
+    const options = kind === 'unknown'
+        ? FILTER_OPTIONS
+        : FILTER_OPTIONS.filter((option) =>
+            FILTER_OPERATOR_METADATA_BY_VALUE.get(option.value)?.columnKinds.includes(kind));
+    // "Is one of" is availability-gated: it needs a complete distinct-value
+    // list, which loading/errored/over-cap columns cannot provide.
+    return value_list_available
+        ? options
+        : options.filter((option) => option.value !== 'isOneOf');
 }
 
 /** Kind options plus the current operator when it falls outside the kind list. */
 export function filter_options_for_draft(
     kind: FilterColumnKind,
     current_operator: FilterOperator,
+    value_list_available = false,
 ): readonly FilterOption[] {
-    const options = filter_options_for_kind(kind);
+    const options = filter_options_for_kind(kind, value_list_available);
     if (options.some((option) => option.value === current_operator)) return options;
     const extra = FILTER_OPTIONS.find((option) => option.value === current_operator);
     return extra ? [...options, extra] : options;
@@ -113,9 +127,18 @@ export function operator_supports_case_sensitive(
         && FILTER_OPERATOR_METADATA_BY_VALUE.get(operator)?.supportsCaseSensitive === true;
 }
 
+/** Settled per-column filter analysis: histogram bins plus the distinct
+ *  value list backing the "Is one of" checklist. */
+export interface FilterHistogramReady {
+    bins: readonly { lo: number; hi: number; count: number }[];
+    columnKind?: FilterColumnKind;
+    distinctValues?: readonly (string | null)[];
+    distinctValuesExceeded?: boolean;
+}
+
 export type FilterHistogramStatus =
     | { status: 'loading' }
-    | { status: 'ready'; bins: readonly { lo: number; hi: number; count: number }[]; columnKind?: FilterColumnKind }
+    | ({ status: 'ready' } & FilterHistogramReady)
     | { status: 'error'; message: string };
 
 /**
@@ -148,6 +171,9 @@ export function filter_draft_for_column(
             ...existing,
             value: existing.value ?? '',
             secondValue: existing.secondValue ?? '',
+            excludedValues: existing.excludedValues
+                ? [...existing.excludedValues]
+                : undefined,
         };
     }
     return {
@@ -170,6 +196,23 @@ export function is_pristine_default_filter_draft(entry: FilterEntry): boolean {
         && entry.enabled === true;
 }
 
+/** Human-readable checklist entry label; `null` is the blank category. */
+export function filter_value_label(value: string | null): string {
+    return value === null ? '(Blanks)' : value;
+}
+
+function is_one_of_summary(name: string, entry: FilterEntry): string {
+    const excluded = entry.excludedValues ?? [];
+    if (excluded.length === 0) return `${name} includes all values`;
+    if (excluded.length === 1) {
+        const label = excluded[0] === null
+            ? '(Blanks)'
+            : `“${excluded[0]}”`;
+        return `${name} excludes ${label}`;
+    }
+    return `${name} excludes ${excluded.length} values`;
+}
+
 export function filter_summary(
     entry: FilterEntry,
     column_names: readonly string[],
@@ -190,6 +233,7 @@ export function filter_summary(
         case 'notBetween': return `${name} not in ${entry.value ?? ''}–${entry.secondValue ?? ''}`;
         case 'isEmpty': return `${name} is empty`;
         case 'isNotEmpty': return `${name} is not empty`;
+        case 'isOneOf': return is_one_of_summary(name, entry);
     }
 }
 

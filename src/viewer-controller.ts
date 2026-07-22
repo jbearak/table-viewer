@@ -12,6 +12,7 @@ import {
     InvalidPersistedTransformError,
     ViewerPanelCore,
     adopt_source_into_core,
+    clone_filter_entry,
     transform_states_equal,
     type PanelLike,
 } from './panel-core';
@@ -1230,7 +1231,7 @@ export function attach_viewer(
                 ? {
                     ...error.retainedState,
                     sort: error.retainedState.sort.map((key) => ({ ...key })),
-                    filters: error.retainedState.filters.map((entry) => ({ ...entry })),
+                    filters: error.retainedState.filters.map(clone_filter_entry),
                 }
                 : undefined;
             const result = await state_store.compare_and_set(
@@ -1307,7 +1308,7 @@ export function attach_viewer(
                 ? {
                     ...state,
                     sort: state.sort.map((key) => ({ ...key })),
-                    filters: state.filters.map((entry) => ({ ...entry })),
+                    filters: state.filters.map(clone_filter_entry),
                 }
                 : undefined;
             return { ...current, transforms };

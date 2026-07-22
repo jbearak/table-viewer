@@ -17,14 +17,12 @@ import {
     type CellHighlightSelection,
     type CellHighlightState,
     type CsvDirtyMap,
-    type FilterColumnKind,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
     type FilterEntry,
-    type HistogramBin,
     type SheetColumnVisibilityState,
     type TransformIntent,
 } from '../types';
@@ -38,7 +36,12 @@ import {
 } from '../viewer-snapshot';
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
-import { transform_progress_label, upsert_filter } from './transform-ui-model';
+import {
+    transform_progress_label,
+    upsert_filter,
+    type FilterHistogramReady,
+    type FilterHistogramStatus,
+} from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
 import {
     GridShell,
@@ -79,9 +82,7 @@ type ColumnVisibilityUpdater = (
 ) => SheetColumnVisibilityState | undefined;
 
 type TransformOrigin = 'grid' | 'toolbar' | 'restore';
-type FilterHistogramState = { status: 'loading' }
-    | { status: 'ready'; bins: readonly HistogramBin[]; columnKind: FilterColumnKind }
-    | { status: 'error'; message: string };
+type FilterHistogramState = FilterHistogramStatus;
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
@@ -111,6 +112,14 @@ export function transforms_semantically_equal(
             };
             if (entry.operator === 'isEmpty' || entry.operator === 'isNotEmpty') {
                 return base;
+            }
+            if (entry.operator === 'isOneOf') {
+                return {
+                    ...base,
+                    excludedValues: [...(entry.excludedValues ?? [])].sort(
+                        (a, b) => (a ?? '').localeCompare(b ?? ''),
+                    ),
+                };
             }
             return {
                 ...base,
@@ -281,10 +290,7 @@ export function App(): React.JSX.Element {
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
-    const histogram_cache_ref = useRef(new Map<string, {
-        bins: readonly HistogramBin[];
-        columnKind: FilterColumnKind;
-    }>());
+    const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
     const pending_histogram_ref = useRef<{
         requestId: string;
         key: string;
@@ -572,17 +578,16 @@ export function App(): React.JSX.Element {
                         value: { status: 'error', message: msg.error },
                     });
                 } else {
-                    histogram_cache_ref.current.set(pending.key, {
+                    const ready: FilterHistogramReady = {
                         bins: msg.bins,
                         columnKind: msg.columnKind ?? 'unknown',
-                    });
+                        distinctValues: msg.distinctValues,
+                        distinctValuesExceeded: msg.distinctValuesExceeded,
+                    };
+                    histogram_cache_ref.current.set(pending.key, ready);
                     set_filter_histogram({
                         key: pending.key,
-                        value: {
-                            status: 'ready',
-                            bins: msg.bins,
-                            columnKind: msg.columnKind ?? 'unknown',
-                        },
+                        value: { status: 'ready', ...ready },
                     });
                 }
             }
@@ -1361,11 +1366,7 @@ export function App(): React.JSX.Element {
         if (cached) {
             set_filter_histogram({
                 key,
-                value: {
-                    status: 'ready',
-                    bins: cached.bins,
-                    columnKind: cached.columnKind,
-                },
+                value: { status: 'ready', ...cached },
             });
             return;
         }

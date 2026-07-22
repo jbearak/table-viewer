@@ -175,6 +175,71 @@ describe('sheet-state helpers', () => {
         });
     });
 
+    it('sanitizes isOneOf exclusion lists and rejects malformed ones', () => {
+        const entry = (overrides: Record<string, unknown>) => ({
+            id: 'list',
+            colIndex: 0,
+            operator: 'isOneOf',
+            caseSensitive: false,
+            enabled: true,
+            ...overrides,
+        });
+
+        // Valid: strings and null kept, non-strings dropped, duplicates
+        // removed, caseSensitive forced false, scalar operands not retained.
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [entry({
+                excludedValues: ['a', null, 'a', 7, {}, 'b'],
+                value: 'stale',
+                secondValue: 'stale',
+                caseSensitive: true,
+            })],
+        }, 1)).toEqual({
+            sort: [],
+            filters: [{
+                id: 'list',
+                colIndex: 0,
+                operator: 'isOneOf',
+                value: undefined,
+                secondValue: undefined,
+                excludedValues: ['a', null, 'b'],
+                caseSensitive: false,
+                enabled: true,
+            }],
+        });
+
+        // Missing or non-array exclusion lists reject the entry outright.
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [entry({})],
+        }, 1)).toBeUndefined();
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [entry({ excludedValues: 'a,b' })],
+        }, 1)).toBeUndefined();
+
+        // An empty list is valid (explicit include-everything filter).
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [entry({ excludedValues: [] })],
+        }, 1)?.filters[0].excludedValues).toEqual([]);
+
+        // Other operators never retain an exclusion list.
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [{
+                id: 'text',
+                colIndex: 0,
+                operator: 'contains',
+                value: 'x',
+                excludedValues: ['a'],
+                caseSensitive: false,
+                enabled: true,
+            }],
+        }, 1)?.filters[0].excludedValues).toBeUndefined();
+    });
+
     it('drops a persisted transform when its sheet schema fingerprint changes', () => {
         expect(sanitize_transform_state({
             sort: [{ colIndex: 0, direction: 'asc' }],

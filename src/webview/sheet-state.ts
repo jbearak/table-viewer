@@ -114,6 +114,7 @@ export function sanitize_transform_state(
         'contains', 'notContains', 'equals', 'notEquals', 'startsWith',
         'endsWith', 'greaterThan', 'greaterThanOrEqual', 'lessThan',
         'lessThanOrEqual', 'between', 'notBetween', 'isEmpty', 'isNotEmpty',
+        'isOneOf',
     ]);
     for (const item of candidate.filters) {
         if (!item || typeof item !== 'object') continue;
@@ -134,7 +135,9 @@ export function sanitize_transform_state(
         ) {
             continue;
         }
-        const needs_value = entry.operator !== 'isEmpty'
+        const is_one_of = entry.operator === 'isOneOf';
+        const needs_value = !is_one_of
+            && entry.operator !== 'isEmpty'
             && entry.operator !== 'isNotEmpty';
         if (needs_value && typeof entry.value !== 'string') continue;
         if (
@@ -144,17 +147,26 @@ export function sanitize_transform_state(
         ) {
             continue;
         }
+        // A missing/malformed exclusion list is rejected rather than treated as
+        // "exclude nothing": corrupt state must not silently become a no-op.
+        const excluded_values = is_one_of
+            ? sanitize_excluded_values(entry.excludedValues)
+            : undefined;
+        if (is_one_of && excluded_values === undefined) continue;
         seen_filter_ids.add(entry.id);
         seen_filter_columns.add(entry.colIndex);
         filters.push({
             id: entry.id,
             colIndex: entry.colIndex,
             operator: entry.operator as FilterEntry['operator'],
-            value: typeof entry.value === 'string' ? entry.value : undefined,
-            secondValue: typeof entry.secondValue === 'string'
+            value: !is_one_of && typeof entry.value === 'string'
+                ? entry.value
+                : undefined,
+            secondValue: !is_one_of && typeof entry.secondValue === 'string'
                 ? entry.secondValue
                 : undefined,
-            caseSensitive: entry.caseSensitive,
+            excludedValues: excluded_values,
+            caseSensitive: is_one_of ? false : entry.caseSensitive,
             enabled: entry.enabled,
         });
     }
@@ -163,6 +175,24 @@ export function sanitize_transform_state(
     const result: SheetTransformState = { sort, filters };
     if (schema !== undefined) result.schema = schema;
     return result;
+}
+
+/** Allocation guard for corrupt/malicious persisted state. Stale exclusions
+ *  can accumulate ~1,000 per file-content change, so a legitimate list is
+ *  truncated to this bound (permissive: extra rows show) rather than having
+ *  the whole filter rejected. */
+const MAX_PERSISTED_EXCLUDED_VALUES = 100_000;
+
+function sanitize_excluded_values(
+    value: unknown,
+): (string | null)[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const unique = new Set<string | null>();
+    for (const item of value) {
+        if (item === null || typeof item === 'string') unique.add(item);
+        if (unique.size === MAX_PERSISTED_EXCLUDED_VALUES) break;
+    }
+    return [...unique];
 }
 
 export function trim_sheet_state_array<T>(

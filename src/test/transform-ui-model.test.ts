@@ -143,6 +143,7 @@ describe('transform UI model', () => {
             notBetween: 'Amount not in 5–9',
             isEmpty: 'Amount is empty',
             isNotEmpty: 'Amount is not empty',
+            isOneOf: 'Amount includes all values',
         };
         for (const operator of Object.keys(expected) as FilterOperator[]) {
             expect(filter_summary(entry(operator), ['Amount'])).toBe(expected[operator]);

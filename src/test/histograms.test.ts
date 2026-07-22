@@ -80,10 +80,17 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [{ lo: 4, hi: 4, count: 2 }],
             columnKind: 'numeric',
+            distinctValues: ['4', null],
+            distinctValuesExceeded: false,
         });
         await expect(compute_column_histogram(
             new HistogramSource(['text', '', null]), 0, 0, () => false,
-        )).resolves.toEqual({ bins: [], columnKind: 'text' });
+        )).resolves.toEqual({
+            bins: [],
+            columnKind: 'text',
+            distinctValues: ['text', null],
+            distinctValuesExceeded: false,
+        });
     });
 
 
@@ -128,16 +135,82 @@ describe('compute_column_histogram', () => {
         )).resolves.toMatchObject({ columnKind: 'text' });
     });
 
-    it('stops scanning when the column kind becomes text', async () => {
+    it('stops scanning once text kind and distinct overflow are both final', async () => {
         const source = new HistogramSource([
             '1',
             'label',
-            ...Array.from({ length: 1_999 }, (_, index) => String(index + 2)),
+            ...Array.from({ length: 3_999 }, (_, index) => String(index + 2)),
         ]);
         await expect(compute_column_histogram(
             source, 0, 0, () => false,
-        )).resolves.toEqual({ bins: [], columnKind: 'text' });
-        expect(source.selected_columns).toEqual([[0]]);
+        )).resolves.toEqual({
+            bins: [],
+            columnKind: 'text',
+            distinctValues: [],
+            distinctValuesExceeded: true,
+        });
+        // A complete distinct list requires the second batch; the remaining
+        // two batches are skipped once both facts are final.
+        expect(source.selected_columns).toEqual([[0], [0]]);
+    });
+
+    it('keeps a complete distinct list for text columns under the cap', async () => {
+        const source = new HistogramSource([
+            'b', 'a', 'b', '  ', 'a ', null,
+        ]);
+        await expect(compute_column_histogram(
+            source, 0, 0, () => false,
+        )).resolves.toEqual({
+            bins: [],
+            columnKind: 'text',
+            // Exact raw values in first-seen order; whitespace-only collapses
+            // to the single blank (null) entry, "a " stays distinct from "a".
+            distinctValues: ['b', 'a', null, 'a '],
+            distinctValuesExceeded: false,
+        });
+    });
+
+    it('returns exactly the cap of distinct values but not one more', async () => {
+        const under = await compute_column_histogram(
+            new HistogramSource(
+                Array.from({ length: 1_000 }, (_, i) => `v${i}`),
+            ),
+            0, 0, () => false,
+        );
+        expect(under.distinctValuesExceeded).toBe(false);
+        expect(under.distinctValues).toHaveLength(1_000);
+
+        const over = await compute_column_histogram(
+            new HistogramSource(
+                Array.from({ length: 1_001 }, (_, i) => `v${i}`),
+            ),
+            0, 0, () => false,
+        );
+        expect(over.distinctValuesExceeded).toBe(true);
+        expect(over.distinctValues).toEqual([]);
+    });
+
+    it('counts blanks as one distinct entry toward the cap', async () => {
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                null,
+                ...Array.from({ length: 1_000 }, (_, i) => `v${i}`),
+            ]),
+            0, 0, () => false,
+        );
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
+    });
+
+    it('produces numeric bins and distinct values from the same scan', async () => {
+        const histogram = await compute_column_histogram(
+            new HistogramSource(['1', '2', '2.0', '1']),
+            0, 0, () => false,
+        );
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.bins.length).toBeGreaterThan(0);
+        // Distinct values stay exact raw strings: '2' and '2.0' differ.
+        expect(histogram.distinctValues).toEqual(['1', '2', '2.0']);
     });
 
     it('classifies raw and ISO date columns as ordered text', async () => {
@@ -146,13 +219,23 @@ describe('compute_column_histogram', () => {
             0,
             0,
             () => false,
-        )).resolves.toEqual({ bins: [], columnKind: 'orderedText' });
+        )).resolves.toEqual({
+            bins: [],
+            columnKind: 'orderedText',
+            distinctValues: ['2026-07-21'],
+            distinctValuesExceeded: false,
+        });
         await expect(compute_column_histogram(
             new HistogramSource(['2026-07-21', '2026-07-22']),
             0,
             0,
             () => false,
-        )).resolves.toEqual({ bins: [], columnKind: 'orderedText' });
+        )).resolves.toEqual({
+            bins: [],
+            columnKind: 'orderedText',
+            distinctValues: ['2026-07-21', '2026-07-22'],
+            distinctValuesExceeded: false,
+        });
     });
 
     it('checks cancellation between bounded row reads', async () => {

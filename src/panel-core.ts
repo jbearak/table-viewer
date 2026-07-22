@@ -4,7 +4,7 @@ import {
     read_source_row_indices,
 } from './data-source/interface';
 import { deep_clone_and_freeze } from './immutable';
-import { compute_column_histogram } from './histograms';
+import { compute_column_histogram, type ColumnHistogram } from './histograms';
 import {
     compute_transform,
     InvalidNumericFilterOperandError,
@@ -22,8 +22,7 @@ import {
     transform_is_active,
     transform_schema_for_sheet,
     type DisplayRowInterval,
-    type FilterColumnKind,
-    type HistogramBin,
+    type FilterEntry,
     type HostMessage,
     type SheetTransformState,
     type WebviewMessage,
@@ -175,7 +174,7 @@ export class ViewerPanelCore {
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
-    private readonly histogram_cache = new Map<string, { bins: HistogramBin[]; columnKind: FilterColumnKind }>();
+    private readonly histogram_cache = new Map<string, ColumnHistogram>();
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private source_epoch = 0;
     private receiver_epoch = 0;
@@ -396,6 +395,8 @@ export class ViewerPanelCore {
                 columnIndex: msg.columnIndex,
                 bins: [],
                 columnKind: 'unknown',
+                distinctValues: [],
+                distinctValuesExceeded: false,
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
@@ -428,6 +429,8 @@ export class ViewerPanelCore {
                 columnIndex: msg.columnIndex,
                 bins: histogram.bins,
                 columnKind: histogram.columnKind,
+                distinctValues: histogram.distinctValues,
+                distinctValuesExceeded: histogram.distinctValuesExceeded,
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
@@ -440,6 +443,8 @@ export class ViewerPanelCore {
                 columnIndex: msg.columnIndex,
                 bins: [],
                 columnKind: 'unknown',
+                distinctValues: [],
+                distinctValuesExceeded: false,
                 requestId: msg.requestId,
                 generation: msg.generation,
                 sourceGeneration: msg.sourceGeneration,
@@ -882,10 +887,16 @@ export class ViewerPanelCore {
 function clone_transform(state: SheetTransformState): SheetTransformState {
     const clone: SheetTransformState = {
         sort: state.sort.map((key) => ({ ...key })),
-        filters: state.filters.map((entry) => ({ ...entry })),
+        filters: state.filters.map(clone_filter_entry),
     };
     if (state.schema !== undefined) clone.schema = state.schema;
     return clone;
+}
+
+export function clone_filter_entry(entry: FilterEntry): FilterEntry {
+    return entry.excludedValues
+        ? { ...entry, excludedValues: [...entry.excludedValues] }
+        : { ...entry };
 }
 
 /**
@@ -949,7 +960,17 @@ export function transform_states_equal(
                 && entry.operator === candidate.operator
                 && entry.value === candidate.value
                 && entry.secondValue === candidate.secondValue
+                && excluded_values_equal(entry.excludedValues, candidate.excludedValues)
                 && entry.caseSensitive === candidate.caseSensitive
                 && entry.enabled === candidate.enabled;
         });
+}
+
+function excluded_values_equal(
+    left: readonly (string | null)[] | undefined,
+    right: readonly (string | null)[] | undefined,
+): boolean {
+    if (left === right) return true;
+    if (!left || !right || left.length !== right.length) return false;
+    return left.every((value, index) => value === right[index]);
 }

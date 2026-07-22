@@ -947,6 +947,51 @@ describe('table transforms', () => {
         )).toBe(true);
     });
 
+    it('excludes exact raw values with isOneOf and passes everything else', async () => {
+        const exclusion = (
+            excluded: (string | null)[],
+        ): FilterEntry => ({
+            ...filter('isOneOf'),
+            excludedValues: excluded,
+        });
+
+        // Exact, case-sensitive raw matching; caseSensitive flag is ignored.
+        expect(matches_filter(cell('Yes'), exclusion(['Yes']))).toBe(false);
+        expect(matches_filter(cell('yes'), exclusion(['Yes']))).toBe(true);
+        expect(matches_filter(
+            cell('Yes'),
+            { ...exclusion(['Yes']), caseSensitive: true },
+        )).toBe(false);
+
+        // No numeric canonicalization: '2' does not exclude '2.0' or '02'.
+        expect(matches_filter(cell('2.0', 'number'), exclusion(['2']))).toBe(true);
+        expect(matches_filter(cell('02'), exclusion(['2']))).toBe(true);
+        expect(matches_filter(cell('2', 'number'), exclusion(['2']))).toBe(false);
+
+        // null excludes blanks: null, empty, and whitespace-only cells.
+        expect(matches_filter(null, exclusion([null]))).toBe(false);
+        expect(matches_filter(cell('', 'string'), exclusion([null]))).toBe(false);
+        expect(matches_filter(cell('   ', 'string'), exclusion([null]))).toBe(false);
+        expect(matches_filter(cell('kept'), exclusion([null]))).toBe(true);
+
+        // Unknown (future) values and the empty exclusion list always pass.
+        expect(matches_filter(cell('brand new'), exclusion(['old']))).toBe(true);
+        expect(matches_filter(cell('anything'), exclusion([]))).toBe(true);
+        expect(matches_filter(null, exclusion([]))).toBe(true);
+
+        // Full transform: survivors keep source order; blanks drop with null.
+        const source = new Source([
+            [cell('a')],
+            [cell('b')],
+            [null],
+            [cell('c')],
+        ]);
+        await expect(compute_transform(source, 0, {
+            sort: [],
+            filters: [exclusion(['b', null])],
+        })).resolves.toMatchObject({ indices: Uint32Array.from([0, 3]) });
+    });
+
     it('treats empty strings and nulls consistently as missing', () => {
         const empty_string = cell('', 'string');
         expect(matches_filter(empty_string, filter('isEmpty'))).toBe(true);

@@ -1,6 +1,7 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import { read_source_columns } from './data-source/interface';
 import type { FilterColumnKind, HistogramBin } from './types';
+import { FILTER_DISTINCT_VALUE_LIMIT } from './types';
 import {
     canonical_numeric_string,
     raw_value,
@@ -12,6 +13,10 @@ const ROW_BATCH_SIZE = 1_000;
 export interface ColumnHistogram {
     bins: HistogramBin[];
     columnKind: FilterColumnKind;
+    /** Exact raw values in first-seen source order; `null` is the blank
+     *  category. Empty when the column exceeds the distinct-value cap. */
+    distinctValues: (string | null)[];
+    distinctValuesExceeded: boolean;
 }
 
 function finite_numeric_value(cell: RenderedCell | null | undefined): number | undefined {
@@ -95,6 +100,7 @@ export async function compute_column_histogram(
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
     let columnKind: FilterColumnKind = 'unknown';
+    let distinct: Set<string | null> | null = new Set();
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
         const window = read_source_columns(
@@ -105,11 +111,20 @@ export async function compute_column_histogram(
             [column_index],
         );
         for (const row of window.rows) {
+            if (distinct !== null) {
+                distinct.add(raw_value(row[0]));
+                if (distinct.size > FILTER_DISTINCT_VALUE_LIMIT) {
+                    // Release retained strings; a partial list is never sent.
+                    distinct = null;
+                }
+            }
             const classified = classify_value(row[0]);
             if (classified === undefined) continue;
             columnKind = combine_kind(columnKind, classified.kind);
-            if (columnKind === 'text') {
-                return { bins: [], columnKind };
+            // A text column has no bins; once the distinct list has also
+            // overflowed nothing further can change, so stop scanning.
+            if (columnKind === 'text' && distinct === null) {
+                return distinct_result([], columnKind, null);
             }
             if (classified.kind !== 'numeric') continue;
             const value = classified.numericValue;
@@ -121,9 +136,12 @@ export async function compute_column_histogram(
     }
 
     if (is_cancelled()) throw abort_error();
-    if (columnKind !== 'numeric') return { bins: [], columnKind };
-    if (count === 0) return { bins: [], columnKind };
-    if (min === max) return { bins: [{ lo: min, hi: max, count }], columnKind };
+    if (columnKind !== 'numeric' || count === 0) {
+        return distinct_result([], columnKind, distinct);
+    }
+    if (min === max) {
+        return distinct_result([{ lo: min, hi: max, count }], columnKind, distinct);
+    }
 
     const span = max - min;
     const boundary = (index: number) => {
@@ -161,5 +179,18 @@ export async function compute_column_histogram(
         await yield_to_host();
     }
     if (is_cancelled()) throw abort_error();
-    return { bins, columnKind };
+    return distinct_result(bins, columnKind, distinct);
+}
+
+function distinct_result(
+    bins: HistogramBin[],
+    columnKind: FilterColumnKind,
+    distinct: Set<string | null> | null,
+): ColumnHistogram {
+    return {
+        bins,
+        columnKind,
+        distinctValues: distinct === null ? [] : [...distinct],
+        distinctValuesExceeded: distinct === null,
+    };
 }
