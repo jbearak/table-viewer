@@ -90,9 +90,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
-    const row_count_text = row_count === source_row_count
-        ? `${row_count.toLocaleString()} rows`
-        : `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
+    // The row count is only informative when a filter is hiding rows; in the
+    // common unfiltered view it is just persistent chrome, so suppress it and
+    // surface "N of M rows" purely as filter feedback.
+    const is_filtered = row_count !== source_row_count;
+    const row_count_text = `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
     const wrapped = use_toolbar_wrap(
         { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
         [
@@ -124,11 +126,14 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             tabIndex={-1}
             aria-label="Table controls"
         >
-            <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
+            {is_filtered && (
+                <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
+            )}
             <span className="sr-only" role="status" aria-live="polite">
                 {props.excel_header_status ?? ''}
             </span>
             <div ref={chips_ref} className="toolbar-chips">
+                {props.highlight && <HighlightControl {...props.highlight} />}
                 <SortStrip
                     state={transform}
                     column_names={column_names}
@@ -211,7 +216,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ref={columns_ref}
                     {...props.column_visibility}
                 />
-                {props.highlight && <HighlightControl {...props.highlight} />}
                 <ToolbarButton
                     label="Auto-fit Columns"
                     active={props.auto_fit_active}
