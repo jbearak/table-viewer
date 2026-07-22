@@ -44,7 +44,10 @@ export interface ExcelFirstRowHeaderMeta {
 
 export interface SheetMeta {
     name: string;
+    /** Rows exposed by this DataSource after logical projections such as headers. */
     rowCount: number;
+    /** Size of the stable canonical row space in the underlying physical source. */
+    sourceRowCount: number;
     columnCount: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
@@ -63,6 +66,18 @@ export interface WorkbookMeta {
 export interface DataSource {
     /** Workbook structure only — no cell data. Cheap; safe to call repeatedly. */
     meta(): WorkbookMeta;
+    /** Map projected rows exposed by this DataSource to canonical source rows.
+     * Optional identity default for sources without a row projection. */
+    source_row_indices?(
+        sheet_index: number,
+        projected_rows: ArrayLike<number>,
+    ): Uint32Array;
+    /** Map one canonical source row back into this DataSource's projected row
+     * space. Returns undefined when the source row is excluded by the projection. */
+    projected_row_index?(
+        sheet_index: number,
+        source_row: number,
+    ): number | undefined;
     /** Materialize a window of rows for one sheet. count may overshoot rowCount. */
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow;
     /** Materialize arbitrary absolute rows in requested order without reading
@@ -99,6 +114,60 @@ export interface DataSource {
     headerLine?: string;
     /** CSV save path: detected line terminator, so re-serialization round-trips. */
     lineEnding?: '\r\n' | '\r' | '\n';
+}
+
+/** Map projected DataSource rows to canonical source rows. Identity sources
+ * need not implement source_row_indices explicitly. */
+export function read_source_row_indices(
+    source: DataSource,
+    sheet_index: number,
+    projected_rows: ArrayLike<number>,
+): Uint32Array {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+    for (let position = 0; position < projected_rows.length; position++) {
+        const row = projected_rows[position];
+        if (!Number.isInteger(row) || row < 0 || row >= sheet.rowCount) {
+            throw new RangeError(`row index ${row} out of range (${sheet.rowCount} rows)`);
+        }
+    }
+    const source_rows = source.source_row_indices
+        ? source.source_row_indices(sheet_index, projected_rows)
+        : Uint32Array.from(projected_rows);
+    if (source_rows.length !== projected_rows.length) {
+        throw new RangeError('source row mapping length does not match projected rows');
+    }
+    for (const row of source_rows) {
+        if (!Number.isInteger(row) || row < 0 || row >= sheet.sourceRowCount) {
+            throw new RangeError(
+                `source row ${row} out of range (${sheet.sourceRowCount} rows)`,
+            );
+        }
+    }
+    return source_rows;
+}
+
+/** Map one canonical source row into the DataSource's projected row space. */
+export function projected_row_for_source(
+    source: DataSource,
+    sheet_index: number,
+    source_row: number,
+): number | undefined {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+    if (
+        !Number.isInteger(source_row)
+        || source_row < 0
+        || source_row >= sheet.sourceRowCount
+    ) return undefined;
+    const projected = source.projected_row_index
+        ? source.projected_row_index(sheet_index, source_row)
+        : source_row < sheet.rowCount ? source_row : undefined;
+    if (projected === undefined) return undefined;
+    if (!Number.isInteger(projected) || projected < 0 || projected >= sheet.rowCount) {
+        throw new RangeError(`projected row ${projected} out of range (${sheet.rowCount} rows)`);
+    }
+    return projected;
 }
 
 /** Read arbitrary rows in requested order. Legacy sources are read as adjacent

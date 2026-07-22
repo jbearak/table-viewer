@@ -150,6 +150,7 @@ const planning_input: ExcelHeaderPlanningInput = Object.freeze({
     sheets: Object.freeze([Object.freeze({
         name: 'People',
         rowCount: 3,
+        sourceRowCount: 3,
         columnCount: 2,
         merges: Object.freeze([]),
         hasFormatting: false,
@@ -2659,4 +2660,261 @@ describe('file coordinator identity', () => {
         first.dispose();
         second.dispose();
     });
+
+    it('applies and publishes cell highlights while preserving unrelated state', async () => {
+        const path = '/tmp/highlight-authority.csv';
+        const initial = {
+            [path]: {
+                rowHeights: [{ 1: 31 }],
+                pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+            },
+        };
+        const mapped = mapped_state_store(initial);
+        const first = acquire_file_coordinator(path, mapped.store, 'linux');
+        const second = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(first, 'digest-a', mapped.store);
+        const receipts: unknown[] = [];
+        const a = first.subscribe_cell_highlights((receipt) => { receipts.push(receipt); });
+        const b = second.subscribe_cell_highlights((receipt) => { receipts.push(receipt); });
+        const basis = first.authority();
+        const meta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'People', rowCount: 3, sourceRowCount: 3, columnCount: 2,
+                merges: [], hasFormatting: false, columnNames: ['Name', 'Age'],
+            }],
+        };
+        const result = await first.apply_cell_highlights({
+            requestId: 'highlight:1',
+            originToken: Symbol('origin'),
+            sheetIndex: 0,
+            sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 1 }], sourceColumns: [1] },
+            mutation: { type: 'set', color: 'green' },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta,
+            stateStore: mapped.store,
+            isCurrent: () => true,
+            mapDisplayRowsToSource: () => Uint32Array.from([0, 1]),
+            displayRowForSource: (_sheet, sourceRow) => sourceRow,
+        });
+        expect(result.type).toBe('committed');
+        expect(receipts).toHaveLength(2);
+        expect(mapped.value(path)).toMatchObject({
+            rowHeights: [{ 1: 31 }],
+            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+            cellHighlights: {
+                sourceDigest: 'digest-a',
+                sheets: [{ cells: { '0:1': 'green', '1:1': 'green' } }],
+            },
+        });
+        a.dispose(); b.dispose(); first.dispose(); second.dispose();
+    });
+
+    it('serializes same-file highlight mutations in coordinator admission order', async () => {
+        const path = '/tmp/ordered-highlights.csv';
+        const mapped = mapped_state_store();
+        const first = acquire_file_coordinator(path, mapped.store, 'linux');
+        const second = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(first, 'digest-a', mapped.store);
+        const basis = first.authority();
+        const meta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1,
+                merges: [], hasFormatting: false,
+            }],
+        };
+        let release_first!: () => void;
+        const first_gate = new Promise<void>((resolve) => { release_first = resolve; });
+        let compare_calls = 0;
+        const deferred_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(...args) {
+                compare_calls += 1;
+                if (compare_calls === 1) await first_gate;
+                return mapped.store.compare_and_set(...args);
+            },
+        };
+        const receipts: string[] = [];
+        const subscription = first.subscribe_cell_highlights((receipt) => {
+            receipts.push(receipt.requestId);
+        });
+        const command = (requestId: string, color: 'yellow' | 'blue') => ({
+            requestId,
+            originToken: Symbol(requestId),
+            sheetIndex: 0,
+            sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set' as const, color },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta,
+            stateStore: deferred_store,
+            isCurrent: () => true,
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+
+        const older = first.apply_cell_highlights(command('older', 'yellow'));
+        await vi.waitFor(() => expect(compare_calls).toBe(1));
+        const newer = second.apply_cell_highlights(command('newer', 'blue'));
+        await Promise.resolve();
+        expect(compare_calls).toBe(1);
+        release_first();
+        expect((await older).type).toBe('committed');
+        expect((await newer).type).toBe('committed');
+        expect(receipts).toEqual(['older', 'newer']);
+        expect((mapped.value(path) as any)?.cellHighlights?.sheets[0]?.cells).toEqual({
+            '0:0': 'blue',
+        });
+
+        subscription.dispose(); first.dispose(); second.dispose();
+    });
+
+    it('replans highlight conflicts over unrelated concurrent state', async () => {
+        const path = '/tmp/highlight-conflict.csv';
+        const mapped = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        let compare_calls = 0;
+        const conflicting_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(file_path, expected, state, validate) {
+                compare_calls += 1;
+                if (compare_calls === 1) {
+                    const peer = await mapped.store.compare_and_set(file_path, expected, {
+                        ...state,
+                        rowHeights: [{ 0: 33 }],
+                        cellHighlights: undefined,
+                    }, validate);
+                    if (peer.type !== 'committed') throw new Error('peer write failed');
+                    return { type: 'conflict', snapshot: peer.snapshot };
+                }
+                return mapped.store.compare_and_set(file_path, expected, state, validate);
+            },
+        };
+        const result = await coordinator.apply_cell_highlights({
+            requestId: 'retry', originToken: Symbol(), sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'green' },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [{ name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1, merges: [], hasFormatting: false }] },
+            stateStore: conflicting_store, isCurrent: () => true,
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        expect(result.type).toBe('committed');
+        expect(compare_calls).toBe(2);
+        expect(mapped.value(path)).toMatchObject({
+            rowHeights: [{ 0: 33 }],
+            cellHighlights: { sheets: [{ cells: { '0:0': 'green' } }] },
+        });
+        coordinator.dispose();
+    });
+
+    it('does not publish when a highlight command becomes stale during CAS', async () => {
+        const path = '/tmp/stale-highlight-cas.csv';
+        const mapped = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        let current = true;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        const deferred_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(file_path, expected, state, validate) {
+                await gate;
+                return mapped.store.compare_and_set(file_path, expected, state, validate);
+            },
+        };
+        const subscriber = vi.fn();
+        const subscription = coordinator.subscribe_cell_highlights(subscriber);
+        const pending = coordinator.apply_cell_highlights({
+            requestId: 'stale-mid-cas', originToken: Symbol(), sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'pink' },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [{ name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1, merges: [], hasFormatting: false }] },
+            stateStore: deferred_store, isCurrent: () => current,
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        await Promise.resolve();
+        current = false;
+        release();
+        expect((await pending).type).toBe('rejected');
+        expect((mapped.value(path) as any)?.cellHighlights).toBeUndefined();
+        expect(subscriber).not.toHaveBeenCalled();
+        subscription.dispose(); coordinator.dispose();
+    });
+
+    it('rejects exhausted highlight conflicts without publishing a receipt', async () => {
+        const path = '/tmp/exhausted-highlights.csv';
+        const mapped = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        let compare_calls = 0;
+        const conflict_store: AuthorityFileStateStore = {
+            ...mapped.store,
+            async compare_and_set(file_path) {
+                compare_calls += 1;
+                return { type: 'conflict', snapshot: await mapped.store.read(file_path) };
+            },
+        };
+        const subscriber = vi.fn();
+        const subscription = coordinator.subscribe_cell_highlights(subscriber);
+        const result = await coordinator.apply_cell_highlights({
+            requestId: 'exhausted', originToken: Symbol(), sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'yellow' },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [{ name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1, merges: [], hasFormatting: false }] },
+            stateStore: conflict_store, isCurrent: () => true,
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        expect(result).toMatchObject({ type: 'rejected' });
+        expect(compare_calls).toBe(16);
+        expect(subscriber).not.toHaveBeenCalled();
+        expect((mapped.value(path) as any)?.cellHighlights).toBeUndefined();
+        subscription.dispose(); coordinator.dispose();
+    });
+
+    it('rejects a highlight CAS after physical authority advances', async () => {
+        const path = '/tmp/stale-highlight.csv';
+        const mapped = mapped_state_store();
+        const coordinator = acquire_file_coordinator(path, mapped.store, 'linux');
+        await establish(coordinator, 'digest-a', mapped.store);
+        const basis = coordinator.authority();
+        const newer = begin_physical(coordinator, 'digest-b');
+        coordinator.cancel(newer);
+        const result = await coordinator.apply_cell_highlights({
+            requestId: 'stale', originToken: Symbol(), sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'yellow' },
+            expectedAuthorityRevision: basis.authorityRevision,
+            expectedPhysicalRevision: basis.physicalRevision,
+            expectedPhysicalDigest: 'digest-a',
+            meta: { hasFormatting: false, sheets: [{ name: 'People', rowCount: 1, sourceRowCount: 1, columnCount: 1, merges: [], hasFormatting: false }] },
+            stateStore: mapped.store, isCurrent: () => false,
+            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            displayRowForSource: () => 0,
+        });
+        expect(result.type).toBe('rejected');
+        coordinator.dispose();
+    });
+
 });

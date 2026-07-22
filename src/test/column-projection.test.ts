@@ -11,6 +11,7 @@ import {
 const SHEET = {
     name: 'Data',
     rowCount: 2,
+    sourceRowCount: 2,
     columnCount: 5,
     columnNames: ['A', 'B', 'C', 'D', 'E'],
     merges: [],

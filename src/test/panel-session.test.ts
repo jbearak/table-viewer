@@ -91,6 +91,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             sheets: [{
                 name: 'Sheet1',
                 rowCount: 2,
+                sourceRowCount: 2,
                 columnCount: 1,
                 merges: [],
                 hasFormatting: false,
@@ -355,6 +356,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                     sheets: [{
                         name: 'Locally transformed',
                         rowCount: 1,
+                        sourceRowCount: 2,
                         columnCount: 1,
                         merges: [],
                         hasFormatting: false,

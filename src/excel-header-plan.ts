@@ -1,3 +1,4 @@
+import { migrate_cell_highlight_schema } from './cell-highlights';
 import {
     project_excel_header_sheet,
     project_excel_header_workbook,
@@ -92,6 +93,7 @@ export function plan_excel_candidate_state(
     const scrollPosition = [...(current.scrollPosition ?? [])];
     let transforms = current.transforms;
     let columnVisibility = current.columnVisibility;
+    let cellHighlights = current.cellHighlights;
 
     sheets.forEach((sheet, index) => {
         const next_is_active = next_active[sheet.name] ?? false;
@@ -131,6 +133,12 @@ export function plan_excel_candidate_state(
             previous,
             sheet,
         );
+        cellHighlights = migrate_cell_highlight_schema(
+            cellHighlights,
+            index,
+            previous,
+            sheet,
+        );
     });
 
     return {
@@ -144,6 +152,7 @@ export function plan_excel_candidate_state(
             scrollPosition,
             transforms,
             columnVisibility,
+            cellHighlights,
             excelFirstRowHeaderActive: next_active,
             excelFirstRowHeaderVersion: 1,
         },
@@ -199,6 +208,12 @@ export function plan_excel_override_state(
             ),
             columnVisibility: migrate_compatible_sheet_schema(
                 current.columnVisibility,
+                sheet_index,
+                old_sheet,
+                new_sheet,
+            ),
+            cellHighlights: migrate_cell_highlight_schema(
+                current.cellHighlights,
                 sheet_index,
                 old_sheet,
                 new_sheet,

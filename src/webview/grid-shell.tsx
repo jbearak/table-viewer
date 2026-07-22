@@ -28,10 +28,14 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
+    type CellHighlightColor,
+    type CellHighlightMutation,
+    type CellHighlightSelection,
     type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type MergeRange,
+    type SheetCellHighlightState,
     type SheetTransformState,
     type SortDirection,
 } from '../types';
@@ -78,8 +82,17 @@ import {
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
-import { changed_tint_keys } from './grid-repaint-model';
+import {
+    changed_highlight_keys,
+    changed_tint_keys,
+    visible_highlight_damage,
+} from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
+import {
+    grid_selection_contains_cell,
+    highlight_selection_from_grid,
+} from './highlight-selection-model';
+import { CELL_HIGHLIGHT_COLORS, highlight_rgba } from './highlight-theme';
 import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
@@ -147,6 +160,11 @@ export interface EditingHandle {
 }
 
 /** Imperative focus bridge used by App after generation-keyed remounts. */
+export interface HighlightSelectionHandle {
+    apply(color: CellHighlightColor): boolean;
+    clear(): boolean;
+}
+
 export interface GridFocusHandle {
     /** Generation owned by the GridShell instance exposing this handle. */
     generation: number;
@@ -219,6 +237,13 @@ export interface GridShellProps {
     on_hide_column?: (source_column: number) => void;
     /** Focus recovery target when hiding the final visible header removes Glide. */
     on_focus_columns?: () => void;
+    cell_highlights?: SheetCellHighlightState;
+    on_highlight_selection?: (
+        selection: CellHighlightSelection,
+        mutation: CellHighlightMutation,
+    ) => void;
+    on_highlight_selection_available_change?: (available: boolean) => void;
+    highlight_ref?: MutableRefObject<HighlightSelectionHandle | null>;
 }
 
 /**
@@ -264,6 +289,10 @@ export function GridShell({
     on_open_filter = () => {},
     on_hide_column = () => {},
     on_focus_columns = () => {},
+    cell_highlights,
+    on_highlight_selection = () => {},
+    on_highlight_selection_available_change,
+    highlight_ref,
 }: GridShellProps): React.JSX.Element {
     const visible_source_columns = column_projection.visible_to_source;
     const display_column_count = visible_source_columns.length;
@@ -274,7 +303,7 @@ export function GridShell({
         generation,
         has_visible_columns,
     );
-    const theme = use_vscode_theme();
+    const { theme, highContrast: high_contrast } = use_vscode_theme();
     const grid_ref = useRef<DataEditorRef | null>(null);
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
@@ -380,7 +409,7 @@ export function GridShell({
         [column_projection.source_to_visible],
     );
 
-    const { ensure_rows, get_row, sample_loaded_rows, version } = loader;
+    const { ensure_rows, get_row, get_source_row, sample_loaded_rows, version } = loader;
     const lifecycle_operation = (
         save_lifecycle.state === 'active'
         || save_lifecycle.state === 'failed'
@@ -557,6 +586,35 @@ export function GridShell({
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
+    const current_highlight_selection = useCallback(() => (
+        highlight_selection_from_grid(
+            grid_selection_ref.current,
+            row_count,
+            column_projection,
+            merges,
+        )?.selection ?? null
+    ), [column_projection, merges, row_count]);
+    const mutate_highlight_selection = useCallback((mutation: CellHighlightMutation): boolean => {
+        const selection = current_highlight_selection();
+        if (!selection) return false;
+        on_highlight_selection(selection, mutation);
+        return true;
+    }, [current_highlight_selection, on_highlight_selection]);
+    useLayoutEffect(() => {
+        if (!highlight_ref) return;
+        const handle: HighlightSelectionHandle = {
+            apply: (color) => mutate_highlight_selection({ type: 'set', color }),
+            clear: () => mutate_highlight_selection({ type: 'clear' }),
+        };
+        highlight_ref.current = handle;
+        return () => {
+            if (highlight_ref.current === handle) highlight_ref.current = null;
+        };
+    }, [highlight_ref, mutate_highlight_selection]);
+    const highlight_selection_available = current_highlight_selection() !== null;
+    useEffect(() => {
+        on_highlight_selection_available_change?.(highlight_selection_available);
+    }, [highlight_selection_available, on_highlight_selection_available_change]);
     const focused_source_column_ref = useRef<number | undefined>(
         visible_source_columns[0],
     );
@@ -899,6 +957,14 @@ export function GridShell({
         };
     }, [auto_fit_ref, compute_auto_fit]);
 
+    const get_highlight_background = useCallback((
+        source_row: number,
+        source_column: number,
+    ): string | undefined => {
+        const color = cell_highlights?.cells[`${source_row}:${source_column}`];
+        return color ? highlight_rgba(color, high_contrast) : undefined;
+    }, [cell_highlights, high_contrast]);
+
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
             const [display_column, row] = cell;
@@ -913,13 +979,22 @@ export function GridShell({
             }
             const key = `${row}:${source_column}`;
             const dirty = dirty_cells_ref.current.get(key);
+            const merge = merge_index.entry_at(row, source_column);
+            const highlight_source_row = get_source_row(merge?.startRow ?? row);
+            const highlight_source_column = merge?.startCol ?? source_column;
+            const highlight_bg = highlight_source_row === undefined
+                ? undefined
+                : get_highlight_background(
+                    highlight_source_row,
+                    highlight_source_column,
+                );
             // Tint + dirty text whenever an edit exists; open the overlay only in
             // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
             // dirty/conflict read via refs (see conflicted_keys_ref) so this
             // closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty) {
+            if (editable_cells || dirty || highlight_bg) {
                 overlay = {
                     editable: editable_cells,
                     dirty_value: dirty?.value,
@@ -927,7 +1002,7 @@ export function GridShell({
                         ? conflicted_keys_ref.current.has(key)
                             ? CONFLICT_BG
                             : DIRTY_BG
-                        : undefined,
+                        : highlight_bg,
                 };
             }
             return build_grid_cell(
@@ -947,6 +1022,8 @@ export function GridShell({
             merge_index,
             editable_cells,
             source_column_for_display,
+            get_source_row,
+            get_highlight_background,
         ],
     );
 
@@ -1324,13 +1401,11 @@ export function GridShell({
             );
             const [anchor_col, anchor_row] = anchor;
 
-            const sel = grid_selection_ref.current.current;
-            const inside =
-                !!sel &&
-                col >= sel.range.x &&
-                col < sel.range.x + sel.range.width &&
-                row >= sel.range.y &&
-                row < sel.range.y + sel.range.height;
+            const inside = grid_selection_contains_cell(
+                grid_selection_ref.current,
+                col,
+                row,
+            );
             if (!inside) {
                 // Use the merge-expanded range so right-clicking any covered cell
                 // selects (and highlights) the whole merge block, not just 1x1.
@@ -1603,6 +1678,32 @@ export function GridShell({
         if (cells.length > 0) grid.updateCells(cells);
     }, [dirty_cells, conflicted_keys, display_column_for_source]);
 
+    const previous_highlights_ref = useRef<SheetCellHighlightState['cells']>();
+    useEffect(() => {
+        const previous = previous_highlights_ref.current;
+        const next = cell_highlights?.cells;
+        previous_highlights_ref.current = next;
+        const changed = changed_highlight_keys(previous, next);
+        if (changed.size === 0) return;
+        const cells = visible_highlight_damage(
+            changed,
+            visible_ref.current,
+            display_column_for_source,
+            get_source_row,
+        ).map(({ cell }) => ({ cell: cell as Item }));
+        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+        // A vertical merge can remain visible while its anchor row is above the
+        // viewport, so anchor-key changes are not guaranteed to produce cell damage.
+        if (merge_index.entries.some((entry) => entry.rowSpan > 1)) {
+            overlay_ref.current?.repaint();
+        }
+    }, [
+        cell_highlights,
+        display_column_for_source,
+        get_source_row,
+        merge_index,
+    ]);
+
     const handle_column_resize = useCallback(
         (_column: GridColumn, new_size: number, display_column: number) => {
             const source_column = source_column_for_display(display_column);
@@ -1641,6 +1742,20 @@ export function GridShell({
                 label: 'Copy selection',
                 on_click: () => copy_rect(range),
             });
+        }
+        if (!preview_mode) {
+            menu_items.push({ kind: 'separator' });
+            for (const color of CELL_HIGHLIGHT_COLORS) {
+                menu_items.push({
+                    label: `Highlight ${color}`,
+                    on_click: () => mutate_highlight_selection({ type: 'set', color }),
+                });
+            }
+            menu_items.push({
+                label: 'Clear highlights',
+                on_click: () => mutate_highlight_selection({ type: 'clear' }),
+            });
+            menu_items.push({ kind: 'separator' });
         }
         menu_items.push({ label: 'Select row', on_click: () => select_row(row) });
         menu_items.push({
@@ -1698,6 +1813,8 @@ export function GridShell({
                 theme={theme}
                 show_formatting={show_formatting}
                 get_row={get_row}
+                get_source_row={get_source_row}
+                get_cell_background={get_highlight_background}
                 version={version}
             />
             {!transformed && (

@@ -12,6 +12,10 @@ import {
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    type CellHighlightColor,
+    type CellHighlightMutation,
+    type CellHighlightSelection,
+    type CellHighlightState,
     type CsvDirtyMap,
     type FilterColumnKind,
     type CsvSaveLifecycle,
@@ -41,6 +45,7 @@ import {
     type EditingStatus,
     type EditingHandle,
     type GridFocusHandle,
+    type HighlightSelectionHandle,
     type PendingPreviewScroll,
 } from './grid-shell';
 import {
@@ -201,6 +206,13 @@ export function App(): React.JSX.Element {
     } | null>(null);
     const [source_epoch, set_source_epoch] = useState(0);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
+    const [cell_highlights, set_cell_highlights] = useState<CellHighlightState>();
+    const [active_highlight_color, set_active_highlight_color] =
+        useState<CellHighlightColor>('yellow');
+    const [highlight_selection_available, set_highlight_selection_available] =
+        useState(false);
+    const [highlight_request_pending, set_highlight_request_pending] = useState(false);
+    const [highlight_status, set_highlight_status] = useState('');
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
     // unsaved work survives a webview reload. CSV is single-sheet, so this flat map
     // belongs to the one editable sheet.
@@ -292,6 +304,14 @@ export function App(): React.JSX.Element {
     const filter_restore_timer_ref = useRef<number | undefined>(undefined);
     const grid_focus_ref = useRef<GridFocusHandle | null>(null);
     const toolbar_focus_ref = useRef<ToolbarFocusHandle | null>(null);
+    const highlight_ref = useRef<HighlightSelectionHandle | null>(null);
+    const highlight_request_seq_ref = useRef(0);
+    const highlight_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    const pending_highlight_request_ref = useRef<string | null>(null);
+    const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
         state_ref,
@@ -495,6 +515,40 @@ export function App(): React.JSX.Element {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
 
+            if (msg.type === 'cellHighlightsChanged') {
+                const identity = snapshot_identity_ref.current;
+                if (
+                    !identity
+                    || msg.physicalRevision !== identity.sourceBasis.physicalRevision
+                    || msg.sourceGeneration !== source_generation_ref.current
+                ) return;
+                const matching_request = !!msg.requestId
+                    && pending_highlight_request_ref.current === msg.requestId;
+                if (matching_request) {
+                    pending_highlight_request_ref.current = null;
+                    set_highlight_request_pending(false);
+                }
+                if (msg.stateRevision < last_highlight_state_revision_ref.current) {
+                    if (matching_request && msg.error) {
+                        set_highlight_status(msg.error);
+                        vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                    }
+                    return;
+                }
+                last_highlight_state_revision_ref.current = msg.stateRevision;
+                state_ref.current = {
+                    ...state_ref.current,
+                    cellHighlights: msg.state,
+                };
+                set_cell_highlights(msg.state);
+                if (msg.error) {
+                    set_highlight_status(msg.error);
+                    vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                } else {
+                    set_highlight_status(msg.requestId ? 'Cell highlights updated.' : 'Cell highlights refreshed.');
+                }
+            }
+
             if (msg.type === 'filterHistogram') {
                 const pending = pending_histogram_ref.current;
                 if (!pending || pending.requestId !== msg.requestId) return;
@@ -633,6 +687,22 @@ export function App(): React.JSX.Element {
                                 snapshot.meta,
                             )
                             : undefined;
+                    const incoming_snapshot_highlights = snapshot.presentation === 'refresh'
+                        ? refresh_authoritative_state!.cellHighlights
+                        : normalize_workbook_snapshot_state(
+                            snapshot.state,
+                            snapshot.meta,
+                        ).cellHighlights;
+                    const install_snapshot_highlights = snapshot.presentation === 'initial'
+                        || snapshot.identity.stateRevision
+                            >= last_highlight_state_revision_ref.current;
+                    const snapshot_highlights = install_snapshot_highlights
+                        ? incoming_snapshot_highlights
+                        : state_ref.current.cellHighlights;
+                    if (install_snapshot_highlights) {
+                        last_highlight_state_revision_ref.current = snapshot.identity.stateRevision;
+                        set_cell_highlights(snapshot_highlights);
+                    }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
                     const refresh_editing_current_session =
@@ -679,6 +749,10 @@ export function App(): React.JSX.Element {
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
                     if (snapshot.presentation === 'initial') {
+                        pending_highlight_request_ref.current = null;
+                        set_highlight_request_pending(false);
+                        set_highlight_status('');
+                        set_highlight_selection_available(false);
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
@@ -709,9 +783,11 @@ export function App(): React.JSX.Element {
                         correction_required = JSON.stringify({
                             transforms: base.transforms ?? [],
                             columnVisibility: base.columnVisibility ?? [],
+                            cellHighlights: base.cellHighlights,
                         }) !== JSON.stringify({
                             transforms: normalized.transforms,
                             columnVisibility: normalized.columnVisibility,
+                            cellHighlights: normalized.cellHighlights,
                         });
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
@@ -797,11 +873,13 @@ export function App(): React.JSX.Element {
                             scrollPosition: authoritative_state.scrollPosition,
                             transforms: authoritative_state.transforms,
                             columnVisibility: authoritative_state.columnVisibility,
+                            cellHighlights: snapshot.state.cellHighlights,
                         }) !== JSON.stringify({
                             rowHeights: next_row_heights,
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
+                            cellHighlights: authoritative_state.cellHighlights,
                         });
                         set_column_widths(next_column_widths);
                         set_row_heights(next_row_heights);
@@ -822,6 +900,7 @@ export function App(): React.JSX.Element {
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
+                            cellHighlights: snapshot_highlights,
                             activeSheetIndex: authoritative_state.activeSheetIndex,
                             ...(refresh_editing_current_session
                                 ? { pendingEdits: refresh_edits }
@@ -1446,6 +1525,39 @@ export function App(): React.JSX.Element {
         set_editing_status(status);
     }, []);
 
+    const handle_highlight_selection = useCallback((
+        selection: CellHighlightSelection,
+        mutation: CellHighlightMutation,
+    ) => {
+        const sheet = meta_ref.current?.sheets[active_sheet_index];
+        const identity = snapshot_identity_ref.current;
+        if (
+            !sheet
+            || !identity
+            || preview_mode_ref.current
+            || pending_highlight_request_ref.current
+        ) return;
+        const request_id = [
+            'highlight',
+            highlight_request_prefix_ref.current,
+            ++highlight_request_seq_ref.current,
+        ].join(':');
+        pending_highlight_request_ref.current = request_id;
+        set_highlight_request_pending(true);
+        set_highlight_status('Updating cell highlights…');
+        vscode_api.postMessage({
+            type: 'applyCellHighlights',
+            requestId: request_id,
+            sheetIndex: active_sheet_index,
+            sheetName: sheet.name,
+            selection,
+            mutation,
+            generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+            snapshotIdentity: identity,
+        });
+    }, [active_sheet_index]);
+
     const handle_toggle_tab_orientation = useCallback(() => {
         set_vertical_tabs((prev) => {
             const next = !prev;
@@ -1802,6 +1914,10 @@ export function App(): React.JSX.Element {
             on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
             on_focus_columns={focus_columns_trigger}
+            cell_highlights={cell_highlights?.sheets[active_sheet_index]}
+            on_highlight_selection={handle_highlight_selection}
+            on_highlight_selection_available_change={set_highlight_selection_available}
+            highlight_ref={highlight_ref}
         />
     );
 
@@ -1847,6 +1963,16 @@ export function App(): React.JSX.Element {
                 vertical_tabs={vertical_tabs}
                 on_toggle_tab_orientation={handle_toggle_tab_orientation}
                 show_vertical_tabs_button={has_multiple_sheets}
+                highlight={{
+                    active_color: active_highlight_color,
+                    on_color_change: set_active_highlight_color,
+                    on_apply: () => highlight_ref.current?.apply(active_highlight_color),
+                    on_clear: () => highlight_ref.current?.clear(),
+                    selection_available: highlight_selection_available,
+                    pending: highlight_request_pending,
+                    disabled: preview_mode,
+                    status: highlight_status,
+                }}
                 column_visibility={{
                     column_count: current_sheet.columnCount,
                     get_column_name,

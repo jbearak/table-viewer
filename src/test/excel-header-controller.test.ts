@@ -40,6 +40,7 @@ class PhysicalExcelSource implements DataSource {
             sheets: [{
                 name: this.sheet_name,
                 rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
                 columnCount: 2,
                 merges: [],
                 hasFormatting: false,

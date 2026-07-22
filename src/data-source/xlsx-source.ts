@@ -36,6 +36,7 @@ export class XlsxDataSource implements DataSource {
             sheets: sheets.map((s) => ({
                 name: s.name,
                 rowCount: s.rowCount,
+                sourceRowCount: s.rowCount,
                 columnCount: s.columnCount,
                 merges: s.merges,
                 hasFormatting: s.hasFormatting,

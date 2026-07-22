@@ -35,8 +35,11 @@ export interface MergeOverlayProps {
     theme: Partial<Theme>;
     show_formatting: boolean;
     get_row: (row: number) => (RenderedCell | null)[] | undefined;
-    /** Bumps when a page lands so content re-paints over its placeholder. */
+    get_source_row: (display_row: number) => number | undefined;
+    get_cell_background: (source_row: number, source_column: number) => string | undefined;
+    /** Bumps when a page or authoritative highlight state lands. */
     version: number;
+    highlight_version?: number;
 }
 
 /**
@@ -58,7 +61,17 @@ export interface MergeOverlayProps {
  */
 export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
     function MergeOverlay(
-        { grid_ref, merge_index, theme, show_formatting, get_row, version },
+        {
+            grid_ref,
+            merge_index,
+            theme,
+            show_formatting,
+            get_row,
+            get_source_row,
+            get_cell_background,
+            version,
+            highlight_version = 0,
+        },
         ref,
     ): React.JSX.Element {
         const canvas_ref = useRef<HTMLCanvasElement | null>(null);
@@ -135,9 +148,17 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                     const r = overlay_block_rect(tl, br, origin);
                     if (r.width <= 0 || r.height <= 0) continue;
 
-                    // Fill covers the blank covered cells + interior gridlines.
+                    // Base fill covers blank covered cells + interior gridlines.
                     ctx.fillStyle = bg;
                     ctx.fillRect(r.x, r.y, r.width, r.height);
+                    const source_row = get_source_row(entry.startRow);
+                    const highlight = source_row === undefined
+                        ? undefined
+                        : get_cell_background(source_row, entry.startCol);
+                    if (highlight) {
+                        ctx.fillStyle = highlight;
+                        ctx.fillRect(r.x, r.y, r.width, r.height);
+                    }
 
                     // Outer border at half-pixels for a crisp 1px line.
                     ctx.strokeStyle = border;
@@ -169,7 +190,15 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                 ctx.restore();
                 return true;
             },
-            [entries, grid_ref, theme, show_formatting, get_row],
+            [
+                entries,
+                grid_ref,
+                theme,
+                show_formatting,
+                get_row,
+                get_source_row,
+                get_cell_background,
+            ],
         );
 
         useImperativeHandle(ref, () => ({ repaint }), [repaint]);
@@ -193,7 +222,7 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
             };
             tick();
             return () => cancelAnimationFrame(frame);
-        }, [repaint, version]);
+        }, [repaint, version, highlight_version]);
 
         // Repaint on container resize (the grid relayouts outside React).
         useEffect(() => {

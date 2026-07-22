@@ -8,7 +8,12 @@ import type {
     SheetMeta,
     WorkbookMeta,
 } from './interface';
-import { read_source_columns, read_source_rows_indexed } from './interface';
+import {
+    projected_row_for_source,
+    read_source_columns,
+    read_source_row_indices,
+    read_source_rows_indexed,
+} from './interface';
 import type { MergeRange } from '../types';
 import { sanitize_excel_header_overrides } from '../types';
 
@@ -35,6 +40,7 @@ export interface ExcelHeaderOverridePlan {
 export interface ExcelHeaderPlanningSheet {
     readonly name: string;
     readonly rowCount: number;
+    readonly sourceRowCount: number;
     readonly columnCount: number;
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
@@ -100,6 +106,39 @@ export class ExcelHeaderDataSource implements DataSource {
         return this._meta;
     }
 
+    source_row_indices(
+        sheet_index: number,
+        projected_rows: ArrayLike<number>,
+    ): Uint32Array {
+        const projection = this.sheets[sheet_index];
+        if (!projection) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        if (!header_active(projection, projection.override)) {
+            return read_source_row_indices(this.base, sheet_index, projected_rows);
+        }
+        const base_rows = Uint32Array.from(projected_rows, (row) => row + 1);
+        return read_source_row_indices(this.base, sheet_index, base_rows);
+    }
+
+    projected_row_index(
+        sheet_index: number,
+        source_row: number,
+    ): number | undefined {
+        const projection = this.sheets[sheet_index];
+        if (!projection) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        const base_row = projected_row_for_source(this.base, sheet_index, source_row);
+        if (base_row === undefined) return undefined;
+        if (!header_active(projection, projection.override)) return base_row;
+        return base_row === 0 ? undefined : base_row - 1;
+    }
+
     /** Immutable facts used by pure state planning and CAS conflict retries. */
     planning_input(): ExcelHeaderPlanningInput {
         return Object.freeze({
@@ -107,6 +146,7 @@ export class ExcelHeaderDataSource implements DataSource {
             sheets: Object.freeze(this.sheets.map((sheet) => Object.freeze({
                 name: sheet.physical.name,
                 rowCount: sheet.physical.rowCount,
+                sourceRowCount: sheet.physical.sourceRowCount,
                 columnCount: sheet.physical.columnCount,
                 merges: Object.freeze(
                     sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
@@ -279,6 +319,7 @@ function project_sheet(
     return project_excel_header_sheet({
         name: sheet.physical.name,
         rowCount: sheet.physical.rowCount,
+        sourceRowCount: sheet.physical.sourceRowCount,
         columnCount: sheet.physical.columnCount,
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
@@ -300,6 +341,7 @@ export function project_excel_header_sheet(
     return {
         name: sheet.name,
         rowCount: active ? Math.max(0, sheet.rowCount - 1) : sheet.rowCount,
+        sourceRowCount: sheet.sourceRowCount,
         columnCount: sheet.columnCount,
         merges: active
             ? project_header_merges(sheet.merges)

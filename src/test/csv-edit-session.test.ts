@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import type { ExtensionContext } from 'vscode';
@@ -44,6 +45,7 @@ class StubSource implements DataSource {
             sheets: [{
                 name: 'Sheet1',
                 rowCount: 1,
+                sourceRowCount: 1,
                 columnCount: 1,
                 merges: [],
                 hasFormatting: false,
@@ -61,7 +63,7 @@ class FailingTransformSource extends StubSource {
         const meta = super.meta();
         return {
             ...meta,
-            sheets: [{ ...meta.sheets[0], rowCount: 2 }],
+            sheets: [{ ...meta.sheets[0], rowCount: 2, sourceRowCount: 2 }],
         };
     }
 
@@ -79,6 +81,7 @@ class TrackingTransformSource extends StubSource {
             sheets: [{
                 name: 'Sheet1',
                 rowCount: 3,
+                sourceRowCount: 3,
                 columnCount: 1,
                 merges: [],
                 hasFormatting: false,
@@ -128,6 +131,7 @@ class TwoSheetSource extends StubSource {
                 {
                     name: 'Sheet1',
                     rowCount: 1,
+                    sourceRowCount: 1,
                     columnCount: 2,
                     merges: [],
                     hasFormatting: false,
@@ -135,6 +139,7 @@ class TwoSheetSource extends StubSource {
                 {
                     name: 'Sheet2',
                     rowCount: 1,
+                    sourceRowCount: 1,
                     columnCount: 2,
                     merges: [],
                     hasFormatting: false,
@@ -1319,6 +1324,58 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
+    it('rebases and retains highlights across an extension-controlled CSV save', async () => {
+        const file_path = '/tmp/save-highlight-rebase.csv';
+        let bytes: Uint8Array<ArrayBufferLike> = enc.encode('h\na\n');
+        let mtime = 1;
+        const digest = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
+        const state = state_store({
+            rowHeights: [{ 0: 29 }],
+            cellHighlights: {
+                sourceDigest: digest(bytes),
+                sheets: [{
+                    schema: '["Sheet1",1,["h"]]',
+                    cells: { '0:0': 'pink' },
+                }],
+            },
+        });
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, next) => {
+            bytes = next;
+            mtime += 1;
+        });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'snapshotApplied', identity: snapshot.identity, disposition: 'applied',
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save-highlight',
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+            },
+        });
+        await flush_promises();
+
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult', success: true,
+        }));
+        expect(state.get_state(file_path)).toMatchObject({
+            rowHeights: [{ 0: 29 }],
+            cellHighlights: {
+                sourceDigest: digest(bytes),
+                sheets: [{ cells: { '0:0': 'pink' } }],
+            },
+        });
+    });
+
     it('keeps an accepted overlay save across ready and restores exact bases on write failure', async () => {
         const file_path = '/tmp/accepted-overlay-remount.csv';
         const versioned = state_store();
@@ -2134,6 +2191,118 @@ describe('CSV edit sessions', () => {
         await peer.__receive({ type: 'requestEditSession' });
         expect(edit_session_results(peer).at(-1)?.granted).toBe(true);
         expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('publishes authoritative cell highlight changes to origin and sibling panels', async () => {
+        const file_path = '/tmp/two-panel-highlights.csv';
+        const state = state_store({ rowHeights: [{ 0: 28 }] });
+        const first = open_csv_table(uri(file_path), state.store);
+        const second = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const first_snapshot = latest_snapshot(first);
+        const second_snapshot = latest_snapshot(second);
+        await first.__receive({
+            type: 'snapshotApplied',
+            identity: first_snapshot.identity,
+            disposition: 'applied',
+        });
+        await second.__receive({
+            type: 'snapshotApplied',
+            identity: second_snapshot.identity,
+            disposition: 'applied',
+        });
+
+        await first.__receive({
+            type: 'applyCellHighlights',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'blue' },
+            requestId: 'highlight:origin',
+            generation: first_snapshot.generation,
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+        });
+        await flush_promises();
+
+        expect(state.get_state(file_path)).toMatchObject({
+            rowHeights: [{ 0: 28 }],
+            cellHighlights: { sheets: [{ cells: { '0:0': 'blue' } }] },
+        });
+        const origin = first.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+        )).at(-1) as any;
+        const sibling = second.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+        )).at(-1) as any;
+        expect(origin).toMatchObject({
+            requestId: 'highlight:origin',
+            sheetIndex: 0,
+            state: { sheets: [{ cells: { '0:0': 'blue' } }] },
+        });
+        expect(sibling).toMatchObject({
+            sheetIndex: 0,
+            stateRevision: origin.stateRevision,
+            physicalRevision: origin.physicalRevision,
+            state: origin.state,
+        });
+        expect(sibling.requestId).toBeUndefined();
+    });
+
+    it('rejects stale, wrong-sheet, and preview highlight authorities without mutation', async () => {
+        const file_path = '/tmp/rejected-highlights.csv';
+        const state = state_store();
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'snapshotApplied', identity: snapshot.identity, disposition: 'applied',
+        });
+        const base = {
+            type: 'applyCellHighlights' as const,
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            mutation: { type: 'set' as const, color: 'yellow' as const },
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            snapshotIdentity: snapshot.identity,
+        };
+        await panel.__receive({ ...base, requestId: 'stale', generation: snapshot.generation + 1 });
+        await panel.__receive({ ...base, requestId: 'wrong-sheet', sheetName: 'Other' });
+        expect(panel.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged' && message.error
+        )).slice(-2).map((message: any) => message.requestId)).toEqual([
+            'stale', 'wrong-sheet',
+        ]);
+        expect(state.get_state(file_path).cellHighlights).toBeUndefined();
+
+        const preview_profile: ViewerProfile = {
+            editing: false,
+            previewMode: true,
+            build_source: async () => new StubSource(),
+        };
+        const preview = open_csv_table(uri('/tmp/preview-highlights.csv'), state.store, preview_profile);
+        await preview.__receive({ type: 'ready' });
+        const preview_snapshot = latest_snapshot(preview);
+        await preview.__receive({
+            type: 'snapshotApplied',
+            identity: preview_snapshot.identity,
+            disposition: 'applied',
+        });
+        await preview.__receive({
+            ...base,
+            requestId: 'preview',
+            generation: preview_snapshot.generation,
+            sourceGeneration: preview_snapshot.sourceGeneration,
+            snapshotIdentity: preview_snapshot.identity,
+        });
+        expect(preview.__messages).toContainEqual(expect.objectContaining({
+            type: 'cellHighlightsChanged',
+            requestId: 'preview',
+            error: 'Cell highlights cannot be changed from a preview.',
+        }));
     });
 
     it('does not resurrect cleared pending edits from a later visibility snapshot', async () => {
@@ -3102,6 +3271,7 @@ describe('CSV edit sessions', () => {
                             sheets: Array.from({ length: sheet_count }, (_, index) => ({
                                 name: `Sheet${index + 1}`,
                                 rowCount: 1,
+                                sourceRowCount: 1,
                                 columnCount: 1,
                                 merges: [],
                                 hasFormatting: false,

@@ -67,6 +67,7 @@ vi.mock('../webview/use-row-loader', () => ({
         return {
             ensure_rows: grid_mock.ensure_rows,
             get_row: grid_mock.get_row,
+            get_source_row: (row: number) => row,
             sample_loaded_rows: () => [],
             version: 0,
         };
@@ -74,7 +75,7 @@ vi.mock('../webview/use-row-loader', () => ({
 }));
 
 vi.mock('../webview/vscode-theme', () => ({
-    use_vscode_theme: () => ({}),
+    use_vscode_theme: () => ({ theme: {}, highContrast: false }),
 }));
 
 vi.mock('../webview/merge-overlay', () => ({
@@ -110,6 +111,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
         sheet_meta: {
             name: 'Sheet1',
             rowCount: 1,
+            sourceRowCount: 1,
             columnCount: 3,
             columnNames: ['A name', 'B name', 'C name'],
             merges: [],
@@ -1013,8 +1015,8 @@ describe('GridShell column projection', () => {
     it('renders an unrecoverable message for a genuine zero-column sheet', async () => {
         await render_grid(props({
             sheet_meta: {
-                name: 'Empty', rowCount: 0, columnCount: 0,
-                columnNames: [], merges: [], hasFormatting: false,
+                name: 'Empty', rowCount: 0, sourceRowCount: 0,
+                columnCount: 0, columnNames: [], merges: [], hasFormatting: false,
             },
             row_count: 0,
             column_projection: {

@@ -47,6 +47,7 @@ class Source implements DataSource {
             sheets: [{
                 name: 'Sheet1',
                 rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
                 columnCount: Math.max(0, ...this.rows.map((row) => row.length)),
                 merges: this.merges,
                 hasFormatting: false,

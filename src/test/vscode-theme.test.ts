@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { build_theme_from_vars } from '../webview/vscode-theme';
+import {
+    build_theme_from_vars,
+    is_vscode_high_contrast,
+} from '../webview/vscode-theme';
 
 describe('build_theme_from_vars', () => {
     it('maps core VS Code variables onto Glide theme keys', () => {
@@ -31,5 +34,17 @@ describe('build_theme_from_vars', () => {
             name === '--vscode-editor-background' ? '  #abcdef  ' : ''
         );
         expect(theme.bgCell).toBe('#abcdef');
+    });
+});
+
+describe('is_vscode_high_contrast', () => {
+    const body = (class_name: string) => ({
+        classList: { contains: (name: string) => class_name.split(' ').includes(name) },
+    }) as HTMLElement;
+
+    it('detects both VS Code high-contrast classes', () => {
+        expect(is_vscode_high_contrast(body('vscode-high-contrast'))).toBe(true);
+        expect(is_vscode_high_contrast(body('vscode-high-contrast-light'))).toBe(true);
+        expect(is_vscode_high_contrast(body('vscode-dark'))).toBe(false);
     });
 });

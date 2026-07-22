@@ -62,6 +62,9 @@ export function normalize_per_file_state(
                 : undefined,
             sheet_names.length,
         ),
+        cellHighlights: 'cellHighlights' in state
+            ? (state as PerFileState).cellHighlights
+            : undefined,
     };
 }
 

@@ -71,12 +71,29 @@ export function build_vscode_theme(
     return build_theme_from_vars((name) => style.getPropertyValue(name));
 }
 
+export function is_vscode_high_contrast(body: HTMLElement = document.body): boolean {
+    return body.classList.contains('vscode-high-contrast')
+        || body.classList.contains('vscode-high-contrast-light');
+}
+
+export interface VscodeGridTheme {
+    theme: Partial<Theme>;
+    highContrast: boolean;
+}
+
+function read_vscode_grid_theme(): VscodeGridTheme {
+    return {
+        theme: build_vscode_theme(),
+        highContrast: is_vscode_high_contrast(),
+    };
+}
+
 /** React hook: current theme, re-read when VS Code switches color themes
  *  (it mutates the body class / inline custom properties). */
-export function use_vscode_theme(): Partial<Theme> {
-    const [theme, set_theme] = useState<Partial<Theme>>(() => build_vscode_theme());
+export function use_vscode_theme(): VscodeGridTheme {
+    const [value, set_value] = useState<VscodeGridTheme>(read_vscode_grid_theme);
     useEffect(() => {
-        const update = () => set_theme(build_vscode_theme());
+        const update = () => set_value(read_vscode_grid_theme());
         const observer = new MutationObserver(update);
         const opts: MutationObserverInit = {
             attributes: true,
@@ -86,5 +103,5 @@ export function use_vscode_theme(): Partial<Theme> {
         observer.observe(document.documentElement, opts);
         return () => observer.disconnect();
     }, []);
-    return theme;
+    return value;
 }

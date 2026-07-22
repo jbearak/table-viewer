@@ -248,6 +248,7 @@ function make_meta(sheet_names: string[], has_formatting = true): WorkbookMeta {
         sheets: sheet_names.map((name) => ({
             name,
             rowCount: 1,
+            sourceRowCount: 1,
             columnCount: 1,
             merges: [],
             hasFormatting: has_formatting,
@@ -552,6 +553,7 @@ function workbook_snapshot_message(
                 tabOrientation: null,
                 transforms: meta.sheets.map(() => undefined),
                 columnVisibility: meta.sheets.map(() => undefined),
+                cellHighlights: undefined,
                 ...state,
             },
             configuration: {
@@ -2475,17 +2477,20 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
-        const operation = {
+        const operation: CsvSaveOperation = {
             editSessionId: 'test-edit-session',
             saveRequestId: 'save:matching',
             edits: { '0:0': 'draft' },
+            dirtyEdits: { '0:0': { value: 'draft', base: 'a' } },
         };
-        await dispatch_host_message({ type: 'saveOperationStarted', operation });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
         await dispatch_host_message({
             type: 'editSessionRevoked',
             reason: 'saved',
-            editSessionId: operation.editSessionId,
-            saveRequestId: operation.saveRequestId,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
         });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
@@ -2556,10 +2561,7 @@ describe('edit mode save exit', () => {
 
         await click_button('Edit');
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
-        const operation = grid_shell_mock.latest_props?.save_operation as {
-            editSessionId: string;
-            saveRequestId: string;
-        };
+        const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(operation.saveRequestId).toEqual(expect.any(String));
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
@@ -2577,15 +2579,18 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({
             type: 'saveResult',
             success: false,
-            editSessionId: operation.editSessionId,
-            saveRequestId: 'stale-save',
+            lifecycle: {
+                revision: 1,
+                state: 'failed',
+                operation: { ...operation, saveRequestId: 'stale-save' },
+            },
         });
         expect(grid_shell_mock.latest_props?.save_operation).toMatchObject(operation);
 
         await dispatch_host_message({
             type: 'saveResult',
             success: false,
-            ...operation,
+            lifecycle: { revision: 2, state: 'failed', operation },
         });
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
     });

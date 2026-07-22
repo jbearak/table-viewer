@@ -18,6 +18,7 @@ function normalized(
         tabOrientation: null,
         transforms: [],
         columnVisibility: [],
+        cellHighlights: undefined,
         ...overrides,
     };
 }
