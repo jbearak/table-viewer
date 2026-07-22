@@ -39,7 +39,7 @@ These are useful starting points, not requirements.
 
 ### Keep only the useful Activity Bar icons
 
-Right-click an empty part of the Activity Bar. Leave **Explorer**, **Search**, and **Extensions** checked, and uncheck views such as **Source Control**, **Run and Debug**, and **Chat** if you do not plan to use them. You can also drag the remaining icons into a more convenient order.
+Right-click an empty part of the Activity Bar. Leave **Explorer**, **Search**, and **Extensions** checked, and uncheck views such as **Source Control** and **Run and Debug** if you do not plan to use them. You can also drag the remaining icons into a more convenient order.
 
 This hides shortcuts, not the underlying features. Right-click the Activity Bar again and re-check an item whenever you want it back.
 
@@ -55,7 +55,7 @@ If you rarely use any sidebar, choose **View → Appearance → Activity Bar Pos
 
 ### Disable built-in AI features, if you prefer
 
-Hiding the Chat icon only removes its shortcut. To turn off VS Code's built-in AI features as well:
+Closing Chat or hiding the Secondary Side Bar only removes Chat from view. To turn off VS Code's built-in AI features as well:
 
 1. Select the gear-shaped **Manage** button and choose **Settings**, or press `Cmd+,` on macOS / `Ctrl+,` on Windows and Linux.
 2. Search for `disable AI features`.
