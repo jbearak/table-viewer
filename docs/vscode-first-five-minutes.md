@@ -10,7 +10,9 @@ VS Code is a practical common denominator: it was again the most-used developer 
 
 The [**Remote - SSH** extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) was equally important. VNC shows you another computer's entire desktop and sends your mouse and keyboard actions back to it. With Remote - SSH, the VS Code window stays on your own computer; your files stay on the remote server, and commands, extensions, and computations run there. It usually feels much more like using a normal local app, while still letting the team keep data and demanding work on a shared or more powerful machine.
 
-My [**Sight – Stata Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.sight) and [**Raven – R Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) extensions bring those languages into VS Code. Their data viewers share some code with Table Viewer, deliberately giving you a similar grid and familiar controls whether you open an Excel file with Table Viewer, inspect a Stata dataset with Sight, or look at an R data frame with Raven.
+VS Code also supports **language servers**: extensions that understand a programming language as you type. They can flag errors, suggest completions, jump to definitions, and follow relationships across files. This extension model is common in modern code editors, but it is not the model used by RStudio or Stata's built-in editor.
+
+My [**Sight**](https://marketplace.visualstudio.com/items?itemName=jbearak.sight) and [**Raven**](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) extensions bring that kind of assistance to Stata and R, including cross-file understanding beyond those programs' built-in editing tools. Their data viewers also share some code with Table Viewer, deliberately giving you a similar grid and familiar controls whether you open an Excel file with Table Viewer, inspect a Stata dataset with Sight, or look at an R data frame with Raven.
 
 ## The few parts you need
 
