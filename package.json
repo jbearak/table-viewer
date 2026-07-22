@@ -120,7 +120,7 @@
             "filenamePattern": "*.TSV"
           }
         ],
-        "priority": "option"
+        "priority": "default"
       }
     ],
     "configuration": {
