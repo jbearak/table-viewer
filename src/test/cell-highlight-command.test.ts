@@ -169,16 +169,27 @@ describe('plan_cell_highlight_mutation', () => {
 
         const recolored = plan_cell_highlight_mutation({
             sheetIndex: 0, sheetName: 'People',
-            selection: { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            selection: {
+                displayRows: [{ start: 0, end: MAX_HIGHLIGHTED_CELLS_PER_FILE }],
+                sourceColumns: [0],
+            },
             mutation: { type: 'set', color: 'pink' },
         }, {
             current, meta: { sheets: [largeSheet], hasFormatting: false }, sourceDigest: 'digest',
-            mapDisplayRowsToSource: () => Uint32Array.from([0]),
+            mapDisplayRowsToSource: () => Uint32Array.from(
+                { length: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1 },
+                (_, index) => index,
+            ),
             displayRowForSource: (_sheet, sourceRow) => sourceRow,
         });
-        expect(recolored).toMatchObject({ type: 'applied', affectedCells: 1 });
+        expect(recolored).toMatchObject({
+            type: 'applied',
+            affectedCells: MAX_HIGHLIGHTED_CELLS_PER_FILE + 1,
+        });
         if (recolored.type !== 'applied') throw new Error('Expected recolor to apply.');
         expect(recolored.state?.sheets[0]?.cells['0:0']).toBe('pink');
+        expect(recolored.state?.sheets[0]?.cells[`${MAX_HIGHLIGHTED_CELLS_PER_FILE}:0`])
+            .toBe('pink');
 
         const cleared = plan_cell_highlight_mutation({
             sheetIndex: 0, sheetName: 'People',

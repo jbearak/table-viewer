@@ -99,11 +99,6 @@ export function plan_cell_highlight_mutation(
         if (!Number.isSafeInteger(selected_count)) {
             return reject('The selected cell range is too large.');
         }
-        if (selected_count > MAX_HIGHLIGHTED_CELLS_PER_FILE) {
-            return reject(
-                `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
-            );
-        }
         let source_rows: Uint32Array;
         try {
             source_rows = context.mapDisplayRowsToSource(
@@ -117,6 +112,9 @@ export function plan_cell_highlight_mutation(
             return reject('The selected rows no longer match this table view.');
         }
         affected_cells = selected_count;
+        const existing_count = count_cell_highlights(current);
+        const existing_sheet = current?.sheets[input.sheetIndex]?.cells ?? {};
+        let additions = 0;
         for (const source_row of source_rows) {
             if (
                 !Number.isSafeInteger(source_row)
@@ -124,22 +122,24 @@ export function plan_cell_highlight_mutation(
                 || source_row >= sheet.sourceRowCount
             ) return reject('The selected rows no longer match the physical worksheet.');
             for (const source_column of columns.values) {
-                cells[cell_highlight_key(source_row, source_column)] = set_color!;
+                const key = cell_highlight_key(source_row, source_column);
+                if (existing_sheet[key] === undefined) {
+                    additions += 1;
+                    if (
+                        existing_count + additions
+                        > MAX_HIGHLIGHTED_CELLS_PER_FILE
+                    ) {
+                        return reject(
+                            `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
+                        );
+                    }
+                }
             }
         }
-        const existing_count = count_cell_highlights(current);
-        const existing_sheet = current?.sheets[input.sheetIndex]?.cells ?? {};
-        let additions = 0;
-        for (const key of Object.keys(cells)) {
-            if (existing_sheet[key] === undefined) additions += 1;
-        }
-        if (
-            additions > 0
-            && existing_count + additions > MAX_HIGHLIGHTED_CELLS_PER_FILE
-        ) {
-            return reject(
-                `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
-            );
+        for (const source_row of source_rows) {
+            for (const source_column of columns.values) {
+                cells[cell_highlight_key(source_row, source_column)] = set_color!;
+            }
         }
     }
 

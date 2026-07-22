@@ -54,6 +54,13 @@ Table Viewer is the result.
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menu for copy, select row, select column, select all
 
+**Cell highlights**
+- Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column
+- Highlights survive saves, reloads, file-content replacement, column-name changes, and first-row-header changes
+- Highlights at temporarily unavailable rows, columns, or worksheets remain stored and reappear when those positions return
+- Only an explicit user clear removes highlights
+- Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
+
 **Sorting and filtering**
 - Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
 - Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules

@@ -81,7 +81,14 @@ describe('pure Excel header state planning', () => {
             columnVisibility: [{ hiddenColumns: [1], schema: old_schema }],
             cellHighlights: {
                 sourceDigest: 'digest',
-                sheets: [{ schema: old_schema, cells: { '1:1': 'yellow' } }],
+                sheets: [{
+                    schema: old_schema,
+                    cells: {
+                        '0:0': 'green',
+                        '1:1': 'yellow',
+                        '4:0': 'pink',
+                    },
+                }],
             },
         };
 
@@ -98,7 +105,11 @@ describe('pure Excel header state planning', () => {
         expect(plan.state.columnVisibility?.[0]?.schema).toBe(new_schema);
         expect(plan.state.cellHighlights?.sheets[0]).toEqual({
             schema: new_schema,
-            cells: { '1:1': 'yellow' },
+            cells: {
+                '0:0': 'green',
+                '1:1': 'yellow',
+                '4:0': 'pink',
+            },
         });
     });
 
