@@ -95,7 +95,7 @@ The light colors in the guide screenshots come from the **Catppuccin Latte** the
 To use it:
 
 1. Open **Extensions** from the blocks icon in the Activity Bar.
-2. Search for `@id:Catppuccin.catppuccin-vsc` and install [**Catppuccin for VSCode**](https://marketplace.visualstudio.com/items?itemName=Catppuccin.catppuccin-vsc), published by **Catppuccin**.
+2. Search for `@id:Catppuccin.catppuccin-vsc` and install [**Catppuccin for VSCode**](https://marketplace.visualstudio.com/items?itemName=Catppuccin.catppuccin-vsc).
 3. Choose **Preferences: Color Theme** from the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows and Linux), then select **Catppuccin Latte**.
 
 VS Code also includes several themes out of the box. You can preview them from the same Color Theme picker and use whichever is easiest for you to read. Two other popular choices are:
