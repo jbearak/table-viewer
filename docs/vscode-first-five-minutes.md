@@ -16,17 +16,22 @@ For Table Viewer, the important parts are much simpler:
 
 The screenshots in the [setup and try-out guide](setup-guide.md) keep only those three Activity Bar views: Explorer, Search, and Extensions. You may see more icons, and that is completely normal.
 
-## Open a workbook without a workspace
+## Open a table file without a workspace
 
 You can open one file at a time. There is no need to choose **Open Folder** or create a workspace.
 
 Use whichever route feels most familiar:
 
-- In VS Code, choose **File → Open File…**, select an `.xlsx` or `.xls` file, and click **Open**.
-- In Finder on macOS or File Explorer on Windows, right-click a workbook and choose **Open With → Visual Studio Code**. The exact wording can vary slightly by operating-system version.
-- Drag a workbook from Finder or File Explorer onto an empty VS Code window.
+- In VS Code, choose **File → Open File…**, select an `.xlsx`, `.xls`, `.csv`, or `.tsv` file, and click **Open**.
+- In Finder on macOS or File Explorer on Windows, right-click a supported file and choose **Open With → Visual Studio Code**. The exact wording can vary slightly by operating-system version.
+- Drag the file from Finder or File Explorer onto an empty VS Code window.
 
-VS Code remembers open files when you close and reopen it. A workbook may therefore still be waiting in its tab the next time you start the app.
+> [!NOTE]
+> `.xlsx` and `.xls` files open directly in Table Viewer and have the richest viewing support: multiple worksheets, merged cells, number and date formatting, and bold or italic text. They are read-only.
+>
+> `.csv` and `.tsv` files open in VS Code's text editor by default. Use the table icon in the editor title bar, or right-click the tab and choose **Reopen Editor With… → Table Viewer**, for a single unformatted table that you can edit. CSV and TSV also support a synchronized side-by-side preview.
+
+VS Code remembers open files when you close and reopen it. A file may therefore still be waiting in its tab the next time you start the app.
 
 ## Make the window quieter
 
