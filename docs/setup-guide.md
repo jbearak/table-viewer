@@ -51,6 +51,10 @@ Nothing in this section edits the `.xlsx` file, so feel free to poke around.
 5. Select one or more cells, open **Highlight**, choose a color, and click **Apply to selection**.
 6. Click **Formatting** to switch between the workbook's formatted display values and the underlying raw values.
 
+Right-clicking a column header is the quickest way to find its sort, filter, copy, and hide actions.
+
+![The Roast column's right-click menu with ascending and descending sort, filter, copy, and hide actions](images/column-header-menu.jpg)
+
 Active sorts and filters appear as controls above the table, where you can edit, disable, reverse, reorder, or remove them.
 
 > [!TIP]
@@ -59,6 +63,8 @@ Active sorts and filters appear as controls above the table, where you can edit,
 > - To highlight quickly, right-click a cell—or right-click anywhere inside a multi-cell selection—and choose **Highlight yellow**, **Highlight green**, **Highlight blue**, or **Highlight pink**.
 > - To hide a column without opening **Columns**, right-click its header and choose **Hide column**.
 > - To give several adjacent columns the same width, click one column header, then hold **Shift** and click another. Every column between them is selected, inclusive. Drag a border on any selected column to resize them together.
+
+![A cell's right-click menu with four one-click highlight colors](images/cell-context-menu.jpg)
 
 ![The Coffee Shelf sheet with a sort, filter, highlight, vertical tabs, and the Columns menu](images/explore-workbook.jpg)
 
