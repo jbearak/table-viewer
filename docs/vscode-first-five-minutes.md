@@ -63,6 +63,9 @@ Choose **View → Appearance** to show or hide parts of the window:
 
 If you rarely use any sidebar, choose **View → Appearance → Activity Bar Position → Top** for a compact horizontal arrangement, or choose **Hidden** to remove the Activity Bar entirely. The same menu restores its default position.
 
+> [!NOTE]
+> If you use VS Code for work, your organization may have policies about telemetry and AI tools—or may manage these settings for you. If you are unsure, check with your IT or security team before using AI features with work-related code or data. You can use the steps below to turn telemetry and built-in AI features off.
+
 ### Disable telemetry, if you prefer
 
 VS Code sends Microsoft crash reports, error information, and usage data to help improve the product. If you would rather not send that information:
