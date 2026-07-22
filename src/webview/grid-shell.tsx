@@ -1722,6 +1722,15 @@ export function GridShell({
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
         const is_multi_cell = !!range && range.width * range.height > 1;
+        // Label singular/plural from the same selection the mutation targets,
+        // so row/column-marker selections (where `range` is absent) stay plural.
+        const highlight_selection = current_highlight_selection();
+        const highlight_cell_count = highlight_selection
+            ? highlight_selection.displayRows.reduce(
+                (total, interval) => total + (interval.end - interval.start + 1),
+                0,
+            ) * highlight_selection.sourceColumns.length
+            : 0;
         if (dirty_cells.has(`${row}:${source_col}`)) {
             menu_items.push({
                 label: 'Discard edit',
@@ -1752,7 +1761,7 @@ export function GridShell({
                 });
             }
             menu_items.push({
-                label: 'Clear highlights',
+                label: highlight_cell_count === 1 ? 'Clear highlight' : 'Clear highlights',
                 on_click: () => mutate_highlight_selection({ type: 'clear' }),
             });
             menu_items.push({ kind: 'separator' });
