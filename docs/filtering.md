@@ -73,6 +73,6 @@ Examining a large column can take a moment. While that happens the editor may sh
 
 ## Limits and special cases
 
-- Filtering is unavailable while you are editing a CSV or TSV in the table, and in the synchronized side-by-side preview. Leave edit mode, or open the file as a regular table, to use filters.
+- CSV and TSV tables can be filtered like any other, but not while you are editing one (after clicking the **Edit** button) or in the synchronized side-by-side preview. Leave edit mode, or open the file as a regular table, to use filters.
 - When a worksheet with merged cells is filtered, sorted, or has hidden columns, the merged cells are temporarily shown separately, with the value in the original top-left cell and the other cells blank. The merged layout returns once no filters or sorts are active and all columns are visible again.
 - Saved filters are tied to the worksheet's column layout. If a reloaded file has a different worksheet name, column count, or column names, Table Viewer removes the saved filters rather than risk applying them to the wrong columns.
