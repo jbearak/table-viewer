@@ -15,6 +15,8 @@ The two files have the same set of sheets and columns, but the revised version c
 
 If VS Code is not already installed, [download Visual Studio Code](https://code.visualstudio.com/) and follow its normal installation steps. Table Viewer requires VS Code 1.114 or later. You do not need to create a project, open a programming folder, or configure anything else.
 
+If VS Code is new to you—or just looks busier than you remember—see [Make VS Code comfortable for Table Viewer](vscode-first-five-minutes.md). It explains the few parts of the window used in this guide, how to open individual files without creating a workspace, and optional ways to simplify the interface to match these screenshots.
+
 ## 2. Install Table Viewer
 
 The Marketplace is the simplest option:
