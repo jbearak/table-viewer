@@ -4,6 +4,12 @@ You do not need to become a programmer or set up a project to use Table Viewer. 
 
 This page is optional. The default VS Code layout works with Table Viewer, and every change below is reversible. Pick only the changes that make the window feel more comfortable.
 
+## Why I use VS Code
+
+VS Code is a practical common denominator: it was again the most-used developer environment among respondents to the [2025 Stack Overflow Developer Survey](https://survey.stackoverflow.co/2025/technology/), and the same editor works on macOS, Windows, and Linux. I needed something everyone on my team could use for both Stata and R, rather than asking people on different operating systems—or using different statistical languages—to adopt different tools.
+
+My [**Sight – Stata Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.sight) and [**Raven – R Language Server**](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) extensions bring those languages into VS Code. Their data viewers share some code with Table Viewer, deliberately giving you a similar grid and familiar controls whether you open an Excel file with Table Viewer, inspect a Stata dataset with Sight, or look at an R data frame with Raven.
+
 ## The few parts you need
 
 VS Code is normally used with a folder open as a **workspace**. That is why its left side includes tools for browsing a project's files, searching across them, tracking code changes, and running programs.
