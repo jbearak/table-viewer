@@ -131,7 +131,7 @@ export interface SheetCellHighlightState {
 }
 
 export interface CellHighlightState {
-    /** Physical file content to which these source-row coordinates are attached. */
+    /** Most recent physical file content observed for these positional annotations. */
     sourceDigest: string;
     sheets: (SheetCellHighlightState | undefined)[];
 }

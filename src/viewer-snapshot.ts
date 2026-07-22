@@ -5,7 +5,7 @@ import type {
 } from './file-coordinator';
 import type { FileStateSnapshot } from './state';
 import { deep_clone_and_freeze } from './immutable';
-import { sanitize_cell_highlight_state } from './cell-highlights';
+import { project_renderable_cell_highlight_state } from './cell-highlights';
 import {
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
@@ -288,13 +288,11 @@ export function normalize_workbook_snapshot_state(
             sheet.columnCount,
             transform_schema_for_sheet(sheet),
         ));
-    const cell_highlights = expected_digest === null
-        ? undefined
-        : sanitize_cell_highlight_state(
-            normalized.cellHighlights,
-            meta,
-            expected_digest,
-        );
+    const cell_highlights = project_renderable_cell_highlight_state(
+        normalized.cellHighlights,
+        meta,
+        expected_digest,
+    );
     return {
         ...normalized,
         transforms,

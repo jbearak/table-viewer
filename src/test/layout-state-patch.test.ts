@@ -76,6 +76,13 @@ describe('layout state patches', () => {
             rowHeights: [{ 0: 20 }, { 1: 41 }],
             pendingEdits: { '0:0': 'peer' },
             excelFirstRowHeaders: { Sheet1: 'off' },
+            cellHighlights: {
+                sourceDigest: 'latest-digest',
+                sheets: [undefined, {
+                    schema: 'dormant-schema',
+                    cells: { '999:999': 'pink' },
+                }],
+            },
         };
 
         const merged = apply_layout_state_patch(latest, patch);
@@ -90,6 +97,7 @@ describe('layout state patches', () => {
         ]);
         expect(merged.pendingEdits).toEqual({ '0:0': 'peer' });
         expect(merged.excelFirstRowHeaders).toEqual({ Sheet1: 'off' });
+        expect(merged.cellHighlights).toBe(latest.cellHighlights);
     });
 
     it('deletes only basis-known keys and preserves concurrent additions', () => {

@@ -693,8 +693,8 @@ export function App(): React.JSX.Element {
                                 snapshot.meta,
                             )
                             : undefined;
-                    // Normalization sanitizes up to the 100k-cell highlight cap,
-                    // so compute it once and reuse it in the 'initial' branch.
+                    // Normalization derives the current renderable highlight
+                    // projection, so compute it once for the 'initial' branch.
                     const initial_normalized_state = snapshot.presentation === 'initial'
                         ? normalize_workbook_snapshot_state(
                             snapshot.state,

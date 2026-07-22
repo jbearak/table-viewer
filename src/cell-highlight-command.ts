@@ -71,11 +71,7 @@ export function plan_cell_highlight_mutation(
         return reject('The cell highlight mutation is invalid.');
     }
 
-    const current = sanitize_cell_highlight_state(
-        context.current,
-        context.meta,
-        context.sourceDigest,
-    );
+    const current = sanitize_cell_highlight_state(context.current);
     const cells: Record<string, CellHighlightColor | null> = {};
     let affected_cells = 0;
     if (mutation_type === 'clear') {
@@ -137,7 +133,10 @@ export function plan_cell_highlight_mutation(
         for (const key of Object.keys(cells)) {
             if (existing_sheet[key] === undefined) additions += 1;
         }
-        if (existing_count + additions > MAX_HIGHLIGHTED_CELLS_PER_FILE) {
+        if (
+            additions > 0
+            && existing_count + additions > MAX_HIGHLIGHTED_CELLS_PER_FILE
+        ) {
             return reject(
                 `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
             );
