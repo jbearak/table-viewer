@@ -529,9 +529,15 @@ export function App(): React.JSX.Element {
                     set_highlight_request_pending(false);
                 }
                 if (msg.stateRevision < last_highlight_state_revision_ref.current) {
-                    if (matching_request && msg.error) {
-                        set_highlight_status(msg.error);
-                        vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                    // A superseded reply still resolves this panel's own pending
+                    // request, so its status must not stay stuck on "Updating…".
+                    if (matching_request) {
+                        if (msg.error) {
+                            set_highlight_status(msg.error);
+                            vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                        } else {
+                            set_highlight_status('Cell highlights updated.');
+                        }
                     }
                     return;
                 }
@@ -687,12 +693,17 @@ export function App(): React.JSX.Element {
                                 snapshot.meta,
                             )
                             : undefined;
-                    const incoming_snapshot_highlights = snapshot.presentation === 'refresh'
-                        ? refresh_authoritative_state!.cellHighlights
-                        : normalize_workbook_snapshot_state(
+                    // Normalization sanitizes up to the 100k-cell highlight cap,
+                    // so compute it once and reuse it in the 'initial' branch.
+                    const initial_normalized_state = snapshot.presentation === 'initial'
+                        ? normalize_workbook_snapshot_state(
                             snapshot.state,
                             snapshot.meta,
-                        ).cellHighlights;
+                        )
+                        : undefined;
+                    const incoming_snapshot_highlights = snapshot.presentation === 'refresh'
+                        ? refresh_authoritative_state!.cellHighlights
+                        : initial_normalized_state!.cellHighlights;
                     const install_snapshot_highlights = snapshot.presentation === 'initial'
                         || snapshot.identity.stateRevision
                             >= last_highlight_state_revision_ref.current;
@@ -772,10 +783,7 @@ export function App(): React.JSX.Element {
                     let correction_required = false;
                     if (snapshot.presentation === 'initial') {
                         set_load_epoch((n) => n + 1);
-                        const normalized = normalize_workbook_snapshot_state(
-                            snapshot.state,
-                            snapshot.meta,
-                        );
+                        const normalized = initial_normalized_state!;
                         const base = normalize_complete_per_file_state(
                             snapshot.state,
                             snapshot.meta.sheets.map((sheet) => sheet.name),

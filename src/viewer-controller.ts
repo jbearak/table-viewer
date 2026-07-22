@@ -1428,8 +1428,10 @@ export function attach_viewer(
                     digest,
                     rebase_highlights_from_digest,
                 );
-                const highlight_state_changed = JSON.stringify(planned_state.cellHighlights)
-                    !== JSON.stringify(next_highlights);
+                const highlight_state_changed = !cell_highlight_states_equal(
+                    planned_state.cellHighlights,
+                    next_highlights,
+                );
                 const next_state = plan?.changed || highlight_state_changed
                     ? { ...planned_state, cellHighlights: next_highlights }
                     : undefined;
@@ -2499,6 +2501,10 @@ export function attach_viewer(
             // physical refresh can clear old-digest coordinates between them.
             const before_rebase = await read_file_state(false);
             const stored_highlights = (before_rebase.state as PerFileState).cellHighlights;
+            // update_file_state reports a no-op updater as undefined; a
+            // byte-identical save (saved_digest === expected_digest) is such a
+            // no-op and must count as success, not a validator failure.
+            let rebase_was_noop = false;
             const rebased = stored_highlights?.sourceDigest === expected_digest
                 ? await update_file_state((current) => {
                     if (!save_operation_is_current(operation)) return current;
@@ -2507,12 +2513,15 @@ export function attach_viewer(
                         saved_digest,
                         src.meta(),
                     );
-                    return cell_highlight_states_equal(current.cellHighlights, highlights)
-                        ? current
-                        : { ...current, cellHighlights: highlights };
+                    if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
+                        rebase_was_noop = true;
+                        return current;
+                    }
+                    return { ...current, cellHighlights: highlights };
                 }, undefined, () => save_operation_is_current(operation)
                     && source_authority.authorityRevision === expected_authority
                     && file_coordinator.state_write_is_current(expected_authority))
+                    ?? (rebase_was_noop ? before_rebase : undefined)
                 : before_rebase;
             if (!rebased || !save_operation_is_current(operation)) {
                 throw new Error(

@@ -70,6 +70,26 @@ describe('highlight_selection_from_grid', () => {
             });
     });
 
+    it('projects merges into display coordinates for rangeStack entries', () => {
+        const merges: MergeRange[] = [
+            { startRow: 2, endRow: 3, startCol: 0, endCol: 1 },
+        ];
+        // Column 1 is hidden, so the merge occupies only display column 0.
+        // A stacked range on display column 0 must expand by the projected
+        // merge (rows 2-3, one column), not the raw source-coordinate one.
+        expect(highlight_selection_from_grid({
+            ...empty(),
+            current: {
+                cell: [0, 2],
+                range: { x: 0, y: 2, width: 1, height: 2 },
+                rangeStack: [{ x: 0, y: 3, width: 1, height: 1 }],
+            },
+        }, 10, projection, merges)?.selection).toEqual({
+            displayRows: [{ start: 2, end: 3 }],
+            sourceColumns: [0],
+        });
+    });
+
     it('expands cell selections through merges with an identity projection', () => {
         const identity = create_column_projection(4);
         const merges: MergeRange[] = [

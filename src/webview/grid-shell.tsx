@@ -1679,12 +1679,17 @@ export function GridShell({
     }, [dirty_cells, conflicted_keys, display_column_for_source]);
 
     const previous_highlights_ref = useRef<SheetCellHighlightState['cells']>();
+    const [highlight_version, set_highlight_version] = useState(0);
     useEffect(() => {
         const previous = previous_highlights_ref.current;
         const next = cell_highlights?.cells;
         previous_highlights_ref.current = next;
         const changed = changed_highlight_keys(previous, next);
         if (changed.size === 0) return;
+        // Drives MergeOverlay's bounds-retry effect so highlight changes that
+        // land before Glide's first draw still paint (the one-shot repaint()
+        // below can lose that race).
+        set_highlight_version((n) => n + 1);
         const cells = visible_highlight_damage(
             changed,
             visible_ref.current,
@@ -1825,6 +1830,7 @@ export function GridShell({
                 get_source_row={get_source_row}
                 get_cell_background={get_highlight_background}
                 version={version}
+                highlight_version={highlight_version}
             />
             {!transformed && (
                 <RowResizeOverlay

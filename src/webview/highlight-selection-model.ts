@@ -243,7 +243,7 @@ export function highlight_selection_from_grid(
                 [range.x, range.y],
                 row_count,
                 display_column_count,
-                merges,
+                display_merges,
                 regions,
             );
         }

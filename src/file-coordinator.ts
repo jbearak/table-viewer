@@ -1217,7 +1217,7 @@ export function acquire_file_coordinator(
             entry.cellHighlightTail = new Promise<void>((resolve) => { release = resolve; });
             entry.operations += 1;
 
-            return (async (): Promise<CellHighlightCommitResult> => {
+            const run = async (): Promise<CellHighlightCommitResult> => {
                 await predecessor;
                 await register_store(entry, identity, state_store);
                 const basis_is_current = () => {
@@ -1288,7 +1288,15 @@ export function acquire_file_coordinator(
                     return { type: 'committed', receipt };
                 }
                 return { type: 'rejected', error: 'The highlight state kept changing before it could be saved.' };
-            })().finally(() => {
+            };
+            // Callers await this promise directly; map unexpected store failures
+            // to a rejected result instead of escaping the message handler.
+            return run().catch((error): CellHighlightCommitResult => ({
+                type: 'rejected',
+                error: error instanceof Error
+                    ? error.message
+                    : 'The highlight change could not be saved.',
+            })).finally(() => {
                 release();
                 entry.operations -= 1;
                 cleanup(entry);

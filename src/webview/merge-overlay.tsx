@@ -37,8 +37,10 @@ export interface MergeOverlayProps {
     get_row: (row: number) => (RenderedCell | null)[] | undefined;
     get_source_row: (display_row: number) => number | undefined;
     get_cell_background: (source_row: number, source_column: number) => string | undefined;
-    /** Bumps when a page or authoritative highlight state lands. */
+    /** Bumps when a row page lands. */
     version: number;
+    /** Bumps when highlight state changes, so the bounds-retry effect repaints
+     *  even when the change lands before Glide's first draw. */
     highlight_version?: number;
 }
 
