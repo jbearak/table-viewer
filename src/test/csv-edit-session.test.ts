@@ -2459,6 +2459,96 @@ describe('CSV edit sessions', () => {
         expect(sibling.requestId).toBeUndefined();
     });
 
+    it('rejects stale clear-all then clears full durable state for both panels', async () => {
+        const file_path = '/tmp/two-panel-clear-all-highlights.csv';
+        const bytes = enc.encode('h\na\nb\n');
+        const state = state_store({
+            rowHeights: [{ 0: 36 }],
+            cellHighlights: {
+                sourceDigest: source_digest(bytes),
+                sheets: [{
+                    schema: 'stored-schema',
+                    cells: { '0:0': 'yellow', '9:0': 'pink' },
+                }, {
+                    schema: 'absent-sheet',
+                    cells: { '0:0': 'blue' },
+                }],
+            },
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        const first = open_csv_table(uri(file_path), state.store);
+        const second = open_csv_table(uri(file_path), state.store);
+        await first.__receive({ type: 'ready' });
+        await second.__receive({ type: 'ready' });
+        const first_snapshot = latest_snapshot(first);
+        const second_snapshot = latest_snapshot(second);
+        await first.__receive({
+            type: 'snapshotApplied',
+            identity: first_snapshot.identity,
+            disposition: 'applied',
+        });
+        await second.__receive({
+            type: 'snapshotApplied',
+            identity: second_snapshot.identity,
+            disposition: 'applied',
+        });
+
+        await first.__receive({
+            type: 'clearAllCellHighlights',
+            requestId: 'clear-all:stale',
+            generation: first_snapshot.generation + 1,
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+        });
+        const rejected = first.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === 'clear-all:stale'
+        )).at(-1) as any;
+        expect(rejected).toMatchObject({
+            state: { sheets: [{ cells: { '0:0': 'yellow' } }] },
+            error: 'The workbook changed before the highlight request arrived.',
+        });
+        expect(rejected.sheetIndex).toBeUndefined();
+        expect(state.get_state(file_path).cellHighlights?.sheets[1]?.cells)
+            .toEqual({ '0:0': 'blue' });
+
+        await first.__receive({
+            type: 'clearAllCellHighlights',
+            requestId: 'clear-all:current',
+            generation: first_snapshot.generation,
+            sourceGeneration: first_snapshot.sourceGeneration,
+            snapshotIdentity: first_snapshot.identity,
+        });
+        await flush_promises();
+        expect(state.get_state(file_path)).toMatchObject({
+            rowHeights: [{ 0: 36 }],
+        });
+        expect(state.get_state(file_path).cellHighlights).toBeUndefined();
+
+        const origin = first.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === 'clear-all:current'
+        )).at(-1) as any;
+        const sibling = second.__messages.filter((message: any) => (
+            message?.type === 'cellHighlightsChanged'
+            && message.requestId === undefined
+            && message.state === undefined
+        )).at(-1) as any;
+        expect(origin).toMatchObject({
+            state: undefined,
+            stateRevision: expect.any(Number),
+            physicalRevision: first_snapshot.identity.sourceBasis.physicalRevision,
+        });
+        expect(origin.sheetIndex).toBeUndefined();
+        expect(sibling).toMatchObject({
+            state: undefined,
+            stateRevision: origin.stateRevision,
+            physicalRevision: origin.physicalRevision,
+        });
+        expect(sibling.sheetIndex).toBeUndefined();
+    });
+
     it('rejects stale, wrong-sheet, and preview highlight authorities without mutation', async () => {
         const file_path = '/tmp/rejected-highlights.csv';
         const state = state_store();

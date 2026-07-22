@@ -8,6 +8,7 @@ export interface HighlightControlProps {
     on_color_change: (color: CellHighlightColor) => void;
     on_apply: () => void;
     on_clear: () => void;
+    on_clear_all: () => void;
     selection_available: boolean;
     pending: boolean;
     disabled?: boolean;
@@ -23,6 +24,7 @@ export function HighlightControl({
     on_color_change,
     on_apply,
     on_clear,
+    on_clear_all,
     selection_available,
     pending,
     disabled = false,
@@ -123,6 +125,7 @@ export function HighlightControl({
     };
 
     const actions_disabled = disabled || pending || !selection_available;
+    const clear_all_disabled = disabled || pending;
     return (
         <div ref={boundary_ref} className="toolbar-item highlight-control-anchor">
             <button
@@ -195,6 +198,13 @@ export function HighlightControl({
                             onClick={() => { on_clear(); close(true); }}
                         >
                             Clear selection highlights
+                        </button>
+                        <button
+                            type="button"
+                            disabled={clear_all_disabled}
+                            onClick={() => { on_clear_all(); close(true); }}
+                        >
+                            Clear all highlights
                         </button>
                     </div>
                 </div>

@@ -650,6 +650,47 @@ describe('initial render', () => {
     });
 });
 
+describe('cell highlight clear-all wiring', () => {
+    it('posts a selection-free command and resolves pending from its response', async () => {
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1']));
+        await dispatch_host_message(snapshot);
+        post_message.mockClear();
+
+        await click_button('Highlight');
+        const clear_all = get_button('Clear all highlights');
+        expect(clear_all.disabled).toBe(false);
+        await click_button('Clear all highlights');
+
+        const request = post_message.mock.calls.map((call) => call[0]).at(-1);
+        expect(request).toEqual({
+            type: 'clearAllCellHighlights',
+            requestId: expect.any(String),
+            generation: snapshot.snapshot.generation,
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+            snapshotIdentity: snapshot.snapshot.identity,
+        });
+        expect(request).not.toHaveProperty('sheetIndex');
+        expect(request).not.toHaveProperty('selection');
+
+        await click_button('Highlight');
+        expect(get_button('Clear all highlights').disabled).toBe(true);
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        expect(get_button('Clear all highlights').disabled).toBe(false);
+        const status_id = get_button('Highlight').getAttribute('aria-describedby');
+        expect(status_id).not.toBeNull();
+        expect(document.getElementById(status_id!)?.textContent)
+            .toBe('Cell highlights updated.');
+    });
+});
+
 describe('workbook snapshot hydration', () => {
     it('matches fresh initial hydration and acknowledges independently', async () => {
         const { post_message } = await render_app();

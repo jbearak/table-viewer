@@ -58,7 +58,8 @@ Table Viewer is the result.
 - Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column
 - Highlights survive saves, reloads, file-content replacement, column-name changes, and first-row-header changes
 - Highlights at temporarily unavailable rows, columns, or worksheets remain stored and reappear when those positions return
-- Only an explicit user clear removes highlights
+- Clear selection removes highlights only from the selected cells; Clear all removes every highlight for the file, including dormant highlights in unavailable rows, columns, or worksheets
+- Only these explicit user clear actions remove highlights
 - Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
 
 **Sorting and filtering**

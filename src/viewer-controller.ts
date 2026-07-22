@@ -1868,7 +1868,9 @@ export function attach_viewer(
             update_session_state_material(receipt.stateSnapshot, false);
             void post_to_receiver({
                 type: 'cellHighlightsChanged',
-                sheetIndex: receipt.sheetIndex,
+                ...(receipt.scope.type === 'selection'
+                    ? { sheetIndex: receipt.scope.sheetIndex }
+                    : {}),
                 ...(receipt.originToken === cell_highlight_subscriber_token
                     ? { requestId: receipt.requestId }
                     : {}),
@@ -2910,7 +2912,8 @@ export function attach_viewer(
                 }
                 return;
             }
-            case 'applyCellHighlights': {
+            case 'applyCellHighlights':
+            case 'clearAllCellHighlights': {
                 const message = structuredClone(msg);
                 const receiver_epoch = session.current_receiver_epoch;
                 const command_core = core;
@@ -2961,7 +2964,9 @@ export function attach_viewer(
                     if (disposed || session.current_receiver_epoch !== receiver_epoch) return;
                     void post_to_receiver({
                         type: 'cellHighlightsChanged',
-                        sheetIndex: message.sheetIndex,
+                        ...(message.type === 'applyCellHighlights'
+                            ? { sheetIndex: message.sheetIndex }
+                            : {}),
                         requestId: message.requestId,
                         stateRevision: state_revision,
                         physicalRevision: current_authority.physicalRevision,
@@ -2985,8 +2990,8 @@ export function attach_viewer(
                     );
                     return;
                 }
-                const result = await file_coordinator.apply_cell_highlights({
-                    ...message,
+                const common = {
+                    requestId: message.requestId,
                     originToken: cell_highlight_subscriber_token,
                     expectedAuthorityRevision: expected_authority,
                     expectedPhysicalRevision: expected_physical_revision,
@@ -2994,11 +2999,20 @@ export function attach_viewer(
                     meta: command_source.meta(),
                     stateStore: durable_state_store,
                     isCurrent: command_is_current,
-                    mapDisplayRowsToSource: (sheet_index, display_rows) =>
-                        command_core.map_display_rows_to_source(sheet_index, display_rows),
-                    displayRowForSource: (sheet_index, source_row) =>
-                        command_core.display_row_for_source(sheet_index, source_row),
-                });
+                };
+                const result = message.type === 'applyCellHighlights'
+                    ? await file_coordinator.apply_cell_highlights({
+                        ...common,
+                        sheetIndex: message.sheetIndex,
+                        sheetName: message.sheetName,
+                        selection: message.selection,
+                        mutation: message.mutation,
+                        mapDisplayRowsToSource: (sheet_index, display_rows) =>
+                            command_core.map_display_rows_to_source(sheet_index, display_rows),
+                        displayRowForSource: (sheet_index, source_row) =>
+                            command_core.display_row_for_source(sheet_index, source_row),
+                    })
+                    : await file_coordinator.clear_all_cell_highlights(common);
                 if (result.type === 'rejected') {
                     await reject_highlight_command(result.error);
                 }

@@ -13,6 +13,7 @@ const defaults = (): HighlightControlProps => ({
     on_color_change: vi.fn(),
     on_apply: vi.fn(),
     on_clear: vi.fn(),
+    on_clear_all: vi.fn(),
     selection_available: true,
     pending: false,
     status: '',
@@ -81,26 +82,39 @@ describe('HighlightControl', () => {
         expect(document.activeElement).toBe(radios[0]);
     });
 
-    it('disables mutations without a selection or while pending', async () => {
+    it('allows clear-all without a selection and disables every mutation while pending', async () => {
         await render({ selection_available: false });
         await click(container.querySelector('button')!);
-        expect(Array.from(container.querySelectorAll('.highlight-actions button'))
-            .every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+        const no_selection = Array.from(
+            container.querySelectorAll<HTMLButtonElement>('.highlight-actions button'),
+        );
+        expect(no_selection.map((button) => button.disabled)).toEqual([
+            true, true, false,
+        ]);
 
         await render({ selection_available: true, pending: true });
         expect(Array.from(container.querySelectorAll('.highlight-actions button'))
             .every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
     });
 
-    it('applies, clears, and restores trigger focus on Escape', async () => {
+    it('applies, clears selection, clears all, and restores trigger focus on Escape', async () => {
         const on_apply = vi.fn();
         const on_clear = vi.fn();
-        await render({ on_apply, on_clear });
+        const on_clear_all = vi.fn();
+        await render({ on_apply, on_clear, on_clear_all });
         const trigger = container.querySelector<HTMLButtonElement>('.highlight-trigger')!;
         await click(trigger);
         await click(Array.from(container.querySelectorAll('.highlight-actions button'))[0]);
         expect(on_apply).toHaveBeenCalledOnce();
         expect(document.activeElement).toBe(trigger);
+
+        await click(trigger);
+        await click(Array.from(container.querySelectorAll('.highlight-actions button'))[1]);
+        expect(on_clear).toHaveBeenCalledOnce();
+
+        await click(trigger);
+        await click(Array.from(container.querySelectorAll('.highlight-actions button'))[2]);
+        expect(on_clear_all).toHaveBeenCalledOnce();
 
         await click(trigger);
         await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', {
