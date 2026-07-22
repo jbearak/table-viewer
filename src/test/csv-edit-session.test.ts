@@ -1328,6 +1328,10 @@ describe('CSV edit sessions', () => {
         const file_path = '/tmp/save-highlight-rebase.csv';
         let bytes: Uint8Array<ArrayBufferLike> = enc.encode('h\na\n');
         let mtime = 1;
+        let write_finished = false;
+        let conflict_injected = false;
+        const post_conflict_read_started = deferred();
+        const post_conflict_read_gate = deferred();
         const digest = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
         const state = state_store({
             rowHeights: [{ 0: 29 }],
@@ -1339,13 +1343,50 @@ describe('CSV edit sessions', () => {
                 }],
             },
         });
+        let gated_post_conflict_read = false;
+        const store: FileStateStore = {
+            ...state.store,
+            async read(path) {
+                if (conflict_injected && !gated_post_conflict_read) {
+                    gated_post_conflict_read = true;
+                    post_conflict_read_started.resolve();
+                    await post_conflict_read_gate.promise;
+                }
+                return state.store.read(path);
+            },
+            async compare_and_set(path, expected, next, validate) {
+                if (write_finished && !conflict_injected) {
+                    const concurrent: PerFileState = {
+                        ...next,
+                        rowHeights: [{ 0: 41 }],
+                        cellHighlights: next.cellHighlights && {
+                            ...next.cellHighlights,
+                            sheets: [{
+                                schema: next.cellHighlights.sheets[0]?.schema ?? 'stale',
+                                cells: { '9:0': 'blue' },
+                            }],
+                        },
+                    };
+                    const committed = await state.store.compare_and_set(
+                        path,
+                        expected,
+                        concurrent,
+                        validate,
+                    );
+                    if (committed.type !== 'committed') return committed;
+                    conflict_injected = true;
+                }
+                return state.store.compare_and_set(path, expected, next, validate);
+            },
+        };
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime }));
         vscode_mock.__setReadFileImplementation(async () => bytes);
         vscode_mock.__setWriteFileImplementation(async (_uri, next) => {
             bytes = next;
             mtime += 1;
+            write_finished = true;
         });
-        const panel = open_csv_table(uri(file_path), state.store);
+        const panel = open_csv_table(uri(file_path), store);
         await panel.__receive({ type: 'ready' });
         const snapshot = latest_snapshot(panel);
         await panel.__receive({
@@ -1353,7 +1394,7 @@ describe('CSV edit sessions', () => {
         });
         await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
         const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
-        await panel.__receive({
+        const save = panel.__receive({
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
@@ -1362,16 +1403,22 @@ describe('CSV edit sessions', () => {
                 dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
             },
         });
+        await post_conflict_read_started.promise;
+        expect(panel.__messages).not.toContainEqual(expect.objectContaining({
+            type: 'saveResult', success: true,
+        }));
+        post_conflict_read_gate.resolve();
+        await save;
         await flush_promises();
 
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult', success: true,
         }));
         expect(state.get_state(file_path)).toMatchObject({
-            rowHeights: [{ 0: 29 }],
+            rowHeights: [{ 0: 41 }],
             cellHighlights: {
                 sourceDigest: digest(bytes),
-                sheets: [{ cells: { '0:0': 'pink' } }],
+                sheets: [{ cells: { '9:0': 'blue' } }],
             },
         });
     });

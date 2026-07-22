@@ -2495,29 +2495,29 @@ export function attach_viewer(
 
             // The watcher is reserved across this write and CAS so the state
             // rebase commits against the same save authority.
-            const before_rebase = await read_file_state(false);
-            const stored_highlights = (before_rebase.state as PerFileState).cellHighlights;
-            // update_file_state reports a no-op updater as undefined; a
-            // byte-identical save (saved_digest === expected_digest) is such a
-            // no-op and must count as success, not a validator failure.
+            // update_file_state reports a no-op updater as undefined. That can
+            // mean either a byte-identical save or a concurrent writer that
+            // already satisfied the rebase, so recover the latest snapshot.
             let rebase_was_noop = false;
-            const rebased = stored_highlights
-                ? await update_file_state((current) => {
-                    if (!save_operation_is_current(operation)) return current;
-                    const highlights = rebase_cell_highlight_digest(
-                        current.cellHighlights,
-                        saved_digest,
-                    );
-                    if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
-                        rebase_was_noop = true;
-                        return current;
-                    }
-                    return { ...current, cellHighlights: highlights };
-                }, undefined, () => save_operation_is_current(operation)
-                    && source_authority.authorityRevision === expected_authority
-                    && file_coordinator.state_write_is_current(expected_authority))
-                    ?? (rebase_was_noop ? before_rebase : undefined)
-                : before_rebase;
+            const rebase_is_current = () => save_operation_is_current(operation)
+                && source_authority.authorityRevision === expected_authority
+                && file_coordinator.state_write_is_current(expected_authority);
+            let rebased = await update_file_state((current) => {
+                if (!save_operation_is_current(operation)) return current;
+                const highlights = rebase_cell_highlight_digest(
+                    current.cellHighlights,
+                    saved_digest,
+                );
+                if (cell_highlight_states_equal(current.cellHighlights, highlights)) {
+                    rebase_was_noop = true;
+                    return current;
+                }
+                return { ...current, cellHighlights: highlights };
+            }, undefined, rebase_is_current);
+            if (!rebased && rebase_was_noop && rebase_is_current()) {
+                const current = await read_file_state(false);
+                rebased = rebase_is_current() ? current : undefined;
+            }
             if (!rebased || !save_operation_is_current(operation)) {
                 throw new Error(
                     'The file was written, but its highlight state could not be rebased safely.',
