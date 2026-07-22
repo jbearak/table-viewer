@@ -736,7 +736,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         expect(options.slice(0, 3)).toEqual(['contains', 'isOneOf', 'notContains']);
     });
 
-    it('promotes a pristine Contains draft to Is one of when the value list settles', () => {
+    it('promotes a pristine Contains draft to Is one of when the value list settles', async () => {
         const props = {
             column_index: 1, column_name: 'Value', filters: [] as FilterEntry[],
             anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
@@ -752,10 +752,22 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             ...props, histogram: TEXT_READY,
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        // Focus is deferred with a zero-delay timer until the checklist mounts.
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(document.activeElement?.className).toBe('filter-value-search');
     });
 
     it('keeps Contains when the distinct list is over cap or empty', () => {
-        render_popover([], { ...TEXT_READY, distinctValues: [], distinctValuesExceeded: true });
+        render_popover([], { ...TEXT_READY, distinctValues: [], distinctValuesExceeded: false });
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { ...TEXT_READY, distinctValuesExceeded: true },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
     });
 

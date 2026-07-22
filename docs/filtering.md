@@ -65,7 +65,7 @@ When you open the filter editor on a column with no filter yet, Table Viewer exa
 - **Category-like columns** start on **Is one of**, with the checklist ready to search.
 - **Everything else** starts on **Contains**.
 
-Table Viewer treats a column as category-like when it is not a number column and contains at most 1,000 different values, blanks included. Columns such as **Status** or **Country** usually qualify; columns of names, comments, or other free text usually have too many different values and start on **Contains**.
+Table Viewer treats a column as category-like when it is not a number column and contains at least one and at most 1,000 different values, blanks included. Columns such as **Status** or **Country** usually qualify; columns of names, comments, or other free text usually have too many different values and start on **Contains**, as does a column with no rows at all.
 
 Column types come from the cells themselves. Cells holding numbers — or text that reads as a plain number — make a number column. Date cells, or text in ISO date format, make a date column. Anything else is text, as is a column mixing numbers, dates, and text. Blank cells are ignored when deciding the type, so a column of numbers with some blanks still counts as a number column.
 
