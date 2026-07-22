@@ -2,6 +2,8 @@
 
 Fast, full-featured viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files in VS Code, with persistent layouts, sorting, filtering, and auto-refresh.
 
+You do not need to be an existing VS Code user to use Table Viewer—VS Code can simply be the app that hosts the viewer. [Install Table Viewer from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer), or follow the [setup and 10-minute try-out guide](docs/setup-guide.md) from installing VS Code through trying two sample workbooks and a safe revised-file exercise.
+
 ## Why
 
 If you work with scripts that output tables — R, Stata, Python, or anything else — you've probably dealt with the friction of viewing those results. You rerun your script, but your viewer doesn't refresh. Or it does, but you lose your scroll position, your column widths, and the worksheet tab you were looking at. You resize columns again, or you go back to encoding widths in your script — tedious and imprecise.
