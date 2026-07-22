@@ -63,6 +63,16 @@ Choose **View → Appearance** to show or hide parts of the window:
 
 If you rarely use any sidebar, choose **View → Appearance → Activity Bar Position → Top** for a compact horizontal arrangement, or choose **Hidden** to remove the Activity Bar entirely. The same menu restores its default position.
 
+### Disable telemetry, if you prefer
+
+VS Code sends Microsoft crash reports, error information, and usage data to help improve the product. If you would rather not send that information:
+
+1. Select the gear-shaped **Manage** button and choose **Settings**, or press `Cmd+,` on macOS / `Ctrl+,` on Windows and Linux.
+2. Search for `telemetry level`.
+3. Set **Telemetry: Telemetry Level** to **off**.
+
+This stops VS Code's crash, error, and usage telemetry going forward. Extensions can have their own data practices, so check an extension's documentation if that matters to you. See [VS Code's telemetry documentation](https://code.visualstudio.com/docs/configure/telemetry) for more detail.
+
 ### Disable built-in AI features, if you prefer
 
 Closing Chat or hiding the Secondary Side Bar only removes Chat from view. To turn off VS Code's built-in AI features as well:
