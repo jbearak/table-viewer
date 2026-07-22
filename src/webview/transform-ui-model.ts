@@ -26,6 +26,10 @@ const FILTER_OPERATOR_METADATA: readonly FilterOperatorMetadata[] = [
         columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
     },
     {
+        value: 'isOneOf', label: 'Is one of',
+        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
+    },
+    {
         value: 'notContains', label: 'Does not contain',
         columnKinds: ['text', 'orderedText'], supportsCaseSensitive: true,
     },
@@ -68,10 +72,6 @@ const FILTER_OPERATOR_METADATA: readonly FilterOperatorMetadata[] = [
     {
         value: 'notBetween', label: 'Not between (inclusive bounds)',
         columnKinds: ['numeric', 'orderedText'], supportsCaseSensitive: false,
-    },
-    {
-        value: 'isOneOf', label: 'Is one of',
-        columnKinds: ['numeric', 'text', 'orderedText'], supportsCaseSensitive: false,
     },
     {
         value: 'isEmpty', label: 'Is empty',

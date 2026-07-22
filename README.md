@@ -64,7 +64,7 @@ Table Viewer is the result.
 - Only these explicit user clear actions remove highlights
 - Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
 
-**Sorting and filtering**
+**Sorting and filtering** — see the [filtering guide](docs/filtering.md) for conditions, defaults, and the value checklist
 - Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
 - Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules
 - Keyboard shortcuts operate on the focused column: `Shift+Alt+A` / `D` sort, `Shift+Alt+F` filters, `Shift+Alt+X` clears its filter, and `Shift+Alt+0` / `9` clear all sorts or filters
