@@ -90,6 +90,7 @@ import {
 import { expand_glide_selection } from './selection-glide';
 import {
     grid_selection_contains_cell,
+    highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
 } from './highlight-selection-model';
 import { CELL_HIGHLIGHT_COLORS, highlight_rgba } from './highlight-theme';
@@ -1736,6 +1737,11 @@ export function GridShell({
                 0,
             ) * highlight_selection.sourceColumns.length
             : 0;
+        const can_clear_highlight = highlight_selection_may_have_renderable_highlight(
+            highlight_selection,
+            cell_highlights?.cells,
+            get_source_row,
+        );
         if (dirty_cells.has(`${row}:${source_col}`)) {
             menu_items.push({
                 label: 'Discard edit',
@@ -1765,10 +1771,14 @@ export function GridShell({
                     on_click: () => mutate_highlight_selection({ type: 'set', color }),
                 });
             }
-            menu_items.push({
-                label: highlight_cell_count === 1 ? 'Clear highlight' : 'Clear highlights',
-                on_click: () => mutate_highlight_selection({ type: 'clear' }),
-            });
+            if (can_clear_highlight) {
+                menu_items.push({
+                    label: highlight_cell_count === 1
+                        ? 'Clear highlight'
+                        : 'Clear highlights',
+                    on_click: () => mutate_highlight_selection({ type: 'clear' }),
+                });
+            }
             menu_items.push({ kind: 'separator' });
         }
         menu_items.push({ label: 'Select row', on_click: () => select_row(row) });

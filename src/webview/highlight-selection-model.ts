@@ -1,9 +1,11 @@
 import type { GridSelection, Rectangle } from '@glideapps/glide-data-grid';
 import type {
+    CellHighlightColor,
     CellHighlightSelection,
     DisplayRowInterval,
     MergeRange,
 } from '../types';
+import { parse_cell_highlight_key } from '../cell-highlights';
 import type { ColumnProjection } from './column-projection';
 import { expand_glide_selection } from './selection-glide';
 
@@ -11,6 +13,40 @@ export interface HighlightSelectionResult {
     selection: CellHighlightSelection;
     /** Saturates at Number.MAX_SAFE_INTEGER. Host validation remains authoritative. */
     estimatedCellCount: number;
+}
+
+/**
+ * Whether clearing the effective selection could remove a renderable highlight.
+ * Unknown display-to-source rows are conservative, but only after a highlight
+ * candidate has been found in one of the selected source columns.
+ */
+export function highlight_selection_may_have_renderable_highlight(
+    selection: CellHighlightSelection | null,
+    cells: Readonly<Record<string, CellHighlightColor>> | undefined,
+    get_source_row: (display_row: number) => number | undefined,
+): boolean {
+    if (!selection || !cells || selection.displayRows.length === 0) return false;
+    const selected_columns = new Set(selection.sourceColumns);
+    if (selected_columns.size === 0) return false;
+
+    const highlighted_source_rows = new Set<number>();
+    for (const key of Object.keys(cells)) {
+        const coordinates = parse_cell_highlight_key(key);
+        if (coordinates && selected_columns.has(coordinates.sourceColumn)) {
+            highlighted_source_rows.add(coordinates.sourceRow);
+        }
+    }
+    if (highlighted_source_rows.size === 0) return false;
+
+    for (const interval of selection.displayRows) {
+        for (let display_row = interval.start; display_row <= interval.end; display_row++) {
+            const source_row = get_source_row(display_row);
+            if (source_row === undefined || highlighted_source_rows.has(source_row)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 interface DisplayRegion {

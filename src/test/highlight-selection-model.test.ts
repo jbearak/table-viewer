@@ -4,6 +4,7 @@ import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
 import {
     grid_selection_contains_cell,
+    highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
 } from '../webview/highlight-selection-model';
 import type { MergeRange } from '../types';
@@ -16,6 +17,59 @@ const empty = (): GridSelection => ({
 const current = (x: number, y: number, width = 1, height = 1): GridSelection => ({
     ...empty(),
     current: { cell: [x, y], range: { x, y, width, height }, rangeStack: [] },
+});
+
+describe('highlight_selection_may_have_renderable_highlight', () => {
+    const selection = {
+        displayRows: [{ start: 4, end: 5 }],
+        sourceColumns: [0, 2],
+    };
+
+    it('requires an exact mapped source row in a selected source column', () => {
+        const get_source_row = vi.fn((display_row: number) => display_row + 10);
+        expect(highlight_selection_may_have_renderable_highlight(
+            selection,
+            { '14:1': 'yellow', '13:2': 'green' },
+            get_source_row,
+        )).toBe(false);
+        expect(highlight_selection_may_have_renderable_highlight(
+            selection,
+            { '14:1': 'yellow', '15:2': 'green' },
+            get_source_row,
+        )).toBe(true);
+    });
+
+    it('treats an unresolved selected row conservatively only for selected-column candidates', () => {
+        const unresolved = vi.fn(() => undefined);
+        expect(highlight_selection_may_have_renderable_highlight(
+            selection,
+            { '99:1': 'blue' },
+            unresolved,
+        )).toBe(false);
+        expect(unresolved).not.toHaveBeenCalled();
+
+        expect(highlight_selection_may_have_renderable_highlight(
+            selection,
+            { '99:2': 'blue' },
+            unresolved,
+        )).toBe(true);
+        expect(unresolved).toHaveBeenCalledOnce();
+    });
+
+    it('returns false for empty inputs without resolving display rows', () => {
+        const get_source_row = vi.fn((row: number) => row);
+        expect(highlight_selection_may_have_renderable_highlight(
+            null,
+            { '4:0': 'pink' },
+            get_source_row,
+        )).toBe(false);
+        expect(highlight_selection_may_have_renderable_highlight(
+            selection,
+            undefined,
+            get_source_row,
+        )).toBe(false);
+        expect(get_source_row).not.toHaveBeenCalled();
+    });
 });
 
 describe('highlight_selection_from_grid', () => {
