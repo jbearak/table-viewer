@@ -106,6 +106,11 @@ function compact(values: number[]) {
     };
 }
 
+function menu_button_labels(): string[] {
+    return Array.from(document.querySelectorAll('button'))
+        .map((button) => button.textContent ?? '');
+}
+
 function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
     return {
         sheet_meta: {
@@ -1010,6 +1015,96 @@ describe('GridShell column projection', () => {
         expect(document.body.textContent).toContain('Select column');
         expect(document.body.textContent).toContain('Select all');
         expect(document.body.textContent).not.toContain('Sort ascending');
+    });
+
+    it('evaluates an outside right-click as the projected single source cell', async () => {
+        const initial = props({
+            cell_highlights: { schema: 'accepted', cells: { '0:0': 'yellow' } },
+        });
+        const GridShell = await render_grid(initial);
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).not.toContain('Clear highlight');
+        expect(menu_button_labels()).not.toContain('Clear highlights');
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...initial,
+            cell_highlights: {
+                schema: 'accepted',
+                cells: { '0:0': 'yellow', '0:2': 'blue' },
+            },
+        })));
+        expect(menu_button_labels()).toContain('Clear highlight');
+        expect(menu_button_labels()).not.toContain('Clear highlights');
+    });
+
+    it('preserves an inside multi-selection and shows clear only when any cell is highlighted', async () => {
+        const on_highlight_selection = vi.fn();
+        const initial = props({
+            row_count: 2,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 2,
+                sourceRowCount: 2,
+            },
+            cell_highlights: { schema: 'accepted', cells: { '1:2': 'green' } },
+            on_highlight_selection,
+        });
+        const GridShell = await render_grid(initial);
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 2, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).not.toContain('Clear highlights');
+
+        await act(async () => root!.render(React.createElement(GridShell, {
+            ...initial,
+            cell_highlights: {
+                schema: 'accepted',
+                cells: { '1:2': 'green', '0:2': 'pink' },
+            },
+        })));
+        expect(menu_button_labels()).toContain('Clear highlights');
+        expect(menu_button_labels()).not.toContain('Clear highlight');
+
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Clear highlights')!.click());
+        expect(on_highlight_selection).toHaveBeenCalledWith({
+            displayRows: [{ start: 0, end: 0 }],
+            sourceColumns: [0, 2],
+        }, { type: 'clear' });
     });
 
     it('renders an unrecoverable message for a genuine zero-column sheet', async () => {
