@@ -725,6 +725,52 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         root = null;
     });
 
+    it('defaults new categorical columns to Is one of and lists it right after Contains', () => {
+        render_popover([], TEXT_READY);
+        const select = document.querySelector('select') as HTMLSelectElement;
+        expect(select.value).toBe('isOneOf');
+        const options = Array.from(
+            document.querySelectorAll('#filter-condition option'),
+            (option) => (option as HTMLOptionElement).value,
+        );
+        expect(options.slice(0, 3)).toEqual(['contains', 'isOneOf', 'notContains']);
+    });
+
+    it('promotes a pristine Contains draft to Is one of when the value list settles', async () => {
+        const props = {
+            column_index: 1, column_name: 'Value', filters: [] as FilterEntry[],
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        };
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props, histogram: { status: 'loading' },
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props, histogram: TEXT_READY,
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        // Focus is deferred with a zero-delay timer until the checklist mounts.
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(document.activeElement?.className).toBe('filter-value-search');
+    });
+
+    it('keeps Contains when the distinct list is over cap or empty', () => {
+        render_popover([], { ...TEXT_READY, distinctValues: [], distinctValuesExceeded: false });
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1, column_name: 'Value', filters: [],
+            histogram: { ...TEXT_READY, distinctValuesExceeded: true },
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+        })));
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
+    });
+
     it('swaps in the checklist, hides value input and case sensitivity', () => {
         render_popover([], TEXT_READY);
         select_is_one_of();

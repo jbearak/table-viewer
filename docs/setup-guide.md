@@ -48,7 +48,7 @@ Nothing in this section edits the `.xlsx` file, so feel free to poke around.
 
 1. Click **Vertical Tabs** to move the worksheet tabs between the top and left side. With this many sheets, the left side is usually easier to scan.
 2. Click **Auto-fit Columns**, or drag a column border. Double-clicking a column border fits that column to its contents.
-3. Right-click a column header to sort or filter it. On **Coffee Shelf**, try filtering **Roast** to values containing `Light`, then sort **Price / bag** ascending.
+3. Right-click a column header to sort or [filter](filtering.md) it. On **Coffee Shelf**, try filtering **Roast** to values containing `Light`, then sort **Price / bag** ascending.
 4. Open **Columns** to hide fields you do not need. Try hiding **Origin**; open the menu again to bring it back.
 5. Select one or more cells, open **Highlight**, choose a color, and click **Apply to selection**.
 6. Click **Formatting** to switch between the workbook's formatted display values and the underlying raw values.

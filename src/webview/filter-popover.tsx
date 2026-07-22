@@ -28,9 +28,18 @@ export interface FilterPopoverProps {
 function preferred_operator_from_histogram(
     histogram: NonNullable<FilterPopoverProps['histogram']>,
 ): FilterOperator {
-    return filter_column_kind_from_histogram(histogram) === 'numeric'
-        ? 'between'
-        : 'contains';
+    if (filter_column_kind_from_histogram(histogram) === 'numeric') return 'between';
+    if (histogram.status !== 'ready') return 'contains';
+    // Kind may settle as 'unknown' when the host omits it; bins still mean numeric.
+    if (histogram.bins.length > 0) return 'between';
+    return value_list_offered(histogram) ? 'isOneOf' : 'contains';
+}
+
+function value_list_offered(
+    histogram: Extract<FilterHistogramStatus, { status: 'ready' }>,
+): boolean {
+    return histogram.distinctValuesExceeded !== true
+        && (histogram.distinctValues?.length ?? 0) > 0;
 }
 
 function parse_range_bound(value: string | undefined): number | undefined {
@@ -121,14 +130,21 @@ export function FilterPopover({
             ?? condition_ref.current)?.focus();
     }, []);
 
-    // Promote pristine Contains drafts to Between once a numeric histogram arrives.
+    // Promote pristine Contains drafts once the histogram settles: numeric
+    // columns get Between, columns with a complete value list get Is one of.
     useEffect(() => {
         if (existing || user_edited_ref.current) return;
-        if (histogram.status !== 'ready' || histogram.bins.length === 0) return;
+        if (histogram.status !== 'ready') return;
+        const promoted = preferred_operator_from_histogram(histogram);
+        if (promoted === 'contains') return;
         set_draft((current) => {
             if (!is_pristine_default_filter_draft(current)) return current;
-            return { ...current, operator: 'between' };
+            return { ...current, operator: promoted };
         });
+        if (promoted === 'isOneOf') {
+            // Focus after the checklist mounts.
+            window.setTimeout(() => value_search_ref.current?.focus(), 0);
+        }
     }, [existing, histogram]);
 
     const uses_value_list = draft.operator === 'isOneOf';
