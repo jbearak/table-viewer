@@ -73,7 +73,10 @@ To use it:
 2. Search for `@id:Catppuccin.catppuccin-vsc` and install [**Catppuccin for VSCode**](https://marketplace.visualstudio.com/items?itemName=Catppuccin.catppuccin-vsc), published by **Catppuccin**.
 3. Choose **Preferences: Color Theme** from the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows and Linux), then select **Catppuccin Latte**.
 
-VS Code also includes several themes out of the box. You can preview them from the same Color Theme picker and use whichever is easiest for you to read.
+VS Code also includes several themes out of the box. You can preview them from the same Color Theme picker and use whichever is easiest for you to read. Two other popular choices are:
+
+- [**Solarized Light**](https://github.com/microsoft/vscode/tree/main/extensions/theme-solarized-light) (`vscode.theme-solarized-light`) and [**Solarized Dark**](https://github.com/microsoft/vscode/tree/main/extensions/theme-solarized-dark) (`vscode.theme-solarized-dark`) are built into VS Code, so there is nothing extra to install.
+- [**Gruvbox Theme**](https://marketplace.visualstudio.com/items?itemName=jdinhlife.gruvbox) (`jdinhlife.gruvbox`) is a Marketplace extension with light and dark variants at several contrast levels.
 
 ## Continue with Table Viewer
 
