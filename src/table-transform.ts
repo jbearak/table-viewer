@@ -597,6 +597,16 @@ function compile_filter(
             matches: (raw) => raw !== null,
         };
     }
+    if (entry.operator === 'isOneOf') {
+        // Exact raw-value exclusion: no case folding, no numeric
+        // canonicalization. Values absent from the set — including values that
+        // appear in the file later — always pass. `null` excludes blanks.
+        const excluded = new Set(entry.excludedValues ?? []);
+        return {
+            needsNumericKey: false,
+            matches: (raw) => !excluded.has(raw),
+        };
+    }
 
     const raw_rhs = entry.value ?? '';
     if (is_range_filter_operator(entry.operator)) {
