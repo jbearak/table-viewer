@@ -357,11 +357,29 @@ describe('FilterPopover', () => {
             enabled: false,
         };
         const { on_apply } = render_popover([existing]);
-        expect(document.activeElement?.id).toBe('filter-condition');
-        expect((document.querySelector('[aria-label="Filter value"]') as HTMLInputElement).value).toBe('0');
+        const value_input = document.querySelector(
+            '[aria-label="Filter value"]',
+        ) as HTMLInputElement;
+        expect(document.activeElement).toBe(value_input);
+        expect(value_input.value).toBe('0');
         expect((document.querySelector('input[type="checkbox"]') as HTMLInputElement).checked).toBe(true);
         act(() => (document.querySelector('.filter-popover-btn-primary') as HTMLButtonElement).click());
         expect(on_apply).toHaveBeenCalledWith(existing);
+    });
+
+    it('focuses the first range value input when opened', () => {
+        render_popover([], { status: 'ready', bins: READY_BINS });
+        expect(document.activeElement).toBe(
+            document.querySelector('[aria-label="Lower value"]'),
+        );
+    });
+
+    it('focuses the condition menu when the filter has no value input', () => {
+        render_popover([{
+            id: 'empty', colIndex: 1, operator: 'isEmpty',
+            caseSensitive: false, enabled: true,
+        }]);
+        expect(document.activeElement?.id).toBe('filter-condition');
     });
 
     it('preserves caseSensitive on apply when the checkbox is hidden for range ops', () => {
