@@ -129,6 +129,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 {props.excel_header_status ?? ''}
             </span>
             <div ref={chips_ref} className="toolbar-chips">
+                {props.highlight && <HighlightControl {...props.highlight} />}
                 <SortStrip
                     state={transform}
                     column_names={column_names}
@@ -211,7 +212,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ref={columns_ref}
                     {...props.column_visibility}
                 />
-                {props.highlight && <HighlightControl {...props.highlight} />}
                 <ToolbarButton
                     label="Auto-fit Columns"
                     active={props.auto_fit_active}
