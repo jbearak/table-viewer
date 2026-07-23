@@ -14,6 +14,7 @@ import type {
 import {
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
+    transform_has_entries,
     transform_schema_for_sheet,
 } from './types';
 import { normalize_complete_per_file_state } from './viewer-snapshot';
@@ -166,7 +167,9 @@ export function plan_excel_override_state(
     sheet_index: number,
     sheet_name: string,
     override: ExcelHeaderOverride,
+    options?: { clearHiddenRows?: boolean },
 ): ExcelOverrideStatePlan | undefined {
+    if (options?.clearHiddenRows && override !== 'off') return undefined;
     const planning_sheet = input.sheets[sheet_index];
     if (!planning_sheet || planning_sheet.name !== sheet_name) return undefined;
     const excelFirstRowHeaders = sanitize_excel_header_overrides(
@@ -176,6 +179,19 @@ export function plan_excel_override_state(
         excelFirstRowHeaders,
         sheet_name,
     ) ? excelFirstRowHeaders[sheet_name] : undefined;
+    if (
+        (current_override === 'on' || override === 'on')
+        && Object.prototype.hasOwnProperty.call(
+            planning_sheet,
+            'manualHeaderSourceRow',
+        )
+    ) {
+        const hidden_rows = current.transforms?.[sheet_index]?.hiddenRows;
+        if (
+            first_non_hidden_source_row(planning_sheet.sourceRowCount, hidden_rows)
+                !== planning_sheet.manualHeaderSourceRow
+        ) return undefined;
+    }
     const old_sheet = project_excel_header_sheet(planning_sheet, current_override);
     const new_sheet = project_excel_header_sheet(planning_sheet, override);
     excelFirstRowHeaders[sheet_name] = override;
@@ -189,6 +205,12 @@ export function plan_excel_override_state(
     const scrollPosition = [...(current.scrollPosition ?? [])];
     rowHeights[sheet_index] = undefined;
     scrollPosition[sheet_index] = undefined;
+    let transforms = current.transforms;
+    if (options?.clearHiddenRows && transforms?.[sheet_index]?.hiddenRows) {
+        transforms = [...transforms];
+        const { hiddenRows: _hidden_rows, ...retained } = transforms[sheet_index]!;
+        transforms[sheet_index] = transform_has_entries(retained) ? retained : undefined;
+    }
 
     return {
         oldSheet: old_sheet,
@@ -201,7 +223,7 @@ export function plan_excel_override_state(
             rowHeights,
             scrollPosition,
             transforms: migrate_compatible_sheet_schema(
-                current.transforms,
+                transforms,
                 sheet_index,
                 old_sheet,
                 new_sheet,
@@ -220,6 +242,22 @@ export function plan_excel_override_state(
             ),
         },
     };
+}
+
+function first_non_hidden_source_row(
+    source_row_count: number,
+    hidden_rows: readonly number[] | undefined,
+): number | undefined {
+    // Header authority is only constructed over the physical XLS/XLSX sources,
+    // whose canonical source IDs are their zero-based physical row positions.
+    if (!Array.isArray(hidden_rows)) return source_row_count > 0 ? 0 : undefined;
+    let candidate = 0;
+    for (const row of hidden_rows) {
+        if (!Number.isInteger(row) || row < candidate) continue;
+        if (row !== candidate) break;
+        candidate += 1;
+    }
+    return candidate < source_row_count ? candidate : undefined;
 }
 
 function compatible_sheet(left: SheetMeta, right: SheetMeta): boolean {

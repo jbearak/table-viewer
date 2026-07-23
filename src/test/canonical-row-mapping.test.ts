@@ -94,6 +94,23 @@ describe('canonical source row mapping', () => {
         expect(projected_row_for_source(source, 0, 2)).toBe(1);
     });
 
+    it('maps around an explicitly promoted nonzero source row', () => {
+        const source = new ExcelHeaderDataSource(
+            new Source(['title', 'note', 'Header', 'Alice', 'Bob']),
+            { Sheet1: 'on' },
+            [[0, 1]],
+        );
+
+        expect(source.meta().sheets[0].excelFirstRowHeader?.sourceRow).toBe(2);
+        expect([...read_source_row_indices(source, 0, [0, 1, 2, 3])])
+            .toEqual([0, 1, 3, 4]);
+        expect(projected_row_for_source(source, 0, 0)).toBe(0);
+        expect(projected_row_for_source(source, 0, 1)).toBe(1);
+        expect(projected_row_for_source(source, 0, 2)).toBeUndefined();
+        expect(projected_row_for_source(source, 0, 3)).toBe(2);
+        expect(projected_row_for_source(source, 0, 4)).toBe(3);
+    });
+
     it('returns sourceRows aligned with identity and transformed windows', () => {
         const source = new ExcelHeaderDataSource(
             new Source(['Header', 'zero', 'one', 'two']),

@@ -7,7 +7,7 @@ import type {
     SortKey,
     StoredPerFileState,
 } from '../types';
-import { is_range_filter_operator } from '../types';
+import { is_range_filter_operator, sheet_name_from_transform_schema } from '../types';
 import { sanitize_column_visibility_state } from './column-projection';
 
 export function clamp_sheet_index(
@@ -82,8 +82,44 @@ export function sanitize_transform_state(
     const schema = typeof (candidate as { schema?: unknown }).schema === 'string'
         ? (candidate as { schema: string }).schema
         : undefined;
+    const hidden_rows: number[] = [];
+    if (Array.isArray(candidate.hiddenRows)) {
+        let unique: Set<number> | undefined;
+        let previous = -1;
+        for (const row of candidate.hiddenRows) {
+            if (
+                typeof row === 'number'
+                && Number.isInteger(row)
+                && row >= 0
+                && row < row_count
+            ) {
+                if (!unique && row > previous) {
+                    hidden_rows.push(row);
+                    previous = row;
+                } else {
+                    unique ??= new Set(hidden_rows);
+                    unique.add(row);
+                }
+            }
+            if ((unique?.size ?? hidden_rows.length) === MAX_PERSISTED_HIDDEN_ROWS) break;
+        }
+        if (unique) {
+            hidden_rows.length = 0;
+            for (const row of unique) hidden_rows.push(row);
+            hidden_rows.sort((a, b) => a - b);
+        }
+    }
     if (expected_schema !== undefined && schema !== expected_schema) {
-        return undefined;
+        const same_sheet = sheet_name_from_transform_schema(schema)
+            === sheet_name_from_transform_schema(expected_schema);
+        return hidden_rows.length > 0 && same_sheet
+            ? {
+                sort: [],
+                filters: [],
+                hiddenRows: hidden_rows,
+                schema: expected_schema,
+            }
+            : undefined;
     }
 
     const sort: SortKey[] = [];
@@ -170,22 +206,6 @@ export function sanitize_transform_state(
             caseSensitive: is_one_of ? false : entry.caseSensitive,
             enabled: entry.enabled,
         });
-    }
-
-    const hidden_rows: number[] = [];
-    if (Array.isArray(candidate.hiddenRows)) {
-        const unique = new Set<number>();
-        for (const row of candidate.hiddenRows) {
-            if (
-                typeof row === 'number'
-                && Number.isInteger(row)
-                && row >= 0
-                && row < row_count
-            ) unique.add(row);
-            if (unique.size === MAX_PERSISTED_HIDDEN_ROWS) break;
-        }
-        hidden_rows.push(...unique);
-        hidden_rows.sort((a, b) => a - b);
     }
 
     if (sort.length === 0 && filters.length === 0 && hidden_rows.length === 0) {

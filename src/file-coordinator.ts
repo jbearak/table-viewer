@@ -121,6 +121,7 @@ export interface CommitExcelHeaderCommand {
     readonly sheetIndex: number;
     readonly sheetName: string;
     readonly override: ExcelHeaderOverride;
+    readonly clearHiddenRows?: boolean;
     readonly originToken: symbol;
     readonly expectedPhysicalRevision: number;
     readonly expectedPhysicalDigest?: string;
@@ -1107,6 +1108,7 @@ export function acquire_file_coordinator(
                         command.sheetIndex,
                         command.sheetName,
                         command.override,
+                        { clearHiddenRows: command.clearHiddenRows },
                     );
                     if (!plan) {
                         return { type: 'rejected', error: 'The selected worksheet no longer matches this request.' };

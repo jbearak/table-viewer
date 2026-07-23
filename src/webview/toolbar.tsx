@@ -202,8 +202,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                             : props.excel_header_active
                             ? props.excel_header_automatic
                                 ? 'Automatically using the first row as column names. Click to show it as data.'
-                                : 'Show the first row as data.'
-                            : 'Use the first row as column names.'}
+                                : 'Show the header row as data.'
+                            : 'Use the first non-hidden row as column names.'}
                         onClick={props.on_toggle_excel_header}
                         disabled={props.excel_header_disabled}
                         focusable_when_disabled

@@ -40,6 +40,8 @@ export interface ExcelFirstRowHeaderMeta {
     active: boolean;
     /** Whether the physical sheet currently has a first row that can be promoted. */
     available: boolean;
+    /** Canonical source row currently promoted. Present only while active. */
+    sourceRow?: number;
 }
 
 export interface SheetMeta {

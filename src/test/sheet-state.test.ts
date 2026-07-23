@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+    MAX_PERSISTED_HIDDEN_ROWS,
     clamp_sheet_index,
     normalize_per_file_state,
     sanitize_transform_state,
@@ -274,6 +275,38 @@ describe('sheet-state helpers', () => {
             sort: [],
             filters: [],
         }, 1, undefined, 6)).toBeUndefined();
+    });
+
+    it('sanitizes the maximum hidden-row set without spreading it as arguments', () => {
+        const hiddenRows = Array.from(
+            { length: MAX_PERSISTED_HIDDEN_ROWS },
+            (_, index) => index,
+        );
+        [hiddenRows[0], hiddenRows[1]] = [hiddenRows[1], hiddenRows[0]];
+
+        const sanitized = sanitize_transform_state({
+            sort: [],
+            filters: [],
+            hiddenRows,
+        }, 1, undefined, MAX_PERSISTED_HIDDEN_ROWS);
+
+        expect(sanitized?.hiddenRows).toHaveLength(MAX_PERSISTED_HIDDEN_ROWS);
+        expect(sanitized?.hiddenRows?.[0]).toBe(0);
+        expect(sanitized?.hiddenRows?.at(-1)).toBe(MAX_PERSISTED_HIDDEN_ROWS - 1);
+    });
+
+    it('preserves canonical hidden rows when a stale schema drops column transforms', () => {
+        expect(sanitize_transform_state({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            hiddenRows: [3, 1, 3],
+            schema: '["People",1,["Old"]]',
+        }, 1, '["People",1,["New"]]', 5)).toEqual({
+            sort: [],
+            filters: [],
+            hiddenRows: [1, 3],
+            schema: '["People",1,["New"]]',
+        });
     });
 
 });

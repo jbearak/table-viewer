@@ -1182,6 +1182,7 @@ describe('Excel first-row header toggle', () => {
         const { post_message } = await render_app();
         const active_empty = excel_meta(true, 'on');
         active_empty.sheets[0].rowCount = 0;
+        active_empty.sheets[0].sourceRowCount = 0;
         active_empty.sheets[0].excelFirstRowHeader = {
             mode: 'on',
             detected: false,
@@ -1205,6 +1206,7 @@ describe('Excel first-row header toggle', () => {
 
         const inactive_empty = excel_meta(false, 'off');
         inactive_empty.sheets[0].rowCount = 0;
+        inactive_empty.sheets[0].sourceRowCount = 0;
         inactive_empty.sheets[0].excelFirstRowHeader = {
             mode: 'off',
             detected: false,
@@ -1303,6 +1305,134 @@ describe('Excel first-row header toggle', () => {
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+    });
+
+    it('routes Unhide all through an atomic header command for a nonzero header', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+            generation: 3,
+            sourceGeneration: 5,
+        }));
+        const restore = latest_transform_request(post_message);
+        await acknowledge_transform(restore, 4);
+        post_message.mockClear();
+
+        await click_button('Unhide all');
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            unhideAll: true,
+            generation: 4,
+            sourceGeneration: 5,
+        }));
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setTransform')).toBe(false);
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Restoring rows…');
+    });
+
+    it('keeps a row-zero header active when Unhide all clears other hidden rows', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 0,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [2],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        post_message.mockClear();
+
+        await click_button('Unhide all');
+
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+        expect(latest_transform_request(post_message).state.hiddenRows).toBeUndefined();
+    });
+
+    it('can enable the header after restoring an initially all-hidden sheet', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 3;
+        meta.sheets[0].excelFirstRowHeader!.available = false;
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1, 2],
+            schema: '["People",2,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        post_message.mockClear();
+
+        await click_button('Unhide all');
+        const unhide = latest_transform_request(post_message);
+        expect(unhide.state.hiddenRows).toBeUndefined();
+        await acknowledge_transform(unhide, 3);
+        post_message.mockClear();
+
+        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        await click_button('First Row as Header');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'setExcelFirstRowHeader',
+            enabled: true,
+            generation: 3,
+        }));
+    });
+
+    it('atomically disables an unavailable explicit header while unhiding all rows', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'on');
+        meta.sheets[0].sourceRowCount = 3;
+        meta.sheets[0].excelFirstRowHeader = {
+            mode: 'on', detected: false, active: false, available: false,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1, 2],
+            schema: '["People",2,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        post_message.mockClear();
+
+        await click_button('Unhide all');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'setExcelFirstRowHeader',
+            enabled: false,
+            unhideAll: true,
+        }));
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setTransform')).toBe(false);
     });
 
     it('does not restore another sheet transform while a header request is pending', async () => {

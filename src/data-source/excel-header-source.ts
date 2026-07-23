@@ -23,7 +23,10 @@ const HEADER_MAX_LENGTH = 80;
 
 interface SheetProjection {
     physical: SheetMeta;
-    columnNames: string[];
+    firstRowColumnNames: string[];
+    manualColumnNames: string[];
+    manualHeaderRow?: number;
+    manualHeaderSourceRow?: number;
     detected: boolean;
     override?: ExcelHeaderOverride;
 }
@@ -45,6 +48,9 @@ export interface ExcelHeaderPlanningSheet {
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
     readonly columnNames: readonly string[];
+    readonly manualColumnNames?: readonly string[];
+    readonly manualHeaderRow?: number;
+    readonly manualHeaderSourceRow?: number;
     readonly detected: boolean;
     readonly override?: ExcelHeaderOverride;
 }
@@ -67,6 +73,7 @@ export class ExcelHeaderDataSource implements DataSource {
     constructor(
         private readonly base: DataSource,
         overrides?: Record<string, ExcelHeaderOverride>,
+        hidden_rows?: readonly (readonly number[] | undefined)[],
     ) {
         const sanitized = sanitize_excel_header_overrides(overrides);
         const physical_meta = base.meta();
@@ -88,12 +95,20 @@ export class ExcelHeaderDataSource implements DataSource {
                     [first_row ?? [], ...body_rows],
                 );
             }
-            return {
+            const projection: SheetProjection = {
                 physical: sheet,
-                columnNames: first_row_names(sheet, first_row),
+                firstRowColumnNames: first_row_names(sheet, first_row),
+                manualColumnNames: [],
                 detected,
                 override: override_for(sanitized, sheet.name),
             };
+            this.update_manual_candidate(
+                projection,
+                sheet_index,
+                hidden_rows?.[sheet_index],
+                first_row,
+            );
+            return projection;
         });
         this._meta = this.build_meta();
     }
@@ -116,10 +131,14 @@ export class ExcelHeaderDataSource implements DataSource {
                 `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
             );
         }
-        if (!header_active(projection, projection.override)) {
+        const header_row = active_header_row(projection, projection.override);
+        if (header_row === undefined) {
             return read_source_row_indices(this.base, sheet_index, projected_rows);
         }
-        const base_rows = Uint32Array.from(projected_rows, (row) => row + 1);
+        const base_rows = Uint32Array.from(
+            projected_rows,
+            (row) => row < header_row ? row : row + 1,
+        );
         return read_source_row_indices(this.base, sheet_index, base_rows);
     }
 
@@ -135,8 +154,10 @@ export class ExcelHeaderDataSource implements DataSource {
         }
         const base_row = projected_row_for_source(this.base, sheet_index, source_row);
         if (base_row === undefined) return undefined;
-        if (!header_active(projection, projection.override)) return base_row;
-        return base_row === 0 ? undefined : base_row - 1;
+        const header_row = active_header_row(projection, projection.override);
+        if (header_row === undefined) return base_row;
+        if (base_row === header_row) return undefined;
+        return base_row < header_row ? base_row : base_row - 1;
     }
 
     /** Immutable facts used by pure state planning and CAS conflict retries. */
@@ -152,7 +173,10 @@ export class ExcelHeaderDataSource implements DataSource {
                     sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
                 ),
                 hasFormatting: sheet.physical.hasFormatting,
-                columnNames: Object.freeze([...sheet.columnNames]),
+                columnNames: Object.freeze([...sheet.firstRowColumnNames]),
+                manualColumnNames: Object.freeze([...sheet.manualColumnNames]),
+                manualHeaderRow: sheet.manualHeaderRow,
+                manualHeaderSourceRow: sheet.manualHeaderSourceRow,
                 detected: sheet.detected,
                 override: sheet.override,
             }))),
@@ -166,7 +190,8 @@ export class ExcelHeaderDataSource implements DataSource {
                 `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
             );
         }
-        if (!header_active(projection, projection.override)) {
+        const header_row = active_header_row(projection, projection.override);
+        if (header_row === undefined) {
             return this.base.read_rows(sheet_index, start_row, count);
         }
 
@@ -176,12 +201,21 @@ export class ExcelHeaderDataSource implements DataSource {
         const available = Math.min(requested, row_count - start);
         if (available <= 0) return { startRow: start, rows: [] };
 
-        const physical = this.base.read_rows(
-            sheet_index,
-            start + 1,
-            available,
+        const physical_indices = Array.from(
+            { length: available },
+            (_, offset) => {
+                const row = start + offset;
+                return row < header_row ? row : row + 1;
+            },
         );
-        return { startRow: start, rows: physical.rows.slice(0, available) };
+        return {
+            startRow: start,
+            rows: read_source_rows_indexed(
+                this.base,
+                sheet_index,
+                physical_indices,
+            ).rows,
+        };
     }
 
     read_rows_indexed(sheet_index: number, row_indices: ArrayLike<number>): IndexedRows {
@@ -192,7 +226,8 @@ export class ExcelHeaderDataSource implements DataSource {
             );
         }
         const requested = Array.from(row_indices);
-        const row_count = header_active(projection, projection.override)
+        const header_row = active_header_row(projection, projection.override);
+        const row_count = header_row !== undefined
             ? Math.max(0, projection.physical.rowCount - 1)
             : projection.physical.rowCount;
         for (const row of requested) {
@@ -201,8 +236,8 @@ export class ExcelHeaderDataSource implements DataSource {
             }
         }
         if (requested.length === 0) return { rows: [] };
-        const physical_indices = header_active(projection, projection.override)
-            ? requested.map((row) => row + 1)
+        const physical_indices = header_row !== undefined
+            ? requested.map((row) => row < header_row ? row : row + 1)
             : requested;
         return read_source_rows_indexed(this.base, sheet_index, physical_indices);
     }
@@ -219,7 +254,8 @@ export class ExcelHeaderDataSource implements DataSource {
                 `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
             );
         }
-        if (!header_active(projection, projection.override)) {
+        const header_row = active_header_row(projection, projection.override);
+        if (header_row === undefined) {
             return read_source_columns(
                 this.base,
                 sheet_index,
@@ -233,14 +269,31 @@ export class ExcelHeaderDataSource implements DataSource {
         const start = Math.max(0, Math.min(start_row, row_count));
         const available = Math.min(Math.max(0, count), row_count - start);
         if (available <= 0) return { startRow: start, rows: [] };
-        const physical = read_source_columns(
-            this.base,
-            sheet_index,
-            start + 1,
-            available,
-            column_indices,
-        );
-        return { startRow: start, rows: physical.rows.slice(0, available) };
+        const before_count = start < header_row
+            ? Math.min(available, header_row - start)
+            : 0;
+        const rows: (RenderedCell | null)[][] = [];
+        if (before_count > 0) {
+            rows.push(...read_source_columns(
+                this.base,
+                sheet_index,
+                start,
+                before_count,
+                column_indices,
+            ).rows.slice(0, before_count));
+        }
+        const after_count = available - before_count;
+        if (after_count > 0) {
+            const projected_start = start + before_count;
+            rows.push(...read_source_columns(
+                this.base,
+                sheet_index,
+                projected_start + 1,
+                after_count,
+                column_indices,
+            ).rows.slice(0, after_count));
+        }
+        return { startRow: start, rows };
     }
 
     /** Predict one sheet's projected metadata without changing live row behavior. */
@@ -259,8 +312,8 @@ export class ExcelHeaderDataSource implements DataSource {
             sheet: project_sheet(projection, next_override),
             previousMode: projection.override ?? 'auto',
             nextMode: override,
-            previousActive: header_active(projection, projection.override),
-            nextActive: header_active(projection, next_override),
+            previousActive: active_header_row(projection, projection.override) !== undefined,
+            nextActive: active_header_row(projection, next_override) !== undefined,
         };
     }
 
@@ -280,6 +333,25 @@ export class ExcelHeaderDataSource implements DataSource {
         this._meta = this.build_meta();
     }
 
+    /** Refresh manual header candidates after canonical hidden-row state changes. */
+    replace_hidden_rows(
+        hidden_rows: readonly (readonly number[] | undefined)[] | undefined,
+    ): void {
+        this.sheets.forEach((sheet, sheet_index) => {
+            this.update_manual_candidate(sheet, sheet_index, hidden_rows?.[sheet_index]);
+        });
+        this._meta = this.build_meta();
+    }
+
+    set_hidden_rows(sheet_name: string, hidden_rows: readonly number[] | undefined): boolean {
+        const sheet_index = this.sheets.findIndex((sheet) => sheet.physical.name === sheet_name);
+        const sheet = this.sheets[sheet_index];
+        if (!sheet) return false;
+        this.update_manual_candidate(sheet, sheet_index, hidden_rows);
+        this._meta = this.build_meta();
+        return true;
+    }
+
     close(): void {
         if (this.closed) return;
         this.closed = true;
@@ -292,6 +364,28 @@ export class ExcelHeaderDataSource implements DataSource {
             sheets: this.sheets.map((sheet) => project_sheet(sheet, sheet.override)),
         };
     }
+
+    private update_manual_candidate(
+        projection: SheetProjection,
+        sheet_index: number,
+        hidden_rows: readonly number[] | undefined,
+        cached_first_row?: readonly (RenderedCell | null)[],
+    ): void {
+        const candidate = first_non_hidden_row(
+            this.base,
+            sheet_index,
+            projection.physical.rowCount,
+            hidden_rows ?? [],
+        );
+        projection.manualHeaderRow = candidate?.projectedRow;
+        projection.manualHeaderSourceRow = candidate?.sourceRow;
+        const row = candidate === undefined
+            ? undefined
+            : candidate.projectedRow === 0 && cached_first_row !== undefined
+            ? cached_first_row
+            : this.base.read_rows(sheet_index, candidate.projectedRow, 1).rows[0];
+        projection.manualColumnNames = first_row_names(projection.physical, row);
+    }
 }
 
 function override_for(
@@ -303,13 +397,13 @@ function override_for(
         : undefined;
 }
 
-function header_active(
+function active_header_row(
     sheet: SheetProjection,
     override: ExcelHeaderOverride | undefined,
-): boolean {
-    if (override === 'on') return true;
-    if (override === 'off') return false;
-    return sheet.detected;
+): number | undefined {
+    if (override === 'on') return sheet.manualHeaderRow;
+    if (override === 'off' || !sheet.detected) return undefined;
+    return 0;
 }
 
 function project_sheet(
@@ -323,7 +417,10 @@ function project_sheet(
         columnCount: sheet.physical.columnCount,
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
-        columnNames: sheet.columnNames,
+        columnNames: sheet.firstRowColumnNames,
+        manualColumnNames: sheet.manualColumnNames,
+        manualHeaderRow: sheet.manualHeaderRow,
+        manualHeaderSourceRow: sheet.manualHeaderSourceRow,
         detected: sheet.detected,
         override: sheet.override,
     }, override);
@@ -333,26 +430,47 @@ export function project_excel_header_sheet(
     sheet: ExcelHeaderPlanningSheet,
     override: ExcelHeaderOverride | undefined,
 ): SheetMeta {
-    const active = override === 'on'
-        ? true
-        : override === 'off'
-        ? false
-        : sheet.detected;
+    const has_manual_candidate = Object.prototype.hasOwnProperty.call(
+        sheet,
+        'manualHeaderRow',
+    );
+    const manual_header_row = has_manual_candidate
+        ? sheet.manualHeaderRow
+        : sheet.rowCount > 0 ? 0 : undefined;
+    const manual_header_source_row = Object.prototype.hasOwnProperty.call(
+        sheet,
+        'manualHeaderSourceRow',
+    ) ? sheet.manualHeaderSourceRow : manual_header_row;
+    const header_row = override === 'on'
+        ? manual_header_row
+        : override === 'off' || !sheet.detected
+        ? undefined
+        : 0;
+    const header_source_row = override === 'on'
+        ? manual_header_source_row
+        : header_row === 0 ? 0 : undefined;
+    const active = header_row !== undefined;
+    const column_names = override === 'on'
+        ? sheet.manualColumnNames ?? sheet.columnNames
+        : sheet.columnNames;
     return {
         name: sheet.name,
         rowCount: active ? Math.max(0, sheet.rowCount - 1) : sheet.rowCount,
         sourceRowCount: sheet.sourceRowCount,
         columnCount: sheet.columnCount,
         merges: active
-            ? project_header_merges(sheet.merges)
+            ? project_header_merges(sheet.merges, header_row)
             : sheet.merges.map((merge) => ({ ...merge })),
         hasFormatting: sheet.hasFormatting,
-        columnNames: active ? [...sheet.columnNames] : undefined,
+        columnNames: active ? [...column_names] : undefined,
         excelFirstRowHeader: {
             mode: override ?? 'auto',
             detected: sheet.detected,
             active,
-            available: sheet.rowCount > 0 && sheet.columnCount > 0,
+            available: manual_header_row !== undefined && sheet.columnCount > 0,
+            ...(active && override === 'on' && header_source_row !== undefined
+                ? { sourceRow: header_source_row }
+                : {}),
         },
     };
 }
@@ -370,10 +488,21 @@ export function project_excel_header_workbook(
     };
 }
 
-export function project_header_merges(merges: readonly MergeRange[]): MergeRange[] {
+export function project_header_merges(
+    merges: readonly MergeRange[],
+    header_row = 0,
+): MergeRange[] {
     const projected: MergeRange[] = [];
     for (const merge of merges) {
-        if (merge.startRow === 0) continue;
+        if (merge.startRow === header_row) continue;
+        if (merge.endRow < header_row) {
+            projected.push({ ...merge });
+            continue;
+        }
+        if (merge.startRow < header_row) {
+            projected.push({ ...merge, endRow: merge.endRow - 1 });
+            continue;
+        }
         projected.push({
             ...merge,
             startRow: merge.startRow - 1,
@@ -381,6 +510,70 @@ export function project_header_merges(merges: readonly MergeRange[]): MergeRange
         });
     }
     return projected;
+}
+
+function first_non_hidden_row(
+    source: DataSource,
+    sheet_index: number,
+    row_count: number,
+    hidden_rows: readonly number[],
+): { projectedRow: number; sourceRow: number } | undefined {
+    if (row_count === 0) return undefined;
+    if (hidden_rows.length === 0) {
+        return {
+            projectedRow: 0,
+            sourceRow: read_source_row_indices(source, sheet_index, [0])[0],
+        };
+    }
+    // Controller ingress sanitizes this as sorted/unique. Keep candidate lookup
+    // allocation-free even at the one-million-row persistence bound.
+    let hidden_position = 0;
+    let previous_source_row = -1;
+    let mapping_is_monotonic = true;
+    const chunk_size = 4096;
+    for (let start = 0; start < row_count; start += chunk_size) {
+        const count = Math.min(chunk_size, row_count - start);
+        const projected = Uint32Array.from(
+            { length: count },
+            (_, offset) => start + offset,
+        );
+        const source_rows = read_source_row_indices(source, sheet_index, projected);
+        for (let offset = 0; offset < source_rows.length; offset++) {
+            const source_row = source_rows[offset];
+            let is_hidden: boolean;
+            if (mapping_is_monotonic && source_row >= previous_source_row) {
+                while (
+                    hidden_position < hidden_rows.length
+                    && hidden_rows[hidden_position] < source_row
+                ) hidden_position += 1;
+                is_hidden = hidden_rows[hidden_position] === source_row;
+            } else {
+                mapping_is_monotonic = false;
+                is_hidden = sorted_numeric_array_includes(hidden_rows, source_row);
+            }
+            previous_source_row = source_row;
+            if (!is_hidden) {
+                return {
+                    projectedRow: start + offset,
+                    sourceRow: source_row,
+                };
+            }
+        }
+    }
+    return undefined;
+}
+
+function sorted_numeric_array_includes(values: readonly number[], target: number): boolean {
+    let low = 0;
+    let high = values.length - 1;
+    while (low <= high) {
+        const middle = (low + high) >>> 1;
+        const value = values[middle];
+        if (value === target) return true;
+        if (value < target) low = middle + 1;
+        else high = middle - 1;
+    }
+    return false;
 }
 
 function detection_structure_is_eligible(sheet: SheetMeta): boolean {
