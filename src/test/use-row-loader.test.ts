@@ -493,6 +493,32 @@ describe('RowLoader', () => {
             await expect(done).resolves.toBe(false);
         });
 
+        it('protects each pending load individually, not the gap between them', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 1); // cap = 1
+            loader.configure(0, 2000, 1);
+            // Two disjoint bulk loads in flight: page 0 and page 1900, both
+            // still awaiting their host reply.
+            const done_low = loader.ensure_rows_loaded(0, 40);
+            const done_high = loader.ensure_rows_loaded(1900, 1940);
+            // Scroll a page in the gap between them into view and load it…
+            loader.ensure_rows(1000, 1040);
+            loader.on_row_data(reply_for(post, 0, 1000, 1));
+            expect(loader.get_row(1000)).toBeDefined();
+            // …then scroll on. The old viewport page (1000) is neither in view
+            // nor part of either pending load, so it must be evictable — the two
+            // waiters protect only pages 0 and 1900, not the span between them.
+            loader.ensure_rows(1100, 1140);
+            loader.on_row_data(reply_for(post, 0, 1100, 1));
+            expect(loader.get_row(1000)).toBeUndefined();
+            expect(loader.get_row(1100)).toBeDefined();
+            // Deliver both loads' pages to settle their promises.
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            loader.on_row_data(reply_for(post, 0, 1900, 1));
+            await expect(done_low).resolves.toBe(true);
+            await expect(done_high).resolves.toBe(true);
+        });
+
         it('does not move the display viewport', async () => {
             const post = vi.fn();
             const loader = new RowLoader(post, () => {});

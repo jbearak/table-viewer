@@ -37,9 +37,8 @@ export class RowLoader {
     private viewport = { start: 0, end: 0 };
     private viewport_set = false;
     private enabled = true;
-    // Ranges whose pages a bulk copy load is holding resident, plus the promises
-    // it is waiting to settle once those ranges are fully cached.
-    private copy_protect: { start: number; end: number } | null = null;
+    // Outstanding bulk-copy loads: each holds its own range's pages resident
+    // until that range is fully cached and the promise settles.
     private load_waiters: Array<{
         start: number;
         end: number;
@@ -142,11 +141,12 @@ export class RowLoader {
      * user never scrolled into view (e.g. "Copy sheet" on a freshly switched-to
      * sheet, whose pages are still in flight).
      *
-     * The range is protected from LRU eviction until the promise settles, so a
-     * bulk copy can hold more than `max_pages` pages resident at once. Resolves
-     * `true` once the whole range is resident. Resolves `false` if a sheet switch
-     * or reload clears the cache mid-load, so the caller can abandon the copy
-     * rather than serialize a now-empty cache into the clipboard.
+     * The range's pages are protected from LRU eviction until this promise
+     * settles (see {@link evict}), so a bulk copy can hold more than `max_pages`
+     * pages resident at once. Resolves `true` once the whole range is resident.
+     * Resolves `false` if a sheet switch or reload clears the cache mid-load, so
+     * the caller can abandon the copy rather than serialize a now-empty cache
+     * into the clipboard.
      */
     ensure_rows_loaded(start_row: number, end_row: number): Promise<boolean> {
         if (!this.enabled || this.row_count <= 0) {
@@ -158,15 +158,11 @@ export class RowLoader {
             this.request_missing_pages(start, end); // touch for LRU recency
             return Promise.resolve(true);
         }
-        this.copy_protect = this.copy_protect === null
-            ? { start, end }
-            : {
-                start: Math.min(this.copy_protect.start, start),
-                end: Math.max(this.copy_protect.end, end),
-            };
-        this.request_missing_pages(start, end);
         return new Promise<boolean>((resolve) => {
+            // Register the waiter before requesting, so its range is protected
+            // from eviction the moment any of its pages start arriving.
             this.load_waiters.push({ start, end, resolve });
+            this.request_missing_pages(start, end);
         });
     }
 
@@ -200,10 +196,11 @@ export class RowLoader {
 
     /**
      * Resolve any bulk-copy waiters whose range is now fully resident. Runs after
-     * `evict()` (which still sees `copy_protect`, so the just-loaded pages are
-     * safe), and drops the eviction protection only once every waiter is done —
-     * by which point no further `rowData` macrotask has run, so the awaiting copy
-     * serializes before those pages can be trimmed.
+     * `evict()` — which still sees the waiter, so the just-loaded pages are kept.
+     * A resolved waiter drops out of {@link load_waiters}, so its pages become
+     * evictable again; but its `await` continuation is a microtask that runs
+     * before the next `rowData` macrotask, so the awaiting copy serializes those
+     * pages before any later ingest can trim them.
      */
     private settle_load_waiters(): void {
         if (this.load_waiters.length === 0) return;
@@ -212,7 +209,6 @@ export class RowLoader {
             waiter.resolve(true);
             return false;
         });
-        if (this.load_waiters.length === 0) this.copy_protect = null;
     }
 
     /**
@@ -251,7 +247,6 @@ export class RowLoader {
         // Abandon any in-flight bulk copy: the cache it was accumulating is gone,
         // so let the awaiting copy proceed with whatever is left (it will report
         // the usual clip warning) rather than hang forever.
-        this.copy_protect = null;
         const waiters = this.load_waiters;
         this.load_waiters = [];
         for (const waiter of waiters) waiter.resolve(false);
@@ -276,13 +271,12 @@ export class RowLoader {
         const protect = new Set(
             get_needed_page_starts(this.viewport.start, this.viewport.end),
         );
-        // A bulk copy load may hold far more than the cap resident; never evict
-        // the pages it is still assembling.
-        if (this.copy_protect !== null) {
-            for (const start of get_needed_page_starts(
-                this.copy_protect.start,
-                this.copy_protect.end,
-            )) {
+        // Each outstanding bulk copy load may hold far more than the cap
+        // resident; never evict the pages any of them is still assembling.
+        // Protecting per waiter (rather than one merged envelope) keeps the gap
+        // between disjoint loads evictable and shrinks protection as each settles.
+        for (const waiter of this.load_waiters) {
+            for (const start of get_needed_page_starts(waiter.start, waiter.end)) {
                 protect.add(start);
             }
         }
