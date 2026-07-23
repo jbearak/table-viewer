@@ -1,5 +1,14 @@
 import type { RenderedCell } from '../data-source/interface';
+import type { DisplayRowInterval } from '../types';
 import type { MergeIndex } from './merge-index';
+
+export function* display_row_indices(
+    intervals: readonly DisplayRowInterval[],
+): Generator<number> {
+    for (const interval of intervals) {
+        for (let row = interval.start; row <= interval.end; row++) yield row;
+    }
+}
 
 /** Display-row selection paired with its ordered canonical source columns. */
 export type CopySelection = ({

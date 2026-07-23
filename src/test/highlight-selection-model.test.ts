@@ -4,6 +4,7 @@ import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
 import {
     grid_selection_contains_cell,
+    grid_selection_contains_row,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
     selected_display_row_intervals,
@@ -70,6 +71,15 @@ describe('highlight_selection_may_have_renderable_highlight', () => {
             get_source_row,
         )).toBe(false);
         expect(get_source_row).not.toHaveBeenCalled();
+    });
+});
+
+describe('grid_selection_contains_row', () => {
+    it('checks only explicit row-marker selections', () => {
+        const rows = CompactSelection.fromSingleSelection([2, 5]);
+        expect(grid_selection_contains_row({ ...current(0, 3), rows }, 3)).toBe(true);
+        expect(grid_selection_contains_row({ ...current(0, 3), rows }, 5)).toBe(false);
+        expect(grid_selection_contains_row(current(0, 3), 3)).toBe(false);
     });
 });
 
