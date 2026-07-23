@@ -23,7 +23,11 @@ export function header_drag_columns(
     return drag.base.add([start, end + 1]);
 }
 
-function compact_contains(selection: GridSelection['columns'], index: number): boolean {
+/** Whether a CompactSelection contains an index (tolerates reduced doubles). */
+export function compact_selection_contains(
+    selection: GridSelection['columns'],
+    index: number,
+): boolean {
     if (typeof selection.hasIndex === 'function') return selection.hasIndex(index);
     if (typeof selection.toArray === 'function') return selection.toArray().includes(index);
     return false;
@@ -46,7 +50,7 @@ export function header_drag_state_for_selection(
     next_columns: GridSelection['columns'],
 ): HeaderDragState | null {
     const next = compact_to_array(next_columns);
-    const added = next.filter((column) => !compact_contains(previous_columns, column));
+    const added = next.filter((column) => !compact_selection_contains(previous_columns, column));
     const anchor = added.length === 1
         ? added[0]
         : next.length === 1
@@ -60,7 +64,7 @@ export function grid_selection_contains_column(
     selection: GridSelection,
     display_column: number,
 ): boolean {
-    return compact_contains(selection.columns, display_column);
+    return compact_selection_contains(selection.columns, display_column);
 }
 
 /** Display columns covered by the selection, ascending: the explicit header

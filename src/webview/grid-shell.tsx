@@ -54,6 +54,11 @@ import {
     type HeaderDragState,
 } from './column-selection-model';
 import { row_context_menu_items } from './row-context-menu';
+import {
+    marker_drag_rows,
+    marker_drag_state_for_selection,
+    type MarkerDragState,
+} from './row-selection-model';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
     append_sort,
@@ -1145,6 +1150,9 @@ export function GridShell({
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
+            marker_hover_row_ref.current = args.kind === 'cell' && args.location[0] < 0
+                ? args.location[1]
+                : null;
             // Header drag-select: while the primary button that started on a
             // header stays down, sweep the hovered column into the selection.
             // (Glide suppresses hover events during a column resize drag, so
@@ -1169,6 +1177,30 @@ export function GridShell({
                         });
                     }
                     // Sweeping columns; don't arm the row-resize strip mid-drag.
+                    row_resize_ref.current?.set_target(null);
+                    return;
+                }
+            }
+            // Row-marker drag-select: same sweep for rows. Hovering the marker
+            // gutter reports kind 'cell' with a negative display column, so only
+            // the row coordinate is gated.
+            const marker_drag = marker_drag_ref.current;
+            if (marker_drag) {
+                if ((args.buttons & 1) === 0) {
+                    marker_drag_ref.current = null;
+                } else if (args.kind === 'cell' && args.location[1] >= 0) {
+                    const rows = marker_drag_rows(
+                        marker_drag,
+                        args.location[1],
+                        row_count,
+                    );
+                    if (!rows.equals(grid_selection_ref.current.rows)) {
+                        set_grid_selection({
+                            columns: CompactSelection.empty(),
+                            rows,
+                        });
+                    }
+                    // Sweeping rows; don't arm the row-resize strip mid-drag.
                     row_resize_ref.current?.set_target(null);
                     return;
                 }
@@ -1199,7 +1231,7 @@ export function GridShell({
                     : null,
             );
         },
-        [display_column_count, row_heights, transformed],
+        [display_column_count, row_count, row_heights, transformed],
     );
 
     // Live drag: persist the new height (mirrors column resize) and nudge Glide +
@@ -1222,41 +1254,121 @@ export function GridShell({
     // while the primary button stays down to grow the column selection.
     const header_drag_ref = useRef<HeaderDragState | null>(null);
 
+    // Armed by a row-marker mousedown the same way; consumed by hover events to
+    // grow the row selection while the primary button stays down.
+    const marker_drag_ref = useRef<MarkerDragState | null>(null);
+    const marker_hover_row_ref = useRef<number | null>(null);
+    // Glide toggles a sole selected row off on plain re-click. Capture the marker
+    // press before Glide handles it so the re-click remains selected and can drag.
+    const marker_reclick_row_ref = useRef<number | null>(null);
+    // Fallback for a click that arrives without a preceding marker hover.
+    const marker_click_restore_ref = useRef<number | null>(null);
+    // Glide follows an outside marker context-menu callback by selecting the
+    // first data cell in that row. This one-shot ref rejects that overwrite.
+    const marker_context_row_ref = useRef<number | null>(null);
+    const marker_touch_selection_ref = useRef<GridSelection['rows'] | null>(null);
+
+    const on_grid_pointer_down_capture = useCallback((event: React.PointerEvent) => {
+        const row = marker_hover_row_ref.current;
+        const rows = grid_selection_ref.current.rows;
+        if (
+            event.button !== 0
+            || event.shiftKey
+            || event.ctrlKey
+            || event.metaKey
+            || row === null
+            || rows.length !== 1
+            || !rows.hasIndex(row)
+        ) return;
+        marker_reclick_row_ref.current = row;
+        marker_drag_ref.current = { anchor: row, base: rows };
+    }, []);
+
     // A release outside the grid produces no zero-button grid hover, so without
-    // this a later press elsewhere could resume a long-finished header drag.
+    // this a later press elsewhere could resume a long-finished drag.
     useEffect(() => {
         // Deferred one macrotask: on touch, pointerup precedes Glide's touchend
         // header selection, which would re-arm the ref right after a synchronous
         // clear. Deferring runs the clear after every completion handler.
         let timer: number | undefined;
-        const end_header_drag = () => {
+        const end_drags = () => {
             window.clearTimeout(timer);
             timer = window.setTimeout(() => {
                 header_drag_ref.current = null;
+                marker_drag_ref.current = null;
+                marker_reclick_row_ref.current = null;
             }, 0);
         };
-        window.addEventListener('pointerup', end_header_drag);
-        window.addEventListener('blur', end_header_drag);
+        window.addEventListener('pointerup', end_drags);
+        window.addEventListener('blur', end_drags);
         return () => {
             window.clearTimeout(timer);
-            window.removeEventListener('pointerup', end_header_drag);
-            window.removeEventListener('blur', end_header_drag);
+            window.removeEventListener('pointerup', end_drags);
+            window.removeEventListener('blur', end_drags);
         };
     }, []);
 
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
+            const touch_menu_rows = marker_touch_selection_ref.current;
+            if (touch_menu_rows && !sel.current) {
+                marker_touch_selection_ref.current = null;
+                set_grid_selection({
+                    columns: CompactSelection.empty(),
+                    rows: touch_menu_rows,
+                });
+                return;
+            }
+            const context_row = marker_context_row_ref.current;
+            if (
+                sel.current
+                && context_row !== null
+                && sel.current.cell[1] === context_row
+            ) {
+                marker_context_row_ref.current = null;
+                set_grid_selection({
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.fromSingleSelection(context_row),
+                });
+                return;
+            }
             if (!sel.current) {
+                // Preserve a sole selected row on plain re-click. The capture
+                // handler has already armed its drag before Glide reports empty.
+                if (
+                    marker_reclick_row_ref.current !== null
+                    && marker_drag_ref.current
+                    && sel.rows.length === 0
+                    && sel.columns.length === 0
+                ) return;
+                // While a marker sweep is armed, the hover handler is the sole
+                // writer: Glide's native marker drag keeps reporting a bare
+                // contiguous replacement, which would drop cmd/ctrl-selected
+                // base rows and re-anchor the sweep.
+                if (marker_drag_ref.current && sel.rows.length > 0) return;
+                const previous_rows = grid_selection_ref.current.rows;
+                marker_click_restore_ref.current = sel.rows.length === 0
+                    && sel.columns.length === 0
+                    && previous_rows.length === 1
+                    ? previous_rows.first() ?? null
+                    : null;
                 header_drag_ref.current = sel.columns.length > 0
                     ? header_drag_state_for_selection(
                         grid_selection_ref.current.columns,
                         sel.columns,
                     )
                     : null;
+                marker_drag_ref.current = sel.rows.length > 0
+                    ? marker_drag_state_for_selection(
+                        grid_selection_ref.current.rows,
+                        sel.rows,
+                    )
+                    : null;
                 set_grid_selection(sel);
                 return;
             }
             header_drag_ref.current = null;
+            marker_drag_ref.current = null;
             const { cell, range } = expand_glide_selection(
                 sel.current.cell,
                 sel.current.range,
@@ -1509,6 +1621,60 @@ export function GridShell({
         if (source_column !== undefined) focused_source_column_ref.current = source_column;
     }, [source_column_for_display]);
 
+    const on_cell_clicked = useCallback((cell: Item, event: CellClickedEventArgs) => {
+        const [column, row] = cell;
+        if (
+            column < 0
+            && event.isTouch
+            && event.isLongTouch !== true
+            && grid_selection_ref.current.rows.length === 1
+            && grid_selection_ref.current.rows.hasIndex(row)
+        ) {
+            // Touch selection runs after onCellClicked. Preserve the sole row
+            // through Glide's ensuing toggle-off callback, matching plain mouse
+            // re-click and header behavior.
+            marker_touch_selection_ref.current = grid_selection_ref.current.rows;
+            return;
+        }
+        if (column < 0 && event.isLongTouch === true) {
+            event.preventDefault();
+            marker_drag_ref.current = null;
+            const current = grid_selection_ref.current;
+            const inside = grid_selection_contains_row(current, row);
+            const rows = inside
+                ? current.rows
+                : CompactSelection.fromSingleSelection(row);
+            marker_touch_selection_ref.current = rows;
+            set_grid_selection({ columns: CompactSelection.empty(), rows });
+            set_context_menu({
+                kind: 'row',
+                x: event.bounds.x + event.localEventX,
+                y: event.bounds.y + event.localEventY,
+                row,
+                display_rows: inside
+                    ? selected_display_row_intervals(current, row_count)
+                        ?? [{ start: row, end: row }]
+                    : [{ start: row, end: row }],
+            });
+            return;
+        }
+        const restore_row = marker_click_restore_ref.current;
+        marker_click_restore_ref.current = null;
+        if (
+            column >= 0
+            || restore_row === null
+            || row !== restore_row
+            || event.button !== 0
+            || event.shiftKey
+            || event.ctrlKey
+            || event.metaKey
+        ) return;
+        set_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.fromSingleSelection(restore_row),
+        });
+    }, [row_count]);
+
     const select_header_column = useCallback((display_column: number) => {
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
@@ -1568,12 +1734,14 @@ export function GridShell({
             event.preventDefault();
             const [col, row] = cell;
             if (col < 0) {
+                marker_drag_ref.current = null;
                 const inside = grid_selection_contains_row(grid_selection_ref.current, row);
                 const display_rows = inside
                     ? selected_display_row_intervals(grid_selection_ref.current, row_count)
                         ?? [{ start: row, end: row }]
                     : [{ start: row, end: row }];
                 if (!inside) {
+                    marker_context_row_ref.current = row;
                     set_grid_selection({
                         columns: CompactSelection.empty(),
                         rows: CompactSelection.fromSingleSelection(row),
@@ -2000,7 +2168,11 @@ export function GridShell({
     }
 
     return (
-        <div ref={grid_root_ref} className="grid-shell-root">
+        <div
+            ref={grid_root_ref}
+            className="grid-shell-root"
+            onPointerDownCapture={on_grid_pointer_down_capture}
+        >
             <DataEditor
                 ref={grid_ref}
                 className="glide-grid"
@@ -2010,7 +2182,7 @@ export function GridShell({
                 columns={columns}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
-                rowMarkers="number"
+                rowMarkers="clickable-number"
                 theme={theme}
                 smoothScrollX
                 smoothScrollY
@@ -2024,6 +2196,7 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
+                onCellClicked={on_cell_clicked}
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}

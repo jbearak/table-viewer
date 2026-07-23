@@ -9,6 +9,47 @@ import type {
     GridShellProps,
 } from '../webview/grid-shell';
 
+// Array-backed CompactSelection stand-in with just enough surface for the
+// selection models (add/remove/hasIndex/equals) used by drag sweeps.
+const make_compact = vi.hoisted(() => {
+    type Compact = {
+        length: number;
+        toArray: () => number[];
+        hasIndex: (index: number) => boolean;
+        first: () => number | undefined;
+        add: (value: number | readonly [number, number]) => Compact;
+        remove: (value: number) => Compact;
+        equals: (other: { toArray?: () => number[] }) => boolean;
+        [Symbol.iterator]: () => Iterator<number>;
+    };
+    const make = (values: number[]): Compact => {
+        const sorted = [...new Set(values)].sort((a, b) => a - b);
+        return {
+            length: sorted.length,
+            toArray: () => [...sorted],
+            hasIndex: (index: number) => sorted.includes(index),
+            first: () => sorted[0],
+            add: (value: number | readonly [number, number]) => {
+                const added = typeof value === 'number'
+                    ? [value]
+                    : Array.from(
+                        { length: value[1] - value[0] },
+                        (_, offset) => value[0] + offset,
+                    );
+                return make([...sorted, ...added]);
+            },
+            remove: (value: number) => make(sorted.filter((index) => index !== value)),
+            equals: (other) => {
+                const other_values = other.toArray?.() ?? [];
+                return other_values.length === sorted.length
+                    && other_values.every((index, at) => index === sorted[at]);
+            },
+            *[Symbol.iterator]() { yield* sorted; },
+        };
+    };
+    return make;
+});
+
 const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
     update_cells: vi.fn(),
@@ -31,13 +72,14 @@ vi.mock('@glideapps/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
     return {
         CompactSelection: {
-            empty: () => ({ length: 0, toArray: () => [], *[Symbol.iterator]() {} }),
-            fromSingleSelection: (value: number) => ({
-                selected: value,
-                length: 1,
-                toArray: () => [value],
-                *[Symbol.iterator]() { yield value; },
-            }),
+            empty: () => make_compact([]),
+            fromSingleSelection: (value: number | readonly [number, number]) =>
+                typeof value === 'number'
+                    ? make_compact([value])
+                    : make_compact(Array.from(
+                        { length: value[1] - value[0] },
+                        (_, offset) => value[0] + offset,
+                    )),
         },
         DataEditor: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
             grid_mock.props = props as Record<string, unknown>;
@@ -99,11 +141,7 @@ let container: HTMLDivElement | null = null;
     .IS_REACT_ACT_ENVIRONMENT = true;
 
 function compact(values: number[]) {
-    return {
-        length: values.length,
-        toArray: () => [...values],
-        *[Symbol.iterator]() { yield* values; },
-    };
+    return make_compact(values);
 }
 
 function menu_button_labels(): string[] {
@@ -1070,6 +1108,16 @@ describe('GridShell column projection', () => {
             localEventX: 10,
             localEventY: 10,
         }));
+        // Glide follows an outside marker context-menu callback by trying to
+        // select the first data cell in that row; keep the marker row selected.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 3],
+                range: { x: 0, y: 3, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
         expect(menu_button_labels()).toContain('Copy row');
         expect(menu_button_labels()).not.toContain('Copy 2 rows');
         expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
@@ -1077,6 +1125,175 @@ describe('GridShell column projection', () => {
         await act(async () => Array.from(document.querySelectorAll('button'))
             .find((button) => button.textContent === 'Copy row')!.click());
         expect(write_text).toHaveBeenCalledWith('r3-a\tr3-c');
+    });
+
+    it('sweeps a row-marker drag through hovered rows and back', async () => {
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        // Marker mousedown: Glide reports the clicked row before any movement.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([2]),
+        }));
+        // Sweep down to row 5 (marker gutter hovers report col -1).
+        await act(async () => on_item_hovered({
+            kind: 'cell', location: [-1, 5], buttons: 1,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2, 3, 4, 5]);
+        // Shrink back to row 3: rows only covered by the wider sweep drop out.
+        await act(async () => on_item_hovered({
+            kind: 'cell', location: [0, 3], buttons: 1,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2, 3]);
+    });
+
+    it('keeps a sole selected row on plain re-click and can drag from it', async () => {
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([2]),
+        }));
+        // Hover identifies the marker for the root capture handler before the
+        // next pointerdown reaches Glide.
+        on_item_hovered({
+            kind: 'cell', location: [-1, 2], buttons: 0,
+            bounds: { x: 0, y: 48, width: 40, height: 24 }, localEventY: 12,
+        });
+        await act(async () => container!.querySelector('.data-editor-stub')!.dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, button: 0 }),
+        ));
+        // Glide's clickable-number behavior tries to toggle the sole row off.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2]);
+        await act(async () => on_item_hovered({
+            kind: 'cell', location: [-1, 5], buttons: 1,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2, 3, 4, 5]);
+    });
+
+    it('preserves a sole selected row across Glide touch re-click ordering', async () => {
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_cell_clicked = grid_mock.props!.onCellClicked as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([2]),
+        }));
+        // On touch, Glide invokes onCellClicked before handleSelect toggles the
+        // sole selected row off.
+        await act(async () => on_cell_clicked([-1, 2], {
+            isTouch: true,
+            isLongTouch: false,
+            button: 0,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            preventDefault: vi.fn(),
+        }));
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2]);
+    });
+
+    it('opens row actions on a marker long-press and preserves selected rows', async () => {
+        await render_grid(props({ row_count: 10, transform_sections: true }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_cell_clicked = grid_mock.props!.onCellClicked as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([1, 2, 4]),
+        }));
+        await act(async () => on_cell_clicked([-1, 2], {
+            isLongTouch: true,
+            button: 0,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining([
+            'Hide 3 rows', 'Copy 3 rows',
+        ]));
+        // Glide continues into its touch selection after onCellClicked; reject
+        // that replacement and retain the rows targeted by the open menu.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([1, 2]),
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([1, 2, 4]);
+    });
+
+    it('keeps cmd/ctrl-selected rows while sweeping and ignores native replacements', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        // Row 0 already selected; releasing that click clears its armed drag.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([0]),
+        }));
+        await act(async () => {
+            window.dispatchEvent(new Event('pointerup'));
+            vi.runAllTimers();
+        });
+        // Cmd-click adds row 4 (the drag anchor) and the press stays down.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([0, 4]),
+        }));
+        // Glide's native marker drag reports a bare contiguous replacement;
+        // the armed sweep must ignore it rather than dropping row 0.
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([4, 5]),
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([0, 4]);
+        await act(async () => on_item_hovered({
+            kind: 'cell', location: [-1, 6], buttons: 1,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([0, 4, 5, 6]);
+    });
+
+    it('ends a marker drag on pointerup so a later hover cannot resume it', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([2]),
+        }));
+        await act(async () => {
+            window.dispatchEvent(new Event('pointerup'));
+            vi.runAllTimers();
+        });
+        await act(async () => on_item_hovered({
+            kind: 'cell', location: [-1, 7], buttons: 1,
+            bounds: { x: 0, y: 96, width: 40, height: 24 }, localEventY: 12,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2]);
     });
 
     it('groups cell hide/select actions into submenus and projects Hide column', async () => {
