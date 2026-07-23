@@ -73,7 +73,6 @@ import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
 import {
-    CELL_TOOLTIP_HIDE_DELAY_MS,
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_position,
     clamp_tooltip_text,
@@ -1012,10 +1011,8 @@ export function GridShell({
 
     // Truncated-cell hover tooltip. Shown after a short dwell only when the
     // displayed value does not fit the painted cell (horizontal ellipsis or
-    // vertical clip of wrapped / multiline text). The bubble is hoverable so
-    // long content can be selected/scrolled; leave uses a grace delay so the
-    // pointer can travel from the cell onto the tooltip. Forced clear on
-    // scroll, drag, menus, and unmount so it never sticks over moved cells.
+    // vertical clip of wrapped / multiline text). Cleared on leave, scroll,
+    // and unmount so a stale bubble never lingers over a moved cell.
     type CellTooltipState = {
         text: string;
         bounds: { x: number; y: number; width: number; height: number };
@@ -1023,62 +1020,27 @@ export function GridShell({
         top: number;
     };
     const [cell_tooltip, set_cell_tooltip] = useState<CellTooltipState | null>(null);
-    const cell_tooltip_show_timer_ref = useRef<number | null>(null);
-    const cell_tooltip_hide_timer_ref = useRef<number | null>(null);
+    const cell_tooltip_timer_ref = useRef<number | null>(null);
     const cell_tooltip_el_ref = useRef<HTMLDivElement | null>(null);
     const cell_tooltip_key_ref = useRef<string | null>(null);
-    const cell_tooltip_hovered_ref = useRef(false);
 
-    const clear_cell_tooltip_show_timer = useCallback(() => {
-        if (cell_tooltip_show_timer_ref.current !== null) {
-            window.clearTimeout(cell_tooltip_show_timer_ref.current);
-            cell_tooltip_show_timer_ref.current = null;
+    const clear_cell_tooltip_timer = useCallback(() => {
+        if (cell_tooltip_timer_ref.current !== null) {
+            window.clearTimeout(cell_tooltip_timer_ref.current);
+            cell_tooltip_timer_ref.current = null;
         }
     }, []);
 
-    const clear_cell_tooltip_hide_timer = useCallback(() => {
-        if (cell_tooltip_hide_timer_ref.current !== null) {
-            window.clearTimeout(cell_tooltip_hide_timer_ref.current);
-            cell_tooltip_hide_timer_ref.current = null;
-        }
-    }, []);
-
-    const hide_cell_tooltip = useCallback((force = true) => {
-        if (!force) {
-            // Soft leave: give the user time to move onto the tooltip.
-            if (cell_tooltip_hovered_ref.current) return;
-            clear_cell_tooltip_hide_timer();
-            cell_tooltip_hide_timer_ref.current = window.setTimeout(() => {
-                cell_tooltip_hide_timer_ref.current = null;
-                if (cell_tooltip_hovered_ref.current) return;
-                clear_cell_tooltip_show_timer();
-                cell_tooltip_key_ref.current = null;
-                set_cell_tooltip(null);
-            }, CELL_TOOLTIP_HIDE_DELAY_MS);
-            return;
-        }
-        clear_cell_tooltip_show_timer();
-        clear_cell_tooltip_hide_timer();
-        cell_tooltip_hovered_ref.current = false;
+    const hide_cell_tooltip = useCallback(() => {
+        clear_cell_tooltip_timer();
         cell_tooltip_key_ref.current = null;
         set_cell_tooltip(null);
-    }, [clear_cell_tooltip_hide_timer, clear_cell_tooltip_show_timer]);
-    hide_cell_tooltip_ref.current = () => hide_cell_tooltip(true);
-
-    const retain_cell_tooltip = useCallback(() => {
-        cell_tooltip_hovered_ref.current = true;
-        clear_cell_tooltip_hide_timer();
-    }, [clear_cell_tooltip_hide_timer]);
-
-    const release_cell_tooltip = useCallback(() => {
-        cell_tooltip_hovered_ref.current = false;
-        hide_cell_tooltip(false);
-    }, [hide_cell_tooltip]);
+    }, [clear_cell_tooltip_timer]);
+    hide_cell_tooltip_ref.current = hide_cell_tooltip;
 
     useEffect(() => () => {
-        clear_cell_tooltip_show_timer();
-        clear_cell_tooltip_hide_timer();
-    }, [clear_cell_tooltip_hide_timer, clear_cell_tooltip_show_timer]);
+        clear_cell_tooltip_timer();
+    }, [clear_cell_tooltip_timer]);
 
     const ensure_measure_ctx = useCallback((): CanvasRenderingContext2D | null => {
         if (!measure_ctx_ref.current) {
@@ -1182,15 +1144,11 @@ export function GridShell({
             cell_bounds: { x: number; y: number; width: number; height: number },
         ) => {
             const key = `${row}:${display_column}`;
-            // Pointer is back over a cell — cancel any pending soft-hide from a
-            // prior leave, whether or not this is the same cell.
-            clear_cell_tooltip_hide_timer();
             // Same cell still hovered — keep an already-visible tooltip, or let
             // the pending timer fire. Avoid restarting the dwell on every move.
             if (cell_tooltip_key_ref.current === key) return;
 
-            clear_cell_tooltip_show_timer();
-            cell_tooltip_hovered_ref.current = false;
+            clear_cell_tooltip_timer();
             cell_tooltip_key_ref.current = key;
             set_cell_tooltip(null);
 
@@ -1212,8 +1170,8 @@ export function GridShell({
             if (!overflows) return;
 
             const clamped = clamp_tooltip_text(text);
-            cell_tooltip_show_timer_ref.current = window.setTimeout(() => {
-                cell_tooltip_show_timer_ref.current = null;
+            cell_tooltip_timer_ref.current = window.setTimeout(() => {
+                cell_tooltip_timer_ref.current = null;
                 // Drop if the pointer left this cell during the dwell.
                 if (cell_tooltip_key_ref.current !== key) return;
                 // Initial placement uses an estimated size; layout effect below
@@ -1232,8 +1190,7 @@ export function GridShell({
             }, CELL_TOOLTIP_SHOW_DELAY_MS);
         },
         [
-            clear_cell_tooltip_hide_timer,
-            clear_cell_tooltip_show_timer,
+            clear_cell_tooltip_timer,
             displayed_cell_text,
             font_flags_for_cell,
             measure_line_width,
@@ -1515,11 +1472,10 @@ export function GridShell({
                 return;
             }
             if (args.kind !== 'cell' || args.location[0] < 0 || args.location[1] < 0) {
-                // Soft hide so the pointer can travel onto the tooltip bubble.
-                hide_cell_tooltip(false);
+                hide_cell_tooltip();
             } else if ((args.buttons & 1) !== 0) {
                 // Primary button down (drag-select / resize) — no tooltip.
-                hide_cell_tooltip(true);
+                hide_cell_tooltip();
             } else {
                 schedule_cell_tooltip(
                     args.location[0],
@@ -2502,8 +2458,6 @@ export function GridShell({
                         left: cell_tooltip.left,
                         top: cell_tooltip.top,
                     }}
-                    onMouseEnter={retain_cell_tooltip}
-                    onMouseLeave={release_cell_tooltip}
                 >
                     {cell_tooltip.text}
                 </div>
