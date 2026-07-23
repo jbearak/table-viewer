@@ -69,6 +69,7 @@ import { column_letter } from './grid-model';
 import {
     create_column_projection,
     hide_all_columns,
+    hide_source_columns,
     sanitize_column_visibility_state,
     show_all_columns,
     toggle_source_column,
@@ -1760,6 +1761,12 @@ export function App(): React.JSX.Element {
         ));
     }, [update_column_visibility]);
 
+    const handle_hide_columns = useCallback((source_indexes: number[]) => {
+        update_column_visibility((current, column_count, schema) => (
+            hide_source_columns(current, source_indexes, column_count, schema)
+        ));
+    }, [update_column_visibility]);
+
     const handle_show_all_columns = useCallback(() => {
         update_column_visibility(() => show_all_columns());
     }, [update_column_visibility]);
@@ -2021,6 +2028,7 @@ export function App(): React.JSX.Element {
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
+            on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
             on_focus_columns={focus_columns_trigger}
             cell_highlights={cell_highlights?.sheets[active_sheet_index]}
