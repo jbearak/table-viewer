@@ -1221,12 +1221,20 @@ export function GridShell({
     // A release outside the grid produces no zero-button grid hover, so without
     // this a later press elsewhere could resume a long-finished header drag.
     useEffect(() => {
+        // Deferred one macrotask: on touch, pointerup precedes Glide's touchend
+        // header selection, which would re-arm the ref right after a synchronous
+        // clear. Deferring runs the clear after every completion handler.
+        let timer: number | undefined;
         const end_header_drag = () => {
-            header_drag_ref.current = null;
+            window.clearTimeout(timer);
+            timer = window.setTimeout(() => {
+                header_drag_ref.current = null;
+            }, 0);
         };
         window.addEventListener('pointerup', end_header_drag);
         window.addEventListener('blur', end_header_drag);
         return () => {
+            window.clearTimeout(timer);
             window.removeEventListener('pointerup', end_header_drag);
             window.removeEventListener('blur', end_header_drag);
         };
