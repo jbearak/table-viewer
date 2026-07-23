@@ -1102,22 +1102,25 @@ describe('GridShell column projection', () => {
         }));
         const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
             (cell: [number, number], event: Record<string, unknown>) => void;
-        await act(async () => on_cell_context_menu([-1, 3], {
-            preventDefault: vi.fn(),
-            bounds: { x: 0, y: 96, width: 40, height: 24 },
-            localEventX: 10,
-            localEventY: 10,
-        }));
-        // Glide follows an outside marker context-menu callback by trying to
-        // select the first data cell in that row; keep the marker row selected.
-        await act(async () => on_selection_change({
-            columns: compact([]), rows: compact([]),
-            current: {
-                cell: [0, 3],
-                range: { x: 0, y: 3, width: 1, height: 1 },
-                rangeStack: [],
-            },
-        }));
+        await act(async () => {
+            on_cell_context_menu([-1, 3], {
+                preventDefault: vi.fn(),
+                bounds: { x: 0, y: 96, width: 40, height: 24 },
+                localEventX: 10,
+                localEventY: 10,
+            });
+            // Glide follows an outside marker context-menu callback synchronously
+            // by trying to select the first data cell in that row.
+            on_selection_change({
+                columns: compact([]), rows: compact([]),
+                current: {
+                    cell: [0, 3],
+                    range: { x: 0, y: 3, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+            await Promise.resolve();
+        });
         expect(menu_button_labels()).toContain('Copy row');
         expect(menu_button_labels()).not.toContain('Copy 2 rows');
         expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
@@ -1125,6 +1128,38 @@ describe('GridShell column projection', () => {
         await act(async () => Array.from(document.querySelectorAll('button'))
             .find((button) => button.textContent === 'Copy row')!.click());
         expect(write_text).toHaveBeenCalledWith('r3-a\tr3-c');
+    });
+
+    it('retires the marker context guard when Glide cell selection is already active', async () => {
+        await render_grid(props({ row_count: 5 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const current = (column: number) => ({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [column, 3],
+                range: { x: column, y: 3, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        });
+        await act(async () => on_selection_change(current(0)));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => {
+            on_cell_context_menu([-1, 3], {
+                preventDefault: vi.fn(),
+                bounds: { x: 0, y: 96, width: 40, height: 24 },
+                localEventX: 10,
+                localEventY: 10,
+            });
+            await Promise.resolve();
+        });
+        // updateSelectedCell is a no-op when Glide's old current cell was already
+        // [0, 3]; a later cell selection on that row must not hit a stale guard.
+        await act(async () => on_selection_change(current(1)));
+        expect((grid_mock.props!.gridSelection as {
+            current?: { cell: [number, number] };
+        }).current?.cell).toEqual([1, 3]);
     });
 
     it('sweeps a row-marker drag through hovered rows and back', async () => {
@@ -1180,6 +1215,30 @@ describe('GridShell column projection', () => {
         }));
         expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
             .rows.toArray()).toEqual([2, 3, 4, 5]);
+    });
+
+    it('restores a plain re-click when no prior marker hover was observed', async () => {
+        vi.useFakeTimers();
+        await render_grid(props({ row_count: 10 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_cell_clicked = grid_mock.props!.onCellClicked as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([2]),
+        }));
+        await act(async () => {
+            window.dispatchEvent(new Event('pointerup'));
+            vi.runAllTimers();
+        });
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+        }));
+        await act(async () => on_cell_clicked([-1, 2], {
+            button: 0, shiftKey: false, ctrlKey: false, metaKey: false,
+        }));
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([2]);
     });
 
     it('preserves a sole selected row across Glide touch re-click ordering', async () => {
