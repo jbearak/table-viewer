@@ -38,7 +38,7 @@ Table Viewer is the result.
 **Layout**
 - Drag column and row borders to resize
 - Double-click a column border to auto-fit to content
-- Select multiple columns and resize or auto-fit them together
+- Select multiple rows or columns and resize them together; auto-fit selected columns
 - Use the searchable **Columns** menu to show, hide, restore, or hide all columns
 - Column visibility and sizing are persisted per file and sheet across VS Code sessions
 

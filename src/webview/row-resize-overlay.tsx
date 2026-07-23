@@ -27,9 +27,12 @@ export interface RowResizeOverlayHandle {
 }
 
 export interface RowResizeOverlayProps {
-    /** Called continuously during the drag with the clamped new height (mirrors
-     *  column-resize, which persists on every tick). */
+    /** Called when a primary-button drag begins. */
+    on_resize_start?: (row: number, height: number) => void;
+    /** Called continuously during the drag with each distinct clamped height. */
     on_resize: (row: number, height: number) => void;
+    /** Called when the drag ends or is interrupted, including at its start height. */
+    on_resize_end?: (row: number, height: number) => void;
 }
 
 interface DragState {
@@ -38,6 +41,7 @@ interface DragState {
     start_height: number;
     /** Client-space Y of the border at drag start, to offset the live line. */
     origin_y: number;
+    last_height: number;
 }
 
 /**
@@ -52,13 +56,23 @@ interface DragState {
 export const RowResizeOverlay = forwardRef<
     RowResizeOverlayHandle,
     RowResizeOverlayProps
->(function RowResizeOverlay({ on_resize }, ref): React.JSX.Element {
+>(function RowResizeOverlay({
+    on_resize_start,
+    on_resize,
+    on_resize_end,
+}, ref): React.JSX.Element {
     const wrapper_ref = useRef<HTMLDivElement | null>(null);
     const [target, set_target_state] = useState<RowResizeTarget | null>(null);
     const [is_dragging, set_is_dragging] = useState(false);
     // Live client-space Y of the strip during a drag (drives the visual line).
     const [drag_y, set_drag_y] = useState<number | null>(null);
     const drag_ref = useRef<DragState | null>(null);
+    const on_resize_start_ref = useRef(on_resize_start);
+    const on_resize_ref = useRef(on_resize);
+    const on_resize_end_ref = useRef(on_resize_end);
+    on_resize_start_ref.current = on_resize_start;
+    on_resize_ref.current = on_resize;
+    on_resize_end_ref.current = on_resize_end;
 
     useImperativeHandle(
         ref,
@@ -96,7 +110,9 @@ export const RowResizeOverlay = forwardRef<
                 start_client_y: e.clientY,
                 start_height: target.height,
                 origin_y: target.boundary_y,
+                last_height: target.height,
             };
+            on_resize_start_ref.current?.(target.row, target.height);
             set_drag_y(target.boundary_y);
             set_is_dragging(true);
         },
@@ -107,27 +123,47 @@ export const RowResizeOverlay = forwardRef<
     // live position, so each mousemove doesn't churn listeners).
     useEffect(() => {
         if (!is_dragging) return;
+        const finish = () => {
+            const d = drag_ref.current;
+            if (!d) return;
+            drag_ref.current = null;
+            on_resize_end_ref.current?.(d.row, d.last_height);
+            set_is_dragging(false);
+            set_drag_y(null);
+        };
         const move = (e: MouseEvent) => {
+            if ((e.buttons & 1) === 0) {
+                finish();
+                return;
+            }
             const d = drag_ref.current;
             if (!d) return;
             const dy = e.clientY - d.start_client_y;
             const height = next_row_height(d.start_height, dy);
-            on_resize(d.row, height);
+            if (height === d.last_height) return;
+            d.last_height = height;
+            on_resize_ref.current(d.row, height);
             // Track the live border: original boundary + the clamped delta.
             set_drag_y(d.origin_y + (height - d.start_height));
         };
-        const up = () => {
-            drag_ref.current = null;
-            set_is_dragging(false);
-            set_drag_y(null);
-        };
         document.addEventListener('mousemove', move);
-        document.addEventListener('mouseup', up);
+        document.addEventListener('mouseup', finish);
+        window.addEventListener('blur', finish);
+        window.addEventListener('pointercancel', finish);
         return () => {
             document.removeEventListener('mousemove', move);
-            document.removeEventListener('mouseup', up);
+            document.removeEventListener('mouseup', finish);
+            window.removeEventListener('blur', finish);
+            window.removeEventListener('pointercancel', finish);
+            // If the overlay unmounts or its callbacks change mid-drag, clear
+            // the parent's transient preview and commit the last distinct height.
+            const d = drag_ref.current;
+            if (d) {
+                drag_ref.current = null;
+                on_resize_end_ref.current?.(d.row, d.last_height);
+            }
         };
-    }, [is_dragging, on_resize]);
+    }, [is_dragging]);
 
     // Convert client-space border Y to wrapper-local Y. Reading layout here is a
     // cheap, read-only reflow at human-paced hover frequency.

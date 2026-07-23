@@ -201,6 +201,16 @@ export interface PendingPreviewScroll {
     sequence: number;
 }
 
+interface RowResizePreview {
+    row: number;
+    /** Full selection materialized once when the drag finishes. */
+    commit_rows: GridSelection['rows'] | null;
+    /** Live preview selection. Like Glide columns, only active from its first row. */
+    preview_rows: GridSelection['rows'] | null;
+    start_height: number;
+    height: number;
+}
+
 export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
@@ -217,7 +227,7 @@ export interface GridShellProps {
     row_heights: RowHeightOverrides;
     // Wired by the row-resize overlay (D-wire-3); accepted now so App's contract
     // is stable while the overlay lands.
-    on_row_resize: (row: number, height: number) => void;
+    on_row_resize: (rows: readonly number[], height: number) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
     // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
@@ -343,6 +353,9 @@ export function GridShell({
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
+    const row_resize_preview_ref = useRef<RowResizePreview | null>(null);
+    const [row_resize_preview, set_row_resize_preview] =
+        useState<RowResizePreview | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const last_preview_row = useRef<number | null>(null);
     const applied_preview_sequence_ref = useRef<number | null>(null);
@@ -1114,7 +1127,7 @@ export function GridShell({
             if (text.includes('\n')) {
                 const needed = natural_row_height(text);
                 if (needed > row_height(row_heights, row)) {
-                    on_row_resize(row, needed);
+                    on_row_resize([row], needed);
                     const cells: { cell: Item }[] = [];
                     for (let display_column = 0; display_column < display_column_count; display_column++) {
                         cells.push({ cell: [display_column, row] });
@@ -1174,9 +1187,25 @@ export function GridShell({
     );
 
     const get_row_height = useCallback(
-        (row: number) => row_height(row_heights, row),
-        [row_heights],
+        (row: number) => {
+            if (
+                row_resize_preview
+                && (
+                    row_resize_preview.row === row
+                    || row_resize_preview.preview_rows?.hasIndex(row)
+                )
+            ) return row_resize_preview.height;
+            return row_height(row_heights, row);
+        },
+        [row_heights, row_resize_preview],
     );
+
+    // Repaint merge geometry after live-preview and committed-height renders.
+    // Repainting inline with the pointer handler is too early: Glide has not yet
+    // applied the new rowHeight callback, leaving vertical/2D bounds one tick old.
+    useEffect(() => {
+        overlay_ref.current?.repaint();
+    }, [row_heights, row_resize_preview]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
@@ -1245,20 +1274,69 @@ export function GridShell({
         [display_column_count, row_heights, row_markers, transformed],
     );
 
-    // Live drag: persist the new height (mirrors column resize) and nudge Glide +
-    // the merge overlay to redraw the affected row at its new height.
+    // Snapshot the compact row selection once. Live moves retain that compact
+    // representation so even select-all previews stay bounded to the viewport;
+    // the final heights are expanded and persisted once on mouseup.
+    const handle_row_resize_start = useCallback((row: number, height: number) => {
+        const selected_rows = grid_selection_ref.current.rows;
+        const commit_rows = selected_rows.hasIndex(row) ? selected_rows : null;
+        const preview: RowResizePreview = {
+            row,
+            commit_rows,
+            // Previewing rows above the dragged boundary would move that
+            // boundary once per preceding row and make it outrun the pointer.
+            // Glide uses this same first-selected-item rule for columns.
+            preview_rows: commit_rows?.first() === row ? commit_rows : null,
+            start_height: height,
+            height,
+        };
+        row_resize_preview_ref.current = preview;
+    }, []);
+
     const handle_row_resize_drag = useCallback(
         (row: number, height: number) => {
-            on_row_resize(row, height);
+            const current = row_resize_preview_ref.current;
+            if (!current || current.row !== row || current.height === height) return;
+            const preview = { ...current, height };
+            row_resize_preview_ref.current = preview;
+            set_row_resize_preview(preview);
+            const visible = visible_ref.current;
+            const first_column = Math.max(0, visible.x);
+            const last_column = Math.min(
+                display_column_count,
+                visible.x + visible.width,
+            );
             const cells: { cell: Item }[] = [];
-            for (let display_column = 0; display_column < display_column_count; display_column++) {
-                cells.push({ cell: [display_column, row] });
+            const first_row = Math.max(0, visible.y);
+            const last_row = Math.min(row_count, visible.y + visible.height);
+            for (let target_row = first_row; target_row < last_row; target_row++) {
+                if (
+                    target_row !== preview.row
+                    && !preview.preview_rows?.hasIndex(target_row)
+                ) continue;
+                for (
+                    let display_column = first_column;
+                    display_column < last_column;
+                    display_column++
+                ) {
+                    cells.push({ cell: [display_column, target_row] });
+                }
             }
-            grid_ref.current?.updateCells(cells);
-            overlay_ref.current?.repaint();
+            if (cells.length > 0) grid_ref.current?.updateCells(cells);
         },
-        [on_row_resize, display_column_count],
+        [display_column_count, row_count],
     );
+
+    const handle_row_resize_end = useCallback((row: number, height: number) => {
+        const preview = row_resize_preview_ref.current;
+        row_resize_preview_ref.current = null;
+        set_row_resize_preview(null);
+        if (!preview || preview.row !== row || height === preview.start_height) return;
+        on_row_resize(
+            preview.commit_rows ? [...preview.commit_rows] : [row],
+            height,
+        );
+    }, [on_row_resize]);
 
     // Armed by a header mousedown (Glide selects the column and reports it via
     // onGridSelectionChange before any drag movement); consumed by hover events
@@ -2114,7 +2192,9 @@ export function GridShell({
             {!transformed && (
                 <RowResizeOverlay
                     ref={row_resize_ref}
+                    on_resize_start={handle_row_resize_start}
                     on_resize={handle_row_resize_drag}
+                    on_resize_end={handle_row_resize_end}
                 />
             )}
             {context_menu?.kind === 'cell' && (

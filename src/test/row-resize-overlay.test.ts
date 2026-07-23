@@ -22,18 +22,22 @@ afterEach(() => {
 });
 
 function render_overlay() {
+    const on_resize_start = vi.fn();
     const on_resize = vi.fn();
+    const on_resize_end = vi.fn();
     const ref = React.createRef<RowResizeOverlayHandle>();
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
     act(() => root!.render(React.createElement(RowResizeOverlay, {
         ref,
+        on_resize_start,
         on_resize,
+        on_resize_end,
     })));
     // Arm a target so the grab strip renders.
     act(() => ref.current!.set_target({ row: 2, boundary_y: 100, height: 24 }));
-    return { on_resize };
+    return { ref, on_resize_start, on_resize, on_resize_end };
 }
 
 function strip(): HTMLElement {
@@ -61,14 +65,74 @@ describe('RowResizeOverlay right-click handling', () => {
     });
 
     it('still resizes on a primary-button drag', () => {
-        const { on_resize } = render_overlay();
+        const { on_resize_start, on_resize, on_resize_end } = render_overlay();
         act(() => strip().dispatchEvent(new MouseEvent('mousedown', {
             bubbles: true, button: 0, clientY: 100,
         })));
         act(() => document.dispatchEvent(new MouseEvent('mousemove', {
-            bubbles: true, clientY: 130,
+            bubbles: true, buttons: 1, clientY: 130,
         })));
         expect(on_resize).toHaveBeenCalled();
         expect(on_resize.mock.calls[0][0]).toBe(2);
+        expect(on_resize_start).toHaveBeenCalledWith(2, 24);
+        act(() => document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })));
+        expect(on_resize_end).toHaveBeenCalledWith(2, 54);
+    });
+
+    it('does not emit duplicate live updates for unchanged heights', () => {
+        const { on_resize, on_resize_end } = render_overlay();
+        act(() => strip().dispatchEvent(new MouseEvent('mousedown', {
+            bubbles: true, button: 0, clientY: 100,
+        })));
+        act(() => document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, buttons: 1, clientY: 130,
+        })));
+        act(() => document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, buttons: 1, clientY: 130,
+        })));
+        expect(on_resize).toHaveBeenCalledOnce();
+        act(() => document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })));
+        expect(on_resize_end).toHaveBeenCalledWith(2, 54);
+    });
+
+    it('finishes the drag when the window loses focus', () => {
+        const { on_resize_end } = render_overlay();
+        act(() => strip().dispatchEvent(new MouseEvent('mousedown', {
+            bubbles: true, button: 0, clientY: 100,
+        })));
+        act(() => document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, buttons: 1, clientY: 120,
+        })));
+        act(() => window.dispatchEvent(new Event('blur')));
+        expect(on_resize_end).toHaveBeenCalledOnce();
+        expect(on_resize_end).toHaveBeenCalledWith(2, 44);
+        act(() => document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })));
+        expect(on_resize_end).toHaveBeenCalledOnce();
+    });
+
+    it('uses updated callbacks without interrupting an active drag', () => {
+        const first = render_overlay();
+        act(() => strip().dispatchEvent(new MouseEvent('mousedown', {
+            bubbles: true, button: 0, clientY: 100,
+        })));
+        act(() => document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, buttons: 1, clientY: 110,
+        })));
+
+        const next_resize = vi.fn();
+        const next_end = vi.fn();
+        act(() => root!.render(React.createElement(RowResizeOverlay, {
+            ref: first.ref,
+            on_resize: next_resize,
+            on_resize_end: next_end,
+        })));
+        expect(first.on_resize_end).not.toHaveBeenCalled();
+        act(() => document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, buttons: 1, clientY: 120,
+        })));
+        expect(next_resize).toHaveBeenCalledWith(2, 44);
+        act(() => document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })));
+        expect(next_end).toHaveBeenCalledWith(2, 44);
+        expect(first.on_resize_end).not.toHaveBeenCalled();
     });
 });
