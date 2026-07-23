@@ -105,7 +105,7 @@ export function sanitize_transform_state(
         }
         if (unique) {
             hidden_rows.length = 0;
-            hidden_rows.push(...unique);
+            for (const row of unique) hidden_rows.push(row);
             hidden_rows.sort((a, b) => a - b);
         }
     }
