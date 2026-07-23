@@ -24,8 +24,6 @@ export interface ToolbarFocusHandle {
 }
 
 export interface ToolbarProps {
-    row_count: number;
-    source_row_count: number;
     transform: SheetTransformState;
     transform_disabled: boolean;
     transform_pending: boolean;
@@ -70,8 +68,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
 ): React.JSX.Element {
     const {
         transform,
-        row_count,
-        source_row_count,
         column_names,
         on_transform_change,
         on_edit_filter,
@@ -91,10 +87,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
-    // The row count is only informative when the table view hides rows; in the
-    // natural view it is persistent chrome, so suppress it.
-    const is_filtered = row_count !== source_row_count;
-    const row_count_text = `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
     const wrapped = use_toolbar_wrap(
         { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
         [
@@ -102,7 +94,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             transform.filters,
             props.hidden_rows?.count,
             props.hidden_rows?.pending,
-            row_count_text,
             props.transform_pending,
             props.transform_progress,
             props.merges_flattened,
@@ -128,9 +119,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             tabIndex={-1}
             aria-label="Table controls"
         >
-            {is_filtered && (
-                <span ref={lead_ref} className="toolbar-row-count">{row_count_text}</span>
-            )}
             <span className="sr-only" role="status" aria-live="polite">
                 {props.excel_header_status ?? ''}
             </span>

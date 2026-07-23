@@ -54,6 +54,7 @@ import {
     type HeaderDragState,
 } from './column-selection-model';
 import { row_context_menu_items } from './row-context-menu';
+import { use_row_marker_selection } from './use-row-marker-selection';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
     append_sort,
@@ -102,7 +103,6 @@ import {
 import { expand_glide_selection } from './selection-glide';
 import {
     grid_selection_contains_cell,
-    grid_selection_contains_row,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
     selected_display_row_intervals,
@@ -619,6 +619,20 @@ export function GridShell({
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
+    const open_row_marker_menu = useCallback((request: {
+        x: number;
+        y: number;
+        row: number;
+        display_rows: DisplayRowInterval[];
+    }) => {
+        set_context_menu({ kind: 'row', ...request });
+    }, []);
+    const row_markers = use_row_marker_selection({
+        row_count,
+        selection_ref: grid_selection_ref,
+        set_selection: set_grid_selection,
+        on_open_menu: open_row_marker_menu,
+    });
     const current_highlight_selection = useCallback(() => (
         highlight_selection_from_grid(
             grid_selection_ref.current,
@@ -1145,6 +1159,7 @@ export function GridShell({
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
+            row_markers.observe_hover(args);
             // Header drag-select: while the primary button that started on a
             // header stays down, sweep the hovered column into the selection.
             // (Glide suppresses hover events during a column resize drag, so
@@ -1173,6 +1188,11 @@ export function GridShell({
                     return;
                 }
             }
+            if (row_markers.handle_hover_drag(args)) {
+                // Sweeping rows; don't arm the row-resize strip mid-drag.
+                row_resize_ref.current?.set_target(null);
+                return;
+            }
             if (transformed) {
                 row_resize_ref.current?.set_target(null);
                 return;
@@ -1199,7 +1219,7 @@ export function GridShell({
                     : null,
             );
         },
-        [display_column_count, row_heights, transformed],
+        [display_column_count, row_heights, row_markers, transformed],
     );
 
     // Live drag: persist the new height (mirrors column resize) and nudge Glide +
@@ -1246,6 +1266,7 @@ export function GridShell({
 
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
+            if (row_markers.intercept_selection_change(sel)) return;
             if (!sel.current) {
                 header_drag_ref.current = sel.columns.length > 0
                     ? header_drag_state_for_selection(
@@ -1269,7 +1290,7 @@ export function GridShell({
                 current: { cell, range, rangeStack: sel.current.rangeStack },
             });
         },
-        [merges, source_column_for_display],
+        [merges, row_markers, source_column_for_display],
     );
 
     // --- Context menu: copy + select actions over the paged cache -------------
@@ -1568,24 +1589,7 @@ export function GridShell({
             event.preventDefault();
             const [col, row] = cell;
             if (col < 0) {
-                const inside = grid_selection_contains_row(grid_selection_ref.current, row);
-                const display_rows = inside
-                    ? selected_display_row_intervals(grid_selection_ref.current, row_count)
-                        ?? [{ start: row, end: row }]
-                    : [{ start: row, end: row }];
-                if (!inside) {
-                    set_grid_selection({
-                        columns: CompactSelection.empty(),
-                        rows: CompactSelection.fromSingleSelection(row),
-                    });
-                }
-                set_context_menu({
-                    kind: 'row',
-                    x: event.bounds.x + event.localEventX,
-                    y: event.bounds.y + event.localEventY,
-                    row,
-                    display_rows,
-                });
+                row_markers.on_context_menu(row, event);
                 return;
             }
             const { cell: anchor, range: anchor_range } = expand_glide_selection(
@@ -1617,7 +1621,7 @@ export function GridShell({
                 source_col: source_column,
             });
         },
-        [merges, row_count, select_rect, source_column_for_display],
+        [merges, row_markers, select_rect, source_column_for_display],
     );
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
@@ -2000,7 +2004,11 @@ export function GridShell({
     }
 
     return (
-        <div ref={grid_root_ref} className="grid-shell-root">
+        <div
+            ref={grid_root_ref}
+            className="grid-shell-root"
+            onPointerDownCapture={row_markers.on_pointer_down_capture}
+        >
             <DataEditor
                 ref={grid_ref}
                 className="glide-grid"
@@ -2010,7 +2018,7 @@ export function GridShell({
                 columns={columns}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
-                rowMarkers="number"
+                rowMarkers="clickable-number"
                 theme={theme}
                 smoothScrollX
                 smoothScrollY
@@ -2024,6 +2032,7 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
+                onCellClicked={row_markers.on_cell_clicked}
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}

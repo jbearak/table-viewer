@@ -2042,8 +2042,6 @@ export function App(): React.JSX.Element {
         <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
                 ref={toolbar_focus_ref}
-                row_count={effective_row_count}
-                source_row_count={current_sheet.rowCount}
                 transform={visible_transform}
                 transform_disabled={
                     edit_mode

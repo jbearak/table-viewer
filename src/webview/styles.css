@@ -681,16 +681,6 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 }
 
 /* Raven-style integrated table controls. */
-.toolbar-row-count {
-    flex: 0 1 auto;
-    min-width: 72px;
-    overflow: hidden;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-}
-
 .toolbar-chips {
     display: flex;
     align-items: center;
