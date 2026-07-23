@@ -18,7 +18,13 @@ export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
 export const CELL_TOOLTIP_LINE_HEIGHT_PX = 16;
 
 /** Hover dwell before the truncated-cell tooltip appears (ms). */
-export const CELL_TOOLTIP_SHOW_DELAY_MS = 350;
+export const CELL_TOOLTIP_SHOW_DELAY_MS = 120;
+
+/**
+ * Grace period after the pointer leaves the cell before the tooltip hides.
+ * Long enough to move onto the tooltip itself without it disappearing.
+ */
+export const CELL_TOOLTIP_HIDE_DELAY_MS = 200;
 
 /** Max characters retained in a tooltip body (guards pathological cells). */
 export const CELL_TOOLTIP_MAX_CHARS = 4000;

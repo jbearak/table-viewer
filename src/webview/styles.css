@@ -372,7 +372,9 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     pointer-events: none;
 }
 
-/* Truncated-cell hover: full displayed value when the canvas cell clips it. */
+/* Truncated-cell hover: full displayed value when the canvas cell clips it.
+ * Pointer events are enabled so the user can move onto long/scrollable content;
+ * a transparent hit-extension above the box bridges the gap from the cell. */
 .cell-overflow-tooltip {
     position: fixed;
     z-index: 25;
@@ -392,7 +394,16 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     text-align: left;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
-    pointer-events: none;
+    pointer-events: auto;
+}
+
+.cell-overflow-tooltip::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -10px;
+    height: 10px;
 }
 
 .toolbar-tooltip::before {
