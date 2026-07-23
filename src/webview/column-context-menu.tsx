@@ -112,6 +112,57 @@ export function column_context_menu_items(
     return items;
 }
 
+export interface MultiColumnContextMenuProps {
+    x: number;
+    y: number;
+    column_count: number;
+    transform_sections: boolean;
+    transform_disabled: boolean;
+    on_copy: () => void;
+    on_hide: () => void;
+    on_sort: (direction: SortDirection) => void;
+    on_dismiss: () => void;
+    restore_focus: () => void;
+}
+
+export function multi_column_context_menu_items(
+    props: Omit<MultiColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
+): (ActionMenuItem | MenuSeparator)[] {
+    const count = Math.max(2, props.column_count);
+    const items: (ActionMenuItem | MenuSeparator)[] = [
+        { label: `Copy ${count} columns`, on_click: () => props.on_copy() },
+        { label: `Hide ${count} columns`, on_click: () => props.on_hide() },
+    ];
+    if (!props.transform_sections) return items;
+    items.push(
+        { kind: 'separator' },
+        {
+            label: 'Sort ascending',
+            disabled: props.transform_disabled,
+            on_click: () => props.on_sort('asc'),
+        },
+        {
+            label: 'Sort descending',
+            disabled: props.transform_disabled,
+            on_click: () => props.on_sort('desc'),
+        },
+    );
+    return items;
+}
+
+export function MultiColumnContextMenu(props: MultiColumnContextMenuProps): React.JSX.Element {
+    return (
+        <ContextMenu
+            x={props.x}
+            y={props.y}
+            aria_label={`Column actions for ${Math.max(2, props.column_count)} selected columns`}
+            items={multi_column_context_menu_items(props)}
+            on_dismiss={props.on_dismiss}
+            restore_focus={props.restore_focus}
+        />
+    );
+}
+
 export function ColumnContextMenu(props: ColumnContextMenuProps): React.JSX.Element {
     return (
         <ContextMenu

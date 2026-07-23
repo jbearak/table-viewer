@@ -3,6 +3,7 @@ import { transform_schema_for_sheet } from '../types';
 import {
     create_column_projection,
     hide_all_columns,
+    hide_source_columns,
     sanitize_column_visibility_state,
     show_all_columns,
     toggle_source_column,
@@ -139,6 +140,29 @@ describe('compact visibility state', () => {
 
         expect(hidden_path).toEqual({ hiddenColumns: [2, 3], schema: SCHEMA });
         expect(visible_path).toEqual(hidden_path);
+    });
+
+    it('hides a batch of source columns in one update', () => {
+        const state = hide_source_columns(undefined, [1, 3], 5, SCHEMA);
+        expect(state).toEqual({ hiddenColumns: [1, 3], schema: SCHEMA });
+        const projection = create_column_projection(5, state, SCHEMA);
+        expect(projection.visible_to_source).toEqual([0, 2, 4]);
+    });
+
+    it('batch hide unions with existing hidden columns and ignores bad indexes', () => {
+        const existing = toggle_source_column(undefined, 0, 5, SCHEMA);
+        const state = hide_source_columns(existing, [2, 2, -1, 99, 4.5], 5, SCHEMA);
+        expect(state).toEqual({ hiddenColumns: [0, 2], schema: SCHEMA });
+    });
+
+    it('batch hide flips to the visible-side representation past 50/50', () => {
+        const state = hide_source_columns(undefined, [0, 1, 2], 5, SCHEMA);
+        expect(state).toEqual({ visibleColumns: [3, 4], schema: SCHEMA });
+    });
+
+    it('batch hide of every column yields an empty visible list', () => {
+        const state = hide_source_columns(undefined, [0, 1, 2, 3, 4], 5, SCHEMA);
+        expect(state).toEqual({ visibleColumns: [], schema: SCHEMA });
     });
 
     it('keeps hide-all sparse for a very wide schema', () => {

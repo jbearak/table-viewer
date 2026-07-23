@@ -116,6 +116,35 @@ export function toggle_source_column(
     return canonical_visibility_from_hidden(hidden, column_count, schema ?? state?.schema);
 }
 
+/** Hide every listed source column in one visibility update. */
+export function hide_source_columns(
+    value: unknown,
+    source_columns: readonly number[],
+    column_count: number,
+    schema?: string,
+): SheetColumnVisibilityState | undefined {
+    const state = sanitize_column_visibility_state(value, column_count, schema);
+    const to_hide = source_columns.filter((source_column) => (
+        Number.isInteger(source_column)
+        && source_column >= 0
+        && source_column < column_count
+    ));
+    if (to_hide.length === 0) return state;
+
+    if (state?.visibleColumns) {
+        const visible = new Set(state.visibleColumns);
+        for (const source_column of to_hide) visible.delete(source_column);
+        return canonical_visibility_from_visible(
+            visible,
+            column_count,
+            schema ?? state.schema,
+        );
+    }
+    const hidden = new Set(state?.hiddenColumns ?? []);
+    for (const source_column of to_hide) hidden.add(source_column);
+    return canonical_visibility_from_hidden(hidden, column_count, schema ?? state?.schema);
+}
+
 export function show_all_columns(): undefined {
     return undefined;
 }

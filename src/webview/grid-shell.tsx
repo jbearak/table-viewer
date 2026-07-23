@@ -44,7 +44,14 @@ import type { ColumnProjection } from './column-projection';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu } from './context-menu';
 import { cell_context_menu_items } from './cell-context-menu';
-import { ColumnContextMenu } from './column-context-menu';
+import { ColumnContextMenu, MultiColumnContextMenu } from './column-context-menu';
+import {
+    grid_selection_contains_column,
+    header_drag_columns,
+    header_drag_state_for_selection,
+    selected_source_columns,
+    type HeaderDragState,
+} from './column-selection-model';
 import { row_context_menu_items } from './row-context-menu';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
@@ -242,6 +249,7 @@ export interface GridShellProps {
         restore_focus: () => void,
     ) => void;
     on_hide_column?: (source_column: number) => void;
+    on_hide_columns?: (source_columns: number[]) => void;
     on_hide_rows?: (display_rows: DisplayRowInterval[]) => void;
     /** Focus recovery target when hiding the final visible header removes Glide. */
     on_focus_columns?: () => void;
@@ -296,6 +304,7 @@ export function GridShell({
     on_transform_change = () => {},
     on_open_filter = () => {},
     on_hide_column = () => {},
+    on_hide_columns = () => {},
     on_hide_rows = () => {},
     on_focus_columns = () => {},
     cell_highlights,
@@ -375,6 +384,14 @@ export function GridShell({
         y: number;
         display_col: number;
         source_col: number;
+    } | {
+        kind: 'multi-column';
+        x: number;
+        y: number;
+        /** Selected display columns (ascending) snapshotted at menu-open time. */
+        display_cols: number[];
+        /** Matching canonical source columns, in display order. */
+        source_cols: number[];
     } | {
         kind: 'row';
         x: number;
@@ -1127,6 +1144,34 @@ export function GridShell({
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
+            // Header drag-select: while the primary button that started on a
+            // header stays down, sweep the hovered column into the selection.
+            // (Glide suppresses hover events during a column resize drag, so
+            // this never fires while resizing.)
+            const drag = header_drag_ref.current;
+            if (drag) {
+                if ((args.buttons & 1) === 0) {
+                    header_drag_ref.current = null;
+                } else if (
+                    (args.kind === 'header' || args.kind === 'cell')
+                    && args.location[0] >= 0
+                ) {
+                    const columns = header_drag_columns(
+                        drag,
+                        args.location[0],
+                        display_column_count,
+                    );
+                    if (!columns.equals(grid_selection_ref.current.columns)) {
+                        set_grid_selection({
+                            columns,
+                            rows: CompactSelection.empty(),
+                        });
+                    }
+                    // Sweeping columns; don't arm the row-resize strip mid-drag.
+                    row_resize_ref.current?.set_target(null);
+                    return;
+                }
+            }
             if (transformed) {
                 row_resize_ref.current?.set_target(null);
                 return;
@@ -1153,7 +1198,7 @@ export function GridShell({
                     : null,
             );
         },
-        [row_heights, transformed],
+        [display_column_count, row_heights, transformed],
     );
 
     // Live drag: persist the new height (mirrors column resize) and nudge Glide +
@@ -1171,12 +1216,46 @@ export function GridShell({
         [on_row_resize, display_column_count],
     );
 
+    // Armed by a header mousedown (Glide selects the column and reports it via
+    // onGridSelectionChange before any drag movement); consumed by hover events
+    // while the primary button stays down to grow the column selection.
+    const header_drag_ref = useRef<HeaderDragState | null>(null);
+
+    // A release outside the grid produces no zero-button grid hover, so without
+    // this a later press elsewhere could resume a long-finished header drag.
+    useEffect(() => {
+        // Deferred one macrotask: on touch, pointerup precedes Glide's touchend
+        // header selection, which would re-arm the ref right after a synchronous
+        // clear. Deferring runs the clear after every completion handler.
+        let timer: number | undefined;
+        const end_header_drag = () => {
+            window.clearTimeout(timer);
+            timer = window.setTimeout(() => {
+                header_drag_ref.current = null;
+            }, 0);
+        };
+        window.addEventListener('pointerup', end_header_drag);
+        window.addEventListener('blur', end_header_drag);
+        return () => {
+            window.clearTimeout(timer);
+            window.removeEventListener('pointerup', end_header_drag);
+            window.removeEventListener('blur', end_header_drag);
+        };
+    }, []);
+
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
             if (!sel.current) {
+                header_drag_ref.current = sel.columns.length > 0
+                    ? header_drag_state_for_selection(
+                        grid_selection_ref.current.columns,
+                        sel.columns,
+                    )
+                    : null;
                 set_grid_selection(sel);
                 return;
             }
+            header_drag_ref.current = null;
             const { cell, range } = expand_glide_selection(
                 sel.current.cell,
                 sel.current.range,
@@ -1393,6 +1472,37 @@ export function GridShell({
         transform_state,
     ]);
 
+    const hide_source_columns_multi = useCallback((source_columns: number[]) => {
+        if (source_columns.length >= display_column_count) {
+            // Hiding every visible column removes Glide, so ContextMenu's normal
+            // grid restoration has no target (mirrors hide_source_column).
+            suppress_menu_restore_ref.current = true;
+            on_hide_columns(source_columns);
+            window.setTimeout(on_focus_columns, 0);
+            return;
+        }
+        on_hide_columns(source_columns);
+    }, [display_column_count, on_focus_columns, on_hide_columns]);
+
+    // Multi-column sort: replace the entire sort with one key per selected
+    // column, in display order, all in the same direction.
+    const apply_multi_column_sort = useCallback((
+        source_columns: number[],
+        direction: SortDirection,
+    ) => {
+        if (!transform_sections || transform_pending) return;
+        if (source_columns.length === 0) return;
+        on_transform_change({
+            ...transform_state,
+            sort: source_columns.map((colIndex) => ({ colIndex, direction })),
+        });
+    }, [
+        on_transform_change,
+        transform_pending,
+        transform_sections,
+        transform_state,
+    ]);
+
     const focus_header_column = useCallback((display_column: number) => {
         const source_column = source_column_for_display(display_column);
         if (source_column !== undefined) focused_source_column_ref.current = source_column;
@@ -1413,14 +1523,37 @@ export function GridShell({
         event: HeaderClickedEventArgs,
     ) => {
         event.preventDefault();
+        header_drag_ref.current = null;
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
-        select_header_column(display_column);
         suppress_menu_restore_ref.current = false;
+        const x = event.bounds.x + event.localEventX;
+        const y = event.bounds.y + event.localEventY;
+        // Right-clicking inside a multi-column selection keeps it and opens the
+        // range menu (mirrors the row-marker menu); outside, collapse to the
+        // clicked column as before.
+        if (grid_selection_contains_column(grid_selection_ref.current, display_column)) {
+            const { display_cols, source_cols } = selected_source_columns(
+                grid_selection_ref.current,
+                source_column_for_display,
+            );
+            if (source_cols.length > 1) {
+                focused_source_column_ref.current = source_column;
+                set_context_menu({
+                    kind: 'multi-column',
+                    x,
+                    y,
+                    display_cols,
+                    source_cols,
+                });
+                return;
+            }
+        }
+        select_header_column(display_column);
         set_context_menu({
             kind: 'header',
-            x: event.bounds.x + event.localEventX,
-            y: event.bounds.y + event.localEventY,
+            x,
+            y,
             display_col: display_column,
             source_col: source_column,
         });
@@ -1929,6 +2062,29 @@ export function GridShell({
                     />
                 );
             })()}
+            {context_menu?.kind === 'multi-column' && (
+                <MultiColumnContextMenu
+                    x={context_menu.x}
+                    y={context_menu.y}
+                    column_count={context_menu.source_cols.length}
+                    transform_sections={transform_sections}
+                    transform_disabled={transform_pending}
+                    on_copy={() => copy_source_selection({
+                        y: 0,
+                        height: row_count,
+                        source_columns: context_menu.source_cols,
+                    }, true)}
+                    on_hide={() => hide_source_columns_multi(context_menu.source_cols)}
+                    on_sort={(direction) =>
+                        apply_multi_column_sort(context_menu.source_cols, direction)}
+                    on_dismiss={dismiss_context_menu}
+                    restore_focus={() => {
+                        if (!suppress_menu_restore_ref.current) {
+                            grid_ref.current?.focus();
+                        }
+                    }}
+                />
+            )}
             {context_menu?.kind === 'header' && (() => {
                 const source_column = context_menu.source_col;
                 const active_sort = transform_state.sort.find((key) =>
