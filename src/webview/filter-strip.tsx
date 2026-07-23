@@ -68,6 +68,11 @@ function FilterChip({
     const [coords, set_coords] = useState<{ x: number; y: number } | null>(null);
     const summary = filter_summary(entry, column_names);
     const close = () => set_coords(null);
+    const open_menu = (x: number, y: number) => {
+        if (disabled) return;
+        suppress_restore_ref.current = false;
+        set_coords({ x, y });
+    };
     const edit = (trigger: HTMLElement | null, from_menu = false) => {
         if (disabled) return;
         if (from_menu) suppress_restore_ref.current = true;
@@ -95,7 +100,15 @@ function FilterChip({
     ];
     return (
         <>
-            <div className={entry.enabled ? 'filter-chip' : 'filter-chip disabled'}>
+            <div
+                className={entry.enabled ? 'filter-chip' : 'filter-chip disabled'}
+                onContextMenu={(event) => {
+                    // Right-click opens the same actions menu as the kebab, and
+                    // always suppresses the OS cut/copy/paste menu.
+                    event.preventDefault();
+                    open_menu(event.clientX, event.clientY);
+                }}
+            >
                 <span className="filter-chip-toggle" aria-hidden="true">
                     {entry.enabled ? '✓' : '✗'}
                 </span>
@@ -120,9 +133,8 @@ function FilterChip({
                     onClick={() => {
                         if (disabled) return;
                         if (coords) return close();
-                        suppress_restore_ref.current = false;
                         const rect = menu_ref.current?.getBoundingClientRect();
-                        if (rect) set_coords({ x: rect.left, y: rect.bottom + 4 });
+                        if (rect) open_menu(rect.left, rect.bottom + 4);
                     }}
                 >
                     ⋯

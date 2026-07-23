@@ -187,6 +187,13 @@ export interface GridFocusHandle {
     focus(): boolean;
 }
 
+export interface GridActionsHandle {
+    /** Sheet this handle's grid is mounted for; guards stale-remount races. */
+    sheet_index: number;
+    select_all(): void;
+    copy_sheet(): void;
+}
+
 export interface PendingPreviewScroll {
     row: number;
     sequence: number;
@@ -234,6 +241,8 @@ export interface GridShellProps {
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
     /** App-owned bridge for restoring focus after generation-keyed remounts. */
     grid_focus_ref?: MutableRefObject<GridFocusHandle | null>;
+    /** App-owned bridge for sheet-tab actions (select all / copy sheet). */
+    grid_actions_ref?: MutableRefObject<GridActionsHandle | null>;
     /** Latest preview scroll request, retained by App across GridShell remounts. */
     pending_preview_scroll?: PendingPreviewScroll | null;
     /** Clears the App-owned request only after Glide accepts the scroll. */
@@ -296,6 +305,7 @@ export function GridShell({
     editing_ref,
     auto_fit_ref,
     grid_focus_ref,
+    grid_actions_ref,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
     on_preview_visible_row_change = () => {},
@@ -1264,9 +1274,58 @@ export function GridShell({
         };
     }, []);
 
+    const select_rect = useCallback((anchor: Item, range: Rectangle) => {
+        focused_source_column_ref.current = source_column_for_display(anchor[0]);
+        set_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell: anchor, range, rangeStack: [] },
+        });
+    }, [source_column_for_display]);
+
+    const select_row = useCallback(
+        (row: number) => {
+            if (display_column_count === 0) return;
+            select_rect([0, row], {
+                x: 0,
+                y: row,
+                width: display_column_count,
+                height: 1,
+            });
+        },
+        [display_column_count, select_rect],
+    );
+
+    const select_column = useCallback(
+        (col: number) => {
+            if (row_count === 0) return;
+            select_rect([col, 0], {
+                x: col,
+                y: 0,
+                width: 1,
+                height: row_count,
+            });
+        },
+        [row_count, select_rect],
+    );
+
+    const select_all = useCallback(() => {
+        if (row_count === 0 || display_column_count === 0) return;
+        select_rect([0, 0], {
+            x: 0,
+            y: 0,
+            width: display_column_count,
+            height: row_count,
+        });
+    }, [row_count, display_column_count, select_rect]);
+
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
-            if (row_markers.intercept_selection_change(sel)) return;
+            if (row_markers.intercept_selection_change(
+                sel,
+                display_column_count,
+                select_all,
+            )) return;
             if (!sel.current) {
                 header_drag_ref.current = sel.columns.length > 0
                     ? header_drag_state_for_selection(
@@ -1290,7 +1349,7 @@ export function GridShell({
                 current: { cell, range, rangeStack: sel.current.rangeStack },
             });
         },
-        [merges, row_markers, source_column_for_display],
+        [display_column_count, merges, row_markers, select_all, source_column_for_display],
     );
 
     // --- Context menu: copy + select actions over the paged cache -------------
@@ -1395,50 +1454,31 @@ export function GridShell({
         });
     }, [copy_source_selection, visible_source_columns]);
 
-    const select_rect = useCallback((anchor: Item, range: Rectangle) => {
-        focused_source_column_ref.current = source_column_for_display(anchor[0]);
-        set_grid_selection({
-            columns: CompactSelection.empty(),
-            rows: CompactSelection.empty(),
-            current: { cell: anchor, range, rangeStack: [] },
-        });
-    }, [source_column_for_display]);
-
-    const select_row = useCallback(
-        (row: number) => {
-            if (display_column_count === 0) return;
-            select_rect([0, row], {
-                x: 0,
-                y: row,
-                width: display_column_count,
-                height: 1,
-            });
-        },
-        [display_column_count, select_rect],
-    );
-
-    const select_column = useCallback(
-        (col: number) => {
-            if (row_count === 0) return;
-            select_rect([col, 0], {
-                x: col,
-                y: 0,
-                width: 1,
-                height: row_count,
-            });
-        },
-        [row_count, select_rect],
-    );
-
-    const select_all = useCallback(() => {
-        if (row_count === 0 || display_column_count === 0) return;
-        select_rect([0, 0], {
+    // Whole visible sheet with a header row (delegates to copy_rect, so the same
+    // clipboard-failure and truncation handling applies).
+    const copy_sheet = useCallback(() => {
+        copy_rect({
             x: 0,
             y: 0,
             width: display_column_count,
             height: row_count,
-        });
-    }, [row_count, display_column_count, select_rect]);
+        }, true);
+    }, [copy_rect, display_column_count, row_count]);
+
+    // Publish sheet-tab actions to App, mirroring the grid_focus_ref bridge. The
+    // sheet_index lets App reject a stale handle during a keyed remount.
+    useEffect(() => {
+        if (!grid_actions_ref) return;
+        const handle: GridActionsHandle = {
+            sheet_index,
+            select_all,
+            copy_sheet,
+        };
+        grid_actions_ref.current = handle;
+        return () => {
+            if (grid_actions_ref.current === handle) grid_actions_ref.current = null;
+        };
+    }, [copy_sheet, grid_actions_ref, select_all, sheet_index]);
 
     const hide_source_column = useCallback((source_column: number) => {
         if (display_column_count === 1) {

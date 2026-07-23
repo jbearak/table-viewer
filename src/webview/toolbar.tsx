@@ -118,6 +118,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             role="toolbar"
             tabIndex={-1}
             aria-label="Table controls"
+            onContextMenu={(event) => event.preventDefault()}
         >
             <span className="sr-only" role="status" aria-live="polite">
                 {props.excel_header_status ?? ''}

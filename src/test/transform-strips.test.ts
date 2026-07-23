@@ -95,6 +95,54 @@ describe('Raven transform strips', () => {
         expect(on_change.mock.calls.at(-1)?.[0].filters).toEqual([]);
     });
 
+    it('right-clicking a filter chip opens the kebab menu at the pointer', () => {
+        const on_change = vi.fn();
+        const entry = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'x', caseSensitive: false, enabled: true,
+        };
+        mount(React.createElement(FilterStrip, {
+            state: { sort: [], filters: [entry] },
+            column_names: ['A'],
+            disabled: false,
+            on_change,
+            on_edit: vi.fn(),
+        }));
+        const chip = document.querySelector('.filter-chip') as HTMLElement;
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true, cancelable: true, clientX: 111, clientY: 222,
+        });
+        act(() => chip.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        const menu = document.querySelector('[role="menu"]') as HTMLElement;
+        expect(menu).not.toBeNull();
+        expect(menu.style.left).toBe('111px');
+        expect(menu.style.top).toBe('222px');
+        expect(Array.from(menu.querySelectorAll('[role="menuitem"]'), (item) => item.textContent))
+            .toEqual(['Edit', 'Disable', 'Remove']);
+    });
+
+    it('suppresses the native menu but opens nothing for a disabled chip', () => {
+        const entry = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'x', caseSensitive: false, enabled: true,
+        };
+        mount(React.createElement(FilterStrip, {
+            state: { sort: [], filters: [entry] },
+            column_names: ['A'],
+            disabled: true,
+            on_change: vi.fn(),
+            on_edit: vi.fn(),
+        }));
+        const chip = document.querySelector('.filter-chip') as HTMLElement;
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true, cancelable: true, clientX: 5, clientY: 6,
+        });
+        act(() => chip.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
     it('keeps focus in an editor opened from the filter kebab menu', async () => {
         const editor_control = document.createElement('input');
         document.body.appendChild(editor_control);

@@ -17,6 +17,7 @@ const make_compact = vi.hoisted(() => {
         toArray: () => number[];
         hasIndex: (index: number) => boolean;
         first: () => number | undefined;
+        last: () => number | undefined;
         add: (value: number | readonly [number, number]) => Compact;
         remove: (value: number) => Compact;
         equals: (other: { toArray?: () => number[] }) => boolean;
@@ -29,6 +30,7 @@ const make_compact = vi.hoisted(() => {
             toArray: () => [...sorted],
             hasIndex: (index: number) => sorted.includes(index),
             first: () => sorted[0],
+            last: () => sorted[sorted.length - 1],
             add: (value: number | readonly [number, number]) => {
                 const added = typeof value === 'number'
                     ? [value]
@@ -1536,6 +1538,73 @@ describe('GridShell column projection', () => {
             displayRows: [{ start: 0, end: 0 }],
             sourceColumns: [0, 2],
         }, { type: 'clear' });
+    });
+
+    it('redirects the corner marker toggle to a full-grid select-all and back', async () => {
+        await render_grid(props({
+            row_count: 2,
+            sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        // Glide's native corner toggle proposes a bare all-rows selection.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1]),
+        }));
+        const after_select = grid_mock.props!.gridSelection as {
+            current?: { range: unknown };
+            rows: { length: number };
+        };
+        expect(after_select.current?.range).toEqual({ x: 0, y: 0, width: 2, height: 2 });
+        expect(after_select.rows.length).toBe(0);
+
+        // A second corner click, with the full rectangle already held, clears.
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([0, 1]),
+        }));
+        const after_clear = grid_mock.props!.gridSelection as {
+            current?: unknown;
+            rows: { length: number };
+        };
+        expect(after_clear.current).toBeUndefined();
+        expect(after_clear.rows.length).toBe(0);
+    });
+
+    it('publishes grid actions that select all and copy the whole sheet', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        const grid_actions_ref = React.createRef<
+            import('../webview/grid-shell').GridActionsHandle | null
+        >() as React.MutableRefObject<
+            import('../webview/grid-shell').GridActionsHandle | null
+        >;
+        const GridShell = await render_grid(props({
+            row_count: 2,
+            sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
+            grid_actions_ref,
+        }));
+        expect(grid_actions_ref.current?.sheet_index).toBe(0);
+
+        await act(async () => grid_actions_ref.current!.select_all());
+        const selection = grid_mock.props!.gridSelection as { current?: { range: unknown } };
+        expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 2, height: 2 });
+
+        await act(async () => { grid_actions_ref.current!.copy_sheet(); });
+        // Header row followed by both source rows across the two visible columns.
+        expect(write_text).toHaveBeenCalledWith(
+            'A name\tC name\nsource-a\tsource-c\nsource-a\tsource-c',
+        );
+
+        await act(async () => root!.unmount());
+        expect(grid_actions_ref.current).toBeNull();
+        // Guard the shared afterEach unmount against a second call.
+        root = null;
+        void GridShell;
     });
 
     it('renders an unrecoverable message for a genuine zero-column sheet', async () => {

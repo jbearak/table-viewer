@@ -18,6 +18,7 @@ import {
     selected_display_row_intervals,
 } from './highlight-selection-model';
 import {
+    corner_row_toggle_action,
     marker_drag_rows,
     marker_drag_state_for_selection,
     type MarkerDragState,
@@ -34,7 +35,11 @@ export interface RowMarkerSelectionCoordinator {
     on_pointer_down_capture: React.PointerEventHandler<HTMLDivElement>;
     observe_hover(args: GridMouseEventArgs): void;
     handle_hover_drag(args: GridMouseEventArgs): boolean;
-    intercept_selection_change(selection: GridSelection): boolean;
+    intercept_selection_change(
+        selection: GridSelection,
+        column_count: number,
+        select_all: () => void,
+    ): boolean;
     on_cell_clicked(cell: Item, event: CellClickedEventArgs): void;
     on_context_menu(row: number, event: CellClickedEventArgs): void;
 }
@@ -142,7 +147,11 @@ export function use_row_marker_selection({
         return true;
     }, [row_count, selection_ref, set_selection]);
 
-    const intercept_selection_change = useCallback((selection: GridSelection): boolean => {
+    const intercept_selection_change = useCallback((
+        selection: GridSelection,
+        column_count: number,
+        select_all: () => void,
+    ): boolean => {
         const touch_rows = touch_selection_ref.current;
         if (touch_rows && !selection.current) {
             touch_selection_ref.current = null;
@@ -166,6 +175,30 @@ export function use_row_marker_selection({
             drag_ref.current = null;
             return false;
         }
+        // Redirect Glide's upper-left marker-header toggle to the canonical
+        // full-grid select-all (or clear), so the corner matches the cell
+        // context menu's "Select all" instead of a rows-only selection.
+        const corner = corner_row_toggle_action({
+            next: selection,
+            previous: selection_ref.current,
+            row_count,
+            column_count,
+            marker_drag_active: drag_ref.current !== null,
+            hovered_marker_row: hover_row_ref.current,
+        });
+        if (corner) {
+            drag_ref.current = null;
+            reclick_row_ref.current = null;
+            if (corner === 'select_all') {
+                select_all();
+            } else {
+                set_selection({
+                    columns: CompactSelection.empty(),
+                    rows: CompactSelection.empty(),
+                });
+            }
+            return true;
+        }
         // Preserve a sole selected row on plain re-click. Pointer capture has
         // already armed its drag before Glide reports the empty selection.
         if (
@@ -188,7 +221,7 @@ export function use_row_marker_selection({
             ? marker_drag_state_for_selection(previous_rows, selection.rows)
             : null;
         return false;
-    }, [selection_ref, set_selection]);
+    }, [row_count, selection_ref, set_selection]);
 
     const on_cell_clicked = useCallback((cell: Item, event: CellClickedEventArgs) => {
         const [column, row] = cell;
