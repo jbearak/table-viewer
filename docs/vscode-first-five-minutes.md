@@ -92,17 +92,19 @@ This hides built-in Chat and inline AI suggestions and disables the GitHub Copil
 
 Table Viewer uses the same font as VS Code's text editor by default. This keeps tables and source files visually consistent, and means that changing VS Code's editor font changes both.
 
-First install the font on your computer. Two readable, free, open-source choices are:
+You can change the font in both places or give Table Viewer its own font:
 
-- [**Hack**](https://sourcefoundry.org/hack/) is a sturdy monospaced font designed for source code, with distinct character shapes and regular, bold, italic, and bold italic styles.
-- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a newer fixed-width font with a wide range of weights. Its release archive includes the files to install.
-
-After installing a font, choose whether to use it everywhere or only in tables:
-
-- **Change the editor and Table Viewer together:** Open **Settings**, search for `editor font family`, and set **Editor: Font Family** to the installed family name, such as `Hack` or `Google Sans Code`. Because `tableViewer.fontFamily` is empty by default, Table Viewer follows this setting.
-- **Change only Table Viewer:** Open **Settings**, search for `table viewer font family`, and set **Table Viewer: Font Family** to the installed family name. The text editor keeps its existing font.
+- **Change the editor and Table Viewer together:** Open **Settings**, search for `editor font family`, and set **Editor: Font Family**. Because `tableViewer.fontFamily` is empty by default, Table Viewer follows this setting.
+- **Change only Table Viewer:** Open **Settings**, search for `table viewer font family`, and set **Table Viewer: Font Family**. The text editor keeps its existing font.
 
 Clear **Table Viewer: Font Family** at any time to make Table Viewer follow **Editor: Font Family** again. If a newly installed font does not appear immediately, restart VS Code after installing it.
+
+If you would like to try a different font, two readable, free, open-source choices are:
+
+- [**Hack**](https://sourcefoundry.org/hack/) is a monospaced font designed for source code, with distinct character shapes and regular, bold, italic, and bold italic styles.
+- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a newer monospaced font with a wide range of weights.
+
+Install the font on your computer, then enter its family name—such as `Hack` or `Google Sans Code`—in one of the settings above.
 
 ## Match the screenshots' colors, if you like
 

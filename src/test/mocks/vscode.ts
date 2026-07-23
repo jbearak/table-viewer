@@ -158,6 +158,7 @@ export interface MockWatcher {
 const panels: MockWebviewPanel[] = [];
 const watchers: MockWatcher[] = [];
 const configuration_change_handlers: ConfigurationChangeHandler[] = [];
+const configuration_values = new Map<string, unknown>();
 const custom_editor_registrations: {
     viewType: string;
     provider: unknown;
@@ -471,8 +472,15 @@ export const workspace = {
         watchers.push(watcher);
         return watcher;
     },
-    getConfiguration() {
-        return { get: (_key: string, fallback: unknown) => fallback };
+    getConfiguration(section?: string) {
+        return {
+            get: (key: string, fallback: unknown) => {
+                const full_key = section ? `${section}.${key}` : key;
+                return configuration_values.has(full_key)
+                    ? configuration_values.get(full_key)
+                    : fallback;
+            },
+        };
     },
     onDidChangeConfiguration(handler: ConfigurationChangeHandler) {
         configuration_change_handlers.push(handler);
@@ -490,6 +498,7 @@ export function __reset(): void {
     panels.length = 0;
     watchers.length = 0;
     configuration_change_handlers.length = 0;
+    configuration_values.clear();
     custom_editor_registrations.length = 0;
     stat_impl = undefined;
     read_file_impl = undefined;
@@ -514,6 +523,18 @@ export function __setWriteFileImplementation(
     impl: (uri: UriLike, content: Uint8Array) => Promise<void>,
 ): void {
     write_file_impl = impl;
+}
+
+export function __setConfigurationValue(key: string, value: unknown): void {
+    configuration_values.set(key, value);
+}
+
+export async function __fireConfigurationChange(
+    event: Parameters<ConfigurationChangeHandler>[0],
+): Promise<void> {
+    await Promise.all(
+        [...configuration_change_handlers].map((handler) => handler(event)),
+    );
 }
 
 export function __setWatcherRegistrationFailure(

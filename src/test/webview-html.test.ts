@@ -47,7 +47,9 @@ describe('build_webview_html', () => {
         const stylesheet_at = html.indexOf('<link nonce="nonce123" rel="stylesheet"');
         expect(font_at).toBeGreaterThanOrEqual(0);
         expect(font_at).toBeLessThan(stylesheet_at);
-        expect(html).toContain('nonce="nonce123"');
+        expect(html).toContain(
+            '<script nonce="nonce123">document.documentElement.style.setProperty(',
+        );
     });
 
     it('escapes configured font text before embedding it in a script', () => {

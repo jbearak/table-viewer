@@ -2788,6 +2788,12 @@ export function attach_viewer(
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
                 active_save_dialog_request = undefined;
+                // The inbound ready message guarantees the receiver is installed;
+                // replay without delaying the existing ready-state concurrency.
+                void post_to_receiver({
+                    type: 'fontFamilyChanged',
+                    fontFamily: get_font_family(),
+                }, begun.receiverEpoch);
                 let needs_initial_source = false;
                 try {
                     const older_commit_barriers = [...transform_commit_barriers]

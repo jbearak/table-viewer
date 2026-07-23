@@ -15,7 +15,7 @@ Existing solutions were slow, didn't work the way I wanted, or both. I wanted a 
 - **Lets me explore results** — promote headers, sort and filter rows, and hide irrelevant columns — without changing the underlying file
 - **Lets me toggle formatting** so I can see raw values (`3.14159265358979`) or formatted output (`3.14`) with one click
 - **Lives in VS Code** so it works the same whether I'm local or on a remote host via SSH
-- **Uses VS Code's theme and editor font** so it doesn't look out of place
+- **Uses VS Code's theme** so it doesn't look out of place
 - **Shows CSV/TSV files two ways** — as a standalone table, or as a synced side-by-side preview alongside the source text
 
 Table Viewer is the result.
@@ -108,7 +108,7 @@ To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table e
 
 ## Settings
 
-Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `"Atkinson Hyperlegible", sans-serif` if you want tables to use a different font.
+Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace` if you want tables to use a different font.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
