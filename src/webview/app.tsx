@@ -1945,11 +1945,11 @@ export function App(): React.JSX.Element {
     );
 
     const handle_row_resize = useCallback(
-        (row: number, height: number) => {
+        (rows: readonly number[], height: number) => {
             set_row_heights((prev) => {
                 const next = [...prev];
                 const sheet_heights = { ...(next[active_sheet_index] ?? {}) };
-                sheet_heights[row] = height;
+                for (const row of rows) sheet_heights[row] = height;
                 next[active_sheet_index] = sheet_heights;
                 state_ref.current = {
                     ...state_ref.current,

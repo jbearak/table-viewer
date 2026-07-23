@@ -81,7 +81,7 @@ vi.mock('../webview/grid-shell', () => ({
             } | null;
         };
         on_column_resize: (col: number, width: number) => void;
-        on_row_resize: (row: number, height: number) => void;
+        on_row_resize: (rows: readonly number[], height: number) => void;
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
@@ -220,7 +220,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-row-resize',
-                    onClick: () => props.on_row_resize(3, 50),
+                    onClick: () => props.on_row_resize([3, 5, 8], 50),
                 },
                 'row-resize'
             ),
@@ -2423,14 +2423,17 @@ describe('row height persistence', () => {
             (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
         });
 
-        // Grid receives the updated height for row 3.
+        // Grid receives every height from the single batched resize.
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
             3: 50,
+            5: 50,
+            8: 50,
         });
+        expect(post_message).toHaveBeenCalledOnce();
         const last = post_message.mock.calls.at(-1)![0];
         expect(last.type).toBe('stateChanged');
         expect(last.sourceGeneration).toBe(7);
-        expect(last.state.rowHeights[0]).toEqual({ 3: 50 });
+        expect(last.state.rowHeights[0]).toEqual({ 3: 50, 5: 50, 8: 50 });
     });
 
     it('restores saved row heights from initial snapshot state', async () => {

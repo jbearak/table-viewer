@@ -54,6 +54,9 @@ const make_compact = vi.hoisted(() => {
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
+    row_resize_props: null as null | Record<string, unknown>,
+    row_resize_set_target: vi.fn(),
+    overlay_repaint: vi.fn(),
     update_cells: vi.fn(),
     scroll_to: vi.fn(),
     focus: vi.fn(),
@@ -126,14 +129,17 @@ vi.mock('../webview/vscode-theme', () => ({
 
 vi.mock('../webview/merge-overlay', () => ({
     MergeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
-        React.useImperativeHandle(ref, () => ({ repaint: vi.fn() }));
+        React.useImperativeHandle(ref, () => ({ repaint: grid_mock.overlay_repaint }));
         return React.createElement('div', { className: 'merge-overlay-stub' });
     }),
 }));
 
 vi.mock('../webview/row-resize-overlay', () => ({
-    RowResizeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
-        React.useImperativeHandle(ref, () => ({ set_target: vi.fn() }));
+    RowResizeOverlay: React.forwardRef((props: unknown, ref: React.ForwardedRef<unknown>) => {
+        grid_mock.row_resize_props = props as Record<string, unknown>;
+        React.useImperativeHandle(ref, () => ({
+            set_target: grid_mock.row_resize_set_target,
+        }));
         return React.createElement('div', { className: 'row-resize-overlay-stub' });
     }),
 }));
@@ -205,6 +211,9 @@ afterEach(() => {
     container = null;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    grid_mock.row_resize_props = null;
+    grid_mock.row_resize_set_target.mockReset();
+    grid_mock.overlay_repaint.mockReset();
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
     grid_mock.focus.mockReset();
@@ -1736,5 +1745,187 @@ describe('GridShell column projection', () => {
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
         expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 40);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+});
+
+describe('GridShell row resizing', () => {
+    it('resizes every selected row when the dragged row belongs to the selection', async () => {
+        const on_row_resize = vi.fn();
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 6,
+                sourceRowCount: 6,
+            },
+            row_count: 6,
+            on_row_resize,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => {
+            on_selection_change({
+                columns: compact([]),
+                rows: compact([1, 3, 4]),
+            });
+        });
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 3, width: 2, height: 1 }));
+
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as
+            (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as
+            (row: number, height: number) => void;
+        grid_mock.overlay_repaint.mockClear();
+        act(() => on_resize_start(3, 24));
+        act(() => on_resize(3, 52));
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+        const get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        // Row 3 is not the first selected row, so previewing row 1 would shift
+        // the dragged boundary away from the pointer. All rows commit on end.
+        expect(get_row_height(1)).toBe(24);
+        expect(get_row_height(2)).toBe(24);
+        expect(get_row_height(3)).toBe(52);
+        expect(get_row_height(4)).toBe(24);
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([
+            { cell: [0, 3] }, { cell: [1, 3] },
+        ]);
+        expect(grid_mock.overlay_repaint).toHaveBeenCalled();
+        act(() => on_resize_end(3, 52));
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(on_row_resize).toHaveBeenCalledWith([1, 3, 4], 52);
+    });
+
+    it('previews all selected rows when dragging the first selected row', async () => {
+        const on_row_resize = vi.fn();
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 6,
+                sourceRowCount: 6,
+            },
+            row_count: 6,
+            row_heights: { 1: 24, 3: 36, 4: 44 },
+            on_row_resize,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([1, 3, 4]),
+        }));
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as
+            (row: number, height: number) => void;
+        act(() => on_resize_start(1, 24));
+        let get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect(get_row_height(1)).toBe(24);
+        expect(get_row_height(3)).toBe(36);
+        expect(get_row_height(4)).toBe(44);
+        act(() => on_resize(1, 48));
+
+        get_row_height = grid_mock.props!.rowHeight as (row: number) => number;
+        expect(get_row_height(1)).toBe(48);
+        expect(get_row_height(2)).toBe(24);
+        expect(get_row_height(3)).toBe(48);
+        expect(get_row_height(4)).toBe(48);
+        expect(on_row_resize).not.toHaveBeenCalled();
+    });
+
+    it('resizes only the dragged row when it is outside the selection', async () => {
+        const on_row_resize = vi.fn();
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 6,
+                sourceRowCount: 6,
+            },
+            row_count: 6,
+            on_row_resize,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => {
+            on_selection_change({
+                columns: compact([]),
+                rows: compact([1, 3, 4]),
+            });
+        });
+
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as
+            (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as
+            (row: number, height: number) => void;
+        act(() => on_resize_start(2, 24));
+        act(() => on_resize(2, 48));
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+        act(() => on_resize_end(2, 48));
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(on_row_resize).toHaveBeenCalledWith([2], 48);
+        expect(grid_mock.update_cells).not.toHaveBeenCalled();
+    });
+
+    it('bounds repaint damage for a large selected range to the visible viewport', async () => {
+        const on_row_resize = vi.fn();
+        const selected = Array.from({ length: 10_000 }, (_, row) => row);
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 20_000,
+                sourceRowCount: 20_000,
+            },
+            row_count: 20_000,
+            on_row_resize,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => {
+            on_selection_change({ columns: compact([]), rows: compact(selected) });
+        });
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 1, y: 0, width: 1, height: 2 }));
+
+        const on_resize_start = grid_mock.row_resize_props!.on_resize_start as
+            (row: number, height: number) => void;
+        const on_resize = grid_mock.row_resize_props!.on_resize as
+            (row: number, height: number) => void;
+        const on_resize_end = grid_mock.row_resize_props!.on_resize_end as
+            (row: number, height: number) => void;
+        act(() => on_resize_start(0, 24));
+        act(() => on_resize(0, 40));
+        act(() => on_resize(0, 50));
+        act(() => on_resize(0, 60));
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([
+            { cell: [1, 0] },
+            { cell: [1, 1] },
+        ]);
+        act(() => on_resize_end(0, 60));
+        expect(on_row_resize).toHaveBeenCalledOnce();
+        expect(on_row_resize.mock.calls[0][0]).toHaveLength(10_000);
+    });
+
+    it('repaints merge geometry after committed row heights render', async () => {
+        const initial = props({ row_heights: { 1: 24 } });
+        const GridShell = await render_grid(initial);
+        grid_mock.overlay_repaint.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                row_heights: { 1: 52, 3: 52 },
+            }));
+        });
+
+        expect(grid_mock.overlay_repaint).toHaveBeenCalled();
     });
 });
