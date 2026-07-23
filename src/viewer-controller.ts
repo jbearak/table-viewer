@@ -49,6 +49,7 @@ import { reconcile_finalization } from './finalization-reconciliation';
 import { SourceCandidate } from './source-candidate';
 import {
     EMPTY_TRANSFORM,
+    MAX_PERSISTED_HIDDEN_ROWS,
     sanitize_excel_header_overrides,
     sheet_name_from_transform_schema,
     transform_has_entries,
@@ -62,7 +63,7 @@ import {
     type SheetTransformState,
     type WebviewMessage,
 } from './types';
-import { MAX_PERSISTED_HIDDEN_ROWS, sanitize_transform_state } from './webview/sheet-state';
+import { sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 import {
     cell_highlight_states_equal,
@@ -3053,6 +3054,53 @@ export function attach_viewer(
                     fail('The requested row restoration does not match the active header.');
                     return;
                 }
+                let header_source_row: number | undefined;
+                let target_planning_input: ReturnType<
+                    ExcelHeaderDataSource['planning_input_for_header_source']
+                >;
+                if (msg.headerRow !== undefined) {
+                    if (
+                        !msg.enabled
+                        || msg.unhideAll === true
+                        || !Number.isInteger(msg.headerRow)
+                        || msg.headerRow < 0
+                    ) {
+                        fail('The requested header row is invalid.');
+                        return;
+                    }
+                    const installed_transform = core.transform_state(msg.sheetIndex);
+                    if (
+                        installed_transform.sort.length > 0
+                        || installed_transform.filters.some((filter) => filter.enabled)
+                    ) {
+                        fail('Clear sorting and filtering before choosing a header row.');
+                        return;
+                    }
+                    try {
+                        header_source_row = core.map_display_rows_to_source(
+                            msg.sheetIndex,
+                            [{ start: msg.headerRow, end: msg.headerRow }],
+                        )[0];
+                    } catch {
+                        fail('The selected row is no longer available.');
+                        return;
+                    }
+                    if (
+                        header_source_row === undefined
+                        || header_source_row > MAX_PERSISTED_HIDDEN_ROWS
+                    ) {
+                        fail('Too many rows precede the selected header row.');
+                        return;
+                    }
+                    target_planning_input = source.planning_input_for_header_source(
+                        msg.sheetName,
+                        header_source_row,
+                    );
+                    if (!target_planning_input) {
+                        fail('The selected row is no longer available.');
+                        return;
+                    }
+                }
                 if (msg.enabled && !header.available) {
                     fail('This worksheet has no first row to use as column names.');
                     return;
@@ -3071,6 +3119,8 @@ export function attach_viewer(
                     expectedPhysicalDigest: expected_physical_digest,
                     planningInput: command_source.planning_input(),
                     clearHiddenRows: msg.unhideAll === true,
+                    headerSourceRow: header_source_row,
+                    targetPlanningInput: target_planning_input,
                     stateStore: durable_state_store,
                 });
                 if (result.type === 'indeterminate' && !disposed) {

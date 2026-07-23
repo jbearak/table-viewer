@@ -162,24 +162,66 @@ export class ExcelHeaderDataSource implements DataSource {
 
     /** Immutable facts used by pure state planning and CAS conflict retries. */
     planning_input(): ExcelHeaderPlanningInput {
+        return this.planning_input_with_candidate();
+    }
+
+    /** Immutable projection facts for atomically promoting a specific source row. */
+    planning_input_for_header_source(
+        sheet_name: string,
+        source_row: number,
+    ): ExcelHeaderPlanningInput | undefined {
+        const sheet_index = this.sheets.findIndex(
+            (sheet) => sheet.physical.name === sheet_name,
+        );
+        const sheet = this.sheets[sheet_index];
+        if (!sheet || !Number.isInteger(source_row) || source_row < 0) return undefined;
+        const projected_row = projected_row_for_source(
+            this.base,
+            sheet_index,
+            source_row,
+        );
+        if (projected_row === undefined) return undefined;
+        const row = this.base.read_rows(sheet_index, projected_row, 1).rows[0];
+        return this.planning_input_with_candidate({
+            sheetIndex: sheet_index,
+            projectedRow: projected_row,
+            sourceRow: source_row,
+            columnNames: first_row_names(sheet.physical, row),
+        });
+    }
+
+    private planning_input_with_candidate(candidate?: {
+        sheetIndex: number;
+        projectedRow: number;
+        sourceRow: number;
+        columnNames: readonly string[];
+    }): ExcelHeaderPlanningInput {
         return Object.freeze({
             hasFormatting: this.base.meta().hasFormatting,
-            sheets: Object.freeze(this.sheets.map((sheet) => Object.freeze({
-                name: sheet.physical.name,
-                rowCount: sheet.physical.rowCount,
-                sourceRowCount: sheet.physical.sourceRowCount,
-                columnCount: sheet.physical.columnCount,
-                merges: Object.freeze(
-                    sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
-                ),
-                hasFormatting: sheet.physical.hasFormatting,
-                columnNames: Object.freeze([...sheet.firstRowColumnNames]),
-                manualColumnNames: Object.freeze([...sheet.manualColumnNames]),
-                manualHeaderRow: sheet.manualHeaderRow,
-                manualHeaderSourceRow: sheet.manualHeaderSourceRow,
-                detected: sheet.detected,
-                override: sheet.override,
-            }))),
+            sheets: Object.freeze(this.sheets.map((sheet, sheet_index) => {
+                const selected = candidate?.sheetIndex === sheet_index
+                    ? candidate
+                    : undefined;
+                return Object.freeze({
+                    name: sheet.physical.name,
+                    rowCount: sheet.physical.rowCount,
+                    sourceRowCount: sheet.physical.sourceRowCount,
+                    columnCount: sheet.physical.columnCount,
+                    merges: Object.freeze(
+                        sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
+                    ),
+                    hasFormatting: sheet.physical.hasFormatting,
+                    columnNames: Object.freeze([...sheet.firstRowColumnNames]),
+                    manualColumnNames: Object.freeze([...(selected
+                        ? selected.columnNames
+                        : sheet.manualColumnNames)]),
+                    manualHeaderRow: selected?.projectedRow ?? sheet.manualHeaderRow,
+                    manualHeaderSourceRow: selected?.sourceRow
+                        ?? sheet.manualHeaderSourceRow,
+                    detected: sheet.detected,
+                    override: sheet.override,
+                });
+            })),
         });
     }
 

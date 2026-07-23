@@ -102,6 +102,8 @@ vi.mock('../webview/grid-shell', () => ({
         transform_pending: boolean;
         on_transform_change: (state: { sort: Array<{ colIndex: number; direction: 'asc' | 'desc' }>; filters: unknown[] }) => void;
         on_open_filter: (source_column: number, anchor: { left: number; top: number }, restore_focus: () => void) => void;
+        can_promote_row_to_header?: boolean;
+        on_promote_row_to_header?: (display_row: number) => void;
         on_focus_columns?: () => void;
     }) => {
         grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
@@ -1305,6 +1307,59 @@ describe('Excel first-row header toggle', () => {
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+    });
+
+    it('requests row promotion from the row-header context action', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 4;
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            generation: 6,
+            sourceGeneration: 9,
+        }));
+        post_message.mockClear();
+
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        await act(async () => {
+            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
+                ((display_row: number) => void);
+            promote(2);
+        });
+
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        expect(request).toMatchObject({
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 2,
+            generation: 6,
+            sourceGeneration: 9,
+        });
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Making row header…');
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+
+        const promoted = excel_meta(true, 'on');
+        promoted.sheets[0].sourceRowCount = 4;
+        promoted.sheets[0].excelFirstRowHeader = {
+            ...promoted.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        await dispatch_host_message(refresh_snapshot_message(promoted, {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+        }));
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Header row updated.');
     });
 
     it('routes Unhide all through an atomic header command for a nonzero header', async () => {

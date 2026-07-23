@@ -264,6 +264,51 @@ describe('pure Excel header state planning', () => {
             .toBe(transform_schema_for_sheet(plan.newSheet));
     });
 
+    it('atomically hides the prefix and promotes a selected source row', () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Notes'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Archived'), number(99)],
+        ];
+        const ds = source('off', rows);
+        const old_sheet = ds.meta().sheets[0];
+        const plan = plan_excel_override_state({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [],
+                hiddenRows: [4],
+                schema: transform_schema_for_sheet(old_sheet),
+            }],
+        }, ds.planning_input(), 0, 'People', 'on', {
+            headerSourceRow: 2,
+            targetInput: ds.planning_input_for_header_source('People', 2),
+        })!;
+
+        expect(plan.newSheet).toMatchObject({
+            columnNames: ['Name', 'Age'],
+            excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 2 },
+        });
+        expect(plan.state.transforms?.[0]).toMatchObject({
+            sort: [{ colIndex: 1, direction: 'asc' }],
+            hiddenRows: [0, 1, 4],
+            schema: transform_schema_for_sheet(plan.newSheet),
+        });
+    });
+
+    it('rejects promotion when the selected source row became hidden', () => {
+        const ds = source('off', undefined, [[0]]);
+        expect(plan_excel_override_state({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{ sort: [], filters: [], hiddenRows: [0, 1] }],
+        }, ds.planning_input(), 0, 'People', 'on', {
+            headerSourceRow: 1,
+            targetInput: ds.planning_input_for_header_source('People', 1),
+        })).toBeUndefined();
+    });
+
     it('atomically disables a nonzero header and unhides rows without clearing sort', () => {
         const rows = [
             [text('Report'), text('')],

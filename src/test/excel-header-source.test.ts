@@ -432,6 +432,26 @@ describe('ExcelHeaderDataSource', () => {
         ]);
     });
 
+    it('captures immutable planning facts for a specifically selected header row', () => {
+        const ds = new ExcelHeaderDataSource(new StubSource([
+            [cell('Report title'), null],
+            [cell('Generated today'), null],
+            [cell('Name'), cell('Age')],
+            [cell('Alice'), cell(30)],
+        ]));
+
+        const input = ds.planning_input_for_header_source('Sheet1', 2)!;
+
+        expect(input.sheets[0]).toMatchObject({
+            manualHeaderRow: 2,
+            manualHeaderSourceRow: 2,
+            manualColumnNames: ['Name', 'Age'],
+        });
+        expect(Object.isFrozen(input)).toBe(true);
+        expect(Object.isFrozen(input.sheets[0].manualColumnNames)).toBe(true);
+        expect(ds.planning_input_for_header_source('Sheet1', 9)).toBeUndefined();
+    });
+
     it('makes manual promotion unavailable when every source row is hidden', () => {
         const ds = new ExcelHeaderDataSource(
             new StubSource([

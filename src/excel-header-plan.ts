@@ -12,6 +12,7 @@ import type {
     StoredPerFileState,
 } from './types';
 import {
+    MAX_PERSISTED_HIDDEN_ROWS,
     sanitize_excel_header_active,
     sanitize_excel_header_overrides,
     transform_has_entries,
@@ -167,9 +168,17 @@ export function plan_excel_override_state(
     sheet_index: number,
     sheet_name: string,
     override: ExcelHeaderOverride,
-    options?: { clearHiddenRows?: boolean },
+    options?: {
+        clearHiddenRows?: boolean;
+        headerSourceRow?: number;
+        targetInput?: ExcelHeaderPlanningInput;
+    },
 ): ExcelOverrideStatePlan | undefined {
-    if (options?.clearHiddenRows && override !== 'off') return undefined;
+    if (
+        (options?.clearHiddenRows && override !== 'off')
+        || (options?.headerSourceRow !== undefined && override !== 'on')
+        || (options?.clearHiddenRows && options.headerSourceRow !== undefined)
+    ) return undefined;
     const planning_sheet = input.sheets[sheet_index];
     if (!planning_sheet || planning_sheet.name !== sheet_name) return undefined;
     const excelFirstRowHeaders = sanitize_excel_header_overrides(
@@ -189,11 +198,47 @@ export function plan_excel_override_state(
         const hidden_rows = current.transforms?.[sheet_index]?.hiddenRows;
         if (
             first_non_hidden_source_row(planning_sheet.sourceRowCount, hidden_rows)
-                !== planning_sheet.manualHeaderSourceRow
+            !== planning_sheet.manualHeaderSourceRow
         ) return undefined;
     }
     const old_sheet = project_excel_header_sheet(planning_sheet, current_override);
-    const new_sheet = project_excel_header_sheet(planning_sheet, override);
+    let next_planning_sheet = planning_sheet;
+    let transforms = current.transforms;
+    if (options?.headerSourceRow !== undefined) {
+        const target_sheet = options.targetInput?.sheets[sheet_index];
+        if (
+            !target_sheet
+            || target_sheet.name !== planning_sheet.name
+            || target_sheet.rowCount !== planning_sheet.rowCount
+            || target_sheet.sourceRowCount !== planning_sheet.sourceRowCount
+            || target_sheet.columnCount !== planning_sheet.columnCount
+            || target_sheet.manualHeaderSourceRow !== options.headerSourceRow
+            || target_sheet.manualHeaderRow === undefined
+        ) return undefined;
+        const hidden_rows = hidden_rows_before_header(
+            current.transforms?.[sheet_index]?.hiddenRows,
+            options.headerSourceRow,
+            planning_sheet.sourceRowCount,
+        );
+        if (
+            !hidden_rows
+            || first_non_hidden_source_row(
+                planning_sheet.sourceRowCount,
+                hidden_rows,
+            ) !== options.headerSourceRow
+        ) return undefined;
+        if (hidden_rows.length > 0) {
+            transforms = [...(transforms ?? [])];
+            const retained = transforms[sheet_index] ?? {
+                sort: [],
+                filters: [],
+                schema: transform_schema_for_sheet(old_sheet),
+            };
+            transforms[sheet_index] = { ...retained, hiddenRows: hidden_rows };
+        }
+        next_planning_sheet = target_sheet;
+    }
+    const new_sheet = project_excel_header_sheet(next_planning_sheet, override);
     excelFirstRowHeaders[sheet_name] = override;
     const excelFirstRowHeaderActive = sanitize_excel_header_active(
         current.excelFirstRowHeaderActive,
@@ -205,7 +250,6 @@ export function plan_excel_override_state(
     const scrollPosition = [...(current.scrollPosition ?? [])];
     rowHeights[sheet_index] = undefined;
     scrollPosition[sheet_index] = undefined;
-    let transforms = current.transforms;
     if (options?.clearHiddenRows && transforms?.[sheet_index]?.hiddenRows) {
         transforms = [...transforms];
         const { hiddenRows: _hidden_rows, ...retained } = transforms[sheet_index]!;
@@ -242,6 +286,35 @@ export function plan_excel_override_state(
             ),
         },
     };
+}
+
+function hidden_rows_before_header(
+    current: readonly number[] | undefined,
+    header_source_row: number,
+    source_row_count: number,
+): number[] | undefined {
+    if (
+        !Number.isInteger(header_source_row)
+        || header_source_row < 0
+        || header_source_row >= source_row_count
+    ) return undefined;
+    const suffix: number[] = [];
+    let previous = -1;
+    for (const row of current ?? []) {
+        if (!Number.isInteger(row) || row < 0 || row >= source_row_count) continue;
+        if (row === header_source_row) return undefined;
+        if (row > header_source_row && row !== previous) suffix.push(row);
+        previous = row;
+    }
+    if (header_source_row + suffix.length > MAX_PERSISTED_HIDDEN_ROWS) {
+        return undefined;
+    }
+    const hidden_rows = Array.from(
+        { length: header_source_row },
+        (_, row) => row,
+    );
+    for (const row of suffix) hidden_rows.push(row);
+    return hidden_rows;
 }
 
 function first_non_hidden_source_row(

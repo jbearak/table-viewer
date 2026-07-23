@@ -306,6 +306,7 @@ export function App(): React.JSX.Element {
     );
     const pending_excel_header_ref = useRef<string | null>(null);
     const pending_excel_header_unhide_ref = useRef(false);
+    const pending_excel_header_promote_ref = useRef(false);
     const pending_edit_request_ref = useRef<string | null>(null);
     const pending_save_dialog_ref = useRef<{
         requestId: string;
@@ -643,6 +644,7 @@ export function App(): React.JSX.Element {
                     reset_save_projection();
                     pending_excel_header_ref.current = null;
                     pending_excel_header_unhide_ref.current = false;
+                    pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
                     set_excel_header_status('');
                 }
@@ -673,12 +675,16 @@ export function App(): React.JSX.Element {
                         || pending_excel_header_ref.current !== result.requestId
                     ) return;
                     const restoring_rows = pending_excel_header_unhide_ref.current;
+                    const promoting_row = pending_excel_header_promote_ref.current;
                     pending_excel_header_ref.current = null;
                     pending_excel_header_unhide_ref.current = false;
+                    pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
                     if (result.outcome === 'rejected') {
                         set_excel_header_status(restoring_rows
                             ? 'Rows were not restored.'
+                            : promoting_row
+                            ? 'Header row was not updated.'
                             : 'Column names were not updated.');
                         if (result.error) {
                             vscode_api.postMessage({
@@ -692,6 +698,8 @@ export function App(): React.JSX.Element {
                         set_excel_header_status(
                             restoring_rows
                                 ? 'Rows were restored, but recovery was required.'
+                                : promoting_row
+                                ? 'Header row was updated, but recovery was required.'
                                 : 'Column names were updated, but recovery was required.',
                         );
                         if (result.error) {
@@ -704,7 +712,11 @@ export function App(): React.JSX.Element {
                         }
                     } else {
                         set_excel_header_status(
-                            restoring_rows ? 'Rows restored.' : 'Column names updated.',
+                            restoring_rows
+                                ? 'Rows restored.'
+                                : promoting_row
+                                ? 'Header row updated.'
+                                : 'Column names updated.',
                         );
                     }
                 };
@@ -728,8 +740,12 @@ export function App(): React.JSX.Element {
                         const previous = previous_sheets.get(sheet.name);
                         if (
                             previous
-                            && previous.excelFirstRowHeader?.active
-                                !== sheet.excelFirstRowHeader?.active
+                            && (
+                                previous.excelFirstRowHeader?.active
+                                    !== sheet.excelFirstRowHeader?.active
+                                || previous.excelFirstRowHeader?.sourceRow
+                                    !== sheet.excelFirstRowHeader?.sourceRow
+                            )
                         ) {
                             header_changed.add(index);
                         }
@@ -1289,6 +1305,7 @@ export function App(): React.JSX.Element {
     const request_excel_header = useCallback((
         enabled: boolean,
         unhide_all = false,
+        header_row?: number,
     ) => {
         const sheet = meta?.sheets[active_sheet_index];
         const header = sheet?.excelFirstRowHeader;
@@ -1298,9 +1315,14 @@ export function App(): React.JSX.Element {
         }`;
         pending_excel_header_ref.current = request_id;
         pending_excel_header_unhide_ref.current = unhide_all;
+        pending_excel_header_promote_ref.current = header_row !== undefined;
         set_pending_excel_header(request_id);
         set_excel_header_status(
-            unhide_all ? 'Restoring rows…' : 'Updating column names…',
+            unhide_all
+                ? 'Restoring rows…'
+                : header_row !== undefined
+                ? 'Making row header…'
+                : 'Updating column names…',
         );
         vscode_api.postMessage({
             type: 'setExcelFirstRowHeader',
@@ -1308,6 +1330,7 @@ export function App(): React.JSX.Element {
             sheetName: sheet.name,
             enabled,
             ...(unhide_all ? { unhideAll: true } : {}),
+            ...(header_row !== undefined ? { headerRow: header_row } : {}),
             requestId: request_id,
             generation: generation_ref.current,
             sourceGeneration: source_generation_ref.current,
@@ -1319,6 +1342,10 @@ export function App(): React.JSX.Element {
         if (!header) return;
         request_excel_header(!(header.mode === 'on' || header.active));
     }, [active_sheet_index, meta, request_excel_header]);
+
+    const handle_promote_row_to_header = useCallback((display_row: number) => {
+        request_excel_header(true, false, display_row);
+    }, [request_excel_header]);
 
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
@@ -2104,6 +2131,8 @@ export function App(): React.JSX.Element {
         : excel_header_pending
         ? pending_excel_header_unhide_ref.current
             ? 'Restoring rows…'
+            : pending_excel_header_promote_ref.current
+            ? 'Making row header…'
             : 'Updating column names…'
         : 'Wait for sorting and filtering to finish.';
     const effective_row_count =
@@ -2169,6 +2198,8 @@ export function App(): React.JSX.Element {
             on_hide_column={handle_toggle_column}
             on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
+            can_promote_row_to_header={excel_header !== undefined}
+            on_promote_row_to_header={handle_promote_row_to_header}
             on_focus_columns={focus_columns_trigger}
             cell_highlights={cell_highlights?.sheets[active_sheet_index]}
             on_highlight_selection={handle_highlight_selection}

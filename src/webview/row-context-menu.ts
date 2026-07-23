@@ -3,7 +3,9 @@ import type { MenuItem } from './context-menu';
 export interface RowContextMenuModelProps {
     selected_row_count: number;
     can_hide_rows: boolean;
+    can_promote_row_to_header: boolean;
     on_hide_rows: () => void;
+    on_promote_row_to_header: () => void;
     on_copy_rows: () => void;
 }
 
@@ -22,6 +24,12 @@ export function hide_rows_menu_item(
 export function row_context_menu_items(props: RowContextMenuModelProps): MenuItem[] {
     const selected_row_count = Math.max(1, props.selected_row_count);
     const items: MenuItem[] = [];
+    if (props.can_promote_row_to_header) {
+        items.push({
+            label: 'Use row as header',
+            on_click: () => props.on_promote_row_to_header(),
+        });
+    }
     if (props.can_hide_rows) {
         items.push(hide_rows_menu_item(selected_row_count, props.on_hide_rows));
     }
