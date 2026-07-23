@@ -200,7 +200,7 @@ function MenuLevel({
                                 <span className="context-menu-submenu-chevron" aria-hidden="true">›</span>
                             </button>
                             {is_open && (
-                                <div data-parent-menu-index={index} className="context-menu-submenu-container">
+                                <div role="none" data-parent-menu-index={index} className="context-menu-submenu-container">
                                     <MenuLevel
                                         items={item.items}
                                         aria_label={`${item.label} submenu`}

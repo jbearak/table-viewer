@@ -1,6 +1,7 @@
 import type { CellHighlightColor } from '../types';
 import type { MenuItem } from './context-menu';
 import { CELL_HIGHLIGHT_COLORS } from './highlight-theme';
+import { hide_rows_menu_item } from './row-context-menu';
 
 export interface CellContextMenuModelProps {
     dirty: boolean;
@@ -50,11 +51,7 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
     }
     const hide_items: MenuItem[] = [];
     if (props.can_hide_rows) {
-        const selected_row_count = Math.max(1, props.selected_row_count);
-        hide_items.push({
-            label: selected_row_count === 1 ? 'Hide row' : `Hide ${selected_row_count} rows`,
-            on_click: () => props.on_hide_rows(),
-        });
+        hide_items.push(hide_rows_menu_item(props.selected_row_count, props.on_hide_rows));
     }
     hide_items.push({ label: 'Hide column', on_click: () => props.on_hide_column() });
     items.push(
