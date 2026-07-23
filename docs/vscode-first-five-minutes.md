@@ -102,7 +102,7 @@ Clear **Table Viewer: Font Family** at any time to make Table Viewer follow **Ed
 If you would like to try a different font, two readable, free, open-source choices are:
 
 - [**Hack**](https://sourcefoundry.org/hack/) is a monospaced font designed for source code, with distinct character shapes and regular, bold, italic, and bold italic styles.
-- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a newer monospaced font with a wide range of weights.
+- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a newer monospaced font available in Roman and italic variable styles, each spanning weights from 300 to 800.
 
 Install the font on your computer, then enter its family name—such as `Hack` or `Google Sans Code`—in one of the settings above.
 
