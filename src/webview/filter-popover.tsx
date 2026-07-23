@@ -343,6 +343,9 @@ export function FilterPopover({
                         Remove
                     </button>
                 )}
+                <button type="button" className="filter-popover-btn" onClick={() => on_cancel('explicit')}>
+                    Cancel
+                </button>
                 <button
                     type="button"
                     className="filter-popover-btn filter-popover-btn-primary"
@@ -350,9 +353,6 @@ export function FilterPopover({
                     onClick={apply}
                 >
                     Apply
-                </button>
-                <button type="button" className="filter-popover-btn" onClick={() => on_cancel('explicit')}>
-                    Cancel
                 </button>
             </div>
         </div>

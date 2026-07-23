@@ -955,9 +955,17 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             HTMLButtonElement | null ?? null;
     }
 
-    it('does not show Remove for a new filter', () => {
+    function footer_button_labels(): string[] {
+        return Array.from(
+            document.querySelectorAll('.filter-popover-footer button'),
+            (button) => button.textContent ?? '',
+        );
+    }
+
+    it('shows only Cancel and Apply, in order, for a new filter', () => {
         render_popover([], { status: 'ready', bins: READY_BINS });
         expect(remove_button()).toBeNull();
+        expect(footer_button_labels()).toEqual(['Cancel', 'Apply']);
     });
 
     it('shows a distinct-styled Remove button for an existing filter', () => {
@@ -969,6 +977,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         expect(button).not.toBeNull();
         expect(button!.className).toContain('filter-popover-btn');
         expect(button!.className).toContain('filter-popover-btn-danger');
+        expect(footer_button_labels()).toEqual(['Remove', 'Cancel', 'Apply']);
     });
 
     it('invokes only on_remove when Remove is clicked', () => {
