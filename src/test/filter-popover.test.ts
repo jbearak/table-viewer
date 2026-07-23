@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -57,6 +59,20 @@ function render_popover(
 }
 
 describe('FilterPopover', () => {
+    it('uses theme hover colors for primary and secondary footer actions', () => {
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+
+        expect(css).toMatch(
+            /\.filter-popover-btn-primary:hover:not\(:disabled\)\s*\{[^}]*--vscode-button-hoverBackground[^}]*\}/,
+        );
+        expect(css).toMatch(
+            /\.filter-popover-btn:not\(\.filter-popover-btn-primary\):not\(\.filter-popover-btn-danger\):hover:not\(:disabled\)\s*\{[^}]*--vscode-button-secondaryHoverBackground[^}]*\}/,
+        );
+    });
+
     it('does not show the raw-value transform description', () => {
         render_popover();
         const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
