@@ -94,6 +94,36 @@ describe('use_row_loader', () => {
         expect(hook_result!.sample_loaded_rows).toBe(first.sample_loaded_rows);
     });
 
+    it('settles a pending bulk load to false when the hook unmounts', async () => {
+        const { use_row_loader } = await load_hook();
+
+        function Harness() {
+            hook_result = use_row_loader(0, 10_000, 1);
+            return null;
+        }
+
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(Harness));
+        });
+
+        // A whole-sheet copy load is in flight (pages still requested from host).
+        const load = hook_result!.ensure_rows_loaded(0, 500);
+        let resolved: boolean | null = null;
+        void load.then((v) => { resolved = v; });
+
+        // The keyed GridShell unmounts on a sheet switch/reload before the rows
+        // arrive; the load must settle (false) rather than dangle forever.
+        await act(async () => {
+            root!.unmount();
+        });
+        root = null;
+        await load;
+        expect(resolved).toBe(false);
+    });
+
     it('ignores malformed messages and keeps a mismatched sourceRows request pending', async () => {
         const { use_row_loader, postMessage } = await load_hook();
 

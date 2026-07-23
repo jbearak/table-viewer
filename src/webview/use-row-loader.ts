@@ -8,6 +8,12 @@ export { RowLoader };
 
 export interface UseRowLoader {
     ensure_rows(start_row: number, end_row: number): void;
+    /**
+     * Load every page covering the range. Resolves `true` once all are resident,
+     * or `false` if the cache is cleared mid-load (sheet switch/reload) so the
+     * caller can abandon the operation.
+     */
+    ensure_rows_loaded(start_row: number, end_row: number): Promise<boolean>;
     get_row(row: number): (RenderedCell | null)[] | undefined;
     /** Canonical source-row identity for a resident display row. */
     get_source_row(row: number): number | undefined;
@@ -53,13 +59,24 @@ export function use_row_loader(
         return () => window.removeEventListener('message', handler);
     }, [loader]);
 
+    // On unmount the message listener is gone, so no further rowData can settle a
+    // bulk copy load. Clear the loader so any outstanding ensure_rows_loaded
+    // promise resolves (false) instead of dangling — GridShell is keyed by sheet
+    // and generation, so a switch/reload unmounts rather than reconfigures.
+    useEffect(() => () => loader.clear(), [loader]);
+
     const ensure_rows = useCallback((s: number, en: number) => loader.ensure_rows(s, en), [loader]);
+    const ensure_rows_loaded = useCallback(
+        (s: number, en: number) => loader.ensure_rows_loaded(s, en),
+        [loader],
+    );
     const get_row = useCallback((r: number) => loader.get_row(r), [loader]);
     const get_source_row = useCallback((r: number) => loader.get_source_row(r), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
         ensure_rows,
+        ensure_rows_loaded,
         get_row,
         get_source_row,
         sample_loaded_rows,

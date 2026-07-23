@@ -62,6 +62,7 @@ const grid_mock = vi.hoisted(() => ({
     })),
     loader_enabled: [] as boolean[],
     ensure_rows: vi.fn(),
+    ensure_rows_loaded: vi.fn(async () => true),
     post_message: vi.fn(),
     get_row: vi.fn((_row?: number) => [
         { raw: 'source-a', formatted: 'source-a', bold: false, italic: false },
@@ -110,6 +111,7 @@ vi.mock('../webview/use-row-loader', () => ({
         grid_mock.loader_enabled.push(enabled);
         return {
             ensure_rows: grid_mock.ensure_rows,
+            ensure_rows_loaded: grid_mock.ensure_rows_loaded,
             get_row: grid_mock.get_row,
             get_source_row: (row: number) => row,
             sample_loaded_rows: () => [],
@@ -211,6 +213,8 @@ afterEach(() => {
         x: 30, y: 10, width: 100, height: 36,
     }));
     grid_mock.ensure_rows.mockReset();
+    grid_mock.ensure_rows_loaded.mockReset();
+    grid_mock.ensure_rows_loaded.mockImplementation(async () => true);
     grid_mock.post_message.mockReset();
     grid_mock.get_row.mockReset();
     grid_mock.get_row.mockImplementation(() => [
@@ -1594,7 +1598,13 @@ describe('GridShell column projection', () => {
         const selection = grid_mock.props!.gridSelection as { current?: { range: unknown } };
         expect(selection.current?.range).toEqual({ x: 0, y: 0, width: 2, height: 2 });
 
-        await act(async () => { grid_actions_ref.current!.copy_sheet(); });
+        await act(async () => { await grid_actions_ref.current!.copy_sheet(); });
+        // The whole-sheet copy loads its full row range before serializing, so an
+        // unscrolled/inactive sheet doesn't come back blank.
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(0, 1);
+        const load_order = grid_mock.ensure_rows_loaded.mock.invocationCallOrder[0];
+        const write_order = write_text.mock.invocationCallOrder[0];
+        expect(load_order).toBeLessThan(write_order);
         // Header row followed by both source rows across the two visible columns.
         expect(write_text).toHaveBeenCalledWith(
             'A name\tC name\nsource-a\tsource-c\nsource-a\tsource-c',

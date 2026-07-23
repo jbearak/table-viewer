@@ -414,4 +414,100 @@ describe('RowLoader', () => {
         loader.configure(0, 1000, 1);
         expect(loader.on_row_data(row_data(0, 0, 1, 'unsolicited'))).toBe(false);
     });
+
+    describe('ensure_rows_loaded', () => {
+        it('resolves true immediately when the range is already resident', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            post.mockClear();
+            await expect(loader.ensure_rows_loaded(0, 40)).resolves.toBe(true);
+            expect(post).not.toHaveBeenCalled();
+        });
+
+        it('reports false when it cannot load a disabled sheet', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 1000, 1, false); // disabled, nothing resident
+            await expect(loader.ensure_rows_loaded(0, 40)).resolves.toBe(false);
+            expect(post).not.toHaveBeenCalled();
+        });
+
+        it('resolves only after every covering page is delivered', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 1000, 1);
+            let settled: boolean | null = null;
+            const done = loader.ensure_rows_loaded(0, 250).then((v) => { settled = v; });
+            expect(post.mock.calls.map((c) => (c[0] as RequestRows).startRow).sort((a, b) => a - b))
+                .toEqual([0, 100, 200]);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            await Promise.resolve();
+            expect(settled).toBeNull();
+            loader.on_row_data(reply_for(post, 0, 100, 1));
+            loader.on_row_data(reply_for(post, 0, 200, 1));
+            await done;
+            expect(settled).toBe(true);
+            expect(loader.get_row(0)).toBeDefined();
+            expect(loader.get_row(150)).toBeDefined();
+            expect(loader.get_row(250)).toBeDefined();
+        });
+
+        it('holds more than the cache cap resident until the bulk load resolves', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2); // cap = 2
+            loader.configure(0, 1000, 1);
+            const done = loader.ensure_rows_loaded(0, 250); // needs 3 pages > cap
+            for (const start of [0, 100, 200]) loader.on_row_data(reply_for(post, 0, start, 1));
+            await done;
+            expect(loader.page_count).toBe(3);
+            expect(loader.get_row(0)).toBeDefined();
+            expect(loader.get_row(100)).toBeDefined();
+            expect(loader.get_row(200)).toBeDefined();
+        });
+
+        it('trims back to the cap once the protected copy completes', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 1000, 1);
+            const done = loader.ensure_rows_loaded(0, 250);
+            for (const start of [0, 100, 200]) loader.on_row_data(reply_for(post, 0, start, 1));
+            await done;
+            expect(loader.page_count).toBe(3);
+            // A later unrelated page load evicts down to the cap now that the copy
+            // range is no longer protected.
+            loader.ensure_rows(300, 310);
+            loader.on_row_data(reply_for(post, 0, 300, 1));
+            expect(loader.page_count).toBe(2);
+        });
+
+        it('resolves false (does not hang) when the cache is cleared mid-load', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 1000, 1);
+            const done = loader.ensure_rows_loaded(0, 250);
+            loader.on_row_data(reply_for(post, 0, 0, 1)); // one page in…
+            loader.clear();                               // …then the sheet switches
+            await expect(done).resolves.toBe(false);
+        });
+
+        it('does not move the display viewport', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 10_000, 1);
+            loader.ensure_rows(500, 540); // viewport sits on page 500
+            loader.on_row_data(reply_for(post, 0, 500, 1));
+            const done = loader.ensure_rows_loaded(0, 40); // bulk-load an unrelated range
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            await done;
+            post.mockClear();
+            // A generation bump re-requests the viewport (500), not the copy range.
+            loader.configure(0, 10_000, 2);
+            const reqs = post.mock.calls.map((c) => c[0] as RequestRows);
+            expect(reqs.some((r) => r.startRow === 500)).toBe(true);
+            expect(reqs.some((r) => r.startRow === 0)).toBe(false);
+        });
+    });
 });
