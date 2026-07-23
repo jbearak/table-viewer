@@ -178,6 +178,19 @@ export function transform_schema_for_sheet(
         sheet.columnNames ?? null,
     ]);
 }
+
+/** Recover only the stable sheet identity from a transform fingerprint. */
+export function sheet_name_from_transform_schema(schema: unknown): string | undefined {
+    if (typeof schema !== 'string') return undefined;
+    try {
+        const parsed: unknown = JSON.parse(schema);
+        return Array.isArray(parsed) && typeof parsed[0] === 'string'
+            ? parsed[0]
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
 export interface ScrollPosition {
     top: number;
     left: number;
@@ -299,7 +312,7 @@ export type WebviewMessage =
     | { type: 'showWarning'; message: string }
     | { type: 'requestFilterHistogram'; sheetIndex: number; columnIndex: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'cancelFilterHistogram'; requestId: string }
-    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; requestId: string; generation: number; sourceGeneration: number }
+    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

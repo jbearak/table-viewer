@@ -50,6 +50,7 @@ import { SourceCandidate } from './source-candidate';
 import {
     EMPTY_TRANSFORM,
     sanitize_excel_header_overrides,
+    sheet_name_from_transform_schema,
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
@@ -227,6 +228,24 @@ function same_semantic_authority_basis(
         && left.physicalDigest === right.physicalDigest;
 }
 
+function excel_hidden_rows_for_source(
+    sheets: readonly WorkbookMeta['sheets'][number][],
+    transforms: PerFileState['transforms'],
+): (number[] | undefined)[] {
+    return sheets.map((sheet, index) => {
+        const transform = transforms?.[index];
+        if (sheet_name_from_transform_schema(transform?.schema) !== sheet.name) {
+            return undefined;
+        }
+        return sanitize_transform_state(
+            transform,
+            sheet.columnCount,
+            undefined,
+            sheet.sourceRowCount,
+        )?.hiddenRows;
+    });
+}
+
 function excel_profile(): ViewerProfile {
     return {
         editing: false,
@@ -234,9 +253,11 @@ function excel_profile(): ViewerProfile {
             const physical = file_path.toLowerCase().endsWith('.xlsx')
                 ? await XlsxDataSource.create(raw)
                 : await XlsDataSource.create(Buffer.from(raw));
+            const physical_sheets = physical.meta().sheets;
             return new ExcelHeaderDataSource(
                 physical,
                 sanitize_excel_header_overrides(state.excelFirstRowHeaders),
+                excel_hidden_rows_for_source(physical_sheets, state.transforms),
             );
         },
     };
@@ -1628,6 +1649,12 @@ export function attach_viewer(
             inspected.replace_overrides(sanitize_excel_header_overrides(
                 committed_state.excelFirstRowHeaders,
             ));
+            inspected.replace_hidden_rows(
+                excel_hidden_rows_for_source(
+                    inspected.meta().sheets,
+                    committed_state.transforms,
+                ),
+            );
         }
         let adopted: DataSource | undefined;
         const transferred = candidate.transfer_to((next, confirm_transfer) => {
@@ -1764,8 +1791,21 @@ export function attach_viewer(
                         && source instanceof ExcelHeaderDataSource
                         && current_adoption?.resources.source === source
                         && current_adoption.resources.core === core
-                        && source.set_override(receipt.sheetName, receipt.override)
                     ) {
+                        const receipt_state = normalize_host_state(
+                            receipt.stateSnapshot.state,
+                            source.meta().sheets.map((sheet) => sheet.name),
+                        );
+                        source.set_hidden_rows(
+                            receipt.sheetName,
+                            excel_hidden_rows_for_source(
+                                source.meta().sheets,
+                                receipt_state.transforms,
+                            )[receipt.sheetIndex],
+                        );
+                        if (!source.set_override(receipt.sheetName, receipt.override)) {
+                            throw new Error('The selected worksheet no longer exists.');
+                        }
                         const projection_adoption = adopt_source_into_core(
                             core,
                             panel,
@@ -2615,6 +2655,52 @@ export function attach_viewer(
         // trust boundary: a stale or injected webview message must not
         // reach transform admission, the core, or durable state.
         if (profile.previewMode === true) return;
+        const transform_sheet = source?.meta().sheets[message.sheetIndex];
+        if (transform_sheet) {
+            if (
+                transform_has_entries(message.state)
+                && message.state.schema !== transform_schema_for_sheet(transform_sheet)
+            ) {
+                await core?.handle_message(message);
+                return;
+            }
+            message = {
+                ...message,
+                state: sanitize_transform_state(
+                    message.state,
+                    transform_sheet.columnCount,
+                    transform_schema_for_sheet(transform_sheet),
+                    transform_sheet.sourceRowCount,
+                ) ?? EMPTY_TRANSFORM,
+            };
+        }
+        const active_header = transform_sheet?.excelFirstRowHeader;
+        const protected_source_rows = active_header?.mode === 'on'
+            ? active_header.sourceRow ?? transform_sheet?.sourceRowCount ?? 0
+            : 0;
+        // Native XLS/XLSX sources use physical row positions as canonical IDs.
+        const requested_hidden_rows = new Set(message.state.hiddenRows ?? []);
+        if (
+            active_header?.mode === 'on'
+            && active_header.sourceRow !== undefined
+            && requested_hidden_rows.has(active_header.sourceRow)
+        ) {
+            await core?.reject_transform(
+                message,
+                'The active header row cannot be hidden.',
+            );
+            return;
+        }
+        if (protected_source_rows > 0) {
+            for (let row = 0; row < protected_source_rows; row += 1) {
+                if (requested_hidden_rows.has(row)) continue;
+                await core?.reject_transform(
+                    message,
+                    'Use Unhide all to restore rows above the active header.',
+                );
+                return;
+            }
+        }
         const transform_admission = profile.editing
             ? begin_transform_admission()
             : Symbol(file_key);
@@ -2946,9 +3032,25 @@ export function attach_viewer(
                     fail('The selected worksheet no longer matches this request.');
                     return;
                 }
-                const header = sheet.excelFirstRowHeader;
+                source.set_hidden_rows(
+                    msg.sheetName,
+                    core.transform_state(msg.sheetIndex).hiddenRows,
+                );
+                const header = source.meta().sheets[msg.sheetIndex]
+                    ?.excelFirstRowHeader;
                 if (!header) {
                     fail('First-row headers are only available for Excel worksheets.');
+                    return;
+                }
+                if (
+                    msg.unhideAll === true
+                    && (
+                        msg.enabled
+                        || header.mode !== 'on'
+                        || header.sourceRow === 0
+                    )
+                ) {
+                    fail('The requested row restoration does not match the active header.');
                     return;
                 }
                 if (msg.enabled && !header.available) {
@@ -2968,6 +3070,7 @@ export function attach_viewer(
                     expectedPhysicalRevision: expected_physical_revision,
                     expectedPhysicalDigest: expected_physical_digest,
                     planningInput: command_source.planning_input(),
+                    clearHiddenRows: msg.unhideAll === true,
                     stateStore: durable_state_store,
                 });
                 if (result.type === 'indeterminate' && !disposed) {
@@ -2979,6 +3082,10 @@ export function attach_viewer(
                     });
                 } else if (result.type === 'rejected' && !disposed) {
                     fail(result.error);
+                    if (
+                        result.error
+                            === 'The selected worksheet no longer matches this request.'
+                    ) schedule_header_refresh();
                 }
                 return;
             }

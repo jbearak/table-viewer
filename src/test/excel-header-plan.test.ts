@@ -51,10 +51,12 @@ class PhysicalSource implements DataSource {
 function source(
     override?: 'on' | 'off',
     rows?: (RenderedCell | null)[][],
+    hidden_rows?: readonly (readonly number[] | undefined)[],
 ) {
     return new ExcelHeaderDataSource(
         new PhysicalSource(rows),
         override ? { People: override } : undefined,
+        hidden_rows,
     );
 }
 
@@ -232,6 +234,72 @@ describe('pure Excel header state planning', () => {
         expect(Object.isFrozen(input.sheets)).toBe(true);
         expect(Object.isFrozen(input.sheets[0].columnNames)).toBe(true);
         expect(Object.isFrozen(input.sheets[0].merges)).toBe(true);
+    });
+
+    it('plans a non-hidden manual header and preserves its hidden prefix', () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Notes'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+        ];
+        const ds = source('off', rows, [[0, 1]]);
+        const old_sheet = ds.meta().sheets[0];
+        const plan = plan_excel_override_state({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{
+                sort: [],
+                filters: [],
+                hiddenRows: [0, 1],
+                schema: transform_schema_for_sheet(old_sheet),
+            }],
+        }, ds.planning_input(), 0, 'People', 'on')!;
+
+        expect(plan.newSheet).toMatchObject({
+            columnNames: ['Name', 'Age'],
+            excelFirstRowHeader: { active: true, sourceRow: 2 },
+        });
+        expect(plan.state.transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+        expect(plan.state.transforms?.[0]?.schema)
+            .toBe(transform_schema_for_sheet(plan.newSheet));
+    });
+
+    it('atomically disables a nonzero header and unhides rows without clearing sort', () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Notes'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+        ];
+        const ds = source('on', rows, [[0, 1]]);
+        const old_sheet = ds.meta().sheets[0];
+        const plan = plan_excel_override_state({
+            excelFirstRowHeaders: { People: 'on' },
+            transforms: [{
+                sort: [{ colIndex: 1, direction: 'asc' }],
+                filters: [],
+                hiddenRows: [0, 1],
+                schema: transform_schema_for_sheet(old_sheet),
+            }],
+        }, ds.planning_input(), 0, 'People', 'off', {
+            clearHiddenRows: true,
+        })!;
+
+        expect(plan.newSheet.excelFirstRowHeader?.active).toBe(false);
+        expect(plan.state.excelFirstRowHeaders).toEqual({ People: 'off' });
+        expect(plan.state.transforms?.[0]).toEqual({
+            sort: [{ colIndex: 1, direction: 'asc' }],
+            filters: [],
+            schema: transform_schema_for_sheet(plan.newSheet),
+        });
+    });
+
+    it('rejects a stale manual candidate after hidden rows change', () => {
+        const ds = source('off', undefined, [[0]]);
+        expect(plan_excel_override_state({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{ sort: [], filters: [], hiddenRows: [] }],
+        }, ds.planning_input(), 0, 'People', 'on')).toBeUndefined();
     });
 
     it('does not migrate descriptors when sheet identity or count differs', () => {

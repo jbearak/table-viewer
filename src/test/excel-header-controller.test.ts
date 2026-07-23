@@ -275,6 +275,324 @@ describe('Excel workbook snapshot controller', () => {
         });
     });
 
+    it('promotes the first non-hidden row and atomically disables it on Unhide all', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Generated'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+        ];
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+            transforms: [{
+                sort: [],
+                filters: [],
+                hiddenRows: [0, 1],
+                schema: '["People",2,null]',
+            }],
+        });
+        const panel = open_excel(
+            '/non-hidden-header.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+        const restore = {
+            type: 'setTransform' as const,
+            sheetIndex: 0,
+            state: state.value().transforms![0]!,
+            requestId: 'restore-hidden-prefix',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'restore' as const,
+        };
+        await panel.__receive(restore);
+        const restored = messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === restore.requestId,
+        )!;
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            requestId: 'promote-visible',
+            generation: restored.generation,
+            sourceGeneration: restored.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'promote-visible', outcome: 'applied' }));
+        const promoted = snapshots(panel).at(-1)!;
+        expect(promoted.meta.sheets[0]).toMatchObject({
+            columnNames: ['Name', 'Age'],
+            excelFirstRowHeader: { active: true, sourceRow: 2 },
+        });
+        expect(promoted.state.transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+
+        await panel.__receive({
+            ...restore,
+            state: promoted.state.transforms![0]!,
+            requestId: 'restore-promoted-prefix',
+            generation: promoted.generation,
+            sourceGeneration: promoted.sourceGeneration,
+        });
+        const promoted_restore = messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'restore-promoted-prefix',
+        )!;
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: { sort: [], filters: [] },
+            requestId: 'bypass-atomic-unhide',
+            generation: promoted_restore.generation,
+            sourceGeneration: promoted_restore.sourceGeneration,
+            intent: 'user',
+        });
+        expect(messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'bypass-atomic-unhide',
+        )).toMatchObject({
+            error: 'Use Unhide all to restore rows above the active header.',
+            state: { hiddenRows: [0, 1] },
+        });
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: [0, 1, 2],
+                schema: promoted.state.transforms![0]!.schema,
+            },
+            requestId: 'hide-promoted-header',
+            generation: promoted_restore.generation,
+            sourceGeneration: promoted_restore.sourceGeneration,
+            intent: 'user',
+        });
+        expect(messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'hide-promoted-header',
+        )).toMatchObject({
+            error: 'The active header row cannot be hidden.',
+            state: { hiddenRows: [0, 1] },
+        });
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            unhideAll: true,
+            requestId: 'unhide-and-disable',
+            generation: promoted_restore.generation,
+            sourceGeneration: promoted_restore.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'unhide-and-disable', outcome: 'applied' }));
+        const unhidden = snapshots(panel).at(-1)!;
+        expect(unhidden.meta.sheets[0].excelFirstRowHeader?.active).toBe(false);
+        expect(unhidden.state.transforms?.[0]?.hiddenRows).toBeUndefined();
+        expect(state.value().excelFirstRowHeaders).toEqual({ People: 'off' });
+        expect(state.value().transforms?.[0]).toBeUndefined();
+    });
+
+    it('refreshes after another writer changes the hidden header candidate', async () => {
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+        });
+        const builds = { count: 0 };
+        const panel = open_excel(
+            '/stale-hidden-candidate.xlsx',
+            state.store,
+            excel_profile(builds),
+        );
+        const initial = await ready(panel);
+        const external = await state.store.read('/stale-hidden-candidate.xlsx');
+        await state.store.compare_and_set(
+            '/stale-hidden-candidate.xlsx',
+            external.revision,
+            {
+                ...external.state,
+                transforms: [{
+                    sort: [],
+                    filters: [],
+                    hiddenRows: [0],
+                    schema: '["People",2,null]',
+                }],
+            },
+        );
+
+        await toggle(panel, initial, 'stale-candidate', true);
+        await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+            snapshot.commandResult?.requestId === 'stale-candidate'
+            && snapshot.commandResult.outcome === 'rejected'
+        ))).toBe(true));
+        await vi.waitFor(() => expect(builds.count).toBeGreaterThan(1));
+        const refreshed = snapshots(panel).at(-1)!;
+        const transform = refreshed.state.transforms![0]!;
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: transform,
+            requestId: 'restore-external-hidden-row',
+            generation: refreshed.generation,
+            sourceGeneration: refreshed.sourceGeneration,
+            intent: 'restore',
+        });
+        const restored = messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'restore-external-hidden-row',
+        )!;
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            requestId: 'retry-candidate',
+            generation: restored.generation,
+            sourceGeneration: restored.sourceGeneration,
+        });
+
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'retry-candidate', outcome: 'applied' }));
+        expect(snapshots(panel).at(-1)?.meta.sheets[0].excelFirstRowHeader?.sourceRow)
+            .toBe(1);
+    });
+
+    it('atomically turns off an unavailable explicit header when all rows unhide', async () => {
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'on' },
+            transforms: [{
+                sort: [],
+                filters: [],
+                hiddenRows: [0, 1, 2],
+                schema: '["People",2,null]',
+            }],
+        });
+        const panel = open_excel(
+            '/all-hidden-explicit-header.xlsx',
+            state.store,
+            excel_profile({ count: 0 }),
+        );
+        const initial = await ready(panel);
+        expect(initial.meta.sheets[0].excelFirstRowHeader).toMatchObject({
+            mode: 'on', active: false, available: false,
+        });
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: initial.state.transforms![0]!,
+            requestId: 'restore-all-hidden',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'restore',
+        });
+        const restored = messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'restore-all-hidden',
+        )!;
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: false,
+            unhideAll: true,
+            requestId: 'restore-all-rows',
+            generation: restored.generation,
+            sourceGeneration: restored.sourceGeneration,
+        });
+
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'restore-all-rows', outcome: 'applied' }));
+        const result = snapshots(panel).at(-1)!;
+        expect(result.meta.sheets[0].excelFirstRowHeader).toMatchObject({
+            mode: 'off', active: false, available: true,
+        });
+        expect(result.state.transforms?.[0]).toBeUndefined();
+    });
+
+    it('ignores corrupt persisted hidden-row shapes while opening Excel', async () => {
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'on' },
+            transforms: [{
+                sort: [],
+                filters: [],
+                schema: '["People",2,null]',
+                hiddenRows: { length: 1 },
+            } as unknown as NonNullable<StoredPerFileState['transforms']>[number]],
+        });
+        const panel = open_excel(
+            '/corrupt-hidden-rows.xlsx',
+            state.store,
+            excel_profile({ count: 0 }),
+        );
+
+        const initial = await ready(panel);
+        expect(initial.meta.sheets[0].excelFirstRowHeader).toMatchObject({
+            mode: 'on', active: true, sourceRow: 0,
+        });
+    });
+
+    it('canonicalizes injected hidden rows before selecting a manual header', async () => {
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+        });
+        const panel = open_excel(
+            '/unsorted-hidden-rows.xlsx',
+            state.store,
+            excel_profile({ count: 0 }),
+        );
+        const initial = await ready(panel);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: [1, 0],
+                schema: '["People",2,null]',
+            },
+            requestId: 'unsorted-hidden-rows',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+        });
+        const applied = messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'unsorted-hidden-rows',
+        )!;
+        expect(applied.state.hiddenRows).toEqual([0, 1]);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Other",2,null]',
+            },
+            requestId: 'wrong-live-schema',
+            generation: applied.generation,
+            sourceGeneration: applied.sourceGeneration,
+            intent: 'user',
+        });
+        expect(messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'wrong-live-schema',
+        )).toMatchObject({
+            error: 'The saved table view no longer matches this sheet.',
+            state: { hiddenRows: [0, 1] },
+        });
+        expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            requestId: 'promote-after-unsorted',
+            generation: applied.generation,
+            sourceGeneration: applied.sourceGeneration,
+        });
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'promote-after-unsorted', outcome: 'applied' }));
+        expect(snapshots(panel).at(-1)?.meta.sheets[0].excelFirstRowHeader?.sourceRow)
+            .toBe(2);
+    });
+
     it('retains the exact result snapshot across ACK loss and watcher wake', async () => {
         const state = mutable_state_store();
         const builds = { count: 0 };

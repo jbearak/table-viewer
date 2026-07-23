@@ -41,6 +41,7 @@ class StubSource implements DataSource {
         private readonly rows: (RenderedCell | null)[][],
         private readonly merges: MergeRange[] = [],
         private readonly name = 'Sheet1',
+        private readonly source_rows?: readonly number[],
     ) {}
 
     meta(): WorkbookMeta {
@@ -49,7 +50,9 @@ class StubSource implements DataSource {
             sheets: [{
                 name: this.name,
                 rowCount: this.rows.length,
-                sourceRowCount: this.rows.length,
+                sourceRowCount: this.source_rows === undefined
+                    ? this.rows.length
+                    : Math.max(...this.source_rows) + 1,
                 columnCount: this.rows.reduce(
                     (max, row) => Math.max(max, row.length),
                     0,
@@ -58,6 +61,19 @@ class StubSource implements DataSource {
                 hasFormatting: this.rows.flat().some((value) => value?.bold),
             }],
         };
+    }
+
+    source_row_indices(_sheet: number, projected_rows: ArrayLike<number>): Uint32Array {
+        return Uint32Array.from(
+            projected_rows,
+            (row) => this.source_rows?.[row] ?? row,
+        );
+    }
+
+    projected_row_index(_sheet: number, source_row: number): number | undefined {
+        if (!this.source_rows) return source_row < this.rows.length ? source_row : undefined;
+        const projected = this.source_rows.indexOf(source_row);
+        return projected < 0 ? undefined : projected;
     }
 
     read_rows(_sheet: number, start: number, count: number): RowWindow {
@@ -377,6 +393,99 @@ describe('ExcelHeaderDataSource', () => {
             excelFirstRowHeader: { mode: 'off', active: false },
         });
         expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Name');
+    });
+
+    it('promotes the first non-hidden source row for an explicit override', () => {
+        const base = new StubSource([
+            [cell('Report title'), null],
+            [cell('Generated today'), null],
+            [cell('Name'), cell('Age')],
+            [cell('Alice'), cell(30)],
+            [cell('Bob'), cell(25)],
+        ]);
+        const ds = new ExcelHeaderDataSource(
+            base,
+            { Sheet1: 'on' },
+            [[0, 1]],
+        );
+
+        expect(ds.meta().sheets[0]).toMatchObject({
+            rowCount: 4,
+            columnNames: ['Name', 'Age'],
+            excelFirstRowHeader: {
+                mode: 'on', active: true, available: true, sourceRow: 2,
+            },
+        });
+        expect(ds.read_rows(0, 0, 4).rows.map((row) => row[0]?.raw)).toEqual([
+            'Report title',
+            'Generated today',
+            'Alice',
+            'Bob',
+        ]);
+        expect(ds.read_rows_indexed(0, [2, 0, 3]).rows.map((row) => row[0]?.raw))
+            .toEqual(['Alice', 'Report title', 'Bob']);
+        expect(ds.read_columns(0, 1, 2, [1, 0]).rows.map((row) => (
+            row.map((value) => value?.raw ?? null)
+        ))).toEqual([
+            [null, 'Generated today'],
+            ['30', 'Alice'],
+        ]);
+    });
+
+    it('makes manual promotion unavailable when every source row is hidden', () => {
+        const ds = new ExcelHeaderDataSource(
+            new StubSource([
+                [cell('Name'), cell('Age')],
+                [cell('Alice'), cell(30)],
+            ]),
+            { Sheet1: 'on' },
+            [[0, 1]],
+        );
+
+        expect(ds.meta().sheets[0]).toMatchObject({
+            rowCount: 2,
+            columnNames: undefined,
+            excelFirstRowHeader: {
+                mode: 'on', active: false, available: false,
+            },
+        });
+    });
+
+    it('keeps using exact membership after a non-monotonic source mapping', () => {
+        const ds = new ExcelHeaderDataSource(
+            new StubSource([
+                [cell('Five')],
+                [cell('One')],
+                [cell('Two')],
+            ], [], 'Sheet1', [5, 1, 2]),
+            { Sheet1: 'on' },
+            [[1, 2, 5]],
+        );
+
+        expect(ds.meta().sheets[0].excelFirstRowHeader).toMatchObject({
+            mode: 'on', active: false, available: false,
+        });
+    });
+
+    it('projects merges around an arbitrary promoted row', () => {
+        const ds = new ExcelHeaderDataSource(new StubSource([
+            [cell('before')],
+            [cell('before span')],
+            [cell('Header')],
+            [cell('after')],
+            [cell('after span')],
+        ], [
+            { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+            { startRow: 1, startCol: 0, endRow: 3, endCol: 0 },
+            { startRow: 2, startCol: 1, endRow: 2, endCol: 2 },
+            { startRow: 3, startCol: 1, endRow: 4, endCol: 1 },
+        ]), { Sheet1: 'on' }, [[0, 1]]);
+
+        expect(ds.meta().sheets[0].merges).toEqual([
+            { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+            { startRow: 1, startCol: 0, endRow: 2, endCol: 0 },
+            { startRow: 2, startCol: 1, endRow: 3, endCol: 1 },
+        ]);
     });
 
     it('uses formatted text for manual column names and supports header-only sheets', () => {

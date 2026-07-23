@@ -276,4 +276,18 @@ describe('sheet-state helpers', () => {
         }, 1, undefined, 6)).toBeUndefined();
     });
 
+    it('preserves canonical hidden rows when a stale schema drops column transforms', () => {
+        expect(sanitize_transform_state({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            hiddenRows: [3, 1, 3],
+            schema: '["People",1,["Old"]]',
+        }, 1, '["People",1,["New"]]', 5)).toEqual({
+            sort: [],
+            filters: [],
+            hiddenRows: [1, 3],
+            schema: '["People",1,["New"]]',
+        });
+    });
+
 });
