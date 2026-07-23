@@ -1167,6 +1167,9 @@ export function GridShell({
                             rows: CompactSelection.empty(),
                         });
                     }
+                    // Sweeping columns; don't arm the row-resize strip mid-drag.
+                    row_resize_ref.current?.set_target(null);
+                    return;
                 }
             }
             if (transformed) {
