@@ -63,6 +63,29 @@ export function grid_selection_contains_column(
     return compact_contains(selection.columns, display_column);
 }
 
+/** Display columns covered by the selection, ascending: the explicit header
+ *  selection when present, else the columns spanned by the current cell range
+ *  (and range stack). Mirrors selected_display_row_intervals for rows. */
+export function selected_display_columns(
+    selection: GridSelection,
+    display_column_count: number,
+): number[] {
+    const explicit = compact_to_array(selection.columns)
+        .filter((column) => Number.isSafeInteger(column)
+            && column >= 0
+            && column < display_column_count);
+    if (explicit.length > 0) return [...new Set(explicit)].sort((a, b) => a - b);
+    const current = selection.current;
+    if (!current) return [];
+    const covered = new Set<number>();
+    for (const range of [current.range, ...current.rangeStack]) {
+        const start = Math.max(0, range.x);
+        const end = Math.min(display_column_count - 1, range.x + range.width - 1);
+        for (let column = start; column <= end; column++) covered.add(column);
+    }
+    return [...covered].sort((a, b) => a - b);
+}
+
 /** Selected display columns in left-to-right order, mapped to source columns.
  *  Columns without a source mapping (stale indexes) are dropped. */
 export function selected_source_columns(

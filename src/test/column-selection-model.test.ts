@@ -4,6 +4,7 @@ import {
     grid_selection_contains_column,
     header_drag_columns,
     header_drag_state_for_selection,
+    selected_display_columns,
     selected_source_columns,
 } from '../webview/column-selection-model';
 import {
@@ -83,6 +84,46 @@ describe('grid_selection_contains_column', () => {
         const selection = selection_of(CompactSelection.fromSingleSelection([2, 5]));
         expect(grid_selection_contains_column(selection, 3)).toBe(true);
         expect(grid_selection_contains_column(selection, 5)).toBe(false);
+    });
+});
+
+describe('selected_display_columns', () => {
+    it('prefers the explicit header selection', () => {
+        const selection = selection_of(
+            CompactSelection.fromSingleSelection([1, 3]).add(6),
+        );
+        expect(selected_display_columns(selection, 10)).toEqual([1, 2, 6]);
+    });
+
+    it('falls back to the current cell range plus range stack', () => {
+        const selection: GridSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [2, 0],
+                range: { x: 2, y: 0, width: 2, height: 5 },
+                rangeStack: [{ x: 6, y: 1, width: 1, height: 1 }],
+            },
+        };
+        expect(selected_display_columns(selection, 10)).toEqual([2, 3, 6]);
+    });
+
+    it('clamps ranges to the display column count', () => {
+        const selection: GridSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: {
+                cell: [3, 0],
+                range: { x: 3, y: 0, width: 99, height: 1 },
+                rangeStack: [],
+            },
+        };
+        expect(selected_display_columns(selection, 5)).toEqual([3, 4]);
+    });
+
+    it('returns empty with no columns or current range', () => {
+        expect(selected_display_columns(selection_of(CompactSelection.empty()), 5))
+            .toEqual([]);
     });
 });
 
