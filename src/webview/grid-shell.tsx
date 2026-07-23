@@ -72,6 +72,12 @@ import { resolve_nav, is_copy_key } from './grid-nav-model';
 import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
+import {
+    CELL_TOOLTIP_SHOW_DELAY_MS,
+    cell_tooltip_position,
+    clamp_tooltip_text,
+    text_overflows_cell,
+} from './cell-overflow-model';
 import { use_editing, type DirtyEntry } from './use-editing';
 import {
     collect_exact_dirty_edits,
@@ -655,12 +661,16 @@ export function GridShell({
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
     grid_selection_ref.current = grid_selection;
+    // Populated once the truncated-cell tooltip helpers mount below; row menus
+    // open from an earlier hook, so they clear via this ref rather than a TDZ.
+    const hide_cell_tooltip_ref = useRef<() => void>(() => {});
     const open_row_marker_menu = useCallback((request: {
         x: number;
         y: number;
         row: number;
         display_rows: DisplayRowInterval[];
     }) => {
+        hide_cell_tooltip_ref.current();
         set_context_menu({ kind: 'row', ...request });
     }, []);
     const row_markers = use_row_marker_selection({
@@ -999,6 +1009,218 @@ export function GridShell({
     const sample_loaded_rows_ref = useRef(sample_loaded_rows);
     sample_loaded_rows_ref.current = sample_loaded_rows;
 
+    // Truncated-cell hover tooltip. Shown after a short dwell only when the
+    // displayed value does not fit the painted cell (horizontal ellipsis or
+    // vertical clip of wrapped / multiline text). Cleared on leave, scroll,
+    // and unmount so a stale bubble never lingers over a moved cell.
+    type CellTooltipState = {
+        text: string;
+        bounds: { x: number; y: number; width: number; height: number };
+        left: number;
+        top: number;
+    };
+    const [cell_tooltip, set_cell_tooltip] = useState<CellTooltipState | null>(null);
+    const cell_tooltip_timer_ref = useRef<number | null>(null);
+    const cell_tooltip_el_ref = useRef<HTMLDivElement | null>(null);
+    const cell_tooltip_key_ref = useRef<string | null>(null);
+
+    const clear_cell_tooltip_timer = useCallback(() => {
+        if (cell_tooltip_timer_ref.current !== null) {
+            window.clearTimeout(cell_tooltip_timer_ref.current);
+            cell_tooltip_timer_ref.current = null;
+        }
+    }, []);
+
+    const hide_cell_tooltip = useCallback(() => {
+        clear_cell_tooltip_timer();
+        cell_tooltip_key_ref.current = null;
+        set_cell_tooltip(null);
+    }, [clear_cell_tooltip_timer]);
+    hide_cell_tooltip_ref.current = hide_cell_tooltip;
+
+    useEffect(() => () => {
+        clear_cell_tooltip_timer();
+    }, [clear_cell_tooltip_timer]);
+
+    const ensure_measure_ctx = useCallback((): CanvasRenderingContext2D | null => {
+        if (!measure_ctx_ref.current) {
+            measure_ctx_ref.current = document
+                .createElement('canvas')
+                .getContext('2d');
+        }
+        return measure_ctx_ref.current;
+    }, []);
+
+    /** Displayed text for the tooltip / overflow check at a display cell. */
+    const displayed_cell_text = useCallback(
+        (display_column: number, row: number): string => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return '';
+            const key = `${row}:${source_column}`;
+            const dirty = dirty_cells_ref.current.get(key);
+            if (dirty) return dirty.value;
+
+            const merge = merge_index.entry_at(row, source_column);
+            // Vertical / 2D merges paint via the overlay from the anchor cell.
+            if (merge && !merge.horizontalOnly) {
+                const anchor_row = get_row(merge.startRow);
+                const anchor = anchor_row?.[merge.startCol];
+                if (!anchor) return '';
+                return show_formatting ? anchor.formatted : (anchor.raw ?? '');
+            }
+            // Horizontal merges echo the anchor on every spanned cell.
+            const content_col = merge?.horizontalOnly ? merge.startCol : source_column;
+            const cells = get_row(row);
+            const cell = cells?.[content_col];
+            if (!cell) return '';
+            return show_formatting ? cell.formatted : (cell.raw ?? '');
+        },
+        [get_row, merge_index, show_formatting, source_column_for_display],
+    );
+
+    const measure_line_width = useCallback(
+        (line: string, bold: boolean, italic: boolean): number => {
+            const ctx = ensure_measure_ctx();
+            if (!ctx) return line.length * 7;
+            ctx.font = canvas_font(
+                show_formatting && bold,
+                show_formatting && italic,
+                font_family,
+            );
+            return ctx.measureText(line).width;
+        },
+        [ensure_measure_ctx, font_family, show_formatting],
+    );
+
+    const font_flags_for_cell = useCallback(
+        (display_column: number, row: number): { bold: boolean; italic: boolean } => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return { bold: false, italic: false };
+            const merge = merge_index.entry_at(row, source_column);
+            // Content (and its bold/italic) always lives on the merge anchor.
+            const content_row = merge && !merge.horizontalOnly ? merge.startRow : row;
+            const content_col = merge ? merge.startCol : source_column;
+            const cell = get_row(content_row)?.[content_col];
+            return {
+                bold: !!cell?.bold,
+                italic: !!cell?.italic,
+            };
+        },
+        [get_row, merge_index, source_column_for_display],
+    );
+
+    /** Expand hover bounds to the full painted merge block when needed. */
+    const tooltip_bounds_for_cell = useCallback(
+        (
+            display_column: number,
+            row: number,
+            cell_bounds: { x: number; y: number; width: number; height: number },
+        ): { x: number; y: number; width: number; height: number } => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return cell_bounds;
+            const merge = merge_index.entry_at(row, source_column);
+            // Horizontal spans already report the full block via Glide's bounds.
+            if (!merge || merge.horizontalOnly) return cell_bounds;
+            const start_display = display_column_for_source(merge.startCol);
+            const end_display = display_column_for_source(merge.endCol);
+            if (start_display === undefined || end_display === undefined) return cell_bounds;
+            const top_left = grid_ref.current?.getBounds(start_display, merge.startRow);
+            const bottom_right = grid_ref.current?.getBounds(end_display, merge.endRow);
+            if (!top_left || !bottom_right) return cell_bounds;
+            return {
+                x: top_left.x,
+                y: top_left.y,
+                width: bottom_right.x + bottom_right.width - top_left.x,
+                height: bottom_right.y + bottom_right.height - top_left.y,
+            };
+        },
+        [display_column_for_source, merge_index, source_column_for_display],
+    );
+
+    const schedule_cell_tooltip = useCallback(
+        (
+            display_column: number,
+            row: number,
+            cell_bounds: { x: number; y: number; width: number; height: number },
+        ) => {
+            const key = `${row}:${display_column}`;
+            // Same cell still hovered — keep an already-visible tooltip, or let
+            // the pending timer fire. Avoid restarting the dwell on every move.
+            if (cell_tooltip_key_ref.current === key) return;
+
+            clear_cell_tooltip_timer();
+            cell_tooltip_key_ref.current = key;
+            set_cell_tooltip(null);
+
+            const text = displayed_cell_text(display_column, row);
+            if (!text) return;
+
+            const bounds = tooltip_bounds_for_cell(display_column, row, cell_bounds);
+            const flags = font_flags_for_cell(display_column, row);
+            const wrapping = text.includes('\n');
+            const overflows = text_overflows_cell(
+                text,
+                bounds.width,
+                (line) => measure_line_width(line, flags.bold, flags.italic),
+                {
+                    cell_height: bounds.height,
+                    wrapping,
+                },
+            );
+            if (!overflows) return;
+
+            const clamped = clamp_tooltip_text(text);
+            cell_tooltip_timer_ref.current = window.setTimeout(() => {
+                cell_tooltip_timer_ref.current = null;
+                // Drop if the pointer left this cell during the dwell.
+                if (cell_tooltip_key_ref.current !== key) return;
+                // Initial placement uses an estimated size; layout effect below
+                // re-centers once the real tooltip box is measured.
+                const estimated = {
+                    width: Math.min(360, Math.max(80, clamped.length * 7)),
+                    height: 28 + (clamped.match(/\n/g)?.length ?? 0) * 16,
+                };
+                const pos = cell_tooltip_position(bounds, estimated);
+                set_cell_tooltip({
+                    text: clamped,
+                    bounds,
+                    left: pos.left,
+                    top: pos.top,
+                });
+            }, CELL_TOOLTIP_SHOW_DELAY_MS);
+        },
+        [
+            clear_cell_tooltip_timer,
+            displayed_cell_text,
+            font_flags_for_cell,
+            measure_line_width,
+            tooltip_bounds_for_cell,
+        ],
+    );
+
+    // Re-measure the mounted tooltip and re-clamp into the viewport so long
+    // multi-line content doesn't sit off-screen after the estimate.
+    useLayoutEffect(() => {
+        if (!cell_tooltip) return;
+        const el = cell_tooltip_el_ref.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const pos = cell_tooltip_position(cell_tooltip.bounds, {
+            width: rect.width,
+            height: rect.height,
+        });
+        if (
+            Math.abs(pos.left - cell_tooltip.left) > 0.5
+            || Math.abs(pos.top - cell_tooltip.top) > 0.5
+        ) {
+            set_cell_tooltip({
+                ...cell_tooltip,
+                left: pos.left,
+                top: pos.top,
+            });
+        }
+    }, [cell_tooltip]);
+
     const compute_auto_fit = useCallback((): Record<number, number> | null => {
         if (!has_visible_columns) return null;
         if (!measure_ctx_ref.current) {
@@ -1209,6 +1431,8 @@ export function GridShell({
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
+    // Also drives the truncated-cell tooltip: dwell on an overflowing cell
+    // surfaces the full displayed value without changing selection or edit mode.
     const on_item_hovered = useCallback(
         (args: GridMouseEventArgs) => {
             row_markers.observe_hover(args);
@@ -1237,13 +1461,27 @@ export function GridShell({
                     }
                     // Sweeping columns; don't arm the row-resize strip mid-drag.
                     row_resize_ref.current?.set_target(null);
+                    hide_cell_tooltip();
                     return;
                 }
             }
             if (row_markers.handle_hover_drag(args)) {
                 // Sweeping rows; don't arm the row-resize strip mid-drag.
                 row_resize_ref.current?.set_target(null);
+                hide_cell_tooltip();
                 return;
+            }
+            if (args.kind !== 'cell' || args.location[0] < 0 || args.location[1] < 0) {
+                hide_cell_tooltip();
+            } else if ((args.buttons & 1) !== 0) {
+                // Primary button down (drag-select / resize) — no tooltip.
+                hide_cell_tooltip();
+            } else {
+                schedule_cell_tooltip(
+                    args.location[0],
+                    args.location[1],
+                    args.bounds,
+                );
             }
             if (transformed) {
                 row_resize_ref.current?.set_target(null);
@@ -1271,7 +1509,14 @@ export function GridShell({
                     : null,
             );
         },
-        [display_column_count, row_heights, row_markers, transformed],
+        [
+            display_column_count,
+            hide_cell_tooltip,
+            row_heights,
+            row_markers,
+            schedule_cell_tooltip,
+            transformed,
+        ],
     );
 
     // Snapshot the compact row selection once. Live moves retain that compact
@@ -1701,6 +1946,7 @@ export function GridShell({
             );
             if (source_cols.length > 1) {
                 focused_source_column_ref.current = source_column;
+                hide_cell_tooltip();
                 set_context_menu({
                     kind: 'multi-column',
                     x,
@@ -1712,6 +1958,7 @@ export function GridShell({
             }
         }
         select_header_column(display_column);
+        hide_cell_tooltip();
         set_context_menu({
             kind: 'header',
             x,
@@ -1719,7 +1966,7 @@ export function GridShell({
             display_col: display_column,
             source_col: source_column,
         });
-    }, [select_header_column, source_column_for_display]);
+    }, [hide_cell_tooltip, select_header_column, source_column_for_display]);
 
     // Glide gives no clientX/clientY — derive them from the cell bounds plus the
     // in-cell offset. Right-clicking outside the current selection collapses it to
@@ -1752,6 +1999,7 @@ export function GridShell({
 
             const source_column = source_column_for_display(anchor_col);
             if (source_column === undefined) return;
+            hide_cell_tooltip();
             set_context_menu({
                 kind: 'cell',
                 x: event.bounds.x + event.localEventX,
@@ -1761,7 +2009,7 @@ export function GridShell({
                 source_col: source_column,
             });
         },
-        [merges, row_markers, select_rect, source_column_for_display],
+        [hide_cell_tooltip, merges, row_markers, select_rect, source_column_for_display],
     );
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
@@ -1917,6 +2165,9 @@ export function GridShell({
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
+            // Scroll moves cells under the cursor; drop any open tooltip so it
+            // can't float over the wrong content mid-scroll.
+            hide_cell_tooltip();
             // Repaint the merge overlay against the live scroll (fires per
             // smooth-scroll frame, so blocks stay pinned to their cells).
             overlay_ref.current?.repaint(range);
@@ -1940,6 +2191,7 @@ export function GridShell({
         },
         [
             ensure_rows,
+            hide_cell_tooltip,
             on_preview_visible_row_change,
             pending_preview_scroll,
             preview_mode,
@@ -2196,6 +2448,19 @@ export function GridShell({
                     on_resize={handle_row_resize_drag}
                     on_resize_end={handle_row_resize_end}
                 />
+            )}
+            {cell_tooltip && (
+                <div
+                    ref={cell_tooltip_el_ref}
+                    className="cell-overflow-tooltip"
+                    role="tooltip"
+                    style={{
+                        left: cell_tooltip.left,
+                        top: cell_tooltip.top,
+                    }}
+                >
+                    {cell_tooltip.text}
+                </div>
             )}
             {context_menu?.kind === 'cell' && (
                 <ContextMenu
