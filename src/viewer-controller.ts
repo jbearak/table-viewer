@@ -3085,10 +3085,11 @@ export function attach_viewer(
                         fail('The selected row is no longer available.');
                         return;
                     }
-                    if (
-                        header_source_row === undefined
-                        || header_source_row > MAX_PERSISTED_HIDDEN_ROWS
-                    ) {
+                    if (header_source_row === undefined) {
+                        fail('The selected row is no longer available.');
+                        return;
+                    }
+                    if (header_source_row > MAX_PERSISTED_HIDDEN_ROWS) {
                         fail('Too many rows precede the selected header row.');
                         return;
                     }
