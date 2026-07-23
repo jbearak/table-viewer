@@ -21,8 +21,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     root = createRoot(container);
 
     const merged_props: React.ComponentProps<typeof Toolbar> = {
-        row_count: 3,
-        source_row_count: 3,
         transform: { sort: [], filters: [] },
         transform_disabled: false,
         transform_pending: false,
@@ -220,7 +218,6 @@ describe('Toolbar', () => {
         Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
             configurable: true,
             get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-row-count')) return 70;
                 if (this.classList.contains('toolbar-item')) return 50;
                 return 0;
             },
@@ -494,11 +491,9 @@ describe('Toolbar', () => {
         expect(get_tooltip()).toBeNull();
     });
 
-    it('composes row count, hidden-column transform chips, progress, cancel, and actions', () => {
+    it('composes hidden-column transform chips, progress, cancel, and actions', () => {
         const on_cancel_transform = vi.fn();
         const { container } = render_toolbar({
-            row_count: 2,
-            source_row_count: 5,
             column_names: ['Visible', 'Hidden active'],
             transform: {
                 sort: [{ colIndex: 1, direction: 'asc' }],
@@ -516,7 +511,7 @@ describe('Toolbar', () => {
             merges_flattened: true,
             on_cancel_transform,
         });
-        expect(container.textContent).toContain('2 of 5 rows');
+        expect(container.textContent).not.toMatch(/\d+ of \d+ rows/);
         expect(container.textContent).toContain('Hidden active');
         expect(container.textContent).toContain('Applying saved…');
         expect(container.textContent).toContain('Merged cells shown unmerged');
@@ -542,7 +537,6 @@ describe('Toolbar', () => {
         Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
             configurable: true,
             get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-row-count')) return 70;
                 if (this.classList.contains('sort-strip')) return 210;
                 if (this.classList.contains('filter-strip')) return 240;
                 if (this.classList.contains('toolbar-merge-notice')) return 360;
@@ -627,7 +621,6 @@ describe('Toolbar', () => {
         Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
             configurable: true,
             get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-row-count')) return 50;
                 if (this.classList.contains('toolbar-progress')) {
                     return this.textContent?.includes('A much longer pending progress label')
                         ? 700
