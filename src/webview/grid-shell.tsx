@@ -49,6 +49,7 @@ import {
     grid_selection_contains_column,
     header_drag_columns,
     header_drag_state_for_selection,
+    selected_display_columns,
     selected_source_columns,
     type HeaderDragState,
 } from './column-selection-model';
@@ -1919,6 +1920,17 @@ export function GridShell({
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
+        // Columns the selection spans; hide targets all of them (falls back to
+        // the clicked column when the selection maps to nothing usable).
+        const selected_column_sources = selected_display_columns(
+            grid_selection,
+            display_column_count,
+        )
+            .map(source_column_for_display)
+            .filter((column): column is number => column !== undefined);
+        const hide_column_targets = selected_column_sources.length > 0
+            ? selected_column_sources
+            : [source_col];
         const selected_row_count = selected_rows?.reduce(
             (total, interval) => total + interval.end - interval.start + 1,
             0,
@@ -1940,6 +1952,7 @@ export function GridShell({
                 && !edit_mode
                 && !preview_mode,
             selected_row_count,
+            selected_column_count: hide_column_targets.length,
             can_clear_highlight: highlight_selection_may_have_renderable_highlight(
                 highlight_selection,
                 cell_highlights?.cells,
@@ -1961,7 +1974,13 @@ export function GridShell({
             on_hide_rows: () => {
                 if (selected_rows) on_hide_rows(selected_rows);
             },
-            on_hide_column: () => hide_source_column(source_col),
+            on_hide_columns: () => {
+                if (hide_column_targets.length === 1) {
+                    hide_source_column(hide_column_targets[0]);
+                } else {
+                    hide_source_columns_multi(hide_column_targets);
+                }
+            },
             on_select_row: () => select_row(row),
             on_select_column: () => select_column(display_col),
             on_select_all: select_all,

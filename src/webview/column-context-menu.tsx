@@ -112,6 +112,18 @@ export function column_context_menu_items(
     return items;
 }
 
+/** Shared hide-column(s) action so the cell and header menus can't drift apart. */
+export function hide_columns_menu_item(
+    selected_column_count: number,
+    on_hide_columns: () => void,
+): ActionMenuItem {
+    const count = Math.max(1, selected_column_count);
+    return {
+        label: count === 1 ? 'Hide column' : `Hide ${count} columns`,
+        on_click: () => on_hide_columns(),
+    };
+}
+
 export interface MultiColumnContextMenuProps {
     x: number;
     y: number;
@@ -131,7 +143,7 @@ export function multi_column_context_menu_items(
     const count = Math.max(2, props.column_count);
     const items: (ActionMenuItem | MenuSeparator)[] = [
         { label: `Copy ${count} columns`, on_click: () => props.on_copy() },
-        { label: `Hide ${count} columns`, on_click: () => props.on_hide() },
+        hide_columns_menu_item(count, props.on_hide),
     ];
     if (!props.transform_sections) return items;
     items.push(

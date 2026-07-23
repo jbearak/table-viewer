@@ -9,6 +9,7 @@ function base() {
         preview_mode: false,
         can_hide_rows: true,
         selected_row_count: 1,
+        selected_column_count: 1,
         can_clear_highlight: false,
         highlight_cell_count: 0,
         on_discard_edit: vi.fn(),
@@ -17,7 +18,7 @@ function base() {
         on_highlight: vi.fn(),
         on_clear_highlight: vi.fn(),
         on_hide_rows: vi.fn(),
-        on_hide_column: vi.fn(),
+        on_hide_columns: vi.fn(),
         on_select_row: vi.fn(),
         on_select_column: vi.fn(),
         on_select_all: vi.fn(),
@@ -61,6 +62,16 @@ describe('cell context menu model', () => {
             .toEqual(['Select row', 'Select column', 'Select all']);
     });
 
+    it('shows a count-aware Hide n columns for multi-column selections', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            selected_row_count: 2,
+            selected_column_count: 4,
+        });
+        expect(submenu(items, 'Hide').map((item) => item.kind === 'separator' ? '' : item.label))
+            .toEqual(['Hide 2 rows', 'Hide 4 columns']);
+    });
+
     it('gates row hiding and highlights while always retaining Hide column', () => {
         const items = cell_context_menu_items({
             ...base(),
@@ -80,7 +91,7 @@ describe('cell context menu model', () => {
         action(submenu(items, 'Hide'), 'Hide column').on_click({} as never);
         action(submenu(items, 'Select'), 'Select all').on_click({} as never);
         expect(props.on_hide_rows).toHaveBeenCalledOnce();
-        expect(props.on_hide_column).toHaveBeenCalledOnce();
+        expect(props.on_hide_columns).toHaveBeenCalledOnce();
         expect(props.on_select_all).toHaveBeenCalledOnce();
     });
 });

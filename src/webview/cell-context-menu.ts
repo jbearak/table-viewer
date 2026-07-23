@@ -2,6 +2,7 @@ import type { CellHighlightColor } from '../types';
 import type { MenuItem } from './context-menu';
 import { CELL_HIGHLIGHT_COLORS } from './highlight-theme';
 import { hide_rows_menu_item } from './row-context-menu';
+import { hide_columns_menu_item } from './column-context-menu';
 
 export interface CellContextMenuModelProps {
     dirty: boolean;
@@ -9,6 +10,7 @@ export interface CellContextMenuModelProps {
     preview_mode: boolean;
     can_hide_rows: boolean;
     selected_row_count: number;
+    selected_column_count: number;
     can_clear_highlight: boolean;
     highlight_cell_count: number;
     on_discard_edit: () => void;
@@ -17,7 +19,7 @@ export interface CellContextMenuModelProps {
     on_highlight: (color: CellHighlightColor) => void;
     on_clear_highlight: () => void;
     on_hide_rows: () => void;
-    on_hide_column: () => void;
+    on_hide_columns: () => void;
     on_select_row: () => void;
     on_select_column: () => void;
     on_select_all: () => void;
@@ -53,7 +55,9 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
     if (props.can_hide_rows) {
         hide_items.push(hide_rows_menu_item(props.selected_row_count, props.on_hide_rows));
     }
-    hide_items.push({ label: 'Hide column', on_click: () => props.on_hide_column() });
+    hide_items.push(
+        hide_columns_menu_item(props.selected_column_count, props.on_hide_columns),
+    );
     items.push(
         { kind: 'separator' },
         { kind: 'submenu', label: 'Hide', items: hide_items },
