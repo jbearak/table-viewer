@@ -1150,7 +1150,7 @@ export function GridShell({
             // this never fires while resizing.)
             const drag = header_drag_ref.current;
             if (drag) {
-                if (args.buttons === 0) {
+                if ((args.buttons & 1) === 0) {
                     header_drag_ref.current = null;
                 } else if (
                     (args.kind === 'header' || args.kind === 'cell')
@@ -1217,6 +1217,20 @@ export function GridShell({
     // onGridSelectionChange before any drag movement); consumed by hover events
     // while the primary button stays down to grow the column selection.
     const header_drag_ref = useRef<HeaderDragState | null>(null);
+
+    // A release outside the grid produces no zero-button grid hover, so without
+    // this a later press elsewhere could resume a long-finished header drag.
+    useEffect(() => {
+        const end_header_drag = () => {
+            header_drag_ref.current = null;
+        };
+        window.addEventListener('pointerup', end_header_drag);
+        window.addEventListener('blur', end_header_drag);
+        return () => {
+            window.removeEventListener('pointerup', end_header_drag);
+            window.removeEventListener('blur', end_header_drag);
+        };
+    }, []);
 
     const on_grid_selection_change = useCallback(
         (sel: GridSelection) => {
