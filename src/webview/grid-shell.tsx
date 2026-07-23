@@ -66,6 +66,7 @@ import {
     format_selection_tsv,
     copy_truncation_message,
     display_row_indices,
+    DEFAULT_MAX_ROWS,
 } from './grid-copy-model';
 import { resolve_nav, is_copy_key } from './grid-nav-model';
 import { move_active_cell } from './selection';
@@ -191,7 +192,8 @@ export interface GridActionsHandle {
     /** Sheet this handle's grid is mounted for; guards stale-remount races. */
     sheet_index: number;
     select_all(): void;
-    copy_sheet(): void;
+    /** Loads the sheet's rows before serializing, so it resolves asynchronously. */
+    copy_sheet(): Promise<void>;
 }
 
 export interface PendingPreviewScroll {
@@ -452,7 +454,14 @@ export function GridShell({
         [column_projection.source_to_visible],
     );
 
-    const { ensure_rows, get_row, get_source_row, sample_loaded_rows, version } = loader;
+    const {
+        ensure_rows,
+        ensure_rows_loaded,
+        get_row,
+        get_source_row,
+        sample_loaded_rows,
+        version,
+    } = loader;
     const lifecycle_operation = (
         save_lifecycle.state === 'active'
         || save_lifecycle.state === 'failed'
@@ -1455,15 +1464,24 @@ export function GridShell({
     }, [copy_source_selection, visible_source_columns]);
 
     // Whole visible sheet with a header row (delegates to copy_rect, so the same
-    // clipboard-failure and truncation handling applies).
-    const copy_sheet = useCallback(() => {
+    // clipboard-failure and truncation handling applies). Because this copies
+    // rows the user may never have scrolled into view — "Copy sheet" can target
+    // a sheet that was just switched to, whose pages are still in flight — load
+    // the full range (bounded by the copy cap) before serializing, so the copy
+    // doesn't come back blank with a "scroll to load" warning it can't act on.
+    const copy_sheet = useCallback(async () => {
+        if (row_count === 0 || display_column_count === 0) return;
+        const loaded = await ensure_rows_loaded(0, Math.min(row_count, DEFAULT_MAX_ROWS) - 1);
+        // A sheet switch or reload cleared the cache mid-load: abandon the copy
+        // rather than overwrite the clipboard with a now-empty grid.
+        if (!loaded) return;
         copy_rect({
             x: 0,
             y: 0,
             width: display_column_count,
             height: row_count,
         }, true);
-    }, [copy_rect, display_column_count, row_count]);
+    }, [copy_rect, display_column_count, ensure_rows_loaded, row_count]);
 
     // Publish sheet-tab actions to App, mirroring the grid_focus_ref bridge. The
     // sheet_index lets App reject a stale handle during a keyed remount.
