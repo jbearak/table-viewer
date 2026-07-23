@@ -123,6 +123,9 @@ export class RelativePattern {
 
 type MessageHandler = (message: unknown) => unknown;
 type WatchHandler = (uri: UriLike) => unknown;
+type ConfigurationChangeHandler = (
+    event: { affectsConfiguration(section: string): boolean },
+) => unknown;
 
 interface MockWebviewPanel {
     title: string;
@@ -154,6 +157,7 @@ export interface MockWatcher {
 
 const panels: MockWebviewPanel[] = [];
 const watchers: MockWatcher[] = [];
+const configuration_change_handlers: ConfigurationChangeHandler[] = [];
 const custom_editor_registrations: {
     viewType: string;
     provider: unknown;
@@ -470,6 +474,10 @@ export const workspace = {
     getConfiguration() {
         return { get: (_key: string, fallback: unknown) => fallback };
     },
+    onDidChangeConfiguration(handler: ConfigurationChangeHandler) {
+        configuration_change_handlers.push(handler);
+        return disposable(configuration_change_handlers, handler);
+    },
 };
 
 export const extensions = {
@@ -481,6 +489,7 @@ export const extensions = {
 export function __reset(): void {
     panels.length = 0;
     watchers.length = 0;
+    configuration_change_handlers.length = 0;
     custom_editor_registrations.length = 0;
     stat_impl = undefined;
     read_file_impl = undefined;

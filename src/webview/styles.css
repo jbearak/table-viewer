@@ -13,7 +13,7 @@ html, body, #root {
 }
 
 body {
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, monospace));
     font-size: 13px;
     color: var(--vscode-editor-foreground, #ccc);
     background: var(--vscode-editor-background, #1e1e1e);
@@ -386,7 +386,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, monospace));
     font-size: 12px;
     line-height: 1.35;
     text-align: left;
@@ -486,7 +486,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 
 .data-table {
     border-collapse: collapse;
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, monospace));
     font-size: 13px;
 }
 
@@ -676,7 +676,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     border: 2px solid var(--vscode-focusBorder, #007acc);
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, monospace));
     font-size: 13px;
     outline: none;
     box-sizing: border-box;

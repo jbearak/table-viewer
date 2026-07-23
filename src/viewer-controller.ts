@@ -18,7 +18,11 @@ import {
 } from './panel-core';
 import { PanelSession, type PanelAdoption } from './panel-session';
 import {
-    get_csv_max_rows, get_default_orientation, get_delimiter, get_max_file_size_mib,
+    get_csv_max_rows,
+    get_default_orientation,
+    get_delimiter,
+    get_font_family,
+    get_max_file_size_mib,
 } from './viewer-config';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
@@ -475,6 +479,18 @@ export function attach_viewer(
         }
         throw error;
     };
+
+    try {
+        disposables.push(vscode.workspace.onDidChangeConfiguration((event) => {
+            if (!event.affectsConfiguration('tableViewer.fontFamily')) return;
+            void post_to_receiver({
+                type: 'fontFamilyChanged',
+                fontFamily: get_font_family(),
+            });
+        }));
+    } catch (error) {
+        return abort_setup(error);
+    }
 
     if (file_edit_state) {
         const edit_state_subscriber: CsvEditStateSubscriber = (snapshot) => {

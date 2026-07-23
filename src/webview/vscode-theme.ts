@@ -13,6 +13,18 @@ import type { Theme } from '@glideapps/glide-data-grid';
 
 type VarGetter = (name: string) => string;
 
+export function apply_font_family(
+    font_family: string | null,
+    root: HTMLElement = document.documentElement,
+): void {
+    const normalized = font_family?.trim();
+    if (normalized) {
+        root.style.setProperty('--table-viewer-font-family', normalized);
+    } else {
+        root.style.removeProperty('--table-viewer-font-family');
+    }
+}
+
 export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
     const v = (name: string, fallback: string): string => {
         const value = get(name).trim();
@@ -31,7 +43,10 @@ export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
     const text_light = v('--vscode-disabledForeground', text_medium);
     const link = v('--vscode-textLink-foreground', accent);
     const search = v('--vscode-editor-findMatchHighlightBackground', accent_light);
-    const font = v('--vscode-editor-font-family', v('--vscode-font-family', 'sans-serif'));
+    const font = v(
+        '--table-viewer-font-family',
+        v('--vscode-editor-font-family', v('--vscode-font-family', 'sans-serif')),
+    );
 
     return {
         accentColor: accent,

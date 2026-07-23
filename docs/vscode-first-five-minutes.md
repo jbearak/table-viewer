@@ -88,6 +88,22 @@ Closing Chat or hiding the Secondary Side Bar only removes Chat from view. To tu
 
 This hides built-in Chat and inline AI suggestions and disables the GitHub Copilot extensions if they are installed. Return to the same setting and turn it off if you want those features later.
 
+## Choose a comfortable font
+
+Table Viewer uses the same font as VS Code's text editor by default. This keeps tables and source files visually consistent, and means that changing VS Code's editor font changes both.
+
+First install the font on your computer. Two readable, free, open-source choices are:
+
+- [**Hack**](https://sourcefoundry.org/hack/) is a sturdy monospaced font designed for source code, with distinct character shapes and regular, bold, italic, and bold italic styles.
+- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a newer fixed-width font with a wide range of weights. Its release archive includes the files to install.
+
+After installing a font, choose whether to use it everywhere or only in tables:
+
+- **Change the editor and Table Viewer together:** Open **Settings**, search for `editor font family`, and set **Editor: Font Family** to the installed family name, such as `Hack` or `Google Sans Code`. Because `tableViewer.fontFamily` is empty by default, Table Viewer follows this setting.
+- **Change only Table Viewer:** Open **Settings**, search for `table viewer font family`, and set **Table Viewer: Font Family** to the installed family name. The text editor keeps its existing font.
+
+Clear **Table Viewer: Font Family** at any time to make Table Viewer follow **Editor: Font Family** again. If a newly installed font does not appear immediately, restart VS Code after installing it.
+
 ## Match the screenshots' colors, if you like
 
 The light colors in the guide screenshots come from the **Catppuccin Latte** theme. A theme changes VS Code's appearance; it does not change your workbooks.

@@ -622,6 +622,7 @@ function cleanup() {
     active_post_message = undefined;
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
+    document.documentElement.style.removeProperty('--table-viewer-font-family');
     grid_shell_mock.is_dirty = false;
     grid_shell_mock.has_live_uncommitted = false;
     grid_shell_mock.save_in_flight = false;
@@ -657,6 +658,25 @@ describe('initial render', () => {
     it('posts a ready message on mount', async () => {
         const { post_message } = await render_app();
         expect(post_message).toHaveBeenCalledWith({ type: 'ready' });
+    });
+
+    it('applies and clears live font-family updates', async () => {
+        await render_app();
+        await dispatch_host_message({
+            type: 'fontFamilyChanged',
+            fontFamily: 'Atkinson Hyperlegible',
+        });
+        expect(document.documentElement.style.getPropertyValue(
+            '--table-viewer-font-family',
+        )).toBe('Atkinson Hyperlegible');
+
+        await dispatch_host_message({
+            type: 'fontFamilyChanged',
+            fontFamily: null,
+        });
+        expect(document.documentElement.style.getPropertyValue(
+            '--table-viewer-font-family',
+        )).toBe('');
     });
 
     it('mounts the grid and toolbar after the initial snapshot', async () => {
