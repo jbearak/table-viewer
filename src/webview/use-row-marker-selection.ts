@@ -46,6 +46,27 @@ interface UseRowMarkerSelectionOptions {
     on_open_menu: (request: RowMarkerMenuRequest) => void;
 }
 
+function build_menu_request(
+    selection: GridSelection,
+    row: number,
+    row_count: number,
+    event: CellClickedEventArgs,
+): { inside: boolean; request: RowMarkerMenuRequest } {
+    const inside = grid_selection_contains_row(selection, row);
+    return {
+        inside,
+        request: {
+            x: event.bounds.x + event.localEventX,
+            y: event.bounds.y + event.localEventY,
+            row,
+            display_rows: inside
+                ? selected_display_row_intervals(selection, row_count)
+                    ?? [{ start: row, end: row }]
+                : [{ start: row, end: row }],
+        },
+    };
+}
+
 /** Coordinates Glide's row-marker mouse, touch, drag, and context-menu event
  * ordering while GridShell remains the owner of the controlled selection. */
 export function use_row_marker_selection({
@@ -187,21 +208,18 @@ export function use_row_marker_selection({
             event.preventDefault();
             drag_ref.current = null;
             const current = selection_ref.current;
-            const inside = grid_selection_contains_row(current, row);
+            const { inside, request } = build_menu_request(
+                current,
+                row,
+                row_count,
+                event,
+            );
             const rows = inside
                 ? current.rows
                 : CompactSelection.fromSingleSelection(row);
             touch_selection_ref.current = rows;
             set_selection({ columns: CompactSelection.empty(), rows });
-            on_open_menu({
-                x: event.bounds.x + event.localEventX,
-                y: event.bounds.y + event.localEventY,
-                row,
-                display_rows: inside
-                    ? selected_display_row_intervals(current, row_count)
-                        ?? [{ start: row, end: row }]
-                    : [{ start: row, end: row }],
-            });
+            on_open_menu(request);
             return;
         }
         const restore_row = click_restore_ref.current;
@@ -224,11 +242,12 @@ export function use_row_marker_selection({
     const on_context_menu = useCallback((row: number, event: CellClickedEventArgs) => {
         drag_ref.current = null;
         const current = selection_ref.current;
-        const inside = grid_selection_contains_row(current, row);
-        const display_rows = inside
-            ? selected_display_row_intervals(current, row_count)
-                ?? [{ start: row, end: row }]
-            : [{ start: row, end: row }];
+        const { inside, request } = build_menu_request(
+            current,
+            row,
+            row_count,
+            event,
+        );
         if (!inside) {
             context_row_ref.current = row;
             set_selection({
@@ -242,12 +261,7 @@ export function use_row_marker_selection({
                 if (context_row_ref.current === row) context_row_ref.current = null;
             });
         }
-        on_open_menu({
-            x: event.bounds.x + event.localEventX,
-            y: event.bounds.y + event.localEventY,
-            row,
-            display_rows,
-        });
+        on_open_menu(request);
     }, [on_open_menu, row_count, selection_ref, set_selection]);
 
     return useMemo(() => ({
