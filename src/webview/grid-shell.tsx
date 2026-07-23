@@ -42,8 +42,10 @@ import {
 } from '../types';
 import type { ColumnProjection } from './column-projection';
 import { build_grid_columns } from './grid-model';
-import { ContextMenu, type MenuItem } from './context-menu';
+import { ContextMenu } from './context-menu';
+import { cell_context_menu_items } from './cell-context-menu';
 import { ColumnContextMenu } from './column-context-menu';
+import { row_context_menu_items } from './row-context-menu';
 import { draw_sort_glyphs, header_sort_metadata } from './header-sort-glyph';
 import {
     append_sort,
@@ -54,6 +56,7 @@ import {
 import {
     format_selection_tsv,
     copy_truncation_message,
+    display_row_indices,
 } from './grid-copy-model';
 import { resolve_nav, is_copy_key } from './grid-nav-model';
 import { move_active_cell } from './selection';
@@ -91,11 +94,12 @@ import {
 import { expand_glide_selection } from './selection-glide';
 import {
     grid_selection_contains_cell,
+    grid_selection_contains_row,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
     selected_display_row_intervals,
 } from './highlight-selection-model';
-import { CELL_HIGHLIGHT_COLORS, highlight_rgba } from './highlight-theme';
+import { highlight_rgba } from './highlight-theme';
 import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
@@ -371,6 +375,12 @@ export function GridShell({
         y: number;
         display_col: number;
         source_col: number;
+    } | {
+        kind: 'row';
+        x: number;
+        y: number;
+        row: number;
+        display_rows: DisplayRowInterval[];
     }) | null>(null);
 
     const columns = useMemo<GridColumn[]>(
@@ -1272,6 +1282,18 @@ export function GridShell({
         [copy_source_selection, visible_source_columns],
     );
 
+    const copy_display_rows = useCallback((intervals: readonly DisplayRowInterval[]) => {
+        const row_count_total = intervals.reduce(
+            (total, interval) => total + interval.end - interval.start + 1,
+            0,
+        );
+        copy_source_selection({
+            row_indices: display_row_indices(intervals),
+            row_count: row_count_total,
+            source_columns: visible_source_columns,
+        });
+    }, [copy_source_selection, visible_source_columns]);
+
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
         focused_source_column_ref.current = source_column_for_display(anchor[0]);
         set_grid_selection({
@@ -1316,6 +1338,18 @@ export function GridShell({
             height: row_count,
         });
     }, [row_count, display_column_count, select_rect]);
+
+    const hide_source_column = useCallback((source_column: number) => {
+        if (display_column_count === 1) {
+            // The projection update removes Glide entirely, so ContextMenu's normal
+            // grid restoration has no target.
+            suppress_menu_restore_ref.current = true;
+            on_hide_column(source_column);
+            window.setTimeout(on_focus_columns, 0);
+            return;
+        }
+        on_hide_column(source_column);
+    }, [display_column_count, on_focus_columns, on_hide_column]);
 
     const discard_edit = useCallback(
         (row: number, display_column: number, source_column: number) => {
@@ -1399,6 +1433,27 @@ export function GridShell({
         (cell: Item, event: CellClickedEventArgs) => {
             event.preventDefault();
             const [col, row] = cell;
+            if (col < 0) {
+                const inside = grid_selection_contains_row(grid_selection_ref.current, row);
+                const display_rows = inside
+                    ? selected_display_row_intervals(grid_selection_ref.current, row_count)
+                        ?? [{ start: row, end: row }]
+                    : [{ start: row, end: row }];
+                if (!inside) {
+                    set_grid_selection({
+                        columns: CompactSelection.empty(),
+                        rows: CompactSelection.fromSingleSelection(row),
+                    });
+                }
+                set_context_menu({
+                    kind: 'row',
+                    x: event.bounds.x + event.localEventX,
+                    y: event.bounds.y + event.localEventY,
+                    row,
+                    display_rows,
+                });
+                return;
+            }
             const { cell: anchor, range: anchor_range } = expand_glide_selection(
                 cell,
                 { x: col, y: row, width: 1, height: 1 },
@@ -1428,7 +1483,7 @@ export function GridShell({
                 source_col: source_column,
             });
         },
-        [merges, select_rect, source_column_for_display],
+        [merges, row_count, select_rect, source_column_for_display],
     );
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
@@ -1724,91 +1779,60 @@ export function GridShell({
         [on_column_resize, source_column_for_display],
     );
 
-    // Build menu items for the open context menu. "Copy selection" appears only
-    // for a multi-cell selection; "Discard edit" only when the clicked cell is
-    // dirty. Editing the cell isn't offered (no clean Glide open-overlay API).
-    const menu_items: MenuItem[] = [];
+    // Snapshot the cell menu's effective selection while rendering so every model
+    // callback targets the same rows and range that supplied its labels.
+    let cell_menu_items = null;
     if (context_menu?.kind === 'cell') {
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
-        const is_multi_cell = !!range && range.width * range.height > 1;
-        // Label singular/plural from the same selection the mutation targets,
-        // so row/column-marker selections (where `range` is absent) stay plural.
+        const selected_rows = selected_display_row_intervals(grid_selection, row_count);
+        const selected_row_count = selected_rows?.reduce(
+            (total, interval) => total + interval.end - interval.start + 1,
+            0,
+        ) ?? 1;
         const highlight_selection = current_highlight_selection();
         const highlight_cell_count = highlight_selection
             ? highlight_selection.displayRows.reduce(
-                (total, interval) => total + (interval.end - interval.start + 1),
+                (total, interval) => total + interval.end - interval.start + 1,
                 0,
             ) * highlight_selection.sourceColumns.length
             : 0;
-        const can_clear_highlight = highlight_selection_may_have_renderable_highlight(
-            highlight_selection,
-            cell_highlights?.cells,
-            get_source_row,
-        );
-        if (dirty_cells.has(`${row}:${source_col}`)) {
-            menu_items.push({
-                label: 'Discard edit',
-                on_click: () => discard_edit(row, display_col, source_col),
-            });
-        }
-        menu_items.push({
-            label: 'Copy cell',
-            on_click: () => copy_rect({
+        cell_menu_items = cell_context_menu_items({
+            dirty: dirty_cells.has(`${row}:${source_col}`),
+            is_multi_cell: !!range && range.width * range.height > 1,
+            preview_mode,
+            can_hide_rows: !!selected_rows
+                && transform_sections
+                && !transform_pending
+                && !edit_mode
+                && !preview_mode,
+            selected_row_count,
+            can_clear_highlight: highlight_selection_may_have_renderable_highlight(
+                highlight_selection,
+                cell_highlights?.cells,
+                get_source_row,
+            ),
+            highlight_cell_count,
+            on_discard_edit: () => discard_edit(row, display_col, source_col),
+            on_copy_cell: () => copy_rect({
                 x: display_col,
                 y: row,
                 width: 1,
                 height: 1,
             }),
+            on_copy_selection: () => {
+                if (range) copy_rect(range);
+            },
+            on_highlight: (color) => mutate_highlight_selection({ type: 'set', color }),
+            on_clear_highlight: () => mutate_highlight_selection({ type: 'clear' }),
+            on_hide_rows: () => {
+                if (selected_rows) on_hide_rows(selected_rows);
+            },
+            on_hide_column: () => hide_source_column(source_col),
+            on_select_row: () => select_row(row),
+            on_select_column: () => select_column(display_col),
+            on_select_all: select_all,
         });
-        if (is_multi_cell && range) {
-            menu_items.push({
-                label: 'Copy selection',
-                on_click: () => copy_rect(range),
-            });
-        }
-        if (!preview_mode) {
-            menu_items.push({ kind: 'separator' });
-            for (const color of CELL_HIGHLIGHT_COLORS) {
-                menu_items.push({
-                    label: `Highlight ${color}`,
-                    on_click: () => mutate_highlight_selection({ type: 'set', color }),
-                });
-            }
-            if (can_clear_highlight) {
-                menu_items.push({
-                    label: highlight_cell_count === 1
-                        ? 'Clear highlight'
-                        : 'Clear highlights',
-                    on_click: () => mutate_highlight_selection({ type: 'clear' }),
-                });
-            }
-            menu_items.push({ kind: 'separator' });
-        }
-        const selected_rows = selected_display_row_intervals(grid_selection, row_count);
-        if (
-            selected_rows
-            && transform_sections
-            && !transform_pending
-            && !edit_mode
-            && !preview_mode
-        ) {
-            const selected_row_count = selected_rows.reduce(
-                (total, interval) => total + interval.end - interval.start + 1,
-                0,
-            );
-            menu_items.push({
-                label: selected_row_count === 1 ? 'Hide row' : `Hide ${selected_row_count} rows`,
-                on_click: () => on_hide_rows(selected_rows),
-            });
-            menu_items.push({ kind: 'separator' });
-        }
-        menu_items.push({ label: 'Select row', on_click: () => select_row(row) });
-        menu_items.push({
-            label: 'Select column',
-            on_click: () => select_column(display_col),
-        });
-        menu_items.push({ label: 'Select all', on_click: select_all });
     }
 
     if (!has_visible_columns) {
@@ -1874,11 +1898,37 @@ export function GridShell({
                 <ContextMenu
                     x={context_menu.x}
                     y={context_menu.y}
-                    items={menu_items}
+                    items={cell_menu_items ?? []}
                     on_dismiss={dismiss_context_menu}
                     restore_focus={() => grid_ref.current?.focus()}
                 />
             )}
+            {context_menu?.kind === 'row' && (() => {
+                const selected_row_count = context_menu.display_rows.reduce(
+                    (total, interval) => total + interval.end - interval.start + 1,
+                    0,
+                );
+                return (
+                    <ContextMenu
+                        x={context_menu.x}
+                        y={context_menu.y}
+                        aria_label={selected_row_count === 1
+                            ? `Row actions for row ${context_menu.row + 1}`
+                            : `Row actions for ${selected_row_count} selected rows`}
+                        items={row_context_menu_items({
+                            selected_row_count,
+                            can_hide_rows: transform_sections
+                                && !transform_pending
+                                && !edit_mode
+                                && !preview_mode,
+                            on_hide_rows: () => on_hide_rows(context_menu.display_rows),
+                            on_copy_rows: () => copy_display_rows(context_menu.display_rows),
+                        })}
+                        on_dismiss={dismiss_context_menu}
+                        restore_focus={() => grid_ref.current?.focus()}
+                    />
+                );
+            })()}
             {context_menu?.kind === 'header' && (() => {
                 const source_column = context_menu.source_col;
                 const active_sort = transform_state.sort.find((key) =>
@@ -1905,17 +1955,7 @@ export function GridShell({
                             width: 1,
                             height: row_count,
                         }, true)}
-                        on_hide={() => {
-                            if (display_column_count === 1) {
-                                // The projection update removes Glide entirely, so
-                                // ContextMenu's normal grid restoration has no target.
-                                suppress_menu_restore_ref.current = true;
-                                on_hide_column(source_column);
-                                window.setTimeout(on_focus_columns, 0);
-                                return;
-                            }
-                            on_hide_column(source_column);
-                        }}
+                        on_hide={() => hide_source_column(source_column)}
                         on_sort={(direction, append) =>
                             apply_column_sort(source_column, direction, append)}
                         on_clear_column_sort={() => on_transform_change({

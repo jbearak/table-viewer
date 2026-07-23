@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { format_selection_tsv, copy_truncation_message } from '../webview/grid-copy-model';
+import {
+    format_selection_tsv,
+    copy_truncation_message,
+    display_row_indices,
+} from '../webview/grid-copy-model';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeRange } from '../types';
 import { MergeIndex } from '../webview/merge-index';
@@ -19,6 +23,15 @@ function loader(
 }
 
 const NO_MERGES = new MergeIndex([]);
+
+describe('display_row_indices', () => {
+    it('lazily expands ordered display-row intervals', () => {
+        expect(Array.from(display_row_indices([
+            { start: 1, end: 2 },
+            { start: 5, end: 7 },
+        ]))).toEqual([1, 2, 5, 6, 7]);
+    });
+});
 
 describe('format_selection_tsv', () => {
     it('copies a single cell', () => {

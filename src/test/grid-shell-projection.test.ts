@@ -1000,7 +1000,159 @@ describe('GridShell column projection', () => {
         expect(ctx.fillText).toHaveBeenCalledWith('2', expect.any(Number), expect.any(Number));
     });
 
-    it('keeps existing cell context-menu actions intact', async () => {
+    it('opens row-marker actions instead of cell actions', async () => {
+        await render_grid(props({ row_count: 4, transform_sections: true }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 3], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 96, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Copy row', 'Hide row']));
+        expect(menu_button_labels()).not.toContain('Copy cell');
+    });
+
+    it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {
+        const on_hide_rows = vi.fn();
+        await render_grid(props({
+            row_count: 5,
+            transform_sections: true,
+            on_hide_rows,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([1, 2, 4]),
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining([
+            'Hide 3 rows', 'Copy 3 rows',
+        ]));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Hide 3 rows')!.click());
+        expect(on_hide_rows).toHaveBeenCalledWith([
+            { start: 1, end: 2 },
+            { start: 4, end: 4 },
+        ]);
+    });
+
+    it('collapses an outside row selection and copies visible columns without headers', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.get_row.mockImplementation((row?: number) => [
+            { raw: `r${row}-a`, formatted: `r${row}-a`, bold: false, italic: false },
+            { raw: `r${row}-b`, formatted: `r${row}-b`, bold: false, italic: false },
+            { raw: `r${row}-c`, formatted: `r${row}-c`, bold: false, italic: false },
+        ] as any);
+        await render_grid(props({ row_count: 5, transform_sections: true }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([0, 1]),
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 3], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 96, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Copy row');
+        expect(menu_button_labels()).not.toContain('Copy 2 rows');
+        expect((grid_mock.props!.gridSelection as { rows: { toArray(): number[] } })
+            .rows.toArray()).toEqual([3]);
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy row')!.click());
+        expect(write_text).toHaveBeenCalledWith('r3-a\tr3-c');
+    });
+
+    it('groups cell hide/select actions into submenus and projects Hide column', async () => {
+        const on_hide_column = vi.fn();
+        await render_grid(props({
+            transform_sections: true,
+            on_hide_column,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Copy cell');
+        expect(menu_button_labels()).toContain('Hide›');
+        expect(menu_button_labels()).toContain('Select›');
+        expect(menu_button_labels()).not.toContain('Select row');
+
+        const hide = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Hide›')!;
+        await act(async () => hide.click());
+        expect(menu_button_labels()).toContain('Hide row');
+        expect(menu_button_labels()).toContain('Hide column');
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Hide column')!.click());
+        expect(on_hide_column).toHaveBeenCalledWith(2);
+    });
+
+    it('focuses Columns after hiding the final visible column from the cell submenu', async () => {
+        const GridShell = await render_grid(props());
+        const columns_trigger = document.createElement('button');
+        document.body.appendChild(columns_trigger);
+        const hidden_props = props({
+            column_projection: {
+                visible_to_source: [],
+                source_to_visible: [undefined, undefined, undefined],
+                hidden_count: 3,
+            },
+        });
+        const on_hide_column = vi.fn(() => {
+            root!.render(React.createElement(GridShell, hidden_props));
+        });
+        const on_focus_columns = vi.fn(() => columns_trigger.focus());
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            column_projection: {
+                visible_to_source: [2],
+                source_to_visible: [undefined, undefined, 0],
+                hidden_count: 2,
+            },
+            on_hide_column,
+            on_focus_columns,
+        }))));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 40, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Hide›')!.click());
+        await act(async () => {
+            Array.from(document.querySelectorAll('button'))
+                .find((button) => button.textContent === 'Hide column')!.click();
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(on_hide_column).toHaveBeenCalledWith(2);
+        expect(on_focus_columns).toHaveBeenCalledOnce();
+        expect(document.activeElement).toBe(columns_trigger);
+    });
+
+    it('keeps select actions off the root and exposes all three in its submenu', async () => {
         await render_grid(props());
         const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
             (cell: [number, number], event: Record<string, unknown>) => void;
@@ -1010,11 +1162,14 @@ describe('GridShell column projection', () => {
             localEventX: 10,
             localEventY: 10,
         }));
-        expect(document.body.textContent).toContain('Copy cell');
-        expect(document.body.textContent).toContain('Select row');
-        expect(document.body.textContent).toContain('Select column');
-        expect(document.body.textContent).toContain('Select all');
-        expect(document.body.textContent).not.toContain('Sort ascending');
+        const root_menu = document.querySelector('[aria-label="Context menu"]')!;
+        expect(root_menu.textContent).not.toContain('Select row');
+        const select = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Select›')!;
+        await act(async () => select.click());
+        expect(menu_button_labels()).toEqual(expect.arrayContaining([
+            'Select row', 'Select column', 'Select all',
+        ]));
     });
 
     it('evaluates an outside right-click as the projected single source cell', async () => {

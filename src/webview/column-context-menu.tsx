@@ -1,5 +1,9 @@
 import React from 'react';
-import { ContextMenu, type MenuItem } from './context-menu';
+import {
+    ContextMenu,
+    type ActionMenuItem,
+    type MenuSeparator,
+} from './context-menu';
 import type { SortDirection } from '../types';
 
 export interface ColumnContextMenuProps {
@@ -27,8 +31,8 @@ export interface ColumnContextMenuProps {
 
 export function column_context_menu_items(
     props: Omit<ColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
-): MenuItem[] {
-    const items: MenuItem[] = [
+): (ActionMenuItem | MenuSeparator)[] {
+    const items: (ActionMenuItem | MenuSeparator)[] = [
         { label: 'Copy column', on_click: () => props.on_copy() },
         { label: 'Hide column', on_click: () => props.on_hide() },
     ];

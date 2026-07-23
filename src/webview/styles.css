@@ -1173,6 +1173,18 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     opacity: 0.75;
 }
 
+.context-menu-submenu-chevron {
+    margin-left: auto;
+    padding-left: 16px;
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 14px;
+    line-height: 1;
+}
+
+.context-menu-submenu-container {
+    position: static;
+}
+
 .context-menu-item:disabled {
     cursor: default;
     opacity: 0.5;

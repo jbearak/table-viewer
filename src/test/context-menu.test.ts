@@ -136,4 +136,97 @@ describe('ContextMenu keyboard behavior', () => {
         expect(restore_focus).not.toHaveBeenCalled();
     });
 
+    it('opens a submenu with ArrowRight and closes only it with ArrowLeft', () => {
+        vi.useFakeTimers();
+        const { on_dismiss } = render_menu([
+            {
+                kind: 'submenu',
+                label: 'Hide',
+                items: [{ label: 'Hide row', on_click: vi.fn() }],
+            },
+        ]);
+        const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+        expect(trigger.getAttribute('aria-expanded')).toBe('false');
+        act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowRight', bubbles: true,
+        })));
+        act(() => vi.runAllTimers());
+        expect(trigger.getAttribute('aria-expanded')).toBe('true');
+        expect(document.activeElement?.textContent).toContain('Hide row');
+        act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowLeft', bubbles: true,
+        })));
+        expect(trigger.getAttribute('aria-expanded')).toBe('false');
+        expect(document.activeElement).toBe(trigger);
+        expect(on_dismiss).not.toHaveBeenCalled();
+    });
+
+    it('opens on hover and closes when hovering a sibling action', () => {
+        render_menu([
+            {
+                kind: 'submenu',
+                label: 'Select',
+                items: [{ label: 'Select row', on_click: vi.fn() }],
+            },
+            { label: 'Copy', on_click: vi.fn() },
+        ]);
+        const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+        const copy = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+            .find((button) => button.textContent === 'Copy')!;
+        act(() => trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })));
+        expect(trigger.getAttribute('aria-expanded')).toBe('true');
+        act(() => copy.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })));
+        expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    });
+
+    it('activates a submenu leaf and dismisses/restores exactly once', () => {
+        vi.useFakeTimers();
+        const on_click = vi.fn();
+        const { on_dismiss, restore_focus } = render_menu([
+            {
+                kind: 'submenu',
+                label: 'Hide',
+                items: [{ label: 'Hide row', on_click }],
+            },
+        ]);
+        const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+        act(() => trigger.click());
+        act(() => vi.runOnlyPendingTimers());
+        const leaf = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+            .find((button) => button.textContent === 'Hide row')!;
+        act(() => leaf.click());
+        expect(on_click).toHaveBeenCalledOnce();
+        expect(on_dismiss).toHaveBeenCalledOnce();
+        act(() => vi.runAllTimers());
+        expect(restore_focus).toHaveBeenCalledOnce();
+    });
+
+    it('Escape from a child dismisses the whole menu and disabled submenus stay closed', () => {
+        vi.useFakeTimers();
+        const { on_dismiss, restore_focus } = render_menu([
+            {
+                kind: 'submenu',
+                label: 'Hide',
+                items: [{ label: 'Hide row', on_click: vi.fn() }],
+            },
+            {
+                kind: 'submenu',
+                label: 'Disabled',
+                disabled: true,
+                items: [{ label: 'Never', on_click: vi.fn() }],
+            },
+        ]);
+        const triggers = document.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]');
+        act(() => triggers[1].click());
+        expect(triggers[1].getAttribute('aria-expanded')).toBe('false');
+        act(() => triggers[0].click());
+        act(() => vi.runOnlyPendingTimers());
+        act(() => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape', bubbles: true,
+        })));
+        expect(on_dismiss).toHaveBeenCalledOnce();
+        act(() => vi.runAllTimers());
+        expect(restore_focus).toHaveBeenCalledOnce();
+    });
+
 });

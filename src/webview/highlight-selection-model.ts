@@ -84,6 +84,11 @@ function compact_contains(selection: GridSelection['rows'], index: number): bool
     return false;
 }
 
+/** Whether a row belongs to the explicit row-marker selection. */
+export function grid_selection_contains_row(selection: GridSelection, row: number): boolean {
+    return compact_contains(selection.rows, row);
+}
+
 function rect_contains(rect: Rectangle, column: number, row: number): boolean {
     return column >= rect.x
         && column < rect.x + rect.width
