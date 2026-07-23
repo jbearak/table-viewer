@@ -23,6 +23,7 @@ export interface FilterPopoverProps {
     histogram?: FilterHistogramStatus;
     on_apply: (entry: FilterEntry) => void;
     on_cancel: (reason: FilterPopoverDismissReason) => void;
+    on_remove: () => void;
 }
 
 function preferred_operator_from_histogram(
@@ -56,6 +57,7 @@ export function FilterPopover({
     histogram = { status: 'loading' },
     on_apply,
     on_cancel,
+    on_remove,
 }: FilterPopoverProps): React.JSX.Element {
     const existing = filters.some((entry) => entry.colIndex === column_index);
     const [draft, set_draft] = useState<FilterEntry>(() =>
@@ -332,6 +334,15 @@ export function FilterPopover({
                 )}
             </div>
             <div className="filter-popover-footer">
+                {existing && (
+                    <button
+                        type="button"
+                        className="filter-popover-btn filter-popover-btn-danger"
+                        onClick={on_remove}
+                    >
+                        Remove
+                    </button>
+                )}
                 <button
                     type="button"
                     className="filter-popover-btn filter-popover-btn-primary"

@@ -155,6 +155,17 @@ afterEach(() => {
 });
 
 describe('Toolbar', () => {
+    it('suppresses the native context menu on the toolbar surface', () => {
+        const { container } = render_toolbar();
+        const toolbar = container.querySelector('[role="toolbar"]') as HTMLElement;
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+        });
+        act(() => toolbar.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+    });
+
     it('shows hidden row count and invokes Unhide all', () => {
         const on_unhide_all = vi.fn();
         const { container, rerender } = render_toolbar({

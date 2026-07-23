@@ -85,6 +85,9 @@ export const RowResizeOverlay = forwardRef<
 
     const on_mouse_down = useCallback(
         (e: React.MouseEvent) => {
+            // Only the primary button resizes; a right/middle press must not arm
+            // a drag (and must fall through so its context menu can be suppressed).
+            if (e.button !== 0) return;
             if (!target) return;
             e.preventDefault();
             e.stopPropagation();
@@ -147,6 +150,12 @@ export const RowResizeOverlay = forwardRef<
                 <div
                     className="row-resize-strip"
                     onMouseDown={on_mouse_down}
+                    onContextMenu={(e) => {
+                        // Suppress the OS cut/copy/paste menu on the row-header
+                        // border; nothing should happen here.
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }}
                     style={{
                         position: 'absolute',
                         left: 0,

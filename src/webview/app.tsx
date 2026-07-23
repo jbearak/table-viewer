@@ -44,10 +44,17 @@ import {
     type FilterHistogramStatus,
 } from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
+import { ContextMenu, type MenuItem } from './context-menu';
+import {
+    pending_sheet_action_to_run,
+    type PendingSheetAction,
+    type SheetAction,
+} from './sheet-action-model';
 import {
     GridShell,
     type EditingStatus,
     type EditingHandle,
+    type GridActionsHandle,
     type GridFocusHandle,
     type HighlightSelectionHandle,
     type PendingPreviewScroll,
@@ -212,6 +219,13 @@ export function App(): React.JSX.Element {
         restore_focus: () => void;
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
+    const [sheet_context_menu, set_sheet_context_menu] = useState<{
+        sheet_index: number;
+        x: number;
+        y: number;
+    } | null>(null);
+    const [pending_sheet_action, set_pending_sheet_action] =
+        useState<PendingSheetAction | null>(null);
     const [filter_histogram, set_filter_histogram] = useState<{
         key: string;
         value: FilterHistogramState;
@@ -254,6 +268,9 @@ export function App(): React.JSX.Element {
     // GridShell populates this with a measure function returning fitted column
     // widths (null when nothing is loaded); App calls it from the auto-fit toggle.
     const auto_fit_ref = useRef<(() => Record<number, number> | null) | null>(null);
+    // GridShell populates this with sheet-tab actions (select all / copy sheet)
+    // for the mounted sheet; App calls them from the sheet-tab context menu.
+    const grid_actions_ref = useRef<GridActionsHandle | null>(null);
     // True between posting a save (from the exit dialog) and its saveResult, so a
     // successful save then completes the deferred exit from edit mode.
     const pending_exit_ref = useRef(false);
@@ -1203,6 +1220,54 @@ export function App(): React.JSX.Element {
         [persist_immediate]
     );
 
+    const handle_sheet_context_menu = useCallback((
+        sheet_index: number,
+        x: number,
+        y: number,
+    ) => {
+        set_sheet_context_menu({ sheet_index, x, y });
+    }, []);
+
+    const run_sheet_action = useCallback((
+        sheet_index: number,
+        action: SheetAction,
+    ) => {
+        set_sheet_context_menu(null);
+        const handle = grid_actions_ref.current;
+        // Active sheet with a matching mounted handle runs immediately.
+        if (sheet_index === active_sheet_index && handle?.sheet_index === sheet_index) {
+            handle[action]();
+            return;
+        }
+        // Otherwise defer: switch to the target sheet and run once its grid mounts.
+        set_pending_sheet_action({ sheet_index, action });
+        if (sheet_index !== active_sheet_index) {
+            handle_sheet_select(sheet_index);
+        }
+    }, [active_sheet_index, handle_sheet_select]);
+
+    // Release a deferred sheet action once the active sheet and the mounted grid
+    // handle both match the target. Re-checked after any keyed grid remount.
+    useEffect(() => {
+        if (!pending_sheet_action) return;
+        const action = pending_sheet_action_to_run(
+            pending_sheet_action,
+            active_sheet_index,
+            grid_actions_ref.current?.sheet_index,
+        );
+        if (!action) return;
+        // A newly mounted sheet may still owe a persisted-transform request: the
+        // restore effect above runs first each commit and synchronously records
+        // the pending request id when it dispatches. Waiting on that ref keeps
+        // "Copy sheet" from serializing untransformed rows and "Select all" from
+        // selecting a grid that the transform acknowledgement remounts. When the
+        // request is acknowledged the generation bump re-runs this effect.
+        if (pending_transform_request_ids_ref.current[active_sheet_index]) return;
+        grid_actions_ref.current?.[action]();
+        set_pending_sheet_action((current) =>
+            current === pending_sheet_action ? null : current);
+    }, [active_sheet_index, generation, load_epoch, pending_sheet_action]);
+
     const handle_toggle_formatting = useCallback(() => {
         set_show_formatting((prev) => !prev);
     }, []);
@@ -1497,6 +1562,25 @@ export function App(): React.JSX.Element {
         const requested = handle_transform_change({
             ...current,
             filters: upsert_filter(current.filters, entry),
+        }, filter_editor.origin);
+        close_filter_editor(!requested || filter_editor.origin === 'toolbar');
+    }, [
+        active_sheet_index,
+        close_filter_editor,
+        filter_editor,
+        handle_transform_change,
+        transforms,
+    ]);
+
+    const remove_filter_editor = useCallback(() => {
+        if (!filter_editor) return;
+        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        // Remove by column, matching how the popover determines "existing".
+        const requested = handle_transform_change({
+            ...current,
+            filters: current.filters.filter(
+                (entry) => entry.colIndex !== filter_editor.column_index,
+            ),
         }, filter_editor.origin);
         close_filter_editor(!requested || filter_editor.origin === 'toolbar');
     }, [
@@ -1939,6 +2023,18 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = meta.sheets.map((s) => s.name);
+    const sheet_context_menu_items: MenuItem[] = sheet_context_menu
+        ? [
+            {
+                label: 'Copy sheet',
+                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'copy_sheet'),
+            },
+            {
+                label: 'Select all',
+                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'select_all'),
+            },
+        ]
+        : [];
     const has_multiple_sheets = meta.sheets.length > 1;
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
     const current_transform = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
@@ -2014,6 +2110,7 @@ export function App(): React.JSX.Element {
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
             grid_focus_ref={grid_focus_ref}
+            grid_actions_ref={grid_actions_ref}
             pending_preview_scroll={pending_preview_scroll}
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
@@ -2154,6 +2251,7 @@ export function App(): React.JSX.Element {
                     on_cancel={(reason) => close_filter_editor(
                         reason === 'escape' || reason === 'explicit',
                     )}
+                    on_remove={remove_filter_editor}
                 />
             )}
             {truncation_message && (
@@ -2194,6 +2292,7 @@ export function App(): React.JSX.Element {
                         sheets={sheet_names}
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
+                        on_context_menu={handle_sheet_context_menu}
                         vertical={true}
                     />
                     {grid}
@@ -2204,10 +2303,27 @@ export function App(): React.JSX.Element {
                         sheets={sheet_names}
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
+                        on_context_menu={handle_sheet_context_menu}
                         vertical={false}
                     />
                     {grid}
                 </>
+            )}
+            {sheet_context_menu && (
+                <ContextMenu
+                    x={sheet_context_menu.x}
+                    y={sheet_context_menu.y}
+                    aria_label={`Sheet actions for ${
+                        sheet_names[sheet_context_menu.sheet_index]
+                        ?? `Sheet ${sheet_context_menu.sheet_index + 1}`
+                    }`}
+                    items={sheet_context_menu_items}
+                    on_dismiss={() => set_sheet_context_menu(null)}
+                    restore_focus={() => {
+                        document.querySelectorAll<HTMLElement>('.sheet-tab')
+                            .item(sheet_context_menu.sheet_index)?.focus();
+                    }}
+                />
             )}
         </div>
     );

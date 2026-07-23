@@ -39,6 +39,7 @@ function render_popover(
 ) {
     const on_apply = vi.fn();
     const on_cancel = vi.fn();
+    const on_remove = vi.fn();
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
@@ -50,8 +51,9 @@ function render_popover(
         anchor: { left: 10_000, top: 10_000 },
         on_apply,
         on_cancel,
+        on_remove,
     })));
-    return { on_apply, on_cancel };
+    return { on_apply, on_cancel, on_remove };
 }
 
 describe('FilterPopover', () => {
@@ -84,7 +86,7 @@ describe('FilterPopover', () => {
         act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [],
             histogram: { status: 'loading' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         options = Array.from(
             document.querySelectorAll('#filter-condition option'),
@@ -99,7 +101,7 @@ describe('FilterPopover', () => {
         act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [],
             histogram: { status: 'error', message: 'scan failed' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         options = Array.from(
             document.querySelectorAll('#filter-condition option'),
@@ -113,7 +115,7 @@ describe('FilterPopover', () => {
         act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [],
             histogram: { status: 'ready', bins: [] },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         options = Array.from(
             document.querySelectorAll('#filter-condition option'),
@@ -130,7 +132,7 @@ describe('FilterPopover', () => {
         act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [],
             histogram: { status: 'ready', bins: [], columnKind: 'orderedText' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         options = Array.from(
             document.querySelectorAll('#filter-condition option'),
@@ -148,7 +150,7 @@ describe('FilterPopover', () => {
                 caseSensitive: false, enabled: true,
             }],
             histogram: { status: 'ready', bins: READY_BINS },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         options = Array.from(
             document.querySelectorAll('#filter-condition option'),
@@ -188,7 +190,7 @@ describe('FilterPopover', () => {
                 caseSensitive: true, enabled: true,
             }],
             histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
-            anchor: { left: 10, top: 10 }, on_apply, on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply, on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('equals');
         expect(document.body.textContent).not.toContain('Case sensitive');
@@ -206,7 +208,7 @@ describe('FilterPopover', () => {
                 caseSensitive: true, enabled: true,
             }],
             histogram: { status: 'ready', bins: READY_BINS, columnKind: 'numeric' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
         expect(document.body.textContent).toContain('Case sensitive');
@@ -221,7 +223,7 @@ describe('FilterPopover', () => {
                 caseSensitive: true, enabled: true,
             }],
             histogram: { status: 'ready', bins: READY_BINS },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect(document.body.textContent).not.toContain('Case sensitive');
         expect(document.querySelector('input[type="checkbox"]')).toBeNull();
@@ -242,7 +244,7 @@ describe('FilterPopover', () => {
                 caseSensitive: false, enabled: true,
             }],
             histogram: { status: 'loading' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect(document.body.textContent).toContain('Loading distribution…');
         act(() => root!.unmount());
@@ -254,7 +256,7 @@ describe('FilterPopover', () => {
                 caseSensitive: false, enabled: true,
             }],
             histogram: { status: 'ready', bins: [] },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect(document.body.textContent).toContain('No numeric values to chart.');
         act(() => root!.unmount());
@@ -266,7 +268,7 @@ describe('FilterPopover', () => {
                 caseSensitive: false, enabled: true,
             }],
             histogram: { status: 'error', message: 'scan failed' },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect(document.body.textContent).toContain('Distribution unavailable: scan failed');
         act(() => root!.unmount());
@@ -278,7 +280,7 @@ describe('FilterPopover', () => {
                 caseSensitive: false, enabled: true,
             }],
             histogram: { status: 'ready', bins: READY_BINS },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect(document.querySelector('[role="group"][aria-label="Range histogram"]'))
             .not.toBeNull();
@@ -309,6 +311,7 @@ describe('FilterPopover', () => {
             anchor: { left: 10, top: 10 },
             on_apply,
             on_cancel,
+            on_remove: vi.fn(),
         };
         act(() => root!.render(React.createElement(FilterPopover, {
             ...props,
@@ -717,7 +720,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             act(() => root!.render(React.createElement(FilterPopover, {
                 column_index: 1, column_name: 'Value', filters: [],
                 histogram,
-                anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+                anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
             })));
             expect(options()).not.toContain('isOneOf');
             act(() => root!.unmount());
@@ -739,7 +742,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
     it('promotes a pristine Contains draft to Is one of when the value list settles', async () => {
         const props = {
             column_index: 1, column_name: 'Value', filters: [] as FilterEntry[],
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         };
         container = document.createElement('div');
         document.body.appendChild(container);
@@ -766,7 +769,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         act(() => root!.render(React.createElement(FilterPopover, {
             column_index: 1, column_name: 'Value', filters: [],
             histogram: { ...TEXT_READY, distinctValuesExceeded: true },
-            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(),
+            anchor: { left: 10, top: 10 }, on_apply: vi.fn(), on_cancel: vi.fn(), on_remove: vi.fn(),
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('contains');
     });
@@ -943,5 +946,49 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             caseSensitive: false, enabled: true,
         }], TEXT_READY);
         expect(document.activeElement?.className).toBe('filter-value-search');
+    });
+
+    function remove_button(): HTMLButtonElement | null {
+        return Array.from(
+            document.querySelectorAll('.filter-popover-footer button'),
+        ).find((button) => button.textContent === 'Remove') as
+            HTMLButtonElement | null ?? null;
+    }
+
+    it('does not show Remove for a new filter', () => {
+        render_popover([], { status: 'ready', bins: READY_BINS });
+        expect(remove_button()).toBeNull();
+    });
+
+    it('shows a distinct-styled Remove button for an existing filter', () => {
+        render_popover([{
+            id: 'f', colIndex: 1, operator: 'contains', value: 'x',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        const button = remove_button();
+        expect(button).not.toBeNull();
+        expect(button!.className).toContain('filter-popover-btn');
+        expect(button!.className).toContain('filter-popover-btn-danger');
+    });
+
+    it('invokes only on_remove when Remove is clicked', () => {
+        const { on_apply, on_cancel, on_remove } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'contains', value: 'x',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        act(() => remove_button()!.dispatchEvent(
+            new MouseEvent('click', { bubbles: true }),
+        ));
+        expect(on_remove).toHaveBeenCalledOnce();
+        expect(on_apply).not.toHaveBeenCalled();
+        expect(on_cancel).not.toHaveBeenCalled();
+    });
+
+    it('treats a filter on another column as new (no Remove)', () => {
+        render_popover([{
+            id: 'other', colIndex: 2, operator: 'contains', value: 'x',
+            caseSensitive: false, enabled: true,
+        }], { status: 'ready', bins: READY_BINS });
+        expect(remove_button()).toBeNull();
     });
 });

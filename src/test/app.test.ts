@@ -25,6 +25,8 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     commit_live_edit: vi.fn(),
     focus_grid: vi.fn(),
+    select_all: vi.fn(),
+    copy_sheet: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
     emit_pending_edits_on_mount: false,
@@ -86,6 +88,13 @@ vi.mock('../webview/grid-shell', () => ({
         grid_focus_ref?: {
             current: { generation: number; focus: () => boolean } | null;
         };
+        grid_actions_ref?: {
+            current: {
+                sheet_index: number;
+                select_all: () => void;
+                copy_sheet: () => void;
+            } | null;
+        };
         pending_preview_scroll?: { row: number; sequence: number } | null;
         on_preview_scroll_applied?: (sequence: number) => void;
         on_preview_visible_row_change?: (row: number) => void;
@@ -113,6 +122,20 @@ vi.mock('../webview/grid-shell', () => ({
                 }
             };
         }, [props.generation, props.grid_focus_ref]);
+        React.useLayoutEffect(() => {
+            if (!props.grid_actions_ref) return;
+            const handle = {
+                sheet_index: props.sheet_index,
+                select_all: () => grid_shell_mock.select_all(),
+                copy_sheet: () => grid_shell_mock.copy_sheet(),
+            };
+            props.grid_actions_ref.current = handle;
+            return () => {
+                if (props.grid_actions_ref?.current === handle) {
+                    props.grid_actions_ref.current = null;
+                }
+            };
+        }, [props.generation, props.grid_actions_ref, props.sheet_index]);
         React.useEffect(() => {
             grid_shell_mock.on_editing_change = props.on_editing_change ?? null;
             grid_shell_mock.on_editing_change?.({
@@ -610,6 +633,8 @@ function cleanup() {
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.focus_grid.mockReset();
+    grid_shell_mock.select_all.mockReset();
+    grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.emit_pending_edits_on_mount = false;
     vi.useRealTimers();
@@ -1778,6 +1803,86 @@ describe('sheet tabs', () => {
                 state: expect.objectContaining({ activeSheetIndex: 1 }),
             })
         );
+    });
+
+    function right_click_tab(name: string) {
+        const tab = Array.from(container!.querySelectorAll<HTMLButtonElement>('.sheet-tab'))
+            .find((button) => button.textContent === name);
+        expect(tab).toBeDefined();
+        act(() => tab!.dispatchEvent(new MouseEvent('contextmenu', {
+            bubbles: true, cancelable: true, clientX: 30, clientY: 40,
+        })));
+    }
+
+    it('runs Select all immediately from the active sheet tab menu', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+        right_click_tab('First');
+        expect(Array.from(document.querySelectorAll('[role="menuitem"]'), (item) => item.textContent))
+            .toEqual(['Copy sheet', 'Select all']);
+        await act(async () => get_button('Select all').click());
+        expect(grid_shell_mock.select_all).toHaveBeenCalledOnce();
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('defers Copy sheet from an inactive tab until its grid mounts', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+        post_message.mockClear();
+        right_click_tab('Second');
+        await act(async () => get_button('Copy sheet').click());
+        // The action targets the not-yet-active sheet, so App switches sheets…
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'stateChanged',
+            state: expect.objectContaining({ activeSheetIndex: 1 }),
+        }));
+        // …and fires copy_sheet once the target grid handle is mounted.
+        expect(grid_shell_mock.copy_sheet).toHaveBeenCalledOnce();
+        expect(grid_shell_mock.select_all).not.toHaveBeenCalled();
+    });
+
+    it('holds a deferred sheet action until the target sheet transform is applied', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['First', 'Second']);
+        meta.sheets[1].columnNames = ['Name'];
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Second",1,["Name"]]',
+                }],
+            },
+        }));
+        post_message.mockClear();
+        right_click_tab('Second');
+        await act(async () => get_button('Copy sheet').click());
+        // Switched to the target sheet, but its persisted sort is still applying,
+        // so the copy must not serialize the untransformed rows yet.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_shell_mock.copy_sheet).not.toHaveBeenCalled();
+        // Acknowledge the restore transform; only then does the copy run.
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 3);
+        expect(grid_shell_mock.copy_sheet).toHaveBeenCalledOnce();
+    });
+
+    it('dismissing the sheet tab menu runs no action', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+        right_click_tab('First');
+        const menu = document.querySelector('[role="menu"]') as HTMLElement;
+        expect(menu).not.toBeNull();
+        await act(async () => {
+            menu.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Escape', bubbles: true,
+            }));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(grid_shell_mock.select_all).not.toHaveBeenCalled();
+        expect(grid_shell_mock.copy_sheet).not.toHaveBeenCalled();
     });
 });
 
@@ -3892,6 +3997,32 @@ describe('sorting and filtering', () => {
         await flush_focus_restore();
         expect(toolbar_focus).toHaveBeenCalledOnce();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
+    });
+
+    it('removes an applied filter from the popover Remove button', async () => {
+        const { post_message } = await render_app();
+        const schema = '["Sheet1",1,null]';
+        await load_acknowledged_transform(post_message, {
+            sort: [],
+            filters: [{
+                id: 'drop-me', colIndex: 0, operator: 'equals', value: 'x',
+                caseSensitive: false, enabled: true,
+            }],
+            schema,
+        });
+        // Open the editor for the already-applied filter via its chip.
+        await act(async () => (
+            document.querySelector('.filter-chip-body') as HTMLButtonElement
+        ).click());
+        expect(document.querySelector('.filter-popover')).not.toBeNull();
+
+        post_message.mockClear();
+        await act(async () => get_button('Remove').click());
+        const request = latest_transform_request(post_message);
+        expect(request.state.filters).toEqual([]);
+        await acknowledge_transform(request, 3);
+        expect(document.querySelector('.filter-popover')).toBeNull();
+        expect(document.querySelector('.filter-strip')).toBeNull();
     });
 
     it('focuses the toolbar root after Clear all acknowledgement removes its strip', async () => {
