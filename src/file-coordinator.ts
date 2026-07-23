@@ -122,6 +122,8 @@ export interface CommitExcelHeaderCommand {
     readonly sheetName: string;
     readonly override: ExcelHeaderOverride;
     readonly clearHiddenRows?: boolean;
+    readonly headerSourceRow?: number;
+    readonly targetPlanningInput?: ExcelHeaderPlanningInput;
     readonly originToken: symbol;
     readonly expectedPhysicalRevision: number;
     readonly expectedPhysicalDigest?: string;
@@ -1108,7 +1110,11 @@ export function acquire_file_coordinator(
                         command.sheetIndex,
                         command.sheetName,
                         command.override,
-                        { clearHiddenRows: command.clearHiddenRows },
+                        {
+                            clearHiddenRows: command.clearHiddenRows,
+                            headerSourceRow: command.headerSourceRow,
+                            targetInput: command.targetPlanningInput,
+                        },
                     );
                     if (!plan) {
                         return { type: 'rejected', error: 'The selected worksheet no longer matches this request.' };

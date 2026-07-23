@@ -113,6 +113,9 @@ export interface SheetTransformState {
     schema?: string;
 }
 
+/** Allocation/persistence guard shared by webview sanitization and host plans. */
+export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
+
 export interface SheetColumnVisibilityState {
     /** Canonical visibility stores exactly one side, choosing the smaller list. */
     hiddenColumns?: number[];
@@ -312,7 +315,7 @@ export type WebviewMessage =
     | { type: 'showWarning'; message: string }
     | { type: 'requestFilterHistogram'; sheetIndex: number; columnIndex: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'cancelFilterHistogram'; requestId: string }
-    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; requestId: string; generation: number; sourceGeneration: number }
+    | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

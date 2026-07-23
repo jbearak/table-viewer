@@ -394,6 +394,47 @@ describe('Excel workbook snapshot controller', () => {
         expect(state.value().transforms?.[0]).toBeUndefined();
     });
 
+    it('atomically hides rows above the clicked row and promotes it as the header', async () => {
+        const rows = [
+            [text('Report'), text('')],
+            [text('Generated'), text('')],
+            [text('Name'), text('Age')],
+            [text('Alice'), number(30)],
+            [text('Bob'), number(25)],
+        ];
+        const state = mutable_state_store({
+            excelFirstRowHeaders: { People: 'off' },
+        });
+        const panel = open_excel(
+            '/context-header.xlsx',
+            state.store,
+            excel_profile({ count: 0 }, () => new PhysicalExcelSource(rows)),
+        );
+        const initial = await ready(panel);
+
+        await panel.__receive({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            sheetName: 'People',
+            enabled: true,
+            headerRow: 2,
+            requestId: 'context-promote',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+        });
+
+        await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
+            .toMatchObject({ requestId: 'context-promote', outcome: 'applied' }));
+        const promoted = snapshots(panel).at(-1)!;
+        expect(promoted.meta.sheets[0]).toMatchObject({
+            columnNames: ['Name', 'Age'],
+            excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 2 },
+        });
+        expect(promoted.state.transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+        expect(promoted.state.excelFirstRowHeaders).toEqual({ People: 'on' });
+        expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
+    });
+
     it('refreshes after another writer changes the hidden header candidate', async () => {
         const state = mutable_state_store({
             excelFirstRowHeaders: { People: 'off' },

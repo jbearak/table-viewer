@@ -256,6 +256,7 @@ describe('paginated protocol message shapes', () => {
             sheetIndex: 1,
             sheetName: 'People',
             enabled: true,
+            headerRow: 4,
             requestId: 'header:1',
             generation: 2,
             sourceGeneration: 3,
@@ -277,6 +278,7 @@ describe('paginated protocol message shapes', () => {
             },
         };
         expect(request.type).toBe('setExcelFirstRowHeader');
+        expect(request.headerRow).toBe(4);
         expect(visibility.type).toBe('setColumnVisibility');
         expect(visibility.snapshotIdentity.deliveryId).toBe(12);
     });

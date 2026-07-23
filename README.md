@@ -54,7 +54,7 @@ Table Viewer is the result.
 - Click, drag, or shift-click to select cells
 - Arrow keys and `h`/`j`/`k`/`l` to navigate
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
-- Right-click context menu for copy, select row, select column, select all
+- Right-click context menu for copying, selecting rows or columns, and choosing an Excel row as the header
 
 **Cell highlights**
 - Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column

@@ -1055,7 +1055,72 @@ describe('GridShell column projection', () => {
             localEventY: 10,
         }));
         expect(menu_button_labels()).toEqual(expect.arrayContaining(['Copy row', 'Hide row']));
+        expect(menu_button_labels()).not.toContain('Use row as header');
         expect(menu_button_labels()).not.toContain('Copy cell');
+    });
+
+    it('promotes the clicked Excel row from the row-marker menu', async () => {
+        const on_promote_row_to_header = vi.fn();
+        const base = props();
+        await render_grid(props({
+            row_count: 4,
+            sheet_meta: {
+                ...base.sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 4,
+                excelFirstRowHeader: {
+                    mode: 'off', detected: false, active: false, available: true,
+                },
+            },
+            transform_sections: true,
+            can_promote_row_to_header: true,
+            on_promote_row_to_header,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+
+        const action = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Use row as header')!;
+        await act(async () => action.click());
+
+        expect(on_promote_row_to_header).toHaveBeenCalledWith(2);
+    });
+
+    it('omits row promotion while sorting changes the meaning of rows above', async () => {
+        const base = props();
+        await render_grid(props({
+            row_count: 4,
+            sheet_meta: {
+                ...base.sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 4,
+                excelFirstRowHeader: {
+                    mode: 'off', detected: false, active: false, available: true,
+                },
+            },
+            transform_sections: true,
+            transform_state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            },
+            can_promote_row_to_header: true,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+
+        expect(menu_button_labels()).not.toContain('Use row as header');
     });
 
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {

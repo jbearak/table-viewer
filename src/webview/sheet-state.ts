@@ -7,7 +7,12 @@ import type {
     SortKey,
     StoredPerFileState,
 } from '../types';
-import { is_range_filter_operator, sheet_name_from_transform_schema } from '../types';
+import {
+    MAX_PERSISTED_HIDDEN_ROWS,
+    is_range_filter_operator,
+    sheet_name_from_transform_schema,
+} from '../types';
+export { MAX_PERSISTED_HIDDEN_ROWS } from '../types';
 import { sanitize_column_visibility_state } from './column-projection';
 
 export function clamp_sheet_index(
@@ -222,9 +227,6 @@ export function sanitize_transform_state(
  *  truncated to this bound (permissive: extra rows show) rather than having
  *  the whole filter rejected. */
 const MAX_PERSISTED_EXCLUDED_VALUES = 100_000;
-
-// Bounds allocation when persisted state is corrupt or malicious.
-export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
 
 function sanitize_excluded_values(
     value: unknown,

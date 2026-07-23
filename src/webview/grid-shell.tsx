@@ -263,6 +263,8 @@ export interface GridShellProps {
     on_hide_column?: (source_column: number) => void;
     on_hide_columns?: (source_columns: number[]) => void;
     on_hide_rows?: (display_rows: DisplayRowInterval[]) => void;
+    can_promote_row_to_header?: boolean;
+    on_promote_row_to_header?: (display_row: number) => void;
     /** Focus recovery target when hiding the final visible header removes Glide. */
     on_focus_columns?: () => void;
     cell_highlights?: SheetCellHighlightState;
@@ -319,6 +321,8 @@ export function GridShell({
     on_hide_column = () => {},
     on_hide_columns = () => {},
     on_hide_rows = () => {},
+    can_promote_row_to_header = false,
+    on_promote_row_to_header = () => {},
     on_focus_columns = () => {},
     cell_highlights,
     on_highlight_selection = () => {},
@@ -2140,7 +2144,16 @@ export function GridShell({
                                 && !transform_pending
                                 && !edit_mode
                                 && !preview_mode,
+                            can_promote_row_to_header: can_promote_row_to_header
+                                && transform_sections
+                                && !transform_pending
+                                && !edit_mode
+                                && !preview_mode
+                                && transform_state.sort.length === 0
+                                && !transform_state.filters.some((filter) => filter.enabled),
                             on_hide_rows: () => on_hide_rows(context_menu.display_rows),
+                            on_promote_row_to_header: () =>
+                                on_promote_row_to_header(context_menu.row),
                             on_copy_rows: () => copy_display_rows(context_menu.display_rows),
                         })}
                         on_dismiss={dismiss_context_menu}
