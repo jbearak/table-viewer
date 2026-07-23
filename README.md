@@ -27,7 +27,8 @@ Table Viewer is the result.
 - Multi-sheet workbooks with horizontal or vertical tab orientation
 - Merged cells with correct colspan/rowspan rendering
 - Bold and italic text styling from Excel formatting
-- Conservatively detects Excel column-name rows, with a per-sheet **First Row as Header** override remembered for each file
+- Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row
+- Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
 - Stable, multi-column sorting with missing values kept last
 - Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
 
@@ -38,7 +39,8 @@ Table Viewer is the result.
 **Layout**
 - Drag column and row borders to resize
 - Double-click a column border to auto-fit to content
-- Select multiple rows or columns and resize them together; auto-fit selected columns
+- Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
+- Select multiple columns to resize them together or auto-fit the selection
 - Use the searchable **Columns** menu to show, hide, restore, or hide all columns
 - Column visibility and sizing are persisted per file and sheet across VS Code sessions
 
@@ -54,7 +56,7 @@ Table Viewer is the result.
 - Click, drag, or shift-click to select cells
 - Arrow keys and `h`/`j`/`k`/`l` to navigate
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
-- Right-click context menu for copying, selecting rows or columns, and choosing an Excel row as the header
+- Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
 
 **Cell highlights**
 - Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column
@@ -89,7 +91,9 @@ Table Viewer is the result.
 
 ## Usage
 
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row, and the override is remembered for that file and worksheet.
+**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
+
+To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
 
 **CSV/TSV files** open automatically in Table Viewer as an editable table. An **"Open in Text Editor"** button in the title bar takes you to VS Code's built-in text editor. When a CSV/TSV file is open there, two Table Viewer buttons appear in the editor title bar:
 
