@@ -48,6 +48,7 @@ import { vscode_file_refresh_watcher_factory } from './vscode-file-refresh-watch
 import { reconcile_finalization } from './finalization-reconciliation';
 import { SourceCandidate } from './source-candidate';
 import {
+    EMPTY_TRANSFORM,
     sanitize_excel_header_overrides,
     transform_has_entries,
     transform_is_active,
@@ -1043,6 +1044,7 @@ export function attach_viewer(
                     current_transforms?.[index],
                     sheet.columnCount,
                     transform_schema_for_sheet(sheet),
+                    sheet.sourceRowCount,
                 ));
             const column_visibility = sheets.map((sheet, index) =>
                 sanitize_column_visibility_state(
@@ -1159,6 +1161,7 @@ export function attach_viewer(
                 durable.transforms?.[index],
                 sheet.columnCount,
                 transform_schema_for_sheet(sheet),
+                sheet.sourceRowCount,
             ));
             const prepared = await reconciliation_core.prepare_transform_reconciliation(
                 transforms,
@@ -1217,6 +1220,7 @@ export function attach_viewer(
                 current.transforms?.[error.sheetIndex],
                 sheet.columnCount,
                 transform_schema_for_sheet(sheet),
+                sheet.sourceRowCount,
             );
             if (!current_transform
                 || !transform_states_equal(current_transform, error.invalidState)) {
@@ -1232,6 +1236,9 @@ export function attach_viewer(
                     ...error.retainedState,
                     sort: error.retainedState.sort.map((key) => ({ ...key })),
                     filters: error.retainedState.filters.map(clone_filter_entry),
+                    ...(error.retainedState.hiddenRows
+                        ? { hiddenRows: [...error.retainedState.hiddenRows] }
+                        : {}),
                 }
                 : undefined;
             const result = await state_store.compare_and_set(
@@ -1309,12 +1316,13 @@ export function attach_viewer(
                     ...state,
                     sort: state.sort.map((key) => ({ ...key })),
                     filters: state.filters.map(clone_filter_entry),
+                    ...(state.hiddenRows ? { hiddenRows: [...state.hiddenRows] } : {}),
                 }
                 : undefined;
             return { ...current, transforms };
         }, undefined, transform_is_current_before_commit);
         if (!committed) {
-            throw new Error('The source changed before this sort/filter could be saved.');
+            throw new Error('The source changed before this table view could be saved.');
         }
     }
 
@@ -2598,6 +2606,66 @@ export function attach_viewer(
         });
     }
 
+    async function handle_transform_message(
+        message: Extract<WebviewMessage, { type: 'setTransform' }>,
+    ): Promise<void> {
+        // Synchronized CSV preview relies on display rows retaining their
+        // natural source-row order so visibleRowChanged can index the
+        // source-line map directly. Treat previewMode as a host-side
+        // trust boundary: a stale or injected webview message must not
+        // reach transform admission, the core, or durable state.
+        if (profile.previewMode === true) return;
+        const transform_admission = profile.editing
+            ? begin_transform_admission()
+            : Symbol(file_key);
+        if (!transform_admission) {
+            await core?.reject_transform(
+                message,
+                'Exit edit mode before sorting, filtering, or hiding rows.',
+            );
+            return;
+        }
+        let resolve_completion!: () => void;
+        const completion = new Promise<void>((resolve) => {
+            resolve_completion = resolve;
+        });
+        const transform_authority: TransformAuthority = {
+            authorityRevision: source_authority.authorityRevision,
+            receiverEpoch: session.current_receiver_epoch,
+            completion,
+            resolveCompletion: resolve_completion,
+        };
+        transform_authorities.set(message, transform_authority);
+        latest_transform_authority_by_sheet.set(
+            message.sheetIndex,
+            transform_authority,
+        );
+        try {
+            await core?.handle_message(message);
+            try {
+                await reconcile_transform_terminal(message, transform_authority);
+            } catch (error) {
+                console.error(
+                    'Failed to reconcile durable table transforms after a terminal operation',
+                    error,
+                );
+            }
+        } finally {
+            if (transform_authorities.get(message) === transform_authority) {
+                transform_authorities.delete(message);
+            }
+            if (
+                latest_transform_authority_by_sheet.get(message.sheetIndex)
+                === transform_authority
+            ) latest_transform_authority_by_sheet.delete(message.sheetIndex);
+            transform_commit_barriers.delete(transform_authority);
+            transform_authority.resolveCompletion();
+            if (profile.editing) {
+                finish_transform_admission(transform_admission);
+            }
+        }
+    }
+
     try {
         disposables.push(webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
         if (disposed) return;
@@ -2686,6 +2754,7 @@ export function attach_viewer(
                                     durable.transforms?.[index],
                                     sheet.columnCount,
                                     transform_schema_for_sheet(sheet),
+                                    sheet.sourceRowCount,
                                 )
                             ));
                             const prepared = await ready_core.prepare_transform_reconciliation(
@@ -3173,66 +3242,68 @@ export function attach_viewer(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
                     show_owner_warning(
-                        'Clear sorting and filters before entering edit mode.');
+                        'Clear sorting, filters, and hidden rows before entering edit mode.');
                 }
                 return;
             }
-            case 'setTransform': {
-                // Synchronized CSV preview relies on display rows retaining their
-                // natural source-row order so visibleRowChanged can index the
-                // source-line map directly. Treat previewMode as a host-side
-                // trust boundary: a stale or injected webview message must not
-                // reach transform admission, the core, or durable state.
-                if (profile.previewMode === true) return;
-                const transform_admission = profile.editing
-                    ? begin_transform_admission()
-                    : Symbol(file_key);
-                if (!transform_admission) {
-                    await core?.reject_transform(
-                        msg,
-                        'Exit edit mode before sorting or filtering.',
-                    );
+            case 'hideRows': {
+                const installed = core?.transform_state(msg.sheetIndex) ?? EMPTY_TRANSFORM;
+                const synthesize = (state: SheetTransformState): Extract<
+                    WebviewMessage,
+                    { type: 'setTransform' }
+                > => ({
+                    type: 'setTransform',
+                    sheetIndex: msg.sheetIndex,
+                    state,
+                    requestId: msg.requestId,
+                    generation: msg.generation,
+                    sourceGeneration: msg.sourceGeneration,
+                    intent: 'user',
+                });
+                const reject = async (error: string) => {
+                    await core?.reject_transform(synthesize(installed), error);
+                };
+                if (profile.previewMode === true) {
+                    await reject('Row hiding is unavailable in preview mode.');
                     return;
                 }
-                let resolve_completion!: () => void;
-                const completion = new Promise<void>((resolve) => {
-                    resolve_completion = resolve;
-                });
-                const transform_authority: TransformAuthority = {
-                    authorityRevision: source_authority.authorityRevision,
-                    receiverEpoch: session.current_receiver_epoch,
-                    completion,
-                    resolveCompletion: resolve_completion,
-                };
-                transform_authorities.set(msg, transform_authority);
-                latest_transform_authority_by_sheet.set(
-                    msg.sheetIndex,
-                    transform_authority,
-                );
-                try {
-                    await core?.handle_message(msg);
-                    try {
-                        await reconcile_transform_terminal(msg, transform_authority);
-                    } catch (error) {
-                        console.error(
-                            'Failed to reconcile durable table transforms after a terminal operation',
-                            error,
-                        );
-                    }
-                } finally {
-                    if (transform_authorities.get(msg) === transform_authority) {
-                        transform_authorities.delete(msg);
-                    }
-                    if (
-                        latest_transform_authority_by_sheet.get(msg.sheetIndex)
-                        === transform_authority
-                    ) latest_transform_authority_by_sheet.delete(msg.sheetIndex);
-                    transform_commit_barriers.delete(transform_authority);
-                    transform_authority.resolveCompletion();
-                    if (profile.editing) {
-                        finish_transform_admission(transform_admission);
-                    }
+                if (!core) return;
+                if (msg.generation !== core.generation) {
+                    await reject('The view changed before this table view request arrived.');
+                    return;
                 }
+                if (msg.sourceGeneration !== core.source_generation) {
+                    await reject('The source changed before this table view request arrived.');
+                    return;
+                }
+                const sheet = core.snapshot_material().core.meta.sheets[msg.sheetIndex];
+                if (!sheet) {
+                    await reject(`Sheet index ${msg.sheetIndex} is out of range.`);
+                    return;
+                }
+                let mapped: Uint32Array;
+                try {
+                    mapped = core.map_display_rows_to_source(
+                        msg.sheetIndex,
+                        msg.displayRows,
+                    );
+                } catch (error) {
+                    await reject(error instanceof Error ? error.message : String(error));
+                    return;
+                }
+                const hidden_rows = [...new Set([
+                    ...(installed.hiddenRows ?? []),
+                    ...mapped,
+                ])].sort((a, b) => a - b);
+                await handle_transform_message(synthesize({
+                    ...installed,
+                    hiddenRows: hidden_rows,
+                    schema: transform_schema_for_sheet(sheet),
+                }));
+                return;
+            }
+            case 'setTransform': {
+                await handle_transform_message(msg);
                 return;
             }
             case 'releaseEditSession':

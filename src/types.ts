@@ -104,6 +104,10 @@ export type FilterColumnKind = 'numeric' | 'orderedText' | 'text' | 'unknown';
 export interface SheetTransformState {
     sort: SortKey[];
     filters: FilterEntry[];
+    /** Sorted unique canonical source-row indices excluded from the view;
+     *  positional annotations (like cellHighlights) — never re-associated on
+     *  content change. */
+    hiddenRows?: number[];
     /** Fingerprint of sheet identity + available column names. Prevents a saved
      *  transform from silently attaching to a reordered/replaced sheet. */
     schema?: string;
@@ -153,11 +157,16 @@ export function transform_is_active(state: SheetTransformState | undefined): boo
     return !!state && (
         state.sort.length > 0
         || state.filters.some((entry) => entry.enabled)
+        || (state.hiddenRows?.length ?? 0) > 0
     );
 }
 
 export function transform_has_entries(state: SheetTransformState | undefined): boolean {
-    return !!state && (state.sort.length > 0 || state.filters.length > 0);
+    return !!state && (
+        state.sort.length > 0
+        || state.filters.length > 0
+        || (state.hiddenRows?.length ?? 0) > 0
+    );
 }
 
 export function transform_schema_for_sheet(
@@ -292,6 +301,7 @@ export type WebviewMessage =
     | { type: 'cancelFilterHistogram'; requestId: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
+    | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'applyCellHighlights'; sheetIndex: number; sheetName: string; selection: CellHighlightSelection; mutation: CellHighlightMutation; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'clearAllCellHighlights'; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };

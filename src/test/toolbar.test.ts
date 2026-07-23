@@ -157,6 +157,21 @@ afterEach(() => {
 });
 
 describe('Toolbar', () => {
+    it('shows hidden row count and invokes Unhide all', () => {
+        const on_unhide_all = vi.fn();
+        const { container, rerender } = render_toolbar({
+            hidden_rows: { count: 0, pending: false, on_unhide_all },
+        });
+        expect(container.textContent).not.toContain('hidden row');
+
+        rerender({
+            hidden_rows: { count: 2, pending: false, on_unhide_all },
+        });
+        expect(container.textContent).toContain('2 hidden rows');
+        dispatch_mouse_event(get_button('Unhide all'), 'click');
+        expect(on_unhide_all).toHaveBeenCalledOnce();
+    });
+
     it('orders actions from content editing through table and tab layout', () => {
         const { container } = render_toolbar({
             show_edit_button: true,

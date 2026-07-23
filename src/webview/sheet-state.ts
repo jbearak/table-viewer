@@ -72,9 +72,10 @@ export function sanitize_transform_state(
     value: unknown,
     column_count = Number.MAX_SAFE_INTEGER,
     expected_schema?: string,
+    row_count = Number.MAX_SAFE_INTEGER,
 ): SheetTransformState | undefined {
     if (!value || typeof value !== 'object') return undefined;
-    const candidate = value as { sort?: unknown; filters?: unknown };
+    const candidate = value as { sort?: unknown; filters?: unknown; hiddenRows?: unknown };
     if (!Array.isArray(candidate.sort) || !Array.isArray(candidate.filters)) {
         return undefined;
     }
@@ -171,8 +172,27 @@ export function sanitize_transform_state(
         });
     }
 
-    if (sort.length === 0 && filters.length === 0) return undefined;
+    const hidden_rows: number[] = [];
+    if (Array.isArray(candidate.hiddenRows)) {
+        const unique = new Set<number>();
+        for (const row of candidate.hiddenRows) {
+            if (
+                typeof row === 'number'
+                && Number.isInteger(row)
+                && row >= 0
+                && row < row_count
+            ) unique.add(row);
+            if (unique.size === MAX_PERSISTED_HIDDEN_ROWS) break;
+        }
+        hidden_rows.push(...unique);
+        hidden_rows.sort((a, b) => a - b);
+    }
+
+    if (sort.length === 0 && filters.length === 0 && hidden_rows.length === 0) {
+        return undefined;
+    }
     const result: SheetTransformState = { sort, filters };
+    if (hidden_rows.length > 0) result.hiddenRows = hidden_rows;
     if (schema !== undefined) result.schema = schema;
     return result;
 }
@@ -182,6 +202,9 @@ export function sanitize_transform_state(
  *  truncated to this bound (permissive: extra rows show) rather than having
  *  the whole filter rejected. */
 const MAX_PERSISTED_EXCLUDED_VALUES = 100_000;
+
+// Bounds allocation when persisted state is corrupt or malicious.
+const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
 
 function sanitize_excluded_values(
     value: unknown,

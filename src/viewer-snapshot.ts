@@ -281,6 +281,7 @@ export function normalize_workbook_snapshot_state(
             normalized.transforms?.[index],
             sheet.columnCount,
             transform_schema_for_sheet(sheet),
+            sheet.sourceRowCount,
         ));
     const column_visibility = meta.sheets.map((sheet, index) =>
         sanitize_column_visibility_state(

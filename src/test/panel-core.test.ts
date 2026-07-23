@@ -3,6 +3,7 @@ import {
     InvalidPersistedTransformError,
     ViewerPanelCore,
     adopt_source_into_core,
+    transform_states_equal,
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import type { WebviewMessage } from '../types';
@@ -123,6 +124,40 @@ describe('ViewerPanelCore', () => {
         expect('send_meta' in core).toBe(false);
         expect('send_meta_reload' in core).toBe(false);
         expect('send_meta_recovery' in core).toBe(false);
+    });
+
+    it('compares, installs, and clones hidden row transform state', async () => {
+        expect(transform_states_equal(
+            { sort: [], filters: [] },
+            { sort: [], filters: [], hiddenRows: [] },
+        )).toBe(true);
+        expect(transform_states_equal(
+            { sort: [], filters: [], hiddenRows: [1] },
+            { sort: [], filters: [], hiddenRows: [2] },
+        )).toBe(false);
+
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(4));
+        const before = core.generation;
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 0,
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: [1],
+                schema: JSON.stringify(['Sheet1', 2, null]),
+            },
+            requestId: 'hide',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+        });
+        expect(core.generation).toBe(before + 1);
+        const state = core.transform_state(0);
+        expect(state.hiddenRows).toEqual([1]);
+        state.hiddenRows!.push(2);
+        expect(core.transform_state(0).hiddenRows).toEqual([1]);
     });
 
     it('snapshot_material clones and freezes source metadata and diagnostics', () => {

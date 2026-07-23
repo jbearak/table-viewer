@@ -19,6 +19,7 @@ import {
     type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type DisplayRowInterval,
     type PerFileState,
     type HostMessage,
     type SheetTransformState,
@@ -103,6 +104,9 @@ export function transforms_semantically_equal(
     if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
     if (!left || !right) return false;
     if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
+    const left_hidden = [...(left.hiddenRows ?? [])].sort((a, b) => a - b);
+    const right_hidden = [...(right.hiddenRows ?? [])].sort((a, b) => a - b);
+    if (JSON.stringify(left_hidden) !== JSON.stringify(right_hidden)) return false;
     const semantic_filters = (filters: readonly FilterEntry[]) => filters
         .map((entry) => {
             const base = {
@@ -878,6 +882,7 @@ export function App(): React.JSX.Element {
                                 authoritative_state.transforms[index],
                                 sheet.columnCount,
                                 transform_schema_for_sheet(sheet),
+                                sheet.sourceRowCount,
                             ));
                         const next_column_visibility = snapshot.meta.sheets.map(
                             (sheet, index) => sanitize_column_visibility_state(
@@ -1036,7 +1041,7 @@ export function App(): React.JSX.Element {
                 if (msg.error) {
                     vscode_api.postMessage({
                         type: 'showWarning',
-                        message: `Could not apply sort/filter: ${msg.error}`,
+                        message: `Could not update the table view: ${msg.error}`,
                     });
                 }
             }
@@ -1167,6 +1172,7 @@ export function App(): React.JSX.Element {
             state_ref.current.transforms?.[active_sheet_index],
             sheet.columnCount,
             transform_schema_for_sheet(sheet),
+            sheet.sourceRowCount,
         );
         if (state && transform_is_active(state)) {
             request_transform(active_sheet_index, state, 'restore', 'restore');
@@ -1232,7 +1238,7 @@ export function App(): React.JSX.Element {
             ) {
                 vscode_api.postMessage({
                     type: 'showWarning',
-                    message: 'Clear sorting and filters before entering edit mode.',
+                    message: 'Clear sorting, filters, and hidden rows before entering edit mode.',
                 });
                 return;
             }
@@ -1287,11 +1293,14 @@ export function App(): React.JSX.Element {
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
-            const column_count = meta?.sheets[active_sheet_index]?.columnCount ?? 0;
+            const active_sheet = meta?.sheets[active_sheet_index];
+            const column_count = active_sheet?.columnCount ?? 0;
+            const source_row_count = active_sheet?.sourceRowCount ?? 0;
             const sanitized = sanitize_transform_state(
                 { ...next_state, schema },
                 column_count,
                 schema,
+                source_row_count,
             ) ?? {
                 sort: [],
                 filters: [],
@@ -1302,6 +1311,7 @@ export function App(): React.JSX.Element {
                     ?? state_ref.current.transforms?.[active_sheet_index],
                 column_count,
                 schema,
+                source_row_count,
             );
             if (transforms_semantically_equal(current, sanitized)) return false;
             request_transform(active_sheet_index, sanitized, 'user', origin);
@@ -1316,6 +1326,57 @@ export function App(): React.JSX.Element {
             request_transform,
         ],
     );
+
+    const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
+        if (
+            edit_mode
+            || edit_session_pending
+            || preview_mode
+            || pending_excel_header_ref.current !== null
+            || pending_transforms[active_sheet_index]
+        ) return;
+        const request_id = [
+            'transform',
+            transform_request_prefix_ref.current,
+            active_sheet_index,
+            ++transform_request_seq_ref.current,
+        ].join(':');
+        pending_transform_request_ids_ref.current[active_sheet_index] = request_id;
+        pending_transform_states_ref.current[active_sheet_index] = undefined;
+        pending_transform_origins_ref.current[active_sheet_index] = 'grid';
+        set_pending_transforms((prev) => {
+            const next = [...prev];
+            next[active_sheet_index] = true;
+            return next;
+        });
+        set_pending_transform_labels((prev) => {
+            const next = [...prev];
+            next[active_sheet_index] = 'Hiding rows…';
+            return next;
+        });
+        vscode_api.postMessage({
+            type: 'hideRows',
+            sheetIndex: active_sheet_index,
+            displayRows: display_rows,
+            requestId: request_id,
+            generation: generation_ref.current,
+            sourceGeneration: source_generation_ref.current,
+        });
+    }, [
+        active_sheet_index,
+        edit_mode,
+        edit_session_pending,
+        pending_transforms,
+        preview_mode,
+    ]);
+
+    const handle_unhide_all_rows = useCallback(() => {
+        const current = state_ref.current.transforms?.[active_sheet_index]
+            ?? transforms[active_sheet_index]
+            ?? EMPTY_TRANSFORM;
+        const { hiddenRows: _hidden_rows, ...next } = current;
+        handle_transform_change(next, 'toolbar');
+    }, [active_sheet_index, handle_transform_change, transforms]);
 
     const handle_grid_transform_change = useCallback(
         (next_state: SheetTransformState) => {
@@ -1454,9 +1515,13 @@ export function App(): React.JSX.Element {
                     ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                     : undefined,
             };
-        const current = pending_transform_states_ref.current[active_sheet_index]
+        const pending_state = pending_transform_states_ref.current[active_sheet_index];
+        const current = pending_state
             ?? state_ref.current.transforms?.[active_sheet_index];
-        if (transforms_semantically_equal(current, previous)) return;
+        if (
+            pending_state !== undefined
+            && transforms_semantically_equal(current, previous)
+        ) return;
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
@@ -1882,6 +1947,7 @@ export function App(): React.JSX.Element {
         current_sheet.merges.length > 0
         && (transform_active || has_hidden_columns);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
+    const hidden_row_count = visible_transform.hiddenRows?.length ?? 0;
     const excel_header = current_sheet.excelFirstRowHeader;
     const excel_header_pending = pending_excel_header !== null;
     const excel_header_disabled = !!excel_header && (
@@ -1955,6 +2021,7 @@ export function App(): React.JSX.Element {
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
             on_hide_column={handle_toggle_column}
+            on_hide_rows={handle_hide_rows}
             on_focus_columns={focus_columns_trigger}
             cell_highlights={cell_highlights?.sheets[active_sheet_index]}
             on_highlight_selection={handle_highlight_selection}
@@ -1978,6 +2045,11 @@ export function App(): React.JSX.Element {
                 }
                 transform_pending={transform_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
+                hidden_rows={{
+                    count: hidden_row_count,
+                    pending: transform_pending,
+                    on_unhide_all: handle_unhide_all_rows,
+                }}
                 column_names={column_names}
                 merges_flattened={merges_flattened}
                 on_transform_change={handle_toolbar_transform_change}
@@ -2058,7 +2130,7 @@ export function App(): React.JSX.Element {
                         ? 'Waiting to enter edit mode.'
                         : transform_pending
                         ? 'Wait for sorting and filtering to finish.'
-                        : 'Clear sorting and filters before editing.'
+                        : 'Clear sorting, filters, and hidden rows before editing.'
                 }
             />
             {filter_editor && (

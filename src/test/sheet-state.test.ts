@@ -254,4 +254,26 @@ describe('sheet-state helpers', () => {
             schema: 'old-schema',
         }, 1, 'new-schema')).toBeUndefined();
     });
+
+    it('sanitizes hidden canonical rows and retains hidden-only descriptors', () => {
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [],
+            hiddenRows: [4, 2, 4, -1, 1.5, 8, '3'],
+        }, 1, undefined, 6)).toEqual({
+            sort: [],
+            filters: [],
+            hiddenRows: [2, 4],
+        });
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [],
+            hiddenRows: 'corrupt',
+        }, 1, undefined, 6)).toBeUndefined();
+        expect(sanitize_transform_state({
+            sort: [],
+            filters: [],
+        }, 1, undefined, 6)).toBeUndefined();
+    });
+
 });

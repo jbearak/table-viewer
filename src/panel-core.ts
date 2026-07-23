@@ -19,6 +19,7 @@ import type {
 } from './viewer-snapshot';
 import {
     EMPTY_TRANSFORM,
+    transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
     type DisplayRowInterval,
@@ -216,6 +217,12 @@ export class ViewerPanelCore {
 
     get has_active_transform(): boolean {
         return [...this.transform_states.values()].some(transform_is_active);
+    }
+
+    transform_state(sheet_index: number): SheetTransformState {
+        return clone_transform(
+            this.transform_states.get(sheet_index) ?? EMPTY_TRANSFORM,
+        );
     }
 
     /** Map inclusive installed display-row intervals to canonical source rows. */
@@ -588,19 +595,19 @@ export class ViewerPanelCore {
             await this.post_transform_error(
                 msg,
                 sheet.rowCount,
-                'The source changed before this sort/filter request arrived.',
+                'The source changed before this table view request arrived.',
                 receiver_epoch,
             );
             return;
         }
         if (
-            (msg.state.sort.length > 0 || msg.state.filters.length > 0)
+            transform_has_entries(msg.state)
             && msg.state.schema !== transform_schema_for_sheet(sheet)
         ) {
             await this.post_transform_error(
                 msg,
                 sheet.rowCount,
-                'The saved sort/filter no longer matches this sheet.',
+                'The saved table view no longer matches this sheet.',
                 receiver_epoch,
             );
             return;
@@ -889,6 +896,7 @@ function clone_transform(state: SheetTransformState): SheetTransformState {
         sort: state.sort.map((key) => ({ ...key })),
         filters: state.filters.map(clone_filter_entry),
     };
+    if (state.hiddenRows) clone.hiddenRows = [...state.hiddenRows];
     if (state.schema !== undefined) clone.schema = state.schema;
     return clone;
 }
@@ -943,8 +951,10 @@ export function transform_states_equal(
     if (
         left.sort.length === 0
         && left.filters.length === 0
+        && (left.hiddenRows?.length ?? 0) === 0
         && right.sort.length === 0
         && right.filters.length === 0
+        && (right.hiddenRows?.length ?? 0) === 0
     ) return true;
     return left.schema === right.schema
         && left.sort.length === right.sort.length
@@ -952,6 +962,7 @@ export function transform_states_equal(
             key.colIndex === right.sort[index].colIndex
             && key.direction === right.sort[index].direction
         ))
+        && array_values_equal(left.hiddenRows, right.hiddenRows)
         && left.filters.length === right.filters.length
         && left.filters.every((entry, index) => {
             const candidate = right.filters[index];
@@ -964,6 +975,16 @@ export function transform_states_equal(
                 && entry.caseSensitive === candidate.caseSensitive
                 && entry.enabled === candidate.enabled;
         });
+}
+
+function array_values_equal(
+    left: readonly number[] | undefined,
+    right: readonly number[] | undefined,
+): boolean {
+    if ((left?.length ?? 0) === 0 && (right?.length ?? 0) === 0) return true;
+    return !!left && !!right
+        && left.length === right.length
+        && left.every((value, index) => value === right[index]);
 }
 
 function excluded_values_equal(
