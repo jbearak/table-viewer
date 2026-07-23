@@ -126,6 +126,11 @@
     "configuration": {
       "title": "Table Viewer",
       "properties": {
+        "tableViewer.fontFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Font family used in table views. Leave empty to use the editor font (editor.fontFamily)."
+        },
         "tableViewer.tabOrientation": {
           "type": "string",
           "enum": [

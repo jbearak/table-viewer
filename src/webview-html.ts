@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
+import { get_font_family } from './viewer-config';
 
 export function generate_nonce(): string {
     return crypto.randomBytes(16).toString('hex');
@@ -8,7 +9,8 @@ export function generate_nonce(): string {
 export function build_webview_html(
     webview: vscode.Webview,
     extension_uri: vscode.Uri,
-    nonce: string
+    nonce: string,
+    font_family: string | null = get_font_family(),
 ): string {
     const js_uri = webview.asWebviewUri(
         vscode.Uri.joinPath(
@@ -18,6 +20,16 @@ export function build_webview_html(
             'index.js'
         )
     );
+    const font_bootstrap = font_family
+        ? `<script nonce="${nonce}">document.documentElement.style.setProperty('--table-viewer-font-family', ${
+            JSON.stringify(font_family)
+                .replaceAll('<', '\\u003c')
+                .replaceAll('>', '\\u003e')
+                .replaceAll('&', '\\u0026')
+                .replaceAll('\u2028', '\\u2028')
+                .replaceAll('\u2029', '\\u2029')
+        });</script>\n`
+        : '';
     const css_uri = webview.asWebviewUri(
         vscode.Uri.joinPath(
             extension_uri,
@@ -55,7 +67,7 @@ export function build_webview_html(
                script-src 'nonce-${nonce}';
                font-src ${webview.cspSource};">
 <title>Table Viewer</title>
-<link nonce="${nonce}" rel="stylesheet" href="${css_uri}">
+${font_bootstrap}<link nonce="${nonce}" rel="stylesheet" href="${css_uri}">
 </head>
 <body>
 <div id="root"></div>

@@ -76,6 +76,32 @@ beforeEach(() => {
 });
 
 describe('hide rows controller', () => {
+    it('replays the current font on ready and forwards later changes', async () => {
+        vscode_mock.__setConfigurationValue('tableViewer.fontFamily', 'Hack');
+        const panel = open_csv_table(versioned_state_store().store);
+
+        await ready(panel);
+        expect(messages_of(panel, 'fontFamilyChanged').at(0)).toEqual({
+            type: 'fontFamilyChanged',
+            fontFamily: 'Hack',
+        });
+
+        panel.__messages.length = 0;
+        vscode_mock.__setConfigurationValue(
+            'tableViewer.fontFamily',
+            'Google Sans Code',
+        );
+        await vscode_mock.__fireConfigurationChange({
+            affectsConfiguration: (section) => (
+                section === 'tableViewer.fontFamily'
+            ),
+        });
+        expect(messages_of(panel, 'fontFamilyChanged')).toEqual([{
+            type: 'fontFamilyChanged',
+            fontFamily: 'Google Sans Code',
+        }]);
+    });
+
     it('maps, deduplicates, sorts, and persists hidden source rows', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);

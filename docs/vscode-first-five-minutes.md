@@ -88,6 +88,24 @@ Closing Chat or hiding the Secondary Side Bar only removes Chat from view. To tu
 
 This hides built-in Chat and inline AI suggestions and disables the GitHub Copilot extensions if they are installed. Return to the same setting and turn it off if you want those features later.
 
+## Choose a comfortable font
+
+Table Viewer uses the same font as VS Code's text editor by default. This keeps tables and source files visually consistent, and means that changing VS Code's editor font changes both.
+
+You can change the font in both places or give Table Viewer its own font:
+
+- **Change the editor and Table Viewer together:** Open **Settings**, search for `editor font family`, and set **Editor: Font Family**. Because `tableViewer.fontFamily` is empty by default, Table Viewer follows this setting.
+- **Change only Table Viewer:** Open **Settings**, search for `table viewer font family`, and set **Table Viewer: Font Family**. The text editor keeps its existing font.
+
+Clear **Table Viewer: Font Family** at any time to make Table Viewer follow **Editor: Font Family** again. If a newly installed font does not appear immediately, restart VS Code after installing it.
+
+If you would like to try a different font, two readable, free, open-source choices are:
+
+- [**Hack**](https://sourcefoundry.org/hack/) is an established monospaced typeface with a large x-height and deliberately distinct character shapes. It comes in four fixed styles: regular, bold, italic, and bold italic.
+- [**Google Sans Code**](https://github.com/googlefonts/googlesans-code/releases/latest) is a monospaced typeface designed to remain clear at small sizes. Its upright and italic variable fonts each let you choose any weight from 300 to 800.
+
+Install the font on your computer, then enter its family name—such as `Hack` or `Google Sans Code`—in one of the settings above.
+
 ## Match the screenshots' colors, if you like
 
 The light colors in the guide screenshots come from the **Catppuccin Latte** theme. A theme changes VS Code's appearance; it does not change your workbooks.

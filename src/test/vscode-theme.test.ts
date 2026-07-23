@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+    apply_font_family,
     build_theme_from_vars,
     is_vscode_high_contrast,
 } from '../webview/vscode-theme';
@@ -20,6 +21,15 @@ describe('build_theme_from_vars', () => {
         expect(theme.fontFamily).toBe('Fira Code');
     });
 
+    it('prefers the configured table font over the editor font', () => {
+        const vars: Record<string, string> = {
+            '--table-viewer-font-family': 'Atkinson Hyperlegible',
+            '--vscode-editor-font-family': 'Fira Code',
+        };
+        const theme = build_theme_from_vars((name) => vars[name] ?? '');
+        expect(theme.fontFamily).toBe('Atkinson Hyperlegible');
+    });
+
     it('falls back to defaults when a variable is missing/blank', () => {
         const theme = build_theme_from_vars(() => '');
         // Non-empty fallbacks for the essentials.
@@ -34,6 +44,29 @@ describe('build_theme_from_vars', () => {
             name === '--vscode-editor-background' ? '  #abcdef  ' : ''
         );
         expect(theme.bgCell).toBe('#abcdef');
+    });
+});
+
+describe('apply_font_family', () => {
+    function fake_root() {
+        const values = new Map<string, string>();
+        return {
+            style: {
+                setProperty: (name: string, value: string) => values.set(name, value),
+                removeProperty: (name: string) => values.delete(name),
+                getPropertyValue: (name: string) => values.get(name) ?? '',
+            },
+        } as unknown as HTMLElement;
+    }
+
+    it('sets a trimmed override and removes it to restore inheritance', () => {
+        const root = fake_root();
+        apply_font_family('  Atkinson Hyperlegible  ', root);
+        expect(root.style.getPropertyValue('--table-viewer-font-family'))
+            .toBe('Atkinson Hyperlegible');
+
+        apply_font_family(null, root);
+        expect(root.style.getPropertyValue('--table-viewer-font-family')).toBe('');
     });
 });
 

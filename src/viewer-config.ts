@@ -3,6 +3,12 @@
 // copies of these getters; centralizing them keeps keys and defaults in one place.
 import * as vscode from 'vscode';
 
+export function get_font_family(): string | null {
+    const configured = vscode.workspace.getConfiguration('tableViewer')
+        .get<string>('fontFamily', '');
+    return configured?.trim() || null;
+}
+
 export function get_max_file_size_mib(): number {
     return vscode.workspace.getConfiguration('tableViewer')
         .get<number>('maxFileSizeMiB', 256)!;

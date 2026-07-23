@@ -108,8 +108,11 @@ To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table e
 
 ## Settings
 
+Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace` if you want tables to use a different font.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
 | `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |

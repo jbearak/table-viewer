@@ -35,4 +35,31 @@ describe('build_webview_html', () => {
         expect(root_at).toBeGreaterThanOrEqual(0);
         expect(portal_at).toBeGreaterThan(root_at);
     });
+
+    it('bootstraps a configured font before the stylesheet loads', () => {
+        const html = build_webview_html(
+            fake_webview(),
+            ext_uri,
+            'nonce123',
+            '"Atkinson Hyperlegible", sans-serif',
+        );
+        const font_at = html.indexOf("style.setProperty('--table-viewer-font-family'");
+        const stylesheet_at = html.indexOf('<link nonce="nonce123" rel="stylesheet"');
+        expect(font_at).toBeGreaterThanOrEqual(0);
+        expect(font_at).toBeLessThan(stylesheet_at);
+        expect(html).toContain(
+            '<script nonce="nonce123">document.documentElement.style.setProperty(',
+        );
+    });
+
+    it('escapes configured font text before embedding it in a script', () => {
+        const html = build_webview_html(
+            fake_webview(),
+            ext_uri,
+            'nonce123',
+            '</script><script>alert(1)</script>',
+        );
+        expect(html).not.toContain('</script><script>alert(1)</script>');
+        expect(html).toContain('\\u003c/script\\u003e');
+    });
 });

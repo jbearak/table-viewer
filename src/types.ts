@@ -285,6 +285,7 @@ export type TerminalCsvSaveLifecycle = Extract<
 
 /** Messages from extension host to webview. */
 export type HostMessage =
+    | { type: 'fontFamilyChanged'; fontFamily: string | null }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
