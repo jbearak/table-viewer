@@ -1025,6 +1025,17 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     color: var(--vscode-button-foreground, #fff);
 }
 
+.filter-popover-btn-primary:hover:not(:disabled) {
+    border-color: var(--vscode-button-hoverBackground, #1177bb);
+    background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.filter-popover-btn:not(.filter-popover-btn-primary):not(.filter-popover-btn-danger):hover:not(:disabled) {
+    border-color: var(--vscode-button-secondaryHoverBackground, #45494e);
+    background: var(--vscode-button-secondaryHoverBackground, #45494e);
+    color: var(--vscode-button-secondaryForeground, #fff);
+}
+
 /* Keep the destructive action separate from the routine actions. An outlined
    treatment preserves text contrast instead of mixing unrelated theme colors. */
 .filter-popover-btn-danger {
