@@ -30,6 +30,7 @@ export interface ToolbarProps {
     transform_disabled: boolean;
     transform_pending: boolean;
     transform_progress?: string;
+    hidden_rows?: { count: number; pending: boolean; on_unhide_all: () => void };
     column_names: readonly string[];
     merges_flattened: boolean;
     on_transform_change: (state: SheetTransformState) => void;
@@ -90,9 +91,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
-    // The row count is only informative when a filter is hiding rows; in the
-    // common unfiltered view it is just persistent chrome, so suppress it and
-    // surface "N of M rows" purely as filter feedback.
+    // The row count is only informative when the table view hides rows; in the
+    // natural view it is persistent chrome, so suppress it.
     const is_filtered = row_count !== source_row_count;
     const row_count_text = `${row_count.toLocaleString()} of ${source_row_count.toLocaleString()} rows`;
     const wrapped = use_toolbar_wrap(
@@ -100,6 +100,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         [
             transform.sort,
             transform.filters,
+            props.hidden_rows?.count,
+            props.hidden_rows?.pending,
             row_count_text,
             props.transform_pending,
             props.transform_progress,
@@ -147,6 +149,22 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     on_change={on_transform_change}
                     on_edit={on_edit_filter}
                 />
+                {(props.hidden_rows?.count ?? 0) > 0 && (
+                    <div className="filter-chip">
+                        <span className="filter-chip-body">
+                            {props.hidden_rows!.count} hidden row
+                            {props.hidden_rows!.count === 1 ? '' : 's'}
+                        </span>
+                        <button
+                            type="button"
+                            className="toolbar-cancel"
+                            onClick={props.hidden_rows!.on_unhide_all}
+                            disabled={props.hidden_rows!.pending || props.transform_disabled}
+                        >
+                            Unhide all
+                        </button>
+                    </div>
+                )}
                 {props.transform_pending && (
                     <span className="toolbar-progress" role="status" aria-live="polite">
                         {props.transform_progress ?? 'Applying sort & filters…'}

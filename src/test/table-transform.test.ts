@@ -136,6 +136,51 @@ describe('table transforms', () => {
         expect([...result.indices!]).toEqual([2, 1, 3]);
     });
 
+    it('excludes hidden canonical rows before filtering and sorting', async () => {
+        const source = new Source([
+            [cell('c')],
+            [cell('a')],
+            [cell('b')],
+            [cell('a')],
+        ]);
+        expect([...(await compute_transform(source, 0, {
+            sort: [], filters: [], hiddenRows: [1, 3],
+        })).indices!]).toEqual([0, 2]);
+        expect([...(await compute_transform(source, 0, {
+            sort: [], filters: [filter('equals', 'a')], hiddenRows: [1],
+        })).indices!]).toEqual([3]);
+        expect([...(await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [], hiddenRows: [1],
+        })).indices!]).toEqual([3, 2, 0]);
+        const hidden_all = await compute_transform(source, 0, {
+            sort: [], filters: [], hiddenRows: [0, 1, 2, 3],
+        });
+        expect(hidden_all.indices).toBeInstanceOf(Uint32Array);
+        expect(hidden_all.indices).toHaveLength(0);
+        expect(hidden_all.rowCount).toBe(0);
+        await expect(compute_transform(source, 0, {
+            sort: [], filters: [], hiddenRows: [4],
+        })).rejects.toBeInstanceOf(RangeError);
+    });
+
+    it('keys hidden rows by canonical identity under row projection', async () => {
+        class ProjectedSource extends Source {
+            override meta(): WorkbookMeta {
+                const meta = super.meta();
+                meta.sheets[0].sourceRowCount = this.rows.length + 1;
+                return meta;
+            }
+            source_row_indices(_sheet: number, rows: ArrayLike<number>): Uint32Array {
+                return Uint32Array.from(rows, (row) => row + 1);
+            }
+        }
+        const source = new ProjectedSource([[cell('a')], [cell('b')], [cell('c')]]);
+        const result = await compute_transform(source, 0, {
+            sort: [], filters: [], hiddenRows: [1],
+        });
+        expect([...result.indices!]).toEqual([1, 2]);
+    });
+
     it('infers canonical CSV decimals as numeric but preserves zero-padded identifiers as text', async () => {
         const decimals = new Source([
             [cell('1.10')],

@@ -34,6 +34,7 @@ import {
     type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type DisplayRowInterval,
     type MergeRange,
     type SheetCellHighlightState,
     type SheetTransformState,
@@ -92,6 +93,7 @@ import {
     grid_selection_contains_cell,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
+    selected_display_row_intervals,
 } from './highlight-selection-model';
 import { CELL_HIGHLIGHT_COLORS, highlight_rgba } from './highlight-theme';
 import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
@@ -236,6 +238,7 @@ export interface GridShellProps {
         restore_focus: () => void,
     ) => void;
     on_hide_column?: (source_column: number) => void;
+    on_hide_rows?: (display_rows: DisplayRowInterval[]) => void;
     /** Focus recovery target when hiding the final visible header removes Glide. */
     on_focus_columns?: () => void;
     cell_highlights?: SheetCellHighlightState;
@@ -289,6 +292,7 @@ export function GridShell({
     on_transform_change = () => {},
     on_open_filter = () => {},
     on_hide_column = () => {},
+    on_hide_rows = () => {},
     on_focus_columns = () => {},
     cell_highlights,
     on_highlight_selection = () => {},
@@ -1779,6 +1783,24 @@ export function GridShell({
                     on_click: () => mutate_highlight_selection({ type: 'clear' }),
                 });
             }
+            menu_items.push({ kind: 'separator' });
+        }
+        const selected_rows = selected_display_row_intervals(grid_selection, row_count);
+        if (
+            selected_rows
+            && transform_sections
+            && !transform_pending
+            && !edit_mode
+            && !preview_mode
+        ) {
+            const selected_row_count = selected_rows.reduce(
+                (total, interval) => total + interval.end - interval.start + 1,
+                0,
+            );
+            menu_items.push({
+                label: selected_row_count === 1 ? 'Hide row' : `Hide ${selected_row_count} rows`,
+                on_click: () => on_hide_rows(selected_rows),
+            });
             menu_items.push({ kind: 'separator' });
         }
         menu_items.push({ label: 'Select row', on_click: () => select_row(row) });

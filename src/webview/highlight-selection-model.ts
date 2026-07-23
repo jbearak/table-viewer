@@ -142,6 +142,25 @@ function coalesce_indices(indices: readonly number[]): DisplayRowInterval[] {
     return intervals;
 }
 
+export function selected_display_row_intervals(
+    selection: GridSelection,
+    row_count: number,
+): DisplayRowInterval[] | null {
+    const explicit = coalesce_indices(compact_indices(selection.rows, row_count));
+    if (explicit.length > 0) return explicit;
+    const current = selection.current;
+    if (!current) return null;
+    const intervals = [current.range, ...current.rangeStack]
+        .map((range) => clamp_interval(
+            range.y,
+            range.y + range.height - 1,
+            row_count,
+        ))
+        .filter((interval): interval is DisplayRowInterval => interval !== null);
+    const merged = merge_display_row_intervals(intervals);
+    return merged.length > 0 ? merged : null;
+}
+
 function project_merges_to_display(
     merges: readonly MergeRange[],
     column_projection: ColumnProjection,

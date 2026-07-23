@@ -111,21 +111,57 @@ export async function compute_transform(
 
     // Validate every referenced index before acquiring or publishing any column.
     needed_columns(state, sheet.columnCount);
+    for (const row of state.hiddenRows ?? []) {
+        if (!Number.isInteger(row) || row < 0 || row >= sheet.sourceRowCount) {
+            throw new RangeError(`hidden source row ${row} out of range`);
+        }
+    }
     await cancellation_checkpoint(is_cancelled);
     let survivors: Uint32Array | undefined;
     let survivor_mask: Uint8Array | undefined;
     let returned_result = false;
     try {
+        const hidden_rows = new Set(state.hiddenRows ?? []);
         const filter_groups = group_enabled_filters(state.filters);
         let survivor_count = sheet.rowCount;
-        if (filter_groups.size > 0) {
-            await cancellation_checkpoint(is_cancelled);
+        if (hidden_rows.size > 0) {
             survivor_mask = allocate_survivor_mask(
                 sheet.rowCount,
                 sort_instrumentation,
             );
             survivor_count = 0;
-            let first_group = true;
+            for (let start = 0; start < sheet.rowCount; start += SCAN_ROWS_PER_CHECKPOINT) {
+                const count = Math.min(
+                    SCAN_ROWS_PER_CHECKPOINT,
+                    sheet.rowCount - start,
+                );
+                const projected_rows = Uint32Array.from(
+                    { length: count },
+                    (_, offset) => start + offset,
+                );
+                const source_rows = read_source_row_indices(
+                    source,
+                    sheet_index,
+                    projected_rows,
+                );
+                for (let offset = 0; offset < source_rows.length; offset++) {
+                    const visible = !hidden_rows.has(source_rows[offset]);
+                    survivor_mask[start + offset] = visible ? 1 : 0;
+                    if (visible) survivor_count += 1;
+                }
+                await cancellation_checkpoint(is_cancelled);
+            }
+        }
+        if (filter_groups.size > 0) {
+            await cancellation_checkpoint(is_cancelled);
+            if (!survivor_mask) {
+                survivor_mask = allocate_survivor_mask(
+                    sheet.rowCount,
+                    sort_instrumentation,
+                );
+            }
+            survivor_count = 0;
+            let first_group = hidden_rows.size === 0;
             for (const [column_index, filters] of filter_groups) {
                 const column = await acquire_transform_column(
                     source,

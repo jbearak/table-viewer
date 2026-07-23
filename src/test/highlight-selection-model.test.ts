@@ -6,6 +6,7 @@ import {
     grid_selection_contains_cell,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
+    selected_display_row_intervals,
 } from '../webview/highlight-selection-model';
 import type { MergeRange } from '../types';
 
@@ -69,6 +70,34 @@ describe('highlight_selection_may_have_renderable_highlight', () => {
             get_source_row,
         )).toBe(false);
         expect(get_source_row).not.toHaveBeenCalled();
+    });
+});
+
+describe('selected_display_row_intervals', () => {
+    it('prefers explicit rows and coalesces them', () => {
+        const selection: GridSelection = {
+            ...current(0, 7),
+            rows: CompactSelection.fromSingleSelection([2, 5]),
+        };
+        expect(selected_display_row_intervals(selection, 10)).toEqual([
+            { start: 2, end: 4 },
+        ]);
+    });
+
+    it('uses current ranges and clamps them to the row count', () => {
+        const selection: GridSelection = {
+            ...empty(),
+            current: {
+                cell: [0, 8],
+                range: { x: 0, y: 8, width: 1, height: 5 },
+                rangeStack: [{ x: 1, y: 2, width: 1, height: 2 }],
+            },
+        };
+        expect(selected_display_row_intervals(selection, 10)).toEqual([
+            { start: 2, end: 3 },
+            { start: 8, end: 9 },
+        ]);
+        expect(selected_display_row_intervals(empty(), 10)).toBeNull();
     });
 });
 
