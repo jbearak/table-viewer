@@ -61,7 +61,7 @@ import {
     type SheetTransformState,
     type WebviewMessage,
 } from './types';
-import { sanitize_transform_state } from './webview/sheet-state';
+import { MAX_PERSISTED_HIDDEN_ROWS, sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 import {
     cell_highlight_states_equal,
@@ -3276,7 +3276,7 @@ export function attach_viewer(
                     await reject('The source changed before this table view request arrived.');
                     return;
                 }
-                const sheet = core.snapshot_material().core.meta.sheets[msg.sheetIndex];
+                const sheet = source?.meta().sheets[msg.sheetIndex];
                 if (!sheet) {
                     await reject(`Sheet index ${msg.sheetIndex} is out of range.`);
                     return;
@@ -3295,6 +3295,10 @@ export function attach_viewer(
                     ...(installed.hiddenRows ?? []),
                     ...mapped,
                 ])].sort((a, b) => a - b);
+                if (hidden_rows.length > MAX_PERSISTED_HIDDEN_ROWS) {
+                    await reject('Too many hidden rows to persist.');
+                    return;
+                }
                 await handle_transform_message(synthesize({
                     ...installed,
                     hiddenRows: hidden_rows,

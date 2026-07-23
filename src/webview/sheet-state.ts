@@ -204,7 +204,7 @@ export function sanitize_transform_state(
 const MAX_PERSISTED_EXCLUDED_VALUES = 100_000;
 
 // Bounds allocation when persisted state is corrupt or malicious.
-const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
+export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
 
 function sanitize_excluded_values(
     value: unknown,
