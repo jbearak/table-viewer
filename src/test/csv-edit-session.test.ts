@@ -12,6 +12,7 @@ import type { PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { fake_viewer_host } from './mocks/host-ports';
 import { file_coordinator_registry_size } from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snapshot';
@@ -171,6 +172,7 @@ function open_csv_table(
         file_uri,
         with_in_memory_authority_transactions(store),
         profile,
+        fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;

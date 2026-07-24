@@ -18,6 +18,7 @@ import {
     stage_authority,
     with_in_memory_authority_transactions,
 } from '../state-authority';
+import { fake_viewer_host } from './mocks/host-ports';
 
 class PhysicalExcelSource implements DataSource {
     readonly warnings?: string[];
@@ -167,6 +168,7 @@ function open_excel(path: string, store: FileStateStore, profile: ViewerProfile)
         vscode_mock.Uri.file(path) as unknown as vscode.Uri,
         with_in_memory_authority_transactions(store),
         profile,
+        fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;

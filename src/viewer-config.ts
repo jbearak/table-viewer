@@ -23,8 +23,3 @@ export function get_default_orientation(): 'horizontal' | 'vertical' {
     return vscode.workspace.getConfiguration('tableViewer')
         .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
 }
-
-/** ',' for .csv (and anything else), '\t' for .tsv — chosen by extension. */
-export function get_delimiter(file_path: string): ',' | '\t' {
-    return file_path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
-}

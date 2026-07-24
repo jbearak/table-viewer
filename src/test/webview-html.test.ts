@@ -1,21 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { build_webview_html } from '../webview-html';
+import { build_webview_html, type WebviewHtmlAssets } from '../webview-html';
 
-// `build_webview_html` only touches `webview.asWebviewUri`, `webview.cspSource`
-// and `vscode.Uri.joinPath` (the latter via the aliased mock). A tiny fake
-// webview is all the function needs.
-function fake_webview() {
-    return {
-        asWebviewUri: (uri: { toString(): string }) => ({
-            toString: () => `https://webview.test/${uri.toString()}`,
-        }),
-        cspSource: 'https://webview.test',
-    } as unknown as Parameters<typeof build_webview_html>[0];
-}
-
-const ext_uri = { path: '/ext', toString: () => '/ext' } as unknown as Parameters<
-    typeof build_webview_html
->[1];
+// `build_webview_html` is host-agnostic: it only needs resolved asset URLs and
+// a CSP source expression.
+const assets: WebviewHtmlAssets = {
+    scriptUrl: 'https://webview.test/ext/dist/webview/index.js',
+    styleUrl: 'https://webview.test/ext/dist/webview/index.css',
+    cspSource: 'https://webview.test',
+};
 
 describe('build_webview_html', () => {
     it('renders the Glide overlay-editor portal target so cell editing can mount', () => {
@@ -23,12 +15,12 @@ describe('build_webview_html', () => {
         // id="portal" (document.getElementById("portal")). Without it the editor
         // returns null and CSV editing silently fails — the Edit toggle flips the
         // button colour but no overlay ever opens. See src/webview-html.ts.
-        const html = build_webview_html(fake_webview(), ext_uri, 'nonce123');
+        const html = build_webview_html(assets, 'nonce123');
         expect(html).toContain('<div id="portal"></div>');
     });
 
     it('places the portal inside <body>, after the React root, so the overlay stacks above the grid', () => {
-        const html = build_webview_html(fake_webview(), ext_uri, 'nonce123');
+        const html = build_webview_html(assets, 'nonce123');
         const body = html.slice(html.indexOf('<body>'));
         const root_at = body.indexOf('id="root"');
         const portal_at = body.indexOf('id="portal"');
@@ -36,10 +28,18 @@ describe('build_webview_html', () => {
         expect(portal_at).toBeGreaterThan(root_at);
     });
 
+    it('embeds the provided asset URLs and CSP source', () => {
+        const html = build_webview_html(assets, 'nonce123');
+        expect(html).toContain(`src="${assets.scriptUrl}"`);
+        expect(html).toContain(`href="${assets.styleUrl}"`);
+        expect(html).toContain(`style-src ${assets.cspSource};`);
+        expect(html).toContain(`img-src ${assets.cspSource} data: blob:;`);
+        expect(html).toContain(`font-src ${assets.cspSource};`);
+    });
+
     it('bootstraps a configured font before the stylesheet loads', () => {
         const html = build_webview_html(
-            fake_webview(),
-            ext_uri,
+            assets,
             'nonce123',
             '"Atkinson Hyperlegible", sans-serif',
         );
@@ -54,8 +54,7 @@ describe('build_webview_html', () => {
 
     it('escapes configured font text before embedding it in a script', () => {
         const html = build_webview_html(
-            fake_webview(),
-            ext_uri,
+            assets,
             'nonce123',
             '</script><script>alert(1)</script>',
         );

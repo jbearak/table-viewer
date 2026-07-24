@@ -8,6 +8,7 @@ import { acquire_file_coordinator } from '../file-coordinator';
 import type { AuthorityFileStateStore } from '../state';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { fake_viewer_host } from './mocks/host-ports';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
 
@@ -38,6 +39,7 @@ function open_csv_table(
         file_uri,
         resolved_store,
         profile,
+        fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;
@@ -324,12 +326,14 @@ describe('CSV reload races', () => {
             uri('/tmp/shared-parser.csv'),
             shared_store,
             failing_profile,
+            fake_viewer_host,
         );
         const second_controller = attach_viewer(
             second as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/shared-parser.csv'),
             shared_store,
             csv_table_profile(),
+            fake_viewer_host,
         );
         await first.__receive({ type: 'ready' });
         await second.__receive({ type: 'ready' });
@@ -376,12 +380,14 @@ describe('CSV reload races', () => {
             uri('/tmp/stalled-shared.csv'),
             shared_store,
             stalling_profile,
+            fake_viewer_host,
         );
         const healthy_controller = attach_viewer(
             healthy_panel as unknown as Parameters<typeof attach_viewer>[0],
             uri('/tmp/stalled-shared.csv'),
             shared_store,
             csv_table_profile(),
+            fake_viewer_host,
         );
         await stalled_panel.__receive({ type: 'ready' });
         await healthy_panel.__receive({ type: 'ready' });
@@ -1750,6 +1756,7 @@ describe('CSV reload races', () => {
             uri(file_path),
             store,
             csv_table_profile(),
+            fake_viewer_host,
         );
         panel.onDidDispose(() => controller.dispose());
         vscode_mock.__setWriteFileImplementation(async (_uri, content) => {

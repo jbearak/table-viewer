@@ -7,6 +7,7 @@ import type { WorkbookSnapshot } from '../viewer-snapshot';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
+import { fake_viewer_host } from './mocks/host-ports';
 
 const enc = new TextEncoder();
 const file_path = '/tmp/hide-rows-controller.csv';
@@ -21,6 +22,7 @@ function open_csv_table(
         vscode_mock.Uri.file(file_path) as unknown as vscode.Uri,
         with_in_memory_authority_transactions(store),
         profile,
+        fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;
