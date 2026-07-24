@@ -219,6 +219,28 @@ function show_preferences_window(): void {
     void prefs_window.loadFile(path.join(DESKTOP_DIST_DIR, 'prefs.html'));
 }
 
+/**
+ * Copy / Select All. In the main window the active viewer tab decides what they
+ * mean (its focused text field, else the grid). In any other window — today
+ * that is Preferences, whose fields are ordinary text inputs — fall back to the
+ * native editing command.
+ *
+ * The window Electron reports with the menu click is the routing signal;
+ * sampling focus separately is racy and can silently drop the command.
+ */
+function route_edit_command(
+    command: 'copy' | 'selectAll',
+    window: Electron.BaseWindow | undefined,
+): void {
+    const target = window as BrowserWindow | undefined;
+    const is_main = !target || (!!main_window && target === main_window);
+    if (is_main && tab_manager?.send_edit_command(command)) return;
+    const contents = target?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    if (command === 'copy') contents.copy();
+    else contents.selectAll();
+}
+
 function build_menu(): void {
     const is_mac = process.platform === 'darwin';
     const template: Electron.MenuItemConstructorOptions[] = [
@@ -287,7 +309,31 @@ function build_menu(): void {
                     ]),
             ],
         },
-        { label: 'Edit', role: 'editMenu' },
+        {
+            // Not `role: 'editMenu'`: its Undo/Redo/Delete/Paste-and-Match-Style
+            // items have nothing to act on (there is no undo model, and the grid
+            // is a canvas with no DOM selection), and its Copy/Select All roles
+            // would claim Cmd/Ctrl+C and Cmd/Ctrl+A before the page could run
+            // its own. Cut and Paste keep their native roles because the only
+            // place they mean anything — the CSV cell editor's text field — is
+            // exactly what those roles operate on.
+            label: 'Edit',
+            submenu: [
+                { role: 'cut' },
+                {
+                    label: 'Copy',
+                    accelerator: 'CmdOrCtrl+C',
+                    click: (_item, window) => route_edit_command('copy', window),
+                },
+                { role: 'paste' },
+                { type: 'separator' },
+                {
+                    label: 'Select All',
+                    accelerator: 'CmdOrCtrl+A',
+                    click: (_item, window) => route_edit_command('selectAll', window),
+                },
+            ],
+        },
         {
             label: 'View',
             submenu: [

@@ -1,6 +1,7 @@
 // Smoke test for the standalone desktop app: launches the built Electron
 // bundle (dist/desktop/main.js) with a csv and an xlsx fixture, asserts each
-// viewer tab renders the data grid, and exercises one interaction (sort).
+// viewer tab renders the data grid, and exercises a couple of interactions
+// (sort, and the Edit menu's grid-routed Copy / Select All).
 //
 // Each viewer tab is a WebContentsView; Playwright surfaces its webContents as
 // an additional "window" page alongside the shell window.
@@ -23,6 +24,24 @@ let user_data_dir: string;
 
 function viewer_pages(): Page[] {
     return app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
+}
+
+/** Invoke an application-menu item by label, the way the native menu would. */
+async function click_menu_item(menu_label: string, item_label: string): Promise<void> {
+    const clicked = await app.evaluate(
+        ({ Menu }, labels) => {
+            const menu = Menu.getApplicationMenu()
+                ?.items.find((item) => item.label === labels.menu);
+            const target = menu?.submenu?.items.find(
+                (item) => item.label === labels.item,
+            );
+            if (!target?.click) return false;
+            target.click();
+            return true;
+        },
+        { menu: menu_label, item: item_label },
+    );
+    expect(clicked, `${menu_label} > ${item_label} exists`).toBe(true);
 }
 
 test.beforeAll(async () => {
@@ -56,6 +75,48 @@ test('opens csv and xlsx tabs and renders both grids', async () => {
     expect(shell).toBeTruthy();
     await expect(shell!.getByText('basic.csv')).toBeVisible();
     await expect(shell!.getByText('basic.xlsx')).toBeVisible();
+});
+
+// The grid is a canvas, so the stock `role: 'copy'` / `role: 'selectAll'` menu
+// items have no DOM selection to act on — and their accelerators would keep the
+// keystrokes from ever reaching Glide. The menu forwards the intent to the
+// active tab instead; this guards that wiring end to end.
+test('Edit menu Copy and Select All act on the grid', async () => {
+    const shell = app.windows().find((entry) => !entry.url().startsWith(VIEWER_URL_PREFIX));
+    expect(shell).toBeTruthy();
+    await shell!.locator('.tab', { hasText: 'basic.csv' }).click();
+
+    let page: Page | undefined;
+    await expect
+        .poll(async () => {
+            for (const candidate of viewer_pages()) {
+                if ((await candidate.getByRole('button', { name: 'Edit' }).count()) > 0) {
+                    page = candidate;
+                    return true;
+                }
+            }
+            return false;
+        }, { timeout: 15_000 })
+        .toBe(true);
+
+    const canvas = page!.locator(GRID_CANVAS).first();
+    await canvas.waitFor({ state: 'visible' });
+    await app.evaluate(({ clipboard }) => clipboard.writeText('untouched'));
+
+    // Select the first body cell, then copy it through the menu.
+    const box = (await canvas.boundingBox())!;
+    await page!.mouse.click(box.x + 120, box.y + 50);
+    await click_menu_item('Edit', 'Copy');
+    await expect
+        .poll(() => app.evaluate(({ clipboard }) => clipboard.readText()), { timeout: 5_000 })
+        .toBe('Alice');
+
+    // Select All must widen the grid selection, not the (empty) DOM selection.
+    await click_menu_item('Edit', 'Select All');
+    await click_menu_item('Edit', 'Copy');
+    await expect
+        .poll(() => app.evaluate(({ clipboard }) => clipboard.readText()), { timeout: 5_000 })
+        .toContain('Charlie');
 });
 
 test('sorting a column shows a sort chip', async () => {

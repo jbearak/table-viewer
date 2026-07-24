@@ -84,6 +84,11 @@ import {
 import { use_state_sync } from './use-state-sync';
 import { host_bridge } from './host-bridge';
 import { apply_font_family, apply_font_size } from './vscode-theme';
+import {
+    edit_command_target,
+    text_field_selection,
+    type EditCommand,
+} from './edit-command';
 import './styles.css';
 
 type ColumnVisibilityUpdater = (
@@ -1300,6 +1305,32 @@ export function App(): React.JSX.Element {
             current === pending_sheet_action ? null : current);
     }, [active_sheet_index, generation, load_epoch, pending_sheet_action]);
 
+    // Copy / Select All arriving from a host menu that owns the keyboard
+    // shortcut (the desktop app's native Edit menu). Whatever has focus decides:
+    // the CSV cell editor's text field, otherwise the grid.
+    const run_edit_command = useCallback((command: EditCommand) => {
+        const active = document.activeElement;
+        if (edit_command_target(active) === 'text') {
+            const field = active as HTMLInputElement | HTMLTextAreaElement;
+            if (command === 'selectAll') {
+                field.select?.();
+                return;
+            }
+            const text = typeof field.value === 'string'
+                ? text_field_selection(field)
+                : '';
+            if (text) {
+                void navigator.clipboard.writeText(text).catch((error) => {
+                    console.error('Failed to write to clipboard', error);
+                });
+            }
+            return;
+        }
+        const handle = grid_actions_ref.current;
+        if (command === 'selectAll') handle?.select_all();
+        else handle?.copy_selection();
+    }, []);
+
     const handle_toggle_formatting = useCallback(() => {
         set_show_formatting((prev) => !prev);
     }, []);
@@ -1687,6 +1718,9 @@ export function App(): React.JSX.Element {
                 apply_font_family(msg.fontFamily);
                 apply_font_size(msg.fontSize);
             }
+            if (msg.type === 'editCommand') {
+                run_edit_command(msg.command);
+            }
             if (msg.type === 'editSessionResult') {
                 if (pending_edit_request_ref.current !== msg.requestId) return;
                 pending_edit_request_ref.current = null;
@@ -1744,6 +1778,7 @@ export function App(): React.JSX.Element {
         apply_save_lifecycle,
         discard_edit_session,
         leave_edit_mode,
+        run_edit_command,
     ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave

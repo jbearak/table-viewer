@@ -218,6 +218,26 @@ export class TabManager {
         return true;
     }
 
+    /**
+     * Hand a menu-issued Copy / Select All to the active tab, which routes it to
+     * its focused text field or its grid. Returns false when there is no tab to
+     * receive it, so the caller can fall back to the native editing command.
+     *
+     * Whether this window should get the command at all is the caller's call
+     * (see `route_edit_command` in main.ts) — it knows which window the menu
+     * fired for, which is more reliable than sampling focus here.
+     */
+    send_edit_command(command: 'copy' | 'selectAll'): boolean {
+        if (this.disposed) return false;
+        const tab = this.tabs.find((entry) => entry.id === this.active_tab_id);
+        const contents = tab?.view.webContents;
+        if (!tab || !contents || contents.isDestroyed()) return false;
+        // postMessage is Thenable in the shared panel contract, but delivery to a
+        // live tab is what "claimed" means here.
+        void tab.panel.webview.postMessage({ type: 'editCommand', command });
+        return true;
+    }
+
     broadcast_theme(): void {
         const payload = theme_payload(nativeTheme.shouldUseDarkColors);
         for (const tab of this.tabs) {

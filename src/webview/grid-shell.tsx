@@ -206,6 +206,9 @@ export interface GridActionsHandle {
     select_all(): void;
     /** Loads the sheet's rows before serializing, so it resolves asynchronously. */
     copy_sheet(): Promise<void>;
+    /** Copy the current cell selection as TSV, mirroring Glide's own Ctrl+C.
+     *  No-op when nothing is selected. */
+    copy_selection(): void;
 }
 
 export interface PendingPreviewScroll {
@@ -1823,6 +1826,20 @@ export function GridShell({
         });
     }, [copy_source_selection, visible_source_columns]);
 
+    // What the menu-driven Copy command acts on: the dragged cell rectangle
+    // when there is one, else a row-marker selection. Mirrors what Glide's own
+    // Ctrl+C would have copied, for hosts whose native menu swallows that key.
+    const copy_selection = useCallback(() => {
+        const selection = grid_selection_ref.current;
+        const range = selection.current?.range;
+        if (range) {
+            copy_rect(range);
+            return;
+        }
+        const rows = selected_display_row_intervals(selection, row_count);
+        if (rows) copy_display_rows(rows);
+    }, [copy_display_rows, copy_rect, row_count]);
+
     // Whole visible sheet with a header row (delegates to copy_rect, so the same
     // clipboard-failure and truncation handling applies). Because this copies
     // rows the user may never have scrolled into view — "Copy sheet" can target
@@ -1851,12 +1868,13 @@ export function GridShell({
             sheet_index,
             select_all,
             copy_sheet,
+            copy_selection,
         };
         grid_actions_ref.current = handle;
         return () => {
             if (grid_actions_ref.current === handle) grid_actions_ref.current = null;
         };
-    }, [copy_sheet, grid_actions_ref, select_all, sheet_index]);
+    }, [copy_selection, copy_sheet, grid_actions_ref, select_all, sheet_index]);
 
     const hide_source_column = useCallback((source_column: number) => {
         if (display_column_count === 1) {
