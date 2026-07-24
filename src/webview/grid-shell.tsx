@@ -2257,10 +2257,15 @@ export function GridShell({
 
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version
-    // bump), the formatting toggle (raw ↔ formatted), and the edit-mode toggle
-    // (flips each cell's allowOverlay). A parent re-render alone does not
+    // bump), the formatting toggle (raw ↔ formatted), the edit-mode toggle
+    // (flips each cell's allowOverlay), and a font-size change (each cell
+    // carries the size in its theme override). A parent re-render alone does not
     // reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
+    //
+    // The merge overlay draws its own text, reading the size off the theme at
+    // paint time, and is only otherwise repainted by content/highlight changes —
+    // so repaint it here too, or merged cells keep the previous size.
     useEffect(() => {
         const grid = grid_ref.current;
         if (!grid) return;
@@ -2277,7 +2282,14 @@ export function GridShell({
             }
         }
         if (cells.length > 0) grid.updateCells(cells);
-    }, [version, show_formatting, editable_cells, display_column_count]);
+        overlay_ref.current?.repaint();
+    }, [
+        version,
+        show_formatting,
+        editable_cells,
+        display_column_count,
+        font_size_px,
+    ]);
 
     // Targeted tint repaint: damage only the cells whose dirty/conflict tint
     // actually changed, not the whole viewport. Single-cell edits/discards
