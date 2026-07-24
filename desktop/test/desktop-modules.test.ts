@@ -256,6 +256,34 @@ describe('viewer html', () => {
         expect(html).not.toContain('--table-viewer-font-family');
         expect(html).not.toContain('--table-viewer-font-size');
     });
+
+    // Regression: nothing outside VS Code sets the --vscode-* variables the
+    // shared webview themes itself from. They used to be pushed in by the viewer
+    // preload, which crashed before it could (documentElement is null that
+    // early), leaving the grid on its dark fallbacks in light mode forever.
+    it('bakes the light palette into the page so the grid paints light', () => {
+        const html = build_desktop_viewer_html(null, null, theme_payload(false));
+        expect(html).toContain('"--vscode-editor-background"');
+        expect(html).toContain(
+            `"${theme_css_variables('light')['--vscode-editor-background']}"`,
+        );
+        expect(html).toContain('r.style.colorScheme = "light"');
+    });
+
+    it('bakes the dark palette in when the OS is dark', () => {
+        const html = build_desktop_viewer_html(null, null, theme_payload(true));
+        expect(html).toContain(
+            `"${theme_css_variables('dark')['--vscode-editor-background']}"`,
+        );
+        expect(html).toContain('r.style.colorScheme = "dark"');
+    });
+
+    it('bootstraps every variable the webview consumes', () => {
+        const html = build_desktop_viewer_html(null, null, theme_payload(false));
+        for (const name of REQUIRED_THEME_VARIABLES) {
+            expect(html, `missing ${name}`).toContain(`"${name}"`);
+        }
+    });
 });
 
 describe('node file system port', () => {

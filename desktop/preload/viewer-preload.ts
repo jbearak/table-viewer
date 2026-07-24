@@ -4,10 +4,11 @@
 //     acquireVsCodeApi();
 //  2. relays HostMessages from the main process into `window.postMessage` so
 //     the bundle's existing window 'message' listeners see them unchanged;
-//  3. applies the desktop theme as `--vscode-*` inline custom properties on
-//     <html> (synchronously, before first paint) and re-applies on OS
-//     appearance changes — the webview's MutationObserver picks up the style
-//     mutation and rebuilds the Glide theme.
+//  3. re-applies the desktop theme as `--vscode-*` inline custom properties on
+//     <html> when the OS appearance changes — the webview's MutationObserver
+//     picks up the style mutation and rebuilds the Glide theme. The *initial*
+//     palette is baked into the page HTML (desktop/main/viewer-html.ts) because
+//     a preload runs before <html> exists, so it cannot style the document yet.
 //
 // Cmd/Ctrl+S is deliberately not handled here: the grid's own window keydown
 // listener (src/webview/grid-shell.tsx) saves in CSV edit mode, and it only
@@ -19,7 +20,7 @@ import {
     CHANNEL_THEME_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
 } from '../shared/ipc';
-import type { ThemePayload } from '../main/theme';
+import { apply_theme_to_document, type ThemePayload } from '../main/theme';
 
 // contextBridge clones the object into the main world, so the shared bundle
 // (which only calls postMessage) works across the isolation boundary.
@@ -35,21 +36,19 @@ ipcRenderer.on(CHANNEL_HOST_MESSAGE, (_event, message: unknown) => {
     window.postMessage(message, '*');
 });
 
-function apply_theme(payload: ThemePayload): void {
-    const root = document.documentElement;
-    for (const [name, value] of Object.entries(payload.variables)) {
-        root.style.setProperty(name, value);
-    }
-    root.style.colorScheme = payload.kind;
-    document.body?.classList.toggle('vscode-dark', payload.kind === 'dark');
-    document.body?.classList.toggle('vscode-light', payload.kind === 'light');
+// Latest known palette. The page HTML already carries the variables for it, but
+// the body classes (`vscode-dark`/`vscode-light`, which the shared webview reads
+// to detect high-contrast themes) still need a document to exist.
+let current_theme = ipcRenderer.sendSync(CHANNEL_GET_THEME) as ThemePayload | undefined;
+
+function apply_theme(payload: ThemePayload | undefined): void {
+    if (!payload) return;
+    current_theme = payload;
+    apply_theme_to_document(document, payload);
 }
 
-// Synchronous fetch so the variables exist before the bundle evaluates and
-// the first Glide theme read happens.
-const initial_theme = ipcRenderer.sendSync(CHANNEL_GET_THEME) as ThemePayload;
-apply_theme(initial_theme);
-window.addEventListener('DOMContentLoaded', () => apply_theme(initial_theme));
+apply_theme(current_theme);
+window.addEventListener('DOMContentLoaded', () => apply_theme(current_theme));
 
 ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
     apply_theme(payload);

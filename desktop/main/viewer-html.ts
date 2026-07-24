@@ -2,6 +2,7 @@
 // reusing the shared, host-agnostic HTML builder (src/webview-html.ts) and the
 // existing dist/webview bundle. Pure module (no electron import).
 import { build_webview_html, generate_nonce } from '../../src/webview-html';
+import type { ThemePayload } from './theme';
 
 /** Custom scheme serving the viewer page and the shared webview bundle. */
 export const APP_SCHEME = 'tv-app';
@@ -14,10 +15,16 @@ export const VIEWER_STYLE_URL = `${APP_SCHEME}://${WEBVIEW_HOST}/index.css`;
 export const VIEWER_CSP_SOURCE = `${APP_SCHEME}:`;
 
 /** The generated viewer page keeps the shared bundle's CSP (nonce-locked
- *  scripts, no inline styles) — see src/webview-html.ts for the rationale. */
+ *  scripts, no inline styles) — see src/webview-html.ts for the rationale.
+ *
+ *  Unlike VS Code, nothing outside the app sets the `--vscode-*` variables the
+ *  shared webview themes itself from, so the current light/dark palette is baked
+ *  into the page here. OS appearance changes afterwards arrive over IPC and are
+ *  re-applied by the viewer preload. */
 export function build_desktop_viewer_html(
     font_family: string | null,
     font_size: number | null = null,
+    theme: ThemePayload | null = null,
 ): string {
     return build_webview_html(
         {
@@ -28,5 +35,6 @@ export function build_desktop_viewer_html(
         generate_nonce(),
         font_family,
         font_size,
+        theme && { variables: theme.variables, colorScheme: theme.kind },
     );
 }

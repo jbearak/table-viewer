@@ -95,6 +95,7 @@ function register_app_protocol(): void {
             const html = build_desktop_viewer_html(
                 config.font_family(),
                 config.font_size(),
+                theme_payload(nativeTheme.shouldUseDarkColors),
             );
             return new Response(html, {
                 headers: { 'content-type': 'text/html; charset=utf-8' },

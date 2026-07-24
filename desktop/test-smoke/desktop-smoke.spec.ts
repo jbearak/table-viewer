@@ -162,3 +162,37 @@ test('sorting a column shows a sort chip', async () => {
     await page!.locator('.sort-strip-clear').click();
     await expect(page!.locator('.sort-strip .sort-chip')).toHaveCount(0);
 });
+
+// Regression: the viewer theme is baked into the page HTML and refreshed over
+// IPC. It used to be pushed in by the preload, which threw on the not-yet-parsed
+// document and so applied nothing — the grid stayed dark in light mode forever.
+test('viewer tabs follow the OS light/dark setting', async () => {
+    const page = viewer_pages()[0];
+    expect(page).toBeTruthy();
+    await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
+
+    const editor_background = () =>
+        page.evaluate(() =>
+            getComputedStyle(document.documentElement)
+                .getPropertyValue('--vscode-editor-background')
+                .trim());
+
+    try {
+        for (const [source, expected] of [
+            ['light', '#ffffff'],
+            ['dark', '#1e1e1e'],
+            ['light', '#ffffff'],
+        ] as const) {
+            await app.evaluate(({ nativeTheme }, value) => {
+                nativeTheme.themeSource = value;
+            }, source);
+            await expect.poll(editor_background, { timeout: 5_000 }).toBe(expected);
+            expect(await page.evaluate(() => document.documentElement.style.colorScheme))
+                .toBe(source);
+        }
+    } finally {
+        await app.evaluate(({ nativeTheme }) => {
+            nativeTheme.themeSource = 'system';
+        });
+    }
+});
