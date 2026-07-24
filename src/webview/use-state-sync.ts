@@ -1,14 +1,7 @@
 import { useRef, useCallback, useEffect } from 'react';
 import type { PerFileState } from '../types';
 import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
-
-declare function acquireVsCodeApi(): {
-    postMessage(msg: unknown): void;
-    getState(): unknown;
-    setState(state: unknown): void;
-};
-
-export const vscode_api = acquireVsCodeApi();
+import { host_bridge } from './host-bridge';
 
 const DEBOUNCE_MS = 150;
 
@@ -30,7 +23,7 @@ export function use_state_sync(
     const persist = useCallback(() => {
         const identity = snapshot_identity.current;
         if (!identity) return;
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'stateChanged',
             state: current_state.current,
             sourceGeneration: source_generation.current,
