@@ -1,0 +1,15 @@
+{
+  // Typecheck-only project for the desktop (Electron) shell. The root
+  // tsconfig forces types: ["vscode", "node"]; the desktop compilation path
+  // must stay vscode-free, so this project declares only "node" globals.
+  // Shared src/ modules imported from desktop code are typechecked
+  // transitively (none of them import the vscode runtime).
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true,
+    "rootDir": "..",
+    "outDir": "../dist/desktop-tsc"
+  },
+  "include": ["main/**/*", "preload/**/*", "renderer/**/*", "shared/**/*", "test/**/*"]
+}

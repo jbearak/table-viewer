@@ -1,6 +1,9 @@
 src/**
 node_modules/**
 tsconfig.json
+desktop/**
+dist/desktop/**
+dist/desktop-packages/**
 .gitignore
 .superpowers/**
 docs/**

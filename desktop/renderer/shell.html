@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';">
+<title>Table Viewer</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    background: var(--shell-bg, #f8f8f8);
+    color: var(--shell-fg, #3b3b3b);
+    user-select: none;
+    overflow: hidden;
+  }
+  #tab-bar {
+    display: flex;
+    align-items: stretch;
+    height: 38px;
+    box-sizing: border-box;
+    border-bottom: 1px solid var(--shell-border, #d0d0d0);
+    overflow-x: auto;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    max-width: 220px;
+    border: none;
+    border-right: 1px solid var(--shell-border, #d0d0d0);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: default;
+    white-space: nowrap;
+  }
+  .tab.active { background: var(--shell-active-bg, #ffffff); }
+  .tab .title { overflow: hidden; text-overflow: ellipsis; }
+  .tab .close {
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .tab .close:hover { background: var(--shell-hover-bg, rgba(128,128,128,0.25)); }
+  #open-button {
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 18px;
+    padding: 0 12px;
+    cursor: pointer;
+  }
+  #open-button:hover { background: var(--shell-hover-bg, rgba(128,128,128,0.25)); }
+  #empty-state {
+    position: absolute;
+    inset: 38px 0 0 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: var(--shell-muted, #717171);
+  }
+  #empty-state button {
+    font: inherit;
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--shell-border, #d0d0d0);
+    background: var(--shell-active-bg, #ffffff);
+    color: inherit;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="tab-bar"></div>
+<div id="empty-state">
+  <div>No files open</div>
+  <button id="empty-open">Open File…</button>
+</div>
+<script src="./shell.js"></script>
+</body>
+</html>

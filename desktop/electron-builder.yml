@@ -1,0 +1,44 @@
+# electron-builder configuration for the standalone Table Viewer app.
+#
+# Packaging (unsigned macOS DMG first) ships in a follow-up PR; this file
+# exists now so the file-association metadata is versioned with the shell.
+# Build with: npx electron-builder --config desktop/electron-builder.yml
+appId: com.jbearak.table-viewer
+productName: Table Viewer
+directories:
+  output: dist/desktop-packages
+files:
+  - dist/desktop/**
+  - dist/webview/**
+  - package.json
+  - LICENSE
+extraMetadata:
+  main: dist/desktop/main.js
+# Declare the app as *a* handler for table files so it appears in
+# Finder/Explorer "Open with…" menus. role/rank deliberately avoid claiming
+# OS default-handler status.
+fileAssociations:
+  - ext: csv
+    name: CSV
+    description: Comma-separated values
+    role: Editor
+    rank: Alternate
+  - ext: tsv
+    name: TSV
+    description: Tab-separated values
+    role: Editor
+    rank: Alternate
+  - ext: xlsx
+    name: Excel Workbook
+    description: Excel workbook
+    role: Viewer
+    rank: Alternate
+  - ext: xls
+    name: Excel 97-2003 Workbook
+    description: Legacy Excel workbook
+    role: Viewer
+    rank: Alternate
+mac:
+  category: public.app-category.productivity
+  # v1 ships unsigned local builds (no notarization / auto-update yet).
+  identity: null
