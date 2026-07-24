@@ -35,7 +35,7 @@ The config lives in `desktop/electron-builder.yml`:
 npm run test:desktop-smoke
 ```
 
-A Playwright Electron test (`desktop/test-smoke/`) launches the built dev bundle with a csv and an xlsx fixture, asserts both viewer tabs render the data grid, and applies/clears a column sort. It runs the real app binary, so it is kept separate from the vitest suite and is not wired into CI (the GitHub Actions Linux runner would need xvfb plus Electron sandbox flags; run it locally on a desktop OS instead).
+A Playwright Electron test (`desktop/test-smoke/`) launches the built dev bundle with a csv and an xlsx fixture, asserts both viewer tabs render the data grid, applies/clears a column sort, and drives the Edit menu's Copy and Select All against the grid. It runs the real app binary, so it is kept separate from the vitest suite and is not wired into CI (the GitHub Actions Linux runner would need xvfb plus Electron sandbox flags; run it locally on a desktop OS instead).
 
 The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, state store, single-instance lock); the smoke test uses it to isolate each run in a temp directory.
 
@@ -43,3 +43,15 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 
 - Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
+
+The font family and font size preferences style the whole app — tab bar, table views, and the Preferences window itself — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs default to a vertical orientation.
+
+## Zoom
+
+The main window is several `webContents`: the tab-bar renderer plus one `WebContentsView` per open file. Electron's stock zoom roles act on whichever one has focus, which would scale the tab bar or the table in isolation, so **View → Zoom In / Zoom Out / Actual Size** (`Cmd/Ctrl` with `+`, `-`, `0`) instead drive one shared zoom level in `desktop/main/zoom.ts`, applied to every `webContents` at once. Tab-bar height is expressed in the renderer's CSS pixels, so `TabManager` scales the per-tab view bounds by the same factor.
+
+## Edit menu
+
+The Edit menu is hand-built rather than `role: 'editMenu'`. The stock menu's Undo, Redo, Delete, and Paste and Match Style items have nothing to act on — there is no undo model, and the grid is a canvas with no DOM selection — so they are omitted. Cut and Paste keep their native roles, because the one place they mean anything is the CSV cell editor's text field, which is exactly what those roles operate on.
+
+Copy and Select All are custom items. Their native roles would both do nothing on the canvas *and* claim `Cmd/Ctrl+C` / `Cmd/Ctrl+A` before the page could handle them (on macOS an application-menu key equivalent never reaches the renderer). Instead, `route_edit_command` in `desktop/main/main.ts` forwards the intent to the active viewer tab as an `editCommand` host message; `src/webview/edit-command.ts` then decides whether the focused text field or the grid should receive it. Menu clicks in any other window (Preferences, whose fields are ordinary inputs) fall back to the native editing command. Routing keys off the window Electron reports with the click, not a separately sampled focus — sampling focus is racy and can silently drop the command.

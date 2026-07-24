@@ -14,6 +14,7 @@ import {
     get_csv_max_rows,
     get_default_orientation,
     get_font_family,
+    get_font_size,
     get_max_file_size_mib,
 } from './viewer-config';
 import { vscode_file_refresh_watcher_factory } from './vscode-file-refresh-watcher';
@@ -67,12 +68,16 @@ export const vscode_host_ui_port: HostUiPort = {
 
 export const vscode_config_port: ConfigPort = {
     font_family: get_font_family,
+    font_size: get_font_size,
     max_file_size_mib: get_max_file_size_mib,
     csv_max_rows: get_csv_max_rows,
     default_tab_orientation: get_default_orientation,
-    on_font_family_change(listener) {
+    on_font_change(listener) {
         return vscode.workspace.onDidChangeConfiguration((event) => {
-            if (!event.affectsConfiguration('tableViewer.fontFamily')) return;
+            if (
+                !event.affectsConfiguration('tableViewer.fontFamily')
+                && !event.affectsConfiguration('tableViewer.fontSize')
+            ) return;
             listener();
         });
     },
@@ -92,6 +97,7 @@ export function build_vscode_webview_html(
     extension_uri: vscode.Uri,
     nonce: string,
     font_family: string | null = get_font_family(),
+    font_size: number | null = get_font_size(),
 ): string {
     const asset_url = (file: string) => webview.asWebviewUri(
         vscode.Uri.joinPath(extension_uri, 'dist', 'webview', file),
@@ -104,5 +110,6 @@ export function build_vscode_webview_html(
         },
         nonce,
         font_family,
+        font_size,
     );
 }

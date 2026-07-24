@@ -285,7 +285,10 @@ export type TerminalCsvSaveLifecycle = Extract<
 
 /** Messages from extension host to webview. */
 export type HostMessage =
-    | { type: 'fontFamilyChanged'; fontFamily: string | null }
+    | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
+    // Desktop only: the native Edit menu consumes Cmd/Ctrl+C and Cmd/Ctrl+A
+    // before the page sees them, so it forwards the intent instead.
+    | { type: 'editCommand'; command: 'copy' | 'selectAll' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }

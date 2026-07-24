@@ -2,14 +2,18 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import {
     CHANNEL_GET_THEME,
+    CHANNEL_PREFS_GET,
+    CHANNEL_SETTINGS_CHANGED,
     CHANNEL_SHELL_ACTIVATE_TAB,
     CHANNEL_SHELL_CLOSE_TAB,
     CHANNEL_SHELL_GET_TABS,
     CHANNEL_SHELL_OPEN_FILES,
+    CHANNEL_SHELL_OPEN_PREFERENCES,
     CHANNEL_SHELL_TABS_CHANGED,
     CHANNEL_THEME_CHANGED,
     type ShellTabInfo,
 } from '../shared/ipc';
+import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 
 export interface ShellApi {
@@ -17,9 +21,12 @@ export interface ShellApi {
     activate_tab(id: number): void;
     close_tab(id: number): void;
     open_files(): void;
+    open_preferences(): void;
     on_tabs_changed(listener: (tabs: ShellTabInfo[]) => void): void;
     get_theme(): ThemePayload;
     on_theme_changed(listener: (payload: ThemePayload) => void): void;
+    get_settings(): Promise<DesktopSettings>;
+    on_settings_changed(listener: (settings: DesktopSettings) => void): void;
 }
 
 const api: ShellApi = {
@@ -27,6 +34,7 @@ const api: ShellApi = {
     activate_tab: (id) => ipcRenderer.send(CHANNEL_SHELL_ACTIVATE_TAB, id),
     close_tab: (id) => ipcRenderer.send(CHANNEL_SHELL_CLOSE_TAB, id),
     open_files: () => ipcRenderer.send(CHANNEL_SHELL_OPEN_FILES),
+    open_preferences: () => ipcRenderer.send(CHANNEL_SHELL_OPEN_PREFERENCES),
     on_tabs_changed: (listener) => {
         ipcRenderer.on(CHANNEL_SHELL_TABS_CHANGED, (_event, tabs: ShellTabInfo[]) => {
             listener(tabs);
@@ -36,6 +44,12 @@ const api: ShellApi = {
     on_theme_changed: (listener) => {
         ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
             listener(payload);
+        });
+    },
+    get_settings: () => ipcRenderer.invoke(CHANNEL_PREFS_GET),
+    on_settings_changed: (listener) => {
+        ipcRenderer.on(CHANNEL_SETTINGS_CHANGED, (_event, settings: DesktopSettings) => {
+            listener(settings);
         });
     },
 };

@@ -6,20 +6,26 @@
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';">
 <title>Preferences</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    /* Set from the font settings themselves (desktop/renderer/prefs.ts): the
+       font preference applies to the whole app, this window included. */
+    --prefs-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --prefs-font-size: 13px;
+  }
   body {
     margin: 0;
     padding: 20px 24px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 13px;
+    font-family: var(--prefs-font-family);
+    font-size: var(--prefs-font-size);
     background: var(--prefs-bg, #ffffff);
     color: var(--prefs-fg, #3b3b3b);
     user-select: none;
   }
-  h1 { font-size: 15px; margin: 0 0 16px; }
+  h1 { font-size: calc(var(--prefs-font-size) * 1.15); margin: 0 0 16px; }
   .field { margin-bottom: 14px; display: flex; flex-direction: column; gap: 4px; }
   label { font-weight: 600; }
-  .hint { color: var(--prefs-muted, #717171); font-size: 12px; }
+  .hint { color: var(--prefs-muted, #717171); font-size: calc(var(--prefs-font-size) * 0.92); }
   input, select {
     font: inherit;
     padding: 5px 8px;
@@ -29,15 +35,24 @@
     color: inherit;
     max-width: 240px;
   }
-  #status { color: var(--prefs-muted, #717171); font-size: 12px; height: 16px; }
+  #status {
+    color: var(--prefs-muted, #717171);
+    font-size: calc(var(--prefs-font-size) * 0.92);
+    height: 1.3em;
+  }
 </style>
 </head>
 <body>
 <h1>Table Viewer Preferences</h1>
 <div class="field">
   <label for="fontFamily">Font family</label>
-  <input id="fontFamily" type="text" placeholder="Theme default">
-  <span class="hint">Font used in table views. Leave empty for the default.</span>
+  <input id="fontFamily" type="text" placeholder="System default">
+  <span class="hint">Font used throughout the app. Leave empty for the default.</span>
+</div>
+<div class="field">
+  <label for="fontSize">Font size (px)</label>
+  <input id="fontSize" type="number" min="8" max="32" step="1">
+  <span class="hint">Text size used throughout the app.</span>
 </div>
 <div class="field">
   <label for="tabOrientation">Worksheet tab orientation</label>
@@ -45,6 +60,7 @@
     <option value="horizontal">Horizontal</option>
     <option value="vertical">Vertical</option>
   </select>
+  <span class="hint">Default placement of worksheet tabs. Can be overridden per file.</span>
 </div>
 <div class="field">
   <label for="csvMaxRows">Max CSV/TSV rows</label>
@@ -54,6 +70,7 @@
 <div class="field">
   <label for="maxFileSizeMiB">Max file size (MiB)</label>
   <input id="maxFileSizeMiB" type="number" min="1">
+  <span class="hint">Larger files (xlsx, xls, csv, tsv) are refused instead of opened.</span>
 </div>
 <div id="status"></div>
 <script src="./prefs.js"></script>

@@ -13,6 +13,10 @@ import type { Theme } from '@glideapps/glide-data-grid';
 
 type VarGetter = (name: string) => string;
 
+/** Base grid/chrome font size when neither the setting nor the host provides
+ *  one. Matches the historical hard-coded 13px. */
+export const DEFAULT_FONT_SIZE_PX = 13;
+
 export function apply_font_family(
     font_family: string | null,
     root: HTMLElement = document.documentElement,
@@ -23,6 +27,28 @@ export function apply_font_family(
     } else {
         root.style.removeProperty('--table-viewer-font-family');
     }
+}
+
+/** A null/non-positive size means "inherit the host's editor font size", which
+ *  the CSS var chain in styles.css already falls back to. */
+export function apply_font_size(
+    font_size: number | null,
+    root: HTMLElement = document.documentElement,
+): void {
+    if (font_size && Number.isFinite(font_size) && font_size > 0) {
+        root.style.setProperty('--table-viewer-font-size', `${font_size}px`);
+    } else {
+        root.style.removeProperty('--table-viewer-font-size');
+    }
+}
+
+/** Parse a CSS length that we only ever author in px (`--tv-font-size`). */
+export function parse_font_size_px(
+    value: string,
+    fallback = DEFAULT_FONT_SIZE_PX,
+): number {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
@@ -46,6 +72,11 @@ export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
     const font = v(
         '--table-viewer-font-family',
         v('--vscode-editor-font-family', v('--vscode-font-family', 'sans-serif')),
+    );
+    // styles.css resolves the whole setting → editor-font → default chain into
+    // `--tv-font-size`, so the canvas grid and the DOM chrome cannot disagree.
+    const font_size_px = parse_font_size_px(
+        v('--tv-font-size', `${DEFAULT_FONT_SIZE_PX}px`),
     );
 
     return {
@@ -73,10 +104,16 @@ export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
         drilldownBorder: border,
         linkColor: link,
         fontFamily: font,
-        baseFontStyle: '13px',
-        headerFontStyle: '600 13px',
-        editorFontSize: '13px',
+        baseFontStyle: `${font_size_px}px`,
+        headerFontStyle: `600 ${font_size_px}px`,
+        editorFontSize: `${font_size_px}px`,
     };
+}
+
+/** The px size the Glide theme was built with (its `baseFontStyle`). Canvas
+ *  measurement and row heights need the number, not the CSS shorthand. */
+export function theme_font_size_px(theme: Partial<Theme>): number {
+    return parse_font_size_px(theme.baseFontStyle ?? '');
 }
 
 export function build_vscode_theme(

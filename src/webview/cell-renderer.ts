@@ -34,12 +34,20 @@ export function font_shorthand(bold: boolean, italic: boolean, size_px: number):
     return parts.join(' ');
 }
 
-/** CSS font shorthand fragment for Glide's `baseFontStyle` (family/size context
- *  comes from the theme). Undefined when neither flag is set so the theme font
- *  wins. */
-export function font_style(bold: boolean, italic: boolean): string | undefined {
+/** Default cell size, mirroring the theme's `baseFontStyle` fallback. */
+export const DEFAULT_CELL_FONT_SIZE_PX = 13;
+
+/** CSS font shorthand fragment for Glide's `baseFontStyle` (family context comes
+ *  from the theme). Undefined when neither flag is set so the theme font wins;
+ *  otherwise the theme's resolved size must be repeated, since a `themeOverride`
+ *  replaces `baseFontStyle` wholesale. */
+export function font_style(
+    bold: boolean,
+    italic: boolean,
+    size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
+): string | undefined {
     if (!bold && !italic) return undefined;
-    return font_shorthand(bold, italic, 13);
+    return font_shorthand(bold, italic, size_px);
 }
 
 const BLANK: GridCell = {
@@ -75,8 +83,11 @@ function text_cell(
     show_formatting: boolean,
     span?: [number, number],
     overlay?: CellEditOverlay,
+    font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
 ): GridCell {
-    const style = show_formatting ? font_style(c.bold, c.italic) : undefined;
+    const style = show_formatting
+        ? font_style(c.bold, c.italic, font_size_px)
+        : undefined;
     const theme_override: { baseFontStyle?: string; bgCell?: string } = {};
     if (style) theme_override.baseFontStyle = style;
     if (overlay?.bg) theme_override.bgCell = overlay.bg;
@@ -111,6 +122,7 @@ export function build_grid_cell(
     merge_index: MergeIndex,
     show_formatting: boolean,
     overlay?: CellEditOverlay,
+    font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
 ): GridCell {
     const entry = merge_index.entry_at(row, col);
 
@@ -125,6 +137,7 @@ export function build_grid_cell(
                 show_formatting,
                 [entry.startCol, entry.endCol],
                 overlay,
+                font_size_px,
             );
         }
         // rowSpan > 1: the overlay paints content; keep the Glide cell blank.
@@ -136,8 +149,8 @@ export function build_grid_cell(
         // In CSV edit mode an empty cell can still be edited or hold a dirty
         // value, so synthesize a blank editable cell; otherwise it's read-only.
         return overlay
-            ? text_cell(EMPTY_CELL, show_formatting, undefined, overlay)
+            ? text_cell(EMPTY_CELL, show_formatting, undefined, overlay, font_size_px)
             : BLANK;
     }
-    return text_cell(c, show_formatting, undefined, overlay);
+    return text_cell(c, show_formatting, undefined, overlay, font_size_px);
 }

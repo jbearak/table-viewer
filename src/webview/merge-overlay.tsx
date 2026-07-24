@@ -18,6 +18,7 @@ import {
     overlay_entries,
     type CellRegion,
 } from './merge-overlay-model';
+import { theme_font_size_px } from './vscode-theme';
 
 /** Horizontal text inset inside a merge block; mirrors Glide's default
  *  `cellHorizontalPadding` so overlay content lines up with plain cells. */
@@ -128,6 +129,7 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                 const border = theme.borderColor ?? '#e1e1e1';
                 const fg = theme.textDark ?? '#000000';
                 const family = theme.fontFamily ?? 'sans-serif';
+                const font_size_px = theme_font_size_px(theme);
 
                 // Clip to the grid body so a block scrolled partly under the
                 // header never paints over the column letters.
@@ -177,7 +179,7 @@ export const MergeOverlay = forwardRef<MergeOverlayHandle, MergeOverlayProps>(
                         ctx.rect(r.x, r.y, r.width, r.height);
                         ctx.clip();
                         ctx.fillStyle = fg;
-                        ctx.font = block_font(bold, italic, family);
+                        ctx.font = block_font(bold, italic, family, font_size_px);
                         ctx.textAlign = 'left';
                         ctx.textBaseline = 'middle';
                         ctx.fillText(

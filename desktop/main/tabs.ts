@@ -22,15 +22,17 @@ import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
 import { theme_payload } from './theme';
 import {
     CHANNEL_HOST_MESSAGE,
-    CHANNEL_MENU_SAVE,
     CHANNEL_SHELL_TABS_CHANGED,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
     type ShellTabInfo,
 } from '../shared/ipc';
 import { APP_SCHEME, VIEWER_HOST } from './viewer-html';
+import { tab_bar_height } from '../shared/chrome';
+import { clamp_zoom_level, zoom_factor } from './zoom';
 
-export const TAB_BAR_HEIGHT = 38;
+/** Tab-bar height at the default font size; kept for reference/tests. */
+export const TAB_BAR_HEIGHT = tab_bar_height();
 
 interface Tab {
     readonly id: number;
@@ -47,6 +49,8 @@ export class TabManager {
     private readonly tabs: Tab[] = [];
     private active_tab_id: number | undefined;
     private disposed = false;
+    /** One zoom level for the whole window (tab bar + every tab view). */
+    private zoom_level = 0;
 
     constructor(
         private readonly window: BrowserWindow,
@@ -154,8 +158,32 @@ export class TabManager {
         };
         this.tabs.push(tab);
         this.window.contentView.addChildView(view);
+        // Zoom is per-webContents and resets across navigations, so the shared
+        // level is (re)applied once the new view has committed its page.
+        const apply_zoom = () => {
+            if (!web_contents.isDestroyed()) {
+                web_contents.setZoomLevel(this.zoom_level);
+            }
+        };
+        web_contents.on('did-finish-load', apply_zoom);
         void web_contents.loadURL(`${APP_SCHEME}://${VIEWER_HOST}/index.html`);
+        apply_zoom();
         this.activate_tab(tab.id);
+    }
+
+    /** Apply the window-wide zoom level to every tab view and relayout. */
+    set_zoom_level(level: number): void {
+        this.zoom_level = clamp_zoom_level(level);
+        for (const tab of this.tabs) {
+            const contents = tab.view.webContents;
+            if (!contents.isDestroyed()) contents.setZoomLevel(this.zoom_level);
+        }
+        this.layout();
+    }
+
+    /** Re-run layout, e.g. after the configured font size changed the tab bar. */
+    relayout(): void {
+        this.layout();
     }
 
     activate_tab(tab_id: number): void {
@@ -190,15 +218,24 @@ export class TabManager {
         return true;
     }
 
-    active_web_contents(): Electron.WebContents | undefined {
+    /**
+     * Hand a menu-issued Copy / Select All to the active tab, which routes it to
+     * its focused text field or its grid. Returns false when there is no tab to
+     * receive it, so the caller can fall back to the native editing command.
+     *
+     * Whether this window should get the command at all is the caller's call
+     * (see `route_edit_command` in main.ts) — it knows which window the menu
+     * fired for, which is more reliable than sampling focus here.
+     */
+    send_edit_command(command: 'copy' | 'selectAll'): boolean {
+        if (this.disposed) return false;
         const tab = this.tabs.find((entry) => entry.id === this.active_tab_id);
         const contents = tab?.view.webContents;
-        return contents && !contents.isDestroyed() ? contents : undefined;
-    }
-
-    /** Trigger the webview's own Cmd/Ctrl+S save path in the active tab. */
-    request_save_active(): void {
-        this.active_web_contents()?.send(CHANNEL_MENU_SAVE);
+        if (!tab || !contents || contents.isDestroyed()) return false;
+        // postMessage is Thenable in the shared panel contract, but delivery to a
+        // live tab is what "claimed" means here.
+        void tab.panel.webview.postMessage({ type: 'editCommand', command });
+        return true;
     }
 
     broadcast_theme(): void {
@@ -230,11 +267,17 @@ export class TabManager {
     private layout(): void {
         if (this.disposed || this.window.isDestroyed()) return;
         const [width, height] = this.window.getContentSize();
+        // The tab bar is sized in the shell renderer's CSS pixels, which the
+        // zoom factor scales; these bounds are in unscaled window pixels.
+        const bar_height = Math.round(
+            tab_bar_height(this.config_store.settings().fontSize)
+            * zoom_factor(this.zoom_level),
+        );
         const bounds = {
             x: 0,
-            y: TAB_BAR_HEIGHT,
+            y: bar_height,
             width,
-            height: Math.max(0, height - TAB_BAR_HEIGHT),
+            height: Math.max(0, height - bar_height),
         };
         for (const tab of this.tabs) {
             if (tab.id === this.active_tab_id) tab.view.setBounds(bounds);

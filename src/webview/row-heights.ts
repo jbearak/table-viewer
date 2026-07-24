@@ -9,8 +9,42 @@
 /** Default row height; matches Glide's Phase C constant. */
 export const DEFAULT_ROW_HEIGHT_PX = 24;
 
+/** Font size the default row height (and line height) were sized for. */
+export const BASE_ROW_FONT_SIZE_PX = 13;
+
 /** Floor for a user-resized row, mirroring the old renderer's `Math.max(20, …)`. */
 export const MIN_ROW_HEIGHT_PX = 20;
+
+/**
+ * Default row height for a configured font size, keeping the stock 24px at the
+ * 13px base so existing files look unchanged. Persisted per-row overrides are
+ * unaffected — only rows without one follow the font.
+ */
+export function default_row_height_for_font(
+    font_size_px: number = BASE_ROW_FONT_SIZE_PX,
+): number {
+    if (!Number.isFinite(font_size_px) || font_size_px <= 0) {
+        return DEFAULT_ROW_HEIGHT_PX;
+    }
+    return Math.max(
+        MIN_ROW_HEIGHT_PX,
+        Math.round(DEFAULT_ROW_HEIGHT_PX * (font_size_px / BASE_ROW_FONT_SIZE_PX)),
+    );
+}
+
+/** Per-line text height for a configured font size (see
+ *  {@link DEFAULT_LINE_HEIGHT_PX}). */
+export function line_height_for_font(
+    font_size_px: number = BASE_ROW_FONT_SIZE_PX,
+): number {
+    if (!Number.isFinite(font_size_px) || font_size_px <= 0) {
+        return DEFAULT_LINE_HEIGHT_PX;
+    }
+    return Math.max(
+        1,
+        Math.round(DEFAULT_LINE_HEIGHT_PX * (font_size_px / BASE_ROW_FONT_SIZE_PX)),
+    );
+}
 
 export type RowHeightOverrides = Record<number, number>;
 

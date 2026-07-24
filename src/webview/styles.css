@@ -6,6 +6,21 @@
     padding: 0;
 }
 
+:root {
+    /* Single resolution point for the viewer font, shared by the DOM chrome and
+       the canvas grid (src/webview/vscode-theme.ts reads --tv-font-size back).
+       `tableViewer.fontSize` (or the desktop preference) sets
+       --table-viewer-font-size; unset falls back to the host editor font. */
+    --tv-font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, var(--vscode-font-family, sans-serif)));
+    --tv-font-size: var(--table-viewer-font-size, var(--vscode-editor-font-size, 13px));
+    /* Chrome steps, kept proportional so the old 10/11/12/14px scale is
+       reproduced exactly at the 13px base. */
+    --tv-font-size-xs: calc(var(--tv-font-size) * 0.77);
+    --tv-font-size-sm: calc(var(--tv-font-size) * 0.85);
+    --tv-font-size-md: calc(var(--tv-font-size) * 0.92);
+    --tv-font-size-lg: calc(var(--tv-font-size) * 1.08);
+}
+
 html, body, #root {
     height: 100%;
     overflow: hidden;
@@ -13,8 +28,8 @@ html, body, #root {
 }
 
 body {
-    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, var(--vscode-font-family, sans-serif)));
-    font-size: 13px;
+    font-family: var(--tv-font-family);
+    font-size: var(--tv-font-size);
     color: var(--vscode-editor-foreground, #ccc);
     background: var(--vscode-editor-background, #1e1e1e);
 }
@@ -70,7 +85,7 @@ body {
     background: transparent;
     color: var(--vscode-foreground, #ccc);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
     font-family: inherit;
 }
 
@@ -121,8 +136,8 @@ body {
     border-radius: 8px;
     background: var(--vscode-badge-background, #4d4d4d);
     color: var(--vscode-badge-foreground, #fff);
-    font-size: 10px;
-    line-height: 14px;
+    font-size: var(--tv-font-size-xs);
+    line-height: 1.4;
     text-align: center;
     vertical-align: baseline;
     font-variant-numeric: tabular-nums;
@@ -142,7 +157,7 @@ body {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
 }
 
 .column-visibility-search {
@@ -229,7 +244,7 @@ body {
 
 .column-visibility-limit {
     border-top: 1px solid var(--vscode-panel-border, #444);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     line-height: 1.35;
 }
 
@@ -267,7 +282,7 @@ body {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
 }
 
 .highlight-swatches {
@@ -365,7 +380,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
     line-height: 1.35;
     text-align: center;
     white-space: normal;
@@ -386,8 +401,8 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, var(--vscode-font-family, sans-serif)));
-    font-size: 12px;
+    font-family: var(--tv-font-family);
+    font-size: var(--tv-font-size-md);
     line-height: 1.35;
     text-align: left;
     white-space: pre-wrap;
@@ -419,7 +434,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     padding: 6px 14px;
     border-right: 1px solid var(--vscode-panel-border, #444);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
     white-space: nowrap;
     color: var(--vscode-foreground, #ccc);
     opacity: 0.6;
@@ -486,8 +501,8 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 
 .data-table {
     border-collapse: collapse;
-    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, var(--vscode-font-family, sans-serif)));
-    font-size: 13px;
+    font-family: var(--tv-font-family);
+    font-size: var(--tv-font-size);
 }
 
 .data-table td {
@@ -591,7 +606,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     border-radius: 4px;
     padding: 4px 0;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
 }
 
 .context-menu-item {
@@ -619,7 +634,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorInfo-background, rgba(0, 122, 204, 0.1));
     color: var(--vscode-editorInfo-foreground, var(--vscode-foreground, #ccc));
     border-bottom: 1px solid var(--vscode-panel-border, #444);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
     flex-shrink: 0;
     text-align: center;
 }
@@ -629,7 +644,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorWarning-background, rgba(204, 167, 0, 0.1));
     color: var(--vscode-editorWarning-foreground, #cca700);
     border-bottom: 1px solid var(--vscode-panel-border, #444);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
     flex-shrink: 0;
     text-align: center;
     display: flex;
@@ -651,7 +666,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     border-radius: 2px;
     padding: 2px 8px;
     cursor: pointer;
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
 }
 
 .conflict-banner-actions button:hover {
@@ -676,8 +691,8 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     border: 2px solid var(--vscode-focusBorder, #007acc);
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
-    font-family: var(--table-viewer-font-family, var(--vscode-editor-font-family, var(--vscode-font-family, sans-serif)));
-    font-size: 13px;
+    font-family: var(--tv-font-family);
+    font-size: var(--tv-font-size);
     outline: none;
     box-sizing: border-box;
     resize: none;
@@ -757,7 +772,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 .filter-strip-label {
     flex: 0 0 auto;
     color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
@@ -805,7 +820,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 .filter-chip-toggle {
     flex: 0 0 auto;
     color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007acc));
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
 }
 
 .filter-chip {
@@ -859,7 +874,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 .filter-strip-clear {
     flex: 0 0 auto;
     padding: 0 6px;
-    font-size: 13px;
+    font-size: var(--tv-font-size);
     opacity: 0.65;
 }
 
@@ -884,7 +899,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     border-radius: 10px;
     background: var(--vscode-badge-background, #4d4d4d);
     color: var(--vscode-badge-foreground, #fff);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
 }
 
 .toolbar-cancel {
@@ -898,7 +913,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     min-width: min(100%, 12rem);
     max-width: 100%;
     color: var(--vscode-editorWarning-foreground, #cca700);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     overflow-wrap: anywhere;
     white-space: normal;
 }
@@ -920,7 +935,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
     color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #ccc));
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.32);
-    font-size: 12px;
+    font-size: var(--tv-font-size-md);
 }
 
 .filter-popover-header {
@@ -992,7 +1007,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 .filter-histogram-status {
     min-height: 28px;
     color: var(--vscode-descriptionForeground, #aaa);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
 }
 
 .filter-histogram-error {
@@ -1001,7 +1016,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 
 .filter-popover-field-label {
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
@@ -1171,13 +1186,13 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 
 .filter-value-limit {
     border-top: 1px solid var(--vscode-panel-border, #444);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     line-height: 1.35;
 }
 
 .filter-value-status {
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     line-height: 1.35;
 }
 
@@ -1208,7 +1223,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 .context-menu-shortcut {
     margin-left: auto;
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--tv-font-size-sm);
     opacity: 0.75;
 }
 
@@ -1216,7 +1231,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     margin-left: auto;
     padding-left: 16px;
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 14px;
+    font-size: var(--tv-font-size-lg);
     line-height: 1;
 }
 

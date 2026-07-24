@@ -27,6 +27,8 @@ const GRID_THEME_VARIABLES = [
     '--vscode-editor-findMatchHighlightBackground',
     '--vscode-editor-font-family',
     '--vscode-font-family',
+    '--vscode-editor-font-size',
+    '--vscode-font-size',
 ] as const;
 
 /** Variables consumed by src/webview/styles.css and the React chrome. */
@@ -73,6 +75,9 @@ export const REQUIRED_THEME_VARIABLES: readonly string[] = [
 
 const SYSTEM_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Ubuntu', 'Droid Sans', sans-serif";
 const MONO_FONT = "Menlo, Monaco, 'Courier New', monospace";
+/** Fallback only: the configured desktop font size is injected ahead of this
+ *  by the viewer page bootstrap (--table-viewer-font-size). */
+const BASE_FONT_SIZE = '13px';
 
 /** Values loosely follow VS Code's default Dark+ theme. */
 const DARK: Record<string, string> = {
@@ -91,6 +96,8 @@ const DARK: Record<string, string> = {
     '--vscode-editor-findMatchHighlightBackground': '#ea5c0055',
     '--vscode-editor-font-family': MONO_FONT,
     '--vscode-font-family': SYSTEM_FONT,
+    '--vscode-editor-font-size': BASE_FONT_SIZE,
+    '--vscode-font-size': BASE_FONT_SIZE,
     '--vscode-badge-background': '#4d4d4d',
     '--vscode-badge-foreground': '#ffffff',
     '--vscode-button-background': '#0e639c',
@@ -143,6 +150,8 @@ const LIGHT: Record<string, string> = {
     '--vscode-editor-findMatchHighlightBackground': '#ea5c0055',
     '--vscode-editor-font-family': MONO_FONT,
     '--vscode-font-family': SYSTEM_FONT,
+    '--vscode-editor-font-size': BASE_FONT_SIZE,
+    '--vscode-font-size': BASE_FONT_SIZE,
     '--vscode-badge-background': '#cccccc',
     '--vscode-badge-foreground': '#3b3b3b',
     '--vscode-button-background': '#005fb8',

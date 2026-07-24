@@ -15,7 +15,10 @@ export const VIEWER_CSP_SOURCE = `${APP_SCHEME}:`;
 
 /** The generated viewer page keeps the shared bundle's CSP (nonce-locked
  *  scripts, no inline styles) — see src/webview-html.ts for the rationale. */
-export function build_desktop_viewer_html(font_family: string | null): string {
+export function build_desktop_viewer_html(
+    font_family: string | null,
+    font_size: number | null = null,
+): string {
     return build_webview_html(
         {
             scriptUrl: VIEWER_SCRIPT_URL,
@@ -24,5 +27,6 @@ export function build_desktop_viewer_html(font_family: string | null): string {
         },
         generate_nonce(),
         font_family,
+        font_size,
     );
 }

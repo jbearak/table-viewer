@@ -80,12 +80,14 @@ beforeEach(() => {
 describe('hide rows controller', () => {
     it('replays the current font on ready and forwards later changes', async () => {
         vscode_mock.__setConfigurationValue('tableViewer.fontFamily', 'Hack');
+        vscode_mock.__setConfigurationValue('tableViewer.fontSize', 15);
         const panel = open_csv_table(versioned_state_store().store);
 
         await ready(panel);
-        expect(messages_of(panel, 'fontFamilyChanged').at(0)).toEqual({
-            type: 'fontFamilyChanged',
+        expect(messages_of(panel, 'fontChanged').at(0)).toEqual({
+            type: 'fontChanged',
             fontFamily: 'Hack',
+            fontSize: 15,
         });
 
         panel.__messages.length = 0;
@@ -98,9 +100,27 @@ describe('hide rows controller', () => {
                 section === 'tableViewer.fontFamily'
             ),
         });
-        expect(messages_of(panel, 'fontFamilyChanged')).toEqual([{
-            type: 'fontFamilyChanged',
+        expect(messages_of(panel, 'fontChanged')).toEqual([{
+            type: 'fontChanged',
             fontFamily: 'Google Sans Code',
+            fontSize: 15,
+        }]);
+    });
+
+    it('forwards font size changes on their own', async () => {
+        const panel = open_csv_table(versioned_state_store().store);
+        await ready(panel);
+        panel.__messages.length = 0;
+
+        vscode_mock.__setConfigurationValue('tableViewer.fontSize', 18);
+        await vscode_mock.__fireConfigurationChange({
+            affectsConfiguration: (section) => section === 'tableViewer.fontSize',
+        });
+
+        expect(messages_of(panel, 'fontChanged')).toEqual([{
+            type: 'fontChanged',
+            fontFamily: null,
+            fontSize: 18,
         }]);
     });
 

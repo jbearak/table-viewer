@@ -15,16 +15,26 @@ export function settings_file_path(user_data_dir: string): string {
 export interface DesktopSettings {
     /** Empty string means "use the theme default font". */
     fontFamily: string;
+    /** Font size in px, applied to the whole app (tab bar, viewer, prefs). */
+    fontSize: number;
     tabOrientation: 'horizontal' | 'vertical';
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
 }
 
-/** Defaults mirror the VS Code contribution defaults in package.json. */
+/** Smallest / largest usable app font size; the prefs input clamps to these. */
+export const MIN_FONT_SIZE_PX = 8;
+export const MAX_FONT_SIZE_PX = 32;
+
+/** Defaults mirror the VS Code contribution defaults in package.json, except
+ *  the worksheet tab orientation, which is vertical here (there is no editor
+ *  tab strip to compete with) and the font size, which has no editor setting
+ *  to inherit on the desktop. */
 export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     fontFamily: '',
-    tabOrientation: 'horizontal',
+    fontSize: 13,
+    tabOrientation: 'vertical',
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
     maxStoredFiles: 10_000,
@@ -35,12 +45,25 @@ function sanitize_number(value: unknown, fallback: number, minimum: number): num
     return Math.max(minimum, value);
 }
 
+function clamp(value: number, minimum: number, maximum: number): number {
+    return Math.min(maximum, Math.max(minimum, value));
+}
+
 /** Coerce an untrusted parsed blob into a complete, valid settings object. */
 export function sanitize_settings(raw: unknown): DesktopSettings {
     const record = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
     return {
         fontFamily: typeof record.fontFamily === 'string' ? record.fontFamily : DEFAULT_SETTINGS.fontFamily,
-        tabOrientation: record.tabOrientation === 'vertical' ? 'vertical' : 'horizontal',
+        fontSize: clamp(
+            Math.round(sanitize_number(
+                record.fontSize,
+                DEFAULT_SETTINGS.fontSize,
+                MIN_FONT_SIZE_PX,
+            )),
+            MIN_FONT_SIZE_PX,
+            MAX_FONT_SIZE_PX,
+        ),
+        tabOrientation: record.tabOrientation === 'horizontal' ? 'horizontal' : 'vertical',
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),
         maxStoredFiles: Math.floor(sanitize_number(record.maxStoredFiles, DEFAULT_SETTINGS.maxStoredFiles, 1)),
@@ -102,11 +125,15 @@ export class DesktopConfigStore {
     config_port(): ConfigPort {
         return {
             font_family: () => this.settings().fontFamily.trim() || null,
+            font_size: () => this.settings().fontSize,
             max_file_size_mib: () => this.settings().maxFileSizeMiB,
             csv_max_rows: () => this.settings().csvMaxRows,
             default_tab_orientation: () => this.settings().tabOrientation,
-            on_font_family_change: (notify) => this.on_change((previous, next) => {
-                if (previous.fontFamily !== next.fontFamily) notify();
+            on_font_change: (notify) => this.on_change((previous, next) => {
+                if (
+                    previous.fontFamily !== next.fontFamily
+                    || previous.fontSize !== next.fontSize
+                ) notify();
             }),
         };
     }

@@ -57,13 +57,20 @@ export const fake_config_port: ConfigPort = {
     font_family() {
         return config_value('fontFamily', '')?.trim() || null;
     },
+    font_size() {
+        const configured = config_value('fontSize', 0);
+        return typeof configured === 'number' && configured > 0 ? configured : null;
+    },
     max_file_size_mib: () => config_value('maxFileSizeMiB', 256),
     csv_max_rows: () => config_value('csvMaxRows', 1_000_000),
     default_tab_orientation: () =>
         config_value<'horizontal' | 'vertical'>('tabOrientation', 'horizontal'),
-    on_font_family_change(listener) {
+    on_font_change(listener: () => void) {
         return vscode_mock.workspace.onDidChangeConfiguration((event) => {
-            if (!event.affectsConfiguration('tableViewer.fontFamily')) return;
+            if (
+                !event.affectsConfiguration('tableViewer.fontFamily')
+                && !event.affectsConfiguration('tableViewer.fontSize')
+            ) return;
             listener();
         });
     },

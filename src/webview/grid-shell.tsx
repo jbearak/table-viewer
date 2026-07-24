@@ -115,7 +115,13 @@ import {
     selected_display_row_intervals,
 } from './highlight-selection-model';
 import { highlight_rgba } from './highlight-theme';
-import { natural_row_height, row_height, type RowHeightOverrides } from './row-heights';
+import {
+    default_row_height_for_font,
+    line_height_for_font,
+    natural_row_height,
+    row_height,
+    type RowHeightOverrides,
+} from './row-heights';
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
@@ -138,7 +144,7 @@ const DIRTY_BG = 'rgba(204, 167, 0, 0.16)';
 /** Stronger reddish tint for an edit whose underlying cell drifted (conflict). */
 const CONFLICT_BG = 'rgba(229, 75, 75, 0.22)';
 import { use_row_loader } from './use-row-loader';
-import { use_vscode_theme } from './vscode-theme';
+import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
 import { host_bridge } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
 import '@glideapps/glide-data-grid/dist/index.css';
@@ -200,6 +206,9 @@ export interface GridActionsHandle {
     select_all(): void;
     /** Loads the sheet's rows before serializing, so it resolves asynchronously. */
     copy_sheet(): Promise<void>;
+    /** Copy the current cell selection as TSV, mirroring Glide's own Ctrl+C.
+     *  No-op when nothing is selected. */
+    copy_selection(): void;
 }
 
 export interface PendingPreviewScroll {
@@ -355,6 +364,10 @@ export function GridShell({
         has_visible_columns,
     );
     const { theme, highContrast: high_contrast } = use_vscode_theme();
+    // The configured font size, resolved once from the theme so cell painting,
+    // canvas measurement, and default row heights all agree.
+    const font_size_px = theme_font_size_px(theme);
+    const default_row_height = default_row_height_for_font(font_size_px);
     const grid_ref = useRef<DataEditorRef | null>(null);
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const overlay_ref = useRef<MergeOverlayHandle | null>(null);
@@ -1086,10 +1099,11 @@ export function GridShell({
                 show_formatting && bold,
                 show_formatting && italic,
                 font_family,
+                font_size_px,
             );
             return ctx.measureText(line).width;
         },
-        [ensure_measure_ctx, font_family, show_formatting],
+        [ensure_measure_ctx, font_family, font_size_px, show_formatting],
     );
 
     const font_flags_for_cell = useCallback(
@@ -1164,6 +1178,7 @@ export function GridShell({
                 (line) => measure_line_width(line, flags.bold, flags.italic),
                 {
                     cell_height: bounds.height,
+                    line_height: line_height_for_font(font_size_px),
                     wrapping,
                 },
             );
@@ -1193,6 +1208,7 @@ export function GridShell({
             clear_cell_tooltip_timer,
             displayed_cell_text,
             font_flags_for_cell,
+            font_size_px,
             measure_line_width,
             tooltip_bounds_for_cell,
         ],
@@ -1243,7 +1259,12 @@ export function GridShell({
             return visible_cells;
         });
         const measure = (cell: MeasurableCell): number => {
-            ctx.font = canvas_font(cell.bold, cell.italic, font_family);
+            ctx.font = canvas_font(
+                cell.bold,
+                cell.italic,
+                font_family,
+                font_size_px,
+            );
             return ctx.measureText(cell.text).width;
         };
         return fit_column_widths(cells, visible_source_columns, measure);
@@ -1251,6 +1272,7 @@ export function GridShell({
         has_visible_columns,
         show_formatting,
         font_family,
+        font_size_px,
         visible_source_columns,
     ]);
 
@@ -1317,6 +1339,7 @@ export function GridShell({
                 merge_index,
                 show_formatting,
                 overlay,
+                font_size_px,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
@@ -1326,6 +1349,7 @@ export function GridShell({
             version,
             merge_index,
             editable_cells,
+            font_size_px,
             source_column_for_display,
             get_source_row,
             get_highlight_background,
@@ -1347,8 +1371,13 @@ export function GridShell({
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
             if (text.includes('\n')) {
-                const needed = natural_row_height(text);
-                if (needed > row_height(row_heights, row)) {
+                const needed = natural_row_height(
+                    text,
+                    line_height_for_font(font_size_px),
+                    undefined,
+                    default_row_height,
+                );
+                if (needed > row_height(row_heights, row, default_row_height)) {
                     on_row_resize([row], needed);
                     const cells: { cell: Item }[] = [];
                     for (let display_column = 0; display_column < display_column_count; display_column++) {
@@ -1363,6 +1392,8 @@ export function GridShell({
         },
         [
             commit_edit,
+            default_row_height,
+            font_size_px,
             row_heights,
             on_row_resize,
             display_column_count,
@@ -1417,9 +1448,9 @@ export function GridShell({
                     || row_resize_preview.preview_rows?.hasIndex(row)
                 )
             ) return row_resize_preview.height;
-            return row_height(row_heights, row);
+            return row_height(row_heights, row, default_row_height);
         },
-        [row_heights, row_resize_preview],
+        [default_row_height, row_heights, row_resize_preview],
     );
 
     // Repaint merge geometry after live-preview and committed-height renders.
@@ -1504,12 +1535,17 @@ export function GridShell({
                     ? {
                           row: hit.row,
                           boundary_y: hit.boundary_y,
-                          height: row_height(row_heights, hit.row),
+                          height: row_height(
+                              row_heights,
+                              hit.row,
+                              default_row_height,
+                          ),
                       }
                     : null,
             );
         },
         [
+            default_row_height,
             display_column_count,
             hide_cell_tooltip,
             row_heights,
@@ -1790,6 +1826,20 @@ export function GridShell({
         });
     }, [copy_source_selection, visible_source_columns]);
 
+    // What the menu-driven Copy command acts on: the dragged cell rectangle
+    // when there is one, else a row-marker selection. Mirrors what Glide's own
+    // Ctrl+C would have copied, for hosts whose native menu swallows that key.
+    const copy_selection = useCallback(() => {
+        const selection = grid_selection_ref.current;
+        const range = selection.current?.range;
+        if (range) {
+            copy_rect(range);
+            return;
+        }
+        const rows = selected_display_row_intervals(selection, row_count);
+        if (rows) copy_display_rows(rows);
+    }, [copy_display_rows, copy_rect, row_count]);
+
     // Whole visible sheet with a header row (delegates to copy_rect, so the same
     // clipboard-failure and truncation handling applies). Because this copies
     // rows the user may never have scrolled into view — "Copy sheet" can target
@@ -1818,12 +1868,13 @@ export function GridShell({
             sheet_index,
             select_all,
             copy_sheet,
+            copy_selection,
         };
         grid_actions_ref.current = handle;
         return () => {
             if (grid_actions_ref.current === handle) grid_actions_ref.current = null;
         };
-    }, [copy_sheet, grid_actions_ref, select_all, sheet_index]);
+    }, [copy_selection, copy_sheet, grid_actions_ref, select_all, sheet_index]);
 
     const hide_source_column = useCallback((source_column: number) => {
         if (display_column_count === 1) {
@@ -2206,10 +2257,15 @@ export function GridShell({
 
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version
-    // bump), the formatting toggle (raw ↔ formatted), and the edit-mode toggle
-    // (flips each cell's allowOverlay). A parent re-render alone does not
+    // bump), the formatting toggle (raw ↔ formatted), the edit-mode toggle
+    // (flips each cell's allowOverlay), and a font-size change (each cell
+    // carries the size in its theme override). A parent re-render alone does not
     // reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
+    //
+    // The merge overlay draws its own text, reading the size off the theme at
+    // paint time, and is only otherwise repainted by content/highlight changes —
+    // so repaint it here too, or merged cells keep the previous size.
     useEffect(() => {
         const grid = grid_ref.current;
         if (!grid) return;
@@ -2226,7 +2282,14 @@ export function GridShell({
             }
         }
         if (cells.length > 0) grid.updateCells(cells);
-    }, [version, show_formatting, editable_cells, display_column_count]);
+        overlay_ref.current?.repaint();
+    }, [
+        version,
+        show_formatting,
+        editable_cells,
+        display_column_count,
+        font_size_px,
+    ]);
 
     // Targeted tint repaint: damage only the cells whose dirty/conflict tint
     // actually changed, not the whole viewport. Single-cell edits/discards

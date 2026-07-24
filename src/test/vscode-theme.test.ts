@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
     apply_font_family,
+    apply_font_size,
     build_theme_from_vars,
     is_vscode_high_contrast,
+    theme_font_size_px,
 } from '../webview/vscode-theme';
 
 describe('build_theme_from_vars', () => {
@@ -45,6 +47,22 @@ describe('build_theme_from_vars', () => {
         );
         expect(theme.bgCell).toBe('#abcdef');
     });
+
+    it('sizes the canvas text from the resolved --tv-font-size', () => {
+        const theme = build_theme_from_vars((name) =>
+            name === '--tv-font-size' ? '17px' : ''
+        );
+        expect(theme.baseFontStyle).toBe('17px');
+        expect(theme.headerFontStyle).toBe('600 17px');
+        expect(theme.editorFontSize).toBe('17px');
+        expect(theme_font_size_px(theme)).toBe(17);
+    });
+
+    it('falls back to the 13px base when no size is resolvable', () => {
+        const theme = build_theme_from_vars(() => '');
+        expect(theme.baseFontStyle).toBe('13px');
+        expect(theme_font_size_px({})).toBe(13);
+    });
 });
 
 describe('apply_font_family', () => {
@@ -67,6 +85,20 @@ describe('apply_font_family', () => {
 
         apply_font_family(null, root);
         expect(root.style.getPropertyValue('--table-viewer-font-family')).toBe('');
+    });
+
+    it('writes a px override and clears it for the editor-size fallback', () => {
+        const root = fake_root();
+        apply_font_size(16, root);
+        expect(root.style.getPropertyValue('--table-viewer-font-size')).toBe('16px');
+
+        apply_font_size(null, root);
+        expect(root.style.getPropertyValue('--table-viewer-font-size')).toBe('');
+
+        // 0 is the "follow the editor" sentinel, not a real size.
+        apply_font_size(16, root);
+        apply_font_size(0, root);
+        expect(root.style.getPropertyValue('--table-viewer-font-size')).toBe('');
     });
 });
 

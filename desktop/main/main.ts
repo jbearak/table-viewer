@@ -21,6 +21,7 @@ import {
 import { DesktopConfigStore, settings_file_path } from './desktop-config';
 import { TabManager } from './tabs';
 import { theme_payload } from './theme';
+import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
     VIEWER_HOST,
@@ -31,10 +32,12 @@ import {
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
+    CHANNEL_SETTINGS_CHANGED,
     CHANNEL_SHELL_ACTIVATE_TAB,
     CHANNEL_SHELL_CLOSE_TAB,
     CHANNEL_SHELL_GET_TABS,
     CHANNEL_SHELL_OPEN_FILES,
+    CHANNEL_SHELL_OPEN_PREFERENCES,
     CHANNEL_THEME_CHANGED,
 } from '../shared/ipc';
 
@@ -67,6 +70,9 @@ let main_window: BrowserWindow | undefined;
 let prefs_window: BrowserWindow | undefined;
 /** Files requested before the app/window was ready. */
 const pending_open_paths: string[] = [];
+/** One zoom level for the whole app: the tab bar and every tab view scale
+ *  together instead of whichever webContents happens to be focused. */
+let zoom_level = 0;
 
 // The viewer page and the shared webview bundle are served from a privileged
 // custom scheme so the CSP model matches VS Code's webview loader (no file://).
@@ -85,8 +91,10 @@ function register_app_protocol(): void {
     protocol.handle(APP_SCHEME, async (request) => {
         const url = new URL(request.url);
         if (url.host === VIEWER_HOST) {
+            const config = config_store.config_port();
             const html = build_desktop_viewer_html(
-                config_store.config_port().font_family(),
+                config.font_family(),
+                config.font_size(),
             );
             return new Response(html, {
                 headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -126,6 +134,17 @@ function open_files(paths: string[]): void {
     }
 }
 
+/** Push the shared zoom level to the tab bar and every open tab view. */
+function apply_zoom_level(next: number): void {
+    zoom_level = clamp_zoom_level(next);
+    if (main_window && !main_window.isDestroyed()) {
+        main_window.webContents.setZoomLevel(zoom_level);
+    }
+    // TabManager also rescales the tab-bar strip, whose height is expressed in
+    // the (now zoomed) renderer's CSS pixels.
+    tab_manager?.set_zoom_level(zoom_level);
+}
+
 function ensure_main_window(): BrowserWindow {
     if (main_window && !main_window.isDestroyed()) return main_window;
     const window = new BrowserWindow({
@@ -154,6 +173,7 @@ function ensure_main_window(): BrowserWindow {
     });
     void window.loadFile(path.join(DESKTOP_DIST_DIR, 'shell.html'));
     window.webContents.once('did-finish-load', () => {
+        apply_zoom_level(zoom_level);
         for (const file of pending_open_paths.splice(0)) {
             tab_manager?.open_file(file);
         }
@@ -179,8 +199,8 @@ function show_preferences_window(): void {
         return;
     }
     prefs_window = new BrowserWindow({
-        width: 440,
-        height: 420,
+        width: 460,
+        height: 520,
         resizable: false,
         minimizable: false,
         maximizable: false,
@@ -197,6 +217,28 @@ function show_preferences_window(): void {
         prefs_window = undefined;
     });
     void prefs_window.loadFile(path.join(DESKTOP_DIST_DIR, 'prefs.html'));
+}
+
+/**
+ * Copy / Select All. In the main window the active viewer tab decides what they
+ * mean (its focused text field, else the grid). In any other window — today
+ * that is Preferences, whose fields are ordinary text inputs — fall back to the
+ * native editing command.
+ *
+ * The window Electron reports with the menu click is the routing signal;
+ * sampling focus separately is racy and can silently drop the command.
+ */
+function route_edit_command(
+    command: 'copy' | 'selectAll',
+    window: Electron.BaseWindow | undefined,
+): void {
+    const target = window as BrowserWindow | undefined;
+    const is_main = !target || (!!main_window && target === main_window);
+    if (is_main && tab_manager?.send_edit_command(command)) return;
+    const contents = target?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    if (command === 'copy') contents.copy();
+    else contents.selectAll();
 }
 
 function build_menu(): void {
@@ -234,12 +276,6 @@ function build_menu(): void {
                 },
                 { type: 'separator' },
                 {
-                    label: 'Save',
-                    accelerator: 'CmdOrCtrl+S',
-                    click: () => tab_manager?.request_save_active(),
-                },
-                { type: 'separator' },
-                {
                     label: 'Close Tab',
                     accelerator: 'CmdOrCtrl+W',
                     click: (_item, window) => {
@@ -273,8 +309,70 @@ function build_menu(): void {
                     ]),
             ],
         },
-        { label: 'Edit', role: 'editMenu' },
-        { label: 'View', role: 'viewMenu' },
+        {
+            // Not `role: 'editMenu'`: its Undo/Redo/Delete/Paste-and-Match-Style
+            // items have nothing to act on (there is no undo model, and the grid
+            // is a canvas with no DOM selection), and its Copy/Select All roles
+            // would claim Cmd/Ctrl+C and Cmd/Ctrl+A before the page could run
+            // its own. Cut and Paste keep their native roles because the only
+            // place they mean anything — the CSV cell editor's text field — is
+            // exactly what those roles operate on.
+            label: 'Edit',
+            submenu: [
+                { role: 'cut' },
+                {
+                    label: 'Copy',
+                    accelerator: 'CmdOrCtrl+C',
+                    click: (_item, window) => route_edit_command('copy', window),
+                },
+                { role: 'paste' },
+                { type: 'separator' },
+                {
+                    label: 'Select All',
+                    accelerator: 'CmdOrCtrl+A',
+                    click: (_item, window) => route_edit_command('selectAll', window),
+                },
+            ],
+        },
+        {
+            label: 'View',
+            submenu: [
+                { role: 'reload' },
+                { role: 'forceReload' },
+                { role: 'toggleDevTools' },
+                { type: 'separator' },
+                // Deliberately not the zoom roles: those act on the focused
+                // webContents only, which would scale the tab bar or the table
+                // in isolation.
+                {
+                    label: 'Actual Size',
+                    accelerator: 'CmdOrCtrl+0',
+                    click: () => apply_zoom_level(0),
+                },
+                {
+                    label: 'Zoom In',
+                    accelerator: 'CmdOrCtrl+Plus',
+                    enabled: true,
+                    click: () => apply_zoom_level(zoom_level + 1),
+                },
+                // Hidden twin so the unshifted '=' key also zooms in (a menu
+                // item carries a single accelerator).
+                {
+                    label: 'Zoom In',
+                    accelerator: 'CmdOrCtrl+=',
+                    visible: false,
+                    acceleratorWorksWhenHidden: true,
+                    click: () => apply_zoom_level(zoom_level + 1),
+                },
+                {
+                    label: 'Zoom Out',
+                    accelerator: 'CmdOrCtrl+-',
+                    click: () => apply_zoom_level(zoom_level - 1),
+                },
+                { type: 'separator' },
+                { role: 'togglefullscreen' },
+            ],
+        },
         { label: 'Window', role: 'windowMenu' },
         {
             label: 'Help',
@@ -303,11 +401,26 @@ function register_ipc(): void {
         if (typeof tab_id === 'number') tab_manager?.close_tab(tab_id);
     });
     ipcMain.on(CHANNEL_SHELL_OPEN_FILES, () => void show_open_dialog());
+    ipcMain.on(CHANNEL_SHELL_OPEN_PREFERENCES, () => show_preferences_window());
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
     ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => {
         return config_store.update(
             (partial && typeof partial === 'object' ? partial : {}) as Record<string, never>,
         );
+    });
+}
+
+/** Keep the app chrome (tab bar, Preferences window) on the configured font,
+ *  matching how the extension's font settings style its entire UI. */
+function watch_settings(): void {
+    config_store.on_change((previous, next) => {
+        for (const window of BrowserWindow.getAllWindows()) {
+            if (!window.isDestroyed()) {
+                window.webContents.send(CHANNEL_SETTINGS_CHANGED, next);
+            }
+        }
+        // A larger font makes the tab bar taller, so the tab views move down.
+        if (previous.fontSize !== next.fontSize) tab_manager?.relayout();
     });
 }
 
@@ -347,6 +460,7 @@ if (!got_lock) {
         );
         register_app_protocol();
         register_ipc();
+        watch_settings();
         build_menu();
         nativeTheme.on('updated', () => {
             tab_manager?.broadcast_theme();
