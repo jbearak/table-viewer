@@ -4,6 +4,14 @@ Clone the repo and run `npm install`. Node >= 24 is required (`engines.node` in 
 
 ## npm scripts
 
+**Typechecking** (the esbuild bundlers strip types without checking them, so this
+is the only thing that does — CI runs it):
+
+- `npm run typecheck:all` — all three projects at once
+- `npm run typecheck` — extension, webview, and unit tests (`tsconfig.json`)
+- `npm run typecheck:desktop` — desktop shell (`desktop/tsconfig.json`)
+- `npm run typecheck:integration` — integration tests (`tsconfig.integration.json`)
+
 **VS Code extension:**
 
 - `npm run bundle && npm run bundle:webview` — build the extension and webview bundles

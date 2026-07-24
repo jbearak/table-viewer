@@ -9,7 +9,7 @@ import type {
     WorkbookMeta,
 } from '../data-source/interface';
 import type { AuthorityFileStateStore, FileStateStore } from '../state';
-import type { HostMessage, StoredPerFileState } from '../types';
+import type { HostMessage, PerFileState } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
 import { acquire_file_coordinator } from '../file-coordinator';
@@ -74,8 +74,12 @@ function number(raw: number): RenderedCell {
     };
 }
 
-function mutable_state_store(initial: StoredPerFileState = {}) {
-    let state: StoredPerFileState = structuredClone(initial);
+// These fixtures only ever hold the current state shape (migration of the
+// legacy shape is covered in state.test.ts), so they are typed `PerFileState`
+// rather than the `StoredPerFileState` union the store *reads* — assertions can
+// then reach fields like `transforms`, which the legacy arm does not have.
+function mutable_state_store(initial: PerFileState = {}) {
+    let state: PerFileState = structuredClone(initial);
     let revision = 0;
     const store: FileStateStore = {
         async read() {
@@ -97,10 +101,15 @@ function mutable_state_store(initial: StoredPerFileState = {}) {
         },
         async touch() {},
     };
-    return { store, value: () => state };
+    return {
+        store,
+        value: () => state,
+        /** Like `store.read`, but keeping the current-shape type. */
+        snapshot: () => ({ state: structuredClone(state), revision }),
+    };
 }
 
-function gated_state_store(initial: StoredPerFileState = {}) {
+function gated_state_store(initial: PerFileState = {}) {
     const base = mutable_state_store(initial);
     let release: (() => void) | undefined;
     let started: (() => void) | undefined;
@@ -448,7 +457,7 @@ describe('Excel workbook snapshot controller', () => {
             excel_profile(builds),
         );
         const initial = await ready(panel);
-        const external = await state.store.read('/stale-hidden-candidate.xlsx');
+        const external = state.snapshot();
         await state.store.compare_and_set(
             '/stale-hidden-candidate.xlsx',
             external.revision,
@@ -558,7 +567,7 @@ describe('Excel workbook snapshot controller', () => {
                 filters: [],
                 schema: '["People",2,null]',
                 hiddenRows: { length: 1 },
-            } as unknown as NonNullable<StoredPerFileState['transforms']>[number]],
+            } as unknown as NonNullable<PerFileState['transforms']>[number]],
         });
         const panel = open_excel(
             '/corrupt-hidden-rows.xlsx',
