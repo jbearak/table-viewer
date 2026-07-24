@@ -128,7 +128,7 @@ Table Viewer also runs as a standalone Electron desktop app that reuses the same
 
 ## Development
 
-Clone the repo and run `npm install`. If your npm configuration blocks install scripts (e.g. an allow-scripts policy), the `electron` binary download is skipped — approve/run it manually with `node node_modules/electron/install.js`.
+Clone the repo and run `npm install`.
 
 **VS Code extension** (unchanged flow):
 

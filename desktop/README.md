@@ -5,11 +5,6 @@ Standalone Electron shell for Table Viewer. It reuses the shared viewer controll
 ## Prerequisites
 
 - Node.js >= 24 and `npm install` at the repo root.
-- If your npm setup blocks package install scripts (e.g. an allow-scripts policy), the Electron binary is not downloaded automatically. Run it manually once:
-
-  ```sh
-  node node_modules/electron/install.js
-  ```
 
 ## Run in development
 
