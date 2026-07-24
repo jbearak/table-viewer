@@ -23,6 +23,7 @@ import type { HostMessage, WebviewMessage } from '../../src/types';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
 import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
+import { dirty_from_host_message, dirty_from_webview_message } from './dirty-state';
 import type { ThemePayload } from './theme';
 import { CHANNEL_HOST_MESSAGE, CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { viewer_url } from './viewer-html';
@@ -37,7 +38,11 @@ interface ViewerWindow {
     readonly window: BrowserWindow;
     readonly panel: DesktopViewerPanel;
     readonly controller: Disposable;
+    /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
+    readonly stop_watching_dirty: () => void;
 }
+
+const IS_MAC = process.platform === 'darwin';
 
 function background_color(dark: boolean): string {
     return dark ? '#1e1e1e' : '#ffffff';
@@ -88,15 +93,29 @@ export class ViewerWindowManager {
             },
         });
         const web_contents = window.webContents;
-        // The shared viewer page's <title> is the app name; keep the file name in
-        // the title bar instead (re-asserted, not merely prevented: the document
-        // title is adopted on load regardless), and give macOS the proxy icon and
-        // path popup for the file.
+        if (process.platform === 'darwin') window.setRepresentedFilename(file_path);
+
+        // Unsaved CSV edits are durable (the controller persists them per file), so
+        // this only makes them visible: macOS puts a dot in an edited document's
+        // close button, and other platforms get a marked title.
+        let dirty = false;
+        const apply_window_state = () => {
+            if (window.isDestroyed()) return;
+            // The shared viewer page's <title> is the app name; the file name goes
+            // in the title bar instead. Re-asserted rather than merely prevented:
+            // the document title is adopted on load regardless.
+            window.setTitle(!IS_MAC && dirty ? `• ${title}` : title);
+            window.setDocumentEdited(dirty); // macOS only; a no-op elsewhere.
+        };
+        const set_dirty = (next: boolean | undefined) => {
+            if (next === undefined || next === dirty) return;
+            dirty = next;
+            apply_window_state();
+        };
         web_contents.on('page-title-updated', (event) => {
             event.preventDefault();
-            if (!window.isDestroyed()) window.setTitle(title);
+            apply_window_state();
         });
-        if (process.platform === 'darwin') window.setRepresentedFilename(file_path);
 
         // Per-window transport: host messages go out over this window's
         // webContents; webview messages come back on the shared channel,
@@ -104,6 +123,7 @@ export class ViewerWindowManager {
         const panel = create_viewer_panel({
             send: (message: HostMessage) => {
                 if (web_contents.isDestroyed()) return false;
+                set_dirty(dirty_from_host_message(message));
                 web_contents.send(CHANNEL_HOST_MESSAGE, message);
                 return true;
             },
@@ -120,6 +140,17 @@ export class ViewerWindowManager {
             },
         });
 
+        // Watched independently of the panel's own subscriptions, which belong to
+        // the controller and may come and go.
+        const dirty_watcher = (
+            event: Electron.IpcMainEvent,
+            message: WebviewMessage,
+        ) => {
+            if (event.sender !== web_contents) return;
+            set_dirty(dirty_from_webview_message(message));
+        };
+        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
+
         const controller = attach_viewer(
             panel,
             file_path,
@@ -133,6 +164,8 @@ export class ViewerWindowManager {
             window,
             panel,
             controller,
+            stop_watching_dirty: () =>
+                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
         };
         this.windows.push(entry);
         // 'close' still has live bounds to remember; 'closed' is where the
@@ -201,6 +234,7 @@ export class ViewerWindowManager {
     private teardown(entry: ViewerWindow): void {
         const index = this.windows.indexOf(entry);
         if (index >= 0) this.windows.splice(index, 1);
+        entry.stop_watching_dirty();
         try {
             entry.controller.dispose();
         } catch {

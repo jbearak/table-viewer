@@ -222,3 +222,39 @@ test('viewer windows follow the OS light/dark setting', async () => {
         });
     }
 });
+
+// Unsaved CSV edits are durable, so the window only has to *show* that it holds a
+// draft: macOS puts a dot in an edited document's close button, other platforms
+// mark the title. Kept last — it deliberately leaves a draft behind.
+test('a window holding unsaved edits is marked as edited', async () => {
+    const page = await focus_viewer('basic.csv');
+    const window_state = () => app.evaluate(({ BrowserWindow }) => {
+        const window = BrowserWindow.getAllWindows()
+            .find((candidate) => candidate.getTitle().includes('basic.csv'));
+        return { title: window?.getTitle(), edited: window?.isDocumentEdited() };
+    });
+    expect(await window_state()).toEqual({ title: 'basic.csv', edited: false });
+
+    // Enter edit mode — and wait for it, or the keystrokes below land in a grid
+    // that is still read-only and are swallowed.
+    const edit_toggle = page.getByRole('button', { name: 'Edit' });
+    await edit_toggle.click();
+    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+
+    // Type into the first body cell and commit it. The first keystroke opens the
+    // overwrite editor and is consumed, so the cell ends up holding "licia".
+    const canvas = page.locator(GRID_CANVAS).first();
+    const box = (await canvas.boundingBox())!;
+    await page.mouse.click(box.x + 120, box.y + 50);
+    await page.keyboard.type('Alicia');
+    await page.keyboard.press('Enter');
+    // The toolbar marks its own unsaved state; wait for the page to agree a draft
+    // exists before asking the window about it.
+    await expect(edit_toggle).toHaveClass(/has-unsaved/);
+
+    await expect.poll(window_state, { timeout: 15_000 }).toEqual(
+        process.platform === 'darwin'
+            ? { title: 'basic.csv', edited: true }
+            : { title: '• basic.csv', edited: false },
+    );
+});

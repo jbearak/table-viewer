@@ -11,6 +11,7 @@ import {
     settings_file_path,
 } from '../main/desktop-config';
 import { clamp_zoom_level } from '../main/zoom';
+import { dirty_from_host_message, dirty_from_webview_message } from '../main/dirty-state';
 import {
     CASCADE_STEP,
     DEFAULT_WINDOW_HEIGHT,
@@ -140,6 +141,68 @@ describe('zoom', () => {
         expect(clamp_zoom_level(Number.NaN)).toBe(0);
     });
 
+});
+
+describe('unsaved-edit indicator', () => {
+    const snapshot = (pendingEdits?: Record<string, string>) => ({
+        type: 'workbookSnapshot' as const,
+        snapshot: { state: pendingEdits ? { pendingEdits } : {} },
+    } as unknown as HostMessage);
+
+    it('reads a live draft, and its clearing, from the webview', () => {
+        expect(dirty_from_webview_message({
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'draft', base: 'a' } },
+            editSessionId: 's',
+        })).toBe(true);
+        // Saving posts null; an empty map means the same thing.
+        expect(dirty_from_webview_message({
+            type: 'pendingEditsChanged',
+            edits: null,
+            editSessionId: 's',
+        })).toBe(false);
+        expect(dirty_from_webview_message({
+            type: 'pendingEditsChanged',
+            edits: {},
+            editSessionId: 's',
+        })).toBe(false);
+    });
+
+    // A draft restored from a previous session arrives host → webview; the webview
+    // only echoes pendingEditsChanged once it is in edit mode with a session.
+    it('reads a restored draft from the granted session and the snapshot', () => {
+        expect(dirty_from_host_message({
+            type: 'editSessionResult',
+            requestId: 'r',
+            granted: true,
+            editSessionId: 's',
+            pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
+        })).toBe(true);
+        expect(dirty_from_host_message({
+            type: 'editSessionResult',
+            requestId: 'r',
+            granted: true,
+            editSessionId: 's',
+        })).toBe(false);
+        expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }))).toBe(true);
+        expect(dirty_from_host_message(snapshot())).toBe(false);
+    });
+
+    // undefined means "no information": the indicator must not flip on messages
+    // that simply do not mention pending edits.
+    it('says nothing about unrelated messages, or a refused session', () => {
+        expect(dirty_from_host_message({
+            type: 'editSessionResult',
+            requestId: 'r',
+            granted: false,
+        })).toBeUndefined();
+        expect(dirty_from_host_message({
+            type: 'fontChanged',
+            fontFamily: null,
+            fontSize: null,
+        })).toBeUndefined();
+        expect(dirty_from_webview_message({ type: 'ready' })).toBeUndefined();
+    });
 });
 
 describe('window geometry', () => {
