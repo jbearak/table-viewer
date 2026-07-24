@@ -171,6 +171,9 @@
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
+    "bundle:desktop": "node desktop/build.mjs",
+    "typecheck:desktop": "tsc -p desktop",
+    "desktop:dev": "npm run bundle:webview && npm run bundle:desktop && electron dist/desktop/main.js",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },
@@ -194,6 +197,7 @@
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.2",
+    "electron": "^38.4.0",
     "esbuild": "^0.28.1",
     "jsdom": "^29.0.1",
     "mocha": "^11.7.6",
