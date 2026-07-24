@@ -47,4 +47,4 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 ## State and settings
 
 - Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
-- Preferences: `userData/settings.json`, edited via the Preferences window (**Cmd+,**).
+- Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
