@@ -10,8 +10,16 @@ import {
     sanitize_settings,
     settings_file_path,
 } from '../main/desktop-config';
-import { clamp_zoom_level, zoom_factor } from '../main/zoom';
-import { BASE_TAB_BAR_HEIGHT, tab_bar_height } from '../shared/chrome';
+import { clamp_zoom_level } from '../main/zoom';
+import {
+    CASCADE_STEP,
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
+    MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+    fit_window_size,
+    next_window_bounds,
+} from '../main/window-geometry';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
 import { REQUIRED_THEME_VARIABLES, theme_css_variables, theme_payload } from '../main/theme';
 import {
@@ -19,6 +27,8 @@ import {
     VIEWER_SCRIPT_URL,
     VIEWER_STYLE_URL,
     build_desktop_viewer_html,
+    is_viewer_host,
+    viewer_url,
 } from '../main/viewer-html';
 import { node_file_system_port } from '../main/desktop-host-ports';
 import type { HostMessage, WebviewMessage } from '../../src/types';
@@ -67,6 +77,8 @@ describe('desktop-config', () => {
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
             maxStoredFiles: 2.9,
+            windowWidth: 'wide',
+            windowHeight: 10,
         })).toEqual({
             fontFamily: '',
             fontSize: DEFAULT_SETTINGS.fontSize,
@@ -74,6 +86,9 @@ describe('desktop-config', () => {
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
             maxStoredFiles: 2,
+            windowWidth: DEFAULT_SETTINGS.windowWidth,
+            // Below the usable minimum: raised, not taken literally.
+            windowHeight: MIN_WINDOW_HEIGHT,
         });
     });
 
@@ -125,22 +140,64 @@ describe('zoom', () => {
         expect(clamp_zoom_level(Number.NaN)).toBe(0);
     });
 
-    it('scales by 1.2 per level so the tab bar tracks the zoomed page', () => {
-        expect(zoom_factor(0)).toBe(1);
-        expect(zoom_factor(1)).toBeCloseTo(1.2);
-        expect(zoom_factor(-1)).toBeCloseTo(1 / 1.2);
-    });
 });
 
-describe('chrome metrics', () => {
-    it('keeps the stock tab bar height at the base font size', () => {
-        expect(tab_bar_height(13)).toBe(BASE_TAB_BAR_HEIGHT);
-        expect(tab_bar_height()).toBe(BASE_TAB_BAR_HEIGHT);
+describe('window geometry', () => {
+    const work_area = { x: 0, y: 0, width: 1920, height: 1080 };
+
+    it('centers the first window at the default size', () => {
+        expect(next_window_bounds(work_area, null, null)).toEqual({
+            x: (1920 - DEFAULT_WINDOW_WIDTH) / 2,
+            y: (1080 - DEFAULT_WINDOW_HEIGHT) / 2,
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+        });
     });
 
-    it('grows with the font size and never shrinks below the stock height', () => {
-        expect(tab_bar_height(20)).toBeGreaterThan(BASE_TAB_BAR_HEIGHT);
-        expect(tab_bar_height(8)).toBe(BASE_TAB_BAR_HEIGHT);
+    it('reopens at the remembered size', () => {
+        const bounds = next_window_bounds(work_area, { width: 900, height: 600 }, null);
+        expect([bounds.width, bounds.height]).toEqual([900, 600]);
+    });
+
+    it('cascades the next window down-right from the previous one', () => {
+        const previous = { x: 100, y: 80, width: 900, height: 600 };
+        const bounds = next_window_bounds(work_area, { width: 900, height: 600 }, previous);
+        expect([bounds.x, bounds.y])
+            .toEqual([100 + CASCADE_STEP, 80 + CASCADE_STEP]);
+    });
+
+    it('restarts the cascade instead of walking off the work area', () => {
+        const previous = { x: 1000, y: 470, width: 900, height: 600 };
+        const bounds = next_window_bounds(work_area, { width: 900, height: 600 }, previous);
+        expect([bounds.x, bounds.y]).toEqual([work_area.x, work_area.y]);
+    });
+
+    it('honors a work area that does not start at the origin', () => {
+        const dock = { x: 1920, y: 25, width: 1440, height: 875 };
+        const bounds = next_window_bounds(dock, { width: 5000, height: 5000 }, null);
+        expect(bounds).toEqual({ x: 1920, y: 25, width: 1440, height: 875 });
+    });
+
+    it('never sizes a window past the work area', () => {
+        expect(fit_window_size(work_area, { width: 4000, height: 3000 }))
+            .toEqual({ width: 1920, height: 1080 });
+        // A display smaller than the minimum: fill it rather than overhang.
+        expect(fit_window_size({ x: 0, y: 0, width: 320, height: 240 }, null))
+            .toEqual({ width: 320, height: 240 });
+    });
+
+    it('raises undersized and non-finite sizes to the usable minimum', () => {
+        expect(fit_window_size(work_area, { width: 10, height: 10 }))
+            .toEqual({ width: MIN_WINDOW_WIDTH, height: MIN_WINDOW_HEIGHT });
+        expect(fit_window_size(work_area, { width: Number.NaN, height: undefined }))
+            .toEqual({ width: DEFAULT_WINDOW_WIDTH, height: DEFAULT_WINDOW_HEIGHT });
+    });
+
+    it('keeps a window fully on screen even when placed near the edge', () => {
+        const previous = { x: 1000, y: 100, width: 400, height: 300 };
+        const bounds = next_window_bounds(work_area, { width: 1900, height: 1000 }, previous);
+        expect(bounds.x + bounds.width).toBeLessThanOrEqual(work_area.width);
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(work_area.height);
     });
 });
 
@@ -276,6 +333,18 @@ describe('viewer html', () => {
             `"${theme_css_variables('dark')['--vscode-editor-background']}"`,
         );
         expect(html).toContain('r.style.colorScheme = "dark"');
+    });
+
+    // Chromium keys zoom by origin, so viewer windows sharing one host would
+    // share their zoom level too — View → Zoom would move every window at once.
+    it('gives each window its own viewer host, and serves all of them', () => {
+        expect(viewer_url(1)).toBe('tv-app://viewer-1/index.html');
+        expect(viewer_url(2)).not.toBe(viewer_url(1));
+        expect(is_viewer_host('viewer-1')).toBe(true);
+        expect(is_viewer_host('viewer-42')).toBe(true);
+        expect(is_viewer_host('viewer')).toBe(true);
+        expect(is_viewer_host('webview')).toBe(false);
+        expect(is_viewer_host('viewer-evil.example.com')).toBe(false);
     });
 
     it('bootstraps every variable the webview consumes', () => {

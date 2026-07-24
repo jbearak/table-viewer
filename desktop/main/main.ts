@@ -2,6 +2,11 @@
 // Reuses the shared viewer controller, state store, and webview bundle from
 // the VS Code extension; only the shell (windows, menus, dialogs, protocol)
 // is desktop-specific.
+//
+// Each open file gets its own window (desktop/main/viewer-windows.ts), so
+// spreadsheets can be resized and placed side by side. With no file open the app
+// shows a small welcome window instead — the launcher for File → Open and
+// File → New Window.
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -19,26 +24,23 @@ import {
     json_state_file_path,
 } from '../../src/json-file-state-store';
 import { DesktopConfigStore, settings_file_path } from './desktop-config';
-import { TabManager } from './tabs';
+import { ViewerWindowManager } from './viewer-windows';
 import { theme_payload } from './theme';
 import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
-    VIEWER_HOST,
     WEBVIEW_HOST,
     build_desktop_viewer_html,
+    is_viewer_host,
 } from './viewer-html';
 import {
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
     CHANNEL_SETTINGS_CHANGED,
-    CHANNEL_SHELL_ACTIVATE_TAB,
-    CHANNEL_SHELL_CLOSE_TAB,
-    CHANNEL_SHELL_GET_TABS,
-    CHANNEL_SHELL_OPEN_FILES,
-    CHANNEL_SHELL_OPEN_PREFERENCES,
     CHANNEL_THEME_CHANGED,
+    CHANNEL_WELCOME_OPEN_FILES,
+    CHANNEL_WELCOME_OPEN_PREFERENCES,
 } from '../shared/ipc';
 
 const SUPPORTED_EXTENSIONS = ['csv', 'tsv', 'xlsx', 'xls'];
@@ -61,18 +63,17 @@ const DIST_DIR = path.join(__dirname, '..');
 const WEBVIEW_DIST_DIR = path.join(DIST_DIR, 'webview');
 const DESKTOP_DIST_DIR = path.join(DIST_DIR, 'desktop');
 const VIEWER_PRELOAD = path.join(DESKTOP_DIST_DIR, 'viewer-preload.js');
-const SHELL_PRELOAD = path.join(DESKTOP_DIST_DIR, 'shell-preload.js');
+const WELCOME_PRELOAD = path.join(DESKTOP_DIST_DIR, 'welcome-preload.js');
 const PREFS_PRELOAD = path.join(DESKTOP_DIST_DIR, 'prefs-preload.js');
 
 let config_store: DesktopConfigStore;
-let tab_manager: TabManager | undefined;
-let main_window: BrowserWindow | undefined;
+let viewer_windows: ViewerWindowManager | undefined;
 let prefs_window: BrowserWindow | undefined;
-/** Files requested before the app/window was ready. */
+/** Open launcher windows; tracked so opening a file can replace the one it was
+ *  launched from (a viewer window that opens a file keeps its own file). */
+const welcome_windows = new Set<BrowserWindow>();
+/** Files requested before the app was ready (macOS `open-file` fires early). */
 const pending_open_paths: string[] = [];
-/** One zoom level for the whole app: the tab bar and every tab view scale
- *  together instead of whichever webContents happens to be focused. */
-let zoom_level = 0;
 
 // The viewer page and the shared webview bundle are served from a privileged
 // custom scheme so the CSP model matches VS Code's webview loader (no file://).
@@ -90,7 +91,7 @@ function register_app_protocol(): void {
     ]);
     protocol.handle(APP_SCHEME, async (request) => {
         const url = new URL(request.url);
-        if (url.host === VIEWER_HOST) {
+        if (is_viewer_host(url.host)) {
             const config = config_store.config_port();
             const html = build_desktop_viewer_html(
                 config.font_family(),
@@ -120,78 +121,68 @@ function register_app_protocol(): void {
     });
 }
 
-function open_files(paths: string[]): void {
+/**
+ * Show each supported file in its own window. `source` is the window the request
+ * came from, if any: a welcome window is only a launcher, so it steps aside once
+ * it has produced a viewer window.
+ */
+function open_files(paths: string[], source?: BrowserWindow): void {
     const files = paths.filter(is_supported_file);
     if (files.length === 0) return;
-    if (!tab_manager) {
+    if (!viewer_windows) {
+        // Before app-ready there is no state store yet; replay once there is.
         pending_open_paths.push(...files);
-        if (app.isReady()) ensure_main_window();
         return;
     }
-    for (const file of files) tab_manager.open_file(file);
-    if (main_window) {
-        if (main_window.isMinimized()) main_window.restore();
-        main_window.show();
-    }
+    for (const file of files) viewer_windows.open_file(file);
+    if (source && welcome_windows.has(source) && !source.isDestroyed()) source.close();
 }
 
-/** Push the shared zoom level to the tab bar and every open tab view. */
-function apply_zoom_level(next: number): void {
-    zoom_level = clamp_zoom_level(next);
-    if (main_window && !main_window.isDestroyed()) {
-        main_window.webContents.setZoomLevel(zoom_level);
-    }
-    // TabManager also rescales the tab-bar strip, whose height is expressed in
-    // the (now zoomed) renderer's CSS pixels.
-    tab_manager?.set_zoom_level(zoom_level);
+/** Zoom the window a View-menu item fired for (per-window, like a browser). */
+function apply_zoom(delta: number | 'reset', window: Electron.BaseWindow | undefined): void {
+    const target = (window as BrowserWindow | undefined) ?? BrowserWindow.getFocusedWindow();
+    const contents = target?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    contents.setZoomLevel(
+        delta === 'reset' ? 0 : clamp_zoom_level(contents.getZoomLevel() + delta),
+    );
 }
 
-function ensure_main_window(): BrowserWindow {
-    if (main_window && !main_window.isDestroyed()) return main_window;
+/** The launcher shown with no file open, and by File → New Window. Several may
+ *  be open at once; each is independent. */
+function show_welcome_window(): BrowserWindow {
     const window = new BrowserWindow({
-        width: 1200,
-        height: 800,
-        minWidth: 480,
-        minHeight: 320,
+        width: 520,
+        height: 300,
+        resizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        title: 'Table Viewer',
         backgroundColor: nativeTheme.shouldUseDarkColors ? '#1e1e1e' : '#ffffff',
         webPreferences: {
-            preload: SHELL_PRELOAD,
+            preload: WELCOME_PRELOAD,
             contextIsolation: true,
             nodeIntegration: false,
         },
     });
-    main_window = window;
-    const state_store = create_json_file_state_store(
-        json_state_file_path(app.getPath('userData')),
-        () => config_store.settings().maxStoredFiles,
-    );
-    tab_manager = new TabManager(window, state_store, config_store, VIEWER_PRELOAD);
-    window.once('closed', () => {
-        if (main_window === window) {
-            main_window = undefined;
-            tab_manager = undefined;
-        }
-    });
-    void window.loadFile(path.join(DESKTOP_DIST_DIR, 'shell.html'));
-    window.webContents.once('did-finish-load', () => {
-        apply_zoom_level(zoom_level);
-        for (const file of pending_open_paths.splice(0)) {
-            tab_manager?.open_file(file);
-        }
-    });
+    welcome_windows.add(window);
+    window.once('closed', () => welcome_windows.delete(window));
+    void window.loadFile(path.join(DESKTOP_DIST_DIR, 'welcome.html'));
     return window;
 }
 
-async function show_open_dialog(): Promise<void> {
-    const window = ensure_main_window();
-    const { canceled, filePaths } = await dialog.showOpenDialog(window, {
+async function show_open_dialog(source?: BrowserWindow): Promise<void> {
+    const options: Electron.OpenDialogOptions = {
         properties: ['openFile', 'multiSelections'],
         filters: [
             { name: 'Tables', extensions: SUPPORTED_EXTENSIONS },
             { name: 'All Files', extensions: ['*'] },
         ],
-    });
-    if (!canceled) open_files(filePaths);
+    };
+    const { canceled, filePaths } = await (source && !source.isDestroyed()
+        ? dialog.showOpenDialog(source, options)
+        : dialog.showOpenDialog(options));
+    if (!canceled) open_files(filePaths, source);
 }
 
 function show_preferences_window(): void {
@@ -221,10 +212,10 @@ function show_preferences_window(): void {
 }
 
 /**
- * Copy / Select All. In the main window the active viewer tab decides what they
- * mean (its focused text field, else the grid). In any other window — today
- * that is Preferences, whose fields are ordinary text inputs — fall back to the
- * native editing command.
+ * Copy / Select All. In a viewer window the file's own view decides what they
+ * mean (its focused text field, else the grid). In any other window — the
+ * welcome window, or Preferences, whose fields are ordinary text inputs — fall
+ * back to the native editing command.
  *
  * The window Electron reports with the menu click is the routing signal;
  * sampling focus separately is racy and can silently drop the command.
@@ -233,10 +224,10 @@ function route_edit_command(
     command: 'copy' | 'selectAll',
     window: Electron.BaseWindow | undefined,
 ): void {
-    const target = window as BrowserWindow | undefined;
-    const is_main = !target || (!!main_window && target === main_window);
-    if (is_main && tab_manager?.send_edit_command(command)) return;
-    const contents = target?.webContents;
+    const target = (window as BrowserWindow | undefined) ?? BrowserWindow.getFocusedWindow();
+    if (!target) return;
+    if (viewer_windows?.send_edit_command(target, command)) return;
+    const contents = target.webContents;
     if (!contents || contents.isDestroyed()) return;
     if (command === 'copy') contents.copy();
     else contents.selectAll();
@@ -271,31 +262,20 @@ function build_menu(): void {
             label: 'File',
             submenu: [
                 {
+                    label: 'New Window',
+                    accelerator: 'CmdOrCtrl+N',
+                    click: () => void show_welcome_window(),
+                },
+                {
                     label: 'Open…',
                     accelerator: 'CmdOrCtrl+O',
-                    click: () => void show_open_dialog(),
+                    // Opens in a new window, so the window that asked keeps its
+                    // own file — except a welcome window, which it replaces.
+                    click: (_item, window) =>
+                        void show_open_dialog(window as BrowserWindow | undefined),
                 },
                 { type: 'separator' },
-                {
-                    label: 'Close Tab',
-                    accelerator: 'CmdOrCtrl+W',
-                    click: (_item, window) => {
-                        const focused = window as BrowserWindow | undefined;
-                        // From a secondary window (e.g. Preferences), close it.
-                        if (focused && focused !== main_window) {
-                            focused.close();
-                            return;
-                        }
-                        if (tab_manager?.close_active_tab()) return;
-                        focused?.close();
-                    },
-                },
-                {
-                    label: 'Close Window',
-                    accelerator: 'Shift+CmdOrCtrl+W',
-                    click: (_item, window) =>
-                        (window as BrowserWindow | undefined)?.close(),
-                },
+                { role: 'close' },
                 ...(is_mac
                     ? []
                     : [
@@ -342,19 +322,17 @@ function build_menu(): void {
                 { role: 'forceReload' },
                 { role: 'toggleDevTools' },
                 { type: 'separator' },
-                // Deliberately not the zoom roles: those act on the focused
-                // webContents only, which would scale the tab bar or the table
-                // in isolation.
+                // Deliberately not the zoom roles, which ignore the clamped
+                // range in zoom.ts.
                 {
                     label: 'Actual Size',
                     accelerator: 'CmdOrCtrl+0',
-                    click: () => apply_zoom_level(0),
+                    click: (_item, window) => apply_zoom('reset', window),
                 },
                 {
                     label: 'Zoom In',
                     accelerator: 'CmdOrCtrl+Plus',
-                    enabled: true,
-                    click: () => apply_zoom_level(zoom_level + 1),
+                    click: (_item, window) => apply_zoom(1, window),
                 },
                 // Hidden twin so the unshifted '=' key also zooms in (a menu
                 // item carries a single accelerator).
@@ -363,12 +341,12 @@ function build_menu(): void {
                     accelerator: 'CmdOrCtrl+=',
                     visible: false,
                     acceleratorWorksWhenHidden: true,
-                    click: () => apply_zoom_level(zoom_level + 1),
+                    click: (_item, window) => apply_zoom(1, window),
                 },
                 {
                     label: 'Zoom Out',
                     accelerator: 'CmdOrCtrl+-',
-                    click: () => apply_zoom_level(zoom_level - 1),
+                    click: (_item, window) => apply_zoom(-1, window),
                 },
                 { type: 'separator' },
                 { role: 'togglefullscreen' },
@@ -394,15 +372,10 @@ function register_ipc(): void {
     ipcMain.on(CHANNEL_GET_THEME, (event) => {
         event.returnValue = theme_payload(nativeTheme.shouldUseDarkColors);
     });
-    ipcMain.handle(CHANNEL_SHELL_GET_TABS, () => tab_manager?.tab_infos() ?? []);
-    ipcMain.on(CHANNEL_SHELL_ACTIVATE_TAB, (_event, tab_id: number) => {
-        if (typeof tab_id === 'number') tab_manager?.activate_tab(tab_id);
+    ipcMain.on(CHANNEL_WELCOME_OPEN_FILES, (event) => {
+        void show_open_dialog(BrowserWindow.fromWebContents(event.sender) ?? undefined);
     });
-    ipcMain.on(CHANNEL_SHELL_CLOSE_TAB, (_event, tab_id: number) => {
-        if (typeof tab_id === 'number') tab_manager?.close_tab(tab_id);
-    });
-    ipcMain.on(CHANNEL_SHELL_OPEN_FILES, () => void show_open_dialog());
-    ipcMain.on(CHANNEL_SHELL_OPEN_PREFERENCES, () => show_preferences_window());
+    ipcMain.on(CHANNEL_WELCOME_OPEN_PREFERENCES, () => show_preferences_window());
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
     ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => {
         return config_store.update(
@@ -411,17 +384,15 @@ function register_ipc(): void {
     });
 }
 
-/** Keep the app chrome (tab bar, Preferences window) on the configured font,
- *  matching how the extension's font settings style its entire UI. */
+/** Keep the app chrome (welcome and Preferences windows) on the configured
+ *  font, matching how the extension's font settings style its entire UI. */
 function watch_settings(): void {
-    config_store.on_change((previous, next) => {
+    config_store.on_change((_previous, next) => {
         for (const window of BrowserWindow.getAllWindows()) {
             if (!window.isDestroyed()) {
                 window.webContents.send(CHANNEL_SETTINGS_CHANGED, next);
             }
         }
-        // A larger font makes the tab bar taller, so the tab views move down.
-        if (previous.fontSize !== next.fontSize) tab_manager?.relayout();
     });
 }
 
@@ -440,12 +411,10 @@ if (!got_lock) {
     app.quit();
 } else {
     app.on('second-instance', (_event, argv, working_directory) => {
-        ensure_main_window();
-        open_files(file_args(argv.slice(1), working_directory));
-        if (main_window) {
-            if (main_window.isMinimized()) main_window.restore();
-            main_window.focus();
-        }
+        const files = file_args(argv.slice(1), working_directory);
+        // A second launch with no file behaves like File → New Window.
+        if (files.length === 0) show_welcome_window().focus();
+        else open_files(files);
     });
 
     // macOS: Finder "Open with", dock drops, and `open` deliver open-file
@@ -464,18 +433,33 @@ if (!got_lock) {
         watch_settings();
         build_menu();
         nativeTheme.on('updated', () => {
-            tab_manager?.broadcast_theme();
             const payload = theme_payload(nativeTheme.shouldUseDarkColors);
+            viewer_windows?.apply_theme(payload);
             for (const window of BrowserWindow.getAllWindows()) {
                 window.webContents.send(CHANNEL_THEME_CHANGED, payload);
             }
         });
-        ensure_main_window();
-        open_files(file_args(process.argv.slice(app.isPackaged ? 1 : 2)));
+        viewer_windows = new ViewerWindowManager(
+            create_json_file_state_store(
+                json_state_file_path(app.getPath('userData')),
+                () => config_store.settings().maxStoredFiles,
+            ),
+            config_store,
+            VIEWER_PRELOAD,
+        );
+        const files = [
+            ...pending_open_paths.splice(0),
+            ...file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
+        ];
+        if (files.length > 0) open_files(files);
+        else show_welcome_window();
     });
 
+    // macOS dock click with nothing left on screen.
     app.on('activate', () => {
-        if (app.isReady()) ensure_main_window();
+        if (app.isReady() && BrowserWindow.getAllWindows().length === 0) {
+            show_welcome_window();
+        }
     });
 
     app.on('window-all-closed', () => {

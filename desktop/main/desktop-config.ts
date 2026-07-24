@@ -5,6 +5,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { ConfigPort, Disposable } from '../../src/host-ports';
+import {
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
+    MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+} from './window-geometry';
 
 export const SETTINGS_FILE_NAME = 'settings.v1.json';
 
@@ -15,12 +21,16 @@ export function settings_file_path(user_data_dir: string): string {
 export interface DesktopSettings {
     /** Empty string means "use the theme default font". */
     fontFamily: string;
-    /** Font size in px, applied to the whole app (tab bar, viewer, prefs). */
+    /** Font size in px, applied to the whole app (viewer windows, welcome, prefs). */
     fontSize: number;
     tabOrientation: 'horizontal' | 'vertical';
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
+    /** Size the last closed viewer window had, so the next one opens like it.
+     *  Written by the app, not the Preferences window. */
+    windowWidth: number;
+    windowHeight: number;
 }
 
 /** Smallest / largest usable app font size; the prefs input clamps to these. */
@@ -38,6 +48,8 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
     maxStoredFiles: 10_000,
+    windowWidth: DEFAULT_WINDOW_WIDTH,
+    windowHeight: DEFAULT_WINDOW_HEIGHT,
 });
 
 function sanitize_number(value: unknown, fallback: number, minimum: number): number {
@@ -67,6 +79,16 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),
         maxStoredFiles: Math.floor(sanitize_number(record.maxStoredFiles, DEFAULT_SETTINGS.maxStoredFiles, 1)),
+        windowWidth: Math.round(sanitize_number(
+            record.windowWidth,
+            DEFAULT_WINDOW_WIDTH,
+            MIN_WINDOW_WIDTH,
+        )),
+        windowHeight: Math.round(sanitize_number(
+            record.windowHeight,
+            DEFAULT_WINDOW_HEIGHT,
+            MIN_WINDOW_HEIGHT,
+        )),
     };
 }
 
