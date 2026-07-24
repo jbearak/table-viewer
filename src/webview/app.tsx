@@ -81,7 +81,8 @@ import {
     show_all_columns,
     toggle_source_column,
 } from './column-projection';
-import { vscode_api, use_state_sync } from './use-state-sync';
+import { use_state_sync } from './use-state-sync';
+import { host_bridge } from './host-bridge';
 import { apply_font_family } from './vscode-theme';
 import './styles.css';
 
@@ -388,7 +389,7 @@ export function App(): React.JSX.Element {
             );
             return next;
         });
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'setTransform',
             sheetIndex: sheet_index,
             state,
@@ -402,7 +403,7 @@ export function App(): React.JSX.Element {
     const release_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
         pending_save_dialog_ref.current = null;
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'releaseEditSession',
             editSessionId: csv_edit_session_id,
         });
@@ -417,7 +418,7 @@ export function App(): React.JSX.Element {
         if (!csv_edit_session_id) return;
         pending_save_dialog_ref.current = null;
         set_edit_mode(false);
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
         });
@@ -574,7 +575,7 @@ export function App(): React.JSX.Element {
                     if (matching_request) {
                         if (msg.error) {
                             set_highlight_status(msg.error);
-                            vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                            host_bridge.postMessage({ type: 'showWarning', message: msg.error });
                         } else {
                             set_highlight_status('Cell highlights updated.');
                         }
@@ -589,7 +590,7 @@ export function App(): React.JSX.Element {
                 set_cell_highlights(msg.state);
                 if (msg.error) {
                     set_highlight_status(msg.error);
-                    vscode_api.postMessage({ type: 'showWarning', message: msg.error });
+                    host_bridge.postMessage({ type: 'showWarning', message: msg.error });
                 } else {
                     set_highlight_status(msg.requestId ? 'Cell highlights updated.' : 'Cell highlights refreshed.');
                 }
@@ -688,7 +689,7 @@ export function App(): React.JSX.Element {
                             ? 'Header row was not updated.'
                             : 'Column names were not updated.');
                         if (result.error) {
-                            vscode_api.postMessage({
+                            host_bridge.postMessage({
                                 type: 'showWarning',
                                 message: restoring_rows
                                     ? `Could not restore rows: ${result.error}`
@@ -704,7 +705,7 @@ export function App(): React.JSX.Element {
                                 : 'Column names were updated, but recovery was required.',
                         );
                         if (result.error) {
-                            vscode_api.postMessage({
+                            host_bridge.postMessage({
                                 type: 'showWarning',
                                 message: restoring_rows
                                     ? `The rows were restored after recovery: ${result.error}`
@@ -992,14 +993,14 @@ export function App(): React.JSX.Element {
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
-                    vscode_api.postMessage({
+                    host_bridge.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
                         disposition,
                     });
                     if (correction_required) persist_immediate();
                 } else {
-                    vscode_api.postMessage({
+                    host_bridge.postMessage({
                         type: 'snapshotApplied',
                         identity: snapshot.identity,
                         disposition,
@@ -1088,7 +1089,7 @@ export function App(): React.JSX.Element {
                     return next;
                 });
                 if (msg.error) {
-                    vscode_api.postMessage({
+                    host_bridge.postMessage({
                         type: 'showWarning',
                         message: `Could not update the table view: ${msg.error}`,
                     });
@@ -1198,7 +1199,7 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, toolbar_focus_restore]);
 
     useEffect(() => {
-        vscode_api.postMessage({ type: 'ready' });
+        host_bridge.postMessage({ type: 'ready' });
         return () => {
             release_edit_session();
         };
@@ -1325,7 +1326,7 @@ export function App(): React.JSX.Element {
                 ? 'Making row header…'
                 : 'Updating column names…',
         );
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'setExcelFirstRowHeader',
             sheetIndex: active_sheet_index,
             sheetName: sheet.name,
@@ -1355,7 +1356,7 @@ export function App(): React.JSX.Element {
                 transform_is_active(transforms[active_sheet_index])
                 || pending_transforms[active_sheet_index]
             ) {
-                vscode_api.postMessage({
+                host_bridge.postMessage({
                     type: 'showWarning',
                     message: 'Clear sorting, filters, and hidden rows before entering edit mode.',
                 });
@@ -1368,7 +1369,7 @@ export function App(): React.JSX.Element {
                 ++edit_request_seq_ref.current,
             ].join(':');
             pending_edit_request_ref.current = request_id;
-            vscode_api.postMessage({
+            host_bridge.postMessage({
                 type: 'requestEditSession',
                 requestId: request_id,
             });
@@ -1387,7 +1388,7 @@ export function App(): React.JSX.Element {
                 editSessionId: csv_edit_session_id,
             };
             pending_save_dialog_ref.current = request;
-            vscode_api.postMessage({ type: 'showSaveDialog', ...request });
+            host_bridge.postMessage({ type: 'showSaveDialog', ...request });
             return;
         }
         leave_edit_mode();
@@ -1473,7 +1474,7 @@ export function App(): React.JSX.Element {
             next[active_sheet_index] = 'Hiding rows…';
             return next;
         });
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'hideRows',
             sheetIndex: active_sheet_index,
             displayRows: display_rows,
@@ -1586,7 +1587,7 @@ export function App(): React.JSX.Element {
         };
         pending_histogram_ref.current = pending;
         set_filter_histogram({ key, value: { status: 'loading' } });
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'requestFilterHistogram',
             sheetIndex: sheet_index,
             columnIndex: column_index,
@@ -1597,7 +1598,7 @@ export function App(): React.JSX.Element {
         return () => {
             if (pending_histogram_ref.current !== pending) return;
             pending_histogram_ref.current = null;
-            vscode_api.postMessage({
+            host_bridge.postMessage({
                 type: 'cancelFilterHistogram',
                 requestId: request_id,
             });
@@ -1780,7 +1781,7 @@ export function App(): React.JSX.Element {
         pending_highlight_request_ref.current = request_id;
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'applyCellHighlights',
             requestId: request_id,
             sheetIndex: active_sheet_index,
@@ -1808,7 +1809,7 @@ export function App(): React.JSX.Element {
         pending_highlight_request_ref.current = request_id;
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'clearAllCellHighlights',
             requestId: request_id,
             generation: generation_ref.current,
@@ -1890,7 +1891,7 @@ export function App(): React.JSX.Element {
             columnVisibility: next_visibility,
         };
         set_column_visibility(next_visibility);
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'setColumnVisibility',
             sheetIndex: active_sheet_index,
             sheetName: sheet.name,
