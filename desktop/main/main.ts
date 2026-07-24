@@ -313,6 +313,14 @@ function register_ipc(): void {
 
 // --- app lifecycle ----------------------------------------------------------
 
+// Test hook: the Playwright smoke test points userData at a temp directory so
+// runs are isolated (state store, settings, and the single-instance lock all
+// live under userData).
+const custom_user_data = process.env.TABLE_VIEWER_USER_DATA_DIR;
+if (custom_user_data) {
+    app.setPath('userData', path.resolve(custom_user_data));
+}
+
 const got_lock = app.requestSingleInstanceLock();
 if (!got_lock) {
     app.quit();

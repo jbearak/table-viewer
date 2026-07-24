@@ -6,6 +6,7 @@ import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
     RenderedCell,
+    WorkbookMeta,
 } from './data-source/interface';
 import {
     InvalidPersistedTransformError,

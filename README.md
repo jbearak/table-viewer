@@ -118,6 +118,31 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `t
 | `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
 | `tableViewer.maxFileSizeMiB` | `256` | Maximum file size in MiB. Applies to all supported file types. |
 
+## Standalone desktop app (experimental)
+
+Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
+
+**In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), a multi-tab window, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, and font/tab-orientation preferences.
+
+**Out of scope for v1:** the CSV side-by-side text preview with scroll sync, VS Code remote filesystems, extension commands/menus, signed/notarized builds and auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
+
+## Development
+
+Clone the repo and run `npm install`. If your npm configuration blocks install scripts (e.g. an allow-scripts policy), the `electron` binary download is skipped — approve/run it manually with `node node_modules/electron/install.js`.
+
+**VS Code extension** (unchanged flow):
+
+- `npm run bundle && npm run bundle:webview` — build the extension and webview bundles
+- `npm test` — vitest unit tests
+- `npm run test:integration` — VS Code Extension Host integration tests
+- `npm run package` — build the `.vsix` with vsce
+
+**Desktop app:**
+
+- `npm run desktop:dev` — build the bundles and launch the app with Electron
+- `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
+- `npm run test:desktop-smoke` — Playwright Electron smoke test (separate from the vitest suite)
+
 ## License
 
 [GPL-3.0](LICENSE)

@@ -1,19 +1,37 @@
 # electron-builder configuration for the standalone Table Viewer app.
 #
-# Packaging (unsigned macOS DMG first) ships in a follow-up PR; this file
-# exists now so the file-association metadata is versioned with the shell.
-# Build with: npx electron-builder --config desktop/electron-builder.yml
+# v1 ships unsigned local macOS builds only (no signing, notarization, or
+# auto-update). Build with: npm run desktop:package (dmg + zip) or
+# npm run desktop:package:dir (unpacked .app for quick local verification).
 appId: com.jbearak.table-viewer
 productName: Table Viewer
 directories:
   output: dist/desktop-packages
+# The desktop bundles are self-contained (esbuild); no node_modules ship.
 files:
   - dist/desktop/**
+  - '!dist/desktop/*.map'
+  - '!dist/desktop/THIRD_PARTY_NOTICES.txt'
   - dist/webview/**
   - package.json
   - LICENSE
+  - '!node_modules/**'
+# License notices for the GPL-3.0 app: our own LICENSE, the generated npm
+# third-party attribution (desktop/collect-licenses.mjs), and Electron's own
+# license + Chromium third-party notices from the electron dist.
+extraResources:
+  - from: LICENSE
+    to: LICENSE.txt
+  - from: dist/desktop/THIRD_PARTY_NOTICES.txt
+    to: THIRD_PARTY_NOTICES.txt
+  - from: node_modules/electron/dist/LICENSE
+    to: LICENSE.electron.txt
+  - from: node_modules/electron/dist/LICENSES.chromium.html
+    to: LICENSES.chromium.html
 extraMetadata:
   main: dist/desktop/main.js
+# Nothing native to rebuild (bundles are pure JS); skip the npm rebuild step.
+npmRebuild: false
 # Declare the app as *a* handler for table files so it appears in
 # Finder/Explorer "Open with…" menus. role/rank deliberately avoid claiming
 # OS default-handler status.
@@ -42,3 +60,9 @@ mac:
   category: public.app-category.productivity
   # v1 ships unsigned local builds (no notarization / auto-update yet).
   identity: null
+  target:
+    - dmg
+    - zip
+dmg:
+  # Unsigned build: skip dmg code signing too.
+  sign: false

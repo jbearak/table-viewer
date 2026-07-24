@@ -11,5 +11,5 @@
     "rootDir": "..",
     "outDir": "../dist/desktop-tsc"
   },
-  "include": ["main/**/*", "preload/**/*", "renderer/**/*", "shared/**/*", "test/**/*"]
+  "include": ["main/**/*", "preload/**/*", "renderer/**/*", "shared/**/*", "test/**/*", "test-smoke/**/*"]
 }

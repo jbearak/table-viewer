@@ -11,3 +11,4 @@ docs/**
 .github/**
 scripts/**
 vitest.config.ts
+test-results/**
