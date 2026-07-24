@@ -5,7 +5,8 @@ import { attach_viewer, build_csv_source, type ViewerProfile } from './viewer-co
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
 import type { AuthorityFileStateStore } from './state';
 import type { WebviewMessage } from './types';
-import { build_webview_html, generate_nonce } from './webview-html';
+import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
+import { generate_nonce } from './webview-html';
 
 const SCROLL_LOCKOUT_MS = 150;
 
@@ -58,7 +59,7 @@ export function show_csv_preview(
     );
 
     const nonce = generate_nonce();
-    panel.webview.html = build_webview_html(panel.webview, extension_uri, nonce);
+    panel.webview.html = build_vscode_webview_html(panel.webview, extension_uri, nonce);
 
     const cleanup = setup_preview(panel, uri, extension_uri, state_store, false);
 
@@ -175,7 +176,11 @@ function setup_preview(
     const profile: ViewerProfile = {
         editing: false,
         previewMode: true,
-        build_source: build_csv_source,
+        build_source: (raw, file_path) => build_csv_source(
+            raw,
+            file_path,
+            vscode_viewer_host.config.csv_max_rows(),
+        ),
         on_source_adopted(ds) {
             line_map = (ds as CsvDataSource).lineMap();
         },
@@ -215,7 +220,7 @@ function setup_preview(
 
     // Attach the shared controller (owns the `ready` handshake, watcher, reload
     // guard, and core dispatch; forwards visibleRowChanged to profile.on_message).
-    disposables.push(attach_viewer(panel, uri, state_store, profile));
+    disposables.push(attach_viewer(panel, uri, state_store, profile, vscode_viewer_host));
 
     // When reusing an existing panel for a different file, rebuild the webview
     // HTML rather than messaging the live (stale) one. This clears the previous
@@ -223,7 +228,7 @@ function setup_preview(
     // which the just-attached controller handles. Attach BEFORE this rebuild so
     // the fresh 'ready' is delivered to the new controller.
     if (reusing) {
-        panel.webview.html = build_webview_html(
+        panel.webview.html = build_vscode_webview_html(
             panel.webview, extension_uri, generate_nonce()
         );
     }

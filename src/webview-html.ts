@@ -1,25 +1,24 @@
 import * as crypto from 'crypto';
-import * as vscode from 'vscode';
-import { get_font_family } from './viewer-config';
 
 export function generate_nonce(): string {
     return crypto.randomBytes(16).toString('hex');
 }
 
+/** Host-agnostic asset locations for the viewer shell. The VS Code host
+ *  derives these from webview.asWebviewUri/cspSource (vscode-host-ports.ts);
+ *  other hosts can pass any URLs their loader serves. */
+export interface WebviewHtmlAssets {
+    readonly scriptUrl: string;
+    readonly styleUrl: string;
+    /** Source expression for style/img/font CSP directives. */
+    readonly cspSource: string;
+}
+
 export function build_webview_html(
-    webview: vscode.Webview,
-    extension_uri: vscode.Uri,
+    assets: WebviewHtmlAssets,
     nonce: string,
-    font_family: string | null = get_font_family(),
+    font_family: string | null = null,
 ): string {
-    const js_uri = webview.asWebviewUri(
-        vscode.Uri.joinPath(
-            extension_uri,
-            'dist',
-            'webview',
-            'index.js'
-        )
-    );
     const font_bootstrap = font_family
         ? `<script nonce="${nonce}">document.documentElement.style.setProperty('--table-viewer-font-family', ${
             JSON.stringify(font_family)
@@ -30,14 +29,6 @@ export function build_webview_html(
                 .replaceAll('\u2029', '\\u2029')
         });</script>\n`
         : '';
-    const css_uri = webview.asWebviewUri(
-        vscode.Uri.joinPath(
-            extension_uri,
-            'dist',
-            'webview',
-            'index.css'
-        )
-    );
 
     // Content-Security-Policy for the Glide DataEditor.
     //
@@ -62,16 +53,16 @@ export function build_webview_html(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none';
-               style-src ${webview.cspSource};
-               img-src ${webview.cspSource} data: blob:;
+               style-src ${assets.cspSource};
+               img-src ${assets.cspSource} data: blob:;
                script-src 'nonce-${nonce}';
-               font-src ${webview.cspSource};">
+               font-src ${assets.cspSource};">
 <title>Table Viewer</title>
-${font_bootstrap}<link nonce="${nonce}" rel="stylesheet" href="${css_uri}">
+${font_bootstrap}<link nonce="${nonce}" rel="stylesheet" href="${assets.styleUrl}">
 </head>
 <body>
 <div id="root"></div>
-<script nonce="${nonce}" src="${js_uri}"></script>
+<script nonce="${nonce}" src="${assets.scriptUrl}"></script>
 <!-- Glide's DataEditor portals its cell-overlay editor into an element with
      id="portal"; without it getElementById("portal") returns null and the
      editor silently never mounts (the Edit toggle flips but nothing edits).

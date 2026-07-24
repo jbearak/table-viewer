@@ -1,5 +1,4 @@
 import { createHash } from 'crypto';
-import * as vscode from 'vscode';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
 import { CsvDataSource } from './data-source/csv-source';
@@ -18,12 +17,12 @@ import {
 } from './panel-core';
 import { PanelSession, type PanelAdoption } from './panel-session';
 import {
-    get_csv_max_rows,
-    get_default_orientation,
     get_delimiter,
-    get_font_family,
-    get_max_file_size_mib,
-} from './viewer-config';
+    type ConfigPort,
+    type Disposable,
+    type ViewerHost,
+} from './host-ports';
+import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import type {
@@ -48,7 +47,6 @@ import {
     type FileRefreshSubscriberResult,
     type PhysicalAuthorityCommitReceipt,
 } from './file-coordinator';
-import { vscode_file_refresh_watcher_factory } from './vscode-file-refresh-watcher';
 import { reconcile_finalization } from './finalization-reconciliation';
 import { SourceCandidate } from './source-candidate';
 import {
@@ -90,7 +88,7 @@ import {
  *  satisfy it; html is set by the host before attaching. */
 export interface ViewerHostPanel extends PanelLike {
     webview: PanelLike['webview'] & {
-        onDidReceiveMessage(handler: (msg: WebviewMessage) => unknown): vscode.Disposable;
+        onDidReceiveMessage(handler: (msg: WebviewMessage) => unknown): Disposable;
     };
 }
 
@@ -268,9 +266,15 @@ function excel_profile(): ViewerProfile {
     };
 }
 
-/** Build the editable CSV/TSV DataSource shared by the table and preview hosts. */
-export function build_csv_source(raw: Uint8Array, file_path: string): Promise<CsvDataSource> {
-    const max_rows = Math.min(get_csv_max_rows(), MAX_CSV_ROWS);
+/** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
+ *  `csv_max_rows` comes from the host's ConfigPort; it is clamped to the hard
+ *  safety cap either way. */
+export function build_csv_source(
+    raw: Uint8Array,
+    file_path: string,
+    csv_max_rows: number = MAX_CSV_ROWS,
+): Promise<CsvDataSource> {
+    const max_rows = Math.min(csv_max_rows, MAX_CSV_ROWS);
     // CSV/TSV files conventionally carry column names in their first row, so the
     // grid promotes it to the column header rather than showing letters.
     return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
@@ -278,18 +282,19 @@ export function build_csv_source(raw: Uint8Array, file_path: string): Promise<Cs
     });
 }
 
-export function csv_table_profile(): ViewerProfile {
+export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
-        build_source: build_csv_source,
+        build_source: (raw, file_path) =>
+            build_csv_source(raw, file_path, config?.csv_max_rows()),
     };
 }
 
-/** Profile for a uri, by extension: csv/tsv → editable table; else Excel viewer. */
-export function profile_for(uri: vscode.Uri): ViewerProfile {
-    const ext = uri.fsPath.toLowerCase();
+/** Profile for a path, by extension: csv/tsv → editable table; else Excel viewer. */
+export function profile_for(file_path: string, config?: ConfigPort): ViewerProfile {
+    const ext = file_path.toLowerCase();
     return ext.endsWith('.csv') || ext.endsWith('.tsv')
-        ? csv_table_profile()
+        ? csv_table_profile(config)
         : excel_profile();
 }
 
@@ -298,19 +303,22 @@ export function profile_for(uri: vscode.Uri): ViewerProfile {
  * directory watcher with a monotonic guard, paginated row serving (via the
  * core), and — for editing profiles — save/conflict/pending-edit handling.
  * Returns a Disposable that tears everything down. The host sets webview html
- * and options before calling this.
+ * and options before calling this, and injects its port implementations via
+ * `host` (the extension passes `vscode_viewer_host`).
  */
 export function attach_viewer(
     panel: ViewerHostPanel,
-    uri: vscode.Uri,
+    resource: ResourceUriLike | string,
     state_store: AuthorityFileStateStore,
     profile: ViewerProfile,
-): vscode.Disposable {
+    host: ViewerHost,
+): Disposable {
+    const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
     // VS Code may make panel.webview throw as soon as the panel is disposed.
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
-    const disposables: vscode.Disposable[] = [];
+    const disposables: Disposable[] = [];
     const durable_state_store = state_store;
     const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
     const state_path = file_coordinator.statePath;
@@ -423,7 +431,7 @@ export function attach_viewer(
                         ? adoption.receipt.resultingBasis.physicalRevision
                         : adoption.authority.physicalRevision);
                 if (file_coordinator.mark_warning_seen(`${basis}:${index}:${warning}`)) {
-                    void vscode.window.showWarningMessage(warning);
+                    host.ui.show_warning(warning);
                 }
             }
         },
@@ -481,11 +489,10 @@ export function attach_viewer(
     };
 
     try {
-        disposables.push(vscode.workspace.onDidChangeConfiguration((event) => {
-            if (!event.affectsConfiguration('tableViewer.fontFamily')) return;
+        disposables.push(host.config.on_font_family_change(() => {
             void post_to_receiver({
                 type: 'fontFamilyChanged',
-                fontFamily: get_font_family(),
+                fontFamily: host.config.font_family(),
             });
         }));
     } catch (error) {
@@ -512,7 +519,7 @@ export function attach_viewer(
         try {
             return file_coordinator.subscribe_refresh(
                 refresh_from_event,
-                vscode_file_refresh_watcher_factory,
+                host.refreshWatcherFactory,
             );
         } catch (error) {
             return abort_setup(error);
@@ -1393,10 +1400,10 @@ export function attach_viewer(
 
     async function build_source(): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
-        const stat = await vscode.workspace.fs.stat(uri);
-        const max_mib = get_max_file_size_mib();
+        const stat = await host.fs.stat(uri);
+        const max_mib = host.config.max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
-        const raw = await vscode.workspace.fs.readFile(uri);
+        const raw = await host.fs.read_file(uri);
         assert_safe_file_size(raw.byteLength, max_mib);
         const observation = {
             fingerprint: `${stat.mtime}:${stat.size}`,
@@ -1415,15 +1422,15 @@ export function attach_viewer(
     ): Promise<boolean> {
         if (!load_is_current(seq, refresh_event)) return false;
         const { fingerprint, digest } = candidate.observation;
-        const stat = await vscode.workspace.fs.stat(uri);
+        const stat = await host.fs.stat(uri);
         if (
             !load_is_current(seq, refresh_event)
             || `${stat.mtime}:${stat.size}` !== fingerprint
         ) {
             return false;
         }
-        const raw = await vscode.workspace.fs.readFile(uri);
-        const verified_stat = await vscode.workspace.fs.stat(uri);
+        const raw = await host.fs.read_file(uri);
+        const verified_stat = await host.fs.stat(uri);
         return load_is_current(seq, refresh_event)
             && `${verified_stat.mtime}:${verified_stat.size}` === fingerprint
             && content_digest(raw) === digest;
@@ -1703,7 +1710,7 @@ export function attach_viewer(
                         reason,
                         project: () => ({
                             configuration: {
-                                defaultTabOrientation: get_default_orientation(),
+                                defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
                             },
                             capabilities: {
@@ -1851,7 +1858,7 @@ export function attach_viewer(
                                 reason: 'excelHeader',
                                 project: () => ({
                                     configuration: {
-                                        defaultTabOrientation: get_default_orientation(),
+                                        defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
                                     },
                                     capabilities: {
@@ -2062,17 +2069,17 @@ export function attach_viewer(
         post_save = false,
     ): void {
         if (initial) {
-            void vscode.window.showErrorMessage(
+            host.ui.show_error(
                 error instanceof Error ? error.message : String(error));
             return;
         }
         console.error('Failed to reload table viewer data', error);
         const message = `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
         if (post_save) {
-            void vscode.window.showWarningMessage(
+            host.ui.show_warning(
                 `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
         } else {
-            void vscode.window.showErrorMessage(message);
+            host.ui.show_error(message);
         }
     }
 
@@ -2379,11 +2386,11 @@ export function attach_viewer(
     // warning or error for an editor the user already closed is a spurious effect.
     function show_owner_warning(message: string): void {
         if (disposed) return;
-        void vscode.window.showWarningMessage(message);
+        host.ui.show_warning(message);
     }
     function show_owner_error(message: string): void {
         if (disposed) return;
-        void vscode.window.showErrorMessage(message);
+        host.ui.show_error(message);
     }
 
     function finish_save_failure(
@@ -2525,16 +2532,16 @@ export function attach_viewer(
             await persist_accepted_save(operation);
             operation.phase = 'accepted';
 
-            const current_stat = await vscode.workspace.fs.stat(uri);
+            const current_stat = await host.fs.stat(uri);
             if (!save_operation_is_current(operation)) return;
-            const max_mib = get_max_file_size_mib();
+            const max_mib = host.config.max_file_size_mib();
             assert_safe_file_size(current_stat.size, max_mib);
 
-            const current_raw = await vscode.workspace.fs.readFile(uri);
+            const current_raw = await host.fs.read_file(uri);
             if (!save_operation_is_current(operation)) return;
             assert_safe_file_size(current_raw.byteLength, max_mib);
 
-            const verified_stat = await vscode.workspace.fs.stat(uri);
+            const verified_stat = await host.fs.stat(uri);
             if (!save_operation_is_current(operation)) return;
             const snapshot_changed = current_stat.mtime !== verified_stat.mtime
                 || current_stat.size !== verified_stat.size;
@@ -2559,7 +2566,7 @@ export function attach_viewer(
             operation.phase = 'writing';
             // Once this call starts, release/discard/disposal cannot transfer the
             // edit epoch until durable completion and cleanup ownership transfer.
-            await vscode.workspace.fs.writeFile(uri, saved_bytes);
+            await host.fs.write_file(uri, saved_bytes);
 
             // The watcher is reserved across this write and CAS so the state
             // rebase commits against the same save authority.
@@ -2792,7 +2799,7 @@ export function attach_viewer(
                 // replay without delaying the existing ready-state concurrency.
                 void post_to_receiver({
                     type: 'fontFamilyChanged',
-                    fontFamily: get_font_family(),
+                    fontFamily: host.config.font_family(),
                 }, begun.receiverEpoch);
                 let needs_initial_source = false;
                 try {
@@ -3519,7 +3526,7 @@ export function attach_viewer(
                 }
                 return;
             case 'showWarning':
-                vscode.window.showWarningMessage(msg.message);
+                host.ui.show_warning(msg.message);
                 return;
             case 'saveCsv':
                 if (profile.editing) await handle_save(msg.operation);
@@ -3570,8 +3577,7 @@ export function attach_viewer(
                     editSessionId: msg.editSessionId,
                 } as const;
                 active_save_dialog_request = request;
-                const choice = await vscode.window.showWarningMessage(
-                    'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
+                const choice = await host.ui.show_save_discard_dialog();
                 if (
                     active_save_dialog_request !== request
                     || !receiver_request_is_current(request)
@@ -3582,7 +3588,7 @@ export function attach_viewer(
                     type: 'saveDialogResult',
                     requestId: request.requestId,
                     editSessionId: request.editSessionId,
-                    choice: choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel',
+                    choice,
                 }, request.receiverEpoch);
                 return;
             }

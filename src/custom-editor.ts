@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { attach_viewer, profile_for } from './viewer-controller';
 import type { AuthorityFileStateStore } from './state';
-import { build_webview_html, generate_nonce } from './webview-html';
+import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
+import { generate_nonce } from './webview-html';
 
 const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
@@ -33,11 +34,16 @@ export class TableViewerEditorProvider
                 vscode.Uri.joinPath(this.extension_uri, 'dist', 'webview'),
             ],
         };
-        webview_panel.webview.html = build_webview_html(
+        webview_panel.webview.html = build_vscode_webview_html(
             webview_panel.webview, this.extension_uri, generate_nonce());
 
         const controller = attach_viewer(
-            webview_panel, document.uri, this.state_store, profile_for(document.uri));
+            webview_panel,
+            document.uri,
+            this.state_store,
+            profile_for(document.uri.fsPath, vscode_viewer_host.config),
+            vscode_viewer_host,
+        );
         webview_panel.onDidDispose(() => controller.dispose());
     }
 }

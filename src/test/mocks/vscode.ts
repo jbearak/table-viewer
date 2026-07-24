@@ -429,8 +429,12 @@ export const window = {
         panels.push(panel);
         return panel;
     },
-    showErrorMessage() {},
-    showWarningMessage() {},
+    showErrorMessage(..._args: unknown[]): unknown {
+        return undefined;
+    },
+    showWarningMessage(..._args: unknown[]): unknown {
+        return undefined;
+    },
     onDidChangeTextEditorVisibleRanges() {
         return disposable();
     },
