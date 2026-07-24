@@ -36,11 +36,13 @@ export interface HostUiPort {
 /** Viewer configuration reads (replaces direct viewer-config/vscode reads). */
 export interface ConfigPort {
     font_family(): string | null;
+    /** Font size in px, or null to inherit the host's editor font size. */
+    font_size(): number | null;
     max_file_size_mib(): number;
     csv_max_rows(): number;
     default_tab_orientation(): 'horizontal' | 'vertical';
-    /** Fires whenever the configured font family may have changed. */
-    on_font_family_change(listener: () => void): Disposable;
+    /** Fires whenever the configured font (family or size) may have changed. */
+    on_font_change(listener: () => void): Disposable;
 }
 
 /** Everything host-specific the shared controller needs, injected at attach. */

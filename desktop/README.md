@@ -43,3 +43,9 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 
 - Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
+
+The font family and font size preferences style the whole app — tab bar, table views, and the Preferences window itself — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs default to a vertical orientation.
+
+## Zoom
+
+The main window is several `webContents`: the tab-bar renderer plus one `WebContentsView` per open file. Electron's stock zoom roles act on whichever one has focus, which would scale the tab bar or the table in isolation, so **View → Zoom In / Zoom Out / Actual Size** (`Cmd/Ctrl` with `+`, `-`, `0`) instead drive one shared zoom level in `desktop/main/zoom.ts`, applied to every `webContents` at once. Tab-bar height is expressed in the renderer's CSS pixels, so `TabManager` scales the per-tab view bounds by the same factor.

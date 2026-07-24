@@ -14,20 +14,39 @@ export interface WebviewHtmlAssets {
     readonly cspSource: string;
 }
 
+/** JSON string literal that is safe to inline inside a <script> element. */
+function script_literal(value: string): string {
+    return JSON.stringify(value)
+        .replaceAll('<', '\\u003c')
+        .replaceAll('>', '\\u003e')
+        .replaceAll('&', '\\u0026')
+        .replaceAll('\u2028', '\\u2028')
+        .replaceAll('\u2029', '\\u2029');
+}
+
 export function build_webview_html(
     assets: WebviewHtmlAssets,
     nonce: string,
     font_family: string | null = null,
+    font_size: number | null = null,
 ): string {
-    const font_bootstrap = font_family
-        ? `<script nonce="${nonce}">document.documentElement.style.setProperty('--table-viewer-font-family', ${
-            JSON.stringify(font_family)
-                .replaceAll('<', '\\u003c')
-                .replaceAll('>', '\\u003e')
-                .replaceAll('&', '\\u0026')
-                .replaceAll('\u2028', '\\u2028')
-                .replaceAll('\u2029', '\\u2029')
-        });</script>\n`
+    // Set before the bundle loads so the first paint already uses the
+    // configured font; styles.css and the Glide theme both read these vars.
+    const font_declarations: string[] = [];
+    if (font_family) {
+        font_declarations.push(
+            `document.documentElement.style.setProperty('--table-viewer-font-family', ${
+                script_literal(font_family)});`,
+        );
+    }
+    if (font_size && Number.isFinite(font_size) && font_size > 0) {
+        font_declarations.push(
+            `document.documentElement.style.setProperty('--table-viewer-font-size', ${
+                script_literal(`${font_size}px`)});`,
+        );
+    }
+    const font_bootstrap = font_declarations.length > 0
+        ? `<script nonce="${nonce}">${font_declarations.join('')}</script>\n`
         : '';
 
     // Content-Security-Policy for the Glide DataEditor.

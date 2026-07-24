@@ -99,6 +99,8 @@ You can change the font in both places or give Table Viewer its own font:
 
 Clear **Table Viewer: Font Family** at any time to make Table Viewer follow **Editor: Font Family** again. If a newly installed font does not appear immediately, restart VS Code after installing it.
 
+Text size works the same way. **Editor: Font Size** sets the size for both, and **Table Viewer: Font Size** overrides it for tables only. Set **Table Viewer: Font Size** back to `0` to follow the editor again.
+
 If you would like to try a different font, two readable, free, open-source choices are:
 
 - [**Hack**](https://sourcefoundry.org/hack/) is an established monospaced typeface with a large x-height and deliberately distinct character shapes. It comes in four fixed styles: regular, bold, italic, and bold italic.

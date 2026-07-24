@@ -131,6 +131,12 @@
           "default": "",
           "description": "Font family used in table views. Leave empty to use the editor font (editor.fontFamily)."
         },
+        "tableViewer.fontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Font size in pixels used in table views. Set to 0 to follow the editor font size (editor.fontSize)."
+        },
         "tableViewer.tabOrientation": {
           "type": "string",
           "enum": [

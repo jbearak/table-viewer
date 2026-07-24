@@ -46,6 +46,7 @@ vi.mock('../webview/use-row-loader', () => ({
 
 vi.mock('../webview/vscode-theme', () => ({
     use_vscode_theme: () => ({ theme: {}, highContrast: false }),
+    theme_font_size_px: () => 13,
 }));
 
 vi.mock('../webview/merge-overlay', () => ({

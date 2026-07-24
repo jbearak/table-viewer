@@ -5,9 +5,13 @@ import * as path from 'path';
 import {
     DEFAULT_SETTINGS,
     DesktopConfigStore,
+    MAX_FONT_SIZE_PX,
+    MIN_FONT_SIZE_PX,
     sanitize_settings,
     settings_file_path,
 } from '../main/desktop-config';
+import { clamp_zoom_level, zoom_factor } from '../main/zoom';
+import { BASE_TAB_BAR_HEIGHT, tab_bar_height } from '../shared/chrome';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
 import { REQUIRED_THEME_VARIABLES, theme_css_variables, theme_payload } from '../main/theme';
 import {
@@ -51,20 +55,32 @@ describe('desktop-config', () => {
         expect(reread.settings().csvMaxRows).toBe(DEFAULT_SETTINGS.csvMaxRows);
     });
 
+    it('defaults worksheet tabs to vertical, like the extension', () => {
+        expect(DEFAULT_SETTINGS.tabOrientation).toBe('vertical');
+    });
+
     it('sanitizes malformed values', () => {
         expect(sanitize_settings({
             fontFamily: 42,
+            fontSize: 'big',
             tabOrientation: 'diagonal',
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
             maxStoredFiles: 2.9,
         })).toEqual({
             fontFamily: '',
-            tabOrientation: 'horizontal',
+            fontSize: DEFAULT_SETTINGS.fontSize,
+            tabOrientation: 'vertical',
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
             maxStoredFiles: 2,
         });
+    });
+
+    it('clamps the font size to the usable range', () => {
+        expect(sanitize_settings({ fontSize: 2 }).fontSize).toBe(MIN_FONT_SIZE_PX);
+        expect(sanitize_settings({ fontSize: 500 }).fontSize).toBe(MAX_FONT_SIZE_PX);
+        expect(sanitize_settings({ fontSize: 16.4 }).fontSize).toBe(16);
     });
 
     it('notifies change listeners with previous and next settings', () => {
@@ -81,20 +97,50 @@ describe('desktop-config', () => {
         const store = new DesktopConfigStore(settings_file_path(dir));
         const port = store.config_port();
         const listener = vi.fn();
-        const subscription = port.on_font_family_change(listener);
+        const subscription = port.on_font_change(listener);
 
         store.update({ csvMaxRows: 5 });
         expect(listener).not.toHaveBeenCalled();
         store.update({ fontFamily: 'Menlo' });
         expect(listener).toHaveBeenCalledTimes(1);
+        store.update({ fontSize: 17 });
+        expect(listener).toHaveBeenCalledTimes(2);
+        expect(port.font_size()).toBe(17);
 
         subscription.dispose();
         store.update({ fontFamily: 'Monaco' });
-        expect(listener).toHaveBeenCalledTimes(1);
+        expect(listener).toHaveBeenCalledTimes(2);
 
         expect(port.font_family()).toBe('Monaco');
         store.update({ fontFamily: '   ' });
         expect(port.font_family()).toBeNull();
+    });
+});
+
+describe('zoom', () => {
+    it('clamps levels into the supported range', () => {
+        expect(clamp_zoom_level(0)).toBe(0);
+        expect(clamp_zoom_level(99)).toBe(5);
+        expect(clamp_zoom_level(-99)).toBe(-5);
+        expect(clamp_zoom_level(Number.NaN)).toBe(0);
+    });
+
+    it('scales by 1.2 per level so the tab bar tracks the zoomed page', () => {
+        expect(zoom_factor(0)).toBe(1);
+        expect(zoom_factor(1)).toBeCloseTo(1.2);
+        expect(zoom_factor(-1)).toBeCloseTo(1 / 1.2);
+    });
+});
+
+describe('chrome metrics', () => {
+    it('keeps the stock tab bar height at the base font size', () => {
+        expect(tab_bar_height(13)).toBe(BASE_TAB_BAR_HEIGHT);
+        expect(tab_bar_height()).toBe(BASE_TAB_BAR_HEIGHT);
+    });
+
+    it('grows with the font size and never shrinks below the stock height', () => {
+        expect(tab_bar_height(20)).toBeGreaterThan(BASE_TAB_BAR_HEIGHT);
+        expect(tab_bar_height(8)).toBe(BASE_TAB_BAR_HEIGHT);
     });
 });
 
@@ -125,8 +171,12 @@ describe('viewer-panel adapter', () => {
     it('forwards postMessage to the transport', () => {
         const { transport, sent } = fake_transport();
         const panel = create_viewer_panel(transport);
-        expect(panel.webview.postMessage({ type: 'fontFamilyChanged', fontFamily: null })).toBe(true);
-        expect(sent).toEqual([{ type: 'fontFamilyChanged', fontFamily: null }]);
+        expect(panel.webview.postMessage({
+            type: 'fontChanged',
+            fontFamily: null,
+            fontSize: null,
+        })).toBe(true);
+        expect(sent).toEqual([{ type: 'fontChanged', fontFamily: null, fontSize: null }]);
     });
 
     it('delivers inbound messages to subscribed handlers until disposed', () => {
@@ -153,7 +203,11 @@ describe('viewer-panel adapter', () => {
 
         panel.dispose();
         expect(listener_count()).toBe(0);
-        expect(panel.webview.postMessage({ type: 'fontFamilyChanged', fontFamily: null })).toBe(false);
+        expect(panel.webview.postMessage({
+            type: 'fontChanged',
+            fontFamily: null,
+            fontSize: null,
+        })).toBe(false);
         expect(sent).toHaveLength(0);
         // Subscriptions after dispose are inert.
         panel.webview.onDidReceiveMessage(() => {});
@@ -191,8 +245,16 @@ describe('viewer html', () => {
         expect(html).toContain('id="portal"');
     });
 
+    it('bootstraps the configured font size', () => {
+        const html = build_desktop_viewer_html(null, 17);
+        expect(html).toContain('--table-viewer-font-size');
+        expect(html).toContain('17px');
+    });
+
     it('omits the font bootstrap when no font is configured', () => {
-        expect(build_desktop_viewer_html(null)).not.toContain('--table-viewer-font-family');
+        const html = build_desktop_viewer_html(null);
+        expect(html).not.toContain('--table-viewer-font-family');
+        expect(html).not.toContain('--table-viewer-font-size');
     });
 });
 

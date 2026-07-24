@@ -6,12 +6,18 @@
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';">
 <title>Table Viewer</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    /* Set from the Preferences font settings (desktop/renderer/shell.ts). */
+    --shell-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --shell-font-size: 13px;
+    --shell-tab-bar-height: 38px;
+  }
   html, body {
     margin: 0;
     height: 100%;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 13px;
+    font-family: var(--shell-font-family);
+    font-size: var(--shell-font-size);
     background: var(--shell-bg, #f8f8f8);
     color: var(--shell-fg, #3b3b3b);
     user-select: none;
@@ -20,7 +26,7 @@
   #tab-bar {
     display: flex;
     align-items: stretch;
-    height: 38px;
+    height: var(--shell-tab-bar-height);
     box-sizing: border-box;
     border-bottom: 1px solid var(--shell-border, #d0d0d0);
     overflow-x: auto;
@@ -45,7 +51,7 @@
     border: none;
     background: transparent;
     color: inherit;
-    font-size: 14px;
+    font-size: calc(var(--shell-font-size) * 1.08);
     line-height: 1;
     padding: 2px 4px;
     border-radius: 4px;
@@ -56,20 +62,24 @@
     border: none;
     background: transparent;
     color: inherit;
-    font-size: 18px;
+    font-size: calc(var(--shell-font-size) * 1.4);
     padding: 0 12px;
     cursor: pointer;
   }
   #open-button:hover { background: var(--shell-hover-bg, rgba(128,128,128,0.25)); }
   #empty-state {
     position: absolute;
-    inset: 38px 0 0 0;
+    inset: var(--shell-tab-bar-height) 0 0 0;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 8px;
     color: var(--shell-muted, #717171);
+  }
+  #empty-actions {
+    display: flex;
+    gap: 8px;
   }
   #empty-state button {
     font: inherit;
@@ -80,13 +90,17 @@
     color: inherit;
     cursor: pointer;
   }
+  #empty-state button:hover { background: var(--shell-hover-bg, rgba(128,128,128,0.25)); }
 </style>
 </head>
 <body>
 <div id="tab-bar"></div>
 <div id="empty-state">
   <div>No files open</div>
-  <button id="empty-open">Open File…</button>
+  <div id="empty-actions">
+    <button id="empty-open">Open File…</button>
+    <button id="empty-settings">Preferences…</button>
+  </div>
 </div>
 <script src="./shell.js"></script>
 </body>

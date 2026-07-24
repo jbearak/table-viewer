@@ -623,6 +623,7 @@ function cleanup() {
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     document.documentElement.style.removeProperty('--table-viewer-font-family');
+    document.documentElement.style.removeProperty('--table-viewer-font-size');
     grid_shell_mock.is_dirty = false;
     grid_shell_mock.has_live_uncommitted = false;
     grid_shell_mock.save_in_flight = false;
@@ -660,22 +661,30 @@ describe('initial render', () => {
         expect(post_message).toHaveBeenCalledWith({ type: 'ready' });
     });
 
-    it('applies and clears live font-family updates', async () => {
+    it('applies and clears live font updates', async () => {
         await render_app();
         await dispatch_host_message({
-            type: 'fontFamilyChanged',
+            type: 'fontChanged',
             fontFamily: 'Atkinson Hyperlegible',
+            fontSize: 16,
         });
         expect(document.documentElement.style.getPropertyValue(
             '--table-viewer-font-family',
         )).toBe('Atkinson Hyperlegible');
+        expect(document.documentElement.style.getPropertyValue(
+            '--table-viewer-font-size',
+        )).toBe('16px');
 
         await dispatch_host_message({
-            type: 'fontFamilyChanged',
+            type: 'fontChanged',
             fontFamily: null,
+            fontSize: null,
         });
         expect(document.documentElement.style.getPropertyValue(
             '--table-viewer-font-family',
+        )).toBe('');
+        expect(document.documentElement.style.getPropertyValue(
+            '--table-viewer-font-size',
         )).toBe('');
     });
 

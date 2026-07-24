@@ -9,6 +9,16 @@ export function get_font_family(): string | null {
     return configured?.trim() || null;
 }
 
+/** Configured font size in px, or null for "follow the editor font size"
+ *  (the setting's 0 default, which the webview resolves from
+ *  `--vscode-editor-font-size`). */
+export function get_font_size(): number | null {
+    const configured = vscode.workspace.getConfiguration('tableViewer')
+        .get<number>('fontSize', 0);
+    if (typeof configured !== 'number' || !Number.isFinite(configured)) return null;
+    return configured > 0 ? configured : null;
+}
+
 export function get_max_file_size_mib(): number {
     return vscode.workspace.getConfiguration('tableViewer')
         .get<number>('maxFileSizeMiB', 256)!;

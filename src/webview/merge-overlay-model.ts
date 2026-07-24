@@ -104,8 +104,9 @@ export function block_font(
     bold: boolean,
     italic: boolean,
     family: string,
+    size_px = 13,
 ): string {
-    return `${font_shorthand(bold, italic, 13)} ${family}`;
+    return `${font_shorthand(bold, italic, size_px)} ${family}`;
 }
 
 /** Text the overlay paints for a merge block's anchor: the formatted value when

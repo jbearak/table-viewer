@@ -108,11 +108,12 @@ To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table e
 
 ## Settings
 
-Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace` if you want tables to use a different font.
+Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSize`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace`, or `tableViewer.fontSize` to a pixel size, if you want tables to differ from the editor.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
+| `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
 | `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
@@ -122,7 +123,7 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily`) by default. Set `t
 
 Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
 
-**In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), a multi-tab window, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, and font/tab-orientation preferences.
+**In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), a multi-tab window, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, window zoom, and font/tab-orientation preferences.
 
 **Out of scope for v1:** the CSV side-by-side text preview with scroll sync, VS Code remote filesystems, extension commands/menus, signed/notarized builds and auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
 

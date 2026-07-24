@@ -83,7 +83,7 @@ import {
 } from './column-projection';
 import { use_state_sync } from './use-state-sync';
 import { host_bridge } from './host-bridge';
-import { apply_font_family } from './vscode-theme';
+import { apply_font_family, apply_font_size } from './vscode-theme';
 import './styles.css';
 
 type ColumnVisibilityUpdater = (
@@ -1683,8 +1683,9 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
-            if (msg.type === 'fontFamilyChanged') {
+            if (msg.type === 'fontChanged') {
                 apply_font_family(msg.fontFamily);
+                apply_font_size(msg.fontSize);
             }
             if (msg.type === 'editSessionResult') {
                 if (pending_edit_request_ref.current !== msg.requestId) return;

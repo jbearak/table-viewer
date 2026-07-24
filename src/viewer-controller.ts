@@ -494,10 +494,11 @@ export function attach_viewer(
     };
 
     try {
-        disposables.push(host.config.on_font_family_change(() => {
+        disposables.push(host.config.on_font_change(() => {
             void post_to_receiver({
-                type: 'fontFamilyChanged',
+                type: 'fontChanged',
                 fontFamily: host.config.font_family(),
+                fontSize: host.config.font_size(),
             });
         }));
     } catch (error) {
@@ -2803,8 +2804,9 @@ export function attach_viewer(
                 // The inbound ready message guarantees the receiver is installed;
                 // replay without delaying the existing ready-state concurrency.
                 void post_to_receiver({
-                    type: 'fontFamilyChanged',
+                    type: 'fontChanged',
                     fontFamily: host.config.font_family(),
+                    fontSize: host.config.font_size(),
                 }, begun.receiverEpoch);
                 let needs_initial_source = false;
                 try {
