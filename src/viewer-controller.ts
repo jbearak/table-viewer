@@ -267,14 +267,18 @@ function excel_profile(): ViewerProfile {
 }
 
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
- *  `csv_max_rows` comes from the host's ConfigPort; it is clamped to the hard
- *  safety cap either way. */
+ *  `csv_max_rows` comes from the host's ConfigPort; it is normalized to a
+ *  finite non-negative integer and clamped to the hard safety cap either way,
+ *  since CsvDataSource uses it as an array length. */
 export function build_csv_source(
     raw: Uint8Array,
     file_path: string,
     csv_max_rows: number = MAX_CSV_ROWS,
 ): Promise<CsvDataSource> {
-    const max_rows = Math.min(csv_max_rows, MAX_CSV_ROWS);
+    const requested_max_rows = Number.isFinite(csv_max_rows)
+        ? Math.floor(csv_max_rows)
+        : MAX_CSV_ROWS;
+    const max_rows = Math.max(0, Math.min(requested_max_rows, MAX_CSV_ROWS));
     // CSV/TSV files conventionally carry column names in their first row, so the
     // grid promotes it to the column header rather than showing letters.
     return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
