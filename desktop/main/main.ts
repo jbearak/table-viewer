@@ -254,12 +254,6 @@ function build_menu(): void {
                 },
                 { type: 'separator' },
                 {
-                    label: 'Save',
-                    accelerator: 'CmdOrCtrl+S',
-                    click: () => tab_manager?.request_save_active(),
-                },
-                { type: 'separator' },
-                {
                     label: 'Close Tab',
                     accelerator: 'CmdOrCtrl+W',
                     click: (_item, window) => {

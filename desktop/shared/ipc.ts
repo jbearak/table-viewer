@@ -5,8 +5,6 @@
 export const CHANNEL_WEBVIEW_MESSAGE = 'tableViewer:webviewMessage';
 /** Host → webview viewer protocol messages (HostMessage payloads). */
 export const CHANNEL_HOST_MESSAGE = 'tableViewer:hostMessage';
-/** Main → viewer: native File > Save was invoked (synthesize Cmd/Ctrl+S). */
-export const CHANNEL_MENU_SAVE = 'tableViewer:menuSave';
 /** Sync request from the viewer preload for the initial theme payload. */
 export const CHANNEL_GET_THEME = 'tableViewer:getTheme';
 /** Main → viewer: OS appearance changed (ThemePayload). */

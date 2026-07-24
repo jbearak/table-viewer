@@ -7,14 +7,15 @@
 //  3. applies the desktop theme as `--vscode-*` inline custom properties on
 //     <html> (synchronously, before first paint) and re-applies on OS
 //     appearance changes — the webview's MutationObserver picks up the style
-//     mutation and rebuilds the Glide theme;
-//  4. synthesizes the webview's own Cmd/Ctrl+S save shortcut when the native
-//     File > Save menu item is used.
+//     mutation and rebuilds the Glide theme.
+//
+// Cmd/Ctrl+S is deliberately not handled here: the grid's own window keydown
+// listener (src/webview/grid-shell.tsx) saves in CSV edit mode, and it only
+// sees the keystroke while no application-menu accelerator claims it first.
 import { contextBridge, ipcRenderer } from 'electron';
 import {
     CHANNEL_GET_THEME,
     CHANNEL_HOST_MESSAGE,
-    CHANNEL_MENU_SAVE,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
 } from '../shared/ipc';
@@ -52,16 +53,4 @@ window.addEventListener('DOMContentLoaded', () => apply_theme(initial_theme));
 
 ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
     apply_theme(payload);
-});
-
-ipcRenderer.on(CHANNEL_MENU_SAVE, () => {
-    // grid-shell.tsx listens for Cmd/Ctrl+S on window; synthetic DOM events
-    // dispatched from the isolated world reach main-world listeners.
-    window.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 's',
-        metaKey: process.platform === 'darwin',
-        ctrlKey: process.platform !== 'darwin',
-        bubbles: true,
-        cancelable: true,
-    }));
 });

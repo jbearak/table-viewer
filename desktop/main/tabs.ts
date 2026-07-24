@@ -22,7 +22,6 @@ import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
 import { theme_payload } from './theme';
 import {
     CHANNEL_HOST_MESSAGE,
-    CHANNEL_MENU_SAVE,
     CHANNEL_SHELL_TABS_CHANGED,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
@@ -217,17 +216,6 @@ export class TabManager {
         if (this.active_tab_id === undefined) return false;
         this.close_tab(this.active_tab_id);
         return true;
-    }
-
-    active_web_contents(): Electron.WebContents | undefined {
-        const tab = this.tabs.find((entry) => entry.id === this.active_tab_id);
-        const contents = tab?.view.webContents;
-        return contents && !contents.isDestroyed() ? contents : undefined;
-    }
-
-    /** Trigger the webview's own Cmd/Ctrl+S save path in the active tab. */
-    request_save_active(): void {
-        this.active_web_contents()?.send(CHANNEL_MENU_SAVE);
     }
 
     broadcast_theme(): void {
