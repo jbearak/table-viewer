@@ -17,7 +17,7 @@ let next_loader_id = 0;
  * Demand-paged row store for the Glide grid. Pure (no React, no vscode import):
  * `post` and `on_change` are injected, so the whole fetch/cache/generation/LRU
  * logic is unit-testable with plain spies. The `use_row_loader` hook
- * (use-row-loader.ts) wires it to `vscode_api` and a forced re-render.
+ * (use-row-loader.ts) wires it to the host bridge and a forced re-render.
  *
  * - Pages are PAGE_SIZE-aligned windows keyed by their start row.
  * - `generation` guards against `rowData` belonging to a superseded document

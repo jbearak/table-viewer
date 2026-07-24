@@ -139,7 +139,7 @@ const DIRTY_BG = 'rgba(204, 167, 0, 0.16)';
 const CONFLICT_BG = 'rgba(229, 75, 75, 0.22)';
 import { use_row_loader } from './use-row-loader';
 import { use_vscode_theme } from './vscode-theme';
-import { vscode_api } from './use-state-sync';
+import { host_bridge } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
 import '@glideapps/glide-data-grid/dist/index.css';
 
@@ -644,7 +644,7 @@ export function GridShell({
     // simply round-trips back (harmless), and an empty map posts null (already so).
     useEffect(() => {
         if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'pendingEditsChanged',
             editSessionId: edit_session_id,
             edits: dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
@@ -890,7 +890,7 @@ export function GridShell({
         if (Object.keys(edits).length === 0) return false;
         const dirty_edits = collect_exact_dirty_edits(dirty_cells_ref.current, live);
         if (!dirty_edits) {
-            vscode_api.postMessage({
+            host_bridge.postMessage({
                 type: 'showWarning',
                 message: 'Load every edited row before saving so its conflict base can be verified.',
             });
@@ -925,7 +925,7 @@ export function GridShell({
         if (document.activeElement instanceof HTMLElement) {
             document.activeElement.blur();
         }
-        vscode_api.postMessage({
+        host_bridge.postMessage({
             type: 'saveCsv',
             operation,
         });
@@ -1742,7 +1742,7 @@ export function GridShell({
         );
         const warning = copy_truncation_message(result);
         if (warning) {
-            vscode_api.postMessage({ type: 'showWarning', message: warning });
+            host_bridge.postMessage({ type: 'showWarning', message: warning });
         }
         const header = include_header
             ? selection.source_columns.map((source_column) =>
@@ -2186,7 +2186,7 @@ export function GridShell({
             ) {
                 last_preview_row.current = start;
                 on_preview_visible_row_change(start);
-                vscode_api.postMessage({ type: 'visibleRowChanged', row: start });
+                host_bridge.postMessage({ type: 'visibleRowChanged', row: start });
             }
         },
         [

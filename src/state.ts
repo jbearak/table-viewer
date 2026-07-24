@@ -117,6 +117,26 @@ export interface AuthorityFileStateStore extends FileStateStore {
     cleanup_authority_transactions(file_path: string, now?: number): Promise<void>;
 }
 
+/**
+ * Persistence medium abstraction for the shared authority store.
+ *
+ * The envelope schema, CAS/authority semantics, and LRU policy are identical
+ * across media; only where the `tableViewer.fileState.v1` blob lives differs
+ * (VS Code Memento vs a JSON file on disk).
+ */
+export interface FileStatePersistenceMedium {
+    /**
+     * Identity object for cross-store coordination. Stores created over the
+     * same underlying blob must return the same object so their operations
+     * are serialized and leases are shared.
+     */
+    readonly runtime_key: object;
+    /** Read the current raw persisted blob (envelope, legacy map, or empty). */
+    read(): unknown;
+    /** Durably replace the persisted blob with the given envelope. */
+    write(envelope: unknown): Promise<void>;
+}
+
 interface PersistedAuthorityStage extends AuthorityTransactionStageInput {
     createdAt: number;
 }
@@ -126,6 +146,10 @@ interface PersistedEntry {
     state: StoredPerFileState;
     authority?: DurableFileAuthority;
     stages?: Record<string, PersistedAuthorityStage>;
+    /** UTC epoch ms of the last durable mutation of this entry's state or authority. */
+    updatedAt?: number;
+    /** UTC epoch ms of the last recency touch (access recency, not content recency). */
+    touchedAt?: number;
     copyProvenance?: {
         id: string;
         sourcePath: string;
@@ -137,6 +161,8 @@ interface PersistedStateEnvelope {
     format: typeof STATE_FORMAT;
     nextRevision: number;
     absenceRevision: number;
+    /** UTC epoch ms of the last durable write of the whole blob. */
+    updatedAt?: number;
     entries: Record<string, PersistedEntry>;
 }
 
@@ -146,13 +172,13 @@ interface StateRuntime {
 }
 
 type LegacyStoredStateMap = Record<string, StoredPerFileState>;
-const runtime_by_memento = new WeakMap<object, StateRuntime>();
+const runtime_by_medium = new WeakMap<object, StateRuntime>();
 
-function runtime_for(memento: object): StateRuntime {
-    let runtime = runtime_by_memento.get(memento);
+function runtime_for(runtime_key: object): StateRuntime {
+    let runtime = runtime_by_medium.get(runtime_key);
     if (!runtime) {
         runtime = { pending: Promise.resolve(), leases: new Map() };
-        runtime_by_memento.set(memento, runtime);
+        runtime_by_medium.set(runtime_key, runtime);
     }
     return runtime;
 }
@@ -179,8 +205,8 @@ function is_envelope(value: unknown): value is PersistedStateEnvelope {
         && typeof (value as { entries?: unknown }).entries === 'object';
 }
 
-function get_all_state(context: ExtensionContext): PersistedStateEnvelope {
-    const stored = context.globalState.get<unknown>(STATE_KEY, {});
+function get_all_state(medium: FileStatePersistenceMedium): PersistedStateEnvelope {
+    const stored = medium.read();
     if (is_envelope(stored)) {
         const persisted = structuredClone(stored) as PersistedStateEnvelope & {
             tombstones?: Record<string, number>;
@@ -196,12 +222,14 @@ function get_all_state(context: ExtensionContext): PersistedStateEnvelope {
             absenceRevision + 1,
             ...Object.values(persisted.entries).map((entry) => entry.revision + 1),
         );
-        return {
+        const envelope: PersistedStateEnvelope = {
             format: STATE_FORMAT,
             nextRevision,
             absenceRevision,
             entries: persisted.entries,
         };
+        if (persisted.updatedAt !== undefined) envelope.updatedAt = persisted.updatedAt;
+        return envelope;
     }
     const entries: Record<string, PersistedEntry> = {};
     if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
@@ -351,6 +379,7 @@ function copy_persisted_entry_if_absent(
     }
     const copied = structuredClone(source);
     copied.revision = allocate_revision(all);
+    copied.updatedAt = Date.now();
     for (const stage of Object.values(copied.stages ?? {})) {
         if (stage.expectedStateRevision === source.revision) {
             stage.expectedStateRevision = copied.revision;
@@ -372,28 +401,38 @@ function copy_persisted_entry_if_absent(
     };
 }
 
-export function create_file_state_store(
-    context: ExtensionContext,
+/**
+ * Create an `AuthorityFileStateStore` over an arbitrary persistence medium.
+ *
+ * All store semantics (envelope schema, CAS, authority staging, leases, LRU
+ * trimming, recency timestamps) live here so every backend behaves
+ * identically; media only load and durably replace the blob.
+ */
+export function create_authority_store(
+    medium: FileStatePersistenceMedium,
     get_max_stored?: () => number,
 ): AuthorityFileStateStore {
     const get_max = get_max_stored ?? (() => DEFAULT_MAX_STORED_FILES);
-    const memento = context.globalState as object;
-    const runtime = runtime_for(memento);
+    const runtime = runtime_for(medium.runtime_key);
     const enqueue = <T>(operation: () => Promise<T>): Promise<T> => {
         const result = runtime.pending.catch(() => {}).then(operation);
         runtime.pending = result;
         return result;
     };
+    const persist = async (all: PersistedStateEnvelope): Promise<void> => {
+        all.updatedAt = Date.now();
+        await medium.write(all);
+    };
 
     return {
         read(file_path) {
-            return enqueue(async () => snapshot_for(get_all_state(context), file_path));
+            return enqueue(async () => snapshot_for(get_all_state(medium), file_path));
         },
 
         compare_and_set(file_path, expected_revision, state, validate) {
             const next = structuredClone(state);
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const current = snapshot_for(all, file_path);
                 const valid = validate?.();
                 if (
@@ -406,11 +445,13 @@ export function create_file_state_store(
                     state: next,
                     authority: authority_for(existing),
                     stages: structuredClone(existing?.stages),
+                    updatedAt: Date.now(),
                 };
+                if (existing?.touchedAt !== undefined) entry.touchedAt = existing.touchedAt;
                 delete all.entries[file_path];
                 all.entries[file_path] = entry;
                 trim_entries(all, runtime, get_max());
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
                 return {
                     type: 'committed',
                     snapshot: { state: structuredClone(next), revision: entry.revision },
@@ -419,13 +460,13 @@ export function create_file_state_store(
         },
 
         read_authority(file_path) {
-            return enqueue(async () => authority_for(get_all_state(context).entries[file_path]));
+            return enqueue(async () => authority_for(get_all_state(medium).entries[file_path]));
         },
 
         stage_authority_transaction(file_path, input) {
             const stage = structuredClone({ ...input, createdAt: Date.now() });
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const current = snapshot_for(all, file_path);
                 const entry = ensure_entry(all, file_path);
                 const authority = authority_for(entry);
@@ -437,14 +478,14 @@ export function create_file_state_store(
                 stages[input.id] = stage;
                 delete entry.copyProvenance;
                 trim_entries(all, runtime, get_max());
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
                 return { type: 'staged' };
             });
         },
 
         finalize_authority_transaction(file_path, stage_id) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const entry = all.entries[file_path];
                 const current = snapshot_for(all, file_path);
                 const authority = authority_for(entry);
@@ -477,13 +518,14 @@ export function create_file_state_store(
                 entry.state = structuredClone(next_state);
                 if (state_changed) entry.revision = allocate_revision(all);
                 entry.authority = next_authority;
+                entry.updatedAt = Date.now();
                 delete entry.copyProvenance;
                 delete entry.stages![stage_id];
                 if (Object.keys(entry.stages!).length === 0) delete entry.stages;
                 delete all.entries[file_path];
                 all.entries[file_path] = entry;
                 trim_entries(all, runtime, get_max());
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
                 return {
                     type: 'finalized',
                     snapshot: { state: structuredClone(entry.state), revision: entry.revision },
@@ -494,7 +536,7 @@ export function create_file_state_store(
 
         inspect_authority_transaction(file_path, stage_id) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const entry = all.entries[file_path];
                 return {
                     snapshot: snapshot_for(all, file_path),
@@ -506,28 +548,28 @@ export function create_file_state_store(
 
         discard_authority_transaction(file_path, stage_id) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const entry = all.entries[file_path];
                 if (!entry?.stages?.[stage_id]) return;
                 delete entry.copyProvenance;
                 delete entry.stages[stage_id];
                 if (Object.keys(entry.stages).length === 0) delete entry.stages;
                 trim_entries(all, runtime, get_max());
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
             });
         },
 
         cleanup_authority_transactions(_file_path, now = Date.now()) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 if (!trim_entries(all, runtime, get_max(), new Set(), now)) return;
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
             });
         },
 
         canonicalize_path(canonical_path, canonical_key) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const changed = canonicalize_entries(all, canonical_path, canonical_key);
                 const trimmed = trim_entries(
                     all,
@@ -536,13 +578,13 @@ export function create_file_state_store(
                     new Set([canonical_path]),
                 );
                 if (!changed && !trimmed) return;
-                await context.globalState.update(STATE_KEY, all);
+                await persist(all);
             });
         },
 
         lease_entry(canonical_path, canonical_key, copy_from_if_absent, copy_id) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 let changed = canonicalize_entries(all, canonical_path, canonical_key);
                 if (copy_from_if_absent) {
                     const copied = copy_persisted_entry_if_absent(
@@ -561,7 +603,7 @@ export function create_file_state_store(
                     get_max(),
                     protected_paths,
                 );
-                if (changed || trimmed) await context.globalState.update(STATE_KEY, all);
+                if (changed || trimmed) await persist(all);
                 runtime.leases.set(canonical_path, (runtime.leases.get(canonical_path) ?? 0) + 1);
                 let released = false;
                 let release_promise: Promise<void> | undefined;
@@ -574,9 +616,9 @@ export function create_file_state_store(
                             const count = runtime.leases.get(canonical_path) ?? 0;
                             if (count <= 1) runtime.leases.delete(canonical_path);
                             else runtime.leases.set(canonical_path, count - 1);
-                            const current = get_all_state(context);
+                            const current = get_all_state(medium);
                             if (!trim_entries(current, runtime, get_max())) return;
-                            await context.globalState.update(STATE_KEY, current);
+                            await persist(current);
                         });
                         return release_promise;
                     },
@@ -586,7 +628,7 @@ export function create_file_state_store(
 
         copy_entry_if_absent(source_path, destination_path, copy_id) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const copied = copy_persisted_entry_if_absent(
                     all,
                     source_path,
@@ -600,7 +642,7 @@ export function create_file_state_store(
                     new Set([source_path, destination_path]),
                 );
                 if (copied.changed || trimmed) {
-                    await context.globalState.update(STATE_KEY, all);
+                    await persist(all);
                 }
                 return copied.result;
             });
@@ -608,17 +650,33 @@ export function create_file_state_store(
 
         touch(file_path) {
             return enqueue(async () => {
-                const all = get_all_state(context);
+                const all = get_all_state(medium);
                 const current = all.entries[file_path];
                 let changed = false;
                 if (current) {
+                    current.touchedAt = Date.now();
                     delete all.entries[file_path];
                     all.entries[file_path] = current;
                     changed = true;
                 }
                 changed = trim_entries(all, runtime, get_max()) || changed;
-                if (changed) await context.globalState.update(STATE_KEY, all);
+                if (changed) await persist(all);
             });
         },
     };
+}
+
+export function create_file_state_store(
+    context: ExtensionContext,
+    get_max_stored?: () => number,
+): AuthorityFileStateStore {
+    const memento = context.globalState;
+    const medium: FileStatePersistenceMedium = {
+        runtime_key: memento as object,
+        read: () => memento.get<unknown>(STATE_KEY, {}),
+        write: async (envelope) => {
+            await memento.update(STATE_KEY, envelope);
+        },
+    };
+    return create_authority_store(medium, get_max_stored);
 }

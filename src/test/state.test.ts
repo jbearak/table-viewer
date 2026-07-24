@@ -594,8 +594,13 @@ describe('FileStateStore versioned state', () => {
             format: 'tableViewer.fileState.v1',
             nextRevision: 1,
             absenceRevision: 0,
+            updatedAt: expect.any(Number),
             entries: {
-                '/a': { revision: 0, state: { activeSheetIndex: 3 } },
+                '/a': {
+                    revision: 0,
+                    state: { activeSheetIndex: 3 },
+                    touchedAt: expect.any(Number),
+                },
             },
         });
     });
@@ -658,6 +663,7 @@ describe('FileStateStore versioned state', () => {
             'entries',
             'format',
             'nextRevision',
+            'updatedAt',
         ]);
         expect(JSON.stringify(envelope)).not.toContain('/file-0"');
         expect(envelope.absenceRevision).toBeGreaterThan(0);

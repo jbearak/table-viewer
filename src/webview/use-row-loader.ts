@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react';
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
-import { vscode_api } from './use-state-sync';
+import { host_bridge } from './host-bridge';
 import { RowLoader } from './row-loader';
 
 export { RowLoader };
@@ -40,7 +40,7 @@ export function use_row_loader(
     const [version, bump] = useReducer((n: number) => n + 1, 0);
     const ref = useRef<RowLoader | null>(null);
     if (ref.current === null) {
-        ref.current = new RowLoader((m) => vscode_api.postMessage(m), bump);
+        ref.current = new RowLoader((m) => host_bridge.postMessage(m), bump);
     }
     const loader = ref.current;
 
