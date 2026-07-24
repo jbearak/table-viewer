@@ -143,6 +143,8 @@ Clone the repo and run `npm install`.
 - `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
 - `npm run test:desktop-smoke` — Playwright Electron smoke test (separate from the vitest suite)
 
+`./scripts/setup.sh` builds and installs both front ends locally in one go — the `.vsix` into every supported editor on `PATH`, and (on macOS) the desktop app into `/Applications`. See the [development guide](docs/development.md) for its flags and exact behavior.
+
 ## License
 
 [GPL-3.0](LICENSE)
