@@ -14,6 +14,18 @@ export interface WebviewHtmlAssets {
     readonly cspSource: string;
 }
 
+/** Initial theme for hosts that have no ambient `--vscode-*` variables (the
+ *  desktop app). VS Code injects its own, so it passes none. */
+export interface WebviewThemeBootstrap {
+    /** `--vscode-*` custom properties to set on <html> before the bundle runs. */
+    readonly variables: Record<string, string>;
+    readonly colorScheme?: 'light' | 'dark';
+}
+
+/** Custom-property names we are willing to inline. Names cannot be quoted the
+ *  way values can, so anything unexpected is dropped rather than escaped. */
+const CUSTOM_PROPERTY_NAME = /^--[A-Za-z0-9_-]+$/;
+
 /** JSON string literal that is safe to inline inside a <script> element. */
 function script_literal(value: string): string {
     return JSON.stringify(value)
@@ -29,24 +41,44 @@ export function build_webview_html(
     nonce: string,
     font_family: string | null = null,
     font_size: number | null = null,
+    theme: WebviewThemeBootstrap | null = null,
 ): string {
     // Set before the bundle loads so the first paint already uses the
     // configured font; styles.css and the Glide theme both read these vars.
     const font_declarations: string[] = [];
     if (font_family) {
         font_declarations.push(
-            `document.documentElement.style.setProperty('--table-viewer-font-family', ${
+            `r.style.setProperty('--table-viewer-font-family', ${
                 script_literal(font_family)});`,
         );
     }
     if (font_size && Number.isFinite(font_size) && font_size > 0) {
         font_declarations.push(
-            `document.documentElement.style.setProperty('--table-viewer-font-size', ${
+            `r.style.setProperty('--table-viewer-font-size', ${
                 script_literal(`${font_size}px`)});`,
         );
     }
-    const font_bootstrap = font_declarations.length > 0
-        ? `<script nonce="${nonce}">${font_declarations.join('')}</script>\n`
+    // The theme goes into the document itself rather than being pushed in by a
+    // host (the desktop preload used to do it) so the very first paint — and the
+    // Glide theme the bundle builds as it evaluates — already has the right
+    // light/dark values, with no ordering race against the parser.
+    const theme_declarations: string[] = [];
+    for (const [name, value] of Object.entries(theme?.variables ?? {})) {
+        if (!CUSTOM_PROPERTY_NAME.test(name)) continue;
+        theme_declarations.push(
+            `r.style.setProperty(${script_literal(name)}, ${script_literal(value)});`,
+        );
+    }
+    if (theme?.colorScheme) {
+        theme_declarations.push(
+            `r.style.colorScheme = ${script_literal(theme.colorScheme)};`,
+        );
+    }
+
+    const declarations = [...theme_declarations, ...font_declarations];
+    const bootstrap = declarations.length > 0
+        ? `<script nonce="${nonce}">{const r=document.documentElement;${
+            declarations.join('')}}</script>\n`
         : '';
 
     // Content-Security-Policy for the Glide DataEditor.
@@ -77,7 +109,7 @@ export function build_webview_html(
                script-src 'nonce-${nonce}';
                font-src ${assets.cspSource};">
 <title>Table Viewer</title>
-${font_bootstrap}<link nonce="${nonce}" rel="stylesheet" href="${assets.styleUrl}">
+${bootstrap}<link nonce="${nonce}" rel="stylesheet" href="${assets.styleUrl}">
 </head>
 <body>
 <div id="root"></div>

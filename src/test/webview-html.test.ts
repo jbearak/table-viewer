@@ -48,8 +48,49 @@ describe('build_webview_html', () => {
         expect(font_at).toBeGreaterThanOrEqual(0);
         expect(font_at).toBeLessThan(stylesheet_at);
         expect(html).toContain(
-            '<script nonce="nonce123">document.documentElement.style.setProperty(',
+            '<script nonce="nonce123">{const r=document.documentElement;',
         );
+    });
+
+    it('bootstraps host theme variables before the stylesheet loads', () => {
+        // Regression: the desktop app has no ambient --vscode-* variables, so
+        // without these the grid rendered with the dark fallbacks forever.
+        const html = build_webview_html(assets, 'nonce123', null, null, {
+            variables: { '--vscode-editor-background': '#ffffff' },
+            colorScheme: 'light',
+        });
+        const theme_at = html.indexOf('"--vscode-editor-background"');
+        const stylesheet_at = html.indexOf('<link nonce="nonce123" rel="stylesheet"');
+        expect(theme_at).toBeGreaterThanOrEqual(0);
+        expect(theme_at).toBeLessThan(stylesheet_at);
+        expect(html).toContain('"#ffffff"');
+        expect(html).toContain('r.style.colorScheme = "light"');
+    });
+
+    it('drops theme variable names that are not plain custom properties', () => {
+        const html = build_webview_html(assets, 'nonce123', null, null, {
+            variables: {
+                '--ok': 'red',
+                'color': 'blue',
+                '--bad); alert(1': 'x',
+            },
+        });
+        expect(html).toContain('r.style.setProperty("--ok", "red")');
+        expect(html).not.toContain('"color"');
+        expect(html).not.toContain('alert(1');
+    });
+
+    it('escapes theme variable values before embedding them in a script', () => {
+        const html = build_webview_html(assets, 'nonce123', null, null, {
+            variables: { '--vscode-editor-background': '</script><script>alert(1)</script>' },
+        });
+        expect(html).not.toContain('</script><script>alert(1)</script>');
+        expect(html).toContain('\\u003c/script\\u003e');
+    });
+
+    it('emits no bootstrap script when neither font nor theme is provided', () => {
+        const html = build_webview_html(assets, 'nonce123');
+        expect(html).not.toContain('document.documentElement');
     });
 
     it('escapes configured font text before embedding it in a script', () => {

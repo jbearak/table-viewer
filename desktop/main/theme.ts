@@ -201,3 +201,28 @@ export function theme_payload(dark: boolean): ThemePayload {
     const kind: ThemeKind = dark ? 'dark' : 'light';
     return { kind, variables: theme_css_variables(kind) };
 }
+
+/**
+ * Applies a payload to a viewer document. Used by the viewer preload when the OS
+ * appearance changes (the initial palette is baked into the page HTML instead).
+ *
+ * Deliberately tolerant of a half-built document: a preload script runs before
+ * the response is parsed, so `documentElement` and `body` can both still be
+ * null, and a throw there aborts the *entire* preload module — which is how the
+ * viewer previously lost its theme listener (and thus never switched themes) as
+ * well as its first paint.
+ */
+export function apply_theme_to_document(doc: Document, payload: ThemePayload): void {
+    const root = doc.documentElement;
+    if (root) {
+        for (const [name, value] of Object.entries(payload.variables)) {
+            root.style.setProperty(name, value);
+        }
+        root.style.colorScheme = payload.kind;
+    }
+    const body = doc.body;
+    if (body) {
+        body.classList.toggle('vscode-dark', payload.kind === 'dark');
+        body.classList.toggle('vscode-light', payload.kind === 'light');
+    }
+}
