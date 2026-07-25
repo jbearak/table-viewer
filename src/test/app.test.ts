@@ -3828,6 +3828,229 @@ describe('edit mode save exit', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
     });
+
+    it('does not re-raise a resolved rejection when the same cell is edited again', async () => {
+        // Trigger A. Membership in the rejected-key list is not enough: the user
+        // discards the rejected edit and types into the same cell again, and the
+        // fresh entry's base was re-read from the file the host had just changed.
+        // That edit has never been submitted, so a banner claiming "save was
+        // cancelled" over it is describing an event that did not happen — and the
+        // grid would tint a cell nothing is wrong with.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 904,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-5',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // Discard Conflicted drops '4:1'…
+        await report_grid_editing(false, false, [], {});
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+
+        // …and the user retypes into that very cell. Same key, new edit: a fresh
+        // value over a base read from the current file.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'retyped', base: 'their-text' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('does not carry a rejection into a new edit session', async () => {
+        // Trigger B. The adoption guard at the set site gates only *recording*, so
+        // without a session stamp on the state itself a rejection outlives its
+        // session and re-raises against whatever the next session's retained map
+        // happens to hold under the same key.
+        //
+        // The rotation route is a refresh snapshot advancing csvEditSessionId, which
+        // the host does on every applied snapshot. Deliberately *not* the install
+        // path: the refresh does not install when the id is not our own current
+        // session, so nothing here calls clear_save_verdict and the session stamp is
+        // the only thing that can be doing the work.
+        const meta = make_meta(['Sheet1'], false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 905,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-6',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'second-edit-session',
+            },
+        }));
+        // Byte-identical to the map the host rejected, which is the point: only the
+        // session differs.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('lets a later save result supersede an earlier rejection', async () => {
+        // The adoption block only ever *sets*, so without a clear at the top of the
+        // handler a rejection outlives every later verdict that does not name keys
+        // of its own. Modelled with a second failed save reporting no `rejection`
+        // (a write error rather than a base mismatch), because that is the only
+        // terminal result that leaves edit mode and the session intact — a success
+        // exits edit mode, which would hide the banner for an unrelated reason and
+        // make the assertion vacuous.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 906,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-7',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // A second save over the same map, refused for a reason that names no keys.
+        // The absence of `rejection` has to speak: this verdict says nothing is
+        // base-mismatched any more.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 907,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-8',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+        });
+        // Same map, unchanged — so only the cleared verdict can move the banner.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('lets Keep All dismiss a host rejection', async () => {
+        // Keep All was a no-op for a host rejection: `show_host_rejection`
+        // short-circuited ahead of the dismissal check, so the button recorded a
+        // signature nothing consulted and the banner stayed up with no way to put it
+        // away short of discarding the edits.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 908,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-9',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        await click_button('Keep All');
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        // Dismissed, not resolved: the tint stays so the cell is still identifiable,
+        // and the edit is still there to save or discard.
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
 });
 
 describe('preview mode', () => {

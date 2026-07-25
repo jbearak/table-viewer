@@ -69,6 +69,13 @@ export interface CellEditOverlay {
     bg?: string;
     /** Open Glide's edit overlay on this cell. */
     editable?: boolean;
+    /**
+     * Editing is available on this sheet but we are refusing *this* cell (its
+     * canonical source identity is unresolved). Distinct from `!editable`, which
+     * is also true for every cell of a read-only sheet — see the `readonly` flag
+     * below.
+     */
+    refused?: boolean;
 }
 
 const EMPTY_CELL: RenderedCell = {
@@ -110,10 +117,17 @@ function text_cell(
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
         // — it gates on `isReadWriteCell`, which for a Text cell checks only
         // `readonly !== true` — so a cell we refuse to open an overlay on would
-        // still accept a paste or a cut. Only set when an overlay was supplied and
-        // is non-editable: a read-only sheet passes no overlay, so its cell shape
-        // (and every existing snapshot of it) is unchanged.
-        ...(overlay && !overlay.editable ? { readonly: true } : {}),
+        // still accept a paste or a cut.
+        //
+        // Keyed on `refused`, not on `!editable`. An overlay is supplied for any
+        // cell that needs a tint or a dirty value, and cell highlights are plain
+        // view state available on read-only sheets, so `!editable` would put
+        // `readonly: true` on a highlighted cell of a read-only sheet — where
+        // nothing was ever offered to refuse. Glide derives the DOM
+        // `aria-readonly` from this flag, so that would make a cell announce
+        // itself differently from its unhighlighted neighbour purely because the
+        // user coloured it.
+        ...(overlay?.refused ? { readonly: true } : {}),
         ...(has_override ? { themeOverride: theme_override } : {}),
         ...(span ? { span } : {}),
     };

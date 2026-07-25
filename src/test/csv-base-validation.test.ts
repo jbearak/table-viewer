@@ -83,4 +83,61 @@ describe('validate_dirty_bases', () => {
     it('accepts an empty map', () => {
         expect(validate_dirty_bases({}, 0, reader([]))).toEqual({ type: 'valid' });
     });
+
+    // Fail closed on a key that is not a pair of non-negative integers. Without the
+    // explicit guard the arithmetic absorbs the garbage instead of rejecting it:
+    // Number('') is 0 but Number('a') and a missing half are NaN, `NaN >= count` is
+    // false, and `read_raw(NaN, col) ?? ''` then compares '' to the base.
+    it.each([
+        ['an empty key', ''],
+        ['a non-numeric pair', 'a:b'],
+        ['a negative row', '-1:0'],
+        ['a negative column', '0:-1'],
+        ['a fractional row', '1.5:0'],
+    ])('rejects %s as a removed row', (_label, key) => {
+        const outcome = validate_dirty_bases(
+            edits({ [key]: { value: 'X', base: 'a' } }),
+            2,
+            reader([['a', 'b'], ['c', 'd']]),
+        );
+        expect(outcome).toEqual({ type: 'removedRows', keys: [key] });
+    });
+
+    it('rejects a key with no column even when its row is in range', () => {
+        // '4' parses to source_row 4 and col NaN. Deliberately given a file long
+        // enough to hold row 4, so the removed-row bound below cannot be what
+        // catches it — otherwise this case would pass with no guard at all.
+        const outcome = validate_dirty_bases(
+            edits({ '4': { value: 'X', base: 'a' } }),
+            8,
+            reader(Array.from({ length: 8 }, () => ['a', 'b'])),
+        );
+        expect(outcome).toEqual({ type: 'removedRows', keys: ['4'] });
+    });
+
+    it('rejects a malformed key whose base is empty rather than validating it', () => {
+        // The dangerous shape, and the reason membership in the removed list is not
+        // enough on its own: '' is exactly what `read_raw(NaN, …) ?? ''` produces, so
+        // an unguarded reader finds the base "matching" and hands the key to the
+        // serializer as a fully valid edit.
+        const outcome = validate_dirty_bases(
+            edits({ 'a:b': { value: 'X', base: '' } }),
+            2,
+            reader([['a', 'b'], ['c', 'd']]),
+        );
+        expect(outcome).toEqual({ type: 'removedRows', keys: ['a:b'] });
+    });
+
+    it('rejects a malformed key alongside well-formed ones without losing either verdict', () => {
+        const outcome = validate_dirty_bases(
+            edits({
+                '0:0': { value: 'X', base: 'stale' },
+                'a:b': { value: 'Y', base: '' },
+            }),
+            2,
+            reader([['a', 'b'], ['c', 'd']]),
+        );
+        // removedRows outranks the mismatch, so the malformed key cannot be masked.
+        expect(outcome).toEqual({ type: 'removedRows', keys: ['a:b'] });
+    });
 });

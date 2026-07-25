@@ -2505,6 +2505,8 @@ export function attach_viewer(
             else wanted_columns.set(source_row, [col]);
         }
 
+        const wants_bases = wanted_columns.size > 0;
+
         let content: string;
         try {
             const SAVE_WINDOW = 10_000;
@@ -2514,7 +2516,14 @@ export function attach_viewer(
                 for (let start = 0; start < row_count; start += SAVE_WINDOW) {
                     const { rows } = src!.read_rows(0, start, SAVE_WINDOW);
                     for (const row of rows) {
-                        const columns = wanted_columns.get(absolute_row);
+                        // `wants_bases` short-circuits the per-row Map probe. The
+                        // walk visits every row of the file (1M+ is a real case) but
+                        // the map is empty whenever there is nothing to harvest, so
+                        // without this a save with no dirty edits pays a million
+                        // lookups on an empty Map for no possible hit.
+                        const columns = wants_bases
+                            ? wanted_columns.get(absolute_row)
+                            : undefined;
                         if (columns) {
                             for (const col of columns) {
                                 // A column past this row's field count is left

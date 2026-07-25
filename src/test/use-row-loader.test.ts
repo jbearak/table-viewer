@@ -498,6 +498,79 @@ describe('RowLoader', () => {
         expect(loader.get_source_row(200)).toBe(1200);
     });
 
+    // Explicit eviction holds. An open cell editor is the motivating case: Glide's
+    // overlay does not close on scroll, so the row whose identity the pending commit
+    // needs can be scrolled clean out of the viewport, and the viewport is the only
+    // thing `evict` protects by default.
+    describe('pin_rows', () => {
+        it('protects a pinned page that has left the viewport', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2); // cap = 2
+            loader.configure(0, 100_000, 1);
+
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            loader.pin_rows(0, 0);
+
+            // Scroll away far enough that page 0 is neither in the viewport nor the
+            // most recently used, so without the pin it is the eviction victim.
+            for (const start of [100, 200]) {
+                loader.ensure_rows(start, start + 10);
+                loader.on_row_data(reply_for(post, 0, start, 1));
+            }
+
+            expect(loader.pin_count).toBe(1);
+            expect(loader.get_row(0)).toBeDefined();
+            expect(loader.get_source_row(0)).toBe(0);
+            // The pin adds to the protected set rather than raising the cap: some
+            // other page paid for page 0's survival.
+            expect(loader.page_count).toBe(2);
+        });
+
+        it('lets the cap reclaim a page once its pin is released', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 100_000, 1);
+
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            const pin = loader.pin_rows(0, 0);
+
+            loader.ensure_rows(100, 110);
+            loader.on_row_data(reply_for(post, 0, 100, 1));
+
+            loader.unpin_rows(pin);
+            expect(loader.pin_count).toBe(0);
+            // Releasing does not itself evict (there is no call site for that); the
+            // next page landing is what trims, and now nothing shields page 0.
+            loader.ensure_rows(200, 210);
+            loader.on_row_data(reply_for(post, 0, 200, 1));
+
+            expect(loader.get_row(0)).toBeUndefined();
+            expect(loader.get_source_row(0)).toBeUndefined();
+            expect(loader.page_count).toBe(2);
+
+            // Releasing an already-released token is a no-op, so GridShell's
+            // belt-and-braces release legs cannot corrupt the map.
+            loader.unpin_rows(pin);
+            expect(loader.pin_count).toBe(0);
+        });
+
+        it('drops every pin on clear so a sheet switch cannot shrink the cap forever', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 100_000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            loader.pin_rows(0, 0);
+            expect(loader.pin_count).toBe(1);
+
+            loader.clear();
+
+            expect(loader.pin_count).toBe(0);
+        });
+    });
+
     it('does not request pages past the row count', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});

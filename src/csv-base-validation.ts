@@ -24,6 +24,11 @@
  *    row is gone from the file rather than merely out of view → `removedRows`.
  * 3. **Base mismatch**: the cell is readable and its text is not what the edit
  *    was made against → `conflicts`.
+ *
+ * A fourth, degenerate case joins (2): a key that does not parse as a pair of
+ * non-negative integers. This is the last gate before a raw `write_file`, so it
+ * is the strictest reader of a key in the codebase, stricter than
+ * `row-loader.ts`'s ingest validation and deliberately so.
  */
 
 import type { CsvDirtyMap } from './types';
@@ -43,6 +48,25 @@ export function validate_dirty_bases(
 
     for (const [key, entry] of Object.entries(dirty_edits)) {
         const [source_row, col] = key.split(':').map(Number);
+        // Fail closed on a key that is not a pair of non-negative integers. Without
+        // this the arithmetic silently absorbs the garbage rather than rejecting it:
+        // `''`, `'a:b'` and `'4'` all yield NaN, `NaN >= source_row_count` is
+        // **false** so the removed-row branch below misses them, and then
+        // `read_raw(NaN, col) ?? ''` compares '' against the entry's base — so any
+        // malformed key whose base happens to be '' would pass validation outright
+        // and be handed to the serializer. Grouped with `removedRows` because that
+        // is the outcome whose message ("edited rows no longer exist") is the
+        // closest true statement about a key that names no row at all, and because
+        // it takes precedence, so one such key cannot be masked by a mismatch.
+        if (
+            !Number.isInteger(source_row)
+            || !Number.isInteger(col)
+            || source_row < 0
+            || col < 0
+        ) {
+            removed_keys.push(key);
+            continue;
+        }
         if (source_row >= source_row_count) {
             removed_keys.push(key);
             continue;

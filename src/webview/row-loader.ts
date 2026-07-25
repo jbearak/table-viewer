@@ -24,7 +24,9 @@ let next_loader_id = 0;
  *   version (bumped by the host on every reload); stale or wrong-sheet windows
  *   are dropped.
  * - An LRU cap bounds memory; pages intersecting the current viewport are never
- *   evicted so the visible region always has a chance to stay resident.
+ *   evicted so the visible region always has a chance to stay resident. Explicit
+ *   {@link pin_rows} holds add to that protection for a range whose identity
+ *   something outside the viewport depends on (an open cell editor).
  */
 export class RowLoader {
     private readonly pages = new Map<number, CachedPage>();
@@ -43,8 +45,18 @@ export class RowLoader {
      * `max_pages` x PAGE_SIZE (50 x 100 = 5,000 rows), but bulk-copy waiters are
      * exempt from eviction (see {@link evict}) and "Copy sheet" loads up to
      * `DEFAULT_MAX_ROWS` (100,000) rows, so the map can legitimately hold ~100k
-     * entries for the duration of one copy and then shrink as waiters settle and
-     * `evict` trims back to the cap.
+     * entries.
+     *
+     * That peak does NOT come back down on its own when the copy settles.
+     * `evict` has exactly one call site — the tail of {@link on_row_data} — so
+     * trimming is driven by page *landings*, not by waiters resolving:
+     * `settle_load_waiters` deliberately does not evict (it runs after `evict`
+     * within the same ingest). After a whole-sheet copy has every page resident,
+     * the next landing is what trims back to the cap, and if the user never
+     * scrolls to a page that is not already resident there is no next landing —
+     * the ~100k entries stay until a sheet switch or reload calls
+     * {@link clear}. Bounded and deliberate, not leaked: capping it needs a
+     * standalone trim, which is out of scope here.
      *
      * Deliberately total rather than injective, so no assertion here. Nothing we
      * ship produces a non-injective projection — `transform_indices` is a
@@ -72,6 +84,13 @@ export class RowLoader {
         end: number;
         resolve: (loaded: boolean) => void;
     }> = [];
+    /**
+     * Explicit eviction holds, keyed by an opaque token the caller releases (see
+     * {@link pin_rows}). Separate from `load_waiters` because a pin has no
+     * promise to settle it: its lifetime is a UI state (an open cell editor), so
+     * only the caller knows when it ends.
+     */
+    private readonly pins = new Map<symbol, { start: number; end: number }>();
 
     constructor(
         private readonly post: PostFn,
@@ -197,6 +216,44 @@ export class RowLoader {
         });
     }
 
+    /**
+     * Hold every page covering the inclusive range resident until the returned
+     * token is passed to {@link unpin_rows}. Unlike {@link ensure_rows_loaded}
+     * this requests nothing and promises nothing about *becoming* resident — it
+     * only refuses to let {@link evict} drop what is already there.
+     *
+     * Why this exists: the protect set was the current viewport plus in-flight
+     * bulk copies, and neither covers the row under an *open cell editor*. Glide's
+     * overlay does not close on scroll, so a user can type into display row 12,
+     * scroll thousands of rows away (evicting row 12's page and retracting its
+     * source-row claims), and then press Enter. The commit needs that row's
+     * canonical identity and its persisted text — pinning is what keeps both
+     * readable. GridShell captures the identity too, so a pin that could not be
+     * taken (page already gone) still does not lose the typed text.
+     *
+     * A pin is a leak if it is never released, so the token is deliberately
+     * opaque and single-purpose: one open editor, one token, released on close,
+     * on unmount, and by {@link clear} (a sheet switch or reload throws the pages
+     * away regardless, so holding their pins would protect nothing and outlive
+     * the editor). Releasing an unknown or already-released token is a no-op, so
+     * a double release cannot strand another editor's pin.
+     */
+    pin_rows(start_row: number, end_row: number): symbol {
+        const token = Symbol('row-pin');
+        this.pins.set(token, { start: start_row, end: end_row });
+        return token;
+    }
+
+    /** Release a {@link pin_rows} hold. Unknown/stale tokens are ignored. */
+    unpin_rows(token: symbol): void {
+        this.pins.delete(token);
+    }
+
+    /** For tests: number of outstanding {@link pin_rows} holds. */
+    get pin_count(): number {
+        return this.pins.size;
+    }
+
     /** Ingest a host `rowData` reply. Returns false (and ignores) when stale or malformed. */
     on_row_data(msg: RowDataMsg): boolean {
         if (msg.generation !== this._generation) return false;
@@ -319,6 +376,12 @@ export class RowLoader {
         this.pages.clear();
         this.source_to_page.clear();
         this.pending.clear();
+        // Drop every pin. The pages they protected are gone, so keeping them would
+        // protect nothing while permanently shrinking the effective LRU cap if the
+        // pin holder's release never arrives (a sheet switch can unmount the editor
+        // without a close callback). The holder's own release is still safe —
+        // unpin_rows ignores unknown tokens.
+        this.pins.clear();
         // Abandon any in-flight bulk copy: the cache it was accumulating is gone,
         // so let the awaiting copy proceed with whatever is left (it will report
         // the usual clip warning) rather than hang forever.
@@ -371,6 +434,14 @@ export class RowLoader {
         // between disjoint loads evictable and shrinks protection as each settles.
         for (const waiter of this.load_waiters) {
             for (const start of get_needed_page_starts(waiter.start, waiter.end)) {
+                protect.add(start);
+            }
+        }
+        // Explicit holds (an open cell editor's row) — see pin_rows. Same shape as
+        // the waiter loop above: per pin, so releasing one stops protecting only
+        // its own range.
+        for (const pin of this.pins.values()) {
+            for (const start of get_needed_page_starts(pin.start, pin.end)) {
                 protect.add(start);
             }
         }

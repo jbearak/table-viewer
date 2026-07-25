@@ -521,6 +521,8 @@ export function GridShell({
     const {
         ensure_rows,
         ensure_rows_loaded,
+        pin_rows,
+        unpin_rows,
         get_row,
         get_source_row,
         get_cell_raw_for_source,
@@ -940,6 +942,104 @@ export function GridShell({
         schedule_pending_preview_restore,
     ]);
 
+    // --- Open-overlay identity capture + page pin -----------------------------
+    // Durable edit identity has a *lifetime*, not an instant: the user opens an
+    // overlay on display row 12, types, and only later presses Enter. Between
+    // those two moments the page holding row 12 can leave — Glide's overlay does
+    // not close on scroll (its ClickOutsideContainer listens for pointer events
+    // only), and every page that lands while scrolling away runs `evict`, whose
+    // protect set is the current viewport plus in-flight bulk copies. Nothing
+    // there covers the row under an open editor.
+    //
+    // Re-deriving the source row at commit time therefore yields `undefined` for a
+    // row that was perfectly resolvable when the overlay opened, and the commit
+    // guards would discard text the user typed and watched appear — the exact
+    // failure the overlay-open gate exists to prevent, arrived at from the other
+    // side. So resolve identity once, when the overlay mounts, and hold it:
+    //
+    //  - capture: the commit falls back to the identity the overlay opened with,
+    //    which keeps the typed text even if the page is already gone;
+    //  - pin: the page stays resident, so `get_cell_raw` can still read the
+    //    entry's conflict base (capture alone cannot supply that).
+    //
+    // Both are needed. The pin alone still loses the row across a sheet switch or
+    // reload (which clear the cache outright); the capture alone leaves the base
+    // unreadable.
+    const open_overlay_row_ref = useRef<{
+        display_row: number;
+        source_row: number;
+        pin: symbol;
+    } | null>(null);
+    // Stable handles so the tracking editor's memo identity never churns: Glide
+    // remounts (and unfocuses) the overlay editor whenever the component identity
+    // changes, which would defeat the very capture below.
+    const pin_rows_ref = useRef(pin_rows);
+    pin_rows_ref.current = pin_rows;
+    const unpin_rows_ref = useRef(unpin_rows);
+    unpin_rows_ref.current = unpin_rows;
+    const get_source_row_ref = useRef(get_source_row);
+    get_source_row_ref.current = get_source_row;
+
+    const release_open_overlay_row = useCallback(() => {
+        const captured = open_overlay_row_ref.current;
+        if (!captured) return;
+        open_overlay_row_ref.current = null;
+        unpin_rows_ref.current(captured.pin);
+    }, []);
+
+    const capture_open_overlay_row = useCallback(() => {
+        // Defensive: an overlay opening while a previous capture is still live
+        // would otherwise strand that pin forever, permanently shrinking the LRU
+        // cap. Glide only ever has one overlay open, so this is belt and braces.
+        release_open_overlay_row();
+        const loc = grid_selection_ref.current.current?.cell;
+        if (!loc) return;
+        const display_row = loc[1];
+        const source_row = get_source_row_ref.current(display_row);
+        // Unresolved identity: nothing to remember and nothing worth pinning. The
+        // overlay-open gate means this is unreachable for a real editor mount, and
+        // leaving the ref null keeps the commit guards' early return intact.
+        if (source_row === undefined) return;
+        open_overlay_row_ref.current = {
+            display_row,
+            source_row,
+            pin: pin_rows_ref.current(display_row, display_row),
+        };
+    }, [release_open_overlay_row]);
+
+    /**
+     * Canonical source row for a commit arriving from the open overlay. Live
+     * residency first — that is the truth for every path that did not come through
+     * an overlay (Glide's paste path, most importantly, which never opens one).
+     * Only when the row is no longer resident does the identity captured at
+     * overlay-open time stand in, and only for the row it was captured for: a
+     * mismatched display row means this commit is not that overlay's, so the
+     * caller's early return still applies.
+     */
+    const commit_source_row = useCallback((row: number): number | undefined => {
+        const resident = get_source_row(row);
+        if (resident !== undefined) return resident;
+        const captured = open_overlay_row_ref.current;
+        return captured !== null && captured.display_row === row
+            ? captured.source_row
+            : undefined;
+    }, [get_source_row]);
+
+    // Leaving edit mode (or a save taking the grid read-only) makes provide_editor
+    // stop supplying an editor, which unmounts it and runs the cleanup below — but
+    // only if Glide re-renders the overlay. Releasing here too makes the lifecycle
+    // independent of that: an unreleased pin would hold a page resident for the
+    // rest of the session.
+    useEffect(() => {
+        if (editable_cells) return;
+        release_open_overlay_row();
+    }, [editable_cells, release_open_overlay_row]);
+
+    // Unmount (a generation/sheet remount, or the webview closing). The loader's
+    // own unmount clears its pins as well, so this is the belt to that braces —
+    // kept because the two are separate objects and only this one knows the ref.
+    useEffect(() => release_open_overlay_row, [release_open_overlay_row]);
+
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
     // selected cell and the live text from the portalled .gdg-clip-region input.
@@ -954,17 +1054,17 @@ export function GridShell({
         // The `key` is a durable edit key, so it must be fully source-keyed: the
         // save collectors (collect_save_edits / collect_exact_dirty_edits) merge it
         // straight into the source-keyed dirty map, and a display-keyed LiveEdit
-        // would poison them. Unreachable by construction — get_cell_content refuses
-        // to open an overlay on a row whose source identity is unresolved — but
-        // returning null costs one lookup and the failure mode is a wrong save.
-        const source_row = get_source_row(row);
+        // would poison them. Falls back to the identity captured when this overlay
+        // opened, so an editor whose page left mid-edit still reaches the save
+        // rather than being silently dropped (see commit_source_row).
+        const source_row = commit_source_row(row);
         if (source_row === undefined) return null;
         return {
             key: `${source_row}:${source_column}`,
             value,
             original: get_cell_raw(source_row, source_column) ?? '',
         };
-    }, [get_cell_raw, get_source_row, source_column_for_display]);
+    }, [commit_source_row, get_cell_raw, source_column_for_display]);
 
     // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
     // open and on every keystroke and clears it on close, so the editing-status
@@ -1441,7 +1541,13 @@ export function GridShell({
                 : `${source_row}:${source_column}`;
             const dirty = key === undefined ? undefined : store.get(key);
             const merge = merge_index.entry_at(row, source_column);
-            const highlight_source_row = get_source_row(merge?.startRow ?? row);
+            // Reuse the row's own resolution when there is no merge, which is the
+            // overwhelmingly common case: `entry_at` returns null on a sheet with no
+            // merges, and a second get_source_row for the identical row is a second
+            // `locate()` allocation per cell per frame.
+            const highlight_source_row = merge === null
+                ? source_row
+                : get_source_row(merge.startRow);
             const highlight_source_column = merge?.startCol ?? source_column;
             const highlight_bg = highlight_source_row === undefined
                 ? undefined
@@ -1461,6 +1567,13 @@ export function GridShell({
             if (editable_cells || dirty || highlight_bg) {
                 overlay = {
                     editable,
+                    // `refused` is narrower than `!editable` on purpose: it means
+                    // "editing is on here and we are refusing this cell", which is
+                    // the only situation where Glide's paste path needs closing. A
+                    // read-only sheet is not refusing anything — it never offered —
+                    // and it does reach this branch, via highlight_bg, which is
+                    // plain view state independent of edit mode.
+                    refused: editable_cells && source_row === undefined,
                     dirty_value: dirty?.value,
                     bg: dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
@@ -1507,13 +1620,18 @@ export function GridShell({
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return;
-            // Re-resolve source identity here as well as at overlay-open time.
+            // Resolve source identity here as well as at overlay-open time.
             // get_cell_content's `editable` gate covers the overlay and Glide's
             // activation/delete paths, but Glide's paste path never consults
             // `allowOverlay` (see the `readonly` flag in cell-renderer.ts), so this
             // is the second of the two guards keeping an unresolvable row from
             // landing an edit under the wrong key.
-            const source_row = get_source_row(row);
+            //
+            // Live residency first, then the identity this overlay opened with:
+            // Glide passes `overlay.cell` (the coordinates the editor opened on) to
+            // onFinishEditing, so the captured entry names exactly this commit's row
+            // and the guard keeps refusing only the genuinely unresolvable case.
+            const source_row = commit_source_row(row);
             if (source_row === undefined) return;
             const text =
                 new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
@@ -1551,7 +1669,7 @@ export function GridShell({
             on_row_resize,
             display_column_count,
             source_column_for_display,
-            get_source_row,
+            commit_source_row,
             save_in_flight_ref,
         ],
     );
@@ -1561,11 +1679,27 @@ export function GridShell({
     // Refreshes on open and on every keystroke, clears on close. Memoized so its
     // identity is stable — Glide would otherwise remount (and unfocus) the editor
     // on each parent render.
+    //
+    // Its mount/unmount is also the "overlay opened / closed" hook, and the only
+    // one available: Glide owns the overlay's lifetime and exposes no open
+    // callback, and onFinishedEditing fires on close but not on open. So the same
+    // effect that arms live_uncommitted captures this overlay's source-row identity
+    // and pins its page, and the cleanup releases both — which is what makes the
+    // pin release airtight for the ordinary close (Enter/Esc/click-away), a
+    // selection move, and an unmount.
     const tracking_editor = useMemo(() => {
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
+                capture_open_overlay_row();
                 refresh_live_uncommitted();
-                return () => set_live_uncommitted(false);
+                return () => {
+                    // Ordering matters: on_cell_edited already ran by the time Glide
+                    // tears the editor down (onFinishEditing commits, then clears the
+                    // overlay), so releasing here cannot strip the capture out from
+                    // under the commit that needs it.
+                    release_open_overlay_row();
+                    set_live_uncommitted(false);
+                };
             }, []);
             const handle_change = (next: GridCell) => {
                 if (save_in_flight_ref.current) return;
@@ -1575,7 +1709,12 @@ export function GridShell({
             return <CsvCellEditor {...props} onChange={handle_change} />;
         }
         return TrackingCsvCellEditor;
-    }, [refresh_live_uncommitted, save_in_flight_ref]);
+    }, [
+        capture_open_overlay_row,
+        refresh_live_uncommitted,
+        release_open_overlay_row,
+        save_in_flight_ref,
+    ]);
 
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Only consulted for editable Text cells.

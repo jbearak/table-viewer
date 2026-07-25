@@ -124,7 +124,14 @@ function column_visibility_equal(
  */
 function rejected_rows(keys: readonly string[]): number[] {
     const rows = new Set<number>();
-    for (const key of keys) rows.add(Number(key.split(':')[0]) + 1);
+    for (const key of keys) {
+        // Skip a key that names no row. `validate_dirty_bases` routes a malformed
+        // key to `rowsRemoved`, so one can reach here, and `Number('a') + 1` would
+        // put a literal "NaN" in the banner's row list.
+        const row = Number(key.split(':')[0]);
+        if (!Number.isInteger(row) || row < 0) continue;
+        rows.add(row + 1);
+    }
     return [...rows].sort((a, b) => a - b);
 }
 
@@ -305,9 +312,21 @@ export function App(): React.JSX.Element {
     // rejected save would be permanently unrecoverable — the banner would not
     // render, the cell would not exist to right-click, and Discard Conflicted (a
     // retain over is_entry_conflicted) would keep the very entry blocking the save.
+    //
+    // Stamped with the session it belongs to and with the *exact entries* it was a
+    // verdict over. Both are load-bearing. The session stamp is what stops a
+    // rejection from a previous session riding into a new one on a restored
+    // `pendingEdits` map (the adoption guard at the set site gates only adoption;
+    // after that the state carried no session at all). The entries are what stop a
+    // rejection outliving the edit it named: a key can leave the map and come back
+    // with a *fresh* value and a base re-read from the current file, and a
+    // membership-only test would re-raise "save was cancelled" over an edit the host
+    // has never seen.
     const [save_rejection, set_save_rejection] = useState<{
         reason: 'baseMismatch' | 'rowsRemoved';
         keys: string[];
+        session_id: string | undefined;
+        entries: Record<string, { value: string; base: string }>;
     } | null>(null);
 
     const state_ref = useRef<PerFileState>({});
@@ -459,6 +478,24 @@ export function App(): React.JSX.Element {
         });
     }, []);
 
+    /**
+     * Drop the host's save verdict and any banner dismissal together.
+     *
+     * They must move as a pair, because the banner now honours the dismissal for a
+     * host rejection too (see `show_conflict_banner`). `conflict_signature` covers
+     * only the webview-derived conflicts, so a "Keep All" pressed over a rejection
+     * with no derived conflicts records the empty signature — and leaving that
+     * behind would silently suppress the *next* rejection, which would also present
+     * with no derived conflicts. Conversely, clearing the rejection while keeping
+     * the dismissal is what lets a stale dismissal outlive the thing it dismissed.
+     * Every caller is a point where the map or the session the verdict described is
+     * replaced, which is exactly when both facts stop being true.
+     */
+    const clear_save_verdict = useCallback(() => {
+        set_save_rejection(null);
+        set_dismissed_conflict_signature(null);
+    }, []);
+
     const release_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
         pending_save_dialog_ref.current = null;
@@ -471,17 +508,22 @@ export function App(): React.JSX.Element {
     const leave_edit_mode = useCallback(() => {
         set_edit_mode(false);
         release_edit_session();
-    }, [release_edit_session]);
+        // A verdict is scoped to an editing session. Leaving edit mode ends the one
+        // it belonged to, so nothing it named can still be pending.
+        clear_save_verdict();
+    }, [clear_save_verdict, release_edit_session]);
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
         pending_save_dialog_ref.current = null;
         set_edit_mode(false);
+        // Every edit is being thrown away, including the rejected ones.
+        clear_save_verdict();
         host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
         });
-    }, [csv_edit_session_id]);
+    }, [clear_save_verdict, csv_edit_session_id]);
 
     const begin_save_operation = useCallback((
         edits: Record<string, string>,
@@ -526,7 +568,14 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
         edit_session_ref.current!.install({ session_id }, edits);
-    }, []);
+        // This is the single hydration boundary, so it is also the single place
+        // every replacement of the edit map passes through — a grant, a refresh, a
+        // save's restore. A host verdict is a statement about one specific map, so
+        // it cannot outlive one: the map it judged is no longer the map we hold.
+        // Callers that go on to record a *new* verdict (the saveResult handler) do
+        // so after this returns, so this clear cannot swallow it.
+        clear_save_verdict();
+    }, [clear_save_verdict]);
 
     const apply_save_lifecycle = useCallback((incoming: CsvSaveLifecycle) => {
         const previous = save_projection_ref.current;
@@ -1030,7 +1079,11 @@ export function App(): React.JSX.Element {
                             || restored_edits !== undefined,
                         );
                         set_editing_status(null);
-                        set_dismissed_conflict_signature(null);
+                        // A fresh document: the rejection and the dismissal go
+                        // together (install_edit_session above already does this, but
+                        // stating it here keeps the reset block self-contained rather
+                        // than dependent on that call's internals).
+                        clear_save_verdict();
                         pending_exit_ref.current = false;
                     } else {
                         const sheet_count = snapshot.meta.sheets.length;
@@ -1898,6 +1951,12 @@ export function App(): React.JSX.Element {
                 const operation = save_projection_ref.current.operation;
                 const matching = !operation
                     || csv_save_operations_equal(operation, msg.lifecycle.operation);
+                // Every save result supersedes the previous one, including a success
+                // and including a rejection that named different keys. Clearing here,
+                // before the adoption block below re-records one, is what makes a
+                // *successful* save drop the banner: adoption only ever sets, so
+                // without this a rejection would survive until the session ended.
+                clear_save_verdict();
                 apply_save_lifecycle(msg.lifecycle);
                 if (matching) {
                     pending_exit_ref.current = false;
@@ -1912,9 +1971,25 @@ export function App(): React.JSX.Element {
                     && msg.lifecycle.operation.editSessionId
                         === csv_edit_session_id_ref.current
                 ) {
+                    const submitted = msg.lifecycle.operation.dirtyEdits;
                     set_save_rejection({
                         reason: msg.rejection.reason,
                         keys: [...msg.rejection.keys],
+                        session_id: csv_edit_session_id_ref.current,
+                        // Snapshot what the host actually judged, from the operation
+                        // it judged it over rather than from the live map, which may
+                        // already have moved on. `live_rejected_keys` compares against
+                        // this so a key that came back with a different value or a
+                        // re-read base is understood as a new, unjudged edit.
+                        entries: Object.fromEntries(
+                            msg.rejection.keys.map((key) => [
+                                key,
+                                {
+                                    value: submitted[key]?.value ?? '',
+                                    base: submitted[key]?.base ?? '',
+                                },
+                            ]),
+                        ),
                     });
                 }
             }
@@ -2306,10 +2381,29 @@ export function App(): React.JSX.Element {
     // effect for no change.
     const live_edits = editing_status?.edits;
     const live_rejected_keys = useMemo(
-        () => (save_rejection
-            ? save_rejection.keys.filter((key) => live_edits?.[key] !== undefined)
-            : []),
-        [save_rejection, live_edits],
+        () => {
+            if (!save_rejection) return [];
+            // A verdict from a previous session says nothing about this one. The
+            // adoption guard at the set site only gates *recording*; the state itself
+            // then had no session on it, so a rejection could ride into a new session
+            // on a restored `pendingEdits` map that happens to hold the same keys.
+            if (save_rejection.session_id !== csv_edit_session_id) return [];
+            return save_rejection.keys.filter((key) => {
+                const live = live_edits?.[key];
+                if (live === undefined) return false;
+                // Identity, not membership. The key can leave the map and come back
+                // as a different edit — the user discards a rejected cell and types
+                // into it again, and the fresh entry's base is re-read from the file
+                // the host just changed. That edit has never been submitted, so
+                // claiming "save was cancelled" over it is a lie. Comparing both
+                // fields is deliberate: value alone misses a re-typed identical
+                // value over a new base (genuinely unjudged), and base alone misses
+                // a corrected value over the same stale base.
+                const judged = save_rejection.entries[key];
+                return live.value === judged.value && live.base === judged.base;
+            });
+        },
+        [save_rejection, live_edits, csv_edit_session_id],
     );
 
     if (!meta) {
@@ -2385,17 +2479,21 @@ export function App(): React.JSX.Element {
     const conflicted_keys = editing_status?.conflicted ?? [];
     const conflict_signature = [...conflicted_keys].sort().join(',');
     const show_host_rejection = edit_mode && live_rejected_keys.length > 0;
-    // Renders for a host rejection *independently* of conflicted_keys. That
-    // independence is the whole fix: the keys a host rejection names are exactly the
-    // ones the webview's residency-gated detection cannot flag, so gating this on
-    // conflicted_keys.length would leave the banner (and every exit it offers)
-    // unreachable in precisely the case that needs it.
+    // A host rejection is an *independent* reason to render, because the keys it
+    // names are exactly the ones the webview's residency-gated detection cannot
+    // flag: requiring conflicted_keys.length > 0 would leave the banner (and every
+    // exit it offers) unreachable in precisely the case that needs it.
+    //
+    // The dismissal gate applies to both reasons, not just the derived one. With the
+    // rejection short-circuiting ahead of it, "Keep All" was a no-op for a host
+    // rejection — it recorded a signature nothing consulted, and the banner stayed
+    // up with no way to put it away short of discarding the edits. A dismissal here
+    // is safe because it cannot outlive the verdict: every save result clears both
+    // (see clear_save_verdict).
     const show_conflict_banner =
-        show_host_rejection || (
-            edit_mode
-            && conflicted_keys.length > 0
-            && conflict_signature !== dismissed_conflict_signature
-        );
+        edit_mode
+        && (show_host_rejection || conflicted_keys.length > 0)
+        && conflict_signature !== dismissed_conflict_signature;
     const removed_rows = show_host_rejection
         && save_rejection?.reason === 'rowsRemoved'
         ? rejected_rows(live_rejected_keys)

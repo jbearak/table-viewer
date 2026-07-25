@@ -14,9 +14,22 @@ import type { CsvDirtyEntry } from '../types';
 export type { DirtyEntry, GetCellRaw } from './edit-session-store';
 export { clear_saved_dirty_entries } from './edit-session-store';
 
+/**
+ * The cell this hook currently has an editor open on, in **source** space — the
+ * same space as the store's keys, so `${source_row}:${source_col}` is a durable
+ * edit key and needs no conversion.
+ *
+ * There is deliberately no display coordinate here. Every consumer of this
+ * struct either builds a store key from it or reads the cell through
+ * {@link GetCellRaw}, and both of those are source-keyed; the only thing that
+ * ever wants a display position is the visible cursor, which Glide owns (see
+ * grid-shell's `onCellEdited` / `provideEditor` path). A second field for the
+ * display row would be an unread copy that still had to be kept in step with a
+ * sort, which is precisely the aliasing this PR removes.
+ */
 export interface EditingCell {
-    row: number;
-    col: number;
+    source_row: number;
+    source_col: number;
     value: string;
 }
 
@@ -64,9 +77,10 @@ export function use_editing(
     // GridShell never reads this (it takes edit_mode as a prop from App), so it
     // only gates the reload-token effect below.
     const [edit_mode, set_edit_mode] = useState(() => active_store.size() > 0);
-    // Stays local state on purpose: a display coordinate, so a generation
-    // remount must clear it — otherwise a newly applied sort would leave the
-    // cursor parked on what is now a different row.
+    // Stays local state on purpose: it names a cell whose editor is open right
+    // now, and an editor cannot outlive the mount that opened it. Source-keyed
+    // (see EditingCell), so a generation remount clears it for lifetime reasons
+    // rather than because the coordinate went stale.
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
 
     const is_dirty = dirty_cells.size > 0;
@@ -76,23 +90,31 @@ export function use_editing(
         set_editing_cell(null);
     }, []);
 
+    // Every coordinate below is a source coordinate. The store's keys, the
+    // GetCellRaw reader and EditingCell all live in source space, so nothing on
+    // this path converts — and a caller holding a display row must convert
+    // before it arrives (grid-shell does that in `commit_source_row`).
     const begin_editing = useCallback(
-        (row: number, col: number) => {
-            const key = `${row}:${col}`;
+        (source_row: number, source_col: number) => {
+            const key = `${source_row}:${source_col}`;
             const dirty_entry = dirty_cells.get(key);
             if (dirty_entry !== undefined) {
-                set_editing_cell({ row, col, value: dirty_entry.value });
+                set_editing_cell({ source_row, source_col, value: dirty_entry.value });
                 return;
             }
-            set_editing_cell({ row, col, value: get_cell_raw(row, col) ?? '' });
+            set_editing_cell({
+                source_row,
+                source_col,
+                value: get_cell_raw(source_row, source_col) ?? '',
+            });
         },
         [get_cell_raw, dirty_cells],
     );
 
     const start_editing = useCallback(
-        (row: number, col: number) => {
+        (source_row: number, source_col: number) => {
             if (!edit_mode) return;
-            begin_editing(row, col);
+            begin_editing(source_row, source_col);
         },
         [edit_mode, begin_editing],
     );
@@ -100,8 +122,8 @@ export function use_editing(
     // Like start_editing but bypasses the edit_mode check.
     // Used when entering edit mode and starting editing in the same tick.
     const force_start_editing = useCallback(
-        (row: number, col: number) => {
-            begin_editing(row, col);
+        (source_row: number, source_col: number) => {
+            begin_editing(source_row, source_col);
         },
         [begin_editing],
     );
@@ -109,11 +131,11 @@ export function use_editing(
     const confirm_edit = useCallback(
         (new_value: string) => {
             if (!editing_cell) return;
-            const { row, col } = editing_cell;
-            const key = `${row}:${col}`;
+            const { source_row, source_col } = editing_cell;
+            const key = `${source_row}:${source_col}`;
             // begin-edit/commit always run on a resident, visible cell, so a
             // definite string is expected; coalesce defensively.
-            const original = get_cell_raw(row, col) ?? '';
+            const original = get_cell_raw(source_row, source_col) ?? '';
 
             set_editing_cell(null);
 
@@ -132,13 +154,17 @@ export function use_editing(
     // Location-based commit for Glide, whose overlay editor reports edits via
     // onCellEdited(location, newCell). Unlike confirm_edit it doesn't rely on
     // editing_cell, but it still clears the open editor if it happens to match.
+    // The caller resolves Glide's display row to a source row first, so both
+    // arguments are already source coordinates here.
     const commit_edit = useCallback(
-        (row: number, col: number, new_value: string) => {
-            const key = `${row}:${col}`;
-            const original = get_cell_raw(row, col) ?? '';
+        (source_row: number, source_col: number, new_value: string) => {
+            const key = `${source_row}:${source_col}`;
+            const original = get_cell_raw(source_row, source_col) ?? '';
 
             set_editing_cell((prev) =>
-                prev && prev.row === row && prev.col === col ? null : prev,
+                prev && prev.source_row === source_row && prev.source_col === source_col
+                    ? null
+                    : prev,
             );
 
             if (new_value === original) {
@@ -171,9 +197,11 @@ export function use_editing(
         active_store.clear_saved(session_id, edits);
     }, [active_store, session_id]);
 
+    // The dirty value of a cell named in source space — the "display" in the name
+    // is the *rendered text* it should show, not a display coordinate.
     const get_display_value = useCallback(
-        (row: number, col: number): string | null => {
-            const entry = dirty_cells.get(`${row}:${col}`);
+        (source_row: number, source_col: number): string | null => {
+            const entry = dirty_cells.get(`${source_row}:${source_col}`);
             return entry?.value ?? null;
         },
         [dirty_cells],
@@ -181,7 +209,10 @@ export function use_editing(
 
     const discard_edit = useCallback(
         (key: string) => {
-            if (editing_cell && `${editing_cell.row}:${editing_cell.col}` === key) {
+            if (
+                editing_cell
+                && `${editing_cell.source_row}:${editing_cell.source_col}` === key
+            ) {
                 set_editing_cell(null);
             }
             active_store.remove(session_id, key);
@@ -191,7 +222,8 @@ export function use_editing(
 
     const discard_conflicted = useCallback(() => {
         if (editing_cell) {
-            const active_key = `${editing_cell.row}:${editing_cell.col}`;
+            const active_key =
+                `${editing_cell.source_row}:${editing_cell.source_col}`;
             const active_entry = dirty_cells.get(active_key);
             if (
                 active_entry &&
