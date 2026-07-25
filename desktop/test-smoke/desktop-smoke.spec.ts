@@ -26,6 +26,16 @@ function viewer_pages(): Page[] {
     return app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
 }
 
+/**
+ * The file a window title names. Off macOS a window holding unsaved edits is
+ * titled `• name`, so every title-based lookup here strips that marker — without
+ * it, any test running after the unsaved-edits one fails on Windows/Linux with a
+ * confusing "no viewer page" error.
+ */
+function file_of(title: string): string {
+    return title.replace(/^• /, '');
+}
+
 /** Titles of the app's open windows (each viewer window is titled by file). */
 function window_titles(): Promise<string[]> {
     return app.evaluate(({ BrowserWindow }) =>
@@ -48,7 +58,7 @@ async function focus_viewer(file_name: string): Promise<Page> {
             await window.webContents.executeJavaScript(
                 `window.__tvWindowTitle = ${JSON.stringify(title)};`,
             );
-            if (title !== name) continue;
+            if (title.replace(/^• /, '') !== name) continue;
             window.show();
             window.focus();
             found = true;
@@ -61,7 +71,7 @@ async function focus_viewer(file_name: string): Promise<Page> {
         const title = await page.evaluate(
             () => (window as { __tvWindowTitle?: string }).__tvWindowTitle,
         );
-        if (title !== file_name) continue;
+        if (!title || file_of(title) !== file_name) continue;
         await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
         return page;
     }
@@ -102,7 +112,7 @@ test('opens each file in its own window and renders both grids', async () => {
     // No launcher window alongside the two viewer windows.
     expect(app.windows()).toHaveLength(2);
     // Each window is titled by its file, so the OS window list names them.
-    expect((await window_titles()).sort()).toEqual(['basic.csv', 'basic.xlsx']);
+    expect((await window_titles()).map(file_of).sort()).toEqual(['basic.csv', 'basic.xlsx']);
 });
 
 test('windows are separately sized and positioned', async () => {
@@ -139,8 +149,9 @@ test('reopening an open file focuses its window instead of duplicating it', asyn
     // Still two windows a moment later (a duplicate would appear async), and the
     // reopened file's window is the focused one.
     await expect.poll(() => app.windows().length, { timeout: 5_000 }).toBe(2);
-    expect(await app.evaluate(({ BrowserWindow }) =>
-        BrowserWindow.getFocusedWindow()?.getTitle())).toBe('basic.csv');
+    const focused_title = await app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getFocusedWindow()?.getTitle());
+    expect(file_of(focused_title ?? '')).toBe('basic.csv');
 });
 
 // The grid is a canvas, so the stock `role: 'copy'` / `role: 'selectAll'` menu
@@ -197,9 +208,12 @@ test('View menu zoom applies to the focused window only', async () => {
     await focus_viewer('basic.csv');
     await click_menu_item('View', 'Zoom In');
 
-    const levels = () => app.evaluate(({ BrowserWindow }) =>
-        Object.fromEntries(BrowserWindow.getAllWindows()
-            .map((window) => [window.getTitle(), window.webContents.getZoomLevel()])));
+    const levels = async () => Object.fromEntries(
+        (await app.evaluate(({ BrowserWindow }) =>
+            BrowserWindow.getAllWindows().map((window): [string, number] =>
+                [window.getTitle(), window.webContents.getZoomLevel()])))
+            .map(([title, level]) => [file_of(title), level]),
+    );
     await expect.poll(levels, { timeout: 5_000 })
         .toEqual({ 'basic.csv': 1, 'basic.xlsx': 0 });
 
