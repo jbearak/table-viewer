@@ -63,8 +63,12 @@ electron-builder config deliberately leaves `mac.identity` unset — the local
 `npm run desktop:package` scripts pass `-c.mac.identity=null` explicitly, so a
 local build never needs a certificate.
 
-Once builds are notarized, drop the `caveats` block from the cask and the
-first-launch section from the tap README. Nothing in CI needs changing.
+Enabling signing needs **no** change to the cask, the tap, or CI. The cask's
+`caveats` and the tap README's first-launch section are both phrased as
+conditionals ("if macOS blocks the first launch…") rather than asserting the app
+is unsigned, so they stay accurate once notarized builds ship and can simply be
+left alone. `caveats` is only text printed after install; a stale one is
+cosmetic, but there is nothing stale about a conditional.
 
 ## One-time setup
 
