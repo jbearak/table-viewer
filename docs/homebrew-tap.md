@@ -69,8 +69,13 @@ quarantine section from the tap README.
 
 ## One-time setup
 
+The tap repo (`jbearak/homebrew-table-viewer`) already exists, holding only a
+placeholder README. It was created empty on purpose: a fine-grained PAT can only
+be scoped to a repository that exists, and seeding the cask before any release
+carried a dmg would have meant a red tap CI pointing at a 404.
+
 1. **Seed the tap.** From the tap scaffold (`.tap-staging/` in this repo, which
-   is gitignored — it becomes its own repo):
+   is gitignored — it becomes the tap's contents):
 
    ```sh
    cd .tap-staging
@@ -78,12 +83,18 @@ quarantine section from the tap README.
    ```
 
    This downloads that release's dmg, writes the real checksum into the cask,
-   creates `jbearak/homebrew-table-viewer` if needed, and pushes `main`. It
-   fails loudly rather than seeding a cask that points at a missing asset, so
-   the version must be a release cut *after* the `desktop` build job landed.
+   and commits the cask, `bin/`, CI and the real README on top of the existing
+   `main`. It fails loudly rather than seeding a cask that points at a missing
+   asset, so the version must be a release cut *after* the `desktop` build job
+   landed. Re-running it is safe.
+
+   Because the cask and the tap's CI arrive in that one commit, the tap's first
+   CI run is also its first *real* one — it audits and installs a cask whose
+   checksum matches a dmg that exists.
 
 2. **Require the tap's CI.** In the tap repo, Settings → Branches: require the
-   `test` check on `main`, so a bump PR can't merge red.
+   `test` check on `main`, so a bump PR can't merge red. Do this after step 1:
+   the check has to have run once before it can be selected as required.
 
 3. **Give this repo write access to the tap and enable the bump:**
 
