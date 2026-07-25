@@ -4,6 +4,7 @@ import {
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
+    CHANNEL_PREFS_SET_SYNC,
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_THEME_CHANGED,
 } from '../shared/ipc';
@@ -13,6 +14,9 @@ import type { DesktopSettings } from '../main/desktop-config';
 export interface PrefsApi {
     get_settings(): Promise<DesktopSettings>;
     set_settings(partial: Partial<DesktopSettings>): Promise<DesktopSettings>;
+    /** Blocking write, for the unload-time flush only: a promise started in
+     *  `beforeunload` may never settle before the renderer is torn down. */
+    set_settings_sync(partial: Partial<DesktopSettings>): void;
     /** The themes offerable for `kind`. Not IPC: the catalog is compile-time
      *  constant, and preload + main are bundled from the same source by the same
      *  build, so reading it directly is genuinely one source of truth rather
@@ -27,6 +31,9 @@ export interface PrefsApi {
 const api: PrefsApi = {
     get_settings: () => ipcRenderer.invoke(CHANNEL_PREFS_GET),
     set_settings: (partial) => ipcRenderer.invoke(CHANNEL_PREFS_SET, partial),
+    set_settings_sync: (partial) => {
+        ipcRenderer.sendSync(CHANNEL_PREFS_SET_SYNC, partial);
+    },
     // Only what the dropdown needs, never the variable maps — the renderer paints
     // from the ThemePayload it already receives. `kind` is omitted because it is
     // always the argument the caller just passed.

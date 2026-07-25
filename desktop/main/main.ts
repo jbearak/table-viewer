@@ -23,7 +23,7 @@ import {
     create_json_file_state_store,
     json_state_file_path,
 } from '../../src/json-file-state-store';
-import { DesktopConfigStore, settings_file_path } from './desktop-config';
+import { DesktopConfigStore, settings_file_path, type DesktopSettings } from './desktop-config';
 import { ViewerWindowManager } from './viewer-windows';
 import {
     resolve_theme_id,
@@ -48,6 +48,7 @@ import {
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
+    CHANNEL_PREFS_SET_SYNC,
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WELCOME_OPEN_FILES,
@@ -448,6 +449,12 @@ function build_menu(): void {
     Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function update_settings(partial: unknown): DesktopSettings {
+    return config_store.update(
+        (partial && typeof partial === 'object' ? partial : {}) as Record<string, never>,
+    );
+}
+
 function register_ipc(): void {
     ipcMain.on(CHANNEL_GET_THEME, (event) => {
         event.returnValue = theme_payload(current_theme_id());
@@ -457,10 +464,21 @@ function register_ipc(): void {
     });
     ipcMain.on(CHANNEL_WELCOME_OPEN_PREFERENCES, () => show_preferences_window());
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
-    ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => {
-        return config_store.update(
-            (partial && typeof partial === 'object' ? partial : {}) as Record<string, never>,
-        );
+    ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => update_settings(partial));
+    // The closing Preferences window's last write; see CHANNEL_PREFS_SET_SYNC.
+    //
+    // The try is not decoration. A sync listener gets none of `handle`'s error
+    // plumbing: an unwritable settings file would throw past this, leaving the
+    // renderer blocked forever inside `sendSync` — on a window the user is trying
+    // to close — and taking the main process down with an uncaught exception. A
+    // failed save must cost the user their last edit, and nothing more.
+    ipcMain.on(CHANNEL_PREFS_SET_SYNC, (event, partial: unknown) => {
+        try {
+            event.returnValue = update_settings(partial);
+        } catch (error) {
+            console.error('failed to save preferences on close', error);
+            event.returnValue = null;
+        }
     });
     // Sync, matching CHANNEL_GET_THEME: the renderer needs it before first paint.
     // Only the version — the display name is hardcoded in about.html because

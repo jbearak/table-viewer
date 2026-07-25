@@ -29,7 +29,11 @@
     color: var(--prefs-fg, #3b3b3b);
     user-select: none;
   }
-  h1 { font-size: calc(var(--prefs-font-size) * 1.15); margin: 0 0 16px; }
+  h1 { font-size: calc(var(--prefs-font-size) * 1.15); margin: 0 0 4px; }
+  /* Says what the absence of a Save button means. At the top, because the window
+     is a fixed height the fields already outgrow — anything at the bottom (the
+     old "Saved" flash included) is off screen for the people who most need it. */
+  .subtitle { color: var(--prefs-muted, #717171); margin: 0 0 16px; }
   .field { margin-bottom: 14px; display: flex; flex-direction: column; gap: 4px; }
   label { font-weight: 600; }
   .hint { color: var(--prefs-muted, #717171); font-size: calc(var(--prefs-font-size) * 0.92); }
@@ -48,15 +52,11 @@
   .pair { flex-direction: row; gap: 12px; }
   .pair > div { display: flex; flex-direction: column; gap: 4px; }
   .pair input { max-width: 100px; }
-  #status {
-    color: var(--prefs-muted, #717171);
-    font-size: calc(var(--prefs-font-size) * 0.92);
-    height: 1.3em;
-  }
 </style>
 </head>
 <body>
 <h1>Table Viewer Preferences</h1>
+<p class="subtitle">Changes save as you make them.</p>
 <div class="field">
   <label for="fontFamily">Font family</label>
   <input id="fontFamily" type="text" placeholder="System default">
@@ -120,10 +120,12 @@
 </div>
 <div class="field">
   <label for="maxFileSizeMiB">Max file size (MiB)</label>
-  <input id="maxFileSizeMiB" type="number" min="1">
+  <!-- step="any": the only setting the store keeps fractional, and an integer
+       step would make a half-typed "1.5" invalid, which is what holds a value
+       back from saving as it is typed (see prefs.ts). -->
+  <input id="maxFileSizeMiB" type="number" min="1" step="any">
   <span class="hint">Larger files (xlsx, xls, csv, tsv) are refused instead of opened.</span>
 </div>
-<div id="status"></div>
 <script src="./prefs.js"></script>
 </body>
 </html>
