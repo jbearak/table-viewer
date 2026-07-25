@@ -112,11 +112,14 @@ And: there is no find/search state to migrate — GridShell never passes Glide's
 
 ---
 
-## Revised sequencing: four PRs
+## Revised sequencing: five PRs
 
 The review's conclusion — "PR 1 needs an edit-session-owned state model,
 host-side base validation, and a replacement admission protocol" — is three
 separable pieces of work. Bundling them is what made the original PR 1 unsafe.
+(That review predates this sequencing and argues against a two-PR split; its
+bottom line should be read as the conclusion about the *first* draft, not about
+the plan below. PR 1b was added after #104 landed.)
 
 ### PR 1 — Lift edit state above the grid generation
 
@@ -134,6 +137,36 @@ No behavior change; pure refactor, independently verifiable.
 
 This alone fixes a latent bug: a generation bump from an external refresh
 currently relies on the rehydration path to not lose edits.
+
+**Landed as #104** (`b1fd3be`), and not behavior-neutral after all: the open
+editor now folds in instead of being lost, committed edits survive a refresh
+generation bump, and review caught a latent pre-existing bug where the
+save-restore path could promote a placeholder `base: ''` to a real base —
+admitting a save against a base the user never saw.
+
+### PR 1b — Suppress no-op edit-store notifications
+
+Deferred out of #104 as strict-parity-preserving, and worth doing on its own.
+`edit-session-store.ts` calls `set_entries` → `notify()` unconditionally, so a
+mutation that changes nothing still runs the full downstream chain. Verified by
+probe: identical-value `commit`, `clear` on an empty map, `remove_keys` matching
+nothing, `retain` keeping everything, and `clear_saved` matching nothing all
+notify. (`remove` already guards on `has(key)`.)
+
+Each notification costs a map copy, a React re-render, two full
+`Object.fromEntries` over the dirty map (`grid-shell.tsx:667, 678`), a
+`postMessage`, a host-side `structuredClone`, and an async workspace-state write.
+
+Not only perf: the host's `pendingEditsChanged` handler clears
+`failedSaveTombstone` and calls `retire_save_lifecycle(undefined, 'failed')`
+(`viewer-controller.ts:3568-3571`). So a no-op mutation can retire a failed-save
+lifecycle and drop a tombstone — state changes caused by a write that changed
+nothing. Worth a test either way.
+
+The store is now the single choke point, so one guard in `set_entries` (skip
+`notify` when neither the map contents nor the flag changed) fixes all five
+paths. Cheap and self-contained; scheduled next because it touches only
+`edit-session-store.ts` and so cannot conflict with PR 2's rekey.
 
 ### PR 2 — Source-key edit identity
 

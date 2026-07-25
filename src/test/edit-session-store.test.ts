@@ -234,6 +234,303 @@ describe('edit session store', () => {
         expect(store.get('0:1')).toBeUndefined();
     });
 
+    // A mutation that changes nothing must not notify. Downstream a notification
+    // is not cheap or side-effect-free: a React re-render via
+    // useSyncExternalStore, two Object.fromEntries over the whole dirty map in
+    // grid-shell, a postMessage, a host-side structuredClone and an async
+    // workspace-state write — and the host's pendingEditsChanged handler clears
+    // the failed-save tombstone and retires the save lifecycle, so a write that
+    // changed nothing could retire state that mattered.
+    describe('suppresses no-op mutations', () => {
+        it('commit with an identical value and base', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.commit('s', '0:0', { value: 'a', base: 'A' });
+
+            expect(notifications.n).toBe(0);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+            });
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('clear on an already-empty map', () => {
+            const store = create_edit_session_store({ session_id: 's' });
+            const notifications = count_notifications(store);
+
+            store.clear('s');
+
+            expect(notifications.n).toBe(0);
+            expect(store.size()).toBe(0);
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('remove_keys matching no keys', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.remove_keys('s', new Set(['9:9', '8:8']));
+
+            expect(notifications.n).toBe(0);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+            });
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('retain with a predicate that keeps everything', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            store.retain('s', () => true);
+
+            expect(notifications.n).toBe(0);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('clear_saved matching nothing', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.clear_saved('s', { '9:9': 'whatever' });
+
+            expect(notifications.n).toBe(0);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+            });
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('replace with the same contents', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.replace('s', { '0:0': { value: 'a', base: 'A' } });
+
+            expect(notifications.n).toBe(0);
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        // base_pending is written only when true by the mutators, but `normalize`
+        // stores a restored object verbatim, so an explicit `base_pending: false`
+        // really can be sitting in the map while the entry a mutator builds omits
+        // the field. Absent, undefined and false are the same entry, so the
+        // comparison normalizes to a boolean; an === on the raw field would read
+        // `false !== undefined` and notify on a rewrite that changed nothing.
+        it('an entry rewritten without the explicit base_pending: false it was stored with', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A', base_pending: false },
+            });
+            expect(store.get('0:0')).toEqual({ value: 'a', base: 'A', base_pending: false });
+            expect(store.has_pending_base()).toBe(false);
+            const notifications = count_notifications(store);
+
+            // commit builds `{value, base}` with no flag at all.
+            store.commit('s', '0:0', { value: 'a', base: 'A' });
+            // ...and replace omits it for a non-pending entry, in both directions.
+            store.replace('s', { '0:0': { value: 'a', base: 'A', base_pending: false } });
+
+            expect(notifications.n).toBe(0);
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        // The getSnapshot contract again, from the other side: a suppressed
+        // mutation must not hand out a churning reference. The guard keeps the
+        // *existing* map rather than swapping in the equal candidate, so the
+        // reference is not merely stable from here on — it is the same one a
+        // subscriber already read. A new-but-equal map would be tolerable (no
+        // notify, so React never re-reads immediately) but it would then look like
+        // a change at the next unrelated render; identity is strictly better.
+        it('without churning the snapshot reference', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const before = store.snapshot();
+
+            store.commit('s', '0:0', { value: 'a', base: 'A' });
+            store.retain('s', () => true);
+            store.remove_keys('s', new Set(['9:9']));
+            store.clear_saved('s', {});
+
+            expect(store.snapshot()).toBe(before);
+            expect(store.snapshot()).toBe(store.snapshot());
+        });
+    });
+
+    // The other side of the guard: every real change must still notify exactly
+    // once. These pass with or without the guard by design — they are the
+    // regression fence that keeps a future tightening of the comparison from
+    // swallowing a genuine mutation.
+    describe('still notifies once for a real change', () => {
+        it('commit of a new key', () => {
+            const store = create_edit_session_store({ session_id: 's' });
+            const notifications = count_notifications(store);
+
+            store.commit('s', '0:0', { value: 'a', base: 'A' });
+
+            expect(notifications.n).toBe(1);
+        });
+
+        it('commit that changes only the value', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.commit('s', '0:0', { value: 'a2', base: 'A' });
+
+            expect(notifications.n).toBe(1);
+            expect(store.get('0:0')).toEqual({ value: 'a2', base: 'A' });
+        });
+
+        // `base` drives conflict detection (is_entry_conflicted compares the
+        // current cell against it), so a base-only rebase is a real change even
+        // though the displayed value is identical. An equality check that only
+        // looked at `value` would suppress this and leave conflict detection
+        // judging against a stale base.
+        it('commit that changes only the base', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.commit('s', '0:0', { value: 'a', base: 'A2' });
+
+            expect(notifications.n).toBe(1);
+            expect(store.get('0:0')).toEqual({ value: 'a', base: 'A2' });
+        });
+
+        it('clear on a non-empty map', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.clear('s');
+
+            expect(notifications.n).toBe(1);
+            expect(store.size()).toBe(0);
+        });
+
+        it('remove_keys matching one of two keys', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            store.remove_keys('s', new Set(['0:0', '9:9']));
+
+            expect(notifications.n).toBe(1);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:1': { value: 'b', base: 'B' },
+            });
+        });
+
+        it('retain that drops one of two entries', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            store.retain('s', (key) => key !== '0:0');
+
+            expect(notifications.n).toBe(1);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:1': { value: 'b', base: 'B' },
+            });
+        });
+
+        it('clear_saved that rebases an entry changed since the send', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'newer', base: 'a' },
+            });
+            const notifications = count_notifications(store);
+
+            store.clear_saved('s', { '0:0': 'sent' });
+
+            expect(notifications.n).toBe(1);
+            expect(store.get('0:0')).toEqual({ value: 'newer', base: 'sent' });
+        });
+
+        it('clear_saved that drops a saved entry', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'saved', base: 'a' },
+            });
+            const notifications = count_notifications(store);
+
+            store.clear_saved('s', { '0:0': 'saved' });
+
+            expect(notifications.n).toBe(1);
+            expect(store.size()).toBe(0);
+        });
+
+        // Equal sizes with a different key set: the single forward pass has to
+        // catch this, and does — a key of `prev` missing from `next` forces some
+        // key of `next` to be missing from `prev`.
+        it('a same-size replace that swaps which key is dirty', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.replace('s', { '0:1': { value: 'a', base: 'A' } });
+
+            expect(notifications.n).toBe(1);
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:1': { value: 'a', base: 'A' },
+            });
+        });
+
+        // Contents identical, base_pending flipped: the flag gates the base-capture
+        // effect's hot-path guard and the save gate, so it is part of the state the
+        // guard compares, not just a derived hint.
+        it('a replace that only sets base_pending', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.replace('s', { '0:0': { value: 'a', base: 'A', base_pending: true } });
+
+            expect(notifications.n).toBe(1);
+            expect(store.has_pending_base()).toBe(true);
+        });
+
+        // install crosses a hydration boundary and re-stamps the session, so it
+        // notifies unconditionally — it runs once per grant or restore, never on a
+        // keystroke, and a silently-swallowed install is the kind of bug that
+        // surfaces as a grid that never re-reads.
+        it('install with an identical map', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.install({ session_id: 't' }, { '0:0': { value: 'a', base: 'A' } });
+
+            expect(notifications.n).toBe(1);
+            expect(store.identity()).toEqual({ session_id: 't' });
+        });
+    });
+
     it('retain filters by the caller predicate', () => {
         const store = create_edit_session_store({ session_id: 's' }, {
             '0:0': { value: 'a', base: 'A' },
