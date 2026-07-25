@@ -23,12 +23,20 @@ import {
 } from '../main/window-geometry';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
 import {
+    DEFAULT_THEME_ID,
     REQUIRED_THEME_VARIABLES,
+    THEME_DEFINITIONS,
+    THEME_IDS,
+    list_themes,
+    resolve_theme_id,
+    sanitize_theme_id,
     sanitize_theme_setting,
     THEME_SETTINGS,
-    theme_css_variables,
     theme_payload,
 } from '../main/theme';
+import { build_theme_from_vars } from '../../src/webview/vscode-theme';
+import { notices_file_path } from '../main/notices-path';
+import { REPOSITORY_URL, about_link_url } from '../main/about-links';
 import {
     VIEWER_CSP_SOURCE,
     VIEWER_SCRIPT_URL,
@@ -83,11 +91,35 @@ describe('desktop-config', () => {
         expect(new DesktopConfigStore(file).settings().theme).toBe('dark');
     });
 
+    it('keeps a theme per mode, and rejects a cross-kind swap', () => {
+        expect(DEFAULT_SETTINGS.lightThemeId).toBe('light');
+        expect(DEFAULT_SETTINGS.darkThemeId).toBe('dark');
+        const file = settings_file_path(dir);
+        new DesktopConfigStore(file).update({
+            lightThemeId: 'solarized-light',
+            darkThemeId: 'catppuccin-mocha',
+        });
+        const reread = new DesktopConfigStore(file).settings();
+        expect([reread.lightThemeId, reread.darkThemeId])
+            .toEqual(['solarized-light', 'catppuccin-mocha']);
+        // A hand-edited file with the slots swapped: both slots are validated
+        // against their own fixed kind on every read, so neither survives.
+        expect(sanitize_settings({
+            lightThemeId: 'catppuccin-mocha',
+            darkThemeId: 'solarized-light',
+        })).toMatchObject({ lightThemeId: 'light', darkThemeId: 'dark' });
+        // Picking a theme for the inactive mode is still remembered.
+        expect(sanitize_settings({ theme: 'light', darkThemeId: 'synthwave-84' }).darkThemeId)
+            .toBe('synthwave-84');
+    });
+
     it('sanitizes malformed values', () => {
         expect(sanitize_settings({
             fontFamily: 42,
             fontSize: 'big',
             theme: 'sepia',
+            lightThemeId: 42,
+            darkThemeId: 'nope',
             tabOrientation: 'diagonal',
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
@@ -98,6 +130,8 @@ describe('desktop-config', () => {
             fontFamily: '',
             fontSize: DEFAULT_SETTINGS.fontSize,
             theme: 'system',
+            lightThemeId: 'light',
+            darkThemeId: 'dark',
             tabOrientation: 'vertical',
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
@@ -387,20 +421,25 @@ describe('viewer-panel adapter', () => {
 });
 
 describe('theme', () => {
-    it('provides every --vscode-* variable the webview consumes, for both kinds', () => {
-        for (const kind of ['light', 'dark'] as const) {
-            const vars = theme_css_variables(kind);
+    // Every theme, not just the two built-ins: a ported theme that omits one
+    // variable does not fail loudly, it silently falls back to a hardcoded dark
+    // color inside the Glide grid (see build_theme_from_vars).
+    it('provides every --vscode-* variable the webview consumes, for every theme', () => {
+        for (const id of THEME_IDS) {
+            const vars = theme_payload(id).variables;
             for (const name of REQUIRED_THEME_VARIABLES) {
-                expect(vars[name], `${kind} missing ${name}`).toBeTruthy();
+                expect(vars[name], `${id} missing ${name}`).toBeTruthy();
             }
         }
     });
 
     it('light and dark differ and payload reflects the OS flag', () => {
-        expect(theme_css_variables('light')['--vscode-editor-background'])
-            .not.toBe(theme_css_variables('dark')['--vscode-editor-background']);
-        expect(theme_payload(true).kind).toBe('dark');
-        expect(theme_payload(false).kind).toBe('light');
+        expect(theme_payload('light').variables['--vscode-editor-background'])
+            .not.toBe(theme_payload('dark').variables['--vscode-editor-background']);
+        expect(theme_payload('dark').kind).toBe('dark');
+        expect(theme_payload('light').kind).toBe('light');
+        expect(theme_payload('synthwave-84').kind).toBe('dark');
+        expect(theme_payload('solarized-light').themeId).toBe('solarized-light');
     });
 
     it('accepts only the three appearance settings, defaulting to system', () => {
@@ -409,6 +448,140 @@ describe('theme', () => {
         }
         for (const value of [undefined, null, '', 'Dark', 'sepia', 7, {}]) {
             expect(sanitize_theme_setting(value)).toBe('system');
+        }
+    });
+
+    it('lists exactly the light themes for light and the dark ones for dark', () => {
+        expect(list_themes('light').map((t) => t.id))
+            .toEqual(['light', 'solarized-light', 'catppuccin-latte']);
+        expect(list_themes('dark').map((t) => t.id)).toEqual([
+            'dark', 'solarized-dark', 'catppuccin-frappe',
+            'catppuccin-macchiato', 'catppuccin-mocha', 'synthwave-84',
+        ]);
+        // Every id belongs to exactly one kind's list.
+        expect(list_themes('light').length + list_themes('dark').length)
+            .toBe(THEME_IDS.length);
+    });
+
+    it('rejects unknown AND wrong-kind theme ids', () => {
+        expect(sanitize_theme_id('catppuccin-mocha', 'dark')).toBe('catppuccin-mocha');
+        // Valid id, wrong kind: dormant corruption that would surface the moment
+        // the OS flipped, so it is rejected at read time.
+        expect(sanitize_theme_id('synthwave-84', 'light')).toBe('light');
+        expect(sanitize_theme_id('light', 'dark')).toBe('dark');
+        for (const value of [undefined, null, '', 'Dark', 'sepia', 7, {}]) {
+            expect(sanitize_theme_id(value, 'light')).toBe('light');
+            expect(sanitize_theme_id(value, 'dark')).toBe('dark');
+        }
+    });
+
+    it('resolves the active theme from the mode, one slot each', () => {
+        const slots = { lightThemeId: 'catppuccin-latte', darkThemeId: 'synthwave-84' } as const;
+        expect(resolve_theme_id(slots, false)).toBe('catppuccin-latte');
+        expect(resolve_theme_id(slots, true)).toBe('synthwave-84');
+    });
+
+    it('never lets a theme override the app font', () => {
+        // Fonts are an app-wide preference; every theme must carry the same ones.
+        for (const id of THEME_IDS) {
+            const vars = theme_payload(id).variables;
+            expect(vars['--vscode-font-family'])
+                .toBe(theme_payload('dark').variables['--vscode-font-family']);
+            expect(vars['--vscode-editor-font-family'])
+                .toBe(theme_payload('dark').variables['--vscode-editor-font-family']);
+        }
+    });
+
+    // The teeth behind the SemanticPalette "opaque 6-digit hex" invariant, which
+    // theme-palette.ts relies on when it builds the find highlight and the
+    // info/warning banner fills by *concatenating* an alpha suffix. Paste an
+    // upstream 8-digit color into a palette — which upstream themes routinely
+    // publish, and which the SynthWave '84 notes call out as needing flattening —
+    // and those three become invalid 10-digit strings that CSS drops silently:
+    // one theme's find highlight and banners go transparent, with a green suite.
+    it('paints every theme in opaque or 8-digit hex, never a longer string', () => {
+        const color = /^(#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?|transparent)$/;
+        for (const id of THEME_IDS) {
+            for (const [name, value] of Object.entries(theme_payload(id).variables)) {
+                // The font variables are names and sizes, not colors.
+                if (name.includes('font')) continue;
+                expect(value, `${id} ${name}`).toMatch(color);
+            }
+        }
+    });
+});
+
+// Pins that each theme's variables actually *reach* the canvas grid, rather than
+// being replaced by build_theme_from_vars' hardcoded fallbacks — which are
+// non-empty for every field, so a shape-only assertion here would pass even on an
+// entirely empty variable map. Completeness is the neighbouring
+// REQUIRED_THEME_VARIABLES test's job; this one is about the mapping.
+describe('theme × Glide grid theme', () => {
+    it('maps every theme onto the Glide theme the webview builds', () => {
+        for (const id of THEME_IDS) {
+            const vars = THEME_DEFINITIONS[id].variables;
+            const theme = build_theme_from_vars((name) => vars[name] ?? '');
+            expect(theme.bgCell, id).toBe(vars['--vscode-editor-background']);
+            expect(theme.textDark, id).toBe(vars['--vscode-editor-foreground']);
+            expect(theme.accentColor, id).toBe(vars['--vscode-focusBorder']);
+            expect(theme.accentFg, id).toBe(vars['--vscode-list-activeSelectionForeground']);
+            expect(theme.accentLight, id).toBe(vars['--vscode-editor-selectionBackground']);
+            expect(theme.bgHeader, id).toBe(vars['--vscode-editorGroupHeader-tabsBackground']);
+            expect(theme.bgHeaderHovered, id).toBe(vars['--vscode-list-hoverBackground']);
+            expect(theme.borderColor, id).toBe(vars['--vscode-editorWidget-border']);
+            expect(theme.textMedium, id).toBe(vars['--vscode-descriptionForeground']);
+            expect(theme.textLight, id).toBe(vars['--vscode-disabledForeground']);
+            expect(theme.linkColor, id).toBe(vars['--vscode-textLink-foreground']);
+            expect(theme.bgSearchResult, id)
+                .toBe(vars['--vscode-editor-findMatchHighlightBackground']);
+            // The grid font comes from the theme's mono family (the app-wide font
+            // preference overrides it at runtime via --table-viewer-font-family,
+            // which no theme sets).
+            expect(theme.fontFamily, id).toBe(vars['--vscode-editor-font-family']);
+        }
+    });
+
+    // Backstop for the fields the mapping assertions above do not name one by one.
+    it('leaves no Glide theme field empty for any shipped theme', () => {
+        for (const id of THEME_IDS) {
+            const vars = THEME_DEFINITIONS[id].variables;
+            const theme = build_theme_from_vars((name) => vars[name] ?? '');
+            for (const [field, value] of Object.entries(theme)) {
+                expect(typeof value, `${id}.${field}`).toBe('string');
+                expect((value as string).trim(), `${id}.${field} is empty`).not.toBe('');
+            }
+        }
+    });
+});
+
+describe('notices path', () => {
+    // electron-builder excludes the file from `files` and ships it via
+    // extraResources instead, so packaged and dev builds look in different
+    // places — and it is easy to get backwards.
+    it('reads from Resources when packaged and from dist/desktop in dev', () => {
+        expect(notices_file_path(true, '/App/Contents/Resources', '/repo/dist/desktop'))
+            .toBe(path.join('/App/Contents/Resources', 'THIRD_PARTY_NOTICES.txt'));
+        expect(notices_file_path(false, '/App/Contents/Resources', '/repo/dist/desktop'))
+            .toBe(path.join('/repo/dist/desktop', 'THIRD_PARTY_NOTICES.txt'));
+    });
+});
+
+describe('about links', () => {
+    it('resolves the two link targets to repository URLs', () => {
+        expect(about_link_url('license')).toBe(`${REPOSITORY_URL}/blob/main/LICENSE`);
+        expect(about_link_url('notices')).toBe(`${REPOSITORY_URL}/blob/main/NOTICE.md`);
+    });
+
+    // The renderer picks the target name, so anything it can send must resolve to
+    // a string or to nothing. A plain `LINKS[target]` answers a truthy *function*
+    // for these three, and handing one to shell.openExternal throws out of the
+    // ipcMain listener — an uncaught main-process exception from a button click.
+    it('never resolves an inherited property or a non-string target', () => {
+        for (const target of ['__proto__', 'constructor', 'toString', 'valueOf', 'repository', '']) {
+            expect(about_link_url(target), target).toBeUndefined();
+        }
+        for (const target of [undefined, null, 7, {}, ['license']]) {
+            expect(about_link_url(target), String(target)).toBeUndefined();
         }
     });
 });
@@ -441,18 +614,18 @@ describe('viewer html', () => {
     // preload, which crashed before it could (documentElement is null that
     // early), leaving the grid on its dark fallbacks in light mode forever.
     it('bakes the light palette into the page so the grid paints light', () => {
-        const html = build_desktop_viewer_html(null, null, theme_payload(false));
+        const html = build_desktop_viewer_html(null, null, theme_payload('light'));
         expect(html).toContain('"--vscode-editor-background"');
         expect(html).toContain(
-            `"${theme_css_variables('light')['--vscode-editor-background']}"`,
+            `"${theme_payload('light').variables['--vscode-editor-background']}"`,
         );
         expect(html).toContain('r.style.colorScheme = "light"');
     });
 
     it('bakes the dark palette in when the OS is dark', () => {
-        const html = build_desktop_viewer_html(null, null, theme_payload(true));
+        const html = build_desktop_viewer_html(null, null, theme_payload('dark'));
         expect(html).toContain(
-            `"${theme_css_variables('dark')['--vscode-editor-background']}"`,
+            `"${theme_payload('dark').variables['--vscode-editor-background']}"`,
         );
         expect(html).toContain('r.style.colorScheme = "dark"');
     });
@@ -470,7 +643,7 @@ describe('viewer html', () => {
     });
 
     it('bootstraps every variable the webview consumes', () => {
-        const html = build_desktop_viewer_html(null, null, theme_payload(false));
+        const html = build_desktop_viewer_html(null, null, theme_payload('light'));
         for (const name of REQUIRED_THEME_VARIABLES) {
             expect(html, `missing ${name}`).toContain(`"${name}"`);
         }

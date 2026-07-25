@@ -5,7 +5,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { ConfigPort, Disposable } from '../../src/host-ports';
-import { sanitize_theme_setting, type ThemeSetting } from './theme';
+import {
+    sanitize_theme_id,
+    sanitize_theme_setting,
+    type ThemeId,
+    type ThemeSetting,
+} from './theme';
 import {
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
@@ -26,6 +31,11 @@ export interface DesktopSettings {
     fontSize: number;
     /** Appearance: follow the OS, or pin light / dark. */
     theme: ThemeSetting;
+    /** Which theme paints light mode, and which paints dark mode. Two slots,
+     *  not one: switching appearance back and forth must not lose the theme
+     *  picked for the other mode. `theme` above still decides *which* mode. */
+    lightThemeId: ThemeId;
+    darkThemeId: ThemeId;
     tabOrientation: 'horizontal' | 'vertical';
     csvMaxRows: number;
     maxFileSizeMiB: number;
@@ -49,6 +59,8 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     fontFamily: '',
     fontSize: 13,
     theme: 'system',
+    lightThemeId: 'light',
+    darkThemeId: 'dark',
     tabOrientation: 'vertical',
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
@@ -81,6 +93,11 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
             MAX_FONT_SIZE_PX,
         ),
         theme: sanitize_theme_setting(record.theme),
+        // Each slot is validated against its own fixed kind, always — not just
+        // the slot the current appearance uses. Validating only the active one
+        // would let a corrupt inactive value lie dormant until the OS flipped.
+        lightThemeId: sanitize_theme_id(record.lightThemeId, 'light'),
+        darkThemeId: sanitize_theme_id(record.darkThemeId, 'dark'),
         tabOrientation: record.tabOrientation === 'horizontal' ? 'horizontal' : 'vertical',
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),

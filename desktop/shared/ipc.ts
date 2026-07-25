@@ -20,3 +20,8 @@ export const CHANNEL_PREFS_SET = 'prefs:set';
 /** Main → every renderer: settings were updated (DesktopSettings payload), so
  *  the app chrome can follow the configured font. */
 export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';
+
+/** About window channels. */
+export const CHANNEL_ABOUT_GET_INFO = 'about:getInfo';
+export const CHANNEL_ABOUT_OPEN_LINK = 'about:openLink';
+export const CHANNEL_ABOUT_OPEN_NOTICES = 'about:openNotices';

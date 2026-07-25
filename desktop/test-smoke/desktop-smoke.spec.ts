@@ -16,6 +16,11 @@ import { click_menu_item as click_menu, main_js, repo_dir } from './smoke-helper
 const csv_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.csv');
 const xlsx_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx');
 
+/** The app's real version — the same file desktop/build.mjs injects from. */
+const app_version = (
+    JSON.parse(fs.readFileSync(path.join(repo_dir, 'package.json'), 'utf8')) as { version: string }
+).version;
+
 const VIEWER_URL_PREFIX = 'tv-app://viewer';
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
 
@@ -280,6 +285,7 @@ test('the appearance preference pins light/dark, and System restores OS followin
     await expect.poll(prefs_page, { timeout: 15_000 }).toBeTruthy();
     const prefs = prefs_page()!;
     const appearance = prefs.locator('#theme');
+    const color_theme = prefs.locator('#colorTheme');
     await expect(appearance).toHaveValue('system');
 
     const editor_background = () =>
@@ -294,6 +300,36 @@ test('the appearance preference pins light/dark, and System restores OS followin
         await app.evaluate(({ nativeTheme }) => {
             nativeTheme.themeSource = 'light';
         });
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#ffffff');
+
+        // Light mode offers exactly the light themes, selected on the default.
+        await expect(color_theme.locator('option')).toHaveCount(3);
+        await expect(color_theme).toHaveValue('light');
+
+        // Flipping the OS while Preferences is open must retarget the dropdown
+        // live — under Appearance=System its meaning *is* the current mode.
+        // No reload: the list is rebuilt from the theme payload it already gets.
+        await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
+        await expect(color_theme.locator('option')).toHaveCount(6);
+        await expect(color_theme).toHaveValue('dark');
+
+        // Picking a non-default theme repaints the open viewer windows.
+        await color_theme.selectOption('solarized-dark');
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#002b36');
+
+        // The other mode keeps its own theme, and coming back restores this one.
+        await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'light'; });
+        await expect(color_theme).toHaveValue('light');
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#ffffff');
+        await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
+        await expect(color_theme).toHaveValue('solarized-dark');
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#002b36');
+
+        // Restore the dark default before the appearance assertions below, which
+        // expect Dark's #1e1e1e.
+        await color_theme.selectOption('dark');
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#1e1e1e');
+        await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'light'; });
         await expect.poll(editor_background, { timeout: 5_000 }).toBe('#ffffff');
 
         // Each pin flips the palette away from what the previous step left.
@@ -321,6 +357,46 @@ test('the appearance preference pins light/dark, and System restores OS followin
             nativeTheme.themeSource = 'system';
             BrowserWindow.getAllWindows()
                 .find((window) => window.getTitle().includes('Preferences'))
+                ?.close();
+        });
+    }
+});
+
+// The About window is custom rather than the native panel (GPLv3 wants the
+// license and warranty notice reachable, and the native macOS panel cannot host
+// links). Deliberately does not assert shell.openExternal/openPath actually
+// launched anything — only that the controls exist and are wired.
+test('the About window shows the app version and its notice links', async () => {
+    // About lives on the app menu on macOS and under Help elsewhere, so scan
+    // every top-level menu rather than naming one: the mac app menu's label is
+    // `app.name`, which is `table-viewer` in an unpackaged dev run.
+    const opened = await app.evaluate(({ BrowserWindow, Menu }) => {
+        for (const menu of Menu.getApplicationMenu()?.items ?? []) {
+            const item = menu.submenu?.items.find((entry) => entry.label === 'About Table Viewer');
+            if (!item?.click) continue;
+            item.click(item, BrowserWindow.getFocusedWindow() ?? undefined, {});
+            return true;
+        }
+        return false;
+    });
+    expect(opened, 'an About Table Viewer menu item exists').toBe(true);
+
+    const about_page = () => app.windows().find((page) => page.url().endsWith('about.html'));
+    try {
+        await expect.poll(about_page, { timeout: 15_000 }).toBeTruthy();
+        const about = about_page()!;
+        // Compared against the root package.json, not a loose version-shaped
+        // regex: the bug this guards is the window showing *a* plausible version
+        // that is not the app's (app.getVersion() reports Electron's own version
+        // in an unpackaged dev run), which any /\d+\.\d+\.\d+/ happily accepts.
+        await expect(about.locator('#version')).toHaveText(`Version ${app_version}`);
+        for (const id of ['#license', '#notices', '#bundledNotices']) {
+            await expect(about.locator(id)).toBeVisible();
+        }
+    } finally {
+        await app.evaluate(({ BrowserWindow }) => {
+            BrowserWindow.getAllWindows()
+                .find((window) => window.getTitle().includes('About'))
                 ?.close();
         });
     }
