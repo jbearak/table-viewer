@@ -98,6 +98,13 @@ jobs:
   # broken .vsix.
   desktop:
     runs-on: macos-latest
+    # Notarization waits on Apple, whose turnaround is minutes usually but not
+    # bounded by anything we control. Without this the job would inherit
+    # GitHub's 6h default and sit on a macOS runner (billed at 10x) that whole
+    # time before anyone learned the release had stalled. Packaging itself takes
+    # ~5 min, so this is almost entirely notarization headroom: generous enough
+    # not to kill a slow-but-working run, short enough to fail visibly.
+    timeout-minutes: 90
     # The Apple signing secrets live in the `release` environment, so this job
     # must run in it to read them. Note the consequence: if that environment
     # ever gains required reviewers, this build job waits for approval too, not
