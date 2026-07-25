@@ -54,6 +54,12 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 
 The font family and font size preferences style the whole app — viewer windows, the welcome window, and the Preferences window itself — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 
+## Unsaved CSV edits
+
+Unsaved edits are durable: the shared controller persists `pendingEdits` per file in the state store and hands them back when the file is reopened, so closing a window does not lose a draft — it comes back where you left it (hot-exit semantics, the same as the VS Code extension). Closing therefore does not prompt.
+
+Because the draft is invisible until then, the window says so instead: `desktop/main/dirty-state.ts` derives an "unsaved edits" flag from the viewer protocol messages already passing through `viewer-windows.ts`, and the window marks itself edited — a dot in the close button on macOS (`setDocumentEdited`, which needs the represented filename that is already set), a `•` before the file name in the title elsewhere. The flag comes from both directions, and needs both: the webview posts `pendingEditsChanged` while editing (and `null` after a save), but a draft *restored* from an earlier session arrives host → webview in `editSessionResult` / `workbookSnapshot`, since the webview only echoes `pendingEditsChanged` once it is in edit mode with a session.
+
 ## Zoom
 
 **View → Zoom In / Zoom Out / Actual Size** (`Cmd/Ctrl` with `+`, `-`, `0`) zoom the focused window only, like a browser tab or Excel's per-workbook zoom. The menu items are custom rather than the stock zoom roles so the level stays inside the range in `desktop/main/zoom.ts`.
