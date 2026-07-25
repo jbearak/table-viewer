@@ -21,6 +21,7 @@ import {
     get_delimiter,
     type ConfigPort,
     type Disposable,
+    type FileStat,
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
@@ -2551,20 +2552,62 @@ export function attach_viewer(
             if (!save_operation_is_current(operation)) return;
             const snapshot_changed = current_stat.mtime !== verified_stat.mtime
                 || current_stat.size !== verified_stat.size;
+
+            // Shared refusal path: both the full verification below and the final
+            // pre-write re-stat must report a conflict identically, so a detected
+            // race never surfaces as a generic "Failed to save" error.
+            const refuse_as_external_change = async (): Promise<void> => {
+                show_owner_warning(
+                    'File was modified externally. Please review the changes and try again.',
+                );
+                if (!disposed) await refresh_panel_source(true, 'recovery');
+                if (!save_operation_is_current(operation)) return;
+                finish_save_failure(operation);
+            };
+
             if (
                 snapshot_changed
                 || content_digest(current_raw) !== expected_digest
                 || source_authority.authorityRevision !== expected_authority
                 || expected_authority !== file_coordinator.authority().authorityRevision
             ) {
-                show_owner_warning(
-                    'File was modified externally. Please review the changes and try again.',
-                );
-                // This remains the explicitly known pre-check/pre-write TOCTOU:
-                // watcher coordination does not close the final filesystem gap.
-                if (!disposed) await refresh_panel_source(true, 'recovery');
-                if (!save_operation_is_current(operation)) return;
-                finish_save_failure(operation);
+                await refuse_as_external_change();
+                return;
+            }
+
+            // Narrow (but do not close) the pre-check/pre-write TOCTOU.
+            //
+            // The verification above ends with a synchronous sha256 over the whole
+            // file, so on a large CSV the gap between `verified_stat` and the write
+            // was dominated by that hash — hundreds of milliseconds in which an
+            // external write was silently overwritten. This final cheap stat moves
+            // the observation to the last possible moment: there is deliberately no
+            // `await` between it and `write_file`, so the remaining window is the
+            // filesystem's own, not one we added by hashing.
+            //
+            // What this does NOT close, and cannot:
+            //  - A write landing between this stat and `write_file` is still lost.
+            //    Detection here is best-effort narrowing, not mutual exclusion;
+            //    only an advisory lock or an OS-level compare-and-swap would close
+            //    it, and `FileSystemPort` exposes no handle to build either on.
+            //  - A same-size write within the same coarse mtime tick is invisible
+            //    to any {size, mtime} comparison. Such an edit is caught only by
+            //    the digest check above, and only if it lands before the read.
+            let final_stat: FileStat;
+            try {
+                final_stat = await host.fs.stat(uri);
+            } catch {
+                // A file that cannot be stat'ed right before the write is a race,
+                // not a save bug: refuse rather than clobbering blind.
+                await refuse_as_external_change();
+                return;
+            }
+            if (!save_operation_is_current(operation)) return;
+            if (
+                final_stat.mtime !== verified_stat.mtime
+                || final_stat.size !== verified_stat.size
+            ) {
+                await refuse_as_external_change();
                 return;
             }
 
