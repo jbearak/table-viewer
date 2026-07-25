@@ -58,6 +58,9 @@ fileAssociations:
     rank: Alternate
 mac:
   category: public.app-category.productivity
+  # 1024x1024 master; electron-builder generates the .icns slices at package
+  # time. This is also the auto-detected default path — explicit for clarity.
+  icon: build/icon.png
   # v1 ships unsigned local builds (no notarization / auto-update yet).
   identity: null
   target:

@@ -12,3 +12,7 @@ docs/**
 scripts/**
 vitest.config.ts
 test-results/**
+# Desktop icon master (electron-builder buildResources); media/icon-128.png is
+# the one the marketplace listing uses and must stay in the .vsix.
+build/**
+design_handoff_app_icon/**

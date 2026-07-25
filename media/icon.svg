@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<defs>
+<linearGradient id="thermal" x1="14" y1="0" x2="114" y2="0" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#5AB6FF"></stop><stop offset=".30" stop-color="#B9D6FF"></stop><stop offset=".55" stop-color="#FFE6B0"></stop><stop offset=".78" stop-color="#FFA84A"></stop><stop offset="1" stop-color="#D6342C"></stop>
+</linearGradient>
+<filter id="blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"></feGaussianBlur></filter>
+<clipPath id="clip"><rect x="20" y="26" width="88" height="76" rx="5"></rect></clipPath>
+<mask id="glow" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128">
+<rect width="128" height="128" fill="black"></rect>
+<g filter="url(#blur)" fill="none" stroke="white" stroke-width="5" opacity=".42"><rect x="20" y="26" width="88" height="76" rx="5"></rect><path d="M20 46H108M20 64.7H108M20 83.3H108M49.3 26V102M78.7 26V102"></path></g>
+<g fill="none" stroke="white" stroke-width="1.2"><rect x="20" y="26" width="88" height="76" rx="5"></rect><path d="M20 46H108M20 64.7H108M20 83.3H108M49.3 26V102M78.7 26V102"></path></g>
+</mask>
+</defs>
+<rect width="128" height="128" rx="24" fill="#0A0A0E"></rect>
+<g clip-path="url(#clip)"><g mask="url(#glow)"><rect width="128" height="128" fill="url(#thermal)"></rect></g></g>
+<g fill="none" stroke="#FFD66B" stroke-width="1" stroke-linecap="round"><rect x="20" y="26" width="88" height="76" rx="5"></rect><path d="M20 46H108M20 64.7H108M20 83.3H108M49.3 26V102M78.7 26V102"></path></g>
+</svg>
