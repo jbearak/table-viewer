@@ -54,6 +54,8 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 
 The font family and font size preferences style the whole app — viewer windows, the welcome window, and the Preferences window itself — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 
+The Appearance preference (`theme`) is `system` by default, which follows the OS light/dark setting; `light` and `dark` pin it. It is applied by handing the value to Electron's `nativeTheme.themeSource`, so the rest of the theming path is unchanged — everything downstream still reads `nativeTheme.shouldUseDarkColors` (see `desktop/main/theme.ts`).
+
 ## Unsaved CSV edits
 
 Unsaved edits are durable: the shared controller persists `pendingEdits` per file in the state store and hands them back when the file is reopened, so closing a window does not lose a draft — it comes back where you left it (hot-exit semantics, the same as the VS Code extension). Closing therefore does not prompt.

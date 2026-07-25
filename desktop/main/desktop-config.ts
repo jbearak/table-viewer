@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { ConfigPort, Disposable } from '../../src/host-ports';
+import { sanitize_theme_setting, type ThemeSetting } from './theme';
 import {
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
@@ -23,6 +24,8 @@ export interface DesktopSettings {
     fontFamily: string;
     /** Font size in px, applied to the whole app (viewer windows, welcome, prefs). */
     fontSize: number;
+    /** Appearance: follow the OS, or pin light / dark. */
+    theme: ThemeSetting;
     tabOrientation: 'horizontal' | 'vertical';
     csvMaxRows: number;
     maxFileSizeMiB: number;
@@ -37,13 +40,15 @@ export interface DesktopSettings {
 export const MIN_FONT_SIZE_PX = 8;
 export const MAX_FONT_SIZE_PX = 32;
 
-/** Defaults mirror the VS Code contribution defaults in package.json, except
- *  the worksheet tab orientation, which is vertical here (there is no editor
- *  tab strip to compete with) and the font size, which has no editor setting
- *  to inherit on the desktop. */
+/** Defaults mirror the VS Code contribution defaults in package.json, except:
+ *  the worksheet tab orientation, which is vertical here (there is no editor tab
+ *  strip to compete with); the font size, which has no editor setting to inherit
+ *  on the desktop; and the appearance, which has no counterpart at all (in VS
+ *  Code the viewer takes the editor's theme). */
 export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     fontFamily: '',
     fontSize: 13,
+    theme: 'system',
     tabOrientation: 'vertical',
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
@@ -75,6 +80,7 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
             MIN_FONT_SIZE_PX,
             MAX_FONT_SIZE_PX,
         ),
+        theme: sanitize_theme_setting(record.theme),
         tabOrientation: record.tabOrientation === 'horizontal' ? 'horizontal' : 'vertical',
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),

@@ -10,6 +10,17 @@
 
 export type ThemeKind = 'light' | 'dark';
 
+/** The user's appearance preference. `system` follows the OS (the default) and is
+ *  fed straight to Electron's `nativeTheme.themeSource`, which then decides
+ *  `shouldUseDarkColors` for us — so the rest of the theming path is unchanged. */
+export type ThemeSetting = 'system' | 'light' | 'dark';
+
+export const THEME_SETTINGS: readonly ThemeSetting[] = ['system', 'light', 'dark'];
+
+export function sanitize_theme_setting(value: unknown): ThemeSetting {
+    return THEME_SETTINGS.includes(value as ThemeSetting) ? (value as ThemeSetting) : 'system';
+}
+
 /** Variables consumed by src/webview/vscode-theme.ts (the Glide canvas theme). */
 const GRID_THEME_VARIABLES = [
     '--vscode-editor-background',
@@ -186,6 +197,12 @@ const LIGHT: Record<string, string> = {
     '--vscode-textLink-activeForeground': '#005fb8',
     '--vscode-widget-border': '#c8c8c8',
 };
+
+/** Native window background, painted before the page loads and repainted when the
+ *  appearance changes — otherwise the frame flashes, or keeps, the wrong color. */
+export function window_background_color(kind: ThemeKind): string {
+    return (kind === 'dark' ? DARK : LIGHT)['--vscode-editor-background'];
+}
 
 /** Also set on <html> so the page background matches before CSS loads. */
 export function theme_css_variables(kind: ThemeKind): Record<string, string> {
