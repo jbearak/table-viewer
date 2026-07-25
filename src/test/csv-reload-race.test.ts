@@ -1836,10 +1836,12 @@ describe('CSV reload races', () => {
         let bytes = enc.encode('h\na\n');
         const writes: string[] = [];
 
+        const observed_mtimes: number[] = [];
         vscode_mock.__setStatImplementation(async () => {
             if (!saving) return { size: bytes.byteLength, mtime };
             stats_during_save += 1;
             const observed = { size: bytes.byteLength, mtime };
+            observed_mtimes.push(observed.mtime);
             if (stats_during_save === 2) {
                 // verified_stat has just observed a clean file. The external
                 // writer replaces it right now, shrinking it.
@@ -1862,6 +1864,15 @@ describe('CSV reload races', () => {
         saving = true;
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
 
+        // Pin the injection point. The verification block's two stats must both
+        // observe the clean file, and the third -- the pre-write stat -- must be
+        // the one that sees mtime 99. If anyone later adds a stat inside the save
+        // before the verification block, the external write would land early
+        // enough for the pre-existing `snapshot_changed` branch to catch it, and
+        // this test would stay green while silently no longer exercising the
+        // pre-write stat. Assert the shape so that fails loudly instead.
+        // (Stats past the third belong to the conflict-recovery refresh.)
+        expect(observed_mtimes.slice(0, 3)).toEqual([1, 1, 99]);
         // The external write must survive: we must not have written at all.
         expect(writes).toEqual([]);
         // And the user must be told, not silently clobbered.
@@ -1873,6 +1884,7 @@ describe('CSV reload races', () => {
         expect(panel.__messages).toContainEqual(
             expect.objectContaining({ type: 'saveResult', success: false }),
         );
+        panel.dispose();
     });
 
     it('treats a pre-write stat failure as a conflict, not a save error', async () => {
@@ -1912,6 +1924,9 @@ describe('CSV reload races', () => {
             expect.stringContaining('modified externally'),
         );
         expect(error_spy).not.toHaveBeenCalled();
+        // The refusal's recovery refresh arms a bounded reload retry; dispose
+        // here rather than relying on the next test's beforeEach to do it.
+        panel.dispose();
     });
 
     it('refuses a same-size same-mtime external edit before saving', async () => {

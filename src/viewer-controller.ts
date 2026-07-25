@@ -2577,22 +2577,30 @@ export function attach_viewer(
 
             // Narrow (but do not close) the pre-check/pre-write TOCTOU.
             //
-            // The verification above ends with a synchronous sha256 over the whole
-            // file, so on a large CSV the gap between `verified_stat` and the write
-            // was dominated by that hash — hundreds of milliseconds in which an
-            // external write was silently overwritten. This final cheap stat moves
-            // the observation to the last possible moment: there is deliberately no
-            // `await` between it and `write_file`, so the remaining window is the
-            // filesystem's own, not one we added by hashing.
+            // The verification above has a synchronous sha256 over the whole file as
+            // its last expensive step, so on a large CSV the gap between
+            // `verified_stat` and the write was dominated by that hash — hundreds of
+            // milliseconds in which an external write was silently overwritten. This
+            // final cheap stat moves the observation to the last possible moment:
+            // there is deliberately no `await` between it and `write_file`, so we no
+            // longer carry a self-inflicted hashing delay inside the gap.
             //
             // What this does NOT close, and cannot:
             //  - A write landing between this stat and `write_file` is still lost.
-            //    Detection here is best-effort narrowing, not mutual exclusion;
-            //    only an advisory lock or an OS-level compare-and-swap would close
-            //    it, and `FileSystemPort` exposes no handle to build either on.
+            //    The gap is now the filesystem's own plus the event-loop turn that
+            //    resumes this continuation — small, but not zero. Detection here is
+            //    best-effort narrowing, not mutual exclusion; only an advisory lock
+            //    or an OS-level compare-and-swap would close it, and
+            //    `FileSystemPort` exposes no handle to build either on.
             //  - A same-size write within the same coarse mtime tick is invisible
             //    to any {size, mtime} comparison. Such an edit is caught only by
             //    the digest check above, and only if it lands before the read.
+            //
+            // Triage note: on attribute-caching network filesystems (NFS/SMB) this
+            // stat can land after cache expiry when the two earlier stats were served
+            // from cache, so it may reveal a server-side change they hid. Refusing is
+            // correct there — that save used to clobber silently — but it is a new
+            // refusal on a path that previously appeared to succeed.
             let final_stat: FileStat;
             try {
                 final_stat = await host.fs.stat(uri);
