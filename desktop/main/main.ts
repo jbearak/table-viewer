@@ -25,7 +25,14 @@ import {
 } from '../../src/json-file-state-store';
 import { DesktopConfigStore, settings_file_path } from './desktop-config';
 import { ViewerWindowManager } from './viewer-windows';
-import { theme_payload, window_background_color, type ThemeSetting } from './theme';
+import {
+    resolve_theme_id,
+    theme_payload,
+    window_background_color,
+    type ThemeId,
+    type ThemeSetting,
+} from './theme';
+import { notices_file_path } from './notices-path';
 import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
@@ -34,6 +41,9 @@ import {
     is_viewer_host,
 } from './viewer-html';
 import {
+    CHANNEL_ABOUT_GET_INFO,
+    CHANNEL_ABOUT_OPEN_LINK,
+    CHANNEL_ABOUT_OPEN_NOTICES,
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
@@ -44,6 +54,15 @@ import {
 } from '../shared/ipc';
 
 const SUPPORTED_EXTENSIONS = ['csv', 'tsv', 'xlsx', 'xls'];
+
+const REPOSITORY_URL = 'https://github.com/jbearak/table-viewer';
+/** The main process owns these, so a compromised About renderer cannot talk
+ *  shell.openExternal into opening an arbitrary URL. */
+const ABOUT_LINKS: Record<string, string> = {
+    repository: REPOSITORY_URL,
+    license: `${REPOSITORY_URL}/blob/main/LICENSE`,
+    notices: `${REPOSITORY_URL}/blob/main/NOTICE.md`,
+};
 
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
@@ -65,10 +84,12 @@ const DESKTOP_DIST_DIR = path.join(DIST_DIR, 'desktop');
 const VIEWER_PRELOAD = path.join(DESKTOP_DIST_DIR, 'viewer-preload.js');
 const WELCOME_PRELOAD = path.join(DESKTOP_DIST_DIR, 'welcome-preload.js');
 const PREFS_PRELOAD = path.join(DESKTOP_DIST_DIR, 'prefs-preload.js');
+const ABOUT_PRELOAD = path.join(DESKTOP_DIST_DIR, 'about-preload.js');
 
 let config_store: DesktopConfigStore;
 let viewer_windows: ViewerWindowManager | undefined;
 let prefs_window: BrowserWindow | undefined;
+let about_window: BrowserWindow | undefined;
 /** Open launcher windows; tracked so opening a file can replace the one it was
  *  launched from (a viewer window that opens a file keeps its own file). */
 const welcome_windows = new Set<BrowserWindow>();
@@ -84,6 +105,15 @@ protocol.registerSchemesAsPrivileged([
     },
 ]);
 
+/** The theme to paint with right now: the appearance preference has already been
+ *  handed to Electron (`apply_theme_source`), so `shouldUseDarkColors` is the
+ *  resolved mode, and the settings hold one theme per mode. Every theme lookup
+ *  in this file goes through here — a call site that recomputes the mode itself
+ *  gets the mode right and silently ignores the user's theme choice. */
+function current_theme_id(): ThemeId {
+    return resolve_theme_id(config_store.settings(), nativeTheme.shouldUseDarkColors);
+}
+
 function register_app_protocol(): void {
     const webview_assets = new Map<string, { file: string; mime: string }>([
         ['index.js', { file: path.join(WEBVIEW_DIST_DIR, 'index.js'), mime: 'text/javascript' }],
@@ -96,7 +126,7 @@ function register_app_protocol(): void {
             const html = build_desktop_viewer_html(
                 config.font_family(),
                 config.font_size(),
-                theme_payload(nativeTheme.shouldUseDarkColors),
+                theme_payload(current_theme_id()),
             );
             return new Response(html, {
                 headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -158,7 +188,7 @@ function show_welcome_window(): BrowserWindow {
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer',
-        backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
+        backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: WELCOME_PRELOAD,
             contextIsolation: true,
@@ -192,13 +222,16 @@ function show_preferences_window(): void {
     }
     prefs_window = new BrowserWindow({
         width: 460,
-        height: 600,
+        // Fixed size, so the height must cover every field; the color-theme
+        // field pushed the last controls (and the font-size input, the only way
+        // back from an unreadable font) below the fold at 600.
+        height: 640,
         resizable: false,
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer Preferences',
-        backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
+        backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: PREFS_PRELOAD,
             contextIsolation: true,
@@ -209,6 +242,36 @@ function show_preferences_window(): void {
         prefs_window = undefined;
     });
     void prefs_window.loadFile(path.join(DESKTOP_DIST_DIR, 'prefs.html'));
+}
+
+/** A custom About window rather than the native panel: GPLv3 expects an
+ *  interactive program to surface its license and warranty notice, and the
+ *  native macOS About panel cannot host the links that makes practical.
+ *  Singleton, like Preferences. */
+function show_about_window(): void {
+    if (about_window && !about_window.isDestroyed()) {
+        about_window.focus();
+        return;
+    }
+    about_window = new BrowserWindow({
+        width: 380,
+        height: 400,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        title: 'About Table Viewer',
+        backgroundColor: window_background_color(current_theme_id()),
+        webPreferences: {
+            preload: ABOUT_PRELOAD,
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+    });
+    about_window.once('closed', () => {
+        about_window = undefined;
+    });
+    void about_window.loadFile(path.join(DESKTOP_DIST_DIR, 'about.html'));
 }
 
 /**
@@ -240,7 +303,10 @@ function build_menu(): void {
             ? [{
                 label: app.name,
                 submenu: [
-                    { role: 'about' as const },
+                    {
+                        label: 'About Table Viewer',
+                        click: () => show_about_window(),
+                    },
                     { type: 'separator' as const },
                     {
                         label: 'Preferences…',
@@ -359,9 +425,19 @@ function build_menu(): void {
             submenu: [
                 {
                     label: 'Table Viewer on GitHub',
-                    click: () =>
-                        void shell.openExternal('https://github.com/jbearak/table-viewer'),
+                    click: () => void shell.openExternal(REPOSITORY_URL),
                 },
+                // macOS already has About on the app menu, and a mac Help menu
+                // does not customarily duplicate it.
+                ...(is_mac
+                    ? []
+                    : [
+                        { type: 'separator' as const },
+                        {
+                            label: 'About Table Viewer',
+                            click: () => show_about_window(),
+                        },
+                    ]),
             ],
         },
     ];
@@ -370,7 +446,7 @@ function build_menu(): void {
 
 function register_ipc(): void {
     ipcMain.on(CHANNEL_GET_THEME, (event) => {
-        event.returnValue = theme_payload(nativeTheme.shouldUseDarkColors);
+        event.returnValue = theme_payload(current_theme_id());
     });
     ipcMain.on(CHANNEL_WELCOME_OPEN_FILES, (event) => {
         void show_open_dialog(BrowserWindow.fromWebContents(event.sender) ?? undefined);
@@ -382,6 +458,35 @@ function register_ipc(): void {
             (partial && typeof partial === 'object' ? partial : {}) as Record<string, never>,
         );
     });
+    // Sync, matching CHANNEL_GET_THEME: the renderer needs it before first paint.
+    // Only the version — the display name is hardcoded in about.html because
+    // `app.name` is the package name (`table-viewer`) outside a packaged build.
+    ipcMain.on(CHANNEL_ABOUT_GET_INFO, (event) => {
+        event.returnValue = { version: app.getVersion() };
+    });
+    ipcMain.on(CHANNEL_ABOUT_OPEN_LINK, (_event, target: unknown) => {
+        const url = typeof target === 'string' ? ABOUT_LINKS[target] : undefined;
+        if (url) void shell.openExternal(url);
+    });
+    ipcMain.on(CHANNEL_ABOUT_OPEN_NOTICES, () => {
+        const file = notices_file_path(
+            app.isPackaged,
+            // Not on the `types: ["node"]` Process type — electron adds it.
+            (process as { resourcesPath?: string }).resourcesPath ?? '',
+            DESKTOP_DIST_DIR,
+        );
+        // openPath resolves to a non-empty *error string* rather than rejecting;
+        // in a dev tree the file only exists once collect-licenses.mjs has run,
+        // so say so loudly instead of no-oping.
+        void shell.openPath(file).then((error) => {
+            if (error) {
+                dialog.showErrorBox(
+                    'Could not open the third-party notices',
+                    `${file}\n\n${error}`,
+                );
+            }
+        });
+    });
 }
 
 /** Push the current palette to every window: the page CSS over the theme channel,
@@ -389,10 +494,10 @@ function register_ipc(): void {
  *  manager, the chrome windows here. A frame whose background is not repainted
  *  keeps the old color behind and around its page. */
 function broadcast_theme(): void {
-    const payload = theme_payload(nativeTheme.shouldUseDarkColors);
-    const background = window_background_color(payload.kind);
+    const payload = theme_payload(current_theme_id());
+    const background = window_background_color(payload.themeId);
     viewer_windows?.apply_theme(payload);
-    for (const window of [...welcome_windows, prefs_window]) {
+    for (const window of [...welcome_windows, prefs_window, about_window]) {
         if (window && !window.isDestroyed()) window.setBackgroundColor(background);
     }
     for (const window of BrowserWindow.getAllWindows()) {
@@ -408,7 +513,9 @@ function apply_theme_source(theme: ThemeSetting): void {
 }
 
 /** Keep the app chrome (welcome and Preferences windows) on the configured
- *  font, matching how the extension's font settings style its entire UI.
+ *  font, matching how the extension's font settings style its entire UI, and
+ *  keep every window's palette in step with the appearance preference and the
+ *  two per-mode theme slots.
  *
  *  Sent to every window rather than a tracked chrome list: only the chrome
  *  preloads listen for this channel, and viewer windows get font changes through
@@ -420,13 +527,16 @@ function watch_settings(): void {
                 window.webContents.send(CHANNEL_SETTINGS_CHANGED, next);
             }
         }
-        if (previous.theme !== next.theme) {
-            apply_theme_source(next.theme);
-            // nativeTheme only emits `updated` when the resolved appearance
-            // actually flips (system → light while already light does not), so
-            // push the palette here rather than relying on that event.
-            broadcast_theme();
-        }
+        const appearance_changed = previous.theme !== next.theme;
+        const palette_changed = previous.lightThemeId !== next.lightThemeId
+            || previous.darkThemeId !== next.darkThemeId;
+        // nativeTheme only emits `updated` when the resolved appearance actually
+        // flips (system → light while already light does not), so push the
+        // palette from here rather than relying on that event.
+        if (appearance_changed) apply_theme_source(next.theme);
+        // A change to the *inactive* slot broadcasts harmlessly: broadcast_theme
+        // recomputes current_theme_id(), which is unchanged in that case.
+        if (appearance_changed || palette_changed) broadcast_theme();
     });
 }
 

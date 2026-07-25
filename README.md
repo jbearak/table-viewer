@@ -149,3 +149,6 @@ Clone the repo and run `npm install`.
 ## License
 
 [GPL-3.0](LICENSE)
+
+Third-party attributions (the bundled color themes, and where to find the
+generated npm package notices): [NOTICE.md](NOTICE.md).

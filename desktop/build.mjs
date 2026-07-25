@@ -39,10 +39,11 @@ await build({
         join(desktop_dir, 'preload', 'viewer-preload.ts'),
         join(desktop_dir, 'preload', 'welcome-preload.ts'),
         join(desktop_dir, 'preload', 'prefs-preload.ts'),
+        join(desktop_dir, 'preload', 'about-preload.ts'),
     ],
 });
 
-// Renderer scripts for the welcome (launcher) and preferences pages.
+// Renderer scripts for the welcome (launcher), preferences, and About pages.
 await build({
     bundle: true,
     platform: 'browser',
@@ -54,10 +55,11 @@ await build({
     entryPoints: [
         join(desktop_dir, 'renderer', 'welcome.ts'),
         join(desktop_dir, 'renderer', 'prefs.ts'),
+        join(desktop_dir, 'renderer', 'about.ts'),
     ],
 });
 
 // Static pages.
-for (const file of ['welcome.html', 'prefs.html']) {
+for (const file of ['welcome.html', 'prefs.html', 'about.html']) {
     await copyFile(join(desktop_dir, 'renderer', file), join(out_dir, file));
 }

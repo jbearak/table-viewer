@@ -4,17 +4,24 @@
 // this one included; the other settings apply on the next file load).
 import type { PrefsApi } from '../preload/prefs-preload';
 import type { DesktopSettings } from '../main/desktop-config';
-import type { ThemePayload, ThemeSetting } from '../main/theme';
+import type { ThemePayload, ThemeSetting, ThemeKind } from '../main/theme';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
 const font_family = document.getElementById('fontFamily') as HTMLInputElement;
 const font_size = document.getElementById('fontSize') as HTMLInputElement;
 const theme = document.getElementById('theme') as HTMLSelectElement;
+const color_theme = document.getElementById('colorTheme') as HTMLSelectElement;
 const tab_orientation = document.getElementById('tabOrientation') as HTMLSelectElement;
 const csv_max_rows = document.getElementById('csvMaxRows') as HTMLInputElement;
 const max_file_size = document.getElementById('maxFileSizeMiB') as HTMLInputElement;
 const status = document.getElementById('status') as HTMLDivElement;
+
+/** The kind the color-theme select is currently offering themes for. Tracked
+ *  from the theme payload rather than from the settings, because under
+ *  Appearance=System the answer is the OS's and can change while this window is
+ *  open — the payload is the one stream that already carries that. */
+let current_kind: ThemeKind = 'light';
 
 function apply_theme(payload: ThemePayload): void {
     const vars = payload.variables;
@@ -25,6 +32,31 @@ function apply_theme(payload: ThemePayload): void {
     root.style.setProperty('--prefs-input-bg', vars['--vscode-input-background']);
     root.style.setProperty('--prefs-muted', vars['--vscode-descriptionForeground']);
     root.style.colorScheme = payload.kind;
+    populate_color_themes(payload);
+}
+
+/**
+ * Retarget the color-theme select at whatever mode is now resolved.
+ *
+ * Driven off the theme payload — which arrives on startup via get_theme() and on
+ * every appearance or palette change — rather than off DesktopSettings, so the
+ * dynamic behavior falls out for free (an OS light↔dark flip under
+ * Appearance=System rebuilds the list live) and only one code path ever owns
+ * this element's value.
+ */
+function populate_color_themes(payload: ThemePayload): void {
+    if (payload.kind !== current_kind || color_theme.options.length === 0) {
+        current_kind = payload.kind;
+        color_theme.replaceChildren(
+            ...prefs_api.themes_for_kind(current_kind).map((theme_option) => {
+                const option = document.createElement('option');
+                option.value = theme_option.id;
+                option.textContent = theme_option.label;
+                return option;
+            }),
+        );
+    }
+    color_theme.value = payload.themeId;
 }
 
 /** The font settings style the whole app, so this window follows them too. */
@@ -40,6 +72,8 @@ function populate(settings: DesktopSettings): void {
     font_family.value = settings.fontFamily;
     font_size.value = String(settings.fontSize);
     theme.value = settings.theme;
+    // Deliberately not colorTheme: it is a view of the live theme payload (see
+    // populate_color_themes), so writing it from settings here would fight that.
     tab_orientation.value = settings.tabOrientation;
     csv_max_rows.value = String(settings.csvMaxRows);
     max_file_size.value = String(settings.maxFileSizeMiB);
@@ -61,6 +95,13 @@ function save(partial: Partial<DesktopSettings>): void {
 font_family.addEventListener('change', () => save({ fontFamily: font_family.value }));
 // The select offers only the three valid values, and the store sanitizes anyway.
 theme.addEventListener('change', () => save({ theme: theme.value as ThemeSetting }));
+// Which slot this writes depends on the mode the list is currently showing —
+// that is the whole meaning of this control.
+color_theme.addEventListener('change', () => {
+    save(current_kind === 'dark'
+        ? { darkThemeId: color_theme.value as DesktopSettings['darkThemeId'] }
+        : { lightThemeId: color_theme.value as DesktopSettings['lightThemeId'] });
+});
 tab_orientation.addEventListener('change', () => {
     save({ tabOrientation: tab_orientation.value === 'vertical' ? 'vertical' : 'horizontal' });
 });

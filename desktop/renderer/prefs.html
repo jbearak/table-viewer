@@ -70,6 +70,15 @@
   <span class="hint">System follows the OS light/dark setting.</span>
 </div>
 <div class="field">
+  <label for="colorTheme">Color theme</label>
+  <!-- Options are filled in by prefs.ts: the list depends on whether the app is
+       currently showing light or dark, so it cannot be static markup. -->
+  <select id="colorTheme"></select>
+  <span class="hint">Themes for the mode the app is in right now. Light and dark
+    remember separate themes, so switching Appearance brings back the theme you
+    picked for that mode.</span>
+</div>
+<div class="field">
   <label for="tabOrientation">Worksheet tab orientation</label>
   <select id="tabOrientation">
     <option value="horizontal">Horizontal</option>

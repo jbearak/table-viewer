@@ -183,10 +183,10 @@
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
     "bundle:desktop": "node desktop/build.mjs",
     "typecheck:desktop": "tsc -p desktop",
-    "desktop:dev": "npm run bundle:webview && npm run bundle:desktop && electron dist/desktop/main.js",
+    "desktop:dev": "npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs && electron dist/desktop/main.js",
     "desktop:package": "npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs && electron-builder --config desktop/electron-builder.yml --mac",
     "desktop:package:dir": "npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs && electron-builder --config desktop/electron-builder.yml --mac --dir",
-    "test:desktop-smoke": "npm run bundle:webview && npm run bundle:desktop && playwright test --config=desktop/test-smoke/playwright.config.ts",
+    "test:desktop-smoke": "npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },

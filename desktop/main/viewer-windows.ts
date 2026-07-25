@@ -24,7 +24,7 @@ import { create_desktop_ui_port, node_file_system_port } from './desktop-host-po
 import type { DesktopConfigStore } from './desktop-config';
 import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
 import { dirty_from_host_message, dirty_from_webview_message } from './dirty-state';
-import { window_background_color, type ThemePayload } from './theme';
+import { resolve_theme_id, window_background_color, type ThemePayload } from './theme';
 import { CHANNEL_HOST_MESSAGE, CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { viewer_url } from './viewer-html';
 import {
@@ -80,7 +80,11 @@ export class ViewerWindowManager {
             minWidth: MIN_WINDOW_WIDTH,
             minHeight: MIN_WINDOW_HEIGHT,
             title,
-            backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
+            // resolve_theme_id is the one place "which theme is active" is
+            // decided (see theme-definitions.ts); main.ts wraps it too.
+            backgroundColor: window_background_color(
+                resolve_theme_id(this.config_store.settings(), nativeTheme.shouldUseDarkColors),
+            ),
             webPreferences: {
                 preload: this.viewer_preload_path,
                 contextIsolation: true,
@@ -204,7 +208,7 @@ export class ViewerWindowManager {
     apply_theme(payload: ThemePayload): void {
         for (const entry of this.windows) {
             if (!entry.window.isDestroyed()) {
-                entry.window.setBackgroundColor(window_background_color(payload.kind));
+                entry.window.setBackgroundColor(window_background_color(payload.themeId));
             }
         }
     }
