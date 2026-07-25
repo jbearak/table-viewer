@@ -69,6 +69,9 @@ export class ViewerWindowManager {
     private readonly windows: ViewerWindow[] = [];
     /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
     private resize_counter = 0;
+    /** The sequence behind the size currently stored, so a write from an older
+     *  resize arriving late (see `store_size`) can be recognized and dropped. */
+    private last_stored_seq = 0;
 
     constructor(
         private readonly state_store: AuthorityFileStateStore,
@@ -179,7 +182,10 @@ export class ViewerWindowManager {
         // Track the size as the user drags, not only on close: opening a second
         // file without closing the first should still match the size just set.
         let settle_timer: ReturnType<typeof setTimeout> | undefined;
-        let pending_size: WindowSize | undefined;
+        /** A resize waiting out the settle window, with the sequence it had —
+         *  `store_size` needs the latter to reject it if something newer has
+         *  been recorded in the meantime. */
+        let pending: { size: WindowSize; seq: number } | undefined;
         /** The last size this window was seen at, so a `resize` that does not
          *  actually change the size can be told apart from one that does. */
         let last_size: WindowSize = window.getBounds();
@@ -196,11 +202,11 @@ export class ViewerWindowManager {
             stop_watching_dirty: () =>
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
             flush_size: () => {
-                if (!pending_size) return;
+                if (!pending) return;
                 cancel_settle();
-                const size = pending_size;
-                pending_size = undefined;
-                this.store_size(size);
+                const { size, seq } = pending;
+                pending = undefined;
+                this.store_size(size, seq);
             },
             resize_seq: 0,
         };
@@ -223,7 +229,7 @@ export class ViewerWindowManager {
             // maximize or minimize inside the settle window, and the size they
             // just dragged to would be unreadable by then. The debounce is only
             // about how often it is written.
-            pending_size = last_size;
+            pending = { size: last_size, seq: entry.resize_seq };
             cancel_settle();
             settle_timer = setTimeout(() => {
                 settle_timer = undefined;
@@ -305,18 +311,10 @@ export class ViewerWindowManager {
         );
     }
 
-    /**
-     * Persist every resize still inside its settle window.
-     *
-     * Ordered by `resize_seq`, not by the array, because the array is in
-     * creation order: with two pending drags, flushing the newer-created window
-     * first would let the older-created one write last and win, even though its
-     * resize came first.
-     */
+    /** Persist every resize still inside its settle window. Order does not
+     *  matter: each carries the sequence `store_size` ranks it by. */
     private flush_pending_sizes(): void {
-        for (const entry of [...this.windows].sort((a, b) => a.resize_seq - b.resize_seq)) {
-            entry.flush_size();
-        }
+        for (const entry of this.windows) entry.flush_size();
     }
 
     /**
@@ -328,7 +326,8 @@ export class ViewerWindowManager {
      * opened afterwards would still use it.
      */
     adopt_current_size(): void {
-        // First, so a pending drag cannot land after the adoption and undo it.
+        // First, so this reads a window whose pending drag has been accounted
+        // for rather than racing it.
         this.flush_pending_sizes();
         const live = this.windows.filter((entry) => !entry.window.isDestroyed());
         if (live.length === 0) return;
@@ -341,7 +340,10 @@ export class ViewerWindowManager {
         // still contributes its real size — this is a one-shot with no later
         // event behind it. Safe here, unlike on the resize path: the focused
         // window is Preferences, not a viewer holding an open cell editor.
-        this.store_size(target.window.getNormalBounds());
+        //
+        // A fresh sequence: the user asking for this mode is the newest word on
+        // the subject, and outranks any resize still in flight.
+        this.store_size(target.window.getNormalBounds(), ++this.resize_counter);
     }
 
     /**
@@ -352,8 +354,17 @@ export class ViewerWindowManager {
      * different moments: the resize path samples during the drag and hands the
      * value over the debounce, so that a maximize or minimize before the timer
      * fires cannot make the size the user just chose unreadable.
+     *
+     * `seq` is which resize it came from, and the last one recorded wins
+     * regardless of arrival order. Debounced writes from different windows are
+     * genuinely concurrent — closing the window resized second flushes only its
+     * own pending write, leaving the first window's older one to land after —
+     * so recency has to be carried with the value rather than inferred from
+     * when it shows up.
      */
-    private store_size({ width, height }: WindowSize): void {
+    private store_size({ width, height }: WindowSize, seq: number): void {
+        if (seq < this.last_stored_seq) return;
+        this.last_stored_seq = seq;
         const settings = this.config_store.settings();
         // Under `fixed` the stored size is the user's typed preference, so
         // dragging a window must not quietly overwrite it.
