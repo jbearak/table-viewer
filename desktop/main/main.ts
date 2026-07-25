@@ -385,7 +385,11 @@ function register_ipc(): void {
 }
 
 /** Keep the app chrome (welcome and Preferences windows) on the configured
- *  font, matching how the extension's font settings style its entire UI. */
+ *  font, matching how the extension's font settings style its entire UI.
+ *
+ *  Sent to every window rather than a tracked chrome list: only the chrome
+ *  preloads listen for this channel, and viewer windows get font changes through
+ *  their controller's ConfigPort instead (as a `fontChanged` host message). */
 function watch_settings(): void {
     config_store.on_change((_previous, next) => {
         for (const window of BrowserWindow.getAllWindows()) {
