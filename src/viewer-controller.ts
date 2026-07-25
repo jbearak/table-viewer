@@ -27,6 +27,7 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
+import { validate_dirty_bases } from './csv-base-validation';
 import type {
     AuthorityFileStateStore,
     FileStateSnapshot,
@@ -62,6 +63,7 @@ import {
     type ActiveCsvSaveLifecycle,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type CsvSaveRejection,
     type HostMessage,
     type PerFileState,
     type SheetTransformState,
@@ -2491,14 +2493,46 @@ export function attach_viewer(
             return;
         }
 
+        // Raw text of exactly the cells the dirty map names, harvested from the
+        // serialization walk below so the source is traversed once. Keys are
+        // source-keyed, like the dirty map itself.
+        const observed_bases = new Map<string, string>();
+        const wanted_columns = new Map<number, number[]>();
+        for (const key of Object.keys(identity.dirtyEdits)) {
+            const [source_row, col] = key.split(':').map(Number);
+            const columns = wanted_columns.get(source_row);
+            if (columns) columns.push(col);
+            else wanted_columns.set(source_row, [col]);
+        }
+
         let content: string;
         try {
             const SAVE_WINDOW = 10_000;
             const row_count = src.meta().sheets[0].rowCount;
             function* row_windows(): Generator<(RenderedCell | null)[]> {
+                let absolute_row = 0;
                 for (let start = 0; start < row_count; start += SAVE_WINDOW) {
                     const { rows } = src!.read_rows(0, start, SAVE_WINDOW);
-                    for (const row of rows) yield row;
+                    for (const row of rows) {
+                        const columns = wanted_columns.get(absolute_row);
+                        if (columns) {
+                            for (const col of columns) {
+                                // A column past this row's field count is left
+                                // unrecorded, so the reader below reports
+                                // `undefined` and validate_dirty_bases coalesces it
+                                // to '' — matching the webview's get_cell_raw,
+                                // where a loaded blank cell is ''.
+                                const cell = row[col];
+                                if (cell === undefined) continue;
+                                observed_bases.set(
+                                    `${absolute_row}:${col}`,
+                                    cell === null ? '' : String(cell.raw ?? ''),
+                                );
+                            }
+                        }
+                        absolute_row++;
+                        yield row;
+                    }
                 }
             }
             content = serialize_csv(
@@ -2516,6 +2550,50 @@ export function attach_viewer(
                 `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
             );
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
+            return;
+        }
+
+        // Validate every edit's base against the raw source before a single byte
+        // is written. This is NOT redundant with the TOCTOU digest check further
+        // down, which stays exactly where it is: that one asks "did the file change
+        // since the snapshot we acknowledged?", comparing bytes against the
+        // acknowledged digest. This asks the different question "was this edit's
+        // base ever true?", which is also false for an edit created *before* an
+        // acknowledged refresh — a case the digest check reports as clean because
+        // the file matches the snapshot we did acknowledge. Neither subsumes the
+        // other.
+        //
+        // The webview cannot answer this alone: its conflict detection is
+        // residency-gated (see csv-base-validation.ts's header), so a filtered,
+        // evicted, or shrunk-away row is never flagged there.
+        const validation = validate_dirty_bases(
+            identity.dirtyEdits,
+            src.meta().sheets[0].sourceRowCount,
+            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
+        );
+        if (validation.type !== 'valid') {
+            // Same shape as the sibling early-returns above: a begin/finish pair so
+            // the webview sees a terminal 'failed' lifecycle for this exact
+            // operation and restores the precise dirty map it submitted.
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+            const rejection: CsvSaveRejection = validation.type === 'removedRows'
+                ? { reason: 'rowsRemoved', keys: validation.keys }
+                : { reason: 'baseMismatch', keys: validation.keys };
+            // Warning, not error, matching the digest-check path: an externally
+            // changed file is an expected condition the user resolves, not a
+            // failure of ours.
+            show_owner_warning(
+                rejection.reason === 'rowsRemoved'
+                    ? 'File shrank externally. Some edited rows no longer exist, so the save was cancelled.'
+                    : 'File was modified externally. Some edits no longer match the file, so the save was cancelled.',
+            );
+            void post_to_receiver({
+                type: 'saveResult',
+                success: false,
+                lifecycle,
+                rejection,
+            });
             return;
         }
 

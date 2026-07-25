@@ -1973,6 +1973,47 @@ describe('GridShell source-row edit identity', () => {
         // Source column 2 is display column 1; source row 7 is display row 1.
         expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
     });
+
+    it('repaints a cell the host named on a rejected save', async () => {
+        // The webview cannot derive this conflict: '7:2' still agrees with source
+        // row 7's text, so is_entry_conflicted is false for it. Only the union with
+        // the host's rejected keys can tint the cell — and the targeted repaint
+        // effect has to actually notice that union change, which is the leg this
+        // test pins rather than assumes.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const base_props = props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        });
+        const GridShell = await render_grid(base_props);
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 2, height: 3 }));
+        grid_mock.update_cells.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base_props,
+                host_rejected_keys: ['7:2'],
+            }));
+        });
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+
+        // Un-marked by the same machinery once the rejection is resolved.
+        grid_mock.update_cells.mockClear();
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base_props,
+                host_rejected_keys: [],
+            }));
+        });
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+    });
 });
 
 describe('GridShell row resizing', () => {

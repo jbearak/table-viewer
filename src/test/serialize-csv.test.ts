@@ -85,20 +85,28 @@ describe('serialize_csv', () => {
     });
 
     describe('edits beyond the source rows (file shrank under a stale edit)', () => {
-        it('emits an edit whose row index is past the last source row', () => {
-            // One source row (index 0); an edit targets row 2. Rather than
-            // silently dropping it (data loss on save), serialize emits the
-            // intervening empty row and the edit row.
+        it('does not append rows for an edit past the last source row', () => {
+            // One source row (index 0); an edit targets row 2. Padding out to it
+            // is the thing we must never do: under source-keyed edits that gap can
+            // be ~90,000 rows, and because build_line_index counts a field per LF
+            // the blank filler re-parses as real rows, so a 10-row file reopens
+            // 90,001 rows long. write_file is a raw fs write (there is no
+            // WorkspaceEdit anywhere in src/), so nothing is on the undo stack.
+            // Such a save is rejected upstream by validate_dirty_bases'
+            // `removedRows` outcome and never reaches here; dropping is only the
+            // safe residual for a caller that skipped validation.
             const rows: (CellData | null)[][] = [
                 [cell('a'), cell('b')],
             ];
             const edits: Record<string, string> = { '2:1': 'X' };
-            expect(serialize_csv(rows, ',', edits)).toBe('a,b\n\n,X\n');
+            expect(serialize_csv(rows, ',', edits)).toBe('a,b\n');
         });
 
-        it('emits an edit when the source yields no rows at all', () => {
+        it('emits nothing when the source yields no rows at all', () => {
+            // Same policy at the degenerate end: an edit with no source row to
+            // land on does not conjure one, so an empty sheet stays empty output.
             const edits: Record<string, string> = { '0:0': 'only' };
-            expect(serialize_csv([], ',', edits)).toBe('only\n');
+            expect(serialize_csv([], ',', edits)).toBe('');
         });
 
         it('does not append rows when every edit is within the source range', () => {

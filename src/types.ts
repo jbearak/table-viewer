@@ -205,6 +205,35 @@ export interface PerFileState {
     scrollPosition?: (ScrollPosition | undefined)[];
     activeSheetIndex?: number;
     tabOrientation?: 'horizontal' | 'vertical' | null;
+    /**
+     * Durable CSV edits, keyed `"<canonical source row>:<source column>"`.
+     *
+     * Existing persisted maps are *reinterpreted* as source-keyed rather than
+     * migrated, because no key was ever created under a row permutation, so every
+     * stored key is already canonical. Three independent facts make that argument
+     * complete:
+     *
+     *  - CSV reports `rowCount === sourceRowCount` (`CsvDataSource.meta`,
+     *    data-source/csv-source.ts:139-140), so for the one editable format
+     *    display rows and source rows are the same numbers whenever no transform
+     *    is installed.
+     *  - A transform can never be installed while editing. The host refuses it
+     *    (`transform_blocks_editing`, viewer-controller.ts:547, consulted by
+     *    `editing_available_for_panel` and the transform admission path) and the
+     *    webview refuses both directions independently: entering edit mode under a
+     *    transform (`handle_toggle_edit_mode`, webview/app.tsx:1518-1527) and
+     *    applying a transform while in edit mode (`handle_transform_change`,
+     *    webview/app.tsx:1571-1576).
+     *  - `resolve_csv_save_hydration` (webview/csv-save-lifecycle.ts) passes keys
+     *    through verbatim, so a round-trip through the save lifecycle cannot
+     *    rewrite one either.
+     *
+     * So a stored key was written either with no transform installed (where the
+     * two row spaces coincide) or not at all. A migration pass would therefore
+     * have nothing to change, and would need a row permutation it cannot
+     * reconstruct — permutations are deliberately never persisted (see
+     * `transforms` below).
+     */
     pendingEdits?: Record<string, string | CsvDirtyEntry>;
     /** Explicit Excel first-row choices keyed by worksheet name. Missing = auto. */
     excelFirstRowHeaders?: Record<string, ExcelHeaderOverride>;
@@ -263,6 +292,20 @@ export interface CsvDirtyEntry {
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
 
+/** Why the host refused a save whose bases no longer match the file. Carried on
+ *  the failure result rather than a separate message so it cannot be delivered
+ *  out of order relative to the lifecycle transition that restores the map.
+ *
+ *  Concretely: `apply_save_lifecycle` (webview/grid-shell.tsx) is revision-gated —
+ *  a lifecycle at or below the already-applied revision is dropped — so a
+ *  rejection sent as its own message could be applied against a dirty map that
+ *  has not been restored yet, naming keys the store does not hold. One message,
+ *  one ordering. */
+export interface CsvSaveRejection {
+    readonly reason: 'baseMismatch' | 'rowsRemoved';
+    readonly keys: readonly string[];
+}
+
 /** Immutable identity and payload for one accepted CSV save operation. */
 export interface CsvSaveOperation {
     readonly editSessionId: string;
@@ -293,7 +336,7 @@ export type HostMessage =
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
-    | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle }
+    | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle; rejection?: CsvSaveRejection }
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }

@@ -179,6 +179,15 @@ export interface EditingHandle {
     clear_dirty(): void;
     /** Drop only edits whose underlying cell drifted (conflict resolution). */
     discard_conflicted(): void;
+    /**
+     * Drop exactly the named source-keyed edits. Separate from
+     * {@link discard_conflicted}, whose meaning is defined by
+     * `is_entry_conflicted` and is therefore residency-gated: the keys the *host*
+     * names on a rejected save are precisely the ones that predicate cannot see
+     * (a filtered-out row, an evicted page, a row past the row count), so
+     * overloading it would leave the blocking entry in place.
+     */
+    discard_keys(keys: readonly string[]): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
     commit_live_edit(): void;
     /** True when there are committed edits or an open editor with changes. */
@@ -263,6 +272,14 @@ export interface GridShellProps {
      * mount-scoped store seeded from `initial_edits`.
      */
     edit_session?: EditSessionStore;
+    /**
+     * Source-keyed keys the host refused the last save over. Unioned into the
+     * conflict tint so a `baseMismatch` cell is visibly marked even though the
+     * webview's own residency-gated conflict detection cannot flag it. A
+     * `rowsRemoved` key has no cell to tint (its row is past `row_count`), which is
+     * why the banner names its row numbers instead.
+     */
+    host_rejected_keys?: readonly string[];
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
     // actions so App's toolbar + conflict banner can drive editing that lives here.
@@ -335,6 +352,7 @@ export function GridShell({
     on_save_request = () => undefined,
     initial_edits,
     edit_session,
+    host_rejected_keys,
     on_editing_change,
     editing_ref,
     auto_fit_ref,
@@ -578,13 +596,35 @@ export function GridShell({
 
     const {
         dirty_cells,
-        conflicted_keys,
+        conflicted_keys: derived_conflicted_keys,
         commit_edit,
         clear_dirty,
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
     } = use_editing(get_cell_raw, generation, edit_session_id, store);
+
+    // Tint set = what the webview can derive ∪ what the host named. The union is
+    // what everything downstream consumes (the paint callback's ref, the targeted
+    // repaint effect's diff, and the status reported to App), so a host-named cell
+    // is marked and un-marked by exactly the same machinery as a derived one. Only
+    // keys the store actually holds are included: a stale rejection naming an
+    // already-discarded edit must not keep tinting, and `dirty_cells` is what
+    // decides whether a cell is painted with an overlay at all.
+    //
+    // `conflicted` reported up to App stays this union too. That is deliberate: a
+    // host-named mismatch *is* a conflict from the user's point of view, and the
+    // alternative (App reconciling two sets) would put the same union in two places.
+    const conflicted_keys = useMemo(() => {
+        if (!host_rejected_keys || host_rejected_keys.length === 0) {
+            return derived_conflicted_keys;
+        }
+        const union = new Set(derived_conflicted_keys);
+        for (const key of host_rejected_keys) {
+            if (dirty_cells.has(key)) union.add(key);
+        }
+        return union;
+    }, [derived_conflicted_keys, host_rejected_keys, dirty_cells]);
     const applied_save_lifecycle_revision_ref = useRef(save_lifecycle.revision);
     const [save_in_flight, set_save_in_flight] = useState(
         restored_save_operation !== undefined,
@@ -702,8 +742,9 @@ export function GridShell({
     // stable across edits — otherwise every commit would rebuild the closure and
     // invalidate Glide's whole per-cell cache. Targeted repaints (below) drive the
     // actual damage instead.
-    // conflicted_keys still needs a mirror: it is derived in the hook from
-    // get_cell_raw rather than stored, so there is nothing stable to read it from.
+    // conflicted_keys still needs a mirror: it is derived (in the hook from
+    // get_cell_raw, then unioned with the host's rejected keys above) rather than
+    // stored, so there is nothing stable to read it from.
     const conflicted_keys_ref = useRef(conflicted_keys);
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
@@ -1034,6 +1075,14 @@ export function GridShell({
         if (save_in_flight_ref.current) return;
         discard_conflicted();
     }, [discard_conflicted, save_in_flight_ref]);
+    const guarded_discard_keys = useCallback((keys: readonly string[]) => {
+        if (save_in_flight_ref.current) return;
+        if (keys.length === 0) return;
+        // Host-named keys are already source-keyed, so they go straight into the
+        // source-keyed store with no conversion — the payoff for having moved
+        // durable identity to the source row first.
+        clear_dirty_keys(new Set(keys));
+    }, [clear_dirty_keys, save_in_flight_ref]);
 
     // Expose the imperative actions to App through the ref it provides.
     useEffect(() => {
@@ -1042,6 +1091,7 @@ export function GridShell({
             request_save,
             clear_dirty: guarded_clear_dirty,
             discard_conflicted: guarded_discard_conflicted,
+            discard_keys: guarded_discard_keys,
             commit_live_edit,
             has_uncommitted_changes,
         };
@@ -1053,6 +1103,7 @@ export function GridShell({
         request_save,
         guarded_clear_dirty,
         guarded_discard_conflicted,
+        guarded_discard_keys,
         commit_live_edit,
         has_uncommitted_changes,
     ]);

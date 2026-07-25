@@ -1061,10 +1061,18 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits).toEqual({
             '0:0': { value: 'second', base: 'first' },
         });
+        // Spelled out rather than using the mock's legacy `edits` shorthand, which
+        // synthesizes `base: 'a'`: the first save already rewrote 0:0 to 'first',
+        // so 'a' is no longer this cell's base and host-side base validation would
+        // (correctly) refuse the save. 'first' is what the file actually holds.
         await panel.__receive({
             type: 'saveCsv',
-            editSessionId: second.editSessionId,
-            edits: { '0:0': 'second' },
+            operation: {
+                editSessionId: second.editSessionId!,
+                saveRequestId: 'second-session-save',
+                edits: { '0:0': 'second' },
+                dirtyEdits: { '0:0': { value: 'second', base: 'first' } },
+            },
         });
         expect(panel.__messages.filter((message: any) => (
             message?.type === 'saveResult' && message.success === true
@@ -1330,6 +1338,118 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
+    it('refuses a save whose base never matched the file, before writing any bytes', async () => {
+        const file_path = '/tmp/base-mismatch-rejected.csv';
+        const versioned = state_store();
+        const write = vi.fn(async () => {});
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        // Row 0 column 0 holds 'a'. The save below claims a base of 'stale', which
+        // the file never had — the case the webview's residency-gated conflict
+        // detection cannot see for a filtered-out or evicted row.
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\nb\n'));
+        vscode_mock.__setWriteFileImplementation(write);
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        const operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'save-mismatch',
+            edits: { '0:0': 'next', '1:0': 'fine' },
+            dirtyEdits: {
+                '0:0': { value: 'next', base: 'stale' },
+                '1:0': { value: 'fine', base: 'b' },
+            },
+        };
+        await panel.__receive({ type: 'saveCsv', operation });
+
+        expect(write).not.toHaveBeenCalled();
+        expect(warning).toHaveBeenCalled();
+        expect(panel.__messages).toContainEqual({
+            type: 'saveResult',
+            success: false,
+            lifecycle: expect.objectContaining({ state: 'failed', operation }),
+            // Only the drifted key: the honest edit stays saveable once the user
+            // resolves this one.
+            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+        });
+    });
+
+    it('refuses a save for a row the file no longer has, and writes nothing', async () => {
+        const file_path = '/tmp/rows-removed-rejected.csv';
+        const versioned = state_store();
+        const written: Uint8Array[] = [];
+        const write = vi.fn(async (_target: unknown, bytes: Uint8Array) => {
+            written.push(bytes);
+        });
+        // One header plus one data row, so source row 3 is past the end. Before
+        // host-side validation this save would have silently *grown* the file with
+        // blank filler rows to reach row 3.
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(write as never);
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        const operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'save-removed',
+            edits: { '3:0': 'orphan' },
+            dirtyEdits: { '3:0': { value: 'orphan', base: 'gone' } },
+        };
+        await panel.__receive({ type: 'saveCsv', operation });
+
+        expect(written).toHaveLength(0);
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: false,
+            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+        }));
+    });
+
+    it('still writes a save whose every base matches, with no rejection', async () => {
+        const file_path = '/tmp/valid-bases-still-save.csv';
+        const versioned = state_store();
+        const written: Uint8Array[] = [];
+        const write = vi.fn(async (_target: unknown, bytes: Uint8Array) => {
+            written.push(bytes);
+        });
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\nb\n'));
+        vscode_mock.__setWriteFileImplementation(write as never);
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save-valid',
+                edits: { '1:0': 'B' },
+                dirtyEdits: { '1:0': { value: 'B', base: 'b' } },
+            },
+        });
+
+        expect(written).toHaveLength(1);
+        expect(new TextDecoder().decode(written[0])).toBe('h\na\nB\n');
+        const results = panel.__messages.filter((message): message is {
+            type: string;
+            success: boolean;
+            rejection?: unknown;
+        } => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'saveResult'
+        ));
+        expect(results).toHaveLength(1);
+        expect(results[0].success).toBe(true);
+        expect(results[0].rejection).toBeUndefined();
+    });
+
     it('rebases and retains highlights across an extension-controlled CSV save', async () => {
         const file_path = '/tmp/save-highlight-rebase.csv';
         let bytes: Uint8Array<ArrayBufferLike> = enc.encode('h\na\n');
@@ -1434,7 +1554,11 @@ describe('CSV edit sessions', () => {
         const acceptance_started = deferred();
         const acceptance_gate = deferred();
         const stat = vi.fn(async () => ({ size: 4, mtime: 1 }));
-        const read = vi.fn(async () => enc.encode('h\na\n'));
+        // Two columns so both edited cells have a distinct, *true* base: host-side
+        // base validation now rejects a save whose bases never matched the file, so
+        // placeholder base text would fail before reaching the write this test is
+        // about.
+        const read = vi.fn(async () => enc.encode('h1,h2\na,b\n'));
         const write = vi.fn(async () => { throw new Error('disk unavailable'); });
         const store: FileStateStore = {
             ...versioned.store,
@@ -1461,8 +1585,8 @@ describe('CSV edit sessions', () => {
             saveRequestId: 'save-overlay',
             edits: { '0:0': 'overlay', '0:1': 'committed' },
             dirtyEdits: {
-                '0:0': { value: 'overlay', base: 'overlay-base' },
-                '0:1': { value: 'committed', base: 'committed-base' },
+                '0:0': { value: 'overlay', base: 'a' },
+                '0:1': { value: 'committed', base: 'b' },
             },
         };
         const save = panel.__receive({ type: 'saveCsv', operation });
@@ -1530,7 +1654,10 @@ describe('CSV edit sessions', () => {
             editSessionId: edit_session_id,
             saveRequestId: 'retry-accepted-map',
             edits: { '0:0': 'exact' },
-            dirtyEdits: { '0:0': { value: 'exact', base: 'exact-base' } },
+            // 'a' is what the default fixture file holds at 0:0. Host-side base
+            // validation now rejects a save whose base never matched the file, so a
+            // placeholder base would never reach the acceptance retry under test.
+            dirtyEdits: { '0:0': { value: 'exact', base: 'a' } },
         };
         const save = panel.__receive({ type: 'saveCsv', operation });
         await write_started.promise;

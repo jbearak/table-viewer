@@ -147,6 +147,14 @@ async function render_grid(
         save_lifecycle?: CsvSaveLifecycle;
         initial_edits?: Record<string, string | { value: string; base: string }>;
         edit_session?: EditSessionStore;
+        host_rejected_keys?: readonly string[];
+        on_editing_change?: (status: {
+            is_dirty: boolean;
+            has_live_uncommitted: boolean;
+            save_in_flight: boolean;
+            edits: Record<string, { value: string; base: string }>;
+            conflicted: readonly string[];
+        }) => void;
         generation?: number;
     } = {},
 ) {
@@ -792,5 +800,56 @@ describe('GridShell source-keyed save payloads', () => {
         expect(Object.fromEntries(store.snapshot())).toEqual({
             '5:0': { value: 'typed but not closed', base: 'five-a' },
         });
+    });
+});
+
+describe('GridShell host-rejected save keys', () => {
+    it('discard_keys drops a host-named edit that discard_conflicted retains', async () => {
+        // Display row 0 shows source row 5, and source row 5's text still matches
+        // the edit's base, so is_entry_conflicted is false for it — the residency /
+        // agreement gate that makes discard_conflicted a no-op here.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        grid_mock.text_for_source_row = (source_row: number) => (
+            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+        );
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await edit_cell('typed');
+        expect(Object.keys(Object.fromEntries(store.snapshot()))).toEqual(['5:0']);
+
+        await act(async () => { editing_ref.current!.discard_conflicted(); });
+        expect(Object.fromEntries(store.snapshot())).toHaveProperty('5:0');
+
+        await act(async () => { editing_ref.current!.discard_keys(['5:0']); });
+        expect(Object.fromEntries(store.snapshot())).toEqual({});
+    });
+
+    it('reports a host-named key as conflicted only while the store holds it', async () => {
+        const statuses: { conflicted: readonly string[] }[] = [];
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+            host_rejected_keys: ['0:0'],
+            on_editing_change: (status) => { statuses.push(status); },
+        });
+
+        // Before any edit exists there is nothing to mark: a stale rejection must
+        // not tint a cell the store does not hold.
+        expect(statuses.at(-1)!.conflicted).toEqual([]);
+
+        // The edit's base agrees with the source, so the webview derives no
+        // conflict of its own — the union is the only thing that can report it.
+        await edit_cell('typed');
+        expect(statuses.at(-1)!.conflicted).toEqual(['0:0']);
+
+        await act(async () => { editing_ref.current!.discard_keys(['0:0']); });
+        expect(statuses.at(-1)!.conflicted).toEqual([]);
     });
 });

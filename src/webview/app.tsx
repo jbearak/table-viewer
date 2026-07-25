@@ -116,6 +116,18 @@ function column_visibility_equal(
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+/**
+ * 1-based, de-duplicated, ascending row numbers from source-keyed edit keys, for
+ * the `rowsRemoved` banner. 1-based to match what the grid's row markers and the
+ * context menu ("Row N") show; de-duplicated because several edits on one removed
+ * row are one row to report, not several — the sentence counts rows, not keys.
+ */
+function rejected_rows(keys: readonly string[]): number[] {
+    const rows = new Set<number>();
+    for (const key of keys) rows.add(Number(key.split(':')[0]) + 1);
+    return [...rows].sort((a, b) => a - b);
+}
+
 function sheet_widths_equal(
     left: Record<number, number> | undefined,
     right: Record<number, number> | undefined,
@@ -276,7 +288,9 @@ export function App(): React.JSX.Element {
     const [highlight_status, set_highlight_status] = useState('');
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
     // unsaved work survives a webview reload. CSV is single-sheet, so this flat map
-    // belongs to the one editable sheet.
+    // belongs to the one editable sheet. Keys are source-keyed — see the
+    // `pendingEdits` declaration in types.ts for why existing maps are
+    // reinterpreted as source-keyed rather than migrated.
     const [initial_edits, set_initial_edits] = useState<
         Record<string, string | { value: string; base: string }> | undefined
     >(undefined);
@@ -284,6 +298,17 @@ export function App(): React.JSX.Element {
     // if a *different* set of cells later conflicts.
     const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
         useState<string | null>(null);
+    // Keys the *host* refused a save over, from a saveResult's `rejection`. These
+    // exist because the webview cannot derive them: is_entry_conflicted is
+    // residency-gated, so an edit on a filtered-out row, an evicted page, or a row
+    // past the current row count is never in `conflicted_keys`. Without this state a
+    // rejected save would be permanently unrecoverable — the banner would not
+    // render, the cell would not exist to right-click, and Discard Conflicted (a
+    // retain over is_entry_conflicted) would keep the very entry blocking the save.
+    const [save_rejection, set_save_rejection] = useState<{
+        reason: 'baseMismatch' | 'rowsRemoved';
+        keys: string[];
+    } | null>(null);
 
     const state_ref = useRef<PerFileState>({});
     // GridShell populates this with imperative save/discard actions (the dirty map
@@ -1877,6 +1902,21 @@ export function App(): React.JSX.Element {
                 if (matching) {
                     pending_exit_ref.current = false;
                 }
+                // Adopt the host's named keys only for our own session: a rejection
+                // for someone else's session names keys our store does not hold, and
+                // a banner over them would offer a discard that does nothing. Ride
+                // in on the lifecycle rather than a separate message so the map has
+                // already been restored above (see CsvSaveRejection in types.ts).
+                if (
+                    msg.rejection
+                    && msg.lifecycle.operation.editSessionId
+                        === csv_edit_session_id_ref.current
+                ) {
+                    set_save_rejection({
+                        reason: msg.rejection.reason,
+                        keys: [...msg.rejection.keys],
+                    });
+                }
             }
         };
         window.addEventListener('message', handler);
@@ -2253,6 +2293,25 @@ export function App(): React.JSX.Element {
         toolbar_focus_ref.current?.focus_columns();
     }, []);
 
+    // Host-rejected keys the store still holds. Resolving an edit (discarding it, or
+    // the whole map going away) must dismiss the rejection: the host was refusing a
+    // save over entries that no longer exist. Filtering here rather than in the
+    // saveResult handler keeps a single source of truth — `editing_status.edits` is
+    // the live map — and covers every way an entry can leave, not just our own
+    // discard button.
+    //
+    // Memoized, and above the early returns below because it is a hook: the array
+    // goes down to GridShell where it feeds the tint union's useMemo, so a fresh
+    // identity every render would rebuild that Set and re-run the targeted repaint
+    // effect for no change.
+    const live_edits = editing_status?.edits;
+    const live_rejected_keys = useMemo(
+        () => (save_rejection
+            ? save_rejection.keys.filter((key) => live_edits?.[key] !== undefined)
+            : []),
+        [save_rejection, live_edits],
+    );
+
     if (!meta) {
         return <div className="loading">Loading...</div>;
     }
@@ -2325,10 +2384,40 @@ export function App(): React.JSX.Element {
     // it ("Keep All") sticks until a *different* set of cells drifts.
     const conflicted_keys = editing_status?.conflicted ?? [];
     const conflict_signature = [...conflicted_keys].sort().join(',');
+    const show_host_rejection = edit_mode && live_rejected_keys.length > 0;
+    // Renders for a host rejection *independently* of conflicted_keys. That
+    // independence is the whole fix: the keys a host rejection names are exactly the
+    // ones the webview's residency-gated detection cannot flag, so gating this on
+    // conflicted_keys.length would leave the banner (and every exit it offers)
+    // unreachable in precisely the case that needs it.
     const show_conflict_banner =
-        edit_mode &&
-        conflicted_keys.length > 0 &&
-        conflict_signature !== dismissed_conflict_signature;
+        show_host_rejection || (
+            edit_mode
+            && conflicted_keys.length > 0
+            && conflict_signature !== dismissed_conflict_signature
+        );
+    const removed_rows = show_host_rejection
+        && save_rejection?.reason === 'rowsRemoved'
+        ? rejected_rows(live_rejected_keys)
+        : [];
+    const conflict_banner_message = removed_rows.length > 0
+        // Name the rows. For a removed row there is nothing to highlight — the grid
+        // is given the shrunk row count, so the cell does not exist to paint — and
+        // for the same reason the *values* cannot be shown either. The row numbers
+        // are all the user has to go on. Counted in rows, not keys: several edits on
+        // one vanished row are one row lost.
+        ? `File shrank externally. ${removed_rows.length} edited row${
+            removed_rows.length === 1 ? '' : 's'
+        } no longer exist — save was cancelled. Affected row${
+            removed_rows.length === 1 ? '' : 's'
+        }: ${removed_rows.join(', ')}.`
+        : show_host_rejection
+            ? `File changed externally. ${live_rejected_keys.length} edit${
+                live_rejected_keys.length === 1 ? '' : 's'
+            } no longer match the file — save was cancelled. Highlighted cells show conflicts.`
+            : `File changed externally. ${conflicted_keys.length} edit${
+                conflicted_keys.length === 1 ? '' : 's'
+            } may be affected — highlighted cells show conflicts.`;
 
     const grid = (
         <GridShell
@@ -2354,6 +2443,7 @@ export function App(): React.JSX.Element {
             on_save_request={begin_save_operation}
             initial_edits={initial_edits}
             edit_session={edit_session_ref.current}
+            host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
@@ -2510,9 +2600,7 @@ export function App(): React.JSX.Element {
             )}
             {show_conflict_banner && (
                 <div className="conflict-banner">
-                    File changed externally. {conflicted_keys.length} edit
-                    {conflicted_keys.length === 1 ? '' : 's'} may be affected —
-                    highlighted cells show conflicts.
+                    {conflict_banner_message}
                     <div className="conflict-banner-actions">
                         <button
                             onClick={() =>
@@ -2522,7 +2610,19 @@ export function App(): React.JSX.Element {
                             Keep All
                         </button>
                         <button
-                            onClick={() => editing_ref.current?.discard_conflicted()}
+                            onClick={() => {
+                                // Two distinct actions behind one label. For a host
+                                // rejection the named keys are the only ones that
+                                // can be discarded meaningfully: discard_conflicted
+                                // is a retain over is_entry_conflicted, which is
+                                // false for every one of them, so it would keep the
+                                // blocking entry and leave the session unsaveable.
+                                if (show_host_rejection) {
+                                    editing_ref.current?.discard_keys(live_rejected_keys);
+                                    return;
+                                }
+                                editing_ref.current?.discard_conflicted();
+                            }}
                         >
                             Discard Conflicted
                         </button>
