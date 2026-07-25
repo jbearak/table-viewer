@@ -1,12 +1,26 @@
 # electron-builder configuration for the standalone Table Viewer app.
 #
-# v1 ships unsigned local macOS builds only (no signing, notarization, or
-# auto-update). Build with: npm run desktop:package (dmg + zip) or
-# npm run desktop:package:dir (unpacked .app for quick local verification).
+# Build with: npm run desktop:package (dmg + zip) or npm run
+# desktop:package:dir (unpacked .app for quick local verification).
+#
+# Signing is deliberately NOT pinned here. This file leaves mac.identity
+# unset, which is electron-builder's "sign if a Developer ID certificate is
+# available" mode, so the release workflow only has to supply CSC_LINK /
+# CSC_KEY_PASSWORD to get a signed build and needs no cert name in config.
+# Callers that must not sign pass the unsigned flags explicitly:
+#
+#   -c.mac.identity=null -c.dmg.sign=false
+#
+# The desktop:package npm scripts do exactly that, so a local build never
+# needs a certificate. See .github/workflows/release-build.yml for the
+# signed/notarized path.
 appId: com.jbearak.table-viewer
 productName: Table Viewer
 directories:
   output: dist/desktop-packages
+# productName has a space, which would land in the release URL the Homebrew
+# cask downloads; name the artifacts after the slug instead.
+artifactName: table-viewer-${version}-${arch}.${ext}
 # The desktop bundles are self-contained (esbuild); no node_modules ship.
 files:
   - dist/desktop/**
@@ -28,6 +42,11 @@ extraResources:
     to: LICENSE.electron.txt
   - from: node_modules/electron/dist/LICENSES.chromium.html
     to: LICENSES.chromium.html
+# A missing extraResources source is only a *warning* in electron-builder, so a
+# half-installed node_modules/electron silently yields a bundle with no Electron
+# or Chromium notices. This hook fails the build instead — we must not ship a
+# GPL-3.0 app without its attributions.
+afterPack: desktop/after-pack.mjs
 extraMetadata:
   main: dist/desktop/main.js
 # Nothing native to rebuild (bundles are pure JS); skip the npm rebuild step.
@@ -61,11 +80,13 @@ mac:
   # 1024x1024 master; electron-builder generates the .icns slices at package
   # time. This is also the auto-detected default path — explicit for clarity.
   icon: build/icon.png
-  # v1 ships unsigned local builds (no notarization / auto-update yet).
-  identity: null
+  # Required for notarization, and inert without a signing identity. Electron
+  # needs the JIT/unsigned-memory entitlements that electron-builder applies by
+  # default under a hardened runtime, so no custom entitlements plist.
+  hardenedRuntime: true
+  # `spctl --assess` cannot pass on an unsigned build and would fail packaging.
+  # Notarization (release workflow) is the real Gatekeeper gate.
+  gatekeeperAssess: false
   target:
     - dmg
     - zip
-dmg:
-  # Unsigned build: skip dmg code signing too.
-  sign: false

@@ -90,3 +90,142 @@ jobs:
           path: |
             table-viewer-*.vsix
             table-viewer-*.vsix.sha256
+
+  # The standalone macOS app (Apple Silicon), shipped as a dmg that the
+  # Homebrew cask in jbearak/homebrew-table-viewer downloads by URL + sha256.
+  # Separate from `build` so a macOS runner is only spent on the desktop
+  # artifact, and so a desktop packaging failure is distinguishable from a
+  # broken .vsix.
+  desktop:
+    runs-on: macos-latest
+    # The Apple signing secrets live in the `release` environment, so this job
+    # must run in it to read them. Note the consequence: if that environment
+    # ever gains required reviewers, this build job waits for approval too, not
+    # just release-publish. If that becomes unwanted, move the Apple secrets to
+    # repo-level secrets and drop this line.
+    environment: release
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Validate tag + version
+        shell: bash
+        env:
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$THE_TAG" =~ ^v[0-9] ]]; then
+            echo "ERROR: tag must start with 'v' and a digit (e.g., v0.1.1). Got: $THE_TAG" >&2
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
+            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
+            exit 1
+          fi
+
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "$THE_TAG" != "v${PKG_VERSION}" ]]; then
+            echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Signing and notarization activate themselves once the Apple credentials
+      # exist as `release` environment secrets; until then the job produces the
+      # same unsigned dmg a local `npm run desktop:package` does, and the cask
+      # documents the Gatekeeper first-launch step.
+      #
+      # Setup (one-time), all in the `release` environment:
+      #   CSC_LINK                     base64 of a Developer ID Application .p12
+      #   CSC_KEY_PASSWORD             that .p12's password
+      #   APPLE_ID                     Apple ID email for notarytool
+      #   APPLE_APP_SPECIFIC_PASSWORD  app-specific password for that Apple ID
+      #   APPLE_TEAM_ID                10-character Developer Team ID
+      - name: Decide whether to sign
+        id: signing
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CSC_LINK:-}" ]]; then
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No CSC_LINK secret - producing an unsigned build."
+            exit 0
+          fi
+          echo "sign=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+            echo "notarize=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::CSC_LINK is set but the notarytool credentials are incomplete; shipping signed-but-not-notarized. Gatekeeper will still warn."
+          fi
+
+      - name: Package desktop app (signed)
+        if: steps.signing.outputs.sign == 'true'
+        run: >-
+          npm run desktop:package:release --
+          -c.mac.notarize=${{ steps.signing.outputs.notarize }}
+          -c.dmg.sign=true
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # Read by electron-builder's notarytool step when notarize is true.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Package desktop app (unsigned)
+        if: steps.signing.outputs.sign != 'true'
+        run: npm run desktop:package:release -- -c.mac.identity=null -c.dmg.sign=false
+        env:
+          # A hosted runner has no Developer ID in its keychain, but be explicit:
+          # auto-discovery finding one would make the artifact non-reproducible.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # The cask pins an exact download URL, so the artifact names are part of
+      # the contract with jbearak/homebrew-table-viewer. Assert there is exactly
+      # one dmg and one zip rather than trusting the glob.
+      - name: Calculate checksums
+        shell: bash
+        working-directory: dist/desktop-packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for ext in dmg zip; do
+            files=(table-viewer-*.$ext)
+            if [[ "${#files[@]}" -ne 1 ]]; then
+              echo "ERROR: expected exactly 1 .$ext, found ${#files[@]}. Did artifactName change?" >&2
+              ls -la >&2
+              exit 1
+            fi
+            shasum -a 256 "${files[0]}" | tee "${files[0]}.sha256"
+          done
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: desktop-${{ inputs.tag || github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/desktop-packages/table-viewer-*.dmg
+            dist/desktop-packages/table-viewer-*.zip
+            dist/desktop-packages/*.sha256

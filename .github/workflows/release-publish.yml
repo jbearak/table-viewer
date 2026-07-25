@@ -73,6 +73,7 @@ jobs:
           fi
 
       - name: Download build artifacts
+        id: artifacts
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -99,11 +100,32 @@ jobs:
 
           gh run download "$BUILD_RUN_ID" --name "$ARTIFACT_NAME"
 
+          # The desktop job of the same run produces the macOS app that the
+          # Homebrew cask downloads. Land it in desktop-dist/ rather than the
+          # workspace root: `table-viewer-*` would otherwise match both the
+          # .vsix and the dmg/zip, and `vsce publish --packagePath
+          # table-viewer-*.vsix` and the checksum globs expect a flat, .vsix-only
+          # directory.
+          #
+          # Absent is not fatal: tags built before the desktop job existed, and
+          # runs whose artifacts have aged out, have no desktop-* artifact. The
+          # extension publish must not be held hostage to that — the release
+          # simply ships without the app, and the cask bump is skipped.
+          if gh run download "$BUILD_RUN_ID" --name "desktop-${THE_TAG}" --dir desktop-dist; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No desktop-${THE_TAG} artifact; publishing without the macOS app and skipping the Homebrew bump."
+          fi
+
       - name: Verify checksums
         shell: bash
         run: |
           set -euo pipefail
           sha256sum -c table-viewer-*.vsix.sha256
+          if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
+            (cd desktop-dist && sha256sum -c ./*.sha256)
+          fi
 
       - name: Install publish tools
         run: npm install --global @vscode/vsce@3.7.1 ovsx@0.10.9
@@ -126,8 +148,85 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          # fail_on_unmatched_files defaults to false, so the desktop-dist
+          # globs are a no-op when this tag has no desktop artifact (see the
+          # download step) rather than failing the release.
           files: |
             table-viewer-*.vsix
             table-viewer-*.vsix.sha256
+            desktop-dist/table-viewer-*.dmg
+            desktop-dist/table-viewer-*.zip
+            desktop-dist/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # With the release published (and the dmg attached above), open a PR
+      # against the Homebrew tap (jbearak/homebrew-table-viewer) bumping the
+      # cask to this version, with the checksum recomputed from the very
+      # artifact this run published. Keeping these steps in the `release`
+      # environment lets HOMEBREW_TAP_TOKEN live as an environment secret
+      # without a second release approval.
+      #
+      # Setup (one-time), then these steps activate themselves:
+      #   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/table-viewer --env release
+      #   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/table-viewer --body true
+      # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
+      # scoped to jbearak/homebrew-table-viewer with Contents:write +
+      # Pull requests:write.
+      - name: Checkout Homebrew tap
+        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: jbearak/homebrew-table-viewer
+          # Public repo: no token needed to clone, and persist-credentials:false
+          # keeps any credential out of tap/.git/config. The tap PAT is supplied
+          # only at push time (below), never persisted to disk.
+          persist-credentials: false
+          path: tap
+
+      - name: Bump Homebrew cask
+        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+        shell: bash
+        env:
+          THE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          DMG=(desktop-dist/table-viewer-*.dmg)
+          tap/bin/update-cask.sh "${THE_TAG#v}" "${DMG[0]}"
+
+      - name: Open Homebrew bump PR + enable auto-merge
+        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+        working-directory: tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          THE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          VERSION="${THE_TAG#v}"
+          if git diff --quiet; then
+            echo "Cask already at $VERSION - nothing to do."
+            exit 0
+          fi
+          BRANCH="bump-table-viewer-$VERSION"
+          git config user.name "table-viewer-release-bot"
+          git config user.email "table-viewer-release-bot@users.noreply.github.com"
+          # Only this job ever writes bump-table-viewer-*, so reset the branch
+          # from HEAD and force-push. No remote-tracking ref / pre-fetch needed,
+          # so reruns can't fail on a stale lease.
+          git checkout -B "$BRANCH"
+          git add Casks/table-viewer.rb
+          git commit -m "table-viewer $VERSION"
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c http.extraheader="$AUTH_HEADER" push --force origin "HEAD:$BRANCH"
+          if ! gh pr create --base main --head "$BRANCH" \
+                --title "table-viewer $VERSION" \
+                --body "Automated cask bump for [Table Viewer $VERSION](https://github.com/jbearak/table-viewer/releases/tag/$THE_TAG). Checksum recomputed from the release artifact."; then
+            if gh pr view "$BRANCH" --json url >/dev/null 2>&1; then
+              echo "PR for $BRANCH already exists; the force-push updated it."
+            else
+              echo "::error::gh pr create failed for $BRANCH" >&2
+              exit 1
+            fi
+          fi
+          gh pr merge "$BRANCH" --auto --squash \
+            || echo "::warning::could not enable auto-merge; merge $BRANCH manually."

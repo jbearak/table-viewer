@@ -1,0 +1,129 @@
+# Homebrew tap
+
+The standalone macOS app is distributed through a Homebrew **cask** in a
+separate tap repo, `jbearak/homebrew-table-viewer`, so users can install it with
+
+```sh
+brew install --cask jbearak/table-viewer/table-viewer
+```
+
+This mirrors the arrangement used by [`sight`](https://github.com/jbearak/sight)
+and [`raven`](https://github.com/jbearak/raven): the tool's own repo builds the
+artifact and pushes a bump PR to a tap repo that holds nothing but the
+cask/formula and its CI.
+
+A cask rather than a formula because Table Viewer is a GUI app: casks install a
+prebuilt `.app` into `/Applications` and handle upgrade, uninstall, and `zap`
+(settings cleanup). A formula would have to hide the bundle in the keg and can't
+manage `/Applications`. Building from source in a formula was also ruled out —
+the Electron runtime is ~100 MB and would have to be downloaded at install time
+either way, and Homebrew has no Electron *formula* to depend on (only a cask,
+pinned to one version, which a packaged app can't be repointed at).
+
+## The moving parts
+
+| Where | What |
+| --- | --- |
+| `release-build.yml`, `desktop` job | Runs `npm run desktop:package:release` on a macOS runner, producing `table-viewer-<version>-arm64.dmg` + `.zip` and their `.sha256` files as the `desktop-<tag>` artifact. |
+| `release-publish.yml` | Downloads that artifact, verifies the checksums, attaches the dmg/zip to the GitHub Release, then opens a cask bump PR against the tap. |
+| `jbearak/homebrew-table-viewer` | `Casks/table-viewer.rb`, `bin/update-cask.sh` (the single source of truth for the cask edit), and CI that audits + installs the cask on an Apple Silicon runner. |
+
+The version and checksum in the cask are only ever written by
+`bin/update-cask.sh`, called from both the tap's `bootstrap.sh` and the bump
+steps in `release-publish.yml`, so the seed path and the per-release path can't
+drift.
+
+## Architecture and macOS floor
+
+arm64 only, macOS 12 (Monterey) or newer — the floor comes from the bundled
+Electron runtime (`LSMinimumSystemVersion` in the built bundle). Intel macOS is
+intentionally out of scope, matching `sight` and `raven`.
+
+## Signing
+
+The desktop artifact is currently **unsigned and un-notarized**, so Gatekeeper
+blocks the first launch of a cask-installed (quarantined) app; the cask's
+`caveats` tell users how to approve it.
+
+The release workflow is already wired for signing and turns it on by itself once
+the credentials exist as `release` **environment** secrets in this repo:
+
+| Secret | What |
+| --- | --- |
+| `CSC_LINK` | base64 of a Developer ID Application `.p12` |
+| `CSC_KEY_PASSWORD` | that `.p12`'s password |
+| `APPLE_ID` | Apple ID email for notarytool |
+| `APPLE_APP_SPECIFIC_PASSWORD` | app-specific password for that Apple ID |
+| `APPLE_TEAM_ID` | 10-character Developer Team ID |
+
+`CSC_LINK` alone switches on signing; all three notarytool secrets are needed
+before notarization is attempted (with `CSC_LINK` but incomplete notarytool
+credentials the job warns and ships signed-but-not-notarized). `desktop/`'s
+electron-builder config deliberately leaves `mac.identity` unset — the local
+`npm run desktop:package` scripts pass `-c.mac.identity=null` explicitly, so a
+local build never needs a certificate.
+
+Once builds are notarized, drop the `caveats` block from the cask, the
+`HOMEBREW_CASK_OPTS: --no-quarantine` env from the tap's CI, and the
+quarantine section from the tap README.
+
+## One-time setup
+
+1. **Seed the tap.** From the tap scaffold (`.tap-staging/` in this repo, which
+   is gitignored — it becomes its own repo):
+
+   ```sh
+   cd .tap-staging
+   ./bootstrap.sh <version>     # a release that has the arm64 dmg attached
+   ```
+
+   This downloads that release's dmg, writes the real checksum into the cask,
+   creates `jbearak/homebrew-table-viewer` if needed, and pushes `main`. It
+   fails loudly rather than seeding a cask that points at a missing asset, so
+   the version must be a release cut *after* the `desktop` build job landed.
+
+2. **Require the tap's CI.** In the tap repo, Settings → Branches: require the
+   `test` check on `main`, so a bump PR can't merge red.
+
+3. **Give this repo write access to the tap and enable the bump:**
+
+   ```sh
+   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/table-viewer --env release
+   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/table-viewer --body true
+   ```
+
+   `HOMEBREW_TAP_TOKEN` should be a GitHub App installation token or a
+   fine-grained PAT restricted to `jbearak/homebrew-table-viewer` with
+   **Contents: write** + **Pull requests: write** only — it can ship arbitrary
+   cask Ruby to anyone installing from the tap. Set an expiration.
+
+Until `ENABLE_HOMEBREW_BUMP` is `true` the bump steps are skipped entirely; the
+release still builds and attaches the dmg, so turning it on later needs no
+workflow change.
+
+## Verifying a cask change locally
+
+`brew` can use a checked-out tap directly, which is worth doing before pushing a
+cask edit — `brew style` and `brew audit` catch different things:
+
+```sh
+TAP=$(brew --repository)/Library/Taps/jbearak/homebrew-table-viewer
+mkdir -p "$(dirname "$TAP")" && cp -R /path/to/tap "$TAP"
+brew style --cask jbearak/table-viewer/table-viewer
+brew audit --strict --cask jbearak/table-viewer/table-viewer   # add --online to check the URL
+```
+
+To test an install against a locally built dmg, point the cask's `url` at
+`file:///…/dist/desktop-packages/table-viewer-<version>-arm64.dmg` and install
+into a scratch appdir so you don't clobber an app already in `/Applications`
+(e.g. one that `scripts/setup.sh` installed — the cask refuses to overwrite it):
+
+```sh
+HOMEBREW_CASK_OPTS="--no-quarantine --appdir=/tmp/tv-appdir" \
+  brew install --cask jbearak/table-viewer/table-viewer
+```
+
+`--appdir` is still a `brew install` flag, but `--no-quarantine` is not:
+Homebrew 6 removed it from the command line, and passing it fails with
+`Error: invalid option`. `HOMEBREW_CASK_OPTS` accepts both, so the one-variable
+form above is the simplest thing that works.

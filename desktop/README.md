@@ -32,13 +32,16 @@ npm run desktop:package       # dmg + zip in dist/desktop-packages/
 npm run desktop:package:dir   # unpacked .app only (faster, for local checks)
 ```
 
-v1 ships unsigned builds only: no code signing, notarization, or auto-update. Gatekeeper will warn on first launch of an unsigned app (right-click → Open, or `xattr -dr com.apple.quarantine "Table Viewer.app"`).
+Both pass `-c.mac.identity=null`, so they never need a certificate. Gatekeeper will warn on first launch of an unsigned app (right-click → Open, or `xattr -dr com.apple.quarantine "Table Viewer.app"`).
+
+`npm run desktop:package:release` is the same build *without* those overrides: it signs if a Developer ID certificate is available. CI uses it, and signs + notarizes once the Apple secrets are set — see [docs/homebrew-tap.md](../docs/homebrew-tap.md#signing).
 
 The config lives in `desktop/electron-builder.yml`:
 
 - File associations declare the app as *a* handler for `csv`/`tsv`/`xlsx`/`xls` (`rank: Alternate`) so it appears in "Open with…" without claiming default-handler status.
 - The app bundle contains only the esbuild outputs (`dist/desktop`, `dist/webview`) plus `package.json` — no `node_modules`.
-- License notices for the GPL-3.0 app are shipped in `Contents/Resources`: `LICENSE.txt` (Table Viewer), `THIRD_PARTY_NOTICES.txt` (generated from the production npm dependency closure by `desktop/collect-licenses.mjs`), `LICENSE.electron.txt`, and `LICENSES.chromium.html`.
+- `artifactName` names the dmg/zip `table-viewer-<version>-<arch>` rather than after `productName`, which has a space — those filenames are part of the download URL the Homebrew cask pins.
+- License notices for the GPL-3.0 app are shipped in `Contents/Resources`: `LICENSE.txt` (Table Viewer), `THIRD_PARTY_NOTICES.txt` (generated from the production npm dependency closure by `desktop/collect-licenses.mjs`), `LICENSE.electron.txt`, and `LICENSES.chromium.html`. The `afterPack` hook (`desktop/after-pack.mjs`) asserts all four are present and non-empty in the packaged app, because a missing `extraResources` source is only a *warning* in electron-builder — a half-installed `node_modules/electron` otherwise yields a normal-looking dmg with the Electron/Chromium attributions silently absent.
 
 ## Smoke test
 
