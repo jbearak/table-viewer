@@ -242,16 +242,34 @@ export class ViewerWindowManager {
             ? screen.getDisplayMatching(previous_bounds)
             : screen.getPrimaryDisplay()
         ).workArea;
-        // Under `match-last` the window on screen *is* the last window, so read
-        // it rather than the stored pair, which is only the fallback for when
-        // none is open — the first window of a session. Reading it directly is
-        // also what keeps the two honest: a drag whose settle timer has not
-        // fired yet, or one made while the preference was still `fixed`, is
-        // already reflected here.
-        const preferred = settings.newWindowSize === 'match-last' && previous_bounds
-            ? previous_bounds
-            : { width: settings.windowWidth, height: settings.windowHeight };
-        return next_window_bounds(work_area, preferred, previous_bounds);
+        // The stored pair, never `previous_bounds`: `previous` is the most
+        // recently *created* window, which is not the most recently *resized*
+        // one. Sizing from it would contradict both what is tracked and what
+        // Preferences shows the moment the user resizes any other window.
+        // `previous_bounds` is for the cascade placement only.
+        return next_window_bounds(
+            work_area,
+            { width: settings.windowWidth, height: settings.windowHeight },
+            previous_bounds,
+        );
+    }
+
+    /**
+     * Adopt the size of the window most recently created as the tracked one.
+     *
+     * For the switch into `match-last`: until that moment resizes were
+     * deliberately ignored, so the stored pair is whatever was last typed under
+     * `fixed` rather than any window's size, and without this the first window
+     * opened afterwards would still use it.
+     */
+    adopt_current_size(): void {
+        const window = this.windows
+            .map((entry) => entry.window)
+            .filter((candidate) => !candidate.isDestroyed())
+            .pop();
+        // 'resize' rather than 'close': this samples a window that stays open,
+        // and it is the measurement that leaves a focused window undisturbed.
+        if (window) this.remember_size(window, 'resize');
     }
 
     /**

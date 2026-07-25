@@ -11,7 +11,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { test, expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { click_menu_item as click_menu, main_js, repo_dir } from './smoke-helpers';
+import {
+    click_menu_item as click_menu,
+    close_preferences,
+    main_js,
+    open_preferences,
+    repo_dir,
+} from './smoke-helpers';
 
 const csv_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.csv');
 const xlsx_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx');
@@ -278,21 +284,7 @@ test('the appearance preference pins light/dark, and System restores OS followin
     expect(viewer).toBeTruthy();
     await viewer.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
 
-    // Preferences… lives on the app menu on macOS and under File elsewhere.
-    const opened = await app.evaluate(({ BrowserWindow, Menu }) => {
-        for (const menu of Menu.getApplicationMenu()?.items ?? []) {
-            const item = menu.submenu?.items.find((entry) => entry.label === 'Preferences…');
-            if (!item?.click) continue;
-            item.click(item, BrowserWindow.getFocusedWindow() ?? undefined, {});
-            return true;
-        }
-        return false;
-    });
-    expect(opened, 'a Preferences… menu item exists').toBe(true);
-
-    const prefs_page = () => app.windows().find((page) => page.url().endsWith('prefs.html'));
-    await expect.poll(prefs_page, { timeout: 15_000 }).toBeTruthy();
-    const prefs = prefs_page()!;
+    const prefs = await open_preferences(app);
     const appearance = prefs.locator('#theme');
     const color_theme = prefs.locator('#colorTheme');
     await expect(appearance).toHaveValue('system');
@@ -362,12 +354,53 @@ test('the appearance preference pins light/dark, and System restores OS followin
         }
     } finally {
         await appearance.selectOption('system');
-        await app.evaluate(({ BrowserWindow, nativeTheme }) => {
+        await app.evaluate(({ nativeTheme }) => {
             nativeTheme.themeSource = 'system';
-            BrowserWindow.getAllWindows()
-                .find((window) => window.getTitle().includes('Preferences'))
-                ?.close();
         });
+        await close_preferences(app);
+    }
+});
+
+// Switching to Match last window has to adopt whatever is on screen: while Fixed
+// size was selected the app deliberately ignored every resize, so without this
+// the stored size is the number last typed, and the first window opened after
+// the switch would still use it.
+test('switching to Match last window adopts the current window size', async () => {
+    const settings = () => {
+        const file = path.join(user_data_dir, 'settings.v1.json');
+        if (!fs.existsSync(file)) return null;
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return [parsed.newWindowSize, parsed.windowWidth, parsed.windowHeight];
+    };
+    const prefs = await open_preferences(app);
+    try {
+        await prefs.selectOption('#newWindowSize', 'fixed');
+        for (const [field, value] of [['#windowWidth', '820'], ['#windowHeight', '560']]) {
+            await prefs.fill(field, value);
+            await prefs.locator(field).blur();
+        }
+        await expect.poll(settings, { timeout: 15_000 }).toEqual(['fixed', 820, 560]);
+
+        // Resizing under Fixed size must leave the typed numbers alone. The
+        // most recently opened viewer, since that is the one the switch below
+        // adopts from.
+        await app.evaluate(({ BrowserWindow }) => {
+            BrowserWindow.getAllWindows()
+                .find((window) => window.getTitle().includes('basic.xlsx'))
+                ?.setBounds({ x: 60, y: 60, width: 640, height: 480 });
+        });
+        await prefs.waitForTimeout(1_000);
+        expect(settings()).toEqual(['fixed', 820, 560]);
+
+        // Switching back adopts the window that was resized in the meantime —
+        // in the file and in the readout, which must not be left showing the
+        // size the switch replaced.
+        await prefs.selectOption('#newWindowSize', 'match-last');
+        await expect.poll(settings, { timeout: 15_000 }).toEqual(['match-last', 640, 480]);
+        await expect(prefs.locator('#windowWidth')).toHaveValue('640');
+        await expect(prefs.locator('#windowHeight')).toHaveValue('480');
+    } finally {
+        await close_preferences(app);
     }
 });
 
