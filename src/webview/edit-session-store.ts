@@ -207,6 +207,30 @@ export function create_edit_session_store(
         notify();
     };
 
+    // Recompute the flag from what actually survived. The mutators that only ever
+    // drop entries (remove, remove_keys, clear, retain, clear_saved) previously
+    // carried the old flag forward, leaving it stuck `true` after the last pending
+    // entry was gone. That is self-healing rather than incorrect — no reader
+    // treats the flag as authority, the save gate reads per-entry `base_pending` —
+    // but a stale `true` defeats the hot-path guard in use-editing's base-capture
+    // effect, so it re-ran the scan on every page load and every keystroke for the
+    // rest of the session. Cheap to keep honest: these paths already walk or copy
+    // the map. Only ever narrows, never sets the flag where it was false.
+    const set_entries_recomputed = (entries: Map<string, DirtyEntry>): void => {
+        if (!state.pending_base) {
+            set_entries(entries, false);
+            return;
+        }
+        let pending_base = false;
+        for (const entry of entries.values()) {
+            if (entry.base_pending) {
+                pending_base = true;
+                break;
+            }
+        }
+        set_entries(entries, pending_base);
+    };
+
     return {
         snapshot: () => state.entries,
         subscribe: (listener: () => void) => {
@@ -237,17 +261,17 @@ export function create_edit_session_store(
             if (!owns(session_id) || !state.entries.has(key)) return;
             const next = new Map(state.entries);
             next.delete(key);
-            set_entries(next, state.pending_base);
+            set_entries_recomputed(next);
         },
         remove_keys: (session_id, keys) => {
             if (!owns(session_id)) return;
             const next = new Map(state.entries);
             for (const key of keys) next.delete(key);
-            set_entries(next, state.pending_base);
+            set_entries_recomputed(next);
         },
         clear: (session_id) => {
             if (!owns(session_id)) return;
-            set_entries(new Map(), state.pending_base);
+            set_entries(new Map(), false);
         },
         replace: (session_id, entries) => {
             if (!owns(session_id)) return;
@@ -269,11 +293,11 @@ export function create_edit_session_store(
             for (const [key, entry] of state.entries) {
                 if (keep(key, entry)) next.set(key, entry);
             }
-            set_entries(next, state.pending_base);
+            set_entries_recomputed(next);
         },
         clear_saved: (session_id, saved) => {
             if (!owns(session_id)) return;
-            set_entries(clear_saved_dirty_entries(state.entries, saved), state.pending_base);
+            set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;

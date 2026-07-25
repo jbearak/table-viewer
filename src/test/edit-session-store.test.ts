@@ -143,6 +143,40 @@ describe('edit session store', () => {
         expect(store.get('5:0')).toEqual({ value: 'E', base: 'e' });
     });
 
+    it('clears the pending-base flag once the last pending entry is dropped', () => {
+        // The dropping mutators used to carry the old flag forward, leaving it
+        // stuck true for the rest of the session. Nothing reads the flag as
+        // authority (the save gate checks per-entry base_pending), so it was
+        // self-healing rather than wrong — but a stale true defeats the hot-path
+        // guard in use-editing's base-capture effect, which then rescans on every
+        // page load and every keystroke.
+        const store = create_edit_session_store({ session_id: 's' }, {
+            '1:0': 'D',
+            '2:0': 'E',
+        });
+        expect(store.has_pending_base()).toBe(true);
+
+        store.remove('s', '1:0');
+        expect(store.has_pending_base()).toBe(true);
+
+        store.remove('s', '2:0');
+        expect(store.has_pending_base()).toBe(false);
+    });
+
+    it('clear and retain recompute the pending-base flag', () => {
+        const store = create_edit_session_store({ session_id: 's' }, { '1:0': 'D' });
+        store.retain('s', () => true);
+        expect(store.has_pending_base()).toBe(true);
+
+        store.retain('s', () => false);
+        expect(store.has_pending_base()).toBe(false);
+
+        store.install({ session_id: 's' }, { '1:0': 'D' });
+        expect(store.has_pending_base()).toBe(true);
+        store.clear('s');
+        expect(store.has_pending_base()).toBe(false);
+    });
+
     it('install carries the pending-base flag across a hydration boundary', () => {
         const store = create_edit_session_store({ session_id: 's' });
         expect(store.has_pending_base()).toBe(false);
