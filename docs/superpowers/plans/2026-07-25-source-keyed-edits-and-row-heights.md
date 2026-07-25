@@ -49,12 +49,22 @@ edit-snapshot revision through transform requests and overlay it in the host's
 column reads (a large change to the transform engine's data path), or don't
 offer recomputation on unsaved edits.
 
-**Decision: don't offer it.** The banner becomes purely informational — "Edits
-since this view was sorted/filtered aren't reflected in the current order. Save
-to recompute." No misleading button. Recomputation after save happens naturally
-via source reload. Overlaying edits into transform column reads is a separate
-feature with its own perf question (it would defeat the column cache), not a
-rider on a correctness fix.
+**Decision: don't offer it — and this is a product preference, not a
+concession.** Rows must not move while the user is typing; jumping rows during
+editing is actively frustrating (the behavior Excel exhibits). So an installed
+sort or filter deliberately does **not** recompute during a live edit session:
+an edited row keeps its position even once its value no longer matches the sort
+order or the filter predicate. Recomputation happens on save + source reload.
+
+Consequences for the design:
+
+- **Stable rows during editing is the feature.** Do not describe it as a
+  limitation, and do not add a "Resort"/"Refilter" action. A row that no longer
+  matches an enabled filter stays visible until save; that is correct.
+- The banner is **neutral information**, not a call to action, and only worth
+  showing where the stale view could otherwise mislead.
+- Overlaying edits into transform column reads is explicitly unwanted, not
+  merely deferred. (It would also defeat the column cache.)
 
 ### 2. Edits do not survive a transform remount
 
@@ -189,6 +199,18 @@ currently relies on the rehydration path to not lose edits.
   reverting or discarding the last relevant edit clears it. Clear on save +
   reload, on discard, and only on an acknowledgement that is not older than the
   edits it claims to cover.
+
+  Wording must not imply the user should act, nor that anything is wrong —
+  stable rows are intended. Something like "Sorting and filters don't update
+  while you're editing" and, when a filter is installed, a count of edited rows
+  that no longer match. Neutral, present-tense, no button. Note that rows stay
+  put by design in the edit-mode documentation too.
+
+  **Rows must never move mid-edit.** Since a transform now survives edit mode,
+  add a regression test proving that committing an edit to a sorted column does
+  not change any row's display position, and that an edited row failing an
+  enabled filter stays visible until save. These are the user-facing guarantees
+  of this PR.
 - Guard the multiline auto-grow height write (`grid-shell.tsx:1385`) — it is
   ungated on `transformed`, unlike hover-arming (`:1521`) and the resize overlay
   (`:2516`), so this is the one place a display-keyed height could be written
@@ -229,9 +251,9 @@ pages load — scrollbar jitter.
 ## Out of scope
 
 - Overlaying unsaved edits into transform column reads, i.e. genuinely
-  re-sorting dirty data. This is the honest version of "Resort" and is a real
-  feature; it needs a design for the column cache
-  (`acquire_transform_column`) and its own perf budget.
+  re-sorting dirty data. **Not wanted**, not merely deferred — rows moving while
+  the user types is the behavior this design exists to avoid. Recorded here only
+  so a future reader doesn't mistake its absence for an oversight.
 - `PerFileState.scrollPosition` is row-addressed with the same latent question.
 - Enabling Glide search later: its result `Item`s are display coordinates and
   would need generation-scoping.
