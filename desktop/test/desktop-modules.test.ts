@@ -34,7 +34,11 @@ import {
     THEME_SETTINGS,
     theme_payload,
 } from '../main/theme';
-import { build_theme_from_vars } from '../../src/webview/vscode-theme';
+import {
+    build_edit_tints_from_vars,
+    build_theme_from_vars,
+    CONFLICT_BG_FALLBACK,
+} from '../../src/webview/vscode-theme';
 import { notices_file_path } from '../main/notices-path';
 import { REPOSITORY_URL, about_link_url } from '../main/about-links';
 import {
@@ -551,6 +555,29 @@ describe('theme × Glide grid theme', () => {
                 expect((value as string).trim(), `${id}.${field} is empty`).not.toBe('');
             }
         }
+    });
+
+    it('derives a distinct edit tint per theme rather than silently falling back', () => {
+        const dirty = new Set<string>();
+        const conflict = new Set<string>();
+        for (const id of THEME_IDS) {
+            const vars = THEME_DEFINITIONS[id].variables;
+            const tints = build_edit_tints_from_vars((name) => vars[name] ?? '');
+            // Fixed semantic alpha, canonical rgb: a theme whose variable went
+            // missing would emit the fallback literal instead.
+            expect(tints.dirtyBg, id).toMatch(/^rgba\(\d+, \d+, \d+, 0\.16\)$/);
+            expect(tints.conflictBg, id).toMatch(/^rgba\(\d+, \d+, \d+, 0\.22\)$/);
+            dirty.add(tints.dirtyBg);
+            conflict.add(tints.conflictBg);
+        }
+        // 9 themes, 8 distinct values each: solarized-light and solarized-dark
+        // share one palette, so they share both warning and error colors.
+        expect(dirty.size).toBe(8);
+        expect(conflict.size).toBe(8);
+        // A typo'd variable name would collapse every theme onto the fallback.
+        // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
+        // fallback — so only the conflict side can assert non-fallback.)
+        expect(conflict.has(CONFLICT_BG_FALLBACK)).toBe(false);
     });
 });
 

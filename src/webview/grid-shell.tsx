@@ -137,12 +137,6 @@ const PREVIEW_RESTORE_MAX_ATTEMPTS = 8;
 const PREVIEW_RESTORE_RETRY_MS = 16;
 const PREVIEW_RESTORE_SETTLE_MS = 32;
 
-/** Canvas-drawn tint for a cell holding an unsaved edit (low-alpha warning
- *  amber). Concrete rgba — `themeOverride.bgCell` is painted on canvas and can't
- *  resolve CSS `var()`. */
-const DIRTY_BG = 'rgba(204, 167, 0, 0.16)';
-/** Stronger reddish tint for an edit whose underlying cell drifted (conflict). */
-const CONFLICT_BG = 'rgba(229, 75, 75, 0.22)';
 import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
 import { host_bridge } from './host-bridge';
@@ -363,7 +357,12 @@ export function GridShell({
         generation,
         has_visible_columns,
     );
-    const { theme, highContrast: high_contrast } = use_vscode_theme();
+    const {
+        theme,
+        highContrast: high_contrast,
+        dirtyBg: dirty_bg,
+        conflictBg: conflict_bg,
+    } = use_vscode_theme();
     // The configured font size, resolved once from the theme so cell painting,
     // canvas measurement, and default row heights all agree.
     const font_size_px = theme_font_size_px(theme);
@@ -1327,8 +1326,8 @@ export function GridShell({
                     dirty_value: dirty?.value,
                     bg: dirty
                         ? conflicted_keys_ref.current.has(key)
-                            ? CONFLICT_BG
-                            : DIRTY_BG
+                            ? conflict_bg
+                            : dirty_bg
                         : highlight_bg,
                 };
             }
@@ -1353,6 +1352,11 @@ export function GridShell({
             source_column_for_display,
             get_source_row,
             get_highlight_background,
+            // A theme switch re-derives the tints, so the callback must close
+            // over the new ones (the full-region repaint effect below then
+            // damages the cells already painted with the old ones).
+            dirty_bg,
+            conflict_bg,
         ],
     );
 
@@ -2258,9 +2262,9 @@ export function GridShell({
     // Full-region repaint on the discrete events that change content or
     // editability of *every* already-painted cell: a page landing (version
     // bump), the formatting toggle (raw ↔ formatted), the edit-mode toggle
-    // (flips each cell's allowOverlay), and a font-size change (each cell
-    // carries the size in its theme override). A parent re-render alone does not
-    // reliably invalidate Glide's per-cell cache, so damage explicitly.
+    // (flips each cell's allowOverlay), and a font-size or edit-tint change
+    // (each cell carries both in its theme override). A parent re-render alone
+    // does not reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
     //
     // The merge overlay draws its own text, reading the size off the theme at
@@ -2289,6 +2293,11 @@ export function GridShell({
         editable_cells,
         display_column_count,
         font_size_px,
+        // A theme switch re-derives the tints; without these, already-painted
+        // dirty/conflicted cells keep the previous theme's color until they
+        // happen to be damaged for some other reason.
+        dirty_bg,
+        conflict_bg,
     ]);
 
     // Targeted tint repaint: damage only the cells whose dirty/conflict tint

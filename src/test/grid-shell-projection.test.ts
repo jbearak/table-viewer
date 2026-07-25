@@ -124,7 +124,12 @@ vi.mock('../webview/use-row-loader', () => ({
 }));
 
 vi.mock('../webview/vscode-theme', () => ({
-    use_vscode_theme: () => ({ theme: {}, highContrast: false }),
+    use_vscode_theme: () => ({
+        theme: {},
+        highContrast: false,
+        dirtyBg: 'rgba(204, 167, 0, 0.16)',
+        conflictBg: 'rgba(229, 75, 75, 0.22)',
+    }),
     theme_font_size_px: () => 13,
 }));
 
