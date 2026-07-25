@@ -153,9 +153,13 @@ probe: identical-value `commit`, `clear` on an empty map, `remove_keys` matching
 nothing, `retain` keeping everything, and `clear_saved` matching nothing all
 notify. (`remove` already guards on `has(key)`.)
 
-Each notification costs a map copy, a React re-render, two full
-`Object.fromEntries` over the dirty map (`grid-shell.tsx:667, 678`), a
-`postMessage`, a host-side `structuredClone`, and an async workspace-state write.
+Each notification costs a React re-render, two full `Object.fromEntries` over the
+dirty map (`grid-shell.tsx:667, 680`), a `postMessage`, a host-side
+`structuredClone`, and an async workspace-state write — plus a real CAS revision
+bump, since the handler's `edits` branch always spreads into a fresh object so
+the `next === current` shortcut never fires. The mutators' candidate `Map` copy
+is *not* in that list: it happens before `set_entries` is reached, so the guard
+suppresses the notification but not the allocation.
 
 Not only perf: the host's `pendingEditsChanged` handler clears
 `failedSaveTombstone` and calls `retire_save_lifecycle(undefined, 'failed')`
