@@ -112,6 +112,19 @@ function column_visibility_equal(
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function sheet_widths_equal(
+    left: Record<number, number> | undefined,
+    right: Record<number, number> | undefined,
+): boolean {
+    if (left === right) return true;
+    const left_keys = Object.keys(left ?? {});
+    const right_keys = Object.keys(right ?? {});
+    if (left_keys.length !== right_keys.length) return false;
+    return left_keys.every((key) => (
+        left![key as unknown as number] === right?.[key as unknown as number]
+    ));
+}
+
 export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
@@ -822,13 +835,15 @@ export function App(): React.JSX.Element {
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
-                    if (
+                    const source_changed =
                         snapshot.presentation === 'initial'
-                        || source_generation_ref.current !== snapshot.sourceGeneration
-                    ) {
+                        || source_generation_ref.current !== snapshot.sourceGeneration;
+                    if (source_changed) {
                         histogram_cache_ref.current.clear();
                         set_filter_histogram({ key: '', value: { status: 'loading' } });
                     }
+                    const view_generation_changed =
+                        generation_ref.current !== snapshot.generation;
                     set_generation(snapshot.generation);
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
@@ -842,10 +857,47 @@ export function App(): React.JSX.Element {
                         pending_save_dialog_ref.current = null;
                     }
                     set_source_epoch((n) => n + 1);
-                    auto_fit_active_ref.current = [];
-                    auto_fit_snapshot_ref.current = [];
-                    set_auto_fit_active([]);
-                    set_auto_fit_snapshot([]);
+                    // Auto-fit measures the loaded rows, so anything that changes
+                    // the measured population invalidates it: a new source, a new
+                    // view generation (durable transform reconciliation bumps the
+                    // generation without the source, and reports it only here), or
+                    // a changed header row. A same-generation capability refresh —
+                    // entering edit mode redelivers the projection — must not.
+                    if (
+                        source_changed
+                        || view_generation_changed
+                        || header_changed.size > 0
+                    ) {
+                        auto_fit_active_ref.current = [];
+                        auto_fit_snapshot_ref.current = [];
+                        set_auto_fit_active([]);
+                        set_auto_fit_snapshot([]);
+                    } else {
+                        // The refresh reinstalls the host's authoritative widths, which
+                        // can predate this panel's own fitted-width write. Where the
+                        // widths we fitted are not the widths coming back, the toggle
+                        // would claim fitted columns it no longer has, so drop it for
+                        // those sheets and keep the authoritative widths.
+                        const incoming = refresh_authoritative_state!.columnWidths;
+                        const local = state_ref.current.columnWidths ?? [];
+                        const stale = auto_fit_active_ref.current
+                            .map((active, index) => (
+                                active
+                                && !sheet_widths_equal(incoming[index], local[index])
+                            ));
+                        if (stale.some(Boolean)) {
+                            const next_active = auto_fit_active_ref.current
+                                .map((active, index) => active && !stale[index]);
+                            const next_snapshot = auto_fit_snapshot_ref.current
+                                .map((snapshot, index) => (
+                                    stale[index] ? undefined : snapshot
+                                ));
+                            auto_fit_active_ref.current = next_active;
+                            auto_fit_snapshot_ref.current = next_snapshot;
+                            set_auto_fit_active(next_active);
+                            set_auto_fit_snapshot(next_snapshot);
+                        }
+                    }
                     set_pending_transforms([]);
                     set_pending_transform_labels([]);
                     pending_transform_request_ids_ref.current = [];

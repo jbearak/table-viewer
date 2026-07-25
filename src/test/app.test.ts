@@ -2563,6 +2563,102 @@ describe('auto-fit state', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
     });
 
+    it('keeps auto-fit active across a capability-only refresh (entering edit mode)', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { columnWidths: [{ 0: 80 }] },
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        ));
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        await enter_edit_mode(post_message);
+        // Claiming the edit session makes the host redeliver the projection: same
+        // source and generation, new capabilities, and the fitted widths this
+        // panel already persisted.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                state: { columnWidths: [{ 0: 200 }] },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+            },
+        ));
+
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 200 });
+    });
+
+    it('drops auto-fit when a refresh reinstalls widths that predate the fit', async () => {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { columnWidths: [{ 0: 80 }] },
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        ));
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        await enter_edit_mode(post_message);
+        // The host read its state before the fitted-width write landed, so the
+        // refresh reverts the columns. The toggle must not claim fitted columns
+        // the grid no longer has.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                state: { columnWidths: [{ 0: 80 }] },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+            },
+        ));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 80 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+
+        // A single click re-fits rather than restoring the widths already shown.
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 200 });
+    });
+
+    it('clears auto-fit when a same-source refresh reports a new view generation', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        // Durable transform reconciliation bumps the view generation without the
+        // source generation, and the reconciled rows are reported only here.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+        }));
+
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
     it('merges fitted visible widths without deleting hidden source widths', async () => {
         grid_shell_mock.auto_fit_result = { 0: 120, 2: 220 };
         await render_app();
