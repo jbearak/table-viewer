@@ -130,7 +130,8 @@ Full transcript (file reads) discarded; findings verbatim below.
 - Existing CSV pending-edit migration is plausibly a no-op: CSV’s `rowCount` and `sourceRowCount` are equal at [csv-source.ts:139](/Users/jmb/repos/Extensions/table-viewer.worktrees/release-binaries/src/data-source/csv-source.ts:139), and the current host/webview barriers prevented valid edits from being created under transforms.
 - Auto-grow is genuinely ungated on `transformed`.
 
-Bottom line: keep the two-PR concept if desired, but PR 1 needs an edit-session-owned state model, host-side base validation, and a replacement transform/edit/save admission protocol. The row-height guard itself is not the reason PR 1 is unsafe.
+Bottom line (this reviewed the *earlier* two-PR plan; the plan doc has since been
+resequenced into four PRs in response): keep the two-PR concept if desired, but PR 1 needs an edit-session-owned state model, host-side base validation, and a replacement transform/edit/save admission protocol. The row-height guard itself is not the reason PR 1 is unsafe.
 tokens used
 289,841
 The core diagnosis is correct, but the plan is not safe to implement as written. The two-PR split is defensible in principle; PR 1 is not mergeable until its edit-state lifetime, transform/save ordering, and conflict validation are redesigned.

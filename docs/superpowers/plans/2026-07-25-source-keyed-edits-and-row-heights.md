@@ -112,7 +112,7 @@ And: there is no find/search state to migrate — GridShell never passes Glide's
 
 ---
 
-## Revised sequencing: three PRs
+## Revised sequencing: four PRs
 
 The review's conclusion — "PR 1 needs an edit-session-owned state model,
 host-side base validation, and a replacement admission protocol" — is three

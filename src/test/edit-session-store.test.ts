@@ -125,6 +125,24 @@ describe('edit session store', () => {
         expect(store.get('1:0')).toEqual({ value: 'D', base: 'd' });
     });
 
+    it('replace carries a still-pending entry rather than promoting its placeholder base', () => {
+        // The save-lifecycle restore path reads the live map, filters it through
+        // resolve_csv_save_hydration (which preserves entry objects) and hands it
+        // straight back to replace. A base_pending entry's `base` is the '' set at
+        // normalize time, so clearing the flag here would promote that placeholder
+        // to a real base: conflict detection would compare against '' and
+        // collect_exact_dirty_edits would admit the save instead of holding it.
+        const store = create_edit_session_store({ session_id: 's' }, { '1:0': 'D' });
+        const pending = store.get('1:0');
+        expect(pending).toEqual({ value: 'D', base: '', base_pending: true });
+
+        store.replace('s', { '5:0': { value: 'E', base: 'e' }, '1:0': pending! });
+
+        expect(store.has_pending_base()).toBe(true);
+        expect(store.get('1:0')).toEqual({ value: 'D', base: '', base_pending: true });
+        expect(store.get('5:0')).toEqual({ value: 'E', base: 'e' });
+    });
+
     it('install carries the pending-base flag across a hydration boundary', () => {
         const store = create_edit_session_store({ session_id: 's' });
         expect(store.has_pending_base()).toBe(false);

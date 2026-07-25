@@ -126,8 +126,20 @@ export interface EditSessionStore {
     remove(session_id: string | undefined, key: string): void;
     remove_keys(session_id: string | undefined, keys: ReadonlySet<string>): void;
     clear(session_id: string | undefined): void;
-    /** Clears the pending-base flag: the incoming entries all carry real bases. */
-    replace(session_id: string | undefined, entries: Readonly<Record<string, CsvDirtyEntry>>): void;
+    /**
+     * Replace the whole map, carrying each entry's `base_pending` across. The
+     * save-lifecycle restore path round-trips the live map back through here
+     * (`resolve_csv_save_hydration` filters entries but preserves the objects),
+     * so entries arriving with the flag still set have a placeholder `base` of
+     * `''`. Dropping the flag would promote that placeholder to a real base:
+     * conflict detection would start comparing against `''` and a save would be
+     * admitted with a base the user never saw, instead of being held back by
+     * `collect_exact_dirty_edits`.
+     */
+    replace(
+        session_id: string | undefined,
+        entries: Readonly<Record<string, CsvDirtyEntry & { base_pending?: boolean }>>,
+    ): void;
     /**
      * Filter in place by an arbitrary predicate. Exists so `discard_conflicted`'s
      * predicate ({@link is_entry_conflicted} against `get_cell_raw`) stays
@@ -239,13 +251,17 @@ export function create_edit_session_store(
         },
         replace: (session_id, entries) => {
             if (!owns(session_id)) return;
-            set_entries(
-                new Map(Object.entries(entries).map(([key, entry]) => [
-                    key,
-                    { value: entry.value, base: entry.base },
-                ])),
-                false,
-            );
+            let pending_base = false;
+            const next = new Map<string, DirtyEntry>();
+            for (const [key, entry] of Object.entries(entries)) {
+                if (entry.base_pending) {
+                    pending_base = true;
+                    next.set(key, { value: entry.value, base: entry.base, base_pending: true });
+                    continue;
+                }
+                next.set(key, { value: entry.value, base: entry.base });
+            }
+            set_entries(next, pending_base);
         },
         retain: (session_id, keep) => {
             if (!owns(session_id)) return;
