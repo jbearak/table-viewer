@@ -1899,7 +1899,17 @@ export function App(): React.JSX.Element {
     // drop every subsequent edit. Attributing the retained map to the newly
     // adopted session matches the old behavior exactly: the unchanged
     // initial_edits prop re-seeded the map across that same transition.
-    useEffect(() => {
+    //
+    // useLayoutEffect, not useEffect: React runs child passive effects BEFORE the
+    // parent's, so as a passive effect this would re-stamp only after GridShell's
+    // own effects had already written under the new session id — and the store
+    // would fence those writes off, silently dropping them. GridShell's save
+    // lifecycle effect (replace_dirty) and its pendingEdits persistence effect are
+    // both reachable in that window, because the host delivers csvEditSessionId
+    // and csvSaveLifecycle in one snapshot. A parent layout effect runs before any
+    // child passive effect, so the stamp is always level before the child writes;
+    // none of GridShell's own layout effects touch the store.
+    useLayoutEffect(() => {
         const store = edit_session_ref.current!;
         const stamp = store.identity();
         if (stamp && stamp.session_id === csv_edit_session_id) return;

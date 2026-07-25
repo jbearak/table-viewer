@@ -31,6 +31,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
     emit_pending_edits_on_mount: false,
+    write_on_session_change: false,
 }));
 
 // Stand-in store for the handful of renders that don't pass one, so the stub can
@@ -126,6 +127,22 @@ vi.mock('../webview/grid-shell', () => ({
             props.edit_session?.subscribe ?? empty_edit_session.subscribe,
             props.edit_session?.snapshot ?? empty_edit_session.snapshot,
         );
+        // Models the real shell's session-keyed effects (the save-lifecycle
+        // replace_dirty and the pendingEdits persistence effect): a child effect
+        // that writes to the store under the session id it was just handed. React
+        // runs this before App's own passive effects, so it is the window in which
+        // a lagging session stamp would silently fence the write off.
+        // The key is derived from the session id so each session's write is
+        // distinguishable: keying them all the same way would let the accepted
+        // write from the first session stand in for a dropped one from the second.
+        React.useEffect(() => {
+            if (!grid_shell_mock.write_on_session_change) return;
+            if (!props.edit_session || !props.edit_session_id) return;
+            props.edit_session.commit(props.edit_session_id, `session:${props.edit_session_id}`, {
+                value: 'written by a session-keyed child effect',
+                base: 'base',
+            });
+        }, [props.edit_session, props.edit_session_id]);
         React.useLayoutEffect(() => {
             if (!props.grid_focus_ref) return;
             const handle = {
@@ -660,6 +677,7 @@ function cleanup() {
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.emit_pending_edits_on_mount = false;
+    grid_shell_mock.write_on_session_change = false;
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -4888,6 +4906,41 @@ describe('edit session store hydration', () => {
         expect(store_edits()).toEqual({
             '0:0': { value: 'typed after rotation', base: 'base' },
         });
+    });
+
+    it('re-stamps the session before the grid effects that write under it', async () => {
+        // React runs child passive effects before the parent's, so if App adopted
+        // the rotated session in a passive effect, GridShell's own session-keyed
+        // effects would already have written under the new id against a store
+        // still stamped with the old one — and the ownership guard would drop them
+        // silently. The host ships csvEditSessionId and csvSaveLifecycle in a
+        // single snapshot, so that window is reachable. Adopting in a layout
+        // effect closes it: a parent layout effect precedes every child passive
+        // effect.
+        grid_shell_mock.write_on_session_change = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'rotated-session',
+            },
+        }));
+
+        // Both writes must be present: the first proves the harness writes at all,
+        // the second is the one a lagging stamp would have fenced off.
+        expect(Object.keys(store_edits()).sort()).toEqual([
+            'session:rotated-session',
+            'session:test-edit-session',
+        ]);
     });
 
     it('folds the open editor into the store before a refresh remount', async () => {
