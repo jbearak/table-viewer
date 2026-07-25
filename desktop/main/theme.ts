@@ -12,6 +12,7 @@
 import {
     DEFAULT_THEME_ID,
     THEME_DEFINITIONS,
+    type ThemeDefinition,
     type ThemeId,
     type ThemeKind,
 } from './theme-definitions';
@@ -109,16 +110,15 @@ export function window_background_color(id: ThemeId): string {
     return theme_variables(id)['--vscode-editor-background'];
 }
 
-/** Also set on <html> so the page background matches before CSS loads. */
-export function theme_css_variables(id: ThemeId): Record<string, string> {
-    return { ...theme_variables(id) };
-}
-
 /** Unknown ids cannot come from the settings store (it sanitizes both slots),
  *  but this module is also reachable from tests and future callers, so fall back
  *  to Dark rather than throwing in the middle of a first paint. */
+function theme_definition(id: ThemeId): ThemeDefinition {
+    return THEME_DEFINITIONS[id] ?? THEME_DEFINITIONS[DEFAULT_THEME_ID.dark];
+}
+
 function theme_variables(id: ThemeId): Record<string, string> {
-    return (THEME_DEFINITIONS[id] ?? THEME_DEFINITIONS[DEFAULT_THEME_ID.dark]).variables;
+    return theme_definition(id).variables;
 }
 
 export interface ThemePayload {
@@ -130,7 +130,7 @@ export interface ThemePayload {
 }
 
 export function theme_payload(id: ThemeId): ThemePayload {
-    const definition = THEME_DEFINITIONS[id] ?? THEME_DEFINITIONS[DEFAULT_THEME_ID.dark];
+    const definition = theme_definition(id);
     return {
         themeId: definition.id,
         // Derived from the registry, never passed in: `kind` and `themeId`

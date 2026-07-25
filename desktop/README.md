@@ -52,7 +52,7 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 - Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
 
-The font family and font size preferences style the whole app — viewer windows, the welcome window, and the Preferences window itself — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
+The font family and font size preferences style the whole app — viewer windows, the welcome window, the Preferences window itself, and the About window — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 
 The Appearance preference (`theme`) is `system` by default, which follows the OS light/dark setting; `light` and `dark` pin it. It is applied by handing the value to Electron's `nativeTheme.themeSource`, so Appearance only picks the *mode*. Two further preferences pick which theme paints each mode: `lightThemeId` and `darkThemeId`. Keeping a slot per mode means switching Appearance back and forth never loses the theme chosen for the other mode.
 
@@ -64,7 +64,7 @@ The Preferences **Color theme** select is a view of the live theme payload rathe
 
 **About Table Viewer** (the app menu on macOS, **Help** elsewhere) opens a small custom window (`desktop/renderer/about.html`) rather than the native macOS About panel: GPL-3.0 expects an interactive program to surface its license and warranty notice, and the native panel cannot host the links that makes practical. It offers the app's own license, [NOTICE.md](../NOTICE.md), and the generated npm package notices.
 
-The display name in the markup is hardcoded, because `app.name` is the package name (`table-viewer`) outside a packaged build — only the version comes from Electron (`app.getVersion()`, correct in both modes). The window is a sandboxed renderer like Preferences, so its preload cannot call `shell` itself; the link targets go over IPC and the main process maps each target name to a URL, so a compromised renderer cannot open an arbitrary one.
+The display name in the markup is hardcoded, because `app.name` is the package name (`table-viewer`) outside a packaged build. The version is not read from Electron either: `app.getVersion()` reports *Electron's* version in a dev run (the app is launched as `electron dist/desktop/main.js`, and `dist/desktop` has no `package.json`), so `desktop/build.mjs` injects the root `package.json` version into the main bundle as `__APP_VERSION__` — one source of truth, correct in both modes. The window is a sandboxed renderer like Preferences, so its preload cannot call `shell` itself; the link targets go over IPC and the main process maps each target name to a URL, so a compromised renderer cannot open an arbitrary one.
 
 `notices_file_path` (`desktop/main/notices-path.ts`) resolves the bundled `THIRD_PARTY_NOTICES.txt`, which lives in two different places: `dist/desktop/` in a dev run, and `Contents/Resources/` in a packaged app (electron-builder excludes it from `files` and ships it via `extraResources`). It only exists once `desktop/collect-licenses.mjs` has run, which `npm run desktop:dev` now does.
 

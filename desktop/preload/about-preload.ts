@@ -19,7 +19,7 @@ import type { ThemePayload } from '../main/theme';
 
 /** Link targets, not URLs: the main process owns the URL list, so the renderer
  *  can never talk shell.openExternal into opening something else. */
-export type AboutLink = 'notices' | 'repository' | 'license';
+export type AboutLink = 'notices' | 'license';
 
 export interface AboutApi {
     /** Sync, like CHANNEL_GET_THEME: needed before the first paint. */
@@ -39,7 +39,9 @@ const api: AboutApi = {
     open_notices: () => ipcRenderer.send(CHANNEL_ABOUT_OPEN_NOTICES),
     get_theme: () => ipcRenderer.sendSync(CHANNEL_GET_THEME) as ThemePayload,
     on_theme_changed: (listener) => {
-        ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => listener(payload));
+        ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
+            listener(payload);
+        });
     },
     get_settings: () => ipcRenderer.invoke(CHANNEL_PREFS_GET),
     on_settings_changed: (listener) => {

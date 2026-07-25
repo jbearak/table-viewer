@@ -33,6 +33,7 @@ import {
     type ThemeSetting,
 } from './theme';
 import { notices_file_path } from './notices-path';
+import { REPOSITORY_URL, about_link_url } from './about-links';
 import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
@@ -55,14 +56,17 @@ import {
 
 const SUPPORTED_EXTENSIONS = ['csv', 'tsv', 'xlsx', 'xls'];
 
-const REPOSITORY_URL = 'https://github.com/jbearak/table-viewer';
-/** The main process owns these, so a compromised About renderer cannot talk
- *  shell.openExternal into opening an arbitrary URL. */
-const ABOUT_LINKS: Record<string, string> = {
-    repository: REPOSITORY_URL,
-    license: `${REPOSITORY_URL}/blob/main/LICENSE`,
-    notices: `${REPOSITORY_URL}/blob/main/NOTICE.md`,
-};
+/**
+ * The app's version, injected by desktop/build.mjs from the root package.json.
+ *
+ * Deliberately not `app.getVersion()`: the dev run launches the app as
+ * `electron dist/desktop/main.js`, and dist/desktop has no package.json, so
+ * Electron falls back to reporting *its own* version (the About window showed
+ * Electron 39.x instead of the app's). Only a packaged build — where
+ * electron-builder generates an app package.json — happens to answer correctly,
+ * which is exactly the mode nobody watches while developing.
+ */
+declare const __APP_VERSION__: string;
 
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
@@ -460,12 +464,14 @@ function register_ipc(): void {
     });
     // Sync, matching CHANNEL_GET_THEME: the renderer needs it before first paint.
     // Only the version — the display name is hardcoded in about.html because
-    // `app.name` is the package name (`table-viewer`) outside a packaged build.
+    // `app.name` is the package name (`table-viewer`) outside a packaged build,
+    // and the version is the build-time constant rather than `app.getVersion()`
+    // for the reason documented on __APP_VERSION__.
     ipcMain.on(CHANNEL_ABOUT_GET_INFO, (event) => {
-        event.returnValue = { version: app.getVersion() };
+        event.returnValue = { version: __APP_VERSION__ };
     });
     ipcMain.on(CHANNEL_ABOUT_OPEN_LINK, (_event, target: unknown) => {
-        const url = typeof target === 'string' ? ABOUT_LINKS[target] : undefined;
+        const url = about_link_url(target);
         if (url) void shell.openExternal(url);
     });
     ipcMain.on(CHANNEL_ABOUT_OPEN_NOTICES, () => {
@@ -512,10 +518,10 @@ function apply_theme_source(theme: ThemeSetting): void {
     nativeTheme.themeSource = theme;
 }
 
-/** Keep the app chrome (welcome and Preferences windows) on the configured
- *  font, matching how the extension's font settings style its entire UI, and
- *  keep every window's palette in step with the appearance preference and the
- *  two per-mode theme slots.
+/** Keep the app chrome (welcome, Preferences, and About windows) on the
+ *  configured font, matching how the extension's font settings style its entire
+ *  UI, and keep every window's palette in step with the appearance preference
+ *  and the two per-mode theme slots.
  *
  *  Sent to every window rather than a tracked chrome list: only the chrome
  *  preloads listen for this channel, and viewer windows get font changes through

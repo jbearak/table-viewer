@@ -47,6 +47,10 @@ function apply_theme(payload: ThemePayload): void {
 function populate_color_themes(payload: ThemePayload): void {
     if (payload.kind !== current_kind || color_theme.options.length === 0) {
         current_kind = payload.kind;
+        // Stamped on the element, not only kept in `current_kind`, so the change
+        // handler can write to the slot matching the list the user actually saw
+        // (see the race described there).
+        color_theme.dataset.kind = current_kind;
         color_theme.replaceChildren(
             ...prefs_api.themes_for_kind(current_kind).map((theme_option) => {
                 const option = document.createElement('option');
@@ -97,8 +101,15 @@ font_family.addEventListener('change', () => save({ fontFamily: font_family.valu
 theme.addEventListener('change', () => save({ theme: theme.value as ThemeSetting }));
 // Which slot this writes depends on the mode the list is currently showing —
 // that is the whole meaning of this control.
+//
+// Read from the element's own dataset rather than from `current_kind`, which is
+// module state sampled at *dispatch* time: a theme payload with a flipped kind
+// (an OS light↔dark flip under Appearance=System) landing between the user
+// committing a selection and this event firing would rebuild the list, flip
+// `current_kind`, and make this write e.g. `solarized-light` into darkThemeId —
+// which `sanitize_theme_id` silently rejects, so the click appears to do nothing.
 color_theme.addEventListener('change', () => {
-    save(current_kind === 'dark'
+    save(color_theme.dataset.kind === 'dark'
         ? { darkThemeId: color_theme.value as DesktopSettings['darkThemeId'] }
         : { lightThemeId: color_theme.value as DesktopSettings['lightThemeId'] });
 });

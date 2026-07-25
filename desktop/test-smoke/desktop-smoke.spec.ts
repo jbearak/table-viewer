@@ -16,6 +16,11 @@ import { click_menu_item as click_menu, main_js, repo_dir } from './smoke-helper
 const csv_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.csv');
 const xlsx_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx');
 
+/** The app's real version — the same file desktop/build.mjs injects from. */
+const app_version = (
+    JSON.parse(fs.readFileSync(path.join(repo_dir, 'package.json'), 'utf8')) as { version: string }
+).version;
+
 const VIEWER_URL_PREFIX = 'tv-app://viewer';
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
 
@@ -380,7 +385,11 @@ test('the About window shows the app version and its notice links', async () => 
     try {
         await expect.poll(about_page, { timeout: 15_000 }).toBeTruthy();
         const about = about_page()!;
-        await expect(about.locator('#version')).toHaveText(/^Version \d+\.\d+\.\d+/);
+        // Compared against the root package.json, not a loose version-shaped
+        // regex: the bug this guards is the window showing *a* plausible version
+        // that is not the app's (app.getVersion() reports Electron's own version
+        // in an unpackaged dev run), which any /\d+\.\d+\.\d+/ happily accepts.
+        await expect(about.locator('#version')).toHaveText(`Version ${app_version}`);
         for (const id of ['#license', '#notices', '#bundledNotices']) {
             await expect(about.locator(id)).toBeVisible();
         }

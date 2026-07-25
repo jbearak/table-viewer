@@ -47,13 +47,15 @@
 <body>
 <!-- Hardcoded: `app.name` is the package name (`table-viewer`) in a dev run,
      because electron-builder's productName only applies to a packaged app. The
-     version comes from app.getVersion(), which is right in both modes. -->
+     version is filled in from IPC (desktop/renderer/about.ts) with a constant
+     injected from the root package.json at build time — `app.getVersion()`
+     reports Electron's own version in an unpackaged run (see __APP_VERSION__ in
+     desktop/main/main.ts). -->
 <h1>Table Viewer</h1>
 <div id="version"></div>
 <p class="legal">
-  Copyright © Jonathan Marc Bearak. Licensed under the GNU General Public
-  License, version 3 or later. This program comes with ABSOLUTELY NO WARRANTY,
-  to the extent permitted by law.
+  Copyright © Jonathan Marc Bearak. Licensed under version 3 of the GNU General
+  Public License. This program comes with ABSOLUTELY NO WARRANTY.
 </p>
 <div id="links">
   <button id="license" type="button">License (GPL-3.0)</button>

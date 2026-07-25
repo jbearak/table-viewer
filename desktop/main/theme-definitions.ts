@@ -241,33 +241,60 @@ const CATPPUCCIN_LATTE: SemanticPalette = {
 };
 
 const CATPPUCCIN_FRAPPE: SemanticPalette = {
-    bg: '#303446', bgAlt: '#292c3c', bgElevated: '#414559',
-    fg: '#c6d0f5', fgMuted: '#a5adce', fgSubtle: '#737994',
-    border: '#51576d',
-    accent: '#8caaee', accentHover: '#9fbaf2', accentFg: '#232634', // crust
+    bg: '#303446',          // base
+    bgAlt: '#292c3c',       // mantle
+    bgElevated: '#414559',  // surface0
+    fg: '#c6d0f5',          // text
+    fgMuted: '#a5adce',     // subtext0
+    fgSubtle: '#737994',    // overlay0
+    border: '#51576d',      // surface1
+    accent: '#8caaee',      // blue
+    accentHover: '#9fbaf2', // hand-lightened blue
+    accentFg: '#232634',    // crust
     selection: '#626880',   // surface2
     hover: '#414559',       // surface0
-    link: '#8caaee', error: '#e78284', warning: '#e5c890', info: '#85c1dc',
+    link: '#8caaee',        // blue
+    error: '#e78284',       // red
+    warning: '#e5c890',     // yellow
+    info: '#85c1dc',        // sapphire
 };
 
 const CATPPUCCIN_MACCHIATO: SemanticPalette = {
-    bg: '#24273a', bgAlt: '#1e2030', bgElevated: '#363a4f',
-    fg: '#cad3f5', fgMuted: '#a5adcb', fgSubtle: '#6e738d',
-    border: '#494d64',
-    accent: '#8aadf4', accentHover: '#9dbcf7', accentFg: '#181926', // crust
-    selection: '#5b6078',
-    hover: '#363a4f',
-    link: '#8aadf4', error: '#ed8796', warning: '#eed49f', info: '#7dc4e4',
+    bg: '#24273a',          // base
+    bgAlt: '#1e2030',       // mantle
+    bgElevated: '#363a4f',  // surface0
+    fg: '#cad3f5',          // text
+    fgMuted: '#a5adcb',     // subtext0
+    fgSubtle: '#6e738d',    // overlay0
+    border: '#494d64',      // surface1
+    accent: '#8aadf4',      // blue
+    accentHover: '#9dbcf7', // hand-lightened blue
+    accentFg: '#181926',    // crust
+    selection: '#5b6078',   // surface2
+    hover: '#363a4f',       // surface0
+    link: '#8aadf4',        // blue
+    error: '#ed8796',       // red
+    warning: '#eed49f',     // yellow
+    info: '#7dc4e4',        // sapphire
 };
 
 const CATPPUCCIN_MOCHA: SemanticPalette = {
-    bg: '#1e1e2e', bgAlt: '#181825', bgElevated: '#313244',
-    fg: '#cdd6f4', fgMuted: '#a6adc8', fgSubtle: '#6c7086',
-    border: '#45475a',
-    accent: '#89b4fa', accentHover: '#9dc0fb', accentFg: '#11111b', // crust
-    selection: '#585b70',
-    hover: '#313244',
-    link: '#89b4fa', error: '#f38ba8', warning: '#f9e2af', info: '#74c7ec',
+    bg: '#1e1e2e',          // base
+    bgAlt: '#181825',       // mantle
+    bgElevated: '#313244',  // surface0
+    fg: '#cdd6f4',          // text
+    fgMuted: '#a6adc8',     // subtext0
+    fgSubtle: '#6c7086',    // overlay0
+    border: '#45475a',      // surface1
+    accent: '#89b4fa',      // blue
+    accentHover: '#9dc0fb', // hand-lightened blue
+    accentFg: '#11111b',    // crust
+    selection: '#585b70',   // surface2
+    hover: '#313244',       // surface0
+    link: '#89b4fa',        // blue
+    error: '#f38ba8',       // red
+    warning: '#f9e2af',     // yellow
+    info: '#74c7ec',        // sapphire
 };
 
 /* SynthWave '84 — (c) 2019 Robb Owen, MIT.
