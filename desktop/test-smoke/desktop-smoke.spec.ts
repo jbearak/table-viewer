@@ -18,6 +18,11 @@ import {
     open_preferences,
     repo_dir,
 } from './smoke-helpers';
+// The theme registry, not a copy of it: the dropdown assertions below are about
+// the catalog reaching the window intact, and a hardcoded count would have to be
+// bumped by every theme that ships. Safe to import — theme-definitions.ts is a
+// pure module, so pulling it in here starts no second Electron.
+import { list_themes } from '../main/theme-definitions';
 
 const csv_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.csv');
 const xlsx_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx');
@@ -336,14 +341,18 @@ test('the appearance preference pins light/dark, and System restores OS followin
         await expect.poll(editor_background, { timeout: 5_000 }).toBe('#ffffff');
 
         // Light mode offers exactly the light themes, selected on the default.
-        await expect(color_theme.locator('option')).toHaveCount(3);
+        const option_ids = () => color_theme.locator('option')
+            .evaluateAll((options) => options.map((o) => (o as HTMLOptionElement).value));
+        await expect.poll(option_ids, { timeout: 15_000 })
+            .toEqual(list_themes('light').map((theme) => theme.id));
         await expect(color_theme).toHaveValue('light');
 
         // Flipping the OS while Preferences is open must retarget the dropdown
         // live — under Appearance=System its meaning *is* the current mode.
         // No reload: the list is rebuilt from the theme payload it already gets.
         await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
-        await expect(color_theme.locator('option')).toHaveCount(6);
+        await expect.poll(option_ids, { timeout: 15_000 })
+            .toEqual(list_themes('dark').map((theme) => theme.id));
         await expect(color_theme).toHaveValue('dark');
 
         // Picking a non-default theme repaints the open viewer windows.
