@@ -32,6 +32,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     latest_props: null as Record<string, unknown> | null,
     emit_pending_edits_on_mount: false,
     write_on_session_change: false,
+    listen_for_save_result: false,
 }));
 
 // Stand-in store for the handful of renders that don't pass one, so the stub can
@@ -142,6 +143,26 @@ vi.mock('../webview/grid-shell', () => ({
                 value: 'written by a session-keyed child effect',
                 base: 'base',
             });
+        }, [props.edit_session, props.edit_session_id]);
+        // Models the real shell's own `message` listener (grid-shell.tsx:641),
+        // which calls replace_dirty on a saveResult while capturing the
+        // edit_session_id from the render that registered it. Child effects run
+        // before the parent's, so on the first mount this listener is registered
+        // ahead of App's; a remount re-registers it *after* App's, flipping the
+        // dispatch order. The write then lands after App has already installed
+        // and re-stamped, which is where the ownership fence could drop it.
+        React.useEffect(() => {
+            if (!grid_shell_mock.listen_for_save_result) return;
+            const session_at_registration = props.edit_session_id;
+            const store = props.edit_session;
+            const handler = (event: MessageEvent) => {
+                if (event.data?.type !== 'saveResult') return;
+                store?.replace(session_at_registration, {
+                    'restored:by:shell': { value: 'shell restore', base: 'base' },
+                });
+            };
+            window.addEventListener('message', handler);
+            return () => window.removeEventListener('message', handler);
         }, [props.edit_session, props.edit_session_id]);
         React.useLayoutEffect(() => {
             if (!props.grid_focus_ref) return;
@@ -678,6 +699,7 @@ function cleanup() {
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.emit_pending_edits_on_mount = false;
     grid_shell_mock.write_on_session_change = false;
+    grid_shell_mock.listen_for_save_result = false;
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -4941,6 +4963,38 @@ describe('edit session store hydration', () => {
             'session:rotated-session',
             'session:test-edit-session',
         ]);
+    });
+
+    it('keeps the shell save-lifecycle restore effective after a remount flips listener order', async () => {
+        // GridShell registers its own `message` listener in a passive effect, so on
+        // the first mount it sits ahead of App's and fires first. A generation bump
+        // remounts it, re-registering it *after* App's — from then on App installs
+        // and re-stamps first, and the shell's replace_dirty arrives at an
+        // already-restamped store carrying the session id from its own render.
+        // Pre-refactor there was no fence and that write always landed, so this
+        // pins that the fence did not turn an order flip into a dropped restore.
+        grid_shell_mock.listen_for_save_result = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+
+        // Bump the generation so the shell's listener is re-registered last.
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            rowCount: 1,
+            generation: 5,
+            sourceGeneration: 1,
+        });
+
+        await dispatch_host_message({ type: 'saveResult', success: true });
+
+        // The shell's restore must not have been silently fenced off.
+        expect(Object.keys(store_edits())).toContain('restored:by:shell');
     });
 
     it('folds the open editor into the store before a refresh remount', async () => {
