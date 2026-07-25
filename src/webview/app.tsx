@@ -72,6 +72,10 @@ import {
     resolve_csv_save_hydration,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
+import {
+    create_edit_session_store,
+    type EditSessionStore,
+} from './edit-session-store';
 import { column_letter } from './grid-model';
 import {
     create_column_projection,
@@ -336,6 +340,12 @@ export function App(): React.JSX.Element {
         INITIAL_CSV_SAVE_PROJECTION,
     );
     const latest_live_edits_ref = useRef<PerFileState['pendingEdits']>(undefined);
+    // The dirty map itself, owned here so it survives the generation-keyed
+    // GridShell remounts that a transform or refresh snapshot forces.
+    const edit_session_ref = useRef<EditSessionStore | null>(null);
+    if (edit_session_ref.current === null) {
+        edit_session_ref.current = create_edit_session_store();
+    }
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
@@ -474,6 +484,19 @@ export function App(): React.JSX.Element {
         set_save_operation(undefined);
     }, []);
 
+    // The single edit-map hydration boundary. Everything that used to only set the
+    // prop now also installs into the session store, which outlives the
+    // generation-keyed grid; the install stamps the session so a write from a
+    // previously mounted hook cannot land in another session's map.
+    const install_edit_session = useCallback((
+        edits: PerFileState['pendingEdits'],
+        session_id: string | undefined,
+    ) => {
+        latest_live_edits_ref.current = edits;
+        set_initial_edits(edits ? { ...edits } : undefined);
+        edit_session_ref.current!.install({ session_id }, edits);
+    }, []);
+
     const apply_save_lifecycle = useCallback((incoming: CsvSaveLifecycle) => {
         const previous = save_projection_ref.current;
         const next = reduce_csv_save_projection(previous, incoming);
@@ -493,8 +516,7 @@ export function App(): React.JSX.Element {
                     current_session_id,
                     latest_live_edits_ref.current,
                 );
-                latest_live_edits_ref.current = hydrated;
-                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                install_edit_session(hydrated, current_session_id);
             }
         } else if (incoming.state === 'idle') {
             if (
@@ -502,8 +524,10 @@ export function App(): React.JSX.Element {
                 && !next.operation
                 && previous.operation.editSessionId === current_session_id
             ) {
-                latest_live_edits_ref.current = previous.operation.dirtyEdits;
-                set_initial_edits({ ...previous.operation.dirtyEdits });
+                install_edit_session(
+                    previous.operation.dirtyEdits,
+                    current_session_id,
+                );
                 pending_exit_ref.current = false;
             }
         } else if (
@@ -517,8 +541,7 @@ export function App(): React.JSX.Element {
                         current_session_id,
                         latest_live_edits_ref.current,
                     );
-                    latest_live_edits_ref.current = hydrated;
-                    set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                    install_edit_session(hydrated, current_session_id);
                     pending_exit_ref.current = false;
                 }
             } else if (
@@ -530,15 +553,14 @@ export function App(): React.JSX.Element {
                     current_session_id,
                     latest_live_edits_ref.current,
                 );
-                latest_live_edits_ref.current = hydrated;
-                set_initial_edits(hydrated ? { ...hydrated } : undefined);
+                install_edit_session(hydrated, current_session_id);
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
             }
         }
         return { previous, next, changed: true };
-    }, [set_csv_edit_session_id, set_edit_mode]);
+    }, [install_edit_session, set_csv_edit_session_id, set_edit_mode]);
 
     useEffect(() => {
         auto_fit_active_ref.current = auto_fit_active;
@@ -814,8 +836,10 @@ export function App(): React.JSX.Element {
                         )
                         : undefined;
                     if (refresh_editing_current_session) {
-                        latest_live_edits_ref.current = refresh_edits;
-                        set_initial_edits(refresh_edits);
+                        install_edit_session(
+                            refresh_edits,
+                            snapshot_edit_session_id,
+                        );
                     }
                     document_epoch_ref.current += 1;
                     set_grid_focus_restore(null);
@@ -956,8 +980,10 @@ export function App(): React.JSX.Element {
                         const hydrated_edits = owns_clean_or_dirty_session
                             ? restored_edits ?? {}
                             : restored_edits;
-                        latest_live_edits_ref.current = hydrated_edits;
-                        set_initial_edits(hydrated_edits);
+                        install_edit_session(
+                            hydrated_edits,
+                            snapshot_edit_session_id,
+                        );
                         set_edit_mode(
                             owns_clean_or_dirty_session
                             || restored_edits !== undefined,
@@ -1782,8 +1808,7 @@ export function App(): React.JSX.Element {
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
-                    latest_live_edits_ref.current = msg.pendingEdits;
-                    set_initial_edits(msg.pendingEdits);
+                    install_edit_session(msg.pendingEdits, msg.editSessionId);
                     set_load_epoch((n) => n + 1);
                     set_edit_mode(true);
                 } else {
@@ -1829,6 +1854,7 @@ export function App(): React.JSX.Element {
     }, [
         apply_save_lifecycle,
         discard_edit_session,
+        install_edit_session,
         leave_edit_mode,
         run_edit_command,
     ]);
@@ -1839,9 +1865,26 @@ export function App(): React.JSX.Element {
         if (edit_mode && !csv_editable) leave_edit_mode();
     }, [edit_mode, csv_editable, leave_edit_mode]);
 
-    // GridShell owns the dirty map (next to the loader); it reports status up so
-    // the toolbar dirty dot, pending-edit persistence, and conflict banner —
-    // App-level concerns — can react.
+    // Keep the store's session stamp level with the session id GridShell's hook
+    // writes under. The host advances csvEditSessionId on *every* applied
+    // snapshot, while a refresh only installs when it is our own current session,
+    // so the id can move with no install behind it. The stamp is there to fence
+    // off a *stale writer* — a hook mounted under a previous session, which is
+    // what the grant's hydration-boundary comment describes — and must never
+    // strand a *current* writer against a lagging stamp, which would silently
+    // drop every subsequent edit. Attributing the retained map to the newly
+    // adopted session matches the old behavior exactly: the unchanged
+    // initial_edits prop re-seeded the map across that same transition.
+    useEffect(() => {
+        const store = edit_session_ref.current!;
+        const stamp = store.identity();
+        if (stamp && stamp.session_id === csv_edit_session_id) return;
+        store.adopt_session(csv_edit_session_id);
+    }, [csv_edit_session_id]);
+
+    // GridShell reports editing status up so the toolbar dirty dot, pending-edit
+    // persistence, and conflict banner — App-level concerns — can react. The
+    // dirty map itself lives in edit_session_ref.
     const handle_editing_change = useCallback((status: EditingStatus) => {
         latest_live_edits_ref.current = Object.keys(status.edits).length > 0
             ? status.edits
@@ -2270,6 +2313,7 @@ export function App(): React.JSX.Element {
             save_lifecycle={save_lifecycle}
             on_save_request={begin_save_operation}
             initial_edits={initial_edits}
+            edit_session={edit_session_ref.current}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
