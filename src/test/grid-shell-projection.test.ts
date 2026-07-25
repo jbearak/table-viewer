@@ -109,6 +109,20 @@ vi.mock('@glideapps/glide-data-grid', () => {
     };
 });
 
+// Lowest display row claiming `source_row`, or undefined if none does. Scanning a
+// bounded display window stands in for the loader's source→page index; the harness
+// only ever renders a handful of rows.
+const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
+    for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
+        const claimed = grid_mock.source_row_for_display
+            ? grid_mock.source_row_for_display(display_row)
+            : display_row;
+        if (claimed === source_row) return display_row;
+    }
+    return undefined;
+});
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: (
         _sheet: number,
@@ -128,6 +142,17 @@ vi.mock('../webview/use-row-loader', () => ({
                 grid_mock.source_row_for_display
                     ? grid_mock.source_row_for_display(display_row)
                     : display_row
+            ),
+            // Residency as the real loader's source→page index defines it: a source
+            // row is readable exactly when some display row in the window claims it.
+            get_cell_raw_for_source: (source_row: number, col: number) => {
+                const display_row = resident_display_row(source_row);
+                if (display_row === undefined) return undefined;
+                const cell = grid_mock.get_row(display_row)?.[col];
+                return cell ? String(cell.raw ?? '') : '';
+            },
+            has_source_row: (source_row: number) => (
+                resident_display_row(source_row) !== undefined
             ),
             sample_loaded_rows: () => [],
             version: 0,
@@ -1773,6 +1798,180 @@ describe('GridShell column projection', () => {
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
         expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 40);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+});
+
+// Every test here installs a NON-IDENTITY display→source mapping. Under identity
+// a display-keyed and a source-keyed implementation are indistinguishable, so an
+// identity fixture would make each of these assertions vacuous.
+describe('GridShell source-row edit identity', () => {
+    // Display row 1's source identity is unresolved (its page has not landed);
+    // every other display row maps to itself.
+    const unresolved_row_1 = (display_row: number) => (
+        display_row === 1 ? undefined : display_row
+    );
+
+    it('refuses to open an overlay on a row whose source identity is unresolved', async () => {
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowOverlay: boolean; readonly?: boolean };
+
+        // No source row ⇒ no durable key ⇒ no overlay, and `readonly` closes
+        // Glide's paste path, which never consults allowOverlay.
+        const blocked = get_cell_content([0, 1]);
+        expect(blocked.allowOverlay).toBe(false);
+        expect(blocked.readonly).toBe(true);
+
+        // A resolved row on the same render stays editable.
+        const open = get_cell_content([0, 0]);
+        expect(open.allowOverlay).toBe(true);
+        expect(open.readonly).toBeUndefined();
+    });
+
+    it('keeps a resident blank cell editable', async () => {
+        // Today's behavior, and the thing the overlay-open gate must not regress:
+        // a resident row whose cell is empty is still typeable.
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '', formatted: '', bold: false, italic: false },
+            { raw: '', formatted: '', bold: false, italic: false },
+            { raw: '', formatted: '', bold: false, italic: false },
+        ] as any);
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data: string; allowOverlay: boolean };
+        const blank = get_cell_content([0, 2]);
+        expect(blank.data).toBe('');
+        expect(blank.allowOverlay).toBe(true);
+    });
+
+    it('commits nothing when onCellEdited fires on an unresolved row', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+        }));
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+
+        // Glide's paste path can reach onCellEdited without an overlay, so this is
+        // the second guard: an unresolvable row must land no edit at all rather
+        // than land one under a guessed key.
+        await act(async () => on_cell_edited([0, 1], { kind: 'text', data: 'pasted' }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(false);
+
+        // Same grid, resolved row: the edit does land, so the guard is not simply
+        // disabling all editing.
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('discards the edit under the clicked row\'s source key and reports it dirty', async () => {
+        // Display row 1 ↔ source row 7. A display-keyed discard would target
+        // '1:2' — an entry that does not exist — and leave '7:2' dirty.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        // The menu's `dirty` probe is source-keyed too: a display-keyed probe would
+        // miss and hide this item entirely.
+        const discard = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Discard edit');
+        expect(discard).toBeDefined();
+
+        await act(async () => discard!.click());
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(false);
+    });
+
+    it('copies a dirty cell keyed by source row under a permuted mapping', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '7:2': { value: 'edited-c', base: 'source-c' } },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy cell')!.click());
+        // A display-keyed copy overlay would miss the edit and copy 'source-c'.
+        expect(write_text).toHaveBeenCalledWith('edited-c');
+    });
+
+    it('damages the display coordinates of a source-keyed tint change', async () => {
+        // Source row 7 is displayed at row 1. A tint repaint that treated the
+        // changed key's row as a display coordinate would damage row 7 — outside
+        // the visible region entirely — and paint nothing.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        }));
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 2, height: 3 }));
+        grid_mock.update_cells.mockClear();
+
+        // Bulk transition: clear_dirty drops '7:2' from the dirty set.
+        await act(async () => editing_ref.current!.clear_dirty());
+
+        // Source column 2 is display column 1; source row 7 is display row 1.
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
     });
 });
 

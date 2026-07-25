@@ -246,6 +246,29 @@ describe('conflict detection', () => {
         expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
     });
 
+    it('detects a conflict on a source row the reader resolves in isolation', async () => {
+        // Durable edit keys are source-keyed, and the store splits a key and hands
+        // the row component straight to get_cell_raw — so the reader's domain is
+        // source rows, not display offsets. Model that with a reader that resolves
+        // *only* source row 7: no display-window position is available, so a
+        // conflict can only be found by passing the key's row through unchanged.
+        const resident: (CellData | null)[][] = [];
+        resident[7] = [cell('base')];
+        await render(resident, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(7, 0, 'edited'); });
+        expect(hook_result!.dirty_cells.has('7:0')).toBe(true);
+        expect(hook_result!.dirty_cells.get('7:0')!.base).toBe('base');
+        expect(hook_result!.conflicted_keys.size).toBe(0);
+
+        // Source row 7 drifts (external change to that row).
+        const drifted: (CellData | null)[][] = [];
+        drifted[7] = [cell('drifted')];
+        await rerender(drifted, 1);
+
+        expect(hook_result!.conflicted_keys.has('7:0')).toBe(true);
+    });
+
     it('does not mark conflict when base value unchanged after reload', async () => {
         await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });

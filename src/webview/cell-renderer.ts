@@ -106,6 +106,14 @@ function text_cell(
         // applied to spanned (horizontal-merge) cells — wrapping inside a span is
         // unsupported and multiline merge text is vanishingly rare.
         ...(display.includes('\n') && !span ? { allowWrapping: true } : {}),
+        // Belt and braces with `allowOverlay: false`. Glide's paste path
+        // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
+        // — it gates on `isReadWriteCell`, which for a Text cell checks only
+        // `readonly !== true` — so a cell we refuse to open an overlay on would
+        // still accept a paste or a cut. Only set when an overlay was supplied and
+        // is non-editable: a read-only sheet passes no overlay, so its cell shape
+        // (and every existing snapshot of it) is unchanged.
+        ...(overlay && !overlay.editable ? { readonly: true } : {}),
         ...(has_override ? { themeOverride: theme_override } : {}),
         ...(span ? { span } : {}),
     };

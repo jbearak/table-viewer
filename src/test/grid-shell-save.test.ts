@@ -45,6 +45,28 @@ vi.mock('@glideapps/glide-data-grid', () => {
     };
 });
 
+// Text a source row carries, honouring the overridable fixture.
+const source_row_text = vi.hoisted(() => (source_row: number): readonly string[] => (
+    grid_mock.text_for_source_row
+        ? grid_mock.text_for_source_row(source_row)
+        : (source_row === 0 ? ['base', 'middle', 'source-two'] : ['', '', ''])
+));
+
+// Residency, modelled the way the real loader's source→page index defines it: a
+// source row is readable exactly when some *display* row in the window claims it.
+// Scanning a bounded display window stands in for the index; the harness only ever
+// renders a handful of rows.
+const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
+    for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
+        const claimed = grid_mock.source_row_for_display
+            ? grid_mock.source_row_for_display(display_row)
+            : display_row;
+        if (claimed === source_row) return display_row;
+    }
+    return undefined;
+});
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: () => ({
         ensure_rows: vi.fn(),
@@ -59,10 +81,7 @@ vi.mock('../webview/use-row-loader', () => ({
             // Page not resident: the real loader returns undefined, which
             // get_cell_raw must forward as "unknown", never as a blank cell.
             if (source_row === undefined) return undefined;
-            const text = grid_mock.text_for_source_row
-                ? grid_mock.text_for_source_row(source_row)
-                : (source_row === 0 ? ['base', 'middle', 'source-two'] : ['', '', '']);
-            return text.map((raw) => ({
+            return source_row_text(source_row).map((raw) => ({
                 raw,
                 formatted: raw,
                 bold: false,
@@ -74,6 +93,12 @@ vi.mock('../webview/use-row-loader', () => ({
                 ? grid_mock.source_row_for_display(display_row)
                 : display_row
         ),
+        get_cell_raw_for_source: (source_row: number, col: number) => {
+            if (resident_display_row(source_row) === undefined) return undefined;
+            const raw = source_row_text(source_row)[col];
+            return raw === undefined ? '' : String(raw);
+        },
+        has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
         version: 0,
     }),
@@ -660,6 +685,112 @@ describe('GridShell edits across a generation bump', () => {
 
         expect(Object.fromEntries(store.snapshot())).toEqual({
             '0:1': { value: 'store-only', base: 'middle' },
+        });
+    });
+});
+
+// Every test here installs a NON-IDENTITY display→source mapping, because under
+// identity a display-keyed and a source-keyed save payload are byte-identical and
+// the assertions would prove nothing.
+describe('GridShell source-keyed save payloads', () => {
+    // Display row 0 shows source row 5 — what a sort or a filter produces.
+    function permute_display_0_to_source_5() {
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        grid_mock.text_for_source_row = (source_row: number) => (
+            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+        );
+    }
+
+    // Mount the Glide overlay editor Glide portals into `.gdg-clip-region`, and
+    // select the cell it belongs to, so read_live_edit sees an open editor.
+    async function open_overlay(value: string, cell: [number, number]) {
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = value;
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                columns: {},
+                rows: {},
+                current: {
+                    cell,
+                    range: { x: cell[0], y: cell[1], width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+    }
+
+    function posted_save(post_message: ReturnType<typeof vi.fn>) {
+        return [...post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message)
+            .find((message) => message?.type === 'saveCsv')?.operation;
+    }
+
+    it('posts a committed edit under its source-row key with that row\'s base', async () => {
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await edit_cell('typed');
+        expect(await request_save(editing_ref)).toBe(true);
+
+        // Display-keyed, this would post '0:0' — and its base would be whatever
+        // source row 0 holds, which is not the text the user was looking at.
+        const operation = posted_save(post_message);
+        expect(operation.edits).toEqual({ '5:0': 'typed' });
+        expect(operation.dirtyEdits).toEqual({
+            '5:0': { value: 'typed', base: 'five-a' },
+        });
+    });
+
+    it('folds an open overlay into the save under its source-row key', async () => {
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await open_overlay('overlay-text', [0, 0]);
+        expect(await request_save(editing_ref)).toBe(true);
+
+        // read_live_edit builds the key, so a display-keyed LiveEdit would poison
+        // the collectors even though nothing was ever committed through commit_edit.
+        const operation = posted_save(post_message);
+        expect(operation.edits).toEqual({ '5:0': 'overlay-text' });
+        expect(operation.dirtyEdits).toEqual({
+            '5:0': { value: 'overlay-text', base: 'five-a' },
+        });
+    });
+
+    it('drops an open overlay that reverts to the source row\'s own text', async () => {
+        // The fold rule reads `original` from the same source-keyed reader. Typing
+        // the display row's text back is a revert and must not save; a display-keyed
+        // `original` would read some other row and save a spurious edit.
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await open_overlay('five-a', [0, 0]);
+        expect(await request_save(editing_ref)).toBe(false);
+        expect(posted_save(post_message)).toBeUndefined();
+    });
+
+    it('commit_live_edit writes the open overlay under its source-row key', async () => {
+        permute_display_0_to_source_5();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await open_overlay('typed but not closed', [0, 0]);
+        editing_ref.current!.commit_live_edit();
+
+        // Outside act on purpose, as in the identity-mapped test above: the
+        // write-through is synchronous.
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '5:0': { value: 'typed but not closed', base: 'five-a' },
         });
     });
 });

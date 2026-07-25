@@ -17,6 +17,15 @@ export interface UseRowLoader {
     get_row(row: number): (RenderedCell | null)[] | undefined;
     /** Canonical source-row identity for a resident display row. */
     get_source_row(row: number): number | undefined;
+    /**
+     * A cell's persisted raw text addressed by canonical source row. `''` for a
+     * resident-but-blank cell, `undefined` when the source row is not resident —
+     * the contract source-keyed conflict detection reads through (see
+     * `GetCellRaw` in edit-session-store.ts).
+     */
+    get_cell_raw_for_source(source_row: number, col: number): string | undefined;
+    /** Whether a canonical source row is currently resident on some cached page. */
+    has_source_row(source_row: number): boolean;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
@@ -72,6 +81,11 @@ export function use_row_loader(
     );
     const get_row = useCallback((r: number) => loader.get_row(r), [loader]);
     const get_source_row = useCallback((r: number) => loader.get_source_row(r), [loader]);
+    const get_cell_raw_for_source = useCallback(
+        (source_row: number, col: number) => loader.get_cell_raw_for_source(source_row, col),
+        [loader],
+    );
+    const has_source_row = useCallback((source_row: number) => loader.has_source_row(source_row), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
@@ -79,6 +93,8 @@ export function use_row_loader(
         ensure_rows_loaded,
         get_row,
         get_source_row,
+        get_cell_raw_for_source,
+        has_source_row,
         sample_loaded_rows,
         version,
     };
