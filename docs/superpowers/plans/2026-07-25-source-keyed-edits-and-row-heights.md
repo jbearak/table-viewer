@@ -112,11 +112,14 @@ And: there is no find/search state to migrate — GridShell never passes Glide's
 
 ---
 
-## Revised sequencing: four PRs
+## Revised sequencing: five PRs
 
 The review's conclusion — "PR 1 needs an edit-session-owned state model,
 host-side base validation, and a replacement admission protocol" — is three
 separable pieces of work. Bundling them is what made the original PR 1 unsafe.
+(That review predates this sequencing and argues against a two-PR split; its
+bottom line should be read as the conclusion about the *first* draft, not about
+the plan below. PR 1b was added after #104 landed.)
 
 ### PR 1 — Lift edit state above the grid generation
 
@@ -134,6 +137,63 @@ No behavior change; pure refactor, independently verifiable.
 
 This alone fixes a latent bug: a generation bump from an external refresh
 currently relies on the rehydration path to not lose edits.
+
+**Landed as #104** (`b1fd3be`), and not behavior-neutral after all: the open
+editor now folds in instead of being lost, committed edits survive a refresh
+generation bump, and review caught a latent pre-existing bug where the
+save-restore path could promote a placeholder `base: ''` to a real base —
+admitting a save against a base the user never saw.
+
+### PR 1b — Suppress no-op edit-store notifications
+
+Deferred out of #104 as strict-parity-preserving, and worth doing on its own.
+`edit-session-store.ts` calls `set_entries` → `notify()` unconditionally, so a
+mutation that changes nothing still runs the full downstream chain. Verified by
+probe: identical-value `commit`, `clear` on an empty map, `remove_keys` matching
+nothing, `retain` keeping everything, and `clear_saved` matching nothing all
+notify. (`remove` already guards on `has(key)`.)
+
+Each notification costs a React re-render, two full `Object.fromEntries` over the
+dirty map (`grid-shell.tsx:667, 680`), a `postMessage`, a host-side
+`structuredClone`, and an async workspace-state write — plus a real CAS revision
+bump, since the handler's `edits` branch always spreads into a fresh object so
+the `next === current` shortcut never fires. The mutators' candidate `Map` copy
+is *not* in that list: it happens before `set_entries` is reached, so the guard
+suppresses the notification but not the allocation.
+
+Not only perf: the host's `pendingEditsChanged` handler clears
+`failedSaveTombstone` and calls `retire_save_lifecycle(undefined, 'failed')`
+(`viewer-controller.ts:3566-3568`). None of its three guards blocks a post after
+a *failed* save, so a no-op mutation genuinely can retire a failed-save
+lifecycle — reachable by re-confirming an already-dirty cell without retyping,
+since `commit_edit` compares against the persisted value and so issues an
+identical-value `commit` rather than a `remove`.
+
+**Investigated, and PR 1b does not close that hole** — recorded here so it isn't
+mistaken for done. A failed save produces *two* posts: the `replace_dirty`
+restore (now suppressed, since it restores what the store already holds) and
+`install_edit_session` on `app.tsx`'s failed branch, where `install`
+deliberately force-notifies. So a post still fires and the lifecycle is still
+retired. The honest claim for PR 1b is "removes a redundant duplicate post".
+
+The retire is near-cosmetic on its own. The real harm is upstream and
+pre-existing: with `failed` already retired, `release_edit_session`'s
+`state === 'failed'` check (`:784`) fails, no tombstone is created,
+`ensure_failed_save_cleanup` never runs, and the failed operation's edits —
+persisted by `persist_accepted_save` *before* the disk write — survive into the
+next session. Two follow-ups, both outside PR 1b's file scope: add the
+`save_in_flight` state value to the persistence effect's deps
+(`grid-shell.tsx:682`), and assert in `grid-shell-save.test.ts` that a failed
+save posts `pendingEditsChanged` at most once (would currently fail).
+
+The store is now the single choke point, so one guard in `set_entries` (skip
+`notify` when neither the map contents nor the flag changed) fixes all five
+paths. Cheap and self-contained; scheduled next because it touches only
+`edit-session-store.ts` and so cannot conflict with PR 2's rekey.
+
+Note `clear_saved` has no production consumer (`clear_dirty_saved_edits` in
+`use-editing.ts` is returned but never called), so that one of the five is
+latent rather than live.
 
 ### PR 2 — Source-key edit identity
 

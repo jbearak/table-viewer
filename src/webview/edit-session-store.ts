@@ -176,6 +176,40 @@ function normalize(
     return { entries, pending_base };
 }
 
+/**
+ * Value-equality for two dirty maps, used only to decide whether a mutation is a
+ * no-op worth notifying about. O(size) worst case and allocation-free per entry:
+ * the notification it suppresses is the expensive thing, so this must not itself
+ * cost a copy, a stringify, or a Set per call — it runs on every keystroke.
+ *
+ * Sizes first, then one pass over `next` looking each key up in `prev`. That is a
+ * complete comparison, not a one-directional one: equal sizes plus "every key of
+ * `next` is present in `prev` with equal fields" means the pass found `next.size`
+ * distinct keys of `prev`, i.e. all of them. A key in `prev` and not in `next`
+ * would force some key of `next` to be absent from `prev` and fail the lookup.
+ * So there is nothing to catch with a second loop the other way — please don't
+ * add one and make this O(n^2).
+ *
+ * `base_pending` is compared as a boolean, not by ===: normalize/replace write
+ * the flag only when true, so `{value, base}` and `{value, base, base_pending:
+ * false}` are the same entry and absent/undefined/false must all compare equal.
+ */
+function entries_equal(
+    prev: ReadonlyMap<string, DirtyEntry>,
+    next: ReadonlyMap<string, DirtyEntry>,
+): boolean {
+    if (prev === next) return true;
+    if (prev.size !== next.size) return false;
+    for (const [key, entry] of next) {
+        const before = prev.get(key);
+        if (before === undefined) return false;
+        if (before === entry) continue;
+        if (before.value !== entry.value || before.base !== entry.base) return false;
+        if (!!before.base_pending !== !!entry.base_pending) return false;
+    }
+    return true;
+}
+
 export function create_edit_session_store(
     identity?: EditSessionIdentity,
     edits?: Record<string, string | DirtyEntry>,
@@ -202,7 +236,43 @@ export function create_edit_session_store(
     const owns = (session_id: string | undefined): boolean =>
         stamp === null || stamp.session_id === session_id;
 
-    const set_entries = (entries: Map<string, DirtyEntry>, pending_base: boolean): void => {
+    // `force_notify` exists for `install` alone: see the call site for why a
+    // hydration boundary notifies even when it changes nothing.
+    const set_entries = (
+        entries: Map<string, DirtyEntry>,
+        pending_base: boolean,
+        force_notify = false,
+    ): void => {
+        // Every mutator funnels through here, so this one guard covers all of
+        // them: an identical-value commit, a clear on an empty map, remove_keys
+        // matching nothing, a retain that keeps everything, a clear_saved that
+        // matches nothing. Each of those used to run the whole downstream chain —
+        // a React re-render via useSyncExternalStore, two Object.fromEntries over
+        // the dirty map in grid-shell, a postMessage, a host-side structuredClone
+        // and an async workspace-state write, which always bumps a CAS revision
+        // because the host's handler spreads into a fresh object and so never
+        // hits its own no-change shortcut. Not saved here: the candidate map the
+        // mutator already built above, which is why correctness (not that copy)
+        // is what this guard is for.
+        //
+        // A pendingEdits write also clears the host's failed-save tombstone and
+        // retires the save lifecycle, so a no-op post is not purely wasted work.
+        // This guard does not fully close that: a failed save also re-installs,
+        // and install force-notifies below, so one post still gets through. See
+        // the plan doc's PR 1b section for the follow-ups (both live in files
+        // outside this one).
+        if (!force_notify && pending_base === state.pending_base
+            && entries_equal(state.entries, entries)) {
+            // Deliberately keep the *existing* map rather than swapping in the
+            // equal candidate. The two are interchangeable by value, so holding
+            // the old one keeps `snapshot()` reference-stable across a no-op —
+            // strictly better than a new-but-equal reference, which
+            // useSyncExternalStore would tolerate but would still treat as a
+            // change at the next unrelated render. It also means the store never
+            // adopts a map (or entry objects) built by the caller on this path,
+            // so no aliasing is introduced; the candidate is simply dropped.
+            return;
+        }
         state = { entries, pending_base };
         notify();
     };
@@ -245,7 +315,18 @@ export function create_edit_session_store(
         install: (next_identity, next_edits) => {
             stamp = next_identity;
             const next = normalize(next_edits);
-            set_entries(next.entries, next.pending_base);
+            // Always notifies, even for an identical map. Unlike the mutators,
+            // install is a hydration boundary that also re-stamps the session, so
+            // "the contents didn't change" is not the same claim as "nothing that
+            // a subscriber cares about changed" — and it runs once per grant or
+            // restore, never on a keystroke, so there is no cost to buy by
+            // guessing. The one thing suppression would definitely be safe for is
+            // the map identity itself; everything else here (a fresh normalize
+            // that re-stamps caller-owned entry objects into the store, a session
+            // change that GridShell may already be mid-remount for) is exactly
+            // the kind of boundary where a silent install would be a very quiet
+            // bug. The guard exists for the hot paths; this isn't one.
+            set_entries(next.entries, next.pending_base, true);
         },
         adopt_session: (session_id) => {
             stamp = { session_id };
