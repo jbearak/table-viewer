@@ -199,6 +199,11 @@ export class ViewerWindowManager {
         };
         this.windows.push(entry);
         window.on('resize', () => {
+            // Maximizing, going fullscreen and minimizing all fire this on some
+            // platforms. None of them is the user choosing a size, so they must
+            // not count as one — neither recorded, nor allowed to make this the
+            // most recently resized window.
+            if (window.isMaximized() || window.isFullScreen() || window.isMinimized()) return;
             entry.resize_seq = ++this.resize_counter;
             cancel_settle();
             settle_timer = setTimeout(() => {
@@ -206,12 +211,11 @@ export class ViewerWindowManager {
                 this.remember_size(window, 'live');
             }, RESIZE_SETTLE_MS);
         });
-        // 'close' still has live bounds to remember; 'closed' is where the
-        // controller and its subscriptions go away.
-        window.on('close', () => {
-            cancel_settle();
-            this.remember_size(window, 'restored');
-        });
+        // Only a drag that has not settled yet: a window closing is not itself
+        // a size the user chose, and recording it would overwrite the size they
+        // did choose in some other window. 'closed' is where the controller and
+        // its subscriptions go away.
+        window.on('close', () => entry.flush_size());
         window.once('closed', () => this.teardown(entry));
         // Closing the window mid-load aborts the navigation, which rejects; an
         // unhandled rejection in the main process is fatal, so swallow it.
@@ -328,14 +332,14 @@ export class ViewerWindowManager {
      * `measure` is how to read the size, which the callers do not agree on:
      *
      * - `restored` reads `getNormalBounds()`, the size the window would have
-     *   were it not maximized, fullscreen or minimized. For the one-shot
-     *   callers — a window closing, and the switch into `match-last` — which
-     *   have no later event to fall back on and so must record *something*.
+     *   were it not maximized, fullscreen or minimized. For the switch into
+     *   `match-last`, a one-shot with no later event behind it, which therefore
+     *   has to record *something*.
      * - `live` reads `getBounds()` and skips those states instead. For the
      *   resize path, which fires mid-drag on a focused window, where
      *   `getNormalBounds()` disturbs it enough to swallow keystrokes into an
      *   open cell editor (the desktop smoke suite catches this). Skipping is
-     *   free there: `close` always runs afterwards.
+     *   free there: the states it skips are not sizes the user picked.
      */
     private remember_size(window: BrowserWindow, measure: 'live' | 'restored'): void {
         if (window.isDestroyed()) return;

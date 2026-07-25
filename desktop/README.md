@@ -10,7 +10,7 @@ With no file open the app shows a small welcome window (`desktop/renderer/welcom
 
 New windows are placed by `desktop/main/window-geometry.ts`: the first is centered, each further one cascades down and right from the most recent, and every window is clamped to fit the display's work area — including a size remembered from a larger monitor. How big a new window is comes from the **New window size** preference:
 
-- **Match last window** (the default) follows the size you last gave a viewer window, picked up as you resize rather than only when you close, so opening a second file mid-session matches the window already on screen. A maximized or fullscreen window is not followed — that size is a mode, not a preference. This is the native-app convention: window geometry is state the app keeps for you, so the width and height shown in Preferences are a readout rather than fields.
+- **Match last window** (the default) follows the size you last gave a viewer window, picked up from the resize itself, so opening a second file mid-session matches the window you just sized without having to close it first. A maximized or fullscreen window is not followed — that size is a mode, not a preference. This is the native-app convention: window geometry is state the app keeps for you, so the width and height shown in Preferences are a readout rather than fields.
 - **Fixed size** makes the width and height yours to type, and stops the app changing them, so resizing a window afterwards cannot rewrite what you set.
 
 ## Prerequisites
