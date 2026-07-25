@@ -40,6 +40,9 @@ interface ViewerWindow {
     readonly controller: Disposable;
     /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
     readonly stop_watching_dirty: () => void;
+    /** Persists a resize still inside its settle window, and cancels it.
+     *  A no-op when nothing is pending. */
+    readonly flush_size: () => void;
 }
 
 const IS_MAC = process.platform === 'darwin';
@@ -164,6 +167,14 @@ export class ViewerWindowManager {
             this.viewer_host(window),
         );
 
+        // Track the size as the user drags, not only on close: opening a second
+        // file without closing the first should still match the size just set.
+        let settle_timer: ReturnType<typeof setTimeout> | undefined;
+        const cancel_settle = () => {
+            if (settle_timer) clearTimeout(settle_timer);
+            settle_timer = undefined;
+        };
+
         const entry: ViewerWindow = {
             fileKey: file_key,
             window,
@@ -171,23 +182,25 @@ export class ViewerWindowManager {
             controller,
             stop_watching_dirty: () =>
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
+            flush_size: () => {
+                if (!settle_timer) return;
+                cancel_settle();
+                this.remember_size(window, 'live');
+            },
         };
         this.windows.push(entry);
-        // Track the size as the user drags, not only on close: opening a second
-        // file without closing the first should still match the size just set.
-        let settle_timer: ReturnType<typeof setTimeout> | undefined;
         window.on('resize', () => {
-            if (settle_timer) clearTimeout(settle_timer);
+            cancel_settle();
             settle_timer = setTimeout(() => {
                 settle_timer = undefined;
-                this.remember_size(window, 'resize');
+                this.remember_size(window, 'live');
             }, RESIZE_SETTLE_MS);
         });
         // 'close' still has live bounds to remember; 'closed' is where the
         // controller and its subscriptions go away.
         window.on('close', () => {
-            if (settle_timer) clearTimeout(settle_timer);
-            this.remember_size(window, 'close');
+            cancel_settle();
+            this.remember_size(window, 'restored');
         });
         window.once('closed', () => this.teardown(entry));
         // Closing the window mid-load aborts the navigation, which rejects; an
@@ -232,6 +245,11 @@ export class ViewerWindowManager {
     }
 
     private bounds_for_new_window() {
+        // A drag still inside its settle window has not been persisted yet, and
+        // a file can be opened at any moment — from Finder, or a second launch.
+        // Without this the new window would ignore a resize the user has
+        // already finished making.
+        for (const entry of this.windows) entry.flush_size();
         const settings = this.config_store.settings();
         const previous = this.windows
             .map((entry) => entry.window)
@@ -267,35 +285,38 @@ export class ViewerWindowManager {
             .map((entry) => entry.window)
             .filter((candidate) => !candidate.isDestroyed())
             .pop();
-        // 'resize' rather than 'close': this samples a window that stays open,
-        // and it is the measurement that leaves a focused window undisturbed.
-        if (window) this.remember_size(window, 'resize');
+        // `restored`, so a window that happens to be minimized or maximized
+        // right now still contributes its real size. This is a one-shot with no
+        // later event behind it, and the focused window is Preferences, not a
+        // viewer holding an open cell editor.
+        if (window) this.remember_size(window, 'restored');
     }
 
     /**
      * Remember this window's size so the next one opens at the same size — the
      * `match-last` half of the new-window-size preference.
      *
-     * The two callers have to measure differently:
+     * `measure` is how to read the size, which the callers do not agree on:
      *
-     * - `close` is the last chance to record anything, so it reads
-     *   `getNormalBounds()` — the restored size, which is the one worth keeping
-     *   even when the window is maximized, fullscreen or minimized as it goes.
-     * - `resize` fires mid-drag on a focused window, and `getNormalBounds()`
-     *   there disturbs it enough to swallow keystrokes into an open cell editor
-     *   (the desktop smoke suite catches this). It reads `getBounds()` instead
-     *   and skips the states where that would report something other than the
-     *   restored size, which costs nothing: `close` always runs afterwards.
+     * - `restored` reads `getNormalBounds()`, the size the window would have
+     *   were it not maximized, fullscreen or minimized. For the one-shot
+     *   callers — a window closing, and the switch into `match-last` — which
+     *   have no later event to fall back on and so must record *something*.
+     * - `live` reads `getBounds()` and skips those states instead. For the
+     *   resize path, which fires mid-drag on a focused window, where
+     *   `getNormalBounds()` disturbs it enough to swallow keystrokes into an
+     *   open cell editor (the desktop smoke suite catches this). Skipping is
+     *   free there: `close` always runs afterwards.
      */
-    private remember_size(window: BrowserWindow, source: 'resize' | 'close'): void {
+    private remember_size(window: BrowserWindow, measure: 'live' | 'restored'): void {
         if (window.isDestroyed()) return;
         const settings = this.config_store.settings();
         // Under `fixed` the stored size is the user's typed preference, so
         // dragging a window must not quietly overwrite it.
         if (settings.newWindowSize === 'fixed') return;
-        const transient = window.isMaximized() || window.isFullScreen() || window.isMinimized();
-        if (source === 'resize' && transient) return;
-        const { width, height } = source === 'close'
+        if (measure === 'live'
+            && (window.isMaximized() || window.isFullScreen() || window.isMinimized())) return;
+        const { width, height } = measure === 'restored'
             ? window.getNormalBounds()
             : window.getBounds();
         if (settings.windowWidth === width && settings.windowHeight === height) return;
