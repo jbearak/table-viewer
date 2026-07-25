@@ -112,7 +112,7 @@ And: there is no find/search state to migrate — GridShell never passes Glide's
 
 ---
 
-## Revised sequencing: five PRs
+## Revised sequencing: six PRs
 
 The review's conclusion — "PR 1 needs an edit-session-owned state model,
 host-side base validation, and a replacement admission protocol" — is three
@@ -195,6 +195,12 @@ Note `clear_saved` has no production consumer (`clear_dirty_saved_edits` in
 `use-editing.ts` is returned but never called), so that one of the five is
 latent rather than live.
 
+**Landed as #106** (`ddc33db`). Guard verified non-vacuous by mutation
+independently of the implementing agent: disabling the `set_entries` condition
+fails 8 of the 35 store tests. CodeRabbit's one comment (the mutators' candidate
+`Map` is allocated before the guard, so suppression doesn't save it) was correct
+and is fixed in the cost list above.
+
 ### PR 2 — Source-key edit identity
 
 - **`row-loader.ts`**: add a `source_row → page location` map (per the review's
@@ -230,6 +236,25 @@ latent rather than live.
   (`csv-save-lifecycle.ts:96`) passes keys through verbatim, so no code change.
 - Still blocked: transforms during edit mode. This PR makes them *safe to
   allow*; PR 3 allows them.
+
+### PR 2b — Close the failed-save tombstone hole
+
+Scheduled **after PR 2, before PR 3.** The two follow-ups named in PR 1b above
+(add the `save_in_flight` *state value* to the persistence effect's deps at
+`grid-shell.tsx:682` — it currently depends on the ref, so the effect never
+re-runs when the save state changes; and assert a failed save posts
+`pendingEditsChanged` at most once). Both live in `grid-shell.tsx` /
+`grid-shell-save.test.ts`, which PR 2's rekey rewrites, so ordering it after PR 2
+avoids a conflict on the same lines; ordering it before PR 3 keeps it from being
+forgotten behind the more visible coexistence work. Independently re-traced: the
+harm is real and pre-existing — an early-retired `failed` lifecycle means
+`release_edit_session`'s `state === 'failed'` check (`:784`) fails, no tombstone
+is written, `ensure_failed_save_cleanup` never runs, and edits that
+`persist_accepted_save` wrote *before* the disk write survive into the next
+session. A second, narrower path: the unconditional clear at `:3566` can drop a
+tombstone belonging to an already-released session, and
+`shared_edit_state_is_unused` reads that field, so shared state can be deleted
+with an unmet cleanup obligation.
 
 ### PR 3 — Admission matrix, then unblock
 
