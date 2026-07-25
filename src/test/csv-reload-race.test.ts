@@ -1815,6 +1815,105 @@ describe('CSV reload races', () => {
         expect(grant).not.toHaveProperty('pendingEdits');
     });
 
+    it('refuses an external write that lands in the pre-write gap', async () => {
+        // The verification block ends with a synchronous sha256 over the whole
+        // file, so an external write landing after `verified_stat` but before
+        // `write_file` used to be overwritten with no warning at all. Worse, the
+        // bytes written are the pre-change source plus every edit key, so a
+        // shrinking external write got re-grown with padded blank rows.
+        //
+        // The injection point is deliberately anchored to the *pre-fix* code's
+        // structure, not the fix's, so this test cannot pass vacuously. Stat
+        // calls are counted only inside the save (the flag flips immediately
+        // before `saveCsv`). The verification block makes two: current_stat and
+        // verified_stat. The external write lands immediately after verified_stat
+        // returns its clean value -- i.e. in the exact gap that the pre-fix code
+        // had no observation left to catch it with. Any extra stat the fix adds
+        // must therefore see mtime 99 and refuse.
+        let saving = false;
+        let stats_during_save = 0;
+        let mtime = 1;
+        let bytes = enc.encode('h\na\n');
+        const writes: string[] = [];
+
+        vscode_mock.__setStatImplementation(async () => {
+            if (!saving) return { size: bytes.byteLength, mtime };
+            stats_during_save += 1;
+            const observed = { size: bytes.byteLength, mtime };
+            if (stats_during_save === 2) {
+                // verified_stat has just observed a clean file. The external
+                // writer replaces it right now, shrinking it.
+                bytes = enc.encode('h\n');
+                mtime = 99;
+            }
+            return observed;
+        });
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri: unknown, content: Uint8Array) => {
+            writes.push(new TextDecoder().decode(content));
+        });
+        const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        open_csv_table(uri('/tmp/pre-write-gap.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        saving = true;
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        // The external write must survive: we must not have written at all.
+        expect(writes).toEqual([]);
+        // And the user must be told, not silently clobbered.
+        expect(warning_spy).toHaveBeenCalledWith(
+            expect.stringContaining('modified externally'),
+        );
+        // A detected race is a conflict, never a generic save failure.
+        expect(error_spy).not.toHaveBeenCalled();
+        expect(panel.__messages).toContainEqual(
+            expect.objectContaining({ type: 'saveResult', success: false }),
+        );
+    });
+
+    it('treats a pre-write stat failure as a conflict, not a save error', async () => {
+        // If the final pre-write stat throws (file swapped or removed underneath
+        // us), refusing is correct -- clobbering blind is worse. It must not fall
+        // through to the generic "Failed to save" path.
+        let saving = false;
+        let stats_during_save = 0;
+        const writes: string[] = [];
+
+        // Every stat after the verification block's two throws, so this does not
+        // depend on how many the implementation adds -- only that if it adds one,
+        // the throw is handled as a conflict.
+        vscode_mock.__setStatImplementation(async () => {
+            if (saving) {
+                stats_during_save += 1;
+                if (stats_during_save > 2) throw new Error('ENOENT: vanished');
+            }
+            return { size: 100, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(async (_uri: unknown, content: Uint8Array) => {
+            writes.push(new TextDecoder().decode(content));
+        });
+        const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        open_csv_table(uri('/tmp/pre-write-stat-throw.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        saving = true;
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        expect(writes).toEqual([]);
+        expect(warning_spy).toHaveBeenCalledWith(
+            expect.stringContaining('modified externally'),
+        );
+        expect(error_spy).not.toHaveBeenCalled();
+    });
+
     it('refuses a same-size same-mtime external edit before saving', async () => {
         let reads = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
