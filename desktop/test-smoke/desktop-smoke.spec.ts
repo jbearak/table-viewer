@@ -62,8 +62,8 @@ function window_titles(): Promise<string[]> {
  * each window's title into its own page to pair the two up.
  */
 async function focus_viewer(file_name: string): Promise<Page> {
-    const focused = await app.evaluate(async ({ BrowserWindow }, name) => {
-        let found = false;
+    const target_id = await app.evaluate(async ({ BrowserWindow }, name) => {
+        let id: number | null = null;
         for (const window of BrowserWindow.getAllWindows()) {
             const title = window.getTitle();
             await window.webContents.executeJavaScript(
@@ -72,11 +72,25 @@ async function focus_viewer(file_name: string): Promise<Page> {
             if (title.replace(/^• /, '') !== name) continue;
             window.show();
             window.focus();
-            found = true;
+            id = window.id;
         }
-        return found;
+        return id;
     }, file_name);
-    expect(focused, `window for ${file_name} exists`).toBe(true);
+    expect(target_id, `window for ${file_name} exists`).not.toBeNull();
+
+    // Focus lands asynchronously, and the Edit and View menu commands route on
+    // `BrowserWindow.getFocusedWindow()` (see `route_edit_command`). Acting
+    // before it arrives sends them to whichever window still holds it, where
+    // the native fallback silently does nothing to a canvas grid — which is how
+    // these tests failed under load, several assertions later.
+    await expect
+        .poll(
+            () => app.evaluate(
+                ({ BrowserWindow }) => BrowserWindow.getFocusedWindow()?.id ?? null,
+            ),
+            { timeout: 15_000 },
+        )
+        .toBe(target_id);
 
     for (const page of viewer_pages()) {
         const title = await page.evaluate(
