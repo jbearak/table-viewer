@@ -1,58 +1,23 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo, useSyncExternalStore } from 'react';
 import { read_overlay_editor_value } from './live-editor';
+import {
+    create_edit_session_store,
+    is_entry_conflicted,
+    type EditSessionStore,
+    type GetCellRaw,
+} from './edit-session-store';
 import type { CsvDirtyEntry } from '../types';
+
+// Re-exported so consumers keep importing the edit vocabulary from the hook they
+// already use; the definitions moved to the store because it, not the hook, owns
+// the map now.
+export type { DirtyEntry, GetCellRaw } from './edit-session-store';
+export { clear_saved_dirty_entries } from './edit-session-store';
 
 export interface EditingCell {
     row: number;
     col: number;
     value: string;
-}
-
-export interface DirtyEntry extends CsvDirtyEntry {
-    // When true, `base` has not yet been captured against a resident page (an
-    // old-format string edit restored while its page was evicted). Conflict
-    // detection skips such entries until the page loads and `base` is captured.
-    base_pending?: boolean;
-}
-
-/**
- * Reads a cell's current persisted raw text from the paged cache. A loaded but
- * blank cell yields ''; a row whose page is NOT resident (evicted from / not yet
- * fetched into the row-loader LRU) yields `undefined`. This distinction is
- * load-bearing: conflict detection treats `undefined` as "unknown", never as a
- * changed value, so an evicted page can never produce a false conflict. The hook
- * never holds onto the full grid, so editing scales to ~1M rows; conflict
- * detection compares against {@link DirtyEntry.base}, snapshotted at edit-start,
- * so it never depends on a page that may since have been evicted.
- */
-export type GetCellRaw = (row: number, col: number) => string | undefined;
-
-export function clear_saved_dirty_entries(
-    dirty: ReadonlyMap<string, DirtyEntry>,
-    saved: Readonly<Record<string, string>>,
-): Map<string, DirtyEntry> {
-    const next = new Map(dirty);
-    for (const [key, value] of Object.entries(saved)) {
-        const entry = next.get(key);
-        if (!entry) continue;
-        if (entry.value === value) next.delete(key);
-        else next.set(key, { value: entry.value, base: value });
-    }
-    return next;
-}
-
-function is_entry_conflicted(
-    key: string,
-    entry: DirtyEntry,
-    get_cell_raw: GetCellRaw,
-): boolean {
-    // Base not yet captured (old-format restore on a non-resident page): can't
-    // judge a conflict yet, so never flag.
-    if (entry.base_pending) return false;
-    const [r, c] = key.split(':').map(Number);
-    const cur = get_cell_raw(r, c);
-    // `undefined` means the page isn't resident — unknown, not a conflict.
-    return cur !== undefined && cur !== entry.base;
 }
 
 /**
@@ -62,40 +27,45 @@ function is_entry_conflicted(
  * data reloads (external file change or our own save-triggered reload); a change
  * closes the open editor while preserving dirty edits, and conflict detection
  * then flags any entry whose base drifted.
+ *
+ * The dirty map lives in `store`, whose lifetime is the edit session rather than
+ * this hook's mount, and `session_id` stamps every write so a hook left over
+ * from a previous session cannot land an edit in the current one. A consumer
+ * that has nowhere to hoist the store to (the hook's own tests, and GridShell
+ * before App wires one down) gets a hook-owned one instead.
  */
 export function use_editing(
     get_cell_raw: GetCellRaw,
     reload_token: number,
-    initial_edits?: Record<string, string | DirtyEntry>,
+    session_id: string | undefined,
+    store?: EditSessionStore,
 ) {
-    const [edit_mode, set_edit_mode] = useState(
-        () => initial_edits !== undefined && Object.keys(initial_edits).length > 0,
-    );
+    const own_store_ref = useRef<EditSessionStore | null>(null);
+    if (own_store_ref.current === null) {
+        // No identity: a hook-owned store lives and dies with this hook, so there
+        // is no other writer for a session stamp to fence off, and stamping the
+        // first render's session would strand this hook's own later writes if the
+        // id moved. A hoisted store is where the stamp earns its keep.
+        own_store_ref.current = create_edit_session_store();
+    }
+    const active_store = store ?? own_store_ref.current;
+
+    // useSyncExternalStore rather than the useReducer bump pattern that
+    // use-row-loader.ts uses: that loader is owned by the hook, so nothing can
+    // change the source of truth between render and subscribe. Here App can
+    // install into the store while GridShell is mid-remount — the session grant
+    // does exactly that (set_initial_edits + set_load_epoch in one handler).
+    // useSyncExternalStore re-reads after subscribing; a hand-rolled useEffect
+    // subscribe + bump would silently drop that install.
+    const dirty_cells = useSyncExternalStore(active_store.subscribe, active_store.snapshot);
+
+    // GridShell never reads this (it takes edit_mode as a prop from App), so it
+    // only gates the reload-token effect below.
+    const [edit_mode, set_edit_mode] = useState(() => active_store.size() > 0);
+    // Stays local state on purpose: a display coordinate, so a generation
+    // remount must clear it — otherwise a newly applied sort would leave the
+    // cursor parked on what is now a different row.
     const [editing_cell, set_editing_cell] = useState<EditingCell | null>(null);
-    // True while any dirty entry still has base_pending — i.e. an old-format
-    // string restore whose true on-disk base hasn't been captured yet. The lazy
-    // effect below early-returns when this is false, so the scroll hot path
-    // (get_cell_raw rebinds on every page load) pays nothing once all bases
-    // resolve. Seeded by the initializer; cleared by the effect.
-    const has_pending_base_ref = useRef(false);
-    const [dirty_cells, set_dirty_cells] = useState<Map<string, DirtyEntry>>(
-        () =>
-            initial_edits
-                ? new Map(
-                      Object.entries(initial_edits).map(([k, v]) => {
-                          if (typeof v === 'object' && v !== null)
-                              return [k, v as DirtyEntry];
-                          // Old-format string entry: defer base capture
-                          // uniformly. Baking in a base now would risk a
-                          // permanent false conflict when the page isn't
-                          // resident; the effect below captures the true base
-                          // once the page loads.
-                          has_pending_base_ref.current = true;
-                          return [k, { value: v, base: '', base_pending: true }];
-                      }),
-                  )
-                : new Map(),
-    );
 
     const is_dirty = dirty_cells.size > 0;
 
@@ -145,23 +115,16 @@ export function use_editing(
 
             set_editing_cell(null);
 
+            // The revert rule lives here rather than in the store: only the hook
+            // can read the cell's persisted text.
             if (new_value === original) {
-                set_dirty_cells((prev) => {
-                    if (!prev.has(key)) return prev;
-                    const next = new Map(prev);
-                    next.delete(key);
-                    return next;
-                });
+                active_store.remove(session_id, key);
                 return;
             }
 
-            set_dirty_cells((prev) => {
-                const next = new Map(prev);
-                next.set(key, { value: new_value, base: original });
-                return next;
-            });
+            active_store.commit(session_id, key, { value: new_value, base: original });
         },
-        [editing_cell, get_cell_raw],
+        [active_store, editing_cell, get_cell_raw, session_id],
     );
 
     // Location-based commit for Glide, whose overlay editor reports edits via
@@ -177,22 +140,13 @@ export function use_editing(
             );
 
             if (new_value === original) {
-                set_dirty_cells((prev) => {
-                    if (!prev.has(key)) return prev;
-                    const next = new Map(prev);
-                    next.delete(key);
-                    return next;
-                });
+                active_store.remove(session_id, key);
                 return;
             }
 
-            set_dirty_cells((prev) => {
-                const next = new Map(prev);
-                next.set(key, { value: new_value, base: original });
-                return next;
-            });
+            active_store.commit(session_id, key, { value: new_value, base: original });
         },
-        [get_cell_raw],
+        [active_store, get_cell_raw, session_id],
     );
 
     const cancel_edit = useCallback(() => {
@@ -200,30 +154,20 @@ export function use_editing(
     }, []);
 
     const clear_dirty = useCallback(() => {
-        set_dirty_cells(new Map());
-    }, []);
+        active_store.clear(session_id);
+    }, [active_store, session_id]);
 
     const replace_dirty = useCallback((entries: Readonly<Record<string, CsvDirtyEntry>>) => {
-        has_pending_base_ref.current = false;
-        set_dirty_cells(new Map(
-            Object.entries(entries).map(([key, entry]) => [
-                key,
-                { value: entry.value, base: entry.base },
-            ]),
-        ));
-    }, []);
+        active_store.replace(session_id, entries);
+    }, [active_store, session_id]);
 
     const clear_dirty_keys = useCallback((keys: Set<string>) => {
-        set_dirty_cells((prev) => {
-            const next = new Map(prev);
-            for (const key of keys) next.delete(key);
-            return next;
-        });
-    }, []);
+        active_store.remove_keys(session_id, keys);
+    }, [active_store, session_id]);
 
     const clear_dirty_saved_edits = useCallback((edits: Record<string, string>) => {
-        set_dirty_cells((prev) => clear_saved_dirty_entries(prev, edits));
-    }, []);
+        active_store.clear_saved(session_id, edits);
+    }, [active_store, session_id]);
 
     const get_display_value = useCallback(
         (row: number, col: number): string | null => {
@@ -238,14 +182,9 @@ export function use_editing(
             if (editing_cell && `${editing_cell.row}:${editing_cell.col}` === key) {
                 set_editing_cell(null);
             }
-            set_dirty_cells((prev) => {
-                if (!prev.has(key)) return prev;
-                const next = new Map(prev);
-                next.delete(key);
-                return next;
-            });
+            active_store.remove(session_id, key);
         },
-        [editing_cell],
+        [active_store, editing_cell, session_id],
     );
 
     const discard_conflicted = useCallback(() => {
@@ -259,16 +198,11 @@ export function use_editing(
                 set_editing_cell(null);
             }
         }
-        set_dirty_cells((prev) => {
-            const next = new Map<string, DirtyEntry>();
-            for (const [key, entry] of prev) {
-                if (!is_entry_conflicted(key, entry, get_cell_raw)) {
-                    next.set(key, entry);
-                }
-            }
-            return next;
-        });
-    }, [get_cell_raw, editing_cell, dirty_cells]);
+        active_store.retain(
+            session_id,
+            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw),
+        );
+    }, [active_store, get_cell_raw, editing_cell, dirty_cells, session_id]);
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever
@@ -277,28 +211,9 @@ export function use_editing(
         // Hot-path guard: nothing pending means nothing to resolve, so skip the
         // Map rebuild + rescan entirely. get_cell_raw rebinds on every page load,
         // so without this the effect would re-run on every scroll.
-        if (!has_pending_base_ref.current) return;
-        set_dirty_cells((prev) => {
-            let changed = false;
-            let still_pending = false;
-            const next = new Map<string, DirtyEntry>();
-            for (const [key, entry] of prev) {
-                if (entry.base_pending) {
-                    const [r, c] = key.split(':').map(Number);
-                    const cur = get_cell_raw(r, c);
-                    if (cur !== undefined) {
-                        next.set(key, { value: entry.value, base: cur });
-                        changed = true;
-                        continue;
-                    }
-                    still_pending = true;
-                }
-                next.set(key, entry);
-            }
-            has_pending_base_ref.current = still_pending;
-            return changed ? next : prev;
-        });
-    }, [get_cell_raw]);
+        if (!active_store.has_pending_base()) return;
+        active_store.resolve_pending_bases(session_id, get_cell_raw);
+    }, [active_store, get_cell_raw, session_id]);
 
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();

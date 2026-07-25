@@ -5,6 +5,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { describe, it, expect, afterEach } from 'vitest';
 import type { CellData } from '../types';
 import { clear_saved_dirty_entries, use_editing } from '../webview/use-editing';
+import {
+    create_edit_session_store,
+    type EditSessionStore,
+} from '../webview/edit-session-store';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -35,7 +39,7 @@ function make_get_cell_raw(rows: (CellData | null)[][]) {
 }
 
 function Harness({ rows, token }: { rows: (CellData | null)[][]; token: number }) {
-    hook_result = use_editing(make_get_cell_raw(rows), token);
+    hook_result = use_editing(make_get_cell_raw(rows), token, undefined);
     return null;
 }
 
@@ -418,16 +422,24 @@ describe('conflict detection with non-resident pages', () => {
 // would be a permanent false conflict). It must be captured against the true
 // on-disk value once the page becomes resident.
 describe('old-format string-edit restore (B5)', () => {
+    // The store is created outside the component, so the install happens once —
+    // a re-render with the same initial_edits does NOT reinstall. That is the
+    // point of hoisting the map: a remount no longer re-seeds it.
+    let init_store: EditSessionStore | null = null;
+
     function InitHarness({
         rows,
         token,
-        initial_edits,
     }: {
         rows: (CellData | null)[][];
         token: number;
-        initial_edits: Record<string, string>;
     }) {
-        hook_result = use_editing(make_get_cell_raw(rows), token, initial_edits);
+        hook_result = use_editing(
+            make_get_cell_raw(rows),
+            token,
+            undefined,
+            init_store!,
+        );
         return null;
     }
 
@@ -436,25 +448,21 @@ describe('old-format string-edit restore (B5)', () => {
         token: number,
         initial_edits: Record<string, string>,
     ) {
+        init_store = create_edit_session_store({ session_id: undefined }, initial_edits);
         container = document.createElement('div');
         document.body.appendChild(container);
         root = createRoot(container);
         await act(async () => {
-            root!.render(
-                React.createElement(InitHarness, { rows, token, initial_edits }),
-            );
+            root!.render(React.createElement(InitHarness, { rows, token }));
         });
     }
 
     async function rerender_init(
         rows: (CellData | null)[][],
         token: number,
-        initial_edits: Record<string, string>,
     ) {
         await act(async () => {
-            root!.render(
-                React.createElement(InitHarness, { rows, token, initial_edits }),
-            );
+            root!.render(React.createElement(InitHarness, { rows, token }));
         });
     }
 
@@ -472,7 +480,7 @@ describe('old-format string-edit restore (B5)', () => {
         expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
 
         // Page becomes resident, matching on-disk base 'd' — still not conflicted.
-        await rerender_init(base_rows, 1, initial_edits);
+        await rerender_init(base_rows, 1);
         expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
     });
 
@@ -488,7 +496,7 @@ describe('old-format string-edit restore (B5)', () => {
 
         // Page first becomes resident with the true on-disk value 'd' — this is
         // captured as the base (no false conflict from a baked-in '').
-        await rerender_init(base_rows, 1, initial_edits);
+        await rerender_init(base_rows, 1);
         expect(hook_result!.conflicted_keys.has('1:0')).toBe(false);
 
         // A SUBSEQUENT external change of 1:0 ('d' -> 'z') is now detected against
@@ -498,7 +506,80 @@ describe('old-format string-edit restore (B5)', () => {
             [cell('z'), cell('e'), cell('f')],
             [cell('g'), null, cell('i')],
         ];
-        await rerender_init(changed, 2, initial_edits);
+        await rerender_init(changed, 2);
         expect(hook_result!.conflicted_keys.has('1:0')).toBe(true);
+    });
+});
+
+// The map used to be seeded by a one-time useState initializer, so a changed
+// edit map could only reach the hook through a remount. With a hoisted store the
+// install lands in the mounted hook, and its session stamp fences off a hook
+// left over from the previous session.
+describe('hoisted store installs', () => {
+    let session_store: EditSessionStore | null = null;
+    let session_id: string | undefined;
+    const mount_count = { n: 0 };
+
+    function StoreHarness({ rows, token }: { rows: (CellData | null)[][]; token: number }) {
+        // Counted in the ref body, not in useRef's argument — that argument is
+        // evaluated on every render, so it would count renders, not mounts.
+        const mount_ref = React.useRef<number | null>(null);
+        if (mount_ref.current === null) mount_ref.current = ++mount_count.n;
+        hook_result = use_editing(
+            make_get_cell_raw(rows),
+            token,
+            session_id,
+            session_store!,
+        );
+        return null;
+    }
+
+    async function render_store(initial_session: string | undefined) {
+        session_store = create_edit_session_store({ session_id: initial_session });
+        session_id = initial_session;
+        mount_count.n = 0;
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(StoreHarness, { rows: base_rows, token: 0 }));
+        });
+    }
+
+    it('a changed edit map installs without a remount', async () => {
+        await render_store(undefined);
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
+            '0:0': { value: 'A', base: 'a' },
+        });
+        const mounts_before = mount_count.n;
+
+        await act(async () => {
+            session_store!.install({ session_id: 'granted' }, {
+                '1:1': { value: 'G', base: 'e' },
+            });
+        });
+
+        expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
+            '1:1': { value: 'G', base: 'e' },
+        });
+        expect(mount_count.n).toBe(mounts_before);
+    });
+
+    it('drops a write from a hook still carrying the pre-install session', async () => {
+        await render_store(undefined);
+        await act(async () => {
+            session_store!.install({ session_id: 'granted' }, {
+                '1:1': { value: 'G', base: 'e' },
+            });
+        });
+
+        // The hook's session_id prop hasn't caught up yet, so this write belongs
+        // to the previous session and must not land in the granted one.
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+
+        expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
+            '1:1': { value: 'G', base: 'e' },
+        });
     });
 });
