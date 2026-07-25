@@ -109,9 +109,10 @@ test('windows are separately sized and positioned', async () => {
     const bounds = await app.evaluate(({ BrowserWindow }) =>
         BrowserWindow.getAllWindows().map((window) => window.getBounds()));
     expect(bounds).toHaveLength(2);
-    // The second window cascaded rather than landing exactly on the first.
-    expect(bounds[1].x).not.toBe(bounds[0].x);
-    expect(bounds[1].y).not.toBe(bounds[0].y);
+    // The second window cascaded rather than landing exactly on the first. Only
+    // one axis is guaranteed to differ: on a display with no vertical slack the
+    // cascade wraps y and walks along x (see window-geometry.ts).
+    expect(`${bounds[1].x},${bounds[1].y}`).not.toBe(`${bounds[0].x},${bounds[0].y}`);
 
     // Resizing one window leaves the other alone (the point of windows).
     await app.evaluate(({ BrowserWindow }) => {
@@ -122,6 +123,24 @@ test('windows are separately sized and positioned', async () => {
         BrowserWindow.getAllWindows().map((window) => window.getBounds()));
     expect([after[0].width, after[0].height]).toEqual([700, 500]);
     expect(after[1].width).toBe(bounds[1].width);
+});
+
+// Opening a file that is already open must focus its window, not load the file a
+// second time — two controllers on one file fight over the edit session. Driven
+// through the same `open-file` event Finder's "Open with…" delivers.
+test('reopening an open file focuses its window instead of duplicating it', async () => {
+    await focus_viewer('basic.xlsx');
+    const reopened = await app.evaluate((electron, file) => {
+        electron.app.emit('open-file', { preventDefault() {} }, file);
+        return electron.BrowserWindow.getAllWindows().length;
+    }, csv_fixture);
+    expect(reopened).toBe(2);
+
+    // Still two windows a moment later (a duplicate would appear async), and the
+    // reopened file's window is the focused one.
+    await expect.poll(() => app.windows().length, { timeout: 5_000 }).toBe(2);
+    expect(await app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getFocusedWindow()?.getTitle())).toBe('basic.csv');
 });
 
 // The grid is a canvas, so the stock `role: 'copy'` / `role: 'selectAll'` menu

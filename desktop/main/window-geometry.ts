@@ -74,12 +74,12 @@ export function next_window_bounds(
     if (previous) {
         x = previous.x + CASCADE_STEP;
         y = previous.y + CASCADE_STEP;
-        // Out of room: start the cascade over rather than push the window
-        // (which would silently stack every further window in the corner).
-        if (x > max_x || y > max_y) {
-            x = work_area.x;
-            y = work_area.y;
-        }
+        // Out of room on an axis: wrap that axis, and only that one. Wrapping
+        // both together would stack every window in the corner whenever one axis
+        // has no slack — which is the common case, since the window is sized to
+        // fit the work area and a short work area then leaves max_y == y.
+        if (x > max_x) x = work_area.x;
+        if (y > max_y) y = work_area.y;
     } else {
         x = work_area.x + Math.round((work_area.width - width) / 2);
         y = work_area.y + Math.round((work_area.height - height) / 2);

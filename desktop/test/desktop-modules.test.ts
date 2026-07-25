@@ -235,10 +235,43 @@ describe('window geometry', () => {
         expect([bounds.x, bounds.y]).toEqual([work_area.x, work_area.y]);
     });
 
+    // Regression: wrapping both axes together stacked every window in the corner
+    // whenever one axis had no slack — the common case, since the window is sized
+    // to fit the work area, so a short work area leaves no vertical room at all.
+    // On a 1366x768 laptop every window after the first landed on (0, 0).
+    it('keeps cascading along the axis that still has room', () => {
+        const laptop = { x: 0, y: 0, width: 1366, height: 728 };
+        const remembered = { width: 1200, height: 800 };
+        const seen: string[] = [];
+        let previous = next_window_bounds(laptop, remembered, null);
+        seen.push(`${previous.x},${previous.y}`);
+        for (let index = 0; index < 2; index += 1) {
+            previous = next_window_bounds(laptop, remembered, previous);
+            seen.push(`${previous.x},${previous.y}`);
+        }
+        // Distinct positions, and the wrapped axis stayed put rather than
+        // dragging the other one back to the corner with it.
+        expect(new Set(seen).size).toBe(seen.length);
+        expect(previous.y).toBe(laptop.y);
+    });
+
     it('honors a work area that does not start at the origin', () => {
         const dock = { x: 1920, y: 25, width: 1440, height: 875 };
         const bounds = next_window_bounds(dock, { width: 5000, height: 5000 }, null);
         expect(bounds).toEqual({ x: 1920, y: 25, width: 1440, height: 875 });
+    });
+
+    // A window on a second display, cascading from one dragged past that
+    // display's left/top edge: the result must land back inside the work area,
+    // not at the primary display's origin.
+    it('clamps a cascade into an offset work area', () => {
+        const second = { x: 1920, y: 25, width: 1440, height: 875 };
+        const previous = { x: 100, y: -200, width: 900, height: 600 };
+        const bounds = next_window_bounds(second, { width: 900, height: 600 }, previous);
+        expect(bounds.x).toBeGreaterThanOrEqual(second.x);
+        expect(bounds.y).toBeGreaterThanOrEqual(second.y);
+        expect(bounds.x + bounds.width).toBeLessThanOrEqual(second.x + second.width);
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(second.y + second.height);
     });
 
     it('never sizes a window past the work area', () => {
@@ -259,8 +292,10 @@ describe('window geometry', () => {
     it('keeps a window fully on screen even when placed near the edge', () => {
         const previous = { x: 1000, y: 100, width: 400, height: 300 };
         const bounds = next_window_bounds(work_area, { width: 1900, height: 1000 }, previous);
-        expect(bounds.x + bounds.width).toBeLessThanOrEqual(work_area.width);
-        expect(bounds.y + bounds.height).toBeLessThanOrEqual(work_area.height);
+        expect(bounds.x).toBeGreaterThanOrEqual(work_area.x);
+        expect(bounds.y).toBeGreaterThanOrEqual(work_area.y);
+        expect(bounds.x + bounds.width).toBeLessThanOrEqual(work_area.x + work_area.width);
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(work_area.y + work_area.height);
     });
 });
 

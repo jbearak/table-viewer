@@ -459,11 +459,14 @@ if (!got_lock) {
         else show_welcome_window();
     });
 
-    // macOS dock click with nothing left on screen.
+    // macOS dock click with nothing to work in. Preferences deliberately does not
+    // count: it is a utility window, so activating with only it open should still
+    // produce a launcher.
     app.on('activate', () => {
-        if (app.isReady() && BrowserWindow.getAllWindows().length === 0) {
-            show_welcome_window();
-        }
+        if (!app.isReady()) return;
+        const has_document_window = (viewer_windows?.has_windows() ?? false)
+            || welcome_windows.size > 0;
+        if (!has_document_window) show_welcome_window();
     });
 
     app.on('window-all-closed', () => {

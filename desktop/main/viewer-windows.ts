@@ -172,8 +172,17 @@ export class ViewerWindowManager {
         // controller and its subscriptions go away.
         window.on('close', () => this.remember_size(window));
         window.once('closed', () => this.teardown(entry));
-        void web_contents.loadURL(viewer_url(next_window_id++));
+        // Closing the window mid-load aborts the navigation, which rejects; an
+        // unhandled rejection in the main process is fatal, so swallow it.
+        web_contents.loadURL(viewer_url(next_window_id++)).catch((error) => {
+            if (!window.isDestroyed()) console.error('Failed to load the viewer', error);
+        });
         return window;
+    }
+
+    /** Whether any file is open, i.e. the app has a document window on screen. */
+    has_windows(): boolean {
+        return this.windows.length > 0;
     }
 
     /**
@@ -228,7 +237,14 @@ export class ViewerWindowManager {
         const { width, height } = window.getNormalBounds();
         const settings = this.config_store.settings();
         if (settings.windowWidth === width && settings.windowHeight === height) return;
-        this.config_store.update({ windowWidth: width, windowHeight: height });
+        try {
+            this.config_store.update({ windowWidth: width, windowHeight: height });
+        } catch (error) {
+            // Best-effort convenience: this runs inside the window's 'close'
+            // handler, where an unwritable userData directory would otherwise
+            // take down the whole app on the way out.
+            console.error('Failed to remember the window size', error);
+        }
     }
 
     private teardown(entry: ViewerWindow): void {

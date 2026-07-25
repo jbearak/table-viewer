@@ -36,6 +36,36 @@ test('launching with no file shows the launcher', async () => {
     await expect(page.getByRole('button', { name: 'Open File…' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Preferences…' })).toBeVisible();
     expect(app.windows()).toHaveLength(1);
+
+    // The buttons are static markup, so their presence alone would also pass with
+    // the renderer dead. Check that it ran: the preload API is exposed, and the
+    // theme it applies has reached the document.
+    expect(await page.evaluate(
+        () => typeof (window as { welcomeApi?: { open_files?: unknown } })
+            .welcomeApi?.open_files,
+    )).toBe('function');
+    expect(await page.evaluate(
+        () => document.documentElement.style.getPropertyValue('--welcome-bg'),
+    )).not.toBe('');
+});
+
+// Proves the renderer's click handlers are wired, which the assertions above
+// cannot: Preferences… is the one button whose effect is observable without a
+// native file dialog.
+test('the launcher opens Preferences', async () => {
+    const page = welcome_pages()[0];
+    await page.getByRole('button', { name: 'Preferences…' }).click();
+    await expect
+        .poll(() => app.windows().filter((entry) => entry.url().endsWith('prefs.html')).length,
+            { timeout: 15_000 })
+        .toBe(1);
+
+    await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()
+            .find((window) => window.getTitle().includes('Preferences'))
+            ?.close();
+    });
+    await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
 });
 
 test('File → New Window opens another launcher', async () => {
