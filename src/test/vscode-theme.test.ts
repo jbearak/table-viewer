@@ -124,6 +124,12 @@ describe('build_edit_tints_from_vars', () => {
             '#12345',
             'rgb(50%, 10%, 10%)',
             'color-mix(in srgb, red, blue)',
+            // A malformed argument list must not derive a tint from whatever
+            // prefix happens to parse.
+            'rgb(1 2 3 garbage)',
+            'rgb(1, 2, 3, 4, 5)',
+            'rgb(0x10 0 0)',
+            'rgb(1 2 none)',
         ]) {
             expect(dirty(value), value).toBe('rgba(204, 167, 0, 0.16)');
         }

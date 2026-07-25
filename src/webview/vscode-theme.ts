@@ -77,6 +77,9 @@ export const CONFLICT_BG_FALLBACK = 'rgba(229, 75, 75, 0.22)';
 
 const HEX_RE = /^#([0-9a-f]+)$/i;
 const RGB_FN_RE = /^rgba?\(([^)]*)\)$/i;
+const DECIMAL_RE = /^-?\d+(\.\d+)?$/;
+/** An alpha may also be a percentage (`rgb(1 2 3 / 50%)`). */
+const ALPHA_RE = /^-?\d+(\.\d+)?%?$/;
 
 /**
  * Extract r/g/b from the color notations a `--vscode-*` variable can hold.
@@ -109,10 +112,17 @@ export function parse_rgb_channels(value: string): [number, number, number] | un
     const fn = RGB_FN_RE.exec(text);
     if (!fn) return undefined;
     const parts = fn[1].split(/[\s,/]+/).filter((p) => p.length > 0);
-    if (parts.length < 3) return undefined;
-    const channels = parts.slice(0, 3).map((p) => Number(p));
-    if (channels.some((n) => !Number.isFinite(n))) return undefined; // '50%', 'none'
-    return channels.map((n) => Math.min(255, Math.max(0, Math.round(n)))) as [number, number, number];
+    // Exactly three channels plus an optional alpha. Anything longer is
+    // malformed, and matching each channel against a decimal literal rather
+    // than trusting `Number()` rejects `50%`, `none`, and `0x10` (which
+    // `Number()` would happily read as 16).
+    if (parts.length !== 3 && parts.length !== 4) return undefined;
+    if (!parts.slice(0, 3).every((p) => DECIMAL_RE.test(p))) return undefined;
+    // The alpha is discarded, but a junk alpha still means a malformed color:
+    // trusting the channels of `rgb(1 2 3 garbage)` would invent a tint.
+    if (parts.length === 4 && !ALPHA_RE.test(parts[3])) return undefined;
+    return parts.slice(0, 3).map((p) =>
+        Math.min(255, Math.max(0, Math.round(Number(p))))) as [number, number, number];
 }
 
 /** `color` re-emitted at exactly `alpha`; `fallback` verbatim if unparseable. */
