@@ -44,6 +44,11 @@ interface ViewerWindow {
 
 const IS_MAC = process.platform === 'darwin';
 
+/** How long a drag has to settle before the new size is persisted. A resize
+ *  fires continuously, and each write is a synchronous rewrite of the settings
+ *  file. */
+const RESIZE_SETTLE_MS = 250;
+
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
  *  closed window's zoom level is not inherited by the next one. */
 let next_window_id = 1;
@@ -168,9 +173,22 @@ export class ViewerWindowManager {
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
         };
         this.windows.push(entry);
+        // Track the size as the user drags, not only on close: opening a second
+        // file without closing the first should still match the size just set.
+        let settle_timer: ReturnType<typeof setTimeout> | undefined;
+        window.on('resize', () => {
+            if (settle_timer) clearTimeout(settle_timer);
+            settle_timer = setTimeout(() => {
+                settle_timer = undefined;
+                this.remember_size(window, 'resize');
+            }, RESIZE_SETTLE_MS);
+        });
         // 'close' still has live bounds to remember; 'closed' is where the
         // controller and its subscriptions go away.
-        window.on('close', () => this.remember_size(window));
+        window.on('close', () => {
+            if (settle_timer) clearTimeout(settle_timer);
+            this.remember_size(window, 'close');
+        });
         window.once('closed', () => this.teardown(entry));
         // Closing the window mid-load aborts the navigation, which rejects; an
         // unhandled rejection in the main process is fatal, so swallow it.
@@ -231,16 +249,37 @@ export class ViewerWindowManager {
         );
     }
 
-    /** Remember this window's size so the next one opens at the same size. */
-    private remember_size(window: BrowserWindow): void {
+    /**
+     * Remember this window's size so the next one opens at the same size — the
+     * `match-last` half of the new-window-size preference.
+     *
+     * The two callers have to measure differently:
+     *
+     * - `close` is the last chance to record anything, so it reads
+     *   `getNormalBounds()` — the restored size, which is the one worth keeping
+     *   even when the window is maximized, fullscreen or minimized as it goes.
+     * - `resize` fires mid-drag on a focused window, and `getNormalBounds()`
+     *   there disturbs it enough to swallow keystrokes into an open cell editor
+     *   (the desktop smoke suite catches this). It reads `getBounds()` instead
+     *   and skips the states where that would report something other than the
+     *   restored size, which costs nothing: `close` always runs afterwards.
+     */
+    private remember_size(window: BrowserWindow, source: 'resize' | 'close'): void {
         if (window.isDestroyed()) return;
-        const { width, height } = window.getNormalBounds();
         const settings = this.config_store.settings();
+        // Under `fixed` the stored size is the user's typed preference, so
+        // dragging a window must not quietly overwrite it.
+        if (settings.newWindowSize === 'fixed') return;
+        const transient = window.isMaximized() || window.isFullScreen() || window.isMinimized();
+        if (source === 'resize' && transient) return;
+        const { width, height } = source === 'close'
+            ? window.getNormalBounds()
+            : window.getBounds();
         if (settings.windowWidth === width && settings.windowHeight === height) return;
         try {
             this.config_store.update({ windowWidth: width, windowHeight: height });
         } catch (error) {
-            // Best-effort convenience: this runs inside the window's 'close'
+            // Best-effort convenience: one caller is the window's 'close'
             // handler, where an unwritable userData directory would otherwise
             // take down the whole app on the way out.
             console.error('Failed to remember the window size', error);

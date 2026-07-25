@@ -138,6 +138,15 @@ test('windows are separately sized and positioned', async () => {
         BrowserWindow.getAllWindows().map((window) => window.getBounds()));
     expect([after[0].width, after[0].height]).toEqual([700, 500]);
     expect(after[1].width).toBe(bounds[1].width);
+
+    // Under the default `match-last`, that resize is what the next window will
+    // open at — tracked from the resize itself, without waiting for a close.
+    await expect.poll(() => {
+        const file = path.join(user_data_dir, 'settings.v1.json');
+        if (!fs.existsSync(file)) return null;
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return [settings.windowWidth, settings.windowHeight];
+    }, { timeout: 15_000 }).toEqual([700, 500]);
 });
 
 // Opening a file that is already open must focus its window, not load the file a

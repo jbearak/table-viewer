@@ -20,6 +20,7 @@ import {
     MIN_WINDOW_WIDTH,
     fit_window_size,
     next_window_bounds,
+    sanitize_new_window_size_mode,
 } from '../main/window-geometry';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
 import {
@@ -128,6 +129,7 @@ describe('desktop-config', () => {
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
             maxStoredFiles: 2.9,
+            newWindowSize: 'whatever',
             windowWidth: 'wide',
             windowHeight: 10,
         })).toEqual({
@@ -140,6 +142,7 @@ describe('desktop-config', () => {
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
             maxStoredFiles: 2,
+            newWindowSize: 'match-last',
             windowWidth: DEFAULT_SETTINGS.windowWidth,
             // Below the usable minimum: raised, not taken literally.
             windowHeight: MIN_WINDOW_HEIGHT,
@@ -255,6 +258,27 @@ describe('unsaved-edit indicator', () => {
             fontSize: null,
         })).toBeUndefined();
         expect(dirty_from_webview_message({ type: 'ready' })).toBeUndefined();
+    });
+});
+
+describe('new window size mode', () => {
+    it('defaults to tracking the last window, and only accepts the two modes', () => {
+        expect(DEFAULT_SETTINGS.newWindowSize).toBe('match-last');
+        expect(sanitize_new_window_size_mode('fixed')).toBe('fixed');
+        expect(sanitize_new_window_size_mode('match-last')).toBe('match-last');
+        for (const bad of ['Fixed', '', null, undefined, 7, {}]) {
+            expect(sanitize_new_window_size_mode(bad)).toBe('match-last');
+        }
+    });
+
+    it('keeps a fixed size the user typed, raising one below the minimum', () => {
+        const settings = sanitize_settings({
+            newWindowSize: 'fixed',
+            windowWidth: 1440,
+            windowHeight: 100,
+        });
+        expect(settings.windowWidth).toBe(1440);
+        expect(settings.windowHeight).toBe(MIN_WINDOW_HEIGHT);
     });
 });
 

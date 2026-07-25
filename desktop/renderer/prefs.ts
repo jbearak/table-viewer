@@ -5,6 +5,13 @@
 import type { PrefsApi } from '../preload/prefs-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload, ThemeSetting, ThemeKind } from '../main/theme';
+// A pure module (no electron import), so the renderer bundle can share the one
+// definition of the usable size range with the main process.
+import {
+    MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+    sanitize_new_window_size_mode,
+} from '../main/window-geometry';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -13,6 +20,10 @@ const font_size = document.getElementById('fontSize') as HTMLInputElement;
 const theme = document.getElementById('theme') as HTMLSelectElement;
 const color_theme = document.getElementById('colorTheme') as HTMLSelectElement;
 const tab_orientation = document.getElementById('tabOrientation') as HTMLSelectElement;
+const new_window_size = document.getElementById('newWindowSize') as HTMLSelectElement;
+const new_window_size_hint = document.getElementById('newWindowSizeHint') as HTMLSpanElement;
+const window_width = document.getElementById('windowWidth') as HTMLInputElement;
+const window_height = document.getElementById('windowHeight') as HTMLInputElement;
 const csv_max_rows = document.getElementById('csvMaxRows') as HTMLInputElement;
 const max_file_size = document.getElementById('maxFileSizeMiB') as HTMLInputElement;
 const status = document.getElementById('status') as HTMLDivElement;
@@ -72,6 +83,34 @@ function apply_fonts(settings: DesktopSettings): void {
     root.style.setProperty('--prefs-font-size', `${settings.fontSize}px`);
 }
 
+/** Kept to a line each: the window is a fixed height and every field below
+ *  this one pays for a hint that wraps. */
+const SIZE_HINTS: Record<DesktopSettings['newWindowSize'], string> = {
+    'match-last': 'Tracks the last window you resized.',
+    fixed: 'Always opens at the size below.',
+};
+
+/**
+ * Show the size fields as the mode makes them: editable under `fixed`, and
+ * under `match-last` a read-only readout of the size the app is tracking.
+ *
+ * A focused input is left alone. Under `match-last` these values change on
+ * their own as viewer windows are resized, and overwriting a half-typed number
+ * with one of those updates would be the one way this window fights the user.
+ */
+function apply_window_size(settings: DesktopSettings): void {
+    const fixed = settings.newWindowSize === 'fixed';
+    new_window_size.value = settings.newWindowSize;
+    new_window_size_hint.textContent = SIZE_HINTS[settings.newWindowSize];
+    for (const [input, value] of [
+        [window_width, settings.windowWidth],
+        [window_height, settings.windowHeight],
+    ] as const) {
+        input.disabled = !fixed;
+        if (document.activeElement !== input) input.value = String(value);
+    }
+}
+
 function populate(settings: DesktopSettings): void {
     font_family.value = settings.fontFamily;
     font_size.value = String(settings.fontSize);
@@ -81,6 +120,7 @@ function populate(settings: DesktopSettings): void {
     tab_orientation.value = settings.tabOrientation;
     csv_max_rows.value = String(settings.csvMaxRows);
     max_file_size.value = String(settings.maxFileSizeMiB);
+    apply_window_size(settings);
     apply_fonts(settings);
 }
 
@@ -127,6 +167,22 @@ font_size.addEventListener('change', () => {
     if (value !== null) save({ fontSize: value });
     else void prefs_api.get_settings().then(populate);
 });
+new_window_size.addEventListener('change', () => {
+    save({ newWindowSize: sanitize_new_window_size_mode(new_window_size.value) });
+});
+// Only reachable under `fixed` — the inputs are disabled otherwise. The store
+// raises anything below the usable minimum, and repopulating shows what it
+// settled on.
+window_width.addEventListener('change', () => {
+    const value = numeric_value(window_width);
+    if (value !== null) save({ windowWidth: value });
+    else void prefs_api.get_settings().then(populate);
+});
+window_height.addEventListener('change', () => {
+    const value = numeric_value(window_height);
+    if (value !== null) save({ windowHeight: value });
+    else void prefs_api.get_settings().then(populate);
+});
 csv_max_rows.addEventListener('change', () => {
     const value = numeric_value(csv_max_rows);
     if (value !== null) save({ csvMaxRows: value });
@@ -138,7 +194,15 @@ max_file_size.addEventListener('change', () => {
     else void prefs_api.get_settings().then(populate);
 });
 
+window_width.min = String(MIN_WINDOW_WIDTH);
+window_height.min = String(MIN_WINDOW_HEIGHT);
+
 apply_theme(prefs_api.get_theme());
 prefs_api.on_theme_changed(apply_theme);
-prefs_api.on_settings_changed(apply_fonts);
+// Not just the fonts: under `match-last` the app itself writes the window size
+// as viewer windows are resized, and this window is showing that number.
+prefs_api.on_settings_changed((settings) => {
+    apply_fonts(settings);
+    apply_window_size(settings);
+});
 void prefs_api.get_settings().then(populate);

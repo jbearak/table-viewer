@@ -28,6 +28,20 @@ export const MIN_WINDOW_HEIGHT = 320;
 /** How far each new window steps down and right from the previous one. */
 export const CASCADE_STEP = 28;
 
+/**
+ * Where the size of a new window comes from.
+ *
+ * `match-last` is the default and the native-app convention: window geometry is
+ * window state, silently tracked as the user resizes. `fixed` turns the same
+ * two numbers into a preference the user types — and, crucially, stops the app
+ * writing to them, so a stray drag cannot rewrite what was typed.
+ */
+export type NewWindowSizeMode = 'match-last' | 'fixed';
+
+export function sanitize_new_window_size_mode(value: unknown): NewWindowSizeMode {
+    return value === 'fixed' ? 'fixed' : 'match-last';
+}
+
 function clamp(value: number, minimum: number, maximum: number): number {
     return Math.min(maximum, Math.max(minimum, value));
 }

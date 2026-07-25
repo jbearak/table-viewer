@@ -68,6 +68,50 @@ test('the launcher opens Preferences', async () => {
     await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
 });
 
+// The new-window-size mode is the one preference whose two states change what
+// the *other* controls do, so the enable/disable wiring is worth a real run.
+test('the new-window-size mode enables the size fields and persists', async () => {
+    await welcome_pages()[0].getByRole('button', { name: 'Preferences…' }).click();
+    let prefs: import('@playwright/test').Page | undefined;
+    await expect.poll(
+        () => (prefs = app.windows().find((entry) => entry.url().endsWith('prefs.html'))),
+        { timeout: 15_000 },
+    ).toBeTruthy();
+    const page = prefs!;
+    await page.waitForSelector('#newWindowSize');
+
+    // Default: tracked by the app, so the numbers are a readout, not fields.
+    await expect(page.locator('#newWindowSize')).toHaveValue('match-last');
+    await expect(page.locator('#windowWidth')).toBeDisabled();
+    await expect(page.locator('#windowHeight')).toBeDisabled();
+
+    await page.selectOption('#newWindowSize', 'fixed');
+    await expect(page.locator('#windowWidth')).toBeEnabled();
+    await page.fill('#windowWidth', '1440');
+    await page.locator('#windowWidth').blur();
+    // Below the usable minimum: the store raises it and the field shows what it
+    // settled on rather than what was typed.
+    await page.fill('#windowHeight', '50');
+    await page.locator('#windowHeight').blur();
+    await expect(page.locator('#windowHeight')).toHaveValue('320');
+
+    await expect.poll(() => {
+        const file = path.join(user_data_dir, 'settings.v1.json');
+        if (!fs.existsSync(file)) return null;
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return [settings.newWindowSize, settings.windowWidth, settings.windowHeight];
+    }, { timeout: 15_000 }).toEqual(['fixed', 1440, 320]);
+
+    // Leave the store as the other tests expect to find it.
+    await page.selectOption('#newWindowSize', 'match-last');
+    await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()
+            .find((window) => window.getTitle().includes('Preferences'))
+            ?.close();
+    });
+    await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
+});
+
 test('File → New Window opens another launcher', async () => {
     await click_menu_item(app, 'File', 'New Window');
     await expect.poll(() => welcome_pages().length, { timeout: 15_000 }).toBe(2);
