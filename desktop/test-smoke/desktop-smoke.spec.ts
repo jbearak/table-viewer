@@ -289,6 +289,14 @@ test('the appearance preference pins light/dark, and System restores OS followin
                 .trim());
 
     try {
+        // Start from a known appearance: on a dark-mode runner the first pin below
+        // would otherwise assert a palette the app was already showing.
+        await app.evaluate(({ nativeTheme }) => {
+            nativeTheme.themeSource = 'light';
+        });
+        await expect.poll(editor_background, { timeout: 5_000 }).toBe('#ffffff');
+
+        // Each pin flips the palette away from what the previous step left.
         for (const [choice, expected] of [
             ['dark', '#1e1e1e'],
             ['light', '#ffffff'],

@@ -4,7 +4,7 @@
 // this one included; the other settings apply on the next file load).
 import type { PrefsApi } from '../preload/prefs-preload';
 import type { DesktopSettings } from '../main/desktop-config';
-import { sanitize_theme_setting, type ThemePayload } from '../main/theme';
+import type { ThemePayload, ThemeSetting } from '../main/theme';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -59,7 +59,8 @@ function save(partial: Partial<DesktopSettings>): void {
 }
 
 font_family.addEventListener('change', () => save({ fontFamily: font_family.value }));
-theme.addEventListener('change', () => save({ theme: sanitize_theme_setting(theme.value) }));
+// The select offers only the three valid values, and the store sanitizes anyway.
+theme.addEventListener('change', () => save({ theme: theme.value as ThemeSetting }));
 tab_orientation.addEventListener('change', () => {
     save({ tabOrientation: tab_orientation.value === 'vertical' ? 'vertical' : 'horizontal' });
 });

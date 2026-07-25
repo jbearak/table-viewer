@@ -40,10 +40,11 @@ export interface DesktopSettings {
 export const MIN_FONT_SIZE_PX = 8;
 export const MAX_FONT_SIZE_PX = 32;
 
-/** Defaults mirror the VS Code contribution defaults in package.json, except
- *  the worksheet tab orientation, which is vertical here (there is no editor
- *  tab strip to compete with) and the font size, which has no editor setting
- *  to inherit on the desktop. */
+/** Defaults mirror the VS Code contribution defaults in package.json, except:
+ *  the worksheet tab orientation, which is vertical here (there is no editor tab
+ *  strip to compete with); the font size, which has no editor setting to inherit
+ *  on the desktop; and the appearance, which has no counterpart at all (in VS
+ *  Code the viewer takes the editor's theme). */
 export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     fontFamily: '',
     fontSize: 13,

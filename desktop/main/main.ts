@@ -25,7 +25,7 @@ import {
 } from '../../src/json-file-state-store';
 import { DesktopConfigStore, settings_file_path } from './desktop-config';
 import { ViewerWindowManager } from './viewer-windows';
-import { theme_payload, type ThemeSetting } from './theme';
+import { theme_payload, window_background_color, type ThemeSetting } from './theme';
 import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
@@ -158,7 +158,7 @@ function show_welcome_window(): BrowserWindow {
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer',
-        backgroundColor: nativeTheme.shouldUseDarkColors ? '#1e1e1e' : '#ffffff',
+        backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
         webPreferences: {
             preload: WELCOME_PRELOAD,
             contextIsolation: true,
@@ -198,7 +198,7 @@ function show_preferences_window(): void {
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer Preferences',
-        backgroundColor: nativeTheme.shouldUseDarkColors ? '#1e1e1e' : '#ffffff',
+        backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
         webPreferences: {
             preload: PREFS_PRELOAD,
             contextIsolation: true,
@@ -384,12 +384,17 @@ function register_ipc(): void {
     });
 }
 
-/** Push the current palette to every window. Viewer windows take it through the
- *  window manager (it also repaints their native background); the chrome windows
- *  listen on the theme channel. */
+/** Push the current palette to every window: the page CSS over the theme channel,
+ *  and the native window background separately — viewer windows through the window
+ *  manager, the chrome windows here. A frame whose background is not repainted
+ *  keeps the old color behind and around its page. */
 function broadcast_theme(): void {
     const payload = theme_payload(nativeTheme.shouldUseDarkColors);
+    const background = window_background_color(payload.kind);
     viewer_windows?.apply_theme(payload);
+    for (const window of [...welcome_windows, prefs_window]) {
+        if (window && !window.isDestroyed()) window.setBackgroundColor(background);
+    }
     for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) window.webContents.send(CHANNEL_THEME_CHANGED, payload);
     }

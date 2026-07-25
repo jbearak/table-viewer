@@ -16,6 +16,12 @@
   body {
     margin: 0;
     padding: 20px 24px;
+    /* The window is a fixed size but every dimension here scales with the font
+       setting, so at a large app font the last fields would otherwise fall off
+       the bottom — including the font size input, the only way back. */
+    box-sizing: border-box;
+    height: 100vh;
+    overflow-y: auto;
     font-family: var(--prefs-font-family);
     font-size: var(--prefs-font-size);
     background: var(--prefs-bg, #ffffff);

@@ -198,6 +198,12 @@ const LIGHT: Record<string, string> = {
     '--vscode-widget-border': '#c8c8c8',
 };
 
+/** Native window background, painted before the page loads and repainted when the
+ *  appearance changes — otherwise the frame flashes, or keeps, the wrong color. */
+export function window_background_color(kind: ThemeKind): string {
+    return (kind === 'dark' ? DARK : LIGHT)['--vscode-editor-background'];
+}
+
 /** Also set on <html> so the page background matches before CSS loads. */
 export function theme_css_variables(kind: ThemeKind): Record<string, string> {
     return { ...(kind === 'dark' ? DARK : LIGHT) };

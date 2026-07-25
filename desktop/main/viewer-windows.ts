@@ -24,7 +24,7 @@ import { create_desktop_ui_port, node_file_system_port } from './desktop-host-po
 import type { DesktopConfigStore } from './desktop-config';
 import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
 import { dirty_from_host_message, dirty_from_webview_message } from './dirty-state';
-import type { ThemePayload } from './theme';
+import { window_background_color, type ThemePayload } from './theme';
 import { CHANNEL_HOST_MESSAGE, CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { viewer_url } from './viewer-html';
 import {
@@ -43,10 +43,6 @@ interface ViewerWindow {
 }
 
 const IS_MAC = process.platform === 'darwin';
-
-function background_color(dark: boolean): string {
-    return dark ? '#1e1e1e' : '#ffffff';
-}
 
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
  *  closed window's zoom level is not inherited by the next one. */
@@ -84,7 +80,7 @@ export class ViewerWindowManager {
             minWidth: MIN_WINDOW_WIDTH,
             minHeight: MIN_WINDOW_HEIGHT,
             title,
-            backgroundColor: background_color(nativeTheme.shouldUseDarkColors),
+            backgroundColor: window_background_color(nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
             webPreferences: {
                 preload: this.viewer_preload_path,
                 contextIsolation: true,
@@ -208,7 +204,7 @@ export class ViewerWindowManager {
     apply_theme(payload: ThemePayload): void {
         for (const entry of this.windows) {
             if (!entry.window.isDestroyed()) {
-                entry.window.setBackgroundColor(background_color(payload.kind === 'dark'));
+                entry.window.setBackgroundColor(window_background_color(payload.kind));
             }
         }
     }
