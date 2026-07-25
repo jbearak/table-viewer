@@ -773,6 +773,16 @@ export function App(): React.JSX.Element {
                     // first snapshot for a newly selected file.
                     const applied_save_transition = save_transition!;
                     last_applied_snapshot_ref.current = snapshot.identity;
+                    // Fold the open overlay into the store before this snapshot's
+                    // generation bump unmounts the grid that owns it. Ahead of both
+                    // installs below on purpose: an install carrying authoritative
+                    // absence must still win over a folded overlay, since the
+                    // refresh owns the complete pending-edit projection. The fold's
+                    // value is the refresh where refresh_editing_current_session is
+                    // false and therefore nothing installs. Only on the applied
+                    // branch — a duplicate or stale snapshot must not touch edit
+                    // state at all.
+                    editing_ref.current?.commit_live_edit();
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets = new Map(
                         (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
@@ -1106,6 +1116,20 @@ export function App(): React.JSX.Element {
                 ) {
                     return;
                 }
+                // Fold the open overlay into the store before the generation bump
+                // below unmounts the grid that owns it. Doable here rather than at
+                // dispatch time because GridShell is still mounted and Glide's
+                // .gdg-clip-region overlay is still in the DOM, so read_live_edit
+                // resolves; React batches set_generation and flushes only after
+                // this handler returns. It works at all only because the store's
+                // write is synchronous — the subscription plays no part.
+                // Placed after the requestId guard so a stale or duplicated ack
+                // doesn't fold for no reason. This path installs nothing, which is
+                // exactly where the fold earns its keep; where an authoritative
+                // install does follow, the install runs after the fold and still
+                // wins, preserving "the grant/refresh owns the complete
+                // pending-edit projection, including authoritative absence".
+                editing_ref.current?.commit_live_edit();
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
