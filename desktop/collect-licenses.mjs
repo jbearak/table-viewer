@@ -72,7 +72,10 @@ const preamble = [
     'THIRD-PARTY SOFTWARE NOTICES',
     '',
     'Table Viewer (GPL-3.0) bundles the following third-party npm packages.',
-    'The full license text of each package is reproduced below.',
+    // Not "the full text of each": a few packages publish a license identifier
+    // without shipping the text, and those are listed separately below rather
+    // than silently counted as reproduced.
+    'Each license text published with its package is reproduced below.',
     '',
     "Electron's own license and the Chromium third-party notices are shipped",
     'alongside this file (LICENSE.electron.txt, LICENSES.chromium.html).',

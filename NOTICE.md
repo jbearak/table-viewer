@@ -43,9 +43,11 @@ SOFTWARE.
 
 ## Bundled npm package licenses
 
-The packaged desktop app also ships `THIRD_PARTY_NOTICES.txt`, the full license
-text of every npm package bundled into it. It is generated from
-`package-lock.json` by `desktop/collect-licenses.mjs` at build time and is
+The packaged desktop app also ships `THIRD_PARTY_NOTICES.txt`, covering every npm
+package bundled into it: the license text where the published tarball includes
+one, and otherwise the license identifier from the package metadata — some
+packages publish a license identifier without shipping the text. It is generated
+from `package-lock.json` by `desktop/collect-licenses.mjs` at build time and is
 therefore not checked in; the packaged app puts it in `Contents/Resources`, and
 the About window (**About Table Viewer**) opens it. Electron's own license and
 the Chromium third-party notices ship alongside it.

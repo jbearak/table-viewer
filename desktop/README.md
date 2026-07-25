@@ -62,7 +62,7 @@ The Preferences **Color theme** select is a view of the live theme payload rathe
 
 ## About window
 
-**About Table Viewer** (the app menu on macOS, **Help** elsewhere) opens a small custom window (`desktop/renderer/about.html`) rather than the native macOS About panel: GPL-3.0 expects an interactive program to surface its license and warranty notice, and the native panel cannot host the links that makes practical. It offers the app's own license, [NOTICE.md](../NOTICE.md), and the generated npm package notices.
+**About Table Viewer** (the app menu on macOS, **Help** elsewhere) opens a small custom window (`desktop/renderer/about.html`) rather than the native macOS About panel: GPL-3.0 expects an interactive program to surface its license and warranty notice, and the native panel cannot host the links that make that practical. It offers the app's own license, [NOTICE.md](../NOTICE.md), and the generated npm package notices.
 
 The display name in the markup is hardcoded, because `app.name` is the package name (`table-viewer`) outside a packaged build. The version is not read from Electron either: `app.getVersion()` reports *Electron's* version in a dev run (the app is launched as `electron dist/desktop/main.js`, and `dist/desktop` has no `package.json`), so `desktop/build.mjs` injects the root `package.json` version into the main bundle as `__APP_VERSION__` — one source of truth, correct in both modes. The window is a sandboxed renderer like Preferences, so its preload cannot call `shell` itself; the link targets go over IPC and the main process maps each target name to a URL, so a compromised renderer cannot open an arbitrary one.
 
