@@ -344,7 +344,13 @@ export function App(): React.JSX.Element {
     // GridShell remounts that a transform or refresh snapshot forces.
     const edit_session_ref = useRef<EditSessionStore | null>(null);
     if (edit_session_ref.current === null) {
-        edit_session_ref.current = create_edit_session_store();
+        // Stamped with an explicit undefined session rather than left unstamped:
+        // an unstamped store accepts a write from any writer, which would make
+        // the fence's soundness depend on the adopt_session layout effect having
+        // already run. Stamping at construction makes it hold from the first
+        // render. There is no session yet, and `undefined` is compared with ===
+        // and is a real value here, never a wildcard.
+        edit_session_ref.current = create_edit_session_store({ session_id: undefined });
     }
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);

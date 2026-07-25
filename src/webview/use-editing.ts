@@ -41,14 +41,16 @@ export function use_editing(
     store?: EditSessionStore,
 ) {
     const own_store_ref = useRef<EditSessionStore | null>(null);
-    if (own_store_ref.current === null) {
+    // Only when no store was handed down, matching GridShell's fallback: building
+    // one anyway would allocate a map per mount that nothing ever reads.
+    if (store === undefined && own_store_ref.current === null) {
         // No identity: a hook-owned store lives and dies with this hook, so there
         // is no other writer for a session stamp to fence off, and stamping the
         // first render's session would strand this hook's own later writes if the
         // id moved. A hoisted store is where the stamp earns its keep.
         own_store_ref.current = create_edit_session_store();
     }
-    const active_store = store ?? own_store_ref.current;
+    const active_store = store ?? own_store_ref.current!;
 
     // useSyncExternalStore rather than the useReducer bump pattern that
     // use-row-loader.ts uses: that loader is owned by the hook, so nothing can
