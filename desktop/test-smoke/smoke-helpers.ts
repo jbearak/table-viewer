@@ -57,11 +57,21 @@ export async function open_preferences(app: ElectronApplication): Promise<Page> 
     return prefs_page()!;
 }
 
-/** Close the Preferences window, if it is open. */
+/**
+ * Close the Preferences window, if it is open, and wait for it to be gone.
+ *
+ * Waiting matters: Preferences is a singleton, so a later `open_preferences`
+ * racing a close still in flight focuses the dying window instead of creating a
+ * new one, and then finds no page.
+ */
 export async function close_preferences(app: ElectronApplication): Promise<void> {
     await app.evaluate(({ BrowserWindow }) => {
         BrowserWindow.getAllWindows()
             .find((window) => window.getTitle().includes('Preferences'))
             ?.close();
     });
+    await expect
+        .poll(() => app.windows().some((page) => page.url().endsWith('prefs.html')),
+            { timeout: 15_000 })
+        .toBe(false);
 }

@@ -92,6 +92,32 @@ async function focus_viewer(file_name: string): Promise<Page> {
 const click_menu_item = (menu_label: string, item_label: string) =>
     click_menu(app, menu_label, item_label);
 
+/**
+ * Click the grid cell at `offset` and wait for the grid to agree it is selected.
+ *
+ * The grid draws to a canvas, so a click is a raw coordinate — and a coordinate
+ * only means a cell once the data has laid out. Glide also mirrors the grid into
+ * a hidden accessibility table, which is what makes both halves of that possible
+ * to wait for: `#glide-cell-<col>-<row>` exists once the row is laid out, and
+ * carries `aria-selected` once it is picked.
+ *
+ * Without the first wait a click can land on the header instead, and without the
+ * second nothing distinguishes that from a click that worked — the keystrokes
+ * that follow simply go nowhere, which is how these tests used to fail under
+ * load.
+ */
+async function click_grid_cell(
+    page: Page,
+    cell: { column: number; row: number },
+    offset: { x: number; y: number },
+): Promise<void> {
+    const target = page.locator(`#glide-cell-${cell.column}-${cell.row}`);
+    await target.waitFor({ state: 'attached' });
+    const box = (await page.locator(GRID_CANVAS).first().boundingBox())!;
+    await page.mouse.click(box.x + offset.x, box.y + offset.y);
+    await expect(target).toHaveAttribute('aria-selected', 'true');
+}
+
 test.beforeAll(async () => {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
     user_data_dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-smoke-'));
@@ -180,12 +206,10 @@ test('reopening an open file focuses its window instead of duplicating it', asyn
 // focused viewer window instead; this guards that wiring end to end.
 test('Edit menu Copy and Select All act on the grid', async () => {
     const page = await focus_viewer('basic.csv');
-    const canvas = page.locator(GRID_CANVAS).first();
     await app.evaluate(({ clipboard }) => clipboard.writeText('untouched'));
 
     // Select the first body cell, then copy it through the menu.
-    const box = (await canvas.boundingBox())!;
-    await page.mouse.click(box.x + 120, box.y + 50);
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await click_menu_item('Edit', 'Copy');
     await expect
         .poll(() => app.evaluate(({ clipboard }) => clipboard.readText()), { timeout: 5_000 })
@@ -201,17 +225,11 @@ test('Edit menu Copy and Select All act on the grid', async () => {
 
 test('sorting a column shows a sort chip', async () => {
     const page = await focus_viewer('basic.csv');
-    const canvas = page.locator(GRID_CANVAS).first();
 
     // Focus a data cell (past the row-marker gutter and the header row), then
     // sort the focused column ascending via the keyboard shortcut. Glide
     // overlays a scroller element on the canvas, so click via raw coordinates.
-    const box = await canvas.boundingBox();
-    expect(box).toBeTruthy();
-    await page.mouse.click(
-        box!.x + Math.min(140, box!.width - 10),
-        box!.y + Math.min(60, box!.height - 10),
-    );
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await page.keyboard.press('Shift+Alt+A');
 
     await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
@@ -464,9 +482,7 @@ test('a window holding unsaved edits is marked as edited', async () => {
 
     // Type into the first body cell and commit it. The first keystroke opens the
     // overwrite editor and is consumed, so the cell ends up holding "licia".
-    const canvas = page.locator(GRID_CANVAS).first();
-    const box = (await canvas.boundingBox())!;
-    await page.mouse.click(box.x + 120, box.y + 50);
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await page.keyboard.type('Alicia');
     await page.keyboard.press('Enter');
     // The toolbar marks its own unsaved state; wait for the page to agree a draft

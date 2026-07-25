@@ -180,6 +180,9 @@ export class ViewerWindowManager {
         // file without closing the first should still match the size just set.
         let settle_timer: ReturnType<typeof setTimeout> | undefined;
         let pending_size: WindowSize | undefined;
+        /** The last size this window was seen at, so a `resize` that does not
+         *  actually change the size can be told apart from one that does. */
+        let last_size: WindowSize = window.getBounds();
         const cancel_settle = () => {
             if (settle_timer) clearTimeout(settle_timer);
             settle_timer = undefined;
@@ -208,12 +211,19 @@ export class ViewerWindowManager {
             // not count as one — neither recorded, nor allowed to make this the
             // most recently resized window.
             if (window.isMaximized() || window.isFullScreen() || window.isMinimized()) return;
+            const bounds = window.getBounds();
+            // Nor is landing back on the size this window already had, which is
+            // what *restoring* from those states does — by then the flags above
+            // have cleared, so the size is the only thing left to tell the two
+            // apart. Also covers the events a window emits as it is created.
+            if (bounds.width === last_size.width && bounds.height === last_size.height) return;
+            last_size = { width: bounds.width, height: bounds.height };
             entry.resize_seq = ++this.resize_counter;
             // Measured now rather than when the timer fires: the user can
             // maximize or minimize inside the settle window, and the size they
             // just dragged to would be unreadable by then. The debounce is only
             // about how often it is written.
-            pending_size = window.getBounds();
+            pending_size = last_size;
             cancel_settle();
             settle_timer = setTimeout(() => {
                 settle_timer = undefined;
