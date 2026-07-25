@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     apply_font_family,
     apply_font_size,
+    build_edit_tints_from_vars,
     build_theme_from_vars,
     is_vscode_high_contrast,
     theme_font_size_px,
@@ -62,6 +63,74 @@ describe('build_theme_from_vars', () => {
         const theme = build_theme_from_vars(() => '');
         expect(theme.baseFontStyle).toBe('13px');
         expect(theme_font_size_px({})).toBe(13);
+    });
+});
+
+describe('build_edit_tints_from_vars', () => {
+    const from = (vars: Record<string, string>) =>
+        build_edit_tints_from_vars((name) => vars[name] ?? '');
+    const dirty = (value: string) =>
+        from({ '--vscode-editorWarning-foreground': value }).dirtyBg;
+    const conflict = (value: string) =>
+        from({ '--vscode-errorForeground': value }).conflictBg;
+
+    it('derives both tints from the theme warning/error colors', () => {
+        const tints = from({
+            '--vscode-editorWarning-foreground': '#df8e1d',
+            '--vscode-errorForeground': '#d20f39',
+        });
+        expect(tints.dirtyBg).toBe('rgba(223, 142, 29, 0.16)');
+        expect(tints.conflictBg).toBe('rgba(210, 15, 57, 0.22)');
+    });
+
+    it('keeps the historical VS Code appearance when the vars are unset', () => {
+        // In the VS Code webview these variables are ambient rather than
+        // injected, so they routinely read blank. The tints there must stay
+        // byte-identical to the previously hard-coded amber/red.
+        const tints = build_edit_tints_from_vars(() => '');
+        expect(tints.dirtyBg).toBe('rgba(204, 167, 0, 0.16)');
+        expect(tints.conflictBg).toBe('rgba(229, 75, 75, 0.22)');
+    });
+
+    it('treats whitespace-only values as unset', () => {
+        const tints = from({
+            '--vscode-editorWarning-foreground': '   ',
+            '--vscode-errorForeground': '\t\n',
+        });
+        expect(tints.dirtyBg).toBe('rgba(204, 167, 0, 0.16)');
+        expect(tints.conflictBg).toBe('rgba(229, 75, 75, 0.22)');
+    });
+
+    it('discards any alpha carried by the source color', () => {
+        expect(dirty('#df8e1d80')).toBe(dirty('#df8e1d'));
+        expect(dirty('#f9e2af00')).toBe(dirty('#f9e2af'));
+    });
+
+    it('expands 3- and 4-digit hex', () => {
+        expect(dirty('#fc0')).toBe('rgba(255, 204, 0, 0.16)');
+        expect(dirty('#fc08')).toBe('rgba(255, 204, 0, 0.16)');
+    });
+
+    it('accepts rgb()/rgba() and replaces their alpha', () => {
+        expect(conflict('rgba(229, 75, 75, 0.9)')).toBe('rgba(229, 75, 75, 0.22)');
+        expect(dirty('rgb(1 2 3 / 50%)')).toBe('rgba(1, 2, 3, 0.16)');
+    });
+
+    it('falls back for notations we deliberately do not parse', () => {
+        for (const value of [
+            'red',
+            'transparent',
+            'var(--x)',
+            '#12345',
+            'rgb(50%, 10%, 10%)',
+            'color-mix(in srgb, red, blue)',
+        ]) {
+            expect(dirty(value), value).toBe('rgba(204, 167, 0, 0.16)');
+        }
+    });
+
+    it('trims surrounding whitespace from variable values', () => {
+        expect(dirty('  #cca700  ')).toBe('rgba(204, 167, 0, 0.16)');
     });
 });
 

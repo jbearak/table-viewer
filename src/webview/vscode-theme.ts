@@ -5,13 +5,25 @@ import type { Theme } from '@glideapps/glide-data-grid';
  * Builds a Glide `Partial<Theme>` from VS Code's `--vscode-*` CSS variables so
  * the canvas grid matches the active color theme (light/dark/high-contrast).
  *
- * The mapping is split into a pure `build_theme_from_vars(get)` — unit-tested
- * with an injected getter, sidestepping jsdom's incomplete custom-property
- * support — and `build_vscode_theme(root)` which feeds it `getComputedStyle`.
- * `use_vscode_theme()` re-reads on theme switches via a MutationObserver.
+ * It also derives the two canvas edit tints (unsaved edit / conflict) from the
+ * theme's warning and error colors, so they track the active theme instead of
+ * being hard-coded amber and red.
+ *
+ * Both mappings are split into pure `build_*_from_vars(get)` functions —
+ * unit-tested with an injected getter, sidestepping jsdom's incomplete
+ * custom-property support — and `read_vscode_grid_theme(root)` which feeds them
+ * a single `getComputedStyle`. `use_vscode_theme()` re-reads on theme switches
+ * via a MutationObserver.
  */
 
 type VarGetter = (name: string) => string;
+
+/** The `--vscode-*` read idiom: trimmed value, or `fallback` when the variable
+ *  is absent/blank — which it routinely is in the VS Code webview, where these
+ *  are ambient rather than injected. */
+function var_reader(get: VarGetter): (name: string, fallback: string) => string {
+    return (name, fallback) => get(name).trim() || fallback;
+}
 
 /** Base grid/chrome font size when neither the setting nor the host provides
  *  one. Matches the historical hard-coded 13px. */
@@ -51,11 +63,91 @@ export function parse_font_size_px(
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
-    const v = (name: string, fallback: string): string => {
-        const value = get(name).trim();
-        return value || fallback;
+/** Semantic alphas for the two edit tints. Ours, not the theme's: the tint is
+ *  painted *under cell text*, so legibility has to be identical on every theme
+ *  regardless of what alpha (if any) the source variable carried. */
+const DIRTY_TINT_ALPHA = 0.16;
+const CONFLICT_TINT_ALPHA = 0.22;
+
+/** The historical hard-coded tints, now the fallback for hosts (the VS Code
+ *  webview) where the source variables may be unset. Both round-trip through
+ *  `tint_from_color` to themselves. */
+export const DIRTY_BG_FALLBACK = 'rgba(204, 167, 0, 0.16)';
+export const CONFLICT_BG_FALLBACK = 'rgba(229, 75, 75, 0.22)';
+
+const HEX_RE = /^#([0-9a-f]+)$/i;
+const RGB_FN_RE = /^rgba?\(([^)]*)\)$/i;
+
+/**
+ * Extract r/g/b from the color notations a `--vscode-*` variable can hold.
+ *
+ * Deliberately tolerant of more notations than the desktop themes emit (they
+ * are all opaque 6-digit hex): in the VS Code webview these variables come from
+ * whatever theme extension the user installed, and alpha-bearing hex is already
+ * in this codebase's vocabulary (see the `*-background` entries in
+ * desktop/main/theme-definitions.ts). Accepted:
+ * `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`/`rgba()` with comma or
+ * space/slash separators. Any alpha present is *read and discarded* — callers
+ * re-apply their own. Returns undefined for anything else (named colors,
+ * `transparent`, percentages, `color-mix()`, blank), which callers turn into
+ * their literal fallback.
+ */
+export function parse_rgb_channels(value: string): [number, number, number] | undefined {
+    const text = value.trim();
+    const hex = HEX_RE.exec(text);
+    if (hex) {
+        const d = hex[1];
+        if (d.length === 3 || d.length === 4) {
+            return [0, 1, 2].map((i) => Number.parseInt(d[i] + d[i], 16)) as [number, number, number];
+        }
+        if (d.length === 6 || d.length === 8) {
+            return [0, 1, 2].map((i) =>
+                Number.parseInt(d.slice(i * 2, i * 2 + 2), 16)) as [number, number, number];
+        }
+        return undefined;
+    }
+    const fn = RGB_FN_RE.exec(text);
+    if (!fn) return undefined;
+    const parts = fn[1].split(/[\s,/]+/).filter((p) => p.length > 0);
+    if (parts.length < 3) return undefined;
+    const channels = parts.slice(0, 3).map((p) => Number(p));
+    if (channels.some((n) => !Number.isFinite(n))) return undefined; // '50%', 'none'
+    return channels.map((n) => Math.min(255, Math.max(0, Math.round(n)))) as [number, number, number];
+}
+
+/** `color` re-emitted at exactly `alpha`; `fallback` verbatim if unparseable. */
+export function tint_from_color(color: string, alpha: number, fallback: string): string {
+    const rgb = parse_rgb_channels(color);
+    return rgb ? `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})` : fallback;
+}
+
+export interface GridEditTints {
+    /** Canvas fill for a cell holding an unsaved edit. */
+    dirtyBg: string;
+    /** Canvas fill for an edit whose underlying cell drifted. */
+    conflictBg: string;
+}
+
+/** Pure half of the edit-tint derivation (same injected-getter shape as
+ *  `build_theme_from_vars`, for the same jsdom reason). */
+export function build_edit_tints_from_vars(get: VarGetter): GridEditTints {
+    const v = var_reader(get);
+    return {
+        dirtyBg: tint_from_color(
+            v('--vscode-editorWarning-foreground', DIRTY_BG_FALLBACK),
+            DIRTY_TINT_ALPHA,
+            DIRTY_BG_FALLBACK,
+        ),
+        conflictBg: tint_from_color(
+            v('--vscode-errorForeground', CONFLICT_BG_FALLBACK),
+            CONFLICT_TINT_ALPHA,
+            CONFLICT_BG_FALLBACK,
+        ),
     };
+}
+
+export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
+    const v = var_reader(get);
 
     const editor_bg = v('--vscode-editor-background', '#1e1e1e');
     const editor_fg = v('--vscode-editor-foreground', '#d4d4d4');
@@ -116,27 +208,27 @@ export function theme_font_size_px(theme: Partial<Theme>): number {
     return parse_font_size_px(theme.baseFontStyle ?? '');
 }
 
-export function build_vscode_theme(
-    root: HTMLElement = document.documentElement,
-): Partial<Theme> {
-    const style = getComputedStyle(root);
-    return build_theme_from_vars((name) => style.getPropertyValue(name));
-}
-
 export function is_vscode_high_contrast(body: HTMLElement = document.body): boolean {
     return body.classList.contains('vscode-high-contrast')
         || body.classList.contains('vscode-high-contrast-light');
 }
 
-export interface VscodeGridTheme {
+export interface VscodeGridTheme extends GridEditTints {
     theme: Partial<Theme>;
     highContrast: boolean;
 }
 
-function read_vscode_grid_theme(): VscodeGridTheme {
+/** One `getComputedStyle` feeding both derivations. */
+function read_vscode_grid_theme(
+    root: HTMLElement = document.documentElement,
+    body: HTMLElement = document.body,
+): VscodeGridTheme {
+    const style = getComputedStyle(root);
+    const get: VarGetter = (name) => style.getPropertyValue(name);
     return {
-        theme: build_vscode_theme(),
-        highContrast: is_vscode_high_contrast(),
+        theme: build_theme_from_vars(get),
+        ...build_edit_tints_from_vars(get),
+        highContrast: is_vscode_high_contrast(body),
     };
 }
 
