@@ -16,6 +16,17 @@ const grid_mock = vi.hoisted(() => ({
         onGridSelectionChange?: (selection: unknown) => void;
         getCellContent?: (cell: [number, number]) => { data?: string };
     },
+    // Display row → canonical source row, and source row → that row's raw text.
+    //
+    // Both default to the identity/one-row fixture below, which is what a CSV
+    // with no transform installed actually reports. They are overridable because
+    // under an identity mapping a display-keyed and a source-keyed implementation
+    // are indistinguishable: any assertion about *which* row space a durable edit
+    // key is in is vacuous unless the two spaces are made to diverge. Keying the
+    // text fixture by source row (not display row) keeps the cell contents
+    // attached to the right row however the mapping is permuted.
+    source_row_for_display: null as null | ((display_row: number) => number | undefined),
+    text_for_source_row: null as null | ((source_row: number) => readonly string[]),
 }));
 
 vi.mock('@glideapps/glide-data-grid', () => {
@@ -37,12 +48,32 @@ vi.mock('@glideapps/glide-data-grid', () => {
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: () => ({
         ensure_rows: vi.fn(),
-        get_row: (row: number) => [
-            { raw: row === 0 ? 'base' : '', formatted: row === 0 ? 'base' : '', bold: false, italic: false },
-            { raw: row === 0 ? 'middle' : '', formatted: row === 0 ? 'middle' : '', bold: false, italic: false },
-            { raw: row === 0 ? 'source-two' : '', formatted: row === 0 ? 'source-two' : '', bold: false, italic: false },
-        ],
-        get_source_row: (row: number) => row,
+        // Rows are looked up by display row but their *contents* are addressed by
+        // source row, exactly as the real loader does: the host ships each page's
+        // sourceRows alongside its rows, and a permuted view reorders the rows
+        // without renaming their canonical identities.
+        get_row: (display_row: number) => {
+            const source_row = grid_mock.source_row_for_display
+                ? grid_mock.source_row_for_display(display_row)
+                : display_row;
+            // Page not resident: the real loader returns undefined, which
+            // get_cell_raw must forward as "unknown", never as a blank cell.
+            if (source_row === undefined) return undefined;
+            const text = grid_mock.text_for_source_row
+                ? grid_mock.text_for_source_row(source_row)
+                : (source_row === 0 ? ['base', 'middle', 'source-two'] : ['', '', '']);
+            return text.map((raw) => ({
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+            }));
+        },
+        get_source_row: (display_row: number) => (
+            grid_mock.source_row_for_display
+                ? grid_mock.source_row_for_display(display_row)
+                : display_row
+        ),
         sample_loaded_rows: () => [],
         version: 0,
     }),
@@ -236,6 +267,10 @@ afterEach(() => {
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    // Back to the identity mapping: a leaked permutation would silently change
+    // which source row every later test's edits land on.
+    grid_mock.source_row_for_display = null;
+    grid_mock.text_for_source_row = null;
     vi.unstubAllGlobals();
 });
 

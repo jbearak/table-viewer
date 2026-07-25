@@ -64,6 +64,11 @@ const grid_mock = vi.hoisted(() => ({
         x: 30, y: 10, width: 100, height: 36,
     })),
     loader_enabled: [] as boolean[],
+    // Display row → canonical source row; null means identity, which is what a
+    // CSV with no transform installed reports. Overridable so a test can make the
+    // two row spaces diverge — the only condition under which an assertion about
+    // durable edit-key row space is non-vacuous.
+    source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
     ensure_rows_loaded: vi.fn(async () => true),
     post_message: vi.fn(),
@@ -116,7 +121,14 @@ vi.mock('../webview/use-row-loader', () => ({
             ensure_rows: grid_mock.ensure_rows,
             ensure_rows_loaded: grid_mock.ensure_rows_loaded,
             get_row: grid_mock.get_row,
-            get_source_row: (row: number) => row,
+            // Identity unless a test installs a permutation. See the knob's
+            // declaration: with display === source, a display-keyed and a
+            // source-keyed implementation cannot be told apart.
+            get_source_row: (display_row: number) => (
+                grid_mock.source_row_for_display
+                    ? grid_mock.source_row_for_display(display_row)
+                    : display_row
+            ),
             sample_loaded_rows: () => [],
             version: 0,
         };
@@ -217,6 +229,9 @@ afterEach(() => {
     container = null;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    // Back to identity: a leaked permutation would silently change which source
+    // row every later test's edits land on.
+    grid_mock.source_row_for_display = null;
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.overlay_repaint.mockReset();
