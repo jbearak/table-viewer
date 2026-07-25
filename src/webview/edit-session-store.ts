@@ -249,9 +249,18 @@ export function create_edit_session_store(
         // matches nothing. Each of those used to run the whole downstream chain —
         // a React re-render via useSyncExternalStore, two Object.fromEntries over
         // the dirty map in grid-shell, a postMessage, a host-side structuredClone
-        // and an async workspace-state write — and on the host a pendingEdits
-        // write clears the failed-save tombstone and retires the save lifecycle,
-        // so a write that changed nothing could change state that mattered.
+        // and an async workspace-state write, which always bumps a CAS revision
+        // because the host's handler spreads into a fresh object and so never
+        // hits its own no-change shortcut. Not saved here: the candidate map the
+        // mutator already built above, which is why correctness (not that copy)
+        // is what this guard is for.
+        //
+        // A pendingEdits write also clears the host's failed-save tombstone and
+        // retires the save lifecycle, so a no-op post is not purely wasted work.
+        // This guard does not fully close that: a failed save also re-installs,
+        // and install force-notifies below, so one post still gets through. See
+        // the plan doc's PR 1b section for the follow-ups (both live in files
+        // outside this one).
         if (!force_notify && pending_base === state.pending_base
             && entries_equal(state.entries, entries)) {
             // Deliberately keep the *existing* map rather than swapping in the

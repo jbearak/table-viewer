@@ -239,8 +239,11 @@ describe('edit session store', () => {
     // useSyncExternalStore, two Object.fromEntries over the whole dirty map in
     // grid-shell, a postMessage, a host-side structuredClone and an async
     // workspace-state write — and the host's pendingEditsChanged handler clears
-    // the failed-save tombstone and retires the save lifecycle, so a write that
-    // changed nothing could retire state that mattered.
+    // the failed-save tombstone and retires the save lifecycle, so a no-op post
+    // is not purely wasted work. These tests pin the store's half of that: the
+    // notification does not fire. They deliberately do not claim the host
+    // consequence is gone, because a failed save also re-installs and install
+    // force-notifies, so one post still gets through (see the plan doc).
     describe('suppresses no-op mutations', () => {
         it('commit with an identical value and base', () => {
             const store = create_edit_session_store({ session_id: 's' }, {
