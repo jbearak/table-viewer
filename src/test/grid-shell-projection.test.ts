@@ -519,7 +519,14 @@ describe('GridShell column projection', () => {
             pending_preview_scroll: { row: 150, sequence: 1 },
             on_preview_scroll_applied: on_applied,
         }))));
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        // Glide readiness is deferred, so wait for the scroll to happen rather
+        // than for a fixed delay to elapse: a loaded CI runner overruns any one
+        // number, which is how this failed intermittently and only there.
+        await act(async () => {
+            for (let attempt = 0; attempt < 100 && !grid_mock.scroll_to.mock.calls.length; attempt++) {
+                await new Promise((resolve) => window.setTimeout(resolve, 20));
+            }
+        });
         expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(
             0, 150, 'vertical', 0, 0, { vAlign: 'start' },
         );
