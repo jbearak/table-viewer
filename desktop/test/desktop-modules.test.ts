@@ -22,7 +22,13 @@ import {
     next_window_bounds,
 } from '../main/window-geometry';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
-import { REQUIRED_THEME_VARIABLES, theme_css_variables, theme_payload } from '../main/theme';
+import {
+    REQUIRED_THEME_VARIABLES,
+    sanitize_theme_setting,
+    THEME_SETTINGS,
+    theme_css_variables,
+    theme_payload,
+} from '../main/theme';
 import {
     VIEWER_CSP_SOURCE,
     VIEWER_SCRIPT_URL,
@@ -70,10 +76,18 @@ describe('desktop-config', () => {
         expect(DEFAULT_SETTINGS.tabOrientation).toBe('vertical');
     });
 
+    it('defaults the appearance to following the OS and round-trips a pinned one', () => {
+        expect(DEFAULT_SETTINGS.theme).toBe('system');
+        const file = settings_file_path(dir);
+        new DesktopConfigStore(file).update({ theme: 'dark' });
+        expect(new DesktopConfigStore(file).settings().theme).toBe('dark');
+    });
+
     it('sanitizes malformed values', () => {
         expect(sanitize_settings({
             fontFamily: 42,
             fontSize: 'big',
+            theme: 'sepia',
             tabOrientation: 'diagonal',
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
@@ -83,6 +97,7 @@ describe('desktop-config', () => {
         })).toEqual({
             fontFamily: '',
             fontSize: DEFAULT_SETTINGS.fontSize,
+            theme: 'system',
             tabOrientation: 'vertical',
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
@@ -386,6 +401,15 @@ describe('theme', () => {
             .not.toBe(theme_css_variables('dark')['--vscode-editor-background']);
         expect(theme_payload(true).kind).toBe('dark');
         expect(theme_payload(false).kind).toBe('light');
+    });
+
+    it('accepts only the three appearance settings, defaulting to system', () => {
+        for (const value of THEME_SETTINGS) {
+            expect(sanitize_theme_setting(value)).toBe(value);
+        }
+        for (const value of [undefined, null, '', 'Dark', 'sepia', 7, {}]) {
+            expect(sanitize_theme_setting(value)).toBe('system');
+        }
     });
 });
 

@@ -256,6 +256,68 @@ test('viewer windows follow the OS light/dark setting', async () => {
     }
 });
 
+// The appearance preference overrides the OS setting, so this exercises the
+// whole path: the Preferences select → settings file → nativeTheme.themeSource →
+// the palette every open window is holding.
+test('the appearance preference pins light/dark, and System restores OS following', async () => {
+    const viewer = viewer_pages()[0];
+    expect(viewer).toBeTruthy();
+    await viewer.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
+
+    // Preferences… lives on the app menu on macOS and under File elsewhere.
+    const opened = await app.evaluate(({ BrowserWindow, Menu }) => {
+        for (const menu of Menu.getApplicationMenu()?.items ?? []) {
+            const item = menu.submenu?.items.find((entry) => entry.label === 'Preferences…');
+            if (!item?.click) continue;
+            item.click(item, BrowserWindow.getFocusedWindow() ?? undefined, {});
+            return true;
+        }
+        return false;
+    });
+    expect(opened, 'a Preferences… menu item exists').toBe(true);
+
+    const prefs_page = () => app.windows().find((page) => page.url().endsWith('prefs.html'));
+    await expect.poll(prefs_page, { timeout: 15_000 }).toBeTruthy();
+    const prefs = prefs_page()!;
+    const appearance = prefs.locator('#theme');
+    await expect(appearance).toHaveValue('system');
+
+    const editor_background = () =>
+        viewer.evaluate(() =>
+            getComputedStyle(document.documentElement)
+                .getPropertyValue('--vscode-editor-background')
+                .trim());
+
+    try {
+        for (const [choice, expected] of [
+            ['dark', '#1e1e1e'],
+            ['light', '#ffffff'],
+        ] as const) {
+            await appearance.selectOption(choice);
+            await expect.poll(editor_background, { timeout: 5_000 }).toBe(expected);
+            expect(await app.evaluate(({ nativeTheme }) => nativeTheme.themeSource))
+                .toBe(choice);
+        }
+
+        // Back to System: the palette tracks nativeTheme again.
+        await appearance.selectOption('system');
+        for (const [source, expected] of [['dark', '#1e1e1e'], ['light', '#ffffff']] as const) {
+            await app.evaluate(({ nativeTheme }, value) => {
+                nativeTheme.themeSource = value;
+            }, source);
+            await expect.poll(editor_background, { timeout: 5_000 }).toBe(expected);
+        }
+    } finally {
+        await appearance.selectOption('system');
+        await app.evaluate(({ BrowserWindow, nativeTheme }) => {
+            nativeTheme.themeSource = 'system';
+            BrowserWindow.getAllWindows()
+                .find((window) => window.getTitle().includes('Preferences'))
+                ?.close();
+        });
+    }
+});
+
 // Unsaved CSV edits are durable, so the window only has to *show* that it holds a
 // draft: macOS puts a dot in an edited document's close button, other platforms
 // mark the title. Kept last — it deliberately leaves a draft behind.

@@ -25,7 +25,7 @@ import {
 } from '../../src/json-file-state-store';
 import { DesktopConfigStore, settings_file_path } from './desktop-config';
 import { ViewerWindowManager } from './viewer-windows';
-import { theme_payload } from './theme';
+import { theme_payload, type ThemeSetting } from './theme';
 import { clamp_zoom_level } from './zoom';
 import {
     APP_SCHEME,
@@ -192,7 +192,7 @@ function show_preferences_window(): void {
     }
     prefs_window = new BrowserWindow({
         width: 460,
-        height: 520,
+        height: 600,
         resizable: false,
         minimizable: false,
         maximizable: false,
@@ -384,6 +384,24 @@ function register_ipc(): void {
     });
 }
 
+/** Push the current palette to every window. Viewer windows take it through the
+ *  window manager (it also repaints their native background); the chrome windows
+ *  listen on the theme channel. */
+function broadcast_theme(): void {
+    const payload = theme_payload(nativeTheme.shouldUseDarkColors);
+    viewer_windows?.apply_theme(payload);
+    for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) window.webContents.send(CHANNEL_THEME_CHANGED, payload);
+    }
+}
+
+/** Hand the appearance preference to Electron: `system` restores OS following,
+ *  the other two pin `shouldUseDarkColors`, which is what the whole theming path
+ *  already reads. */
+function apply_theme_source(theme: ThemeSetting): void {
+    nativeTheme.themeSource = theme;
+}
+
 /** Keep the app chrome (welcome and Preferences windows) on the configured
  *  font, matching how the extension's font settings style its entire UI.
  *
@@ -391,11 +409,18 @@ function register_ipc(): void {
  *  preloads listen for this channel, and viewer windows get font changes through
  *  their controller's ConfigPort instead (as a `fontChanged` host message). */
 function watch_settings(): void {
-    config_store.on_change((_previous, next) => {
+    config_store.on_change((previous, next) => {
         for (const window of BrowserWindow.getAllWindows()) {
             if (!window.isDestroyed()) {
                 window.webContents.send(CHANNEL_SETTINGS_CHANGED, next);
             }
+        }
+        if (previous.theme !== next.theme) {
+            apply_theme_source(next.theme);
+            // nativeTheme only emits `updated` when the resolved appearance
+            // actually flips (system → light while already light does not), so
+            // push the palette here rather than relying on that event.
+            broadcast_theme();
         }
     });
 }
@@ -432,17 +457,13 @@ if (!got_lock) {
         config_store = new DesktopConfigStore(
             settings_file_path(app.getPath('userData')),
         );
+        // Before any window is created, so first paint uses the right palette.
+        apply_theme_source(config_store.settings().theme);
         register_app_protocol();
         register_ipc();
         watch_settings();
         build_menu();
-        nativeTheme.on('updated', () => {
-            const payload = theme_payload(nativeTheme.shouldUseDarkColors);
-            viewer_windows?.apply_theme(payload);
-            for (const window of BrowserWindow.getAllWindows()) {
-                window.webContents.send(CHANNEL_THEME_CHANGED, payload);
-            }
-        });
+        nativeTheme.on('updated', broadcast_theme);
         viewer_windows = new ViewerWindowManager(
             create_json_file_state_store(
                 json_state_file_path(app.getPath('userData')),
