@@ -43,6 +43,12 @@ interface ViewerWindow {
     /** Persists a resize still inside its settle window, and cancels it.
      *  A no-op when nothing is pending. */
     readonly flush_size: () => void;
+    /** Bumped on every resize of this window, whatever the mode — 0 until the
+     *  first one. Creation order is not resize order, and the preference is
+     *  about the window the user last *resized*; counting even under `fixed`,
+     *  where no size is recorded at all, is what lets the switch back to
+     *  `match-last` still find that window. */
+    resize_seq: number;
 }
 
 const IS_MAC = process.platform === 'darwin';
@@ -60,6 +66,8 @@ export class ViewerWindowManager {
     /** Open windows in the order they were created (the last one is cascaded
      *  from when the next window opens). */
     private readonly windows: ViewerWindow[] = [];
+    /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
+    private resize_counter = 0;
 
     constructor(
         private readonly state_store: AuthorityFileStateStore,
@@ -187,9 +195,11 @@ export class ViewerWindowManager {
                 cancel_settle();
                 this.remember_size(window, 'live');
             },
+            resize_seq: 0,
         };
         this.windows.push(entry);
         window.on('resize', () => {
+            entry.resize_seq = ++this.resize_counter;
             cancel_settle();
             settle_timer = setTimeout(() => {
                 settle_timer = undefined;
@@ -249,7 +259,7 @@ export class ViewerWindowManager {
         // a file can be opened at any moment — from Finder, or a second launch.
         // Without this the new window would ignore a resize the user has
         // already finished making.
-        for (const entry of this.windows) entry.flush_size();
+        this.flush_pending_sizes();
         const settings = this.config_store.settings();
         const previous = this.windows
             .map((entry) => entry.window)
@@ -273,7 +283,21 @@ export class ViewerWindowManager {
     }
 
     /**
-     * Adopt the size of the window most recently created as the tracked one.
+     * Persist every resize still inside its settle window.
+     *
+     * Ordered by `resize_seq`, not by the array, because the array is in
+     * creation order: with two pending drags, flushing the newer-created window
+     * first would let the older-created one write last and win, even though its
+     * resize came first.
+     */
+    private flush_pending_sizes(): void {
+        for (const entry of [...this.windows].sort((a, b) => a.resize_seq - b.resize_seq)) {
+            entry.flush_size();
+        }
+    }
+
+    /**
+     * Adopt the size of the window the user last resized as the tracked one.
      *
      * For the switch into `match-last`: until that moment resizes were
      * deliberately ignored, so the stored pair is whatever was last typed under
@@ -281,15 +305,20 @@ export class ViewerWindowManager {
      * opened afterwards would still use it.
      */
     adopt_current_size(): void {
-        const window = this.windows
-            .map((entry) => entry.window)
-            .filter((candidate) => !candidate.isDestroyed())
-            .pop();
+        // First, so a pending drag cannot land after the adoption and undo it.
+        this.flush_pending_sizes();
+        const live = this.windows.filter((entry) => !entry.window.isDestroyed());
+        if (live.length === 0) return;
+        // Highest `resize_seq` wins; ties (no window resized yet, all still 0)
+        // fall to the most recently created, which is the best guess available.
+        const target = live.reduce(
+            (best, entry) => (entry.resize_seq >= best.resize_seq ? entry : best),
+        );
         // `restored`, so a window that happens to be minimized or maximized
         // right now still contributes its real size. This is a one-shot with no
         // later event behind it, and the focused window is Preferences, not a
         // viewer holding an open cell editor.
-        if (window) this.remember_size(window, 'restored');
+        this.remember_size(target.window, 'restored');
     }
 
     /**
