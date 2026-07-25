@@ -159,14 +159,37 @@ Each notification costs a map copy, a React re-render, two full
 
 Not only perf: the host's `pendingEditsChanged` handler clears
 `failedSaveTombstone` and calls `retire_save_lifecycle(undefined, 'failed')`
-(`viewer-controller.ts:3568-3571`). So a no-op mutation can retire a failed-save
-lifecycle and drop a tombstone — state changes caused by a write that changed
-nothing. Worth a test either way.
+(`viewer-controller.ts:3566-3568`). None of its three guards blocks a post after
+a *failed* save, so a no-op mutation genuinely can retire a failed-save
+lifecycle — reachable by re-confirming an already-dirty cell without retyping,
+since `commit_edit` compares against the persisted value and so issues an
+identical-value `commit` rather than a `remove`.
+
+**Investigated, and PR 1b does not close that hole** — recorded here so it isn't
+mistaken for done. A failed save produces *two* posts: the `replace_dirty`
+restore (now suppressed, since it restores what the store already holds) and
+`install_edit_session` on `app.tsx`'s failed branch, where `install`
+deliberately force-notifies. So a post still fires and the lifecycle is still
+retired. The honest claim for PR 1b is "removes a redundant duplicate post".
+
+The retire is near-cosmetic on its own. The real harm is upstream and
+pre-existing: with `failed` already retired, `release_edit_session`'s
+`state === 'failed'` check (`:784`) fails, no tombstone is created,
+`ensure_failed_save_cleanup` never runs, and the failed operation's edits —
+persisted by `persist_accepted_save` *before* the disk write — survive into the
+next session. Two follow-ups, both outside PR 1b's file scope: add the
+`save_in_flight` state value to the persistence effect's deps
+(`grid-shell.tsx:682`), and assert in `grid-shell-save.test.ts` that a failed
+save posts `pendingEditsChanged` at most once (would currently fail).
 
 The store is now the single choke point, so one guard in `set_entries` (skip
 `notify` when neither the map contents nor the flag changed) fixes all five
 paths. Cheap and self-contained; scheduled next because it touches only
 `edit-session-store.ts` and so cannot conflict with PR 2's rekey.
+
+Note `clear_saved` has no production consumer (`clear_dirty_saved_edits` in
+`use-editing.ts` is returned but never called), so that one of the five is
+latent rather than live.
 
 ### PR 2 — Source-key edit identity
 
