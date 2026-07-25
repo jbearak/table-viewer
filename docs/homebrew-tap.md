@@ -63,9 +63,8 @@ electron-builder config deliberately leaves `mac.identity` unset — the local
 `npm run desktop:package` scripts pass `-c.mac.identity=null` explicitly, so a
 local build never needs a certificate.
 
-Once builds are notarized, drop the `caveats` block from the cask, the
-`HOMEBREW_CASK_OPTS: --no-quarantine` env from the tap's CI, and the
-quarantine section from the tap README.
+Once builds are notarized, drop the `caveats` block from the cask and the
+first-launch section from the tap README. Nothing in CI needs changing.
 
 ## One-time setup
 
@@ -141,11 +140,14 @@ into a scratch appdir so you don't clobber an app already in `/Applications`
 (e.g. one that `scripts/setup.sh` installed — the cask refuses to overwrite it):
 
 ```sh
-HOMEBREW_CASK_OPTS="--no-quarantine --appdir=/tmp/tv-appdir" \
+HOMEBREW_CASK_OPTS="--appdir=/tmp/tv-appdir" \
   brew install --cask jbearak/table-viewer/table-viewer
+xattr -dr com.apple.quarantine "/tmp/tv-appdir/Table Viewer.app"   # if you want to launch it
 ```
 
-`--appdir` is still a `brew install` flag, but `--no-quarantine` is not:
-Homebrew 6 removed it from the command line, and passing it fails with
-`Error: invalid option`. `HOMEBREW_CASK_OPTS` accepts both, so the one-variable
-form above is the simplest thing that works.
+Don't reach for `--no-quarantine` here. Homebrew 6 removed it from the command
+line (as a flag it fails with `Error: invalid option`), and while
+`HOMEBREW_CASK_OPTS` does still parse it, on Homebrew 6.0.12 it does not
+actually suppress the attribute — installs with and without it both leave
+`com.apple.quarantine` on the app. Strip it afterwards with `xattr -dr`, which
+does work, or just notarize.
