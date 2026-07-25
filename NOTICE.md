@@ -6,7 +6,8 @@ are ports/adaptations of the palettes below into this app's own
 `--vscode-*` variable set (see `desktop/main/theme-definitions.ts`). No upstream
 code is included; only the color values, remapped onto this app's roles.
 
-All three are MIT licensed, which is compatible with GPL-3.0.
+All are MIT licensed except Cyberpunk, whose upstream states two licenses (noted
+in its entry). Every one of them permits this use under GPL-3.0.
 
 - **Solarized** — Copyright (c) 2011 Ethan Schoonover — <https://github.com/altercation/solarized>
   (ported as "Solarized Light" and "Solarized Dark")
@@ -14,12 +15,22 @@ All three are MIT licensed, which is compatible with GPL-3.0.
   (ported as "Catppuccin Latte", "Frappé", "Macchiato", and "Mocha")
 - **SynthWave '84** — Copyright (c) 2019 Robb Owen — <https://github.com/robb0wen/synthwave-vscode>
   (ported as "SynthWave '84")
+- **gruvbox** — Copyright (c) Pavel Pertsev (morhetz) — <https://github.com/morhetz/gruvbox>
+  (ported as "Gruvbox Light Hard/Medium/Soft" and "Gruvbox Dark Hard/Medium/Soft").
+  The palette comes from upstream's `colors/gruvbox.vim`; where a color's *role*
+  in an editor UI needed deciding, the mapping follows the MIT-licensed VS Code
+  port, Copyright (c) 2017 JD (jdinhify) — <https://github.com/jdinhify/vscode-theme-gruvbox>
+- **Cyberpunk** — Copyright (c) Max SS — <https://github.com/prometheux-ar/cyberpunk>
+  (ported as "Cyberpunk" and "Cyberpunk Scarlet Protocol", the latter from
+  upstream's "Activate SCARLET protocol" variant). That project's `package.json`
+  declares MIT while the repository also ships a GPL-3.0 `LICENSE` file; the two
+  disagree, but either grant permits this port, since this app is itself GPL-3.0
+  (see [LICENSE](LICENSE) for the GPL-3.0 text).
 
 ## MIT License
 
-All three notices above are the unmodified MIT license, so its text is
-reproduced once rather than three times — per-project duplication only invites
-drift.
+Every MIT notice above is the unmodified MIT license, so its text is reproduced
+once rather than once per project — per-project duplication only invites drift.
 
 MIT License
 

@@ -480,11 +480,15 @@ describe('theme', () => {
     });
 
     it('lists exactly the light themes for light and the dark ones for dark', () => {
-        expect(list_themes('light').map((t) => t.id))
-            .toEqual(['light', 'solarized-light', 'catppuccin-latte']);
+        expect(list_themes('light').map((t) => t.id)).toEqual([
+            'light', 'solarized-light', 'catppuccin-latte',
+            'gruvbox-light-hard', 'gruvbox-light-medium', 'gruvbox-light-soft',
+        ]);
         expect(list_themes('dark').map((t) => t.id)).toEqual([
             'dark', 'solarized-dark', 'catppuccin-frappe',
-            'catppuccin-macchiato', 'catppuccin-mocha', 'synthwave-84',
+            'catppuccin-macchiato', 'catppuccin-mocha',
+            'gruvbox-dark-hard', 'gruvbox-dark-medium', 'gruvbox-dark-soft',
+            'synthwave-84', 'cyberpunk', 'cyberpunk-scarlet',
         ]);
         // Every id belongs to exactly one kind's list.
         expect(list_themes('light').length + list_themes('dark').length)
@@ -500,6 +504,30 @@ describe('theme', () => {
         for (const value of [undefined, null, '', 'Dark', 'sepia', 7, {}]) {
             expect(sanitize_theme_id(value, 'light')).toBe('light');
             expect(sanitize_theme_id(value, 'dark')).toBe('dark');
+        }
+    });
+
+    // Gruvbox's three contrasts per kind are one palette with bg0 swapped, which
+    // is how upstream defines them. Written as an object spread, so a hex pasted
+    // into the medium palette silently reaches its two siblings — intended — while
+    // a *fourth* difference creeping into one contrast alone is the drift worth
+    // catching. Distinct backgrounds are asserted too: a copy-paste that left two
+    // contrasts on the same bg0 would otherwise ship as two identical themes
+    // under different names.
+    it('varies only the background across each gruvbox kind\'s three contrasts', () => {
+        for (const kind of ['light', 'dark'] as const) {
+            const ids = THEME_IDS.filter((id) => id.startsWith(`gruvbox-${kind}-`));
+            expect(ids).toHaveLength(3);
+            const backgrounds = new Set<string>();
+            for (const id of ids) {
+                const { ['--vscode-editor-background']: bg, ...rest } =
+                    THEME_DEFINITIONS[id].variables;
+                backgrounds.add(bg);
+                const medium = THEME_DEFINITIONS[`gruvbox-${kind}-medium`].variables;
+                const { ['--vscode-editor-background']: _, ...medium_rest } = medium;
+                expect(rest, id).toEqual(medium_rest);
+            }
+            expect(backgrounds.size, `${kind} contrasts differ`).toBe(3);
         }
     });
 
@@ -594,10 +622,12 @@ describe('theme × Glide grid theme', () => {
             dirty.add(tints.dirtyBg);
             conflict.add(tints.conflictBg);
         }
-        // 9 themes, 8 distinct values each: solarized-light and solarized-dark
-        // share one palette, so they share both warning and error colors.
-        expect(dirty.size).toBe(8);
-        expect(conflict.size).toBe(8);
+        // 17 themes, 11 distinct values each. The collisions are all intended
+        // palette sharing: solarized-light and solarized-dark share one palette;
+        // each gruvbox kind's three contrasts differ only in their background;
+        // and the two Cyberpunk variants share their warning and error colors.
+        expect(dirty.size).toBe(11);
+        expect(conflict.size).toBe(11);
         // A typo'd variable name would collapse every theme onto the fallback.
         // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
         // fallback — so only the conflict side can assert non-fallback.)

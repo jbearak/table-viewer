@@ -34,7 +34,15 @@ export type ThemeId =
     | 'catppuccin-frappe'
     | 'catppuccin-macchiato'
     | 'catppuccin-mocha'
-    | 'synthwave-84';
+    | 'synthwave-84'
+    | 'gruvbox-light-hard'
+    | 'gruvbox-light-medium'
+    | 'gruvbox-light-soft'
+    | 'gruvbox-dark-hard'
+    | 'gruvbox-dark-medium'
+    | 'gruvbox-dark-soft'
+    | 'cyberpunk'
+    | 'cyberpunk-scarlet';
 
 export interface ThemeDefinition {
     readonly id: ThemeId;
@@ -48,8 +56,8 @@ export interface ThemeDefinition {
 // --- the two hand-tuned themes ---------------------------------------------
 //
 // HYBRID AUTHORING, DELIBERATE: these two maps are hand-tuned against VS Code's
-// real Dark+/Light+ and are kept verbatim, while the seven ported themes below
-// are generated from a SemanticPalette. Please do not "unify" them.
+// real Dark+/Light+ and are kept verbatim, while the ported themes below are
+// generated from a SemanticPalette. Please do not "unify" them.
 //
 // The hand-tuning carries information a 16-role derivation cannot: e.g.
 // `--vscode-list-activeSelectionBackground: #04395e` is deliberately a
@@ -324,6 +332,148 @@ const SYNTHWAVE_84: SemanticPalette = {
     info: '#36f9f6',        // function token
 };
 
+/* Gruvbox — (c) 2017 Pavel Pertsev, MIT. Palette read from upstream's
+   colors/gruvbox.vim; the role mapping follows the VS Code port
+   (jdinhify/vscode-theme-gruvbox, MIT) where the two disagree.
+
+   The three contrasts differ ONLY in bg0 — that is gruvbox's own design, not a
+   simplification here: `dark0_hard`/`dark0`/`dark0_soft` are three editor
+   backgrounds over one shared set of surface, text, and accent tones. So each
+   kind is written once and the two off-medium contrasts are that palette with
+   `bg` replaced; adding a fourth surface tone to one contrast and not its
+   siblings is exactly the drift this avoids.
+
+   Deviations from the port, both because the port's value is invisible in a
+   dense grid where ours is a gridline rather than a rarely-seen widget edge:
+   - `border` is bg2, not the port's bg1 — bg1 is already `bgAlt` here, so a
+     column header and its separators would be the same color.
+   - `bgElevated` is bg2, not the port's `input.background` = bg0, which is the
+     editor background itself and so cannot read as raised above it.
+   `focusBorder` is likewise not ported: upstream sets it to bg1, which as the
+   grid's current-cell ring would be nearly invisible, so `accent` is gruvbox's
+   blue — the port's own button/link color. */
+const GRUVBOX_DARK_MEDIUM: SemanticPalette = {
+    bg: '#282828',          // dark0
+    bgAlt: '#3c3836',       // dark1
+    bgElevated: '#504945',  // dark2
+    fg: '#ebdbb2',          // light1
+    fgMuted: '#bdae93',     // light3
+    fgSubtle: '#928374',    // gray
+    border: '#504945',      // dark2
+    accent: '#83a598',      // bright_blue
+    accentHover: '#9ab5a8', // hand-lightened bright_blue
+    accentFg: '#1d2021',    // dark0_hard
+    selection: '#665c54',   // dark3
+    hover: '#3c3836',       // dark1
+    link: '#83a598',        // bright_blue
+    error: '#fb4934',       // bright_red
+    warning: '#fabd2f',     // bright_yellow
+    info: '#458588',        // neutral_blue
+};
+
+const GRUVBOX_DARK_HARD: SemanticPalette = { ...GRUVBOX_DARK_MEDIUM, bg: '#1d2021' };
+const GRUVBOX_DARK_SOFT: SemanticPalette = { ...GRUVBOX_DARK_MEDIUM, bg: '#32302f' };
+
+/* Light gruvbox is not the dark palette inverted: upstream swaps its accents to
+   the `faded_*` family (dark enough to read on cream) while keeping the
+   `neutral_*` blue for informational text, so `accent` and `info` differ here in
+   the same way they do above. */
+const GRUVBOX_LIGHT_MEDIUM: SemanticPalette = {
+    bg: '#fbf1c7',          // light0
+    bgAlt: '#ebdbb2',       // light1
+    bgElevated: '#d5c4a1',  // light2
+    fg: '#3c3836',          // dark1
+    fgMuted: '#665c54',     // dark3
+    fgSubtle: '#928374',    // gray
+    border: '#d5c4a1',      // light2
+    accent: '#076678',      // faded_blue
+    accentHover: '#054f5d', // hand-darkened faded_blue
+    accentFg: '#fbf1c7',    // light0
+    selection: '#bdae93',   // light3
+    hover: '#ebdbb2',       // light1
+    link: '#076678',        // faded_blue
+    error: '#9d0006',       // faded_red
+    warning: '#b57614',     // faded_yellow
+    info: '#458588',        // neutral_blue
+};
+
+const GRUVBOX_LIGHT_HARD: SemanticPalette = { ...GRUVBOX_LIGHT_MEDIUM, bg: '#f9f5d7' };
+const GRUVBOX_LIGHT_SOFT: SemanticPalette = { ...GRUVBOX_LIGHT_MEDIUM, bg: '#f2e5bc' };
+
+/* Cyberpunk — (c) Max SS, from themes/cyberpunk-color-theme.json (see NOTICE.md
+   on which license that repo grants).
+
+   Upstream is a purple editor with neon-green text and a cyan-green emphasis
+   color (`badge.background`, `activityBar.foreground`,
+   `editorIndentGuide.activeBackground`, `editorLineNumber.activeForeground` are
+   all #00ffc8), which is what `accent` takes — `focusBorder` is undefined
+   upstream, and the accent draws the grid's current-cell ring. `accentFg` is
+   upstream's own `badge.foreground`, the text it pairs with that cyan.
+
+   One translucent color is flattened onto the editor background (#261d45), since
+   palette values must be opaque 6-digit hex:
+     input.background  #002212ec  →  #032216
+   `warning` is `inputValidation.warningBorder`, not `editorWarning.foreground`
+   #009550: that green already serves as `input.placeholderForeground` here (our
+   `fgSubtle`), and it also tints the find-match highlight, where a dark green
+   over the purple background loses the match.
+   `border` is the one hand-derived color (as `accentHover` is elsewhere):
+   lightened from `bgAlt` toward the Dark+ gridline-to-background ratio, because
+   upstream's border tones are either invisible against the purple background
+   (`editorGroup.border` #1e2c3f) or the neon #00e676 of `panel.border`, which
+   as every gridline in a dense table would fight the text for attention. */
+const CYBERPUNK: SemanticPalette = {
+    bg: '#261d45',          // editor.background
+    bgAlt: '#372963',       // sideBar / tabs background
+    bgElevated: '#032216',  // flattened #002212ec
+    fg: '#00ff9c',          // editor.foreground
+    fgMuted: '#7877b3',     // tab.inactiveForeground
+    fgSubtle: '#009550',    // input.placeholderForeground
+    border: '#47367d',      // hand-lightened sideBar background
+    accent: '#00ffc8',      // badge.background
+    accentHover: '#4dffd8', // hand-lightened cyan
+    accentFg: '#001107',    // badge.foreground
+    selection: '#311b92',   // editor.selectionBackground
+    hover: '#100d23',       // list.hoverBackground
+    link: '#0084ff',        // textLink.foreground
+    error: '#ff3270',       // errorForeground
+    warning: '#ff9100',     // inputValidation.warningBorder
+    info: '#00c3ff',        // inputValidation.infoBorder
+};
+
+/* Cyberpunk Scarlet Protocol — the same extension's scarlet variant (upstream
+   labels it "Activate SCARLET protocol"), from
+   themes/cyberpunk-scarlet-color-theme.json. Near-black surfaces with scarlet
+   text; it shares the cyan `accent`/`warning`/`info` trio with Cyberpunk above,
+   which is upstream's arrangement, not a shortcut.
+
+   Upstream's row tints are scarlet at very low alpha over the editor background
+   (#101116), and `editor.selectionBackground` is pure #000000. Flattened as
+   published, the selected row would be a 1.1:1 fill — invisible in a dense grid
+   — so the same #ff0055 tint is flattened at two weights: upstream's own 0x28
+   for `hover`, and 0x50 for `selection`, which is where a selected row becomes
+   visible while scarlet text on top stays legible.
+     list.activeSelectionBackground  #ff005528  →  #360e20   (hover)
+     ↑ same tint at 0x50             #ff005550  →  #5b0c2a   (selection) */
+const CYBERPUNK_SCARLET: SemanticPalette = {
+    bg: '#101116',          // editor.background
+    bgAlt: '#0a0b0e',       // sideBar.background
+    bgElevated: '#001420',  // input.background
+    fg: '#ff0055',          // editor.foreground
+    fgMuted: '#ff8ba8',     // sideBarSectionHeader.foreground
+    fgSubtle: '#be4e74',    // sideBar.foreground
+    border: '#70243d',      // gitDecoration.ignoredResourceForeground
+    accent: '#00ffc8',      // badge.background
+    accentHover: '#4dffd8', // hand-lightened cyan
+    accentFg: '#000807',    // badge.foreground
+    selection: '#5b0c2a',   // scarlet tint at 0x50
+    hover: '#360e20',       // flattened #ff005528
+    link: '#00ffc8',        // textLink.foreground
+    error: '#ff3270',       // errorForeground
+    warning: '#ff9100',     // inputValidation.warningBorder
+    info: '#00c3ff',        // inputValidation.infoBorder
+};
+
 // --- the registry -----------------------------------------------------------
 
 export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
@@ -335,6 +485,18 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
     'catppuccin-latte': {
         id: 'catppuccin-latte', kind: 'light', label: 'Catppuccin Latte',
         variables: derive_theme_variables(CATPPUCCIN_LATTE),
+    },
+    'gruvbox-light-hard': {
+        id: 'gruvbox-light-hard', kind: 'light', label: 'Gruvbox Light Hard',
+        variables: derive_theme_variables(GRUVBOX_LIGHT_HARD),
+    },
+    'gruvbox-light-medium': {
+        id: 'gruvbox-light-medium', kind: 'light', label: 'Gruvbox Light Medium',
+        variables: derive_theme_variables(GRUVBOX_LIGHT_MEDIUM),
+    },
+    'gruvbox-light-soft': {
+        id: 'gruvbox-light-soft', kind: 'light', label: 'Gruvbox Light Soft',
+        variables: derive_theme_variables(GRUVBOX_LIGHT_SOFT),
     },
     dark: { id: 'dark', kind: 'dark', label: 'Dark', variables: DARK },
     'solarized-dark': {
@@ -353,9 +515,29 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
         id: 'catppuccin-mocha', kind: 'dark', label: 'Catppuccin Mocha',
         variables: derive_theme_variables(CATPPUCCIN_MOCHA),
     },
+    'gruvbox-dark-hard': {
+        id: 'gruvbox-dark-hard', kind: 'dark', label: 'Gruvbox Dark Hard',
+        variables: derive_theme_variables(GRUVBOX_DARK_HARD),
+    },
+    'gruvbox-dark-medium': {
+        id: 'gruvbox-dark-medium', kind: 'dark', label: 'Gruvbox Dark Medium',
+        variables: derive_theme_variables(GRUVBOX_DARK_MEDIUM),
+    },
+    'gruvbox-dark-soft': {
+        id: 'gruvbox-dark-soft', kind: 'dark', label: 'Gruvbox Dark Soft',
+        variables: derive_theme_variables(GRUVBOX_DARK_SOFT),
+    },
     'synthwave-84': {
         id: 'synthwave-84', kind: 'dark', label: "SynthWave '84",
         variables: derive_theme_variables(SYNTHWAVE_84),
+    },
+    cyberpunk: {
+        id: 'cyberpunk', kind: 'dark', label: 'Cyberpunk',
+        variables: derive_theme_variables(CYBERPUNK),
+    },
+    'cyberpunk-scarlet': {
+        id: 'cyberpunk-scarlet', kind: 'dark', label: 'Cyberpunk Scarlet Protocol',
+        variables: derive_theme_variables(CYBERPUNK_SCARLET),
     },
 };
 
