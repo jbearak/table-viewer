@@ -16,6 +16,8 @@ import {
     DEFAULT_WINDOW_WIDTH,
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
+    sanitize_new_window_size_mode,
+    type NewWindowSizeMode,
 } from './window-geometry';
 
 export const SETTINGS_FILE_NAME = 'settings.v1.json';
@@ -40,8 +42,18 @@ export interface DesktopSettings {
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
-    /** Size the last closed viewer window had, so the next one opens like it.
-     *  Written by the app, not the Preferences window. */
+    /** Whether the two sizes below are tracked from the windows the user
+     *  resizes, or typed in the Preferences window. */
+    newWindowSize: NewWindowSizeMode;
+    /** Size a new viewer window opens at. Under `match-last` the app writes
+     *  these as viewer windows are resized and closed; under `fixed` only the
+     *  Preferences window writes them.
+     *
+     *  One pair for both modes, unlike the two theme slots above: going
+     *  `fixed` → `match-last` → `fixed` does lose the typed size, but a size
+     *  is not a choice the way a theme is — the tracked value is a perfectly
+     *  good starting point to re-type from, whereas the theme you had picked
+     *  for the other mode is not recoverable by looking at it. */
     windowWidth: number;
     windowHeight: number;
 }
@@ -65,6 +77,7 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
     maxStoredFiles: 10_000,
+    newWindowSize: 'match-last',
     windowWidth: DEFAULT_WINDOW_WIDTH,
     windowHeight: DEFAULT_WINDOW_HEIGHT,
 });
@@ -102,6 +115,7 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),
         maxStoredFiles: Math.floor(sanitize_number(record.maxStoredFiles, DEFAULT_SETTINGS.maxStoredFiles, 1)),
+        newWindowSize: sanitize_new_window_size_mode(record.newWindowSize),
         windowWidth: Math.round(sanitize_number(
             record.windowWidth,
             DEFAULT_WINDOW_WIDTH,

@@ -8,7 +8,10 @@ Every open file gets its own window (`desktop/main/viewer-windows.ts`), so sprea
 
 With no file open the app shows a small welcome window (`desktop/renderer/welcome.html`), which offers **Open File…** and **Preferences…** (the latter lives in the app menu on macOS and under File elsewhere); **File → New Window** (`Cmd/Ctrl+N`) opens another one, and so does launching the app a second time with no file argument. Opening a file from a welcome window replaces it — a launcher has nothing to show once it has produced a viewer window — while **File → Open…** from a viewer window leaves that window on its own file. `Cmd/Ctrl+W` closes a window; as on any Mac app, closing the last one leaves the app running with just the menu bar (on Windows and Linux it quits).
 
-New windows are placed by `desktop/main/window-geometry.ts`: the first is centered, each further one cascades down and right from the most recent, and every window is clamped to fit the display's work area — including a size remembered from a larger monitor. The last closed window's size is remembered in `settings.v1.json` (`windowWidth` / `windowHeight`, written by the app rather than the Preferences window) so the next window opens like the last one.
+New windows are placed by `desktop/main/window-geometry.ts`: the first is centered, each further one cascades down and right from the most recent, and every window is clamped to fit the display's work area — including a size remembered from a larger monitor. How big a new window is comes from the **New window size** preference:
+
+- **Match last window** (the default) follows the size you last gave a viewer window, picked up from the resize itself, so opening a second file mid-session matches the window you just sized without having to close it first. A maximized or fullscreen window is not followed — that size is a mode, not a preference. This is the native-app convention: window geometry is state the app keeps for you, so the width and height shown in Preferences are a readout rather than fields.
+- **Fixed size** makes the width and height yours to type, and stops the app changing them, so resizing a window afterwards cannot rewrite what you set.
 
 ## Prerequisites
 
@@ -44,6 +47,8 @@ npm run test:desktop-smoke
 ```
 
 Two Playwright Electron specs (`desktop/test-smoke/`) drive the built dev bundle. `desktop-smoke.spec.ts` launches it with a csv and an xlsx fixture and asserts each file opened in its own titled window with its grid rendered, that the windows are independently sized and zoomed, that a column sort applies and clears, that the Edit menu's Copy and Select All reach the grid, and that the Appearance and Color theme preferences repaint the open windows (asserted against CSS custom properties, never rendered pixels — the Glide canvas is not drivable headlessly), and that the About window opens with its version and notice links. `welcome-smoke.spec.ts` launches it with no file and covers the launcher plus File → New Window. They run the real app binary, so they are kept separate from the vitest suite and are not wired into CI (the GitHub Actions Linux runner would need xvfb plus Electron sandbox flags; run it locally on a desktop OS instead).
+
+**Leave the machine alone while it runs.** These specs drive a real app on your real desktop, and the menu-routed commands (Edit → Copy, Select All, View → Zoom) stop reaching the grid once the app is no longer frontmost — so switching to another window mid-run fails the suite. It is not a hermetic test: reproduced deliberately by activating another app on a loop, it fails the very first run, always in one of the focus-dependent tests. Everything that *can* be waited for is (see `click_grid_cell` and `focus_viewer`); frontmost-ness is the part no amount of waiting fixes, since taking focus back would just fight whoever is using the machine.
 
 The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, state store, single-instance lock); the smoke test uses it to isolate each run in a temp directory.
 

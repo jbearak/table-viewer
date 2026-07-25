@@ -16,9 +16,10 @@
   body {
     margin: 0;
     padding: 20px 24px;
-    /* The window is a fixed size but every dimension here scales with the font
-       setting, so at a large app font the last fields would otherwise fall off
-       the bottom — including the font size input, the only way back. */
+    /* The window is a fixed size that the fields outgrow — at the default font
+       already, and by more as the app font grows, since every dimension here
+       scales with it. Without this the last fields would fall off the bottom
+       unreachably, including the font size input, the only way back. */
     box-sizing: border-box;
     height: 100vh;
     overflow-y: auto;
@@ -41,6 +42,12 @@
     color: inherit;
     max-width: 240px;
   }
+  input:disabled { opacity: 0.5; }
+  /* Width and height side by side: they are one setting, and stacking them
+     would push the fields below them off a short window. */
+  .pair { flex-direction: row; gap: 12px; }
+  .pair > div { display: flex; flex-direction: column; gap: 4px; }
+  .pair input { max-width: 100px; }
   #status {
     color: var(--prefs-muted, #717171);
     font-size: calc(var(--prefs-font-size) * 0.92);
@@ -85,6 +92,26 @@
     <option value="vertical">Vertical</option>
   </select>
   <span class="hint">Default placement of worksheet tabs. Can be overridden per file.</span>
+</div>
+<div class="field">
+  <label for="newWindowSize">New window size</label>
+  <select id="newWindowSize">
+    <option value="match-last">Match last window</option>
+    <option value="fixed">Fixed size</option>
+  </select>
+  <!-- Filled in by prefs.ts: which half of this is true depends on the mode. -->
+  <span class="hint" id="newWindowSizeHint"></span>
+</div>
+<div class="field pair">
+  <div>
+    <label for="windowWidth">Width (px)</label>
+    <!-- min/max are set from the geometry constants in prefs.ts. -->
+    <input id="windowWidth" type="number" step="1">
+  </div>
+  <div>
+    <label for="windowHeight">Height (px)</label>
+    <input id="windowHeight" type="number" step="1">
+  </div>
 </div>
 <div class="field">
   <label for="csvMaxRows">Max CSV/TSV rows</label>

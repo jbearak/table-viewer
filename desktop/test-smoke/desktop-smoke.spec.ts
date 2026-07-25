@@ -11,7 +11,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { test, expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { click_menu_item as click_menu, main_js, repo_dir } from './smoke-helpers';
+import {
+    click_menu_item as click_menu,
+    close_preferences,
+    main_js,
+    open_preferences,
+    repo_dir,
+} from './smoke-helpers';
 
 const csv_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.csv');
 const xlsx_fixture = path.join(repo_dir, 'src', 'test', 'fixtures', 'basic.xlsx');
@@ -56,8 +62,8 @@ function window_titles(): Promise<string[]> {
  * each window's title into its own page to pair the two up.
  */
 async function focus_viewer(file_name: string): Promise<Page> {
-    const focused = await app.evaluate(async ({ BrowserWindow }, name) => {
-        let found = false;
+    const target_id = await app.evaluate(async ({ BrowserWindow }, name) => {
+        let id: number | null = null;
         for (const window of BrowserWindow.getAllWindows()) {
             const title = window.getTitle();
             await window.webContents.executeJavaScript(
@@ -66,11 +72,25 @@ async function focus_viewer(file_name: string): Promise<Page> {
             if (title.replace(/^• /, '') !== name) continue;
             window.show();
             window.focus();
-            found = true;
+            id = window.id;
         }
-        return found;
+        return id;
     }, file_name);
-    expect(focused, `window for ${file_name} exists`).toBe(true);
+    expect(target_id, `window for ${file_name} exists`).not.toBeNull();
+
+    // Focus lands asynchronously, and the Edit and View menu commands route on
+    // `BrowserWindow.getFocusedWindow()` (see `route_edit_command`). Acting
+    // before it arrives sends them to whichever window still holds it, where
+    // the native fallback silently does nothing to a canvas grid — which is how
+    // these tests failed under load, several assertions later.
+    await expect
+        .poll(
+            () => app.evaluate(
+                ({ BrowserWindow }) => BrowserWindow.getFocusedWindow()?.id ?? null,
+            ),
+            { timeout: 15_000 },
+        )
+        .toBe(target_id);
 
     for (const page of viewer_pages()) {
         const title = await page.evaluate(
@@ -85,6 +105,32 @@ async function focus_viewer(file_name: string): Promise<Page> {
 
 const click_menu_item = (menu_label: string, item_label: string) =>
     click_menu(app, menu_label, item_label);
+
+/**
+ * Click the grid cell at `offset` and wait for the grid to agree it is selected.
+ *
+ * The grid draws to a canvas, so a click is a raw coordinate — and a coordinate
+ * only means a cell once the data has laid out. Glide also mirrors the grid into
+ * a hidden accessibility table, which is what makes both halves of that possible
+ * to wait for: `#glide-cell-<col>-<row>` exists once the row is laid out, and
+ * carries `aria-selected` once it is picked.
+ *
+ * Without the first wait a click can land on the header instead, and without the
+ * second nothing distinguishes that from a click that worked — the keystrokes
+ * that follow simply go nowhere, which is how these tests used to fail under
+ * load.
+ */
+async function click_grid_cell(
+    page: Page,
+    cell: { column: number; row: number },
+    offset: { x: number; y: number },
+): Promise<void> {
+    const target = page.locator(`#glide-cell-${cell.column}-${cell.row}`);
+    await target.waitFor({ state: 'attached' });
+    const box = (await page.locator(GRID_CANVAS).first().boundingBox())!;
+    await page.mouse.click(box.x + offset.x, box.y + offset.y);
+    await expect(target).toHaveAttribute('aria-selected', 'true');
+}
 
 test.beforeAll(async () => {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
@@ -138,6 +184,15 @@ test('windows are separately sized and positioned', async () => {
         BrowserWindow.getAllWindows().map((window) => window.getBounds()));
     expect([after[0].width, after[0].height]).toEqual([700, 500]);
     expect(after[1].width).toBe(bounds[1].width);
+
+    // Under the default `match-last`, that resize is what the next window will
+    // open at — tracked from the resize itself, without waiting for a close.
+    await expect.poll(() => {
+        const file = path.join(user_data_dir, 'settings.v1.json');
+        if (!fs.existsSync(file)) return null;
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return [settings.windowWidth, settings.windowHeight];
+    }, { timeout: 15_000 }).toEqual([700, 500]);
 });
 
 // Opening a file that is already open must focus its window, not load the file a
@@ -165,12 +220,10 @@ test('reopening an open file focuses its window instead of duplicating it', asyn
 // focused viewer window instead; this guards that wiring end to end.
 test('Edit menu Copy and Select All act on the grid', async () => {
     const page = await focus_viewer('basic.csv');
-    const canvas = page.locator(GRID_CANVAS).first();
     await app.evaluate(({ clipboard }) => clipboard.writeText('untouched'));
 
     // Select the first body cell, then copy it through the menu.
-    const box = (await canvas.boundingBox())!;
-    await page.mouse.click(box.x + 120, box.y + 50);
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await click_menu_item('Edit', 'Copy');
     await expect
         .poll(() => app.evaluate(({ clipboard }) => clipboard.readText()), { timeout: 5_000 })
@@ -186,17 +239,11 @@ test('Edit menu Copy and Select All act on the grid', async () => {
 
 test('sorting a column shows a sort chip', async () => {
     const page = await focus_viewer('basic.csv');
-    const canvas = page.locator(GRID_CANVAS).first();
 
     // Focus a data cell (past the row-marker gutter and the header row), then
     // sort the focused column ascending via the keyboard shortcut. Glide
     // overlays a scroller element on the canvas, so click via raw coordinates.
-    const box = await canvas.boundingBox();
-    expect(box).toBeTruthy();
-    await page.mouse.click(
-        box!.x + Math.min(140, box!.width - 10),
-        box!.y + Math.min(60, box!.height - 10),
-    );
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await page.keyboard.press('Shift+Alt+A');
 
     await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
@@ -269,21 +316,7 @@ test('the appearance preference pins light/dark, and System restores OS followin
     expect(viewer).toBeTruthy();
     await viewer.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
 
-    // Preferences… lives on the app menu on macOS and under File elsewhere.
-    const opened = await app.evaluate(({ BrowserWindow, Menu }) => {
-        for (const menu of Menu.getApplicationMenu()?.items ?? []) {
-            const item = menu.submenu?.items.find((entry) => entry.label === 'Preferences…');
-            if (!item?.click) continue;
-            item.click(item, BrowserWindow.getFocusedWindow() ?? undefined, {});
-            return true;
-        }
-        return false;
-    });
-    expect(opened, 'a Preferences… menu item exists').toBe(true);
-
-    const prefs_page = () => app.windows().find((page) => page.url().endsWith('prefs.html'));
-    await expect.poll(prefs_page, { timeout: 15_000 }).toBeTruthy();
-    const prefs = prefs_page()!;
+    const prefs = await open_preferences(app);
     const appearance = prefs.locator('#theme');
     const color_theme = prefs.locator('#colorTheme');
     await expect(appearance).toHaveValue('system');
@@ -353,12 +386,53 @@ test('the appearance preference pins light/dark, and System restores OS followin
         }
     } finally {
         await appearance.selectOption('system');
-        await app.evaluate(({ BrowserWindow, nativeTheme }) => {
+        await app.evaluate(({ nativeTheme }) => {
             nativeTheme.themeSource = 'system';
-            BrowserWindow.getAllWindows()
-                .find((window) => window.getTitle().includes('Preferences'))
-                ?.close();
         });
+        await close_preferences(app);
+    }
+});
+
+// Switching to Match last window has to adopt whatever is on screen: while Fixed
+// size was selected the app deliberately ignored every resize, so without this
+// the stored size is the number last typed, and the first window opened after
+// the switch would still use it.
+test('switching to Match last window adopts the current window size', async () => {
+    const settings = () => {
+        const file = path.join(user_data_dir, 'settings.v1.json');
+        if (!fs.existsSync(file)) return null;
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return [parsed.newWindowSize, parsed.windowWidth, parsed.windowHeight];
+    };
+    const prefs = await open_preferences(app);
+    try {
+        await prefs.selectOption('#newWindowSize', 'fixed');
+        for (const [field, value] of [['#windowWidth', '820'], ['#windowHeight', '560']]) {
+            await prefs.fill(field, value);
+            await prefs.locator(field).blur();
+        }
+        await expect.poll(settings, { timeout: 15_000 }).toEqual(['fixed', 820, 560]);
+
+        // Resizing under Fixed size must leave the typed numbers alone. The
+        // most recently opened viewer, since that is the one the switch below
+        // adopts from.
+        await app.evaluate(({ BrowserWindow }) => {
+            BrowserWindow.getAllWindows()
+                .find((window) => window.getTitle().includes('basic.xlsx'))
+                ?.setBounds({ x: 60, y: 60, width: 640, height: 480 });
+        });
+        await prefs.waitForTimeout(1_000);
+        expect(settings()).toEqual(['fixed', 820, 560]);
+
+        // Switching back adopts the window that was resized in the meantime —
+        // in the file and in the readout, which must not be left showing the
+        // size the switch replaced.
+        await prefs.selectOption('#newWindowSize', 'match-last');
+        await expect.poll(settings, { timeout: 15_000 }).toEqual(['match-last', 640, 480]);
+        await expect(prefs.locator('#windowWidth')).toHaveValue('640');
+        await expect(prefs.locator('#windowHeight')).toHaveValue('480');
+    } finally {
+        await close_preferences(app);
     }
 });
 
@@ -422,9 +496,7 @@ test('a window holding unsaved edits is marked as edited', async () => {
 
     // Type into the first body cell and commit it. The first keystroke opens the
     // overwrite editor and is consumed, so the cell ends up holding "licia".
-    const canvas = page.locator(GRID_CANVAS).first();
-    const box = (await canvas.boundingBox())!;
-    await page.mouse.click(box.x + 120, box.y + 50);
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
     await page.keyboard.type('Alicia');
     await page.keyboard.press('Enter');
     // The toolbar marks its own unsaved state; wait for the page to agree a draft

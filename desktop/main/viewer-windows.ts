@@ -31,6 +31,7 @@ import {
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
     next_window_bounds,
+    type WindowSize,
 } from './window-geometry';
 
 interface ViewerWindow {
@@ -40,9 +41,23 @@ interface ViewerWindow {
     readonly controller: Disposable;
     /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
     readonly stop_watching_dirty: () => void;
+    /** Persists a resize still inside its settle window, and cancels it.
+     *  A no-op when nothing is pending. */
+    readonly flush_size: () => void;
+    /** Bumped on every resize of this window, whatever the mode — 0 until the
+     *  first one. Creation order is not resize order, and the preference is
+     *  about the window the user last *resized*; counting even under `fixed`,
+     *  where no size is recorded at all, is what lets the switch back to
+     *  `match-last` still find that window. */
+    resize_seq: number;
 }
 
 const IS_MAC = process.platform === 'darwin';
+
+/** How long a drag has to settle before the new size is persisted. A resize
+ *  fires continuously, and each write is a synchronous rewrite of the settings
+ *  file. */
+const RESIZE_SETTLE_MS = 250;
 
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
  *  closed window's zoom level is not inherited by the next one. */
@@ -52,6 +67,11 @@ export class ViewerWindowManager {
     /** Open windows in the order they were created (the last one is cascaded
      *  from when the next window opens). */
     private readonly windows: ViewerWindow[] = [];
+    /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
+    private resize_counter = 0;
+    /** The sequence behind the size currently stored, so a write from an older
+     *  resize arriving late (see `store_size`) can be recognized and dropped. */
+    private last_stored_seq = 0;
 
     constructor(
         private readonly state_store: AuthorityFileStateStore,
@@ -159,6 +179,21 @@ export class ViewerWindowManager {
             this.viewer_host(window),
         );
 
+        // Track the size as the user drags, not only on close: opening a second
+        // file without closing the first should still match the size just set.
+        let settle_timer: ReturnType<typeof setTimeout> | undefined;
+        /** A resize waiting out the settle window, with the sequence it had —
+         *  `store_size` needs the latter to reject it if something newer has
+         *  been recorded in the meantime. */
+        let pending: { size: WindowSize; seq: number } | undefined;
+        /** The last size this window was seen at, so a `resize` that does not
+         *  actually change the size can be told apart from one that does. */
+        let last_size: WindowSize = window.getBounds();
+        const cancel_settle = () => {
+            if (settle_timer) clearTimeout(settle_timer);
+            settle_timer = undefined;
+        };
+
         const entry: ViewerWindow = {
             fileKey: file_key,
             window,
@@ -166,11 +201,46 @@ export class ViewerWindowManager {
             controller,
             stop_watching_dirty: () =>
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
+            flush_size: () => {
+                if (!pending) return;
+                cancel_settle();
+                const { size, seq } = pending;
+                pending = undefined;
+                this.store_size(size, seq);
+            },
+            resize_seq: 0,
         };
         this.windows.push(entry);
-        // 'close' still has live bounds to remember; 'closed' is where the
-        // controller and its subscriptions go away.
-        window.on('close', () => this.remember_size(window));
+        window.on('resize', () => {
+            // Maximizing, going fullscreen and minimizing all fire this on some
+            // platforms. None of them is the user choosing a size, so they must
+            // not count as one — neither recorded, nor allowed to make this the
+            // most recently resized window.
+            if (window.isMaximized() || window.isFullScreen() || window.isMinimized()) return;
+            const bounds = window.getBounds();
+            // Nor is landing back on the size this window already had, which is
+            // what *restoring* from those states does — by then the flags above
+            // have cleared, so the size is the only thing left to tell the two
+            // apart. Also covers the events a window emits as it is created.
+            if (bounds.width === last_size.width && bounds.height === last_size.height) return;
+            last_size = { width: bounds.width, height: bounds.height };
+            entry.resize_seq = ++this.resize_counter;
+            // Measured now rather than when the timer fires: the user can
+            // maximize or minimize inside the settle window, and the size they
+            // just dragged to would be unreadable by then. The debounce is only
+            // about how often it is written.
+            pending = { size: last_size, seq: entry.resize_seq };
+            cancel_settle();
+            settle_timer = setTimeout(() => {
+                settle_timer = undefined;
+                entry.flush_size();
+            }, RESIZE_SETTLE_MS);
+        });
+        // Only a drag that has not settled yet: a window closing is not itself
+        // a size the user chose, and recording it would overwrite the size they
+        // did choose in some other window. 'closed' is where the controller and
+        // its subscriptions go away.
+        window.on('close', () => entry.flush_size());
         window.once('closed', () => this.teardown(entry));
         // Closing the window mid-load aborts the navigation, which rejects; an
         // unhandled rejection in the main process is fatal, so swallow it.
@@ -214,6 +284,11 @@ export class ViewerWindowManager {
     }
 
     private bounds_for_new_window() {
+        // A drag still inside its settle window has not been persisted yet, and
+        // a file can be opened at any moment — from Finder, or a second launch.
+        // Without this the new window would ignore a resize the user has
+        // already finished making.
+        this.flush_pending_sizes();
         const settings = this.config_store.settings();
         const previous = this.windows
             .map((entry) => entry.window)
@@ -224,6 +299,11 @@ export class ViewerWindowManager {
             ? screen.getDisplayMatching(previous_bounds)
             : screen.getPrimaryDisplay()
         ).workArea;
+        // The stored pair, never `previous_bounds`: `previous` is the most
+        // recently *created* window, which is not the most recently *resized*
+        // one. Sizing from it would contradict both what is tracked and what
+        // Preferences shows the moment the user resizes any other window.
+        // `previous_bounds` is for the cascade placement only.
         return next_window_bounds(
             work_area,
             { width: settings.windowWidth, height: settings.windowHeight },
@@ -231,16 +311,69 @@ export class ViewerWindowManager {
         );
     }
 
-    /** Remember this window's size so the next one opens at the same size. */
-    private remember_size(window: BrowserWindow): void {
-        if (window.isDestroyed()) return;
-        const { width, height } = window.getNormalBounds();
+    /** Persist every resize still inside its settle window. Order does not
+     *  matter: each carries the sequence `store_size` ranks it by. */
+    private flush_pending_sizes(): void {
+        for (const entry of this.windows) entry.flush_size();
+    }
+
+    /**
+     * Adopt the size of the window the user last resized as the tracked one.
+     *
+     * For the switch into `match-last`: until that moment resizes were
+     * deliberately ignored, so the stored pair is whatever was last typed under
+     * `fixed` rather than any window's size, and without this the first window
+     * opened afterwards would still use it.
+     */
+    adopt_current_size(): void {
+        // First, so this reads a window whose pending drag has been accounted
+        // for rather than racing it.
+        this.flush_pending_sizes();
+        const live = this.windows.filter((entry) => !entry.window.isDestroyed());
+        if (live.length === 0) return;
+        // Highest `resize_seq` wins; ties (no window resized yet, all still 0)
+        // fall to the most recently created, which is the best guess available.
+        const target = live.reduce(
+            (best, entry) => (entry.resize_seq >= best.resize_seq ? entry : best),
+        );
+        // getNormalBounds, so a window that is minimized or maximized right now
+        // still contributes its real size — this is a one-shot with no later
+        // event behind it. Safe here, unlike on the resize path: the focused
+        // window is Preferences, not a viewer holding an open cell editor.
+        //
+        // A fresh sequence: the user asking for this mode is the newest word on
+        // the subject, and outranks any resize still in flight.
+        this.store_size(target.window.getNormalBounds(), ++this.resize_counter);
+    }
+
+    /**
+     * Record `size` as what a new window should open at — the `match-last` half
+     * of the new-window-size preference.
+     *
+     * Takes a size rather than a window because its callers measure at
+     * different moments: the resize path samples during the drag and hands the
+     * value over the debounce, so that a maximize or minimize before the timer
+     * fires cannot make the size the user just chose unreadable.
+     *
+     * `seq` is which resize it came from, and the last one recorded wins
+     * regardless of arrival order. Debounced writes from different windows are
+     * genuinely concurrent — closing the window resized second flushes only its
+     * own pending write, leaving the first window's older one to land after —
+     * so recency has to be carried with the value rather than inferred from
+     * when it shows up.
+     */
+    private store_size({ width, height }: WindowSize, seq: number): void {
+        if (seq < this.last_stored_seq) return;
+        this.last_stored_seq = seq;
         const settings = this.config_store.settings();
+        // Under `fixed` the stored size is the user's typed preference, so
+        // dragging a window must not quietly overwrite it.
+        if (settings.newWindowSize === 'fixed') return;
         if (settings.windowWidth === width && settings.windowHeight === height) return;
         try {
             this.config_store.update({ windowWidth: width, windowHeight: height });
         } catch (error) {
-            // Best-effort convenience: this runs inside the window's 'close'
+            // Best-effort convenience: one caller is the window's 'close'
             // handler, where an unwritable userData directory would otherwise
             // take down the whole app on the way out.
             console.error('Failed to remember the window size', error);

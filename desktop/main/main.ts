@@ -543,6 +543,14 @@ function watch_settings(): void {
         // A change to the *inactive* slot broadcasts harmlessly: broadcast_theme
         // recomputes current_theme_id(), which is unchanged in that case.
         if (appearance_changed || palette_changed) broadcast_theme();
+        if (previous.newWindowSize === 'fixed' && next.newWindowSize === 'match-last') {
+            // Deferred, because adopting a size writes settings, and a write
+            // from inside a change listener notifies before this one finishes:
+            // the stale `next` above would then be the *last* payload every
+            // window received, leaving Preferences showing the size just
+            // replaced.
+            setImmediate(() => viewer_windows?.adopt_current_size());
+        }
     });
 }
 
