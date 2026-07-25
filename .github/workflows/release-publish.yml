@@ -118,6 +118,16 @@ jobs:
             echo "::warning::No desktop-${THE_TAG} artifact; publishing without the macOS app and skipping the Homebrew bump."
           fi
 
+          # Same story for the Windows exes, in their own directory for the same
+          # reason. Nothing downstream depends on them beyond being attached to
+          # the release, so a missing artifact is a warning, not a failure.
+          if gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist; then
+            echo "windows=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app."
+          fi
+
       - name: Verify checksums
         shell: bash
         run: |
@@ -125,6 +135,9 @@ jobs:
           sha256sum -c table-viewer-*.vsix.sha256
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
             (cd desktop-dist && sha256sum -c ./*.sha256)
+          fi
+          if [[ "${{ steps.artifacts.outputs.windows }}" == "true" ]]; then
+            (cd windows-dist && sha256sum -c ./*.sha256)
           fi
 
       - name: Install publish tools
@@ -157,6 +170,8 @@ jobs:
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
             desktop-dist/*.sha256
+            windows-dist/table-viewer-*.exe
+            windows-dist/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

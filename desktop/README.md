@@ -36,12 +36,26 @@ Both pass `-c.mac.identity=null`, so they never need a certificate. Gatekeeper w
 
 `npm run desktop:package:release` is the same build *without* those overrides: it signs if a Developer ID certificate is available. CI uses it, and signs + notarizes once the Apple secrets are set — see [docs/homebrew-tap.md](../docs/homebrew-tap.md#signing).
 
+## Packaging (Windows)
+
+```sh
+npm run desktop:package:win   # setup + portable exe, x64 + arm64
+```
+
+Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling. The release workflow therefore has a separate `desktop-windows` job on a `windows-latest` runner; it invokes exactly this script.
+
+Four exes land in `dist/desktop-packages/`: `table-viewer-<version>-<arch>-setup.exe` and `table-viewer-<version>-<arch>-portable.exe` for each of `x64` and `arm64`. The per-target `artifactName` overrides in `electron-builder.yml` exist because both targets emit `.exe` and would otherwise collide on the shared name, and `nsis.buildUniversalInstaller: false` is what splits the installer per architecture instead of shipping one that carries both payloads.
+
+File associations on Windows are registered by `desktop/installer.nsh` (wired in via `nsis.include`), not by electron-builder's `fileAssociations`. The generated ones write the *default* value of `HKCU\Software\Classes\.csv` — which is how Windows records the default program — so installing would have taken `.xlsx` from Excel. The hand-written version writes a vendor-prefixed ProgID plus an `OpenWithProgids` entry instead, so the app shows up in "Open with…" and the user's default is untouched. This is also why `fileAssociations` is scoped under `mac:` in the config: electron-builder concatenates the root and per-platform lists, so a top-level entry cannot be kept away from Windows.
+
+Windows builds are always unsigned: there is no Authenticode certificate, so nothing in the config or the workflow attempts signing, and CI pins `CSC_IDENTITY_AUTO_DISCOVERY=false` so a certificate sitting in a runner's store can't quietly change the artifact. SmartScreen shows "Windows protected your PC" on first run; the README tells users to click More info → Run anyway.
+
 The config lives in `desktop/electron-builder.yml`:
 
 - File associations declare the app as *a* handler for `csv`/`tsv`/`xlsx`/`xls` (`rank: Alternate`) so it appears in "Open with…" without claiming default-handler status.
 - The app bundle contains only the esbuild outputs (`dist/desktop`, `dist/webview`) plus `package.json` — no `node_modules`.
 - `artifactName` names the dmg/zip `table-viewer-<version>-<arch>` rather than after `productName`, which has a space — those filenames are part of the download URL the Homebrew cask pins.
-- License notices for the GPL-3.0 app are shipped in `Contents/Resources`: `LICENSE.txt` (Table Viewer), `THIRD_PARTY_NOTICES.txt` (generated from the production npm dependency closure by `desktop/collect-licenses.mjs`), `LICENSE.electron.txt`, and `LICENSES.chromium.html`. The `afterPack` hook (`desktop/after-pack.mjs`) asserts all four are present and non-empty in the packaged app, because a missing `extraResources` source is only a *warning* in electron-builder — a half-installed `node_modules/electron` otherwise yields a normal-looking dmg with the Electron/Chromium attributions silently absent.
+- License notices for the GPL-3.0 app are shipped in the packaged app's resources directory (`Contents/Resources` on macOS, `resources/` on Windows): `LICENSE.txt` (Table Viewer), `THIRD_PARTY_NOTICES.txt` (generated from the production npm dependency closure by `desktop/collect-licenses.mjs`), `LICENSE.electron.txt`, and `LICENSES.chromium.html`. The `afterPack` hook (`desktop/after-pack.mjs`) asserts all four are present and non-empty in the packaged app, because a missing `extraResources` source is only a *warning* in electron-builder — a half-installed `node_modules/electron` otherwise yields a normal-looking dmg or installer with the Electron/Chromium attributions silently absent.
 
 ## Smoke test
 

@@ -1,9 +1,11 @@
 # electron-builder configuration for the standalone Table Viewer app.
 #
-# Build with: npm run desktop:package (dmg + zip) or npm run
-# desktop:package:dir (unpacked .app for quick local verification).
+# Build with: npm run desktop:package (macOS dmg + zip), npm run
+# desktop:package:dir (unpacked .app for quick local verification), or npm run
+# desktop:package:win (Windows setup + portable .exe). Each target must be
+# built on its own OS, so the release workflow uses one runner per platform.
 #
-# Signing is deliberately NOT pinned here. This file leaves mac.identity
+# macOS signing is deliberately NOT pinned here. This file leaves mac.identity
 # unset, which is electron-builder's "sign if a Developer ID certificate is
 # available" mode, so the release workflow only has to supply CSC_LINK /
 # CSC_KEY_PASSWORD to get a signed build and needs no cert name in config.
@@ -51,32 +53,39 @@ extraMetadata:
   main: dist/desktop/main.js
 # Nothing native to rebuild (bundles are pure JS); skip the npm rebuild step.
 npmRebuild: false
-# Declare the app as *a* handler for table files so it appears in
-# Finder/Explorer "Open with…" menus. role/rank deliberately avoid claiming
-# OS default-handler status.
-fileAssociations:
-  - ext: csv
-    name: CSV
-    description: Comma-separated values
-    role: Editor
-    rank: Alternate
-  - ext: tsv
-    name: TSV
-    description: Tab-separated values
-    role: Editor
-    rank: Alternate
-  - ext: xlsx
-    name: Excel Workbook
-    description: Excel workbook
-    role: Viewer
-    rank: Alternate
-  - ext: xls
-    name: Excel 97-2003 Workbook
-    description: Legacy Excel workbook
-    role: Viewer
-    rank: Alternate
 mac:
   category: public.app-category.productivity
+  # Declare the app as *a* handler for table files so it appears in Finder's
+  # "Open with…" menu. role/rank deliberately avoid claiming OS
+  # default-handler status.
+  #
+  # Scoped to `mac` rather than declared at the top level because
+  # electron-builder *concatenates* the root and per-platform lists — a
+  # top-level entry reaches every platform and cannot be overridden per
+  # platform. Windows must not use these: `rank`/`role` are macOS-only, and
+  # electron-builder's NSIS association macro seizes the default handler.
+  # Windows registers its own, correctly, in desktop/installer.nsh.
+  fileAssociations:
+    - ext: csv
+      name: CSV
+      description: Comma-separated values
+      role: Editor
+      rank: Alternate
+    - ext: tsv
+      name: TSV
+      description: Tab-separated values
+      role: Editor
+      rank: Alternate
+    - ext: xlsx
+      name: Excel Workbook
+      description: Excel workbook
+      role: Viewer
+      rank: Alternate
+    - ext: xls
+      name: Excel 97-2003 Workbook
+      description: Legacy Excel workbook
+      role: Viewer
+      rank: Alternate
   # 1024x1024 master; electron-builder generates the .icns slices at package
   # time. This is also the auto-detected default path — explicit for clarity.
   icon: build/icon.png
@@ -90,3 +99,55 @@ mac:
   target:
     - dmg
     - zip
+# Windows ships unsigned: an Authenticode certificate is a recurring paid
+# subscription we have chosen not to buy, so SmartScreen shows its
+# "Windows protected your PC" interstitial on first run and the user clicks
+# More info -> Run anyway. Nothing in this config or the release workflow
+# tries to sign, and CSC_IDENTITY_AUTO_DISCOVERY is pinned off in CI so a
+# stray certificate in a runner's store can't silently change the artifact.
+win:
+  # Same 1024x1024 master as macOS; electron-builder renders the .ico slices.
+  icon: build/icon.png
+  target:
+    # Two shapes, because Windows has no single convention: the NSIS installer
+    # for people who want Start Menu + "Open with…" + an uninstaller entry, and
+    # the portable single .exe for locked-down machines that can't install.
+    - target: nsis
+      arch:
+        - x64
+        - arm64
+    - target: portable
+      arch:
+        - x64
+        - arm64
+nsis:
+  # An assisted (wizard) installer rather than the one-click default.
+  #
+  # oneClick: false + perMachine: false is electron-builder's "show the install
+  # mode page" combination: the user picks between installing just for
+  # themselves (%LOCALAPPDATA%, no UAC) and for all users (Program Files, UAC
+  # prompt). Per-user is the default selection, so nobody is *forced* to
+  # elevate for an unsigned binary already fighting SmartScreen, but the
+  # all-users option stays available for machine-wide deployments.
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: Table Viewer
+  # File-type registration, hand-written because electron-builder's generated
+  # associations would hijack the user's default handler for .csv/.xlsx. See
+  # the file for the full explanation.
+  include: desktop/installer.nsh
+  # Default is a single installer carrying both architectures. Build one per
+  # arch instead so the download matches the ${arch} in artifactName and an
+  # arm64 laptop isn't made to download the x64 payload it won't run.
+  buildUniversalInstaller: false
+  # There is no auto-update channel, so the .blockmap files electron-builder
+  # otherwise emits next to each installer are unused weight on the release page.
+  differentialPackage: false
+  # nsis and portable are both `.exe`, so the shared artifactName above would
+  # have them overwrite each other. Disambiguate per target.
+  artifactName: table-viewer-${version}-${arch}-setup.${ext}
+portable:
+  # Same reasoning as nsis above: one exe per arch, not a combined one.
+  buildUniversalInstaller: false
+  artifactName: table-viewer-${version}-${arch}-portable.${ext}
