@@ -2596,9 +2596,15 @@ export function attach_viewer(
             let final_stat: FileStat;
             try {
                 final_stat = await host.fs.stat(uri);
-            } catch {
+            } catch (error) {
                 // A file that cannot be stat'ed right before the write is a race,
-                // not a save bug: refuse rather than clobbering blind.
+                // not a save bug: refuse rather than clobbering blind. The user
+                // sees the external-change warning, so log the real cause to keep
+                // a genuine filesystem fault (EACCES, EBUSY, quota) diagnosable.
+                console.error('Pre-write stat failed before saving', error);
+                // Check currency first, matching the mismatch path below: a save
+                // already superseded during the stat must not emit a warning.
+                if (!save_operation_is_current(operation)) return;
                 await refuse_as_external_change();
                 return;
             }
