@@ -242,11 +242,16 @@ export class ViewerWindowManager {
             ? screen.getDisplayMatching(previous_bounds)
             : screen.getPrimaryDisplay()
         ).workArea;
-        return next_window_bounds(
-            work_area,
-            { width: settings.windowWidth, height: settings.windowHeight },
-            previous_bounds,
-        );
+        // Under `match-last` the window on screen *is* the last window, so read
+        // it rather than the stored pair, which is only the fallback for when
+        // none is open — the first window of a session. Reading it directly is
+        // also what keeps the two honest: a drag whose settle timer has not
+        // fired yet, or one made while the preference was still `fixed`, is
+        // already reflected here.
+        const preferred = settings.newWindowSize === 'match-last' && previous_bounds
+            ? previous_bounds
+            : { width: settings.windowWidth, height: settings.windowHeight };
+        return next_window_bounds(work_area, preferred, previous_bounds);
     }
 
     /**

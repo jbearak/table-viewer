@@ -8,10 +8,10 @@ Every open file gets its own window (`desktop/main/viewer-windows.ts`), so sprea
 
 With no file open the app shows a small welcome window (`desktop/renderer/welcome.html`), which offers **Open File…** and **Preferences…** (the latter lives in the app menu on macOS and under File elsewhere); **File → New Window** (`Cmd/Ctrl+N`) opens another one, and so does launching the app a second time with no file argument. Opening a file from a welcome window replaces it — a launcher has nothing to show once it has produced a viewer window — while **File → Open…** from a viewer window leaves that window on its own file. `Cmd/Ctrl+W` closes a window; as on any Mac app, closing the last one leaves the app running with just the menu bar (on Windows and Linux it quits).
 
-New windows are placed by `desktop/main/window-geometry.ts`: the first is centered, each further one cascades down and right from the most recent, and every window is clamped to fit the display's work area — including a size remembered from a larger monitor. The size itself comes from `windowWidth` / `windowHeight` in `settings.v1.json`, and the **New window size** preference decides who writes them:
+New windows are placed by `desktop/main/window-geometry.ts`: the first is centered, each further one cascades down and right from the most recent, and every window is clamped to fit the display's work area — including a size remembered from a larger monitor. How big a new window is comes from the **New window size** preference:
 
-- `match-last` (the default) has the app track them silently, both as a viewer window is resized (debounced) and as one closes — so a new window matches the last window you sized, even without closing it first. Maximized and fullscreen windows are not tracked: that size is a mode, not a preference. This is the native-app convention — window geometry is window state, so the Preferences fields are a disabled readout of what is being tracked.
-- `fixed` makes the two numbers something the user types, and stops the app writing them, so a stray drag cannot rewrite what was typed.
+- **Match last window** (the default) follows the size you last gave a viewer window, picked up as you resize rather than only when you close, so opening a second file mid-session matches the window already on screen. A maximized or fullscreen window is not followed — that size is a mode, not a preference. This is the native-app convention: window geometry is state the app keeps for you, so the width and height shown in Preferences are a readout rather than fields.
+- **Fixed size** makes the width and height yours to type, and stops the app changing them, so resizing a window afterwards cannot rewrite what you set.
 
 ## Prerequisites
 
