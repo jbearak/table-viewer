@@ -1,6 +1,6 @@
 // Build script for the desktop (Electron) bundles. Produces dist/desktop/*
 // alongside the extension's dist/extension.js and dist/webview/* — the viewer
-// tabs reuse the existing dist/webview bundle (npm run bundle:webview).
+// windows reuse the existing dist/webview bundle (npm run bundle:webview).
 //
 // Deliberately separate entry points from the extension build so the `vscode`
 // module never enters a desktop bundle (only `electron` stays external).
@@ -37,12 +37,12 @@ await build({
     ...node_common,
     entryPoints: [
         join(desktop_dir, 'preload', 'viewer-preload.ts'),
-        join(desktop_dir, 'preload', 'shell-preload.ts'),
+        join(desktop_dir, 'preload', 'welcome-preload.ts'),
         join(desktop_dir, 'preload', 'prefs-preload.ts'),
     ],
 });
 
-// Renderer scripts for the shell (tab bar) and preferences pages.
+// Renderer scripts for the welcome (launcher) and preferences pages.
 await build({
     bundle: true,
     platform: 'browser',
@@ -52,12 +52,12 @@ await build({
     outdir: out_dir,
     logLevel: 'info',
     entryPoints: [
-        join(desktop_dir, 'renderer', 'shell.ts'),
+        join(desktop_dir, 'renderer', 'welcome.ts'),
         join(desktop_dir, 'renderer', 'prefs.ts'),
     ],
 });
 
 // Static pages.
-for (const file of ['shell.html', 'prefs.html']) {
+for (const file of ['welcome.html', 'prefs.html']) {
     await copyFile(join(desktop_dir, 'renderer', file), join(out_dir, file));
 }

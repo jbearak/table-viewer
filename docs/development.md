@@ -24,7 +24,7 @@ is the only thing that does — CI runs it):
 - `npm run desktop:dev` — build the bundles and launch the app with Electron
 - `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
 - `npm run desktop:package:dir` — unpacked `.app` only (faster, for local checks)
-- `npm run test:desktop-smoke` — Playwright Electron smoke test (separate from the vitest suite)
+- `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
 
 See [desktop/README.md](../desktop/README.md) for more on the desktop shell.
 

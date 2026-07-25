@@ -9,6 +9,20 @@ export const APP_SCHEME = 'tv-app';
 export const WEBVIEW_HOST = 'webview';
 export const VIEWER_HOST = 'viewer';
 
+/**
+ * URL for one viewer window's page. Chromium keys the zoom level by origin, so
+ * every window that shared a host would also share its zoom — each window gets
+ * its own `viewer-<n>` host to keep View → Zoom per-window.
+ */
+export function viewer_url(window_id: number): string {
+    return `${APP_SCHEME}://${VIEWER_HOST}-${window_id}/index.html`;
+}
+
+/** Whether `host` is one of those per-window viewer hosts. */
+export function is_viewer_host(host: string): boolean {
+    return host === VIEWER_HOST || /^viewer-[0-9]+$/.test(host);
+}
+
 export const VIEWER_SCRIPT_URL = `${APP_SCHEME}://${WEBVIEW_HOST}/index.js`;
 export const VIEWER_STYLE_URL = `${APP_SCHEME}://${WEBVIEW_HOST}/index.css`;
 /** Scheme source: matches every tv-app:// asset in CSP directives. */
