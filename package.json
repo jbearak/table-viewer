@@ -4,6 +4,7 @@
   "description": "Viewer for Excel files and viewer/editor for CSV and TSV files with merged cells, formatting, and persistent UI state",
   "version": "0.7.0",
   "publisher": "jbearak",
+  "icon": "media/icon-128.png",
   "license": "GPL-3.0",
   "author": "Jonathan Marc Bearak",
   "repository": {
