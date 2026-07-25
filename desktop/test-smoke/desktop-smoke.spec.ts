@@ -463,7 +463,19 @@ async function seize_debounce(prefs: Page): Promise<void> {
             __run_pending_saves: () => Promise<unknown>;
             prefsApi: { get_settings: () => Promise<unknown> };
         };
+        const escaped: number[] = [];
         page.__run_pending_saves = async () => {
+            // Drift guard. The interval below is a copy of the renderer's, and if
+            // the renderer's changes this stops matching — every timer would go to
+            // the real clock, this would drain nothing, and the "not saved yet"
+            // assertions would start passing for the wrong reason. A long timer
+            // getting past the filter is what that looks like from here.
+            if (escaped.length > 0) {
+                throw new Error(
+                    `a ${escaped[0]}ms timer escaped the seized debounce — has `
+                    + 'SAVE_DEBOUNCE_MS changed in desktop/renderer/prefs.ts?',
+                );
+            }
             while (queued.length > 0) queued.shift()!();
             // A round trip on the same IPC as the saves, and so ordered behind
             // anything they just sent: once it answers, whatever was going to be
@@ -475,6 +487,9 @@ async function seize_debounce(prefs: Page): Promise<void> {
                 queued.push(handler);
                 return -1;
             }
+            // Anything else long enough to be a debounce is not one this shim
+            // knows about; see the guard above.
+            if (typeof ms === 'number' && ms >= 100) escaped.push(ms);
             return real_set_timeout(handler, ms, ...rest);
         }) as typeof window.setTimeout;
     }, 500);
@@ -587,11 +602,10 @@ test('a value still being typed waits for the field or window to be left', async
 test('an edit inside the debounce survives closing the window', async () => {
     const prefs = await open_preferences(app);
     try {
-        // Neutering setTimeout is what makes this deterministic: the debounce can
-        // then never fire, so only the flush on close can produce the write.
-        await prefs.evaluate(() => {
-            window.setTimeout = (() => 0) as unknown as typeof window.setTimeout;
-        });
+        // Seizing the debounce is what makes this deterministic: nothing here ever
+        // runs what it captured, so the flush on close is the only thing left that
+        // can produce the write.
+        await seize_debounce(prefs);
         await prefs.fill('#csvMaxRows', '1234567');
         await close_preferences(app);
         await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1234567);

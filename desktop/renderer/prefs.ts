@@ -91,6 +91,14 @@ const SIZE_HINTS: Record<DesktopSettings['newWindowSize'], string> = {
     fixed: 'Always opens at the size below.',
 };
 
+/** The fields holding keystrokes the store has not answered for yet. Marked by
+ *  typing, cleared by a value arriving from the store or by a commit — after
+ *  which the store's answer, clamping and all, is what should be on screen. */
+const mid_edit = new WeakSet<HTMLInputElement>();
+
+/** The stored value each field is showing, by element. */
+const baselines = new WeakMap<HTMLInputElement, string>();
+
 /**
  * Write a stored value into a text input, unless the user is partway through
  * typing in it.
@@ -116,14 +124,6 @@ function set_input(input: HTMLInputElement, value: string): void {
     input.value = value;
     mid_edit.delete(input);
 }
-
-/** The fields holding keystrokes the store has not answered for yet. Marked by
- *  typing, cleared by a value arriving from the store or by a commit — after
- *  which the store's answer, clamping and all, is what should be on screen. */
-const mid_edit = new WeakSet<HTMLInputElement>();
-
-/** The stored value each field is showing, by element. */
-const baselines = new WeakMap<HTMLInputElement, string>();
 
 /**
  * Is this field's text a value in progress rather than a value?
@@ -178,6 +178,15 @@ function save(partial: Partial<DesktopSettings>): void {
     // fields are left showing what the user typed rather than a lie about it.
     prefs_api.set_settings(partial).then(populate, (error: unknown) => {
         console.error('failed to save preferences', error);
+    });
+}
+
+/** Put the stored settings back on screen. Rejection is handled for the same
+ *  reason as in `save`: `void` on a promise silences the lint rule, not the
+ *  unhandled rejection. */
+function repopulate(): void {
+    prefs_api.get_settings().then(populate, (error: unknown) => {
+        console.error('failed to read preferences', error);
     });
 }
 
@@ -370,7 +379,7 @@ function commit(field: TextField): void {
     // them — that is how an empty or garbled entry gets undone.
     const partial = take_pending();
     if (partial) save(partial);
-    else void prefs_api.get_settings().then(populate);
+    else repopulate();
 }
 
 /** The fields that are showing something other than what is stored, as a patch.
@@ -457,4 +466,4 @@ prefs_api.on_settings_changed((settings) => {
     apply_fonts(settings);
     apply_window_size(settings);
 });
-void prefs_api.get_settings().then(populate);
+repopulate();
