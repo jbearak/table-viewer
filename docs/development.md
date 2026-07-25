@@ -83,6 +83,8 @@ What it does, in order:
 
 Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag.
 
+`release-build.yml` has two jobs: `build` packages the `.vsix` on Linux, and `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
+
 ```sh
 git push && git push --tags
 ```
