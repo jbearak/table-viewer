@@ -31,6 +31,7 @@ import {
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
     next_window_bounds,
+    type WindowSize,
 } from './window-geometry';
 
 interface ViewerWindow {
@@ -178,6 +179,7 @@ export class ViewerWindowManager {
         // Track the size as the user drags, not only on close: opening a second
         // file without closing the first should still match the size just set.
         let settle_timer: ReturnType<typeof setTimeout> | undefined;
+        let pending_size: WindowSize | undefined;
         const cancel_settle = () => {
             if (settle_timer) clearTimeout(settle_timer);
             settle_timer = undefined;
@@ -191,9 +193,11 @@ export class ViewerWindowManager {
             stop_watching_dirty: () =>
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
             flush_size: () => {
-                if (!settle_timer) return;
+                if (!pending_size) return;
                 cancel_settle();
-                this.remember_size(window, 'live');
+                const size = pending_size;
+                pending_size = undefined;
+                this.store_size(size);
             },
             resize_seq: 0,
         };
@@ -205,10 +209,15 @@ export class ViewerWindowManager {
             // most recently resized window.
             if (window.isMaximized() || window.isFullScreen() || window.isMinimized()) return;
             entry.resize_seq = ++this.resize_counter;
+            // Measured now rather than when the timer fires: the user can
+            // maximize or minimize inside the settle window, and the size they
+            // just dragged to would be unreadable by then. The debounce is only
+            // about how often it is written.
+            pending_size = window.getBounds();
             cancel_settle();
             settle_timer = setTimeout(() => {
                 settle_timer = undefined;
-                this.remember_size(window, 'live');
+                entry.flush_size();
             }, RESIZE_SETTLE_MS);
         });
         // Only a drag that has not settled yet: a window closing is not itself
@@ -318,40 +327,27 @@ export class ViewerWindowManager {
         const target = live.reduce(
             (best, entry) => (entry.resize_seq >= best.resize_seq ? entry : best),
         );
-        // `restored`, so a window that happens to be minimized or maximized
-        // right now still contributes its real size. This is a one-shot with no
-        // later event behind it, and the focused window is Preferences, not a
-        // viewer holding an open cell editor.
-        this.remember_size(target.window, 'restored');
+        // getNormalBounds, so a window that is minimized or maximized right now
+        // still contributes its real size — this is a one-shot with no later
+        // event behind it. Safe here, unlike on the resize path: the focused
+        // window is Preferences, not a viewer holding an open cell editor.
+        this.store_size(target.window.getNormalBounds());
     }
 
     /**
-     * Remember this window's size so the next one opens at the same size — the
-     * `match-last` half of the new-window-size preference.
+     * Record `size` as what a new window should open at — the `match-last` half
+     * of the new-window-size preference.
      *
-     * `measure` is how to read the size, which the callers do not agree on:
-     *
-     * - `restored` reads `getNormalBounds()`, the size the window would have
-     *   were it not maximized, fullscreen or minimized. For the switch into
-     *   `match-last`, a one-shot with no later event behind it, which therefore
-     *   has to record *something*.
-     * - `live` reads `getBounds()` and skips those states instead. For the
-     *   resize path, which fires mid-drag on a focused window, where
-     *   `getNormalBounds()` disturbs it enough to swallow keystrokes into an
-     *   open cell editor (the desktop smoke suite catches this). Skipping is
-     *   free there: the states it skips are not sizes the user picked.
+     * Takes a size rather than a window because its callers measure at
+     * different moments: the resize path samples during the drag and hands the
+     * value over the debounce, so that a maximize or minimize before the timer
+     * fires cannot make the size the user just chose unreadable.
      */
-    private remember_size(window: BrowserWindow, measure: 'live' | 'restored'): void {
-        if (window.isDestroyed()) return;
+    private store_size({ width, height }: WindowSize): void {
         const settings = this.config_store.settings();
         // Under `fixed` the stored size is the user's typed preference, so
         // dragging a window must not quietly overwrite it.
         if (settings.newWindowSize === 'fixed') return;
-        if (measure === 'live'
-            && (window.isMaximized() || window.isFullScreen() || window.isMinimized())) return;
-        const { width, height } = measure === 'restored'
-            ? window.getNormalBounds()
-            : window.getBounds();
         if (settings.windowWidth === width && settings.windowHeight === height) return;
         try {
             this.config_store.update({ windowWidth: width, windowHeight: height });
