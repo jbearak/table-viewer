@@ -17,6 +17,10 @@ export const CHANNEL_WELCOME_OPEN_PREFERENCES = 'welcome:openPreferences';
 /** Preferences window channels. */
 export const CHANNEL_PREFS_GET = 'prefs:get';
 export const CHANNEL_PREFS_SET = 'prefs:set';
+/** Same write, synchronously. Only for the flush the Preferences window does as
+ *  it closes: an async invoke there races the renderer's teardown, and losing
+ *  that race silently drops the edit the user just typed. */
+export const CHANNEL_PREFS_SET_SYNC = 'prefs:setSync';
 /** Main → every renderer: settings were updated (DesktopSettings payload), so
  *  the app chrome can follow the configured font. */
 export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';

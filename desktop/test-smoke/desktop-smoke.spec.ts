@@ -393,6 +393,14 @@ test('the appearance preference pins light/dark, and System restores OS followin
     }
 });
 
+/** One setting as it is on disk — the only place a preference is really saved.
+ *  `null` until the app has had reason to write the file at all. */
+function stored_setting(key: string): unknown {
+    const file = path.join(user_data_dir, 'settings.v1.json');
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'))[key];
+}
+
 // Switching to Match last window has to adopt whatever is on screen: while Fixed
 // size was selected the app deliberately ignored every resize, so without this
 // the stored size is the number last typed, and the first window opened after
@@ -432,6 +440,167 @@ test('switching to Match last window adopts the current window size', async () =
         await expect(prefs.locator('#windowWidth')).toHaveValue('640');
         await expect(prefs.locator('#windowHeight')).toHaveValue('480');
     } finally {
+        await close_preferences(app);
+    }
+});
+
+/**
+ * Take the Preferences window's save debounce off the clock.
+ *
+ * The tests that assert a value was *not* saved otherwise have to sleep past the
+ * debounce and hope — the one thing this repo's test guidance rules out, and a
+ * false pass on a loaded machine, since a renderer that has not run its timer yet
+ * looks exactly like one that correctly declined to save. So the timer is
+ * captured instead of started, and `run_pending_saves` runs it on demand.
+ */
+async function seize_debounce(prefs: Page): Promise<void> {
+    // 500 mirrors SAVE_DEBOUNCE_MS in desktop/renderer/prefs.ts — matching on it
+    // leaves any other timer in the page running normally.
+    await prefs.evaluate((debounce_ms) => {
+        const real_set_timeout = window.setTimeout.bind(window);
+        const queued: Array<() => void> = [];
+        const page = window as unknown as {
+            __run_pending_saves: () => Promise<unknown>;
+            prefsApi: { get_settings: () => Promise<unknown> };
+        };
+        page.__run_pending_saves = async () => {
+            while (queued.length > 0) queued.shift()!();
+            // A round trip on the same IPC as the saves, and so ordered behind
+            // anything they just sent: once it answers, whatever was going to be
+            // written to the settings file has been.
+            return page.prefsApi.get_settings();
+        };
+        window.setTimeout = ((handler: () => void, ms?: number, ...rest: unknown[]) => {
+            if (ms === debounce_ms) {
+                queued.push(handler);
+                return -1;
+            }
+            return real_set_timeout(handler, ms, ...rest);
+        }) as typeof window.setTimeout;
+    }, 500);
+}
+
+/** Run whatever the debounce is holding, and wait for the writes to land. */
+function run_pending_saves(prefs: Page): Promise<unknown> {
+    return prefs.evaluate(() =>
+        (window as unknown as { __run_pending_saves: () => Promise<unknown> })
+            .__run_pending_saves());
+}
+
+// Preferences has no Save button, so a typed value has to save itself. Neither
+// half of that is obvious from the screen — this is the test that says the window
+// is not quietly dropping edits.
+test('a typed preference saves without Enter', async () => {
+    const prefs = await open_preferences(app);
+    try {
+        // `fill` types without pressing Enter and leaves the field focused —
+        // exactly the case that used to lose the value. 7 digits, matching the
+        // stored default: a *shorter* number reads as a value still being typed
+        // (see the test below), which is a different path.
+        await prefs.fill('#csvMaxRows', '1000001');
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1000001);
+    } finally {
+        await prefs.fill('#csvMaxRows', '1000000');
+        await prefs.locator('#csvMaxRows').blur();
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1_000_000);
+        await close_preferences(app);
+    }
+});
+
+// The other half of saving while typing: the settings apply to the app as they
+// are written, so the values a user is only passing through must not be written
+// at all. Every case here used to change the app under the user mid-keystroke —
+// backspacing 13 to 1 shrank everything to the 8px minimum, and each prefix of a
+// font name dropped the app to its default face.
+//
+// One case at a time, each with focus left in its own field: moving to another
+// field is a blur, and a blur is a commit — which is the second half of every
+// case here, and is asserted as such.
+test('a value still being typed waits for the field or window to be left', async () => {
+    const prefs = await open_preferences(app);
+    try {
+        await seize_debounce(prefs);
+        // A known starting point, saved the ordinary way, so this test depends on
+        // nothing the tests before it left behind.
+        for (const [field, value] of [['#fontSize', '16'], ['#fontFamily', 'monospace']]) {
+            await prefs.fill(field, value);
+            await prefs.locator(field).blur();
+        }
+        await expect.poll(() => stored_setting('fontSize'), { timeout: 15_000 }).toBe(16);
+        // A font the system does have applies as it is typed — what waits is an
+        // unknown name, not every name. Polled, not read: `blur()` dispatches the
+        // renderer's handler without awaiting the IPC it starts.
+        await expect
+            .poll(() => stored_setting('fontFamily'), { timeout: 15_000 })
+            .toBe('monospace');
+
+        // Cleared for retyping: no digit of the old value survives as a setting,
+        // and leaving it blank keeps what was stored rather than saving nothing.
+        await prefs.fill('#fontSize', '');
+        await run_pending_saves(prefs);
+        expect(stored_setting('fontSize')).toBe(16);
+        await prefs.locator('#fontSize').blur();
+        await run_pending_saves(prefs);
+        expect(stored_setting('fontSize')).toBe(16);
+        await expect(prefs.locator('#fontSize')).toHaveValue('16');
+
+        // A digit taken off: 1000000 → 4321 is fewer characters than were there,
+        // so it is someone partway through typing — until they leave the field.
+        await prefs.fill('#csvMaxRows', '4321');
+        await run_pending_saves(prefs);
+        expect(stored_setting('csvMaxRows')).toBe(1_000_000);
+        await prefs.locator('#csvMaxRows').blur();
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(4321);
+
+        // A font name the system does not have: not applied while it is typed, but
+        // saved if the user closes the window still standing on it — they may know
+        // something the availability check does not.
+        await prefs.fill('#fontFamily', 'Nonexistent Zzz Face');
+        await run_pending_saves(prefs);
+        expect(stored_setting('fontFamily')).toBe('monospace');
+        await close_preferences(app);
+        await expect
+            .poll(() => stored_setting('fontFamily'), { timeout: 15_000 })
+            .toBe('Nonexistent Zzz Face');
+    } finally {
+        // Back to the defaults: the font is the app's, and the later tests measure
+        // a grid drawn with it.
+        await close_preferences(app);
+        const restore = await open_preferences(app);
+        for (const [field, value] of [
+            ['#fontFamily', ''],
+            ['#fontSize', '13'],
+            ['#csvMaxRows', '1000000'],
+        ]) {
+            await restore.fill(field, value);
+            await restore.locator(field).blur();
+        }
+        await expect.poll(() => stored_setting('fontFamily'), { timeout: 15_000 }).toBe('');
+        await expect.poll(() => stored_setting('fontSize'), { timeout: 15_000 }).toBe(13);
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1_000_000);
+        await close_preferences(app);
+    }
+});
+
+// An edit can also be inside the debounce when the window goes away, with no blur
+// of any kind to rescue it — the flush on close is the only thing that saves it.
+test('an edit inside the debounce survives closing the window', async () => {
+    const prefs = await open_preferences(app);
+    try {
+        // Neutering setTimeout is what makes this deterministic: the debounce can
+        // then never fire, so only the flush on close can produce the write.
+        await prefs.evaluate(() => {
+            window.setTimeout = (() => 0) as unknown as typeof window.setTimeout;
+        });
+        await prefs.fill('#csvMaxRows', '1234567');
+        await close_preferences(app);
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1234567);
+    } finally {
+        await close_preferences(app);
+        const restore = await open_preferences(app);
+        await restore.fill('#csvMaxRows', '1000000');
+        await restore.locator('#csvMaxRows').blur();
+        await expect.poll(() => stored_setting('csvMaxRows'), { timeout: 15_000 }).toBe(1_000_000);
         await close_preferences(app);
     }
 });

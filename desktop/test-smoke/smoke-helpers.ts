@@ -54,7 +54,18 @@ export async function open_preferences(app: ElectronApplication): Promise<Page> 
     expect(opened, 'a Preferences… menu item exists').toBe(true);
     const prefs_page = () => app.windows().find((page) => page.url().endsWith('prefs.html'));
     await expect.poll(prefs_page, { timeout: 15_000 }).toBeTruthy();
-    return prefs_page()!;
+    const page = prefs_page()!;
+
+    // The page appearing is not the window being ready: prefs.js attaches the
+    // field listeners and then fills the fields from the stored settings, both
+    // after the markup is parseable. Typing in between goes nowhere — the
+    // keystrokes land in an input nothing is listening to — so every test here
+    // waits for a field to be showing a stored value first. The number inputs are
+    // empty in the markup, which is what makes one of them the signal.
+    await expect
+        .poll(() => page.locator('#csvMaxRows').inputValue(), { timeout: 15_000 })
+        .not.toBe('');
+    return page;
 }
 
 /**
