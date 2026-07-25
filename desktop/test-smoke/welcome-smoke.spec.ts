@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { test, expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication } from '@playwright/test';
-import { click_menu_item, main_js, repo_dir } from './smoke-helpers';
+import { click_menu_item, close_preferences, main_js, repo_dir } from './smoke-helpers';
 
 let app: ElectronApplication;
 let user_data_dir: string;
@@ -104,11 +104,8 @@ test('the new-window-size mode enables the size fields and persists', async () =
 
     // Leave the store as the other tests expect to find it.
     await page.selectOption('#newWindowSize', 'match-last');
-    await app.evaluate(({ BrowserWindow }) => {
-        BrowserWindow.getAllWindows()
-            .find((window) => window.getTitle().includes('Preferences'))
-            ?.close();
-    });
+    await close_preferences(app);
+    // The launcher is still there: only Preferences went away.
     await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
 });
 
