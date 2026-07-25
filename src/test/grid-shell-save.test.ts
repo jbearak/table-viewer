@@ -5,6 +5,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CsvSaveLifecycle, CsvSaveOperation } from '../types';
 import type { EditingHandle } from '../webview/grid-shell';
+import {
+    create_edit_session_store,
+    type EditSessionStore,
+} from '../webview/edit-session-store';
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
@@ -86,6 +90,8 @@ async function render_grid(
         save_operation?: CsvSaveOperation;
         save_lifecycle?: CsvSaveLifecycle;
         initial_edits?: Record<string, string | { value: string; base: string }>;
+        edit_session?: EditSessionStore;
+        generation?: number;
     } = {},
 ) {
     vi.resetModules();
@@ -146,12 +152,24 @@ async function render_grid(
             }));
         });
     };
+    // Model what App does on a transform/refresh ack: the generation bump moves
+    // GridShell's key, so the mount is destroyed and rebuilt. The key lives in
+    // App, so the test has to supply one to force the unmount.
+    const remount_at_generation = async (generation: number) => {
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...props,
+                key: `gen-${generation}`,
+                generation,
+            }));
+        });
+    };
 
     await act(async () => {
         root!.render(React.createElement(GridShell, props));
     });
 
-    return { post_message, editing_ref, rerender_save_lifecycle };
+    return { post_message, editing_ref, rerender_save_lifecycle, remount_at_generation };
 }
 
 async function edit_cell(value: string) {
@@ -511,5 +529,102 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         expect(await request_save(editing_ref)).toBe(false);
         expect(save_messages(post_message)).toEqual([]);
+    });
+});
+
+// The dirty map used to live inside the generation-keyed mount, so a transform
+// or refresh ack destroyed it. With an App-owned session store the mount is a
+// view over state that outlives it.
+describe('GridShell edits across a generation bump', () => {
+    it('keeps committed edits when the generation remounts the shell', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref, remount_at_generation } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await edit_cell('survivor');
+        await remount_at_generation(2);
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('survivor');
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('loses committed edits across the same remount without a store', async () => {
+        // The negative control for the test above: with the mount-scoped fallback
+        // store the remount re-seeds from initial_edits and the edit is gone. If
+        // this ever starts reporting 'survivor', the test above proves nothing.
+        const { remount_at_generation } = await render_grid(undefined, {
+            generation: 1,
+        });
+
+        await edit_cell('survivor');
+        await remount_at_generation(2);
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('commit_live_edit writes through to the store synchronously', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = 'typed but not closed';
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                columns: {},
+                rows: {},
+                current: {
+                    cell: [0, 0],
+                    range: { x: 0, y: 0, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+
+        editing_ref.current!.commit_live_edit();
+
+        // Asserted outside act on purpose: the fold before a generation bump only
+        // works because this write lands before React flushes anything, so an
+        // assertion inside act would not distinguish it from a state update.
+        expect(store.snapshot().get('0:0')).toEqual({
+            value: 'typed but not closed',
+            base: 'base',
+        });
+    });
+
+    it('leaves a pre-installed store alone when mounting at a settled revision', async () => {
+        // applied_save_lifecycle_revision_ref is per-mount and initialized to the
+        // revision it mounted with, so apply_save_lifecycle never runs for the
+        // mount-time lifecycle: hydrating it was the job of the deleted seeding of
+        // editing_initial_edits. That is not a hole, because App runs the same
+        // resolve_csv_save_hydration at the same boundary and installs the result,
+        // so a hoisted store already holds what the seeding would have recomputed.
+        // Re-seeding here would instead overwrite whatever App decided not to
+        // install — including a session the host has since replaced.
+        const failed: CsvSaveOperation = {
+            editSessionId: 'session-1',
+            saveRequestId: 'failed-save',
+            edits: { '0:0': 'from-failed' },
+            dirtyEdits: { '0:0': { value: 'from-failed', base: 'base' } },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:1': { value: 'store-only', base: 'middle' },
+        });
+        await render_grid(undefined, {
+            edit_session: store,
+            save_lifecycle: { revision: 9, state: 'failed', operation: failed },
+        });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '0:1': { value: 'store-only', base: 'middle' },
+        });
     });
 });

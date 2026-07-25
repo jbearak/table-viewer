@@ -80,6 +80,10 @@ import {
 } from './cell-overflow-model';
 import { use_editing, type DirtyEntry } from './use-editing';
 import {
+    create_edit_session_store,
+    type EditSessionStore,
+} from './edit-session-store';
+import {
     collect_exact_dirty_edits,
     collect_save_edits,
     type LiveEdit,
@@ -253,6 +257,12 @@ export interface GridShellProps {
         dirty_edits: CsvDirtyMap,
     ) => CsvSaveOperation | undefined;
     initial_edits?: Record<string, string | DirtyEntry>;
+    /**
+     * App-owned dirty map. Its lifetime is the edit session, so committed edits
+     * outlive this generation-keyed mount; without it the shell falls back to a
+     * mount-scoped store seeded from `initial_edits`.
+     */
+    edit_session?: EditSessionStore;
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
     // actions so App's toolbar + conflict banner can drive editing that lives here.
@@ -324,6 +334,7 @@ export function GridShell({
     save_lifecycle = { revision: 0, state: 'idle' },
     on_save_request = () => undefined,
     initial_edits,
+    edit_session,
     on_editing_change,
     editing_ref,
     auto_fit_ref,
@@ -509,11 +520,22 @@ export function GridShell({
         : save_lifecycle.state === 'active'
             ? lifecycle_operation
             : undefined;
-    const editing_initial_edits = resolve_csv_save_hydration(
-        { authoritative: save_lifecycle, operation: save_operation },
-        edit_session_id,
-        initial_edits,
-    );
+    // Fallback for a consumer that doesn't hoist the session store (the shell's
+    // own tests). Lazy so `resolve_csv_save_hydration` runs once at store
+    // creation rather than on every render; its live job is session filtering at
+    // mount, which grid-shell-save.test.ts covers.
+    const fallback_store_ref = useRef<EditSessionStore | null>(null);
+    if (edit_session === undefined && fallback_store_ref.current === null) {
+        fallback_store_ref.current = create_edit_session_store(
+            { session_id: edit_session_id },
+            resolve_csv_save_hydration(
+                { authoritative: save_lifecycle, operation: save_operation },
+                edit_session_id,
+                initial_edits,
+            ),
+        );
+    }
+    const store = edit_session ?? fallback_store_ref.current!;
     // Values posted in the in-flight save; edit bases use these before reload.
     const saved_edits_ref = useRef<Record<string, string>>(
         restored_save_operation ? { ...restored_save_operation.edits } : {},
@@ -550,9 +572,7 @@ export function GridShell({
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
-    } = use_editing(get_cell_raw, generation, editing_initial_edits);
-    const dirty_cells_ref = useRef(dirty_cells);
-    dirty_cells_ref.current = dirty_cells;
+    } = use_editing(get_cell_raw, generation, edit_session_id, store);
     const applied_save_lifecycle_revision_ref = useRef(save_lifecycle.revision);
     const [save_in_flight, set_save_in_flight] = useState(
         restored_save_operation !== undefined,
@@ -584,7 +604,6 @@ export function GridShell({
             const exact: CsvDirtyMap = Object.fromEntries(
                 Object.entries(operation.dirtyEdits),
             );
-            dirty_cells_ref.current = new Map(Object.entries(exact));
             replace_dirty(exact);
             save_in_flight_ref.current = true;
             set_save_in_flight(true);
@@ -606,15 +625,14 @@ export function GridShell({
         const restore = (resolve_csv_save_hydration(
             { authoritative: lifecycle },
             edit_session_id,
-            Object.fromEntries(dirty_cells_ref.current),
+            Object.fromEntries(store.snapshot()),
         ) ?? {}) as CsvDirtyMap;
-        dirty_cells_ref.current = new Map(Object.entries(restore));
         replace_dirty(restore);
         save_operation_ref.current = undefined;
         saved_edits_ref.current = {};
         save_in_flight_ref.current = false;
         set_save_in_flight(false);
-    }, [edit_session_id, replace_dirty]);
+    }, [edit_session_id, replace_dirty, store]);
 
     useEffect(() => {
         apply_save_lifecycle(save_lifecycle);
@@ -663,12 +681,17 @@ export function GridShell({
         });
     }, [dirty_cells, edit_mode, edit_session_id, save_in_flight_ref]);
 
-    // Mirrors read imperatively by the save handle (which must stay stable so the
-    // ref App holds doesn't churn): the live dirty map and current selection.
-    // get_cell_content reads dirty/conflict state through refs so its identity
-    // stays stable across edits — otherwise every commit would rebuild the
-    // closure and invalidate Glide's whole per-cell cache. Targeted repaints
-    // (below) drive the actual damage instead.
+    // Mirror read imperatively by the save handle (which must stay stable so the
+    // ref App holds doesn't churn): the current selection. The dirty map needs no
+    // mirror — `store` is a stable handle whose reads are always current, so it
+    // sits in a dep array without churning.
+    // get_cell_content reads dirty/conflict state through `store` and the ref
+    // below, never through the subscribed `dirty_cells`, so its identity stays
+    // stable across edits — otherwise every commit would rebuild the closure and
+    // invalidate Glide's whole per-cell cache. Targeted repaints (below) drive the
+    // actual damage instead.
+    // conflicted_keys still needs a mirror: it is derived in the hook from
+    // get_cell_raw rather than stored, so there is nothing stable to read it from.
     const conflicted_keys_ref = useRef(conflicted_keys);
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
@@ -898,9 +921,9 @@ export function GridShell({
     const request_save = useCallback((): boolean => {
         if (save_in_flight_ref.current || !edit_session_id) return false;
         const live = read_live_edit();
-        const edits = collect_save_edits(dirty_cells_ref.current, live);
+        const edits = collect_save_edits(store.snapshot(), live);
         if (Object.keys(edits).length === 0) return false;
-        const dirty_edits = collect_exact_dirty_edits(dirty_cells_ref.current, live);
+        const dirty_edits = collect_exact_dirty_edits(store.snapshot(), live);
         if (!dirty_edits) {
             host_bridge.postMessage({
                 type: 'showWarning',
@@ -918,13 +941,10 @@ export function GridShell({
             const [row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(row) && Number.isInteger(source_column)) {
                 // Accept the open editor's current value before closing the mutation
-                // boundary. React state may commit later, so mirror it immediately for
-                // all synchronous guards and failure restoration.
+                // boundary. The store's write is synchronous, so the value is
+                // visible to every synchronous guard below and to failure
+                // restoration, without waiting for React to commit.
                 commit_edit(row, source_column, live.value);
-                const next = new Map(dirty_cells_ref.current);
-                if (live.value === live.original) next.delete(live.key);
-                else next.set(live.key, { value: live.value, base: live.original });
-                dirty_cells_ref.current = next;
             }
         }
         save_operation_ref.current = operation;
@@ -948,6 +968,7 @@ export function GridShell({
         on_save_request,
         read_live_edit,
         save_in_flight_ref,
+        store,
     ]);
 
     const commit_live_edit = useCallback((): void => {
@@ -961,10 +982,10 @@ export function GridShell({
     }, [commit_edit, read_live_edit, save_in_flight_ref]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
-        if (dirty_cells_ref.current.size > 0) return true;
+        if (store.size() > 0) return true;
         const live = read_live_edit();
         return !!live && live.value !== live.original;
-    }, [read_live_edit]);
+    }, [read_live_edit, store]);
 
     // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
     // catch it at the window so it works whether or not an overlay is focused.
@@ -1069,7 +1090,7 @@ export function GridShell({
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return '';
             const key = `${row}:${source_column}`;
-            const dirty = dirty_cells_ref.current.get(key);
+            const dirty = store.get(key);
             if (dirty) return dirty.value;
 
             const merge = merge_index.entry_at(row, source_column);
@@ -1087,7 +1108,7 @@ export function GridShell({
             if (!cell) return '';
             return show_formatting ? cell.formatted : (cell.raw ?? '');
         },
-        [get_row, merge_index, show_formatting, source_column_for_display],
+        [get_row, merge_index, show_formatting, source_column_for_display, store],
     );
 
     const measure_line_width = useCallback(
@@ -1304,7 +1325,7 @@ export function GridShell({
                 };
             }
             const key = `${row}:${source_column}`;
-            const dirty = dirty_cells_ref.current.get(key);
+            const dirty = store.get(key);
             const merge = merge_index.entry_at(row, source_column);
             const highlight_source_row = get_source_row(merge?.startRow ?? row);
             const highlight_source_column = merge?.startCol ?? source_column;
@@ -1316,8 +1337,9 @@ export function GridShell({
                 );
             // Tint + dirty text whenever an edit exists; open the overlay only in
             // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
-            // dirty/conflict read via refs (see conflicted_keys_ref) so this
-            // closure's identity doesn't churn per edit; the targeted repaint
+            // dirty read through the stable `store` handle and conflict through
+            // conflicted_keys_ref — never through the subscribed dirty_cells — so
+            // this closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || highlight_bg) {
@@ -1352,6 +1374,7 @@ export function GridShell({
             source_column_for_display,
             get_source_row,
             get_highlight_background,
+            store,
             // A theme switch re-derives the tints, so the callback must close
             // over the new ones (the full-region repaint effect below then
             // damages the cells already painted with the old ones).
@@ -1748,7 +1771,7 @@ export function GridShell({
         // Snapshot the displayed edit layers once per copy. A row must still be
         // resident before edits are overlaid: one known dirty cell must not make an
         // otherwise-unloaded row look complete or suppress the nonresident warning.
-        const dirty = dirty_cells_ref.current;
+        const dirty = store.snapshot();
         const live = read_live_edit();
         const get_displayed_row = (
             row_index: number,
@@ -1802,6 +1825,7 @@ export function GridShell({
         sheet_meta.columnNames,
         show_formatting,
         safe_write_to_clipboard,
+        store,
     ]);
 
     const copy_rect = useCallback(

@@ -12,6 +12,7 @@ import type {
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
+import type { EditSessionStore } from '../webview/edit-session-store';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -30,7 +31,18 @@ const grid_shell_mock = vi.hoisted(() => ({
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
     emit_pending_edits_on_mount: false,
+    write_on_session_change: false,
+    listen_for_save_result: false,
 }));
+
+// Stand-in store for the handful of renders that don't pass one, so the stub can
+// call useSyncExternalStore unconditionally. Both functions are constants: an
+// unstable subscribe would resubscribe every render, and an unstable snapshot
+// would violate the store contract and loop.
+const empty_edit_session = vi.hoisted(() => {
+    const empty = new Map<string, { value: string; base: string }>();
+    return { subscribe: () => () => {}, snapshot: () => empty };
+});
 
 // Glide's DataEditor renders to a <canvas>, which jsdom can't drive. Replace the
 // grid with a DOM stub that surfaces the props App feeds it (sheet index,
@@ -70,6 +82,7 @@ vi.mock('../webview/grid-shell', () => ({
             dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
         } | undefined;
         initial_edits?: Record<string, string | { value: string; base: string }>;
+        edit_session?: EditSessionStore;
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
             current: {
@@ -108,6 +121,49 @@ vi.mock('../webview/grid-shell', () => ({
     }) => {
         grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
         const mount_id = React.useRef(++grid_shell_mock.mount_count);
+        // Subscribe the way the real use_editing does, so `data-store-edits`
+        // reports what a mounted grid would actually paint from — an install that
+        // never reaches a subscriber is indistinguishable from no install at all.
+        const store_edits = React.useSyncExternalStore(
+            props.edit_session?.subscribe ?? empty_edit_session.subscribe,
+            props.edit_session?.snapshot ?? empty_edit_session.snapshot,
+        );
+        // Models the real shell's session-keyed effects (the save-lifecycle
+        // replace_dirty and the pendingEdits persistence effect): a child effect
+        // that writes to the store under the session id it was just handed. React
+        // runs this before App's own passive effects, so it is the window in which
+        // a lagging session stamp would silently fence the write off.
+        // The key is derived from the session id so each session's write is
+        // distinguishable: keying them all the same way would let the accepted
+        // write from the first session stand in for a dropped one from the second.
+        React.useEffect(() => {
+            if (!grid_shell_mock.write_on_session_change) return;
+            if (!props.edit_session || !props.edit_session_id) return;
+            props.edit_session.commit(props.edit_session_id, `session:${props.edit_session_id}`, {
+                value: 'written by a session-keyed child effect',
+                base: 'base',
+            });
+        }, [props.edit_session, props.edit_session_id]);
+        // Models the real shell's own `message` listener (grid-shell.tsx:641),
+        // which calls replace_dirty on a saveResult while capturing the
+        // edit_session_id from the render that registered it. Child effects run
+        // before the parent's, so on the first mount this listener is registered
+        // ahead of App's; a remount re-registers it *after* App's, flipping the
+        // dispatch order. The write then lands after App has already installed
+        // and re-stamped, which is where the ownership fence could drop it.
+        React.useEffect(() => {
+            if (!grid_shell_mock.listen_for_save_result) return;
+            const session_at_registration = props.edit_session_id;
+            const store = props.edit_session;
+            const handler = (event: MessageEvent) => {
+                if (event.data?.type !== 'saveResult') return;
+                store?.replace(session_at_registration, {
+                    'restored:by:shell': { value: 'shell restore', base: 'base' },
+                });
+            };
+            window.addEventListener('message', handler);
+            return () => window.removeEventListener('message', handler);
+        }, [props.edit_session, props.edit_session_id]);
         React.useLayoutEffect(() => {
             if (!props.grid_focus_ref) return;
             const handle = {
@@ -199,6 +255,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
                 'data-initial-edits': JSON.stringify(props.initial_edits ?? null),
+                'data-store-edits': JSON.stringify(Object.fromEntries(store_edits)),
                 'data-mount-id': String(mount_id.current),
                 'data-projection': JSON.stringify(props.column_projection.visible_to_source),
                 'data-source-to-visible': JSON.stringify(props.column_projection.source_to_visible),
@@ -641,6 +698,8 @@ function cleanup() {
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.emit_pending_edits_on_mount = false;
+    grid_shell_mock.write_on_session_change = false;
+    grid_shell_mock.listen_for_save_result = false;
     vi.useRealTimers();
     vi.unstubAllGlobals();
 }
@@ -2811,6 +2870,9 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-initial-edits')).toBe(
             JSON.stringify(pendingEdits)
         );
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(pendingEdits)
+        );
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
     });
 
@@ -4759,5 +4821,238 @@ describe('sorting and filtering', () => {
             initial_snapshot_message(make_meta(['Sheet1']), { configuration: { previewMode: true } }),
         );
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+    });
+});
+
+// The dirty map now lives in a store App owns, so an install reaches the grid
+// without a remount and survives one. `data-store-edits` is the mounted grid's
+// subscribed view of that store, which is what the real hook reads.
+describe('edit session store hydration', () => {
+    function store_edits() {
+        return JSON.parse(grid_stub().getAttribute('data-store-edits')!);
+    }
+
+    it('installs a changed map into the mounted grid without remounting it', async () => {
+        // Entering edit mode redelivers the projection at the same generation, so
+        // nothing about the key moves. Before the store this install could only
+        // reach the grid as a prop that a mounted hook ignored.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+        const generation = grid_stub().getAttribute('data-generation');
+
+        const pendingEdits = { '0:0': { value: 'refreshed', base: 'base' } };
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            state: { pendingEdits },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+
+        expect(store_edits()).toEqual(pendingEdits);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation);
+    });
+
+    it('keeps a committed edit across a refresh that bumps the generation', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        // A committed edit, the way the grid's own hook writes one. Deliberately not
+        // an install: only an install moves initial_edits, so this edit exists in
+        // the store and nowhere else.
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'committed', base: 'base' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        // A refresh for a session App does not consider current, so nothing
+        // installs and the generation bump remounts the grid.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'other-session',
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
+        expect(store_edits()).toEqual({ '0:0': { value: 'committed', base: 'base' } });
+        // The prop channel that used to seed the fresh mount never saw this edit,
+        // so the store is the only thing carrying it across.
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
+    });
+
+    it('accepts a commit after a refresh re-stamps the session without installing', async () => {
+        // set_csv_edit_session_id runs on every applied snapshot, but the install is
+        // gated on refresh_editing_current_session. When the id moves and nothing
+        // installs, the store keeps the old stamp while the hook now passes the new
+        // id — every later write would be dropped by the ownership guard. App's
+        // adopt_session effect closes that gap.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'rotated-session',
+            },
+        }));
+
+        const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        expect(store.identity()).toEqual({ session_id: 'rotated-session' });
+        await act(async () => {
+            store.commit('rotated-session', '0:0', { value: 'typed after rotation', base: 'base' });
+        });
+
+        expect(store_edits()).toEqual({
+            '0:0': { value: 'typed after rotation', base: 'base' },
+        });
+    });
+
+    it('re-stamps the session before the grid effects that write under it', async () => {
+        // React runs child passive effects before the parent's, so if App adopted
+        // the rotated session in a passive effect, GridShell's own session-keyed
+        // effects would already have written under the new id against a store
+        // still stamped with the old one — and the ownership guard would drop them
+        // silently. The host ships csvEditSessionId and csvSaveLifecycle in a
+        // single snapshot, so that window is reachable. Adopting in a layout
+        // effect closes it: a parent layout effect precedes every child passive
+        // effect.
+        grid_shell_mock.write_on_session_change = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'rotated-session',
+            },
+        }));
+
+        // Both writes must be present: the first proves the harness writes at all,
+        // the second is the one a lagging stamp would have fenced off.
+        expect(Object.keys(store_edits()).sort()).toEqual([
+            'session:rotated-session',
+            'session:test-edit-session',
+        ]);
+    });
+
+    it('keeps the shell save-lifecycle restore effective after a remount flips listener order', async () => {
+        // GridShell registers its own `message` listener in a passive effect, so on
+        // the first mount it sits ahead of App's and fires first. A generation bump
+        // remounts it, re-registering it *after* App's — from then on App installs
+        // and re-stamps first, and the shell's replace_dirty arrives at an
+        // already-restamped store carrying the session id from its own render.
+        // Pre-refactor there was no fence and that write always landed, so this
+        // pins that the fence did not turn an order flip into a dropped restore.
+        grid_shell_mock.listen_for_save_result = true;
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+
+        // Bump the generation so the shell's listener is re-registered last.
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            rowCount: 1,
+            generation: 5,
+            sourceGeneration: 1,
+        });
+
+        await dispatch_host_message({ type: 'saveResult', success: true });
+
+        // The shell's restore must not have been silently fenced off.
+        expect(Object.keys(store_edits())).toContain('restored:by:shell');
+    });
+
+    it('folds the open editor into the store before a refresh remount', async () => {
+        // The refresh branch has its own fold, and this is the case that needs it:
+        // the session moved, so nothing installs, and the open overlay's value has
+        // no other way across the generation bump.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'live', base: 'base' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'other-session',
+            },
+        }));
+
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
+        expect(store_edits()).toEqual({ '0:0': { value: 'live', base: 'base' } });
+    });
+
+    it('folds the open editor into the store before a transform remount', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        // Stand in for the real overlay fold: the value only reaches the next mount
+        // if the write happens before the generation bump destroys this one.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'live', base: 'base' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            rowCount: 1,
+            generation: 5,
+            sourceGeneration: 1,
+        });
+
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
+        expect(store_edits()).toEqual({ '0:0': { value: 'live', base: 'base' } });
     });
 });
