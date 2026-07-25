@@ -96,6 +96,13 @@ carried a dmg would have meant a red tap CI pointing at a 404.
    `test` check on `main`, so a bump PR can't merge red. Do this after step 1:
    the check has to have run once before it can be selected as required.
 
+   This step is also what makes auto-merge meaningful. `gh pr merge --auto`
+   errors on a PR that is *already* mergeable, so with no required check the
+   bump PR just sits there and the workflow logs a warning. With the check
+   required, the PR merges by itself once CI is green. (Auto-merge and
+   delete-branch-on-merge are already enabled on the tap repo; auto-merge is off
+   by default and `--auto` fails outright without it.)
+
 3. **Give this repo write access to the tap and enable the bump:**
 
    ```sh
@@ -107,6 +114,10 @@ carried a dmg would have meant a red tap CI pointing at a 404.
    fine-grained PAT restricted to `jbearak/homebrew-table-viewer` with
    **Contents: write** + **Pull requests: write** only — it can ship arbitrary
    cask Ruby to anyone installing from the tap. Set an expiration.
+
+   It lives on the `release` environment so the bump steps need no second
+   approval. Note that any protection rule added to that environment (required
+   reviewers, a wait timer) would gate the `desktop` build job too.
 
 Until `ENABLE_HOMEBREW_BUMP` is `true` the bump steps are skipped entirely; the
 release still builds and attaches the dmg, so turning it on later needs no
