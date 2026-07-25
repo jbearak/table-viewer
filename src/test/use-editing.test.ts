@@ -525,8 +525,13 @@ describe('hoisted store installs', () => {
         // evaluated on every render, so it would count renders, not mounts.
         const mount_ref = React.useRef<number | null>(null);
         if (mount_ref.current === null) mount_ref.current = ++mount_count.n;
+        // Memoized on `rows`, mirroring production: GridShell's get_cell_raw is a
+        // useCallback keyed on `version`, so it rebinds only on a page load. A
+        // fresh function per render would re-run every effect that depends on it
+        // and mask any missing dependency in the hook.
+        const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
         hook_result = use_editing(
-            make_get_cell_raw(rows),
+            get_cell_raw,
             token,
             session_id,
             session_store!,
@@ -580,6 +585,27 @@ describe('hoisted store installs', () => {
 
         expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
             '1:1': { value: 'G', base: 'e' },
+        });
+    });
+
+    it('resolves bases for an old-format map installed into the mounted hook', async () => {
+        // Pre-refactor an edit map could only arrive through a remount, and a
+        // remount always re-ran the base-capture effect. Now install lands in a
+        // mounted hook, and get_cell_raw only rebinds on a page load — so for
+        // already-resident rows nothing else would ever trigger the resolve, and
+        // the entry would stay base_pending forever. That is not a cosmetic flag:
+        // is_entry_conflicted short-circuits on base_pending (conflict detection
+        // silently off) and collect_exact_dirty_edits returns undefined, so the
+        // save is refused with no way for the user to clear it.
+        await render_store(undefined);
+
+        await act(async () => {
+            session_store!.install({ session_id: undefined }, { '0:0': 'A' });
+        });
+
+        expect(session_store!.has_pending_base()).toBe(false);
+        expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
+            '0:0': { value: 'A', base: 'a' },
         });
     });
 });

@@ -206,14 +206,24 @@ export function use_editing(
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever
-    // get_cell_raw's identity changes (the consumer rebinds it as pages load).
+    // get_cell_raw's identity changes (the consumer rebinds it as pages load) and
+    // whenever the map itself changes.
+    //
+    // `dirty_cells` is a real dependency, not defensive padding. An old-format
+    // string map can now be installed into a *mounted* hook (a same-generation
+    // refresh while editing), where get_cell_raw does not rebind because no page
+    // loaded. Without this dep the pending entries would never be resolved for
+    // already-resident rows: is_entry_conflicted short-circuits on base_pending,
+    // so conflict detection would be silently off, and collect_exact_dirty_edits
+    // would keep refusing the save with no user-reachable way to clear it.
     useEffect(() => {
         // Hot-path guard: nothing pending means nothing to resolve, so skip the
-        // Map rebuild + rescan entirely. get_cell_raw rebinds on every page load,
-        // so without this the effect would re-run on every scroll.
+        // Map rebuild + rescan entirely. get_cell_raw rebinds on every page load
+        // and every commit produces a new map, so without this the effect would
+        // re-run on every scroll and every keystroke.
         if (!active_store.has_pending_base()) return;
         active_store.resolve_pending_bases(session_id, get_cell_raw);
-    }, [active_store, get_cell_raw, session_id]);
+    }, [active_store, get_cell_raw, session_id, dirty_cells]);
 
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
