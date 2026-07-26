@@ -2477,13 +2477,14 @@ export function attach_viewer(
     }
 
     async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
-        // Recorded before the CAS, not after it. Reaching this function already means
-        // every early rejection cleared, so this operation is the kind that makes its
-        // edits durable — and the durable write inside `compare_and_set` can commit
-        // and *then* lose currency (a release landing during the medium's filesystem
-        // persist), which throws below. Adding afterwards would skip the tombstone
-        // for a save whose edits are already on disk: exactly the leak this gate
-        // exists to prevent.
+        // Recorded *before* the CAS, because `release_edit_session` reads this set
+        // while the CAS is still in flight. `compare_and_set` validates currency and
+        // then awaits the medium's durable write — a real filesystem write on a
+        // disk-backed memento. A release landing in that window writes its tombstone
+        // decision right then, so an add that waits for the CAS to return is already
+        // too late: the edits reach disk, the tombstone is skipped, and they survive
+        // into the next session. That is the leak this gate exists to close, and the
+        // surviving edit is the folded live-editor value the user never posted.
         persisted_save_identities.add(operation.identity);
         const committed = await update_file_state((current) => ({
             ...current,
