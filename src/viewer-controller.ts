@@ -362,6 +362,11 @@ export function attach_viewer(
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
     let active_save_operation: CsvSaveHostOperation | undefined;
+    // Save identities whose edits `persist_accepted_save` wrote into durable state.
+    // A failed save only needs a tombstone if it got that far; see the write site in
+    // `release_edit_session`. Weak so a retired operation's entry goes with it —
+    // `save_lifecycle.operation` is the only strong reference either way.
+    const persisted_save_identities = new WeakSet<CsvSaveOperation>();
     let save_lifecycle: CsvSaveLifecycle = Object.freeze({
         revision: 0,
         state: 'idle',
@@ -788,7 +793,18 @@ export function attach_viewer(
             save_lifecycle.state === 'failed'
             && save_lifecycle.operation.editSessionId === edit_session_id
         ) {
-            file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+            // Only a save that got as far as `persist_accepted_save` leaves anything
+            // for the tombstone to undo. The early rejections — base mismatch,
+            // removed rows, serialize failure, "still refreshing" — return before
+            // `active_save_operation` is even assigned, so the only pending edits on
+            // disk are the ones the *user's own* posts made durable. A tombstone
+            // there would have `ensure_failed_save_cleanup` strip them by value,
+            // silently discarding work the user still has open in the grid: hit Save
+            // on an externally-changed file, read the "try again" warning, close the
+            // tab, and the edit is gone.
+            if (persisted_save_identities.has(save_lifecycle.operation)) {
+                file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+            }
             retire_save_lifecycle(edit_session_id, 'failed');
         }
 
@@ -2473,6 +2489,7 @@ export function attach_viewer(
         if (!committed || !save_operation_is_current(operation)) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
+        persisted_save_identities.add(operation.identity);
         notify_edit_state(committed);
     }
 

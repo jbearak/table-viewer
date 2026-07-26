@@ -2089,6 +2089,137 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).pendingEdits).toEqual(kept);
     });
 
+    // A save rejected *before* `persist_accepted_save` runs leaves nothing durable
+    // that belongs to it — the only pending edits on disk are the ones the user's
+    // own posts put there. Tombstoning such a save has `ensure_failed_save_cleanup`
+    // strip those by value, silently destroying work the user still has open: hit
+    // Save on an externally-changed file, read the "try again" warning, close the
+    // tab, and the edit is gone. Only a save that reached persistence gets a
+    // tombstone, so the whole family of early rejections is covered by this one.
+    it('keeps pending edits when a save is rejected before it persists anything', async () => {
+        const file_path = '/tmp/pre-persist-rejection-keeps-edits.csv';
+        const versioned = state_store();
+        const write = vi.fn(async () => {});
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(write);
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+
+        // The user's own edit, posted and made durable by pending-edit persistence.
+        const user_map = { '0:0': { value: 'A', base: 'stale' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: user_map,
+        });
+        await flush_promises();
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(user_map);
+
+        // Save rejected by validate_dirty_bases: base 'stale' was never true.
+        // Returns before active_save_operation is set, so nothing is persisted.
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'rejected',
+                edits: { '0:0': 'A' },
+                dirtyEdits: user_map,
+            },
+        });
+        await flush_promises();
+        expect(write).not.toHaveBeenCalled();
+
+        // App re-installs the restore, so the only post available is a complete echo.
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: user_map,
+        });
+        await flush_promises();
+
+        // User closes the tab without resolving.
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session_a });
+        await flush_promises();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        const grant_b = latest_edit_session_message(panel)!;
+        expect(grant_b.granted).toBe(true);
+        expect(grant_b.pendingEdits).toEqual(user_map);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(user_map);
+    });
+
+    // The tombstone-clearing branch looks unreachable — the handler gates on
+    // `edit_message_is_current`, which needs the `owned` phase, and a tombstone only
+    // ever exists once `release_edit_session` has moved to `releasing`. But the gate
+    // runs when the message *arrives*, while the state write runs later on the
+    // `pending_edit_writes` chain, and `update_edit_session_state`'s `is_current`
+    // deliberately admits `releasing` so writes admitted before the boundary still
+    // land. So a post admitted just before a release finishes after the tombstone is
+    // written, with `edit_session_id` still matching it — and a superseding post must
+    // drop that tombstone, or `ensure_failed_save_cleanup` strips the newer edit the
+    // post just committed.
+    it('drops the tombstone for a superseding post admitted before release', async () => {
+        const file_path = '/tmp/superseding-post-races-release.csv';
+        const versioned = state_store();
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('write failed');
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+        const failed_map = { '0:0': { value: 'A', base: 'a' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: failed_map,
+        });
+        await flush_promises();
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'failed-a',
+                edits: { '0:0': 'A' },
+                dirtyEdits: failed_map,
+            },
+        });
+        await flush_promises();
+
+        // Post a superseding edit WITHOUT awaiting, then release in the same tick, so
+        // the post is admitted while the phase is still `owned` but its state write
+        // runs after `release_edit_session` has written the tombstone.
+        //
+        // The post *keeps* the operation's own entry and adds a second one. That is
+        // what makes the clearing observable: cleanup strips by value, so were the
+        // tombstone left standing it would take '0:0' and leave '1:0' behind — a map
+        // half of which the user is still actively editing.
+        const newer = {
+            '0:0': { value: 'A', base: 'a' },
+            '1:0': { value: 'B', base: 'b' },
+        };
+        const post = panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: newer,
+        });
+        const release = panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_a,
+        });
+        await Promise.all([post, release]);
+        await flush_promises();
+
+        // The newer edit survives: the post dropped the tombstone, so the cleanup
+        // that runs at the end of the release had nothing to strip.
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        const grant_b = latest_edit_session_message(panel)!;
+        expect(grant_b.granted).toBe(true);
+        expect(grant_b.pendingEdits).toEqual(newer);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(newer);
+    });
+
     it('does not hydrate a failed save tombstone into a later panel session', async () => {
         const file_path = '/tmp/cross-panel-edit-session-id-collision.csv';
         const versioned = state_store();
