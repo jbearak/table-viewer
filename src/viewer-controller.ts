@@ -3706,10 +3706,49 @@ export function attach_viewer(
                             },
                         );
                     if (result.type !== 'aborted') {
-                        if (file_edit_state) {
+                        // A post used to be taken as proof the user moved on from a
+                        // failed save, retiring its lifecycle and dropping the
+                        // tombstone unconditionally. But the webview can echo the
+                        // failed operation's *own* map back: `request_save` folds an
+                        // open live editor into the operation before the mutation
+                        // boundary closes, so that map was never posted and no
+                        // webview-side dedupe can recognise the echo — the ordinary
+                        // "type in a cell and hit save without pressing Enter" flow.
+                        // Dropping the tombstone there satisfies
+                        // `shared_edit_state_is_unused()` with the cleanup obligation
+                        // unmet, so `ensure_failed_save_cleanup` never runs and the
+                        // edits `persist_accepted_save` made durable *before* the
+                        // failed disk write survive into the next edit session.
+                        //
+                        // So compare values, not just identity: the post supersedes a
+                        // failed operation only when the committed map retains an
+                        // entry the operation does not own. A genuinely newer edit
+                        // still retires the lifecycle; a byte-identical echo does not.
+                        const committed = result.snapshot.state as PerFileState;
+                        const supersedes = (operation: CsvSaveOperation) => (
+                            strip_operation_owned_pending_edits(
+                                committed.pendingEdits,
+                                operation,
+                            ) !== undefined
+                        );
+                        const tombstone = file_edit_state?.failedSaveTombstone;
+                        if (
+                            file_edit_state
+                            && tombstone
+                            && tombstone.editSessionId === edit_session_id
+                            && supersedes(tombstone)
+                        ) {
                             file_edit_state.failedSaveTombstone = undefined;
                         }
-                        retire_save_lifecycle(undefined, 'failed');
+                        if (
+                            save_lifecycle.state === 'failed'
+                            && (
+                                save_lifecycle.operation.editSessionId !== edit_session_id
+                                || supersedes(save_lifecycle.operation)
+                            )
+                        ) {
+                            retire_save_lifecycle(undefined, 'failed');
+                        }
                         notify_edit_state(result.snapshot);
                         delete_shared_edit_state_if_unused();
                     }
