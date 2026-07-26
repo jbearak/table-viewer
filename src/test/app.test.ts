@@ -3673,7 +3673,7 @@ describe('edit mode save exit', () => {
 
         const banner = container!.querySelector('.conflict-banner');
         expect(banner).not.toBeNull();
-        expect(banner!.textContent).toContain('1 edit no longer match');
+        expect(banner!.textContent).toContain('1 edit no longer matches');
         expect(banner!.textContent).toContain('save was cancelled');
         // The host keys reach the grid so the cell is tinted like a derived conflict.
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
@@ -3724,7 +3724,7 @@ describe('edit mode save exit', () => {
         expect(banner).not.toBeNull();
         // Two edits on one removed row is one row to report, 1-based.
         expect(banner!.textContent).toContain('File shrank externally');
-        expect(banner!.textContent).toContain('1 edited row no longer exist');
+        expect(banner!.textContent).toContain('1 edited row no longer exists');
         expect(banner!.textContent).toContain('Affected row: 8');
     });
 
@@ -3761,8 +3761,11 @@ describe('edit mode save exit', () => {
 
         // The real shell restores the submitted dirty map on a failed lifecycle and
         // then reports it; the stub's mount effect re-emits its default status
-        // instead, so replay the report to model the post-rejection state.
-        await report_grid_editing(true, true, [], {
+        // instead, so replay the report to model the post-rejection state. The
+        // reported `conflicted` includes '4:1' because GridShell folds the host keys
+        // into the set it reports — nothing here derived it, which is exactly why
+        // discard_conflicted cannot clear it.
+        await report_grid_editing(true, true, ['4:1'], {
             '4:1': { value: 'edited', base: 'stale' },
             '0:0': { value: 'fine', base: 'a' },
         });
@@ -3774,6 +3777,53 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.discard_conflicted).not.toHaveBeenCalled();
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledTimes(1);
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
+    });
+
+    it('clears host-named and derived conflicts in one press', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        // '4:1' is the host's verdict; '9:3' is one the webview derived on its own
+        // (its page is resident, so is_entry_conflicted could see the drift). The
+        // grid reports the union, which is what the banner tints.
+        await report_grid_editing(true, true, ['4:1', '9:3'], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '9:3': { value: 'local', base: 'drifted' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 905,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-4',
+                    edits: { '4:1': 'edited', '9:3': 'local' },
+                    dirtyEdits: {
+                        '4:1': { value: 'edited', base: 'stale' },
+                        '9:3': { value: 'local', base: 'drifted' },
+                    },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, ['4:1', '9:3'], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '9:3': { value: 'local', base: 'drifted' },
+        });
+
+        await click_button('Discard Conflicted');
+
+        // Both mechanisms fire: discard_keys can only reach the host's key, and
+        // discard_conflicted can only reach the derived one. Dropping either call
+        // would leave half the tinted cells dirty and the banner still up.
+        expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
+        expect(grid_shell_mock.discard_conflicted).toHaveBeenCalledTimes(1);
     });
 
     it('dismisses a host rejection once its edits leave the dirty map', async () => {

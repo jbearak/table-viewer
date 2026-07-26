@@ -2510,6 +2510,14 @@ export function App(): React.JSX.Element {
         edit_mode
         && (show_host_rejection || conflicted_keys.length > 0)
         && conflict_signature !== dismissed_conflict_signature;
+    // Conflicts the *webview* derived and the host did not name. `conflicted_keys` is
+    // already the union of both sources (GridShell merges them so one set drives all
+    // tinting), so this difference is what's left for discard_conflicted to do once
+    // discard_keys has taken the host's share — including nothing, when the rejection
+    // is the only reason the banner is up.
+    const derived_only_conflicts = show_host_rejection
+        ? conflicted_keys.filter((key) => !live_rejected_keys.includes(key))
+        : conflicted_keys;
     const removed_rows = show_host_rejection
         && save_rejection?.reason === 'rowsRemoved'
         ? rejected_rows(live_rejected_keys)
@@ -2520,15 +2528,21 @@ export function App(): React.JSX.Element {
         // for the same reason the *values* cannot be shown either. The row numbers
         // are all the user has to go on. Counted in rows, not keys: several edits on
         // one vanished row are one row lost.
-        ? `File shrank externally. ${removed_rows.length} edited row${
-            removed_rows.length === 1 ? '' : 's'
-        } no longer exist — save was cancelled. Affected row${
+        // Verb agrees with the count, so the noun and the verb are pluralized as one
+        // phrase rather than the noun alone ("1 edited row no longer exist").
+        ? `File shrank externally. ${
+            removed_rows.length === 1
+                ? '1 edited row no longer exists'
+                : `${removed_rows.length} edited rows no longer exist`
+        } — save was cancelled. Affected row${
             removed_rows.length === 1 ? '' : 's'
         }: ${removed_rows.join(', ')}.`
         : show_host_rejection
-            ? `File changed externally. ${live_rejected_keys.length} edit${
-                live_rejected_keys.length === 1 ? '' : 's'
-            } no longer match the file — save was cancelled. Highlighted cells show conflicts.`
+            ? `File changed externally. ${
+                live_rejected_keys.length === 1
+                    ? '1 edit no longer matches'
+                    : `${live_rejected_keys.length} edits no longer match`
+            } the file — save was cancelled. Highlighted cells show conflicts.`
             : `File changed externally. ${conflicted_keys.length} edit${
                 conflicted_keys.length === 1 ? '' : 's'
             } may be affected — highlighted cells show conflicts.`;
@@ -2725,17 +2739,26 @@ export function App(): React.JSX.Element {
                         </button>
                         <button
                             onClick={() => {
-                                // Two distinct actions behind one label. For a host
-                                // rejection the named keys are the only ones that
-                                // can be discarded meaningfully: discard_conflicted
-                                // is a retain over is_entry_conflicted, which is
-                                // false for every one of them, so it would keep the
-                                // blocking entry and leave the session unsaveable.
+                                // Two mechanisms, one label — and both may be needed
+                                // in the same press. discard_conflicted is a retain
+                                // over is_entry_conflicted, which is false for every
+                                // host-named key, so it alone would keep the entry
+                                // that is blocking the save; discard_keys names only
+                                // the host's. The grid tints the *union* of the two
+                                // sets, so a press that cleared only one of them
+                                // would leave the banner up over still-tinted cells
+                                // and demand a second press for the other half.
+                                //
+                                // Ordering is safe in either direction: both store
+                                // operations read the live entry map rather than a
+                                // captured snapshot, so the retain sees the map with
+                                // the host keys already gone.
                                 if (show_host_rejection) {
                                     editing_ref.current?.discard_keys(live_rejected_keys);
-                                    return;
                                 }
-                                editing_ref.current?.discard_conflicted();
+                                if (derived_only_conflicts.length > 0) {
+                                    editing_ref.current?.discard_conflicted();
+                                }
                             }}
                         >
                             Discard Conflicted
