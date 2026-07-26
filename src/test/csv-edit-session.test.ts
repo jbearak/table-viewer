@@ -4773,6 +4773,9 @@ describe('CSV edit sessions', () => {
             type: 'transformApplied',
             requestId: 'sibling-during-edit',
             error: 'Another panel is editing this file.',
+            // The other panel's session ends, so this is worth retrying and the
+            // sibling must keep its own copy of the request rather than adopt ours.
+            transientRefusal: true,
         }));
     });
 
@@ -5051,6 +5054,9 @@ describe('CSV edit sessions', () => {
             type: 'transformApplied',
             requestId: 'sort-during-save',
             error: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+            // Flagged transient so the webview keeps the request and retries once the
+            // save lands, instead of adopting the unchanged state it just echoed.
+            transientRefusal: true,
         }));
         // The save itself persists a sheet-shaped transforms array, so the
         // meaningful assertion is that the refused sort left no entry in it.

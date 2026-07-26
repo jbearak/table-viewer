@@ -582,13 +582,29 @@ export function App(): React.JSX.Element {
     ) => {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
+        // Read the outgoing stamp before install overwrites it.
+        const previous_identity = edit_session_ref.current!.identity();
         edit_session_ref.current!.install({ session_id }, edits);
         // An acknowledgement is about a specific set of dirty cells, so it expires
-        // with the map it described. Every lifecycle path that empties or replaces
-        // the dirty map — a successful save plus reload, a discard, a re-grant —
-        // crosses this boundary, so this one reset covers all three and stops a
-        // later, coincidentally identical signature reading as already acknowledged.
-        set_acknowledged_stale_signature(undefined);
+        // when the *session* it belonged to does — not on every crossing of this
+        // boundary. Crossing it is not by itself evidence of a new dirty map: the
+        // host echo after pendingEditsChanged and failed-save hydration both
+        // re-install the identical map for the same session, and resetting there
+        // resurrected a banner the user had just dismissed as soon as a delayed
+        // echo landed.
+        //
+        // Keying on the session id still covers every path that genuinely replaces
+        // the map: a successful save plus reload, a discard and a re-grant either
+        // change the session id or install an empty map — and an empty dirty map
+        // makes the signature `undefined`, which hides the banner on its own with
+        // no acknowledgement to expire. A never-stamped store counts as a change;
+        // the reset is a no-op there.
+        if (
+            previous_identity === null
+            || previous_identity.session_id !== session_id
+        ) {
+            set_acknowledged_stale_signature(undefined);
+        }
         // Deliberately does NOT clear the host's save verdict. Crossing this
         // boundary is not evidence that the judged map is gone: the refresh branch
         // installs on a snapshot for our *own* session, and what it installs is
@@ -1237,6 +1253,56 @@ export function App(): React.JSX.Element {
                 ) {
                     return;
                 }
+                if (msg.error && msg.transientRefusal) {
+                    // A transient refusal means the host changed nothing and the
+                    // request is worth retrying, so this path is deliberately
+                    // non-authoritative: it clears the in-flight UI and warns, and
+                    // touches neither the generation, nor the saved/applied
+                    // transforms, nor transform_applied_for_source_ref — leaving the
+                    // latter false is what lets the restore effect retry once the
+                    // refusing condition (a save in flight) settles.
+                    //
+                    // It also must NOT commit_live_edit(): the fold below exists
+                    // only because a generation bump unmounts the grid that owns the
+                    // overlay. No install means no bump means no unmount, so folding
+                    // here would commit an edit the user never confirmed.
+                    const origin =
+                        pending_transform_origins_ref.current[msg.sheetIndex];
+                    pending_transform_request_ids_ref.current[msg.sheetIndex] =
+                        undefined;
+                    pending_transform_states_ref.current[msg.sheetIndex] = undefined;
+                    pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                    // Focus still has to come back. The unchanged generation is
+                    // precisely what the focus effect's
+                    // `grid_focus_restore.generation !== generation` check wants.
+                    if (origin === 'grid') {
+                        set_grid_focus_restore({
+                            sheet_index: msg.sheetIndex,
+                            generation: msg.generation,
+                            document_epoch: document_epoch_ref.current,
+                        });
+                    } else if (origin === 'toolbar') {
+                        set_toolbar_focus_restore({
+                            sheet_index: msg.sheetIndex,
+                            document_epoch: document_epoch_ref.current,
+                        });
+                    }
+                    set_pending_transforms((prev) => {
+                        const next = [...prev];
+                        next[msg.sheetIndex] = false;
+                        return next;
+                    });
+                    set_pending_transform_labels((prev) => {
+                        const next = [...prev];
+                        next[msg.sheetIndex] = '';
+                        return next;
+                    });
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: `Could not update the table view: ${msg.error}`,
+                    });
+                    return;
+                }
                 // Fold the open overlay into the store before the generation bump
                 // below unmounts the grid that owns it. Doable here rather than at
                 // dispatch time because GridShell is still mounted and Glide's
@@ -1443,8 +1509,17 @@ export function App(): React.JSX.Element {
     // silently uninstalled for the rest of the session. Preview keeps its gate
     // (natural source order is a trust boundary there) and so does a pending
     // Excel header change, which is about to reshape the rows itself.
+    //
+    // A save in flight is a gate rather than a plain skip: the host refuses a
+    // transform during a save, and a refusal changes none of this effect's other
+    // deps, so without the boolean in the dep list a refresh mid-save would leave
+    // the stored transform uninstalled forever. Depending on the boolean and not
+    // on `editing_status` is deliberate — the grid reports editing status on every
+    // commit, so the object would re-run this on every keystroke.
+    const save_in_flight = editing_status?.save_in_flight === true;
     useEffect(() => {
         if (!meta || preview_mode || pending_excel_header !== null) return;
+        if (save_in_flight) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -1469,6 +1544,7 @@ export function App(): React.JSX.Element {
         pending_excel_header,
         active_sheet_index,
         request_transform,
+        save_in_flight,
     ]);
 
     const handle_sheet_select = useCallback(
@@ -1920,6 +1996,11 @@ export function App(): React.JSX.Element {
     ]);
 
     const handle_cancel_transform = useCallback(() => {
+        // A cancel the host would refuse must not displace the request it is
+        // cancelling: request_transform overwrites the pending requestId, so the
+        // original in-flight response would stop matching and the webview would sit
+        // on a stale generation. Same admission set as handle_transform_change.
+        if (save_in_flight_ref.current) return;
         const previous = applied_transforms[active_sheet_index]
             ?? {
                 sort: [],

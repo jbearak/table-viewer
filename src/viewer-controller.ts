@@ -3016,7 +3016,14 @@ export function attach_viewer(
             ? begin_transform_admission()
             : { operation: Symbol(file_key) };
         if ('refusal' in transform_admission) {
-            await core?.reject_transform(message, transform_admission.refusal);
+            // Transient: the admission matrix refuses on an edit-session phase or a
+            // save in flight, both of which end on their own. The webview keeps its
+            // requested transform and retries instead of adopting the unchanged echo.
+            await core?.reject_transform(
+                message,
+                transform_admission.refusal,
+                true,
+            );
             return;
         }
         let resolve_completion!: () => void;

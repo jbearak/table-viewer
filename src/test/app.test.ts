@@ -5739,6 +5739,189 @@ describe('transforms during an edit session', () => {
     });
 });
 
+// A refusal always means the host changed nothing. `transientRefusal` says whether
+// the reason will clear on its own, which decides whether the webview may adopt the
+// echo (terminal validation) or must keep its own copy and retry (the admission
+// matrix).
+describe('refused transforms', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+
+    /** Edit mode over an editable CSV whose persisted state carries STORED_SORT. */
+    async function refresh_with_stored_sort(
+        post_message: ReturnType<typeof vi.fn>,
+    ) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES, state: { transforms: [STORED_SORT] } },
+        ));
+        return latest_transform_request(post_message);
+    }
+
+    async function editing_csv() {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(rendered.post_message);
+        return rendered;
+    }
+
+    async function refuse_transform(
+        request: Extract<WebviewMessage, { type: 'setTransform' }>,
+        options: { transient: boolean; generation: number },
+    ) {
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: request.sheetIndex,
+            // A refusal echoes the host's own unchanged state, which here is none.
+            state: { sort: [], filters: [] },
+            rowCount: 1,
+            requestId: request.requestId,
+            generation: options.generation,
+            sourceGeneration: request.sourceGeneration,
+            intent: request.intent,
+            error: 'A save is in progress.',
+            ...(options.transient ? { transientRefusal: true } : {}),
+        });
+    }
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    /** Move the save in and back out of flight, the one dep the restore effect
+     *  gained, so a retriable source gets its second chance. */
+    async function settle_a_save() {
+        await report_grid_editing(true, true, [], undefined, true);
+        await report_grid_editing(true, true, [], undefined, false);
+    }
+
+    it('keeps a transiently refused transform retriable', async () => {
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = grid_stub().getAttribute('data-generation');
+        grid_shell_mock.commit_live_edit.mockClear();
+        post_message.mockClear();
+
+        await refuse_transform(request, { transient: true, generation: 99 });
+
+        // Nothing adopted: neither the echoed generation nor the emptied state.
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // No generation bump means no unmount, so folding the open overlay would
+        // commit an edit the user never confirmed.
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // The spinner and its label must not stick.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        expect(document.querySelector('.toolbar-progress')).toBeNull();
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+
+        // The webview still holds the saved transform and has not marked the source
+        // handled, so the effect asks again once the refusing condition settles.
+        post_message.mockClear();
+        await settle_a_save();
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('adopts the natural state for a terminal refusal', async () => {
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        grid_shell_mock.commit_live_edit.mockClear();
+        post_message.mockClear();
+
+        await refuse_transform(request, { transient: false, generation: 99 });
+
+        // Authoritative, exactly as before: the echoed generation and the empty
+        // state land, and the fold for the impending unmount still happens.
+        expect(grid_stub().getAttribute('data-generation')).toBe('99');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalled();
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+
+        // And the source counts as handled, which is how a saved transform the sheet
+        // can no longer support stays dropped instead of being asked for forever.
+        post_message.mockClear();
+        await settle_a_save();
+        expect(transform_requests(post_message)).toEqual([]);
+    });
+
+    it('holds the stored transform back until a save settles', async () => {
+        const { post_message } = await editing_csv();
+        await report_grid_editing(true, true, [], undefined, true);
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES, state: { transforms: [STORED_SORT] } },
+        ));
+        // The host would refuse this one, and a refusal changes no other dep of the
+        // restore effect, so asking now is asking never.
+        expect(transform_requests(post_message)).toEqual([]);
+
+        await report_grid_editing(true, true, [], undefined, false);
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('blocks Cancel while a save is in flight', async () => {
+        const { post_message } = await editing_csv();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        latest_transform_request(post_message);
+        expect(get_button('Cancel').disabled).toBe(false);
+
+        // Second layer, because the button is only the affordance and it lags by a
+        // render: the save starts and the click lands before React has repainted the
+        // toolbar, which is the actual race. A cancel the host would refuse must not
+        // displace the request it is cancelling, whose requestId it would overwrite.
+        post_message.mockClear();
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'dirty', base: 'base' } },
+                conflicted: [],
+            });
+            get_button('Cancel').click();
+        });
+        expect(transform_requests(post_message)).toEqual([]);
+        // And once React catches up the affordance agrees.
+        expect(get_button('Cancel').disabled).toBe(true);
+
+        // The other half: nothing here permanently disables cancelling.
+        await report_grid_editing(true, true, [], undefined, false);
+        expect(get_button('Cancel').disabled).toBe(false);
+        post_message.mockClear();
+        await click_button('Cancel');
+        expect(transform_requests(post_message)).toHaveLength(1);
+    });
+});
+
 describe('stale-view banner', () => {
     const BANNER_TEXT = 'Sorting and filters don\'t update while you\'re editing.';
     // A future contributor must not be able to reintroduce a "Resort"/"Refresh"
@@ -5824,6 +6007,84 @@ describe('stale-view banner', () => {
 
         // A dismissal covers the edits it was pressed over, not later ones.
         await report_grid_editing(true, true, [], dirty('0:0', '1:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('survives an identical same-session hydration', async () => {
+        const post_message = await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // The host echo after pendingEditsChanged: same session, same dirty map,
+        // same installed order. A delayed echo of what the user is already looking
+        // at must not resurrect the banner they just dismissed.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                    pendingEdits: dirty('0:0'),
+                },
+            },
+        ));
+        await acknowledge_transform(latest_transform_request(post_message), 3);
+        await report_grid_editing(true, true, [], dirty('0:0'));
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('expires with the session it was pressed in', async () => {
+        // Restored-session route rather than a re-grant: entering edit mode refuses
+        // while a sort is installed, so a *second* session that already has both can
+        // only arrive with a document load.
+        const { post_message } = await render_app();
+        const restored_session = async (session_id: string) => {
+            await dispatch_host_message(initial_snapshot_message(
+                make_meta(['Sheet1'], false),
+                {
+                    capabilities: {
+                        csvEditable: true,
+                        csvEditingSupported: true,
+                        csvEditSessionId: session_id,
+                    },
+                    state: {
+                        transforms: [{
+                            sort: [{ colIndex: 0, direction: 'asc' }],
+                            filters: [],
+                            schema: '["Sheet1",1,null]',
+                        }],
+                        pendingEdits: dirty('0:0'),
+                    },
+                },
+            ));
+            await acknowledge_transform(latest_transform_request(post_message), 2);
+            await report_grid_editing(true, true, [], dirty('0:0'));
+            expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+            expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        };
+
+        await restored_session('first-session');
+        expect(banner()).not.toBeNull();
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        await restored_session('second-session');
+
+        // A different session's map is not the one that was acknowledged, even when
+        // the cells happen to coincide.
         expect(banner()?.textContent).toContain(BANNER_TEXT);
         expect_no_call_to_action();
     });

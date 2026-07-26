@@ -366,6 +366,11 @@ describe('Excel workbook snapshot controller', () => {
             error: 'Use Unhide all to restore rows above the active header.',
             state: { hiddenRows: [0, 1] },
         });
+        // Terminal, not transient: nothing here clears on its own, so the webview is
+        // right to adopt the echoed state instead of retrying.
+        expect(messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'bypass-atomic-unhide',
+        )?.transientRefusal).toBeUndefined();
         await panel.__receive({
             type: 'setTransform',
             sheetIndex: 0,
@@ -628,6 +633,11 @@ describe('Excel workbook snapshot controller', () => {
             error: 'The saved table view no longer matches this sheet.',
             state: { hiddenRows: [0, 1] },
         });
+        // A validation refusal is terminal: adopting the echo is how a saved view
+        // the sheet can no longer support gets dropped instead of retried forever.
+        expect(messages_of(panel, 'transformApplied').find(
+            (message) => message.requestId === 'wrong-live-schema',
+        )?.transientRefusal).toBeUndefined();
         expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
 
         await panel.__receive({

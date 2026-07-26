@@ -366,7 +366,19 @@ export type HostMessage =
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
-    | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string };
+    /**
+     * `error` present always means the host changed nothing and is echoing its own
+     * unchanged state, generation and row count.
+     *
+     * `transientRefusal` distinguishes *why*: the host refused for a reason that
+     * clears on its own (an edit-session phase, a save in flight), so the request
+     * is worth retrying and the webview must keep its own copy of the requested
+     * transform rather than adopting the echo. Absent means the refusal is
+     * terminal validation (out-of-range sheet, stale source generation, schema
+     * mismatch) — the echo *is* the answer, and adopting it is how an invalid
+     * saved transform gets dropped from the UI.
+     */
+    | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string; transientRefusal?: boolean };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =

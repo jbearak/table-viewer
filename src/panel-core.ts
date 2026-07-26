@@ -794,13 +794,25 @@ export class ViewerPanelCore {
         }
     }
 
+    /**
+     * `transient` says the refusal will clear on its own and the request is worth
+     * retrying; the default is a terminal validation refusal, which the webview
+     * answers by adopting the echoed state.
+     */
     reject_transform(
         msg: SetTransformMessage,
         error: string,
+        transient = false,
     ): Promise<boolean> {
         const natural_count =
             this.source.meta().sheets[msg.sheetIndex]?.rowCount ?? 0;
-        return this.post_transform_error(msg, natural_count, error);
+        return this.post_transform_error(
+            msg,
+            natural_count,
+            error,
+            this.receiver_epoch,
+            transient,
+        );
     }
 
     private post_transform_error(
@@ -808,6 +820,7 @@ export class ViewerPanelCore {
         natural_row_count: number,
         error: string,
         receiver_epoch = this.receiver_epoch,
+        transient = false,
     ): Promise<boolean> {
         const previous = this.transform_states.get(msg.sheetIndex)
             ?? EMPTY_TRANSFORM;
@@ -822,6 +835,7 @@ export class ViewerPanelCore {
             sourceGeneration: this._source_generation,
             intent: msg.intent,
             error,
+            ...(transient ? { transientRefusal: true } : {}),
         }, receiver_epoch);
     }
 
