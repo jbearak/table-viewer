@@ -203,7 +203,10 @@ describe('hide rows controller', () => {
             [{ start: 0, end: 1 }],
         );
 
-        expect(applied.view.rules?.hiddenRows).toEqual([1, 2]);
+        // The rules the host now holds, read from the ack message beside the record:
+        // the record carries rules only for a view it permuted, and this assertion is
+        // about the durable set the next line matches against the persisted copy.
+        expect(applied.rules?.hiddenRows).toEqual([1, 2]);
         expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([1, 2]);
     });
 
@@ -222,7 +225,7 @@ describe('hide rows controller', () => {
             [{ start: 0, end: 0 }],
         );
 
-        expect(second.view.rules?.hiddenRows).toEqual([0, 1]);
+        expect(second.rules?.hiddenRows).toEqual([0, 1]);
         expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([0, 1]);
     });
 

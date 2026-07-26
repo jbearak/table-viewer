@@ -7,6 +7,7 @@ import {
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import type {
+    HostMessage,
     SheetTransformState,
     SheetViewRecord,
     WebviewMessage,
@@ -535,17 +536,23 @@ describe('ViewerPanelCore', () => {
                 (candidate) => candidate.type === 'transformInstalled',
             ).at(-1);
             expect(message.requestId).toBe(requestId);
-            return message.view as SheetViewRecord;
+            return message as Extract<HostMessage, { type: 'transformInstalled' }>;
         };
 
-        const hidden = await install('hidden', {
+        const hidden = (await install('hidden', {
             sort: [],
             filters: [],
             hiddenRows: [1, 3],
             schema: '["Sheet1",2,null]',
-        });
+        })).view;
         expect(hidden.permuted).toBe(true);
         expect(hidden.rowCount).toBe(3);
+        // The permuted arm's rules are the set the permutation was built from, and this
+        // is the only place the *record's* copy is checked at all: emptying it failed a
+        // single test elsewhere in the suite, because every webview test fabricates its
+        // own record. Cancel's rollback baseline reads exactly this.
+        if (!hidden.permuted) throw new Error('expected a permuted view');
+        expect(hidden.rules.hiddenRows).toEqual([1, 3]);
 
         const disabled = await install('disabled', {
             sort: [],
@@ -559,10 +566,24 @@ describe('ViewerPanelCore', () => {
             }],
             schema: '["Sheet1",2,null]',
         });
-        // The definition survives, and the rows are the source's again.
-        expect(disabled.permuted).toBe(false);
-        expect(disabled.rowCount).toBe(5);
+        expect(disabled.view.permuted).toBe(false);
+        expect(disabled.view.rowCount).toBe(5);
+        // The definition survives — on the message, which is where the host's durable
+        // rules live now that the record carries rules only for a view it permuted.
         expect(disabled.rules?.filters).toHaveLength(1);
+
+        // Probing for holes found this one: the ack normalizes a rule set with no
+        // entries to `undefined`, and nothing held that to account — the assertion that
+        // looked like it did reaches the path with no state stored at all. The webview
+        // copies these rules straight into durable state, so an entry-less object here
+        // is persisted where "no transform" belongs.
+        const cleared = await install('cleared', {
+            sort: [],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        });
+        expect(cleared.view.permuted).toBe(false);
+        expect(cleared.rules).toBeUndefined();
     });
 
     describe('hiddenEditedCellKeys', () => {
@@ -605,7 +626,13 @@ describe('ViewerPanelCore', () => {
                     (candidate) => candidate.type === 'transformInstalled',
                 ).at(-1);
                 expect(message.requestId).toBe(requestId);
-                return message.view as SheetViewRecord;
+                // Every rule set installed in here is active, so the ack is the
+                // permuted arm — the only arm with hidden keys to report. Narrowed by
+                // the discriminant rather than cast: if one of these stopped permuting,
+                // the assertion below would say so instead of the field vanishing.
+                const view = message.view as SheetViewRecord;
+                if (!view.permuted) throw new Error('expected a permuted view');
+                return view;
             };
             return { core, install, durablePendingEditKeys };
         }
@@ -777,6 +804,7 @@ describe('ViewerPanelCore', () => {
             const view = (posted.find(
                 (message) => message.type === 'transformInstalled',
             ).view) as SheetViewRecord;
+            if (!view.permuted) throw new Error('expected a permuted view');
             expect(view.rowCount).toBe(1);
             expect(view.hiddenEditedCellKeys).toEqual([]);
         });

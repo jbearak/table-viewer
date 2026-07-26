@@ -15,6 +15,7 @@ import {
     operator_supports_case_sensitive,
     remove_sort,
     replace_sort,
+    order_relevant_dirty_keys,
     stale_view_signature,
     transform_progress_label,
     transform_shortcut,
@@ -367,5 +368,67 @@ describe('stale_view_signature', () => {
         // a promise about anything.
         expect(stale_view_signature(sort_on_2, ['5:2'], ['9:1', '3:4']))
             .toBe(stale_view_signature(sort_on_2, ['5:2'], ['3:4', '9:1']));
+    });
+
+    it('changes when another dirty cell lands in a read column', () => {
+        // Probing for holes found this one: the hidden half was pinned in both
+        // directions here and the *order* half was pinned nowhere in this file — dropping
+        // `affected` from the signature entirely failed only two app-level tests.
+        // Both halves have to be folded in, because either alone is enough to make the
+        // notice speak and a dismissal covers only what it was pressed over.
+        expect(stale_view_signature(sort_on_2, ['5:2'], []))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2', '7:2'], []));
+    });
+});
+
+describe('order_relevant_dirty_keys', () => {
+    const sorted_on_0: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+    };
+    const enabled_filter = (colIndex: number): FilterEntry => ({
+        ...entry('equals', '5'),
+        id: `filter-${colIndex}`,
+        colIndex,
+        enabled: true,
+    });
+
+    it('names the dirty cells in a sorted column and no others', () => {
+        expect(order_relevant_dirty_keys(sorted_on_0, ['5:0', '5:1'])).toEqual(['5:0']);
+    });
+
+    it('names none for a view that only hides rows', () => {
+        // The condition on the notice's first sentence, which claims that sorting and
+        // filters do not update mid-edit. A view permuted by `hiddenRows` alone has
+        // neither, so there is no such claim to make however many rows it drops.
+        expect(order_relevant_dirty_keys(
+            { sort: [], filters: [], hiddenRows: [5] },
+            ['5:0', '5:1'],
+        )).toEqual([]);
+    });
+
+    it('names none for a disabled filter on the dirty column', () => {
+        expect(order_relevant_dirty_keys(
+            {
+                sort: [],
+                filters: [{ ...enabled_filter(0), enabled: false }],
+            },
+            ['5:0'],
+        )).toEqual([]);
+        expect(order_relevant_dirty_keys(
+            { sort: [], filters: [enabled_filter(0)] },
+            ['5:0'],
+        )).toEqual(['5:0']);
+    });
+
+    it('names none without an installed transform', () => {
+        expect(order_relevant_dirty_keys(undefined, ['5:0'])).toEqual([]);
+    });
+
+    it('does not read a malformed key as column 0', () => {
+        // `Number('')` is 0, which would make every tail-less key an edit in the first
+        // sorted column.
+        expect(order_relevant_dirty_keys(sorted_on_0, ['5:', ':', 'nonsense', '5']))
+            .toEqual([]);
     });
 });

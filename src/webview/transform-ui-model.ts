@@ -320,6 +320,16 @@ export function transform_progress_label(
  *    whose saved values exclude their rows — is exactly that shape. Gating it behind
  *    the column test would silence the notice in the case it exists for.
  *
+ * Both reasons are folded in, which is what makes a dismissal specific to the one that
+ * was speaking: the notice renders a sentence per reason and either can stand alone, so
+ * acknowledging a hidden-cell notice must leave a later stale-order notice free to
+ * appear and the other way round. Each half is pinned in both directions — dropping
+ * either from the result fails tests. They occupy their own `|`-delimited fields for
+ * legibility rather than for discrimination: the caller only ever passes hidden keys the
+ * dirty map still holds, so `affected` and `hidden` are both subsets of the dirty map
+ * and merging them into one sorted list was probed and fails nothing. The separation is
+ * kept because a reader can see which reason a signature is about.
+ *
  * The column half is derived from the *current* dirty map rather than latched, so
  * reverting or discarding the last relevant edit clears it for free. The
  * transform's own signature is folded in so changing the installed sort is a new
@@ -353,6 +363,39 @@ export function transform_progress_label(
  * @param hidden_edited_cell_keys the installed view's
  *   `hiddenEditedCellKeys` already narrowed to entries the dirty map still holds.
  */
+/**
+ * The dirty cells that sit in a column the installed order reads — sorted, so the same
+ * set is the same list.
+ *
+ * Its own function because two callers need the same answer and must not be able to
+ * disagree: this is both the first half of `stale_view_signature` and the condition on
+ * the notice's *first sentence*. That sentence says sorting and filters do not
+ * recompute mid-edit, and a view permuted by `hiddenRows` alone has neither — the
+ * sentence was rendered unconditionally beside the hidden-cell one and was simply false
+ * there. Deriving the sentence from the same list the signature folds in is what keeps
+ * "what the notice says" and "what a dismissal acknowledges" the one fact.
+ */
+export function order_relevant_dirty_keys(
+    state: SheetTransformState | undefined,
+    dirty_keys: readonly string[],
+): readonly string[] {
+    if (!state) return [];
+    const columns = transform_read_columns(state);
+    if (columns.size === 0) return [];
+    return dirty_keys
+        .filter((key) => {
+            const separator = key.indexOf(':');
+            if (separator < 0) return false;
+            const text = key.slice(separator + 1);
+            const column = Number(text);
+            // Number('') is 0, so an empty tail would otherwise read as column 0.
+            return text.length > 0
+                && Number.isInteger(column)
+                && columns.has(column);
+        })
+        .sort();
+}
+
 export function stale_view_signature(
     state: SheetTransformState | undefined,
     dirty_keys: readonly string[],
@@ -361,21 +404,7 @@ export function stale_view_signature(
     // No installed rules is no view to be stale about, and nothing can be hidden by
     // one either — so this also makes the rules serialization below total.
     if (!state) return undefined;
-    const columns = transform_read_columns(state);
-    const affected = columns.size === 0
-        ? []
-        : dirty_keys
-            .filter((key) => {
-                const separator = key.indexOf(':');
-                if (separator < 0) return false;
-                const text = key.slice(separator + 1);
-                const column = Number(text);
-                // Number('') is 0, so an empty tail would otherwise read as column 0.
-                return text.length > 0
-                    && Number.isInteger(column)
-                    && columns.has(column);
-            })
-            .sort();
+    const affected = order_relevant_dirty_keys(state, dirty_keys);
     if (affected.length === 0 && hidden_edited_cell_keys.length === 0) {
         return undefined;
     }

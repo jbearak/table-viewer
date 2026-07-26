@@ -27,6 +27,7 @@ import {
     type SheetColumnVisibilityState,
     type SheetViewRecord,
     type TransformIntent,
+    type ViewBasis,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -39,6 +40,7 @@ import {
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import {
+    order_relevant_dirty_keys,
     stale_view_signature,
     transform_progress_label,
     upsert_filter,
@@ -156,10 +158,7 @@ function sheet_widths_equal(
  * to ask about an installed view: same rows, keep the record; different rows,
  * replace it. There is no way to answer it for the rules and not for the row count.
  */
-function view_bases_equal(
-    left: SheetViewRecord['basis'],
-    right: SheetViewRecord['basis'],
-): boolean {
+function view_bases_equal(left: ViewBasis, right: ViewBasis): boolean {
     return left.generation === right.generation
         && left.sourceGeneration === right.sourceGeneration
         && left.schema === right.schema;
@@ -168,25 +167,32 @@ function view_bases_equal(
 /**
  * A held record carrying the delivery's fresh hidden edited cells.
  *
- * Exactly one field of `SheetViewRecord` is edit-derived; `rules`, `rowCount`,
- * `permuted` and `basis` are all row-derived, and a same-basis refresh is by
- * definition news about neither the rows nor the rules. Taking only this one field is
- * therefore not partial invalidation of the record — it is the only field a delivery
- * that moved no row can have a newer answer for. What licenses taking it is the same
- * basis equality that licenses keeping the rest: the host samples these keys and the
- * generation together, so a generation still equal to the record's is proof these keys
- * were computed against the very permutation that record describes.
+ * Exactly one field of `SheetViewRecord` is edit-derived; `rules`, `rowCount` and
+ * `basis` are all row-derived, and a same-basis refresh is by definition news about
+ * neither the rows nor the rules. Taking only this one field is therefore not partial
+ * invalidation of the record — it is the only field a delivery that moved no row can
+ * have a newer answer for. What licenses taking it is the same basis equality that
+ * licenses keeping the rest: the host samples these keys and the generation together,
+ * so a generation still equal to the record's is proof these keys were computed
+ * against the very permutation that record describes.
  *
- * Deliberately unconditional rather than returning `held` unchanged when the keys
- * match. Probed rather than assumed: preserving the object's identity fails no test,
- * and it cannot — `set_sheet_views` rebuilds the array on every applied snapshot
- * regardless, and every consumer reads the record by value, the restore effect
- * included. A guard nothing can hold to account is worse than the allocation it saves.
+ * A non-permuted record has no such field, and passes through: with no permutation
+ * there is no row the view fails to show, and the host's answer for such a sheet is
+ * empty for exactly that reason, so there is nothing here to take. Structural rather
+ * than checked — the arm has no `hiddenEditedCellKeys` to write.
+ *
+ * Deliberately unconditional on the permuted arm rather than returning `held`
+ * unchanged when the keys match. Probed rather than assumed: preserving the object's
+ * identity fails no test, and it cannot — `set_sheet_views` rebuilds the array on
+ * every applied snapshot regardless, and every consumer reads the record by value, the
+ * restore effect included. A guard nothing can hold to account is worse than the
+ * allocation it saves.
  */
 function view_record_with_hidden_keys(
     held: SheetViewRecord,
     fresh: readonly string[],
 ): SheetViewRecord {
+    if (!held.permuted) return held;
     return { ...held, hiddenEditedCellKeys: fresh };
 }
 
@@ -200,14 +206,15 @@ function view_record_with_hidden_keys(
  * from under an installed permutation without the restore reconciliation seeing it.
  *
  * When nothing is permuted there is no installed view to describe, so the baseline is
- * the durable intent — read live, at click time. A record's rules cannot serve: a
- * sibling that replaces or removes a *disabled* filter definition moves no row, so
- * nothing installs, no generation moves, and the same-basis retention goes on holding
- * definitions the sibling deleted. Cancel persists what it sends, so reading that copy
- * would silently resurrect them over the sibling's update. `state_ref.current
- * .transforms` is the same value the record's copy came from, sanitized against the
- * delivered schema by the snapshot handler before it was stored, and it is what
- * `handle_transform_change` already compares a new request against.
+ * the durable intent — read live, at click time. A record's rules could not serve, and
+ * the non-permuted arm no longer has any: a sibling that replaces or removes a
+ * *disabled* filter definition moves no row, so nothing installs, no generation moves,
+ * and the same-basis retention would go on holding definitions the sibling deleted.
+ * Cancel persists what it sends, so reading that copy would silently resurrect them
+ * over the sibling's update. `state_ref.current.transforms` is the same value that copy
+ * came from, sanitized against the delivered schema by the snapshot handler before it
+ * was stored, and it is what `handle_transform_change` already compares a new request
+ * against.
  *
  * Wholly-inactive durable rules pass through as they are rather than being flattened
  * to empty: a filter the user merely switched off is a definition the host holds and
@@ -221,7 +228,7 @@ function transform_rollback_baseline(
     durable: SheetTransformState | undefined,
     schema: string | undefined,
 ): SheetTransformState {
-    if (installed?.permuted && installed.rules) return installed.rules;
+    if (installed?.permuted) return installed.rules;
     if (durable && transform_has_entries(durable) && !transform_is_active(durable)) {
         return durable;
     }
@@ -1428,36 +1435,25 @@ export function App(): React.JSX.Element {
                             // re-requested and until it lands the rows are the
                             // metadata's own.
                             //
-                            // Which is why no rules are recorded, not even the durable
-                            // definitions a filter the user switched off leaves behind.
-                            // This branch asserts that nothing is installed, so there
-                            // are no installed rules to name, and a record that named
-                            // them anyway would be holding a copy of durable intent
-                            // that basis equality never licensed keeping — see the rule
-                            // on `SheetViewRecord`. Cancel used to read that copy as its
+                            // Which is why this is the `permuted: false` arm and there
+                            // is nothing else to fill in. No rules — not even the
+                            // durable definitions a filter the user switched off leaves
+                            // behind — because this branch asserts that nothing is
+                            // installed, and a record naming them anyway would be
+                            // holding a copy of durable intent that basis equality never
+                            // licensed keeping. Cancel used to read that copy as its
                             // rollback baseline; it now reads the intent live, which is
                             // the only way to see a sibling that replaced or removed a
                             // disabled definition without moving a row.
-                            return {
-                                basis,
-                                rules: undefined,
-                                rowCount: sheet.rowCount,
-                                permuted: false,
-                                // A natural view contains every row, so it hides no
-                                // edit. Fabricating this here is safe for the same
-                                // reason `permuted: false` is: this snapshot's rows
-                                // are the metadata's own until an install lands, and
-                                // that install carries the host's real set.
-                                //
-                                // Deliberately not `snapshot.hiddenEditedCellKeys`,
-                                // even though the delivery has one: this branch is
-                                // building a record that says no permutation is in
-                                // place, and the host's answer is about whatever
-                                // permutation it does hold. Adopting it here would
-                                // make the record self-contradictory — cells named as
-                                // out of sight of a view claiming to show every row.
-                                hiddenEditedCellKeys: [],
-                            };
+                            //
+                            // And no hidden edited cells, which used to be a fabricated
+                            // `[]` here: a view containing every row hides no edit, and
+                            // adopting `snapshot.hiddenEditedCellKeys` instead — which
+                            // the delivery does carry, about whatever permutation the
+                            // host holds — would have made the record self-contradictory.
+                            // Both mistakes are now unwritable rather than commented
+                            // against; see the rule on `SheetViewRecord`.
+                            return { basis, permuted: false, rowCount: sheet.rowCount };
                         },
                     ));
                     set_truncation_message(snapshot.truncationMessage);
@@ -1673,12 +1669,16 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = view;
                     return next;
                 });
-                // The record already normalizes rules with no entries to `undefined`,
-                // so the durable copy takes it verbatim.
+                // From the message's own `rules`, which is the rule set the host now
+                // holds, not from the record: the record describes rows, and a view that
+                // installed nothing has no rules on it to read. The message already
+                // normalizes an entry-less set to `undefined`, so the durable copy takes
+                // it verbatim. Reading a message is safe where reading a record is not —
+                // nothing retains a message, so there is no copy here to go stale.
                 const next_transforms = [
                     ...(state_ref.current.transforms ?? transforms),
                 ];
-                next_transforms[msg.sheetIndex] = view.rules;
+                next_transforms[msg.sheetIndex] = msg.rules;
                 state_ref.current = {
                     ...state_ref.current,
                     transforms: next_transforms,
@@ -1887,7 +1887,20 @@ export function App(): React.JSX.Element {
         // changes the population auto-fit sampled — so the Auto-fit toggle would
         // switch itself off on every commit. Skipping the pointless round-trip
         // removes that and any other side effect a no-op ack could carry.
-        if (transforms_semantically_equal(state, installed?.rules)) return;
+        //
+        // Compared against the rules of a *permutation* only. A non-permuted record has
+        // none, and that is the point rather than a gap to fill from durable state: the
+        // question here is whether the durable rules already describe the view we hold,
+        // and a view holding no permutation is described by no rules at all. The
+        // inactive-both case that used to reach this comparison through a retained
+        // record's stale copy now falls through to the guard below, which answers it
+        // from the same two facts and without the copy.
+        if (
+            transforms_semantically_equal(
+                state,
+                installed?.permuted ? installed.rules : undefined,
+            )
+        ) return;
         // Differing rules the host has nothing to do about, and the one case that is
         // not a reconciliation: neither side describes a permutation, so the rules
         // differ only in definitions nobody is applying — a filter a sibling added
@@ -3056,29 +3069,53 @@ export function App(): React.JSX.Element {
     // Silent until GridShell's first status report lands, since `live_edits` is that
     // report. The column half already waits on the same map, so the notice speaks as
     // one fact over one dirty map rather than half of it arriving early.
-    const hidden_edited_cell_keys = (installed_view?.hiddenEditedCellKeys ?? [])
-        .filter((key) => live_edits?.[key] !== undefined);
+    // Only a permutation has rules and hidden rows to speak about. A non-permuted
+    // record carries neither, structurally, so both halves below fall silent on it
+    // without a guard of their own — which is right: the host applied nothing, so
+    // there is no installed order to be stale and no row it fails to show.
+    const installed_rules = installed_view?.permuted
+        ? installed_view.rules
+        : undefined;
+    const hidden_edited_cell_keys = (installed_view?.permuted
+        ? installed_view.hiddenEditedCellKeys
+        : []).filter((key) => live_edits?.[key] !== undefined);
     const hidden_edited_cells = hidden_edited_cell_keys.length;
+    const dirty_keys = Object.keys(live_edits ?? {});
+    // The first sentence's own reason, from the same list the signature folds in.
+    const order_relevant_edits = order_relevant_dirty_keys(
+        installed_rules,
+        dirty_keys,
+    );
     const stale_view_current_signature = edit_mode
         ? stale_view_signature(
-            installed_view?.rules,
-            Object.keys(live_edits ?? {}),
+            installed_rules,
+            dirty_keys,
             hidden_edited_cell_keys,
         )
         : undefined;
     const show_stale_view_banner = stale_view_current_signature !== undefined
         && stale_view_current_signature !== acknowledged_stale_signature;
-    // One notice, one sentence per fact. The second sentence is still a statement,
-    // not a prompt: it says where the unsaved work is, and nothing about doing
-    // anything with it. Noun and verb are pluralized as one phrase, as in
-    // conflict_banner_message, so "1 edited cells are" cannot be written.
+    // One notice, two independent facts, one sentence each — and each sentence
+    // rendered only when its own fact holds, so either can stand alone. The first was
+    // unconditional and was false of a view permuted by `hiddenRows` alone: nothing
+    // was sorted and nothing was filtered, so there was no order not updating. It now
+    // speaks only when an unsaved edit sits in a column the installed order actually
+    // reads, which is the only case in which the displayed order can disagree with the
+    // values.
+    //
+    // Both are statements, not prompts: they say what the view is doing and where the
+    // unsaved work is, and nothing about doing anything with either. Noun and verb in
+    // the second are pluralized as one phrase, as in conflict_banner_message, so
+    // "1 edited cells are" cannot be written.
     //
     // "doesn't show" rather than "hides" because the host names every edited row the
     // view does not contain, and one of those is a row an external shrink removed —
     // not hidden, gone. The weaker verb is true of both, and both are the same fact
     // for the user: unsaved work they cannot see.
     const stale_view_message = [
-        'Sorting and filters don\'t update while you\'re editing.',
+        ...(order_relevant_edits.length > 0
+            ? ['Sorting and filters don\'t update while you\'re editing.']
+            : []),
         ...(hidden_edited_cells > 0
             ? [hidden_edited_cells === 1
                 ? '1 edited cell is in a row this view doesn\'t show.'

@@ -8,6 +8,7 @@ import type {
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
+    SheetViewRecord,
     TransformIntent,
     WebviewMessage,
 } from '../types';
@@ -471,8 +472,9 @@ function latest_transform_request(post_message: ReturnType<typeof vi.fn>) {
 
 /**
  * The install message the host would post, built the way PanelCore builds it: the
- * record describes what is installed, with rules normalized to `undefined` when
- * they carry no entries, and `permuted` following whether anything is active.
+ * record describes what is installed and takes the arm `permuted` selects, while the
+ * durable rules the webview acknowledges ride the message beside it, normalized to
+ * `undefined` when they carry no entries.
  */
 function transform_installed_message(
     request: {
@@ -497,22 +499,27 @@ function transform_installed_message(
     const is_active = rules.sort.length > 0
         || rules.filters.some((filter) => filter.enabled)
         || (rules.hiddenRows?.length ?? 0) > 0;
+    const permuted = options.permuted ?? is_active;
+    const basis = {
+        generation: options.generation,
+        sourceGeneration: request.sourceGeneration,
+        schema: rules.schema ?? '["Sheet1",1,null]',
+    };
     return {
         type: 'transformInstalled',
         sheetIndex: request.sheetIndex,
         requestId: request.requestId,
         intent: request.intent,
-        view: {
-            basis: {
-                generation: options.generation,
-                sourceGeneration: request.sourceGeneration,
-                schema: rules.schema ?? '["Sheet1",1,null]',
-            },
-            rules: has_entries ? rules : undefined,
-            rowCount: options.rowCount ?? 1,
-            permuted: options.permuted ?? is_active,
-            hiddenEditedCellKeys: options.hiddenEditedCellKeys ?? [],
-        },
+        view: permuted
+            ? {
+                basis,
+                permuted: true,
+                rules,
+                rowCount: options.rowCount ?? 1,
+                hiddenEditedCellKeys: options.hiddenEditedCellKeys ?? [],
+            }
+            : { basis, permuted: false, rowCount: options.rowCount ?? 1 },
+        rules: has_entries ? rules : undefined,
     };
 }
 
@@ -5586,6 +5593,7 @@ describe('edit session store hydration', () => {
                 permuted: true,
                 hiddenEditedCellKeys: [],
             },
+            rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
         });
 
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -5652,6 +5660,7 @@ describe('edit session store hydration', () => {
                 permuted: true,
                 hiddenEditedCellKeys: [],
             },
+            rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
         });
 
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
@@ -7263,6 +7272,11 @@ describe('stale-view banner', () => {
                 permuted: true,
                 hiddenEditedCellKeys: hidden,
             },
+            rules: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,null]',
+            },
         });
     }
 
@@ -7277,7 +7291,10 @@ describe('stale-view banner', () => {
 
         await reinstall_with_hidden_cells(['0:1']);
 
-        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        // And the hidden sentence stands alone. No edit here can change where the sort
+        // puts a row, so there is no order disagreeing with any value and the first
+        // sentence would be saying something about nothing.
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
         // Informational, like the sentence before it: no exit, no affordance.
@@ -7364,7 +7381,8 @@ describe('stale-view banner', () => {
 
         await same_basis_refresh(['0:1']);
 
-        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        // Hidden cells alone again: the sorted column holds no unsaved edit.
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
         // Still the installed view: the record was kept, not replaced by a natural one,
@@ -7837,7 +7855,147 @@ describe('stale-view banner', () => {
         expect(banner()?.textContent).toContain(BANNER_TEXT);
         expect_no_call_to_action();
     });
+
+    /**
+     * A view permuted by `hiddenRows` alone: rows are dropped, nothing is sorted and no
+     * filter is enabled, so the installed order reads no column at all. Restored the way
+     * the app restores one — durable rules on a snapshot, the restore effect's request,
+     * the host's record in answer — because the record has to be the host's word for the
+     * `permuted` arm to be the real one.
+     */
+    async function edit_mode_hiding_row_1(
+        hidden: readonly string[],
+        edits: Record<string, { value: string; base: string }>,
+    ) {
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 3,
+                sourceRowCount: 3,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'hiding-only-session',
+            },
+            state: {
+                transforms: [{
+                    sort: [],
+                    filters: [],
+                    hiddenRows: [1],
+                    schema: '["Sheet1",2,null]',
+                }],
+                pendingEdits: edits,
+            },
+        }));
+        await dispatch_host_message(transform_installed_message(
+            latest_transform_request(post_message),
+            { generation: 2, rowCount: 2, hiddenEditedCellKeys: hidden },
+        ));
+        await report_grid_editing(true, true, [], edits);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        return post_message;
+    }
+
+    it('says nothing about sorting for a view that only hides rows', async () => {
+        // The sentence was unconditional and was simply false here: this view drops a
+        // row and orders nothing, so there is no sort and no enabled filter for the
+        // statement to be about. The hidden sentence has to carry the notice alone, and
+        // read as a complete statement doing it.
+        await edit_mode_hiding_row_1(['1:1'], dirty('1:1'));
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        expect(banner()?.textContent).not.toContain('Sorting');
+        expect(banner()?.textContent).not.toContain('filters');
+        expect_no_call_to_action();
+    });
+
+    it('says nothing at all when a hiding-only view hides no edit', async () => {
+        // The other half of the same gate: with the first sentence conditional, a view
+        // that reads no column and hides no unsaved work has nothing to say. Before the
+        // change this rendered the sorting sentence over a view with no sort in it.
+        await edit_mode_hiding_row_1([], dirty('0:0', '0:1'));
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('says both when the order is stale and a cell is out of sight', async () => {
+        // Two independent facts, two sentences, one notice — and still nothing to press.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0', '1:1'));
+
+        await reinstall_with_hidden_cells(['1:1']);
+
+        expect(banner()?.textContent).toContain(
+            'Sorting and filters don\'t update while you\'re editing.'
+            + ' 1 edited cell is in a row this view doesn\'t show.',
+        );
+        expect_no_call_to_action();
+    });
+
+    it('does not let a dismissed hidden cell silence a later stale order', async () => {
+        // The two reasons occupy their own fields of the signature, so an
+        // acknowledgement of one is not an acknowledgement of the other. Dismissed while
+        // only the hidden half was speaking; the order half then starts.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // A second edit, this one in the sorted column. Same rules, same generation,
+        // same hidden cell — a reason the dismissal never covered.
+        await report_grid_editing(true, true, [], dirty('0:1', '0:0'));
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('does not let a dismissed stale order silence a later hidden cell', async () => {
+        // And the other direction, which is the one a single summed signature would
+        // break: the count of things said would be unchanged.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect(banner()?.textContent).not.toContain('doesn\'t show');
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // The same edit, now in a row the view has stopped showing.
+        await reinstall_with_hidden_cells(['0:0']);
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect_no_call_to_action();
+    });
 });
+
+// The invariant `SheetViewRecord` now carries as a shape, enforced by the compiler and
+// by no test: a record the webview retained across a same-basis refresh must have no
+// `rules` and no `hiddenEditedCellKeys` on it unless it describes a permutation, because
+// neither is a fact about the rows a non-permuted view contains and basis equality is
+// evidence about nothing else. Three review rounds of this PR were each a reader taking
+// one of those fields off a record that had gone stale in exactly that way, and the last
+// of them shipped a paragraph naming which reader was entitled to read what. `Extract` of
+// the fields from the non-permuted arm's keys must be `never`, or this alias resolves to
+// `never` and the assignment stops compiling.
+type _NonPermutedViewDescribesNoRows = Extract<
+    keyof Extract<SheetViewRecord, { permuted: false }>,
+    'rules' | 'hiddenEditedCellKeys'
+> extends never ? true : never;
+const _non_permuted_view_describes_no_rows: _NonPermutedViewDescribesNoRows = true;
+void _non_permuted_view_describes_no_rows;
 
 // One `SheetViewRecord` per sheet, one generation for the whole core: an install
 // bumps the core's counter, so every *other* sheet's record is left quoting a

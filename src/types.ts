@@ -114,6 +114,23 @@ export interface SheetTransformState {
 }
 
 /**
+ * What an installed view was computed against. A record whose basis differs from an
+ * incoming snapshot's describes rows that no longer exist.
+ *
+ * `generation` and `sourceGeneration` are between them sufficient: an Excel header
+ * promotion reaches the view only through `PanelCore.adopt_source`, which bumps
+ * both, so a changed header row cannot arrive on an unchanged basis. `schema` is not
+ * redundant with them — it is the fingerprint `SheetTransformState.schema` is matched
+ * against, so keeping it on the record lets one be checked against a sheet directly
+ * rather than via the generations.
+ */
+export type ViewBasis = {
+    generation: number;
+    sourceGeneration: number;
+    schema: string;
+};
+
+/**
  * Everything the webview needs to know about a view the host actually installed,
  * in one value. Only `transformInstalled` carries it, so holding one is proof that
  * an install happened — a refusal has no way to produce one.
@@ -127,95 +144,114 @@ export interface SheetTransformState {
  * therefore go on holding a stale copy indefinitely, with no later delivery able to
  * correct it.
  *
- * Written as a rule because two review rounds were spent rediscovering it one field
- * at a time. `hiddenEditedCellKeys` is edit-derived, and is fixed by the host
- * re-answering it on every delivery rather than only at an install (see below).
- * `rules` was doubling as a copy of the durable intent for views that install
- * nothing, so a sibling panel's change to a *disabled* filter definition — which
- * moves no row, hence installs nothing and bumps no generation — left the copy stale;
- * Cancel now reads that intent live instead (see `transform_rollback_baseline`).
- * Anyone adding a field should expect the same question of it.
+ * Three review findings on this PR were that one pattern, which is why the rule is
+ * now a *shape* rather than a paragraph readers have to remember. `rowCount` was
+ * separately stored and could be invalidated apart from `permuted`; then
+ * `hiddenEditedCellKeys` turned out to be edit-derived (fixed by the host
+ * re-answering it on every delivery, not only at an install — see below); then
+ * `rules` turned out to be a copy of durable intent for views that install nothing,
+ * so a sibling panel's change to a *disabled* filter definition — which moves no row,
+ * hence installs nothing and bumps no generation — left the copy stale, and Cancel
+ * re-persisted it over the sibling's update.
+ *
+ * That third one was mitigated by prose specifying which reader was entitled to read
+ * what, and reader discipline is exactly what had already failed twice. So the
+ * discriminant does the work instead: **`permuted` is the union tag, and the two
+ * row-describing fields exist only on the arm where they describe rows.** An active
+ * rule set is precisely the set the host built the permutation from, and the hidden
+ * keys are precisely the rows that permutation left out; when the host applied
+ * nothing there is no permutation, hence no rules describing it and nothing it fails
+ * to show, and a retained non-permuted record therefore has no `rules` for a later
+ * reader to mistake for the user's current intent. Anything asking "what does the
+ * user currently want?" reads durable state live.
+ *
+ * `permuted` is a sound tag for both fields and not just for `rules`: the host sets
+ * it from whether it holds an index permutation at all, and it holds one exactly when
+ * `compute_transform` found the rules active — a row-dropping filter and a bare
+ * `hiddenRows` list included. So `permuted` means "this view drops and/or reorders
+ * rows", which is the same condition under which a key can be out of sight.
+ *
+ * The durable-rule acknowledgement the install handler needs did not disappear with
+ * the field; it moved to `transformInstalled.rules`, beside the record rather than in
+ * it, because a message is read once and never retained. Anyone adding a field here
+ * should expect the same question of it — and if the answer is "it is not about these
+ * rows", the message is where it goes.
  */
-export type SheetViewRecord = {
-    /**
-     * What the installed view was computed against. A record whose basis differs
-     * from an incoming snapshot's describes rows that no longer exist.
-     *
-     * `generation` and `sourceGeneration` are between them sufficient: an Excel
-     * header promotion reaches the view only through `PanelCore.adopt_source`,
-     * which bumps both, so a changed header row cannot arrive on an unchanged
-     * basis. `schema` is not redundant with them — it is the fingerprint
-     * `SheetTransformState.schema` is matched against, so keeping it here lets a
-     * record be checked against a sheet directly rather than via the generations.
-     */
-    basis: { generation: number; sourceGeneration: number; schema: string };
-    /**
-     * The rules the host was handed — not the durable intent, which a sibling panel
-     * can change with no row movement at all.
-     *
-     * A description of *these rows* only when `permuted`: an active rule set is
-     * exactly the set the host built the permutation from. When `permuted` is false
-     * the host applied none of them, so nothing here describes the rows, and the only
-     * reader entitled to a non-permuted record's rules is the install handler, which
-     * uses them once — on the fresh record, to update durable state — and never from
-     * a retained one. Anything asking "what does the user currently want?" must read
-     * durable state live.
-     */
-    rules: SheetTransformState | undefined;
-    /** Effective row count, post-filter. */
-    rowCount: number;
-    /** Whether display order differs from source order. */
-    permuted: boolean;
-    /**
-     * Canonical `"sourceRow:sourceColumn"` keys of the durable pending-edit *cells*
-     * whose source row this view does not contain.
-     *
-     * Computed on the host because that is the only place both halves of the
-     * question exist at once — the permutation and the durable dirty map. Membership
-     * moves only at an install: an installed filter reads saved values and
-     * deliberately never recomputes mid-session, and the user can only type into rows
-     * the view is showing.
-     *
-     * Keys rather than a bare count, and this is the refinement worth keeping
-     * straight. Membership moves only at an install, but the *count* is a function of
-     * two things — membership and the set of edits — and the second moves on any
-     * `pendingEditsChanged`, discard or successful save, none of which install
-     * anything. A count sent from here therefore went stale the moment a filtered-out
-     * edit was discarded, with no later install to correct it. Keys do not: the
-     * webview intersects them with its live dirty map, which subtracts every entry
-     * that left it, exactly and with no message from the host.
-     *
-     * Subtraction is only half of it, though, and the other half is why every
-     * *delivery* carries these keys too and not only `transformInstalled` (see
-     * `WorkbookSnapshot.hiddenEditedCellKeys`). "A new edit can only be typed into a
-     * row the view is showing" is true of an installed view and false across an
-     * install: an edit typed while a hiding transform was still computing is in no
-     * durable map when the install reads one, and the install then excludes its row,
-     * so that install's answer omits a genuinely hidden edit and no later install will
-     * correct it. Nothing the webview holds can add it back. So the host re-answers on
-     * the same-basis refresh `pendingEditsChanged` already triggers, the webview takes
-     * the fresh keys onto the record it is keeping, and the two directions are
-     * complete: deliveries add, the live intersection subtracts. Both the number the
-     * webview renders and the acknowledgement identity it derives come from that one
-     * value, which is why they cannot disagree (see `stale_view_signature`).
-     *
-     * Unbounded in principle and deliberately uncapped: the set is a subset of the
-     * dirty map's keys, and the whole dirty map — keys plus values plus bases —
-     * already crosses this protocol on every persist, so this is strictly smaller
-     * than traffic the design already accepts.
-     *
-     * `commit_transform_reconciliation` is the one other writer of a permutation, and
-     * it is not an exception so much as a non-event: it publishes no record at all, so
-     * a reconciliation leaves the membership half exactly as stale as the `rowCount`
-     * and `permuted` beside it, and the same later `transformInstalled` refreshes all
-     * three. That is the argument for carrying this on the record rather than beside it
-     * — one fact about one installed view cannot drift out of step with itself.
-     *
-     * Cells, not rows, because two edits in one hidden row are two pieces of unsaved
-     * work the user cannot see.
-     */
-    hiddenEditedCellKeys: readonly string[];
-};
+export type SheetViewRecord =
+    | {
+        basis: ViewBasis;
+        permuted: true;
+        /**
+         * The rules the host built this permutation from — not the durable intent,
+         * which a sibling panel can change with no row movement at all. Non-optional:
+         * the host writes `transform_indices` and `transform_states` in the same
+         * statement pair, and only ever writes indices for a state
+         * `transform_is_active` accepted, so a permutation always has rules.
+         */
+        rules: SheetTransformState;
+        /** Effective row count, post-filter. */
+        rowCount: number;
+        /**
+         * Canonical `"sourceRow:sourceColumn"` keys of the durable pending-edit *cells*
+         * whose source row this view does not contain.
+         *
+         * Computed on the host because that is the only place both halves of the
+         * question exist at once — the permutation and the durable dirty map.
+         * Membership moves only at an install: an installed filter reads saved values
+         * and deliberately never recomputes mid-session, and the user can only type
+         * into rows the view is showing.
+         *
+         * Keys rather than a bare count, and this is the refinement worth keeping
+         * straight. Membership moves only at an install, but the *count* is a function
+         * of two things — membership and the set of edits — and the second moves on any
+         * `pendingEditsChanged`, discard or successful save, none of which install
+         * anything. A count sent from here therefore went stale the moment a
+         * filtered-out edit was discarded, with no later install to correct it. Keys do
+         * not: the webview intersects them with its live dirty map, which subtracts
+         * every entry that left it, exactly and with no message from the host.
+         *
+         * Subtraction is only half of it, though, and the other half is why every
+         * *delivery* carries these keys too and not only `transformInstalled` (see
+         * `WorkbookSnapshot.hiddenEditedCellKeys`). "A new edit can only be typed into
+         * a row the view is showing" is true of an installed view and false across an
+         * install: an edit typed while a hiding transform was still computing is in no
+         * durable map when the install reads one, and the install then excludes its
+         * row, so that install's answer omits a genuinely hidden edit and no later
+         * install will correct it. Nothing the webview holds can add it back. So the
+         * host re-answers on the same-basis refresh `pendingEditsChanged` already
+         * triggers, the webview takes the fresh keys onto the record it is keeping, and
+         * the two directions are complete: deliveries add, the live intersection
+         * subtracts. Both the number the webview renders and the acknowledgement
+         * identity it derives come from that one value, which is why they cannot
+         * disagree (see `stale_view_signature`).
+         *
+         * Unbounded in principle and deliberately uncapped: the set is a subset of the
+         * dirty map's keys, and the whole dirty map — keys plus values plus bases —
+         * already crosses this protocol on every persist, so this is strictly smaller
+         * than traffic the design already accepts.
+         *
+         * `commit_transform_reconciliation` is the one other writer of a permutation,
+         * and it is not an exception so much as a non-event: it publishes no record at
+         * all, so a reconciliation leaves the membership half exactly as stale as the
+         * `rowCount` beside it, and the same later `transformInstalled` refreshes both.
+         * That is the argument for carrying this on the record rather than beside it —
+         * one fact about one installed view cannot drift out of step with itself.
+         *
+         * Cells, not rows, because two edits in one hidden row are two pieces of
+         * unsaved work the user cannot see.
+         */
+        hiddenEditedCellKeys: readonly string[];
+    }
+    | {
+        basis: ViewBasis;
+        permuted: false;
+        /**
+         * The sheet's own row count. The host applied nothing, so this is every row the
+         * metadata has — which is also why this arm has no `hiddenEditedCellKeys`: a
+         * view containing every row cannot fail to show an edited one.
+         */
+        rowCount: number;
+    };
 
 /** Allocation/persistence guard shared by webview sanitization and host plans. */
 export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
@@ -487,8 +523,19 @@ export type HostMessage =
      * host messages: two copies of it in one message is two things that can
      * disagree, and the fold guard in the webview's install handler compares
      * against exactly the generation the record was computed on.
+     *
+     * `rules` is beside `view` and deliberately not in it: it is the rule set the host
+     * now *holds* for the sheet, which is durable intent rather than a fact about these
+     * rows, and `SheetViewRecord` is retained across same-basis refreshes while a
+     * message is read once and discarded. The webview's one use is to bring its durable
+     * copy into line with the host's — which is why it cannot be re-derived from the
+     * request either: the recovery path that drops a saved transform the sheet can no
+     * longer support acknowledges the rules already installed, not the ones asked for,
+     * and persisting the request there would put the unusable rules straight back.
+     * Normalized to `undefined` when the set has no entries, because rules with no
+     * entries are not a view but the absence of one.
      */
-    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord }
+    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined }
     /**
      * The host changed nothing. It deliberately carries no `view`, no `state`, no
      * `rowCount` and no `generation`: six review rounds of this feature were each a

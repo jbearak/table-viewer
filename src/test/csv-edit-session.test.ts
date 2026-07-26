@@ -9,7 +9,7 @@ import {
     type FileStateSnapshot,
     type FileStateStore,
 } from '../state';
-import type { HostMessage, PerFileState } from '../types';
+import type { HostMessage, PerFileState, SheetViewRecord } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -286,6 +286,20 @@ function transform_installs(
     return transform_answers(panel).filter((message) => (
         message.type === 'transformInstalled'
     )) as Array<Extract<HostMessage, { type: 'transformInstalled' }>>;
+}
+
+/**
+ * The permuted arm of an install's record, which is the only arm carrying hidden
+ * edited cells — a view that permuted nothing shows every row and so has no such field
+ * to answer with. Narrowed through the discriminant rather than cast, so an install
+ * that unexpectedly stopped permuting fails here by name.
+ */
+function permuted_view(
+    installed: Extract<HostMessage, { type: 'transformInstalled' }>,
+): Extract<SheetViewRecord, { permuted: true }> {
+    const view = installed.view;
+    if (!view.permuted) throw new Error('expected an install that permuted the rows');
+    return view;
 }
 
 /** The basis a following request should quote, read off an install. */
@@ -4422,10 +4436,14 @@ describe('CSV edit sessions', () => {
 
         // A recovered invalid restore is an install of the view that stands, so the
         // webview stops asking for the rules the host has just dropped durably.
+        // The dropped rules are read off the message, which is what the webview copies
+        // into durable state; the record simply takes its non-permuted arm, where there
+        // are no rules to disagree with it.
         const ack = transform_answers(panel)[0];
         expect(ack).toMatchObject({
             type: 'transformInstalled',
-            view: { rules: undefined, permuted: false },
+            rules: undefined,
+            view: { permuted: false },
         });
         expect(state.get_state(file_path).transforms).toEqual([undefined]);
     });
@@ -5049,7 +5067,7 @@ describe('CSV edit sessions', () => {
 
         const restored = transform_installs(reopened).at(-1)!;
         expect(restored.view.rowCount).toBe(1);
-        expect([...restored.view.hiddenEditedCellKeys].sort())
+        expect([...permuted_view(restored).hiddenEditedCellKeys].sort())
             .toEqual(['0:0', '0:1', '2:0']);
 
         // Clearing the filter puts every row back, so the same edits are visible and
@@ -5067,7 +5085,10 @@ describe('CSV edit sessions', () => {
         const cleared = transform_installs(reopened).at(-1)!;
         expect(cleared.requestId).toBe('clear-hiding-filter');
         expect(cleared.view.rowCount).toBe(3);
-        expect(cleared.view.hiddenEditedCellKeys).toEqual([]);
+        // Falling to empty is now a property of the *shape*: with the filter gone the
+        // host installs no permutation, and that arm of the record has no hidden-cell
+        // field to latch a stale set in. So the assertion is about the arm.
+        expect(cleared.view.permuted).toBe(false);
     });
 
     it('counts an edit made in this session once a filter is installed over it', async () => {
@@ -5118,7 +5139,7 @@ describe('CSV edit sessions', () => {
 
         const installed = transform_installs(panel).at(-1)!;
         expect(installed.requestId).toBe('filter-over-live-edit');
-        expect(installed.view.hiddenEditedCellKeys).toEqual(['2:0']);
+        expect(permuted_view(installed).hiddenEditedCellKeys).toEqual(['2:0']);
     });
 
     it('names an edit typed while the hiding filter was still computing', async () => {
@@ -5199,7 +5220,7 @@ describe('CSV edit sessions', () => {
         expect(installed.view.rowCount).toBe(1);
         // The omission itself, pinned: the install answers honestly for what it could
         // see, and this is why the fix cannot live in the install.
-        expect(installed.view.hiddenEditedCellKeys).toEqual([]);
+        expect(permuted_view(installed).hiddenEditedCellKeys).toEqual([]);
 
         // The debounce fires. The ordinary post, no different from any other.
         await panel.__receive({
@@ -5284,9 +5305,9 @@ describe('CSV edit sessions', () => {
         expect(installed.requestId).toBe('restore-filter-after-shrink');
         // The precondition that used to end the scan: the filter excluded nothing.
         expect(installed.view.rowCount).toBe(snapshot.meta.sheets[0].rowCount);
-        expect(installed.view.hiddenEditedCellKeys).toEqual(['2:1']);
+        expect(permuted_view(installed).hiddenEditedCellKeys).toEqual(['2:1']);
         // And not the surviving row's edit, so this is not simply naming everything.
-        expect(installed.view.hiddenEditedCellKeys).not.toContain('0:1');
+        expect(permuted_view(installed).hiddenEditedCellKeys).not.toContain('0:1');
     });
 
     it('does not count another session\'s tombstoned edits as hidden work', async () => {
@@ -5383,7 +5404,7 @@ describe('CSV edit sessions', () => {
         // Source row 2 is exactly the row the filter drops, so an unscoped read of the
         // durable map would name its cell here.
         expect(installed.view.rowCount).toBe(1);
-        expect(installed.view.hiddenEditedCellKeys).toEqual([]);
+        expect(permuted_view(installed).hiddenEditedCellKeys).toEqual([]);
         error.mockRestore();
     });
 
@@ -5955,7 +5976,8 @@ describe('CSV edit sessions', () => {
                 // persisted, so there is no prior order to preserve and recomputation
                 // is not declinable. 'edited-c' does not sort as 'edited-c'.
                 expect(installed.view.rowCount).toBe(row_count);
-                expect([...installed.view.hiddenEditedCellKeys].sort()).toEqual(hidden);
+                expect([...permuted_view(installed).hiddenEditedCellKeys].sort())
+                    .toEqual(hidden);
                 expect(await displayed_rows(
                     reopened,
                     'reopen-restored',
@@ -5986,7 +6008,7 @@ describe('CSV edit sessions', () => {
             if (rules) {
                 const installed = await restore_durable_view(reopened, rules);
                 expect(installed.view.rowCount).toBe(3);
-                expect(installed.view.hiddenEditedCellKeys).toEqual([]);
+                expect(permuted_view(installed).hiddenEditedCellKeys).toEqual([]);
             }
         });
 
@@ -6804,7 +6826,6 @@ describe('CSV edit sessions', () => {
             schema: '["Sheet1",1,["h"]]',
         };
         // Two edits on rows the views below drop, and one on the row they keep.
-        const EDITS = { '0:0': 'edited-c', '1:0': 'edited-a', '2:0': 'edited-b' };
         const DIRTY = {
             '0:0': { value: 'edited-c', base: 'c' },
             '1:0': { value: 'edited-a', base: 'a' },

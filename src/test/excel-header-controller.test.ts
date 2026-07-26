@@ -614,7 +614,8 @@ describe('Excel workbook snapshot controller', () => {
         const applied = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'unsorted-hidden-rows',
         )!;
-        expect(applied.view.rules?.hiddenRows).toEqual([0, 1]);
+        // From the ack's own rules: the record carries rules only where it permuted.
+        expect(applied.rules?.hiddenRows).toEqual([0, 1]);
         await panel.__receive({
             type: 'setTransform',
             sheetIndex: 0,

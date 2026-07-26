@@ -717,23 +717,32 @@ export class ViewerPanelCore {
      * Describe the view this core holds for a sheet *right now*. Every install
      * acknowledgement is built from this after the mutation, so the record and the
      * core cannot disagree about what was installed.
+     *
+     * Which arm of `SheetViewRecord` is decided by whether an index permutation is
+     * held, and that is the whole reason the two row-describing fields are unwritable
+     * on the other one: with no permutation there are no rules describing these rows
+     * and no row the view fails to show, so there is nothing here to fabricate and
+     * nothing a retaining webview can later misread. See the type's doc.
      */
     private installed_view(sheet_index: number, sheet: SheetMeta): SheetViewRecord {
+        const basis = {
+            generation: this._generation,
+            sourceGeneration: this._source_generation,
+            schema: transform_schema_for_sheet(sheet),
+        };
         const indices = this.transform_indices.get(sheet_index);
-        const rules = this.transform_states.get(sheet_index);
+        if (!indices) return { basis, permuted: false, rowCount: sheet.rowCount };
         return {
-            basis: {
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                schema: transform_schema_for_sheet(sheet),
-            },
-            // Normalized to `undefined` here rather than by each consumer: rules
-            // with no entries are not a view, they are the absence of one.
-            rules: transform_has_entries(rules)
-                ? clone_transform(rules!)
-                : undefined,
-            rowCount: indices?.length ?? sheet.rowCount,
-            permuted: indices !== undefined,
+            basis,
+            permuted: true,
+            // The fallback is unreachable rather than defensive: indices and state are
+            // written in the same statement pair, and indices are only ever written for
+            // a state `compute_transform` found active. EMPTY_TRANSFORM rather than a
+            // cast so the unreachable case stays a value the readers can handle.
+            rules: clone_transform(
+                this.transform_states.get(sheet_index) ?? EMPTY_TRANSFORM,
+            ),
+            rowCount: indices.length,
             // Every install arm builds its record here, including the two no-op
             // equal-state acks, so none of them can answer this with a stale set.
             hiddenEditedCellKeys: this.hidden_edited_cell_keys(
@@ -741,6 +750,31 @@ export class ViewerPanelCore {
                 sheet,
                 indices,
             ),
+        };
+    }
+
+    /**
+     * The install acknowledgement for a sheet, in one place so the view and the rules
+     * beside it are read from this core in the same tick and cannot disagree.
+     *
+     * The rules ride the message rather than the record because they are the host's
+     * durable intent for the sheet, not a fact about the rows the view contains — see
+     * `HostMessage`'s `transformInstalled` arm.
+     */
+    private transform_installed_ack(
+        msg: SetTransformMessage,
+        sheet: SheetMeta,
+    ): Extract<HostMessage, { type: 'transformInstalled' }> {
+        const rules = this.transform_states.get(msg.sheetIndex);
+        return {
+            type: 'transformInstalled',
+            sheetIndex: msg.sheetIndex,
+            requestId: msg.requestId,
+            intent: msg.intent,
+            view: this.installed_view(msg.sheetIndex, sheet),
+            rules: transform_has_entries(rules)
+                ? clone_transform(rules!)
+                : undefined,
         };
     }
 
@@ -785,13 +819,10 @@ export class ViewerPanelCore {
         ) {
             // A no-op ack, and truthfully an install: the view the record describes
             // is the one already in place, on an unmoved generation.
-            await this.post({
-                type: 'transformInstalled',
-                sheetIndex: msg.sheetIndex,
-                requestId: msg.requestId,
-                intent: msg.intent,
-                view: this.installed_view(msg.sheetIndex, sheet),
-            }, receiver_epoch);
+            await this.post(
+                this.transform_installed_ack(msg, sheet),
+                receiver_epoch,
+            );
             return;
         }
         if (
@@ -816,13 +847,10 @@ export class ViewerPanelCore {
                     receiver_epoch,
                 );
                 if (!source_request_is_current()) return;
-                await this.post({
-                    type: 'transformInstalled',
-                    sheetIndex: msg.sheetIndex,
-                    requestId: msg.requestId,
-                    intent: msg.intent,
-                    view: this.installed_view(msg.sheetIndex, sheet),
-                }, receiver_epoch);
+                await this.post(
+                    this.transform_installed_ack(msg, sheet),
+                    receiver_epoch,
+                );
             } catch (error) {
                 if (!source_request_is_current()) return;
                 // Persisting the cancel failed, so nothing changed and nothing will
@@ -886,13 +914,10 @@ export class ViewerPanelCore {
             // Built after the mutation above, so the record's basis carries the
             // bumped generation and its rules/rowCount/permuted come from what was
             // actually installed rather than from what was asked for.
-            await this.post({
-                type: 'transformInstalled',
-                sheetIndex: msg.sheetIndex,
-                requestId: msg.requestId,
-                intent: msg.intent,
-                view: this.installed_view(msg.sheetIndex, sheet),
-            }, receiver_epoch);
+            await this.post(
+                this.transform_installed_ack(msg, sheet),
+                receiver_epoch,
+            );
         } catch (error) {
             if (
                 !source_request_is_current()
@@ -932,13 +957,10 @@ export class ViewerPanelCore {
                 // there is nothing left to warn about: the view that stands is the
                 // one already installed, and saying so as an install is what stops
                 // the restore effect asking for the dropped rules again.
-                await this.post({
-                    type: 'transformInstalled',
-                    sheetIndex: msg.sheetIndex,
-                    requestId: msg.requestId,
-                    intent: msg.intent,
-                    view: this.installed_view(msg.sheetIndex, sheet),
-                }, receiver_epoch);
+                await this.post(
+                    this.transform_installed_ack(msg, sheet),
+                    receiver_epoch,
+                );
             } else {
                 await this.post_transform_refusal(
                     msg,
