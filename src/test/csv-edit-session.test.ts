@@ -2032,6 +2032,63 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).pendingEdits).toEqual(retyped);
     });
 
+    // The partial post: two edits fail together, and the user reverts one of them
+    // and keeps the other. Every entry the post carries is one the failed operation
+    // owns, so a subset-only comparison reads it as that operation's map echoed
+    // back — but the missing key is a deliberate revert, and leaving the tombstone
+    // standing would strip the kept edit at release. Only a *complete* echo may
+    // preserve the tombstone, which is why the key counts must match.
+    it('retires a failed save when a post drops one of its edits', async () => {
+        const file_path = '/tmp/failed-save-partial-post.csv';
+        const versioned = state_store();
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('write failed');
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-a' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+        const failed_map = {
+            '0:0': { value: 'A', base: 'a' },
+            '1:0': { value: 'B', base: 'b' },
+        };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: failed_map,
+        });
+        await flush_promises();
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'failed-a',
+                edits: { '0:0': 'A', '1:0': 'B' },
+                dirtyEdits: failed_map,
+            },
+        });
+        await flush_promises();
+
+        // Revert '0:0' back to its base, keeping '1:0'. Its entry is byte-identical
+        // to the failed operation's, so nothing but the key count distinguishes
+        // this post from an echo.
+        const kept = { '1:0': { value: 'B', base: 'b' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: kept,
+        });
+        await flush_promises();
+
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session_a });
+        await flush_promises();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        const grant_b = latest_edit_session_message(panel)!;
+        expect(grant_b.granted).toBe(true);
+        expect(grant_b.pendingEdits).toEqual(kept);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(kept);
+    });
+
     it('does not hydrate a failed save tombstone into a later panel session', async () => {
         const file_path = '/tmp/cross-panel-edit-session-id-collision.csv';
         const versioned = state_store();
