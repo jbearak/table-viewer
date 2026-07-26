@@ -1646,6 +1646,29 @@ export function App(): React.JSX.Element {
             transform_schema_for_sheet(sheet),
             sheet.sourceRowCount,
         );
+        // Nothing to reconcile when the durable rules already describe what our core
+        // holds, so ask for neither direction. Every edit commit during an owned
+        // session redelivers a same-basis refresh, which clears
+        // `transform_applied_for_source_ref` unconditionally (deliberately — see the
+        // snapshot handler), so without this the effect would fire a restore request
+        // per keystroke-commit. The host short-circuits an equal restore intent at
+        // the same generation, but the webview's own `transformApplied` handler still
+        // discards `auto_fit_active`/`auto_fit_snapshot` on any ack — correctly, since
+        // a real transform changes the population auto-fit sampled — so the Auto-fit
+        // toggle would switch itself off on every commit. Skipping the pointless
+        // round-trip removes that and any other side effect a no-op ack could carry.
+        //
+        // This comparison is a strictly more precise test than
+        // `transform_applied_for_source_ref`, which only records whether *some*
+        // transform installed against the current source; the flag is kept because
+        // round 3's cross-panel propagation trap depends on its clearing. Folding the
+        // two into one signal belongs to a separate pre-PR-4 refactor.
+        if (transforms_semantically_equal(
+            state,
+            applied_transforms[active_sheet_index],
+        )) {
+            return;
+        }
         if (state && transform_is_active(state)) {
             restore_request_blockers_ref.current[active_sheet_index] =
                 restore_blocker_epoch;

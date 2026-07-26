@@ -5953,10 +5953,11 @@ describe('an applied transform across a refresh', () => {
 
     it('still asks for a durable transform a sibling panel changed', async () => {
         const { post_message } = await editing_with_an_applied_sort();
-        // Settle first, on the state this panel already has: the refresh fires one
-        // redundant restore, and acking it leaves the capability projection exactly
-        // where the next refresh will find it. So the ask below can only have come
-        // from the sibling's change, not from a capability moving underneath.
+        post_message.mockClear();
+        // Settle first, on the state this panel already has: a refresh that changes
+        // no durable rule asks for nothing at all (see 'does not ask to uninstall
+        // rules that are still active'), so the ask below can only have come from
+        // the sibling's change, not from the refresh itself.
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             generation: 2,
             sourceGeneration: 1,
@@ -5964,18 +5965,7 @@ describe('an applied transform across a refresh', () => {
             capabilities: CSV_CAPABILITIES,
             state: STORED_STATE,
         }));
-        const echo = latest_transform_request(post_message);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: echo.state,
-            rowCount: FILTERED_ROW_COUNT,
-            requestId: echo.requestId,
-            generation: 2,
-            sourceGeneration: echo.sourceGeneration,
-            intent: echo.intent,
-        });
-        post_message.mockClear();
+        expect(transform_requests(post_message)).toHaveLength(0);
 
         // Durable transform state is shared between panels, and a sibling changing it
         // arrives here as a refresh on an unchanged row basis and nothing else. So
@@ -5999,8 +5989,8 @@ describe('an applied transform across a refresh', () => {
         const { post_message } = await editing_with_an_applied_sort();
         post_message.mockClear();
 
-        // Unchanged durable state, unchanged row basis: round 3's retention holds and
-        // the reconciliation must reach for the install branch.
+        // Unchanged durable state, unchanged row basis: round 3's retention holds, so
+        // the durable rules and the installed permutation already agree.
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             generation: 2,
             sourceGeneration: 1,
@@ -6009,15 +5999,141 @@ describe('an applied transform across a refresh', () => {
             state: STORED_STATE,
         }));
 
-        // Exactly one ask, and it is the install. The two branches are exclusive: an
-        // empty ask alongside it would un-sort a view nobody asked to un-sort, which is
-        // what a reconciliation that read "inactive" from anything but the durable rules
-        // would produce.
-        await vi.waitUntil(() => transform_requests(post_message).length > 0);
-        expect(transform_requests(post_message)).toHaveLength(1);
-        expect(latest_transform_request(post_message).state.sort)
-            .toEqual(STORED_SORT.sort);
+        // No ask in either direction. The uninstall is the failure this test was
+        // written for — it would un-sort a view nobody asked to un-sort, which is what
+        // a reconciliation reading "inactive" from anything but the durable rules would
+        // produce — and an install is no better: every edit commit lands one of these
+        // refreshes, and re-asking for the transform already installed spends a host
+        // round-trip per keystroke whose acknowledgement discards this panel's auto-fit
+        // (see 'keeps auto-fit across a commit that changes no durable rule').
+        // A request would be posted synchronously inside the dispatch above, so its
+        // absence is already observable here.
+        expect(transform_requests(post_message)).toHaveLength(0);
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+    });
+
+    /**
+     * The same owned session with Auto-fit on over the applied sort. Column widths are
+     * part of the fixture because the toggle's snapshot is only observable through
+     * them: deactivating restores the pre-fit widths instead of re-measuring.
+     */
+    async function editing_with_auto_fit_over_a_sort() {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, columnWidths: [{ 0: 80 }] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: restore.state,
+            rowCount: FILTERED_ROW_COUNT,
+            requestId: restore.requestId,
+            generation: 2,
+            sourceGeneration: restore.sourceGeneration,
+            intent: restore.intent,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 200 });
+        post_message.mockClear();
+        return { post_message };
+    }
+
+    it('keeps auto-fit across a commit that changes no durable rule', async () => {
+        const { post_message } = await editing_with_auto_fit_over_a_sort();
+
+        // What committing a cell during an owned session provokes: pending edits
+        // written, capabilities re-projected, a refresh on the same source and view
+        // generation, carrying the fitted widths this panel already persisted.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, columnWidths: [{ 0: 200 }] },
+        }));
+
+        // The host answers whatever it is asked, and that is the whole hazard: an equal
+        // restore intent is short-circuited at the same generation and row count, yet
+        // the acknowledgement alone discards auto-fit. So answer anything asked here
+        // rather than presupposing that nothing was.
+        for (const request of transform_requests(post_message)) {
+            await dispatch_host_message({
+                type: 'transformApplied',
+                sheetIndex: 0,
+                state: request.state,
+                rowCount: FILTERED_ROW_COUNT,
+                requestId: request.requestId,
+                generation: 2,
+                sourceGeneration: request.sourceGeneration,
+                intent: request.intent,
+            });
+        }
+
+        // Nothing about the rows moved, so nothing justifies dropping the fit.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        // And the snapshot survived with it: deactivating restores the pre-fit widths,
+        // which is only possible while the snapshot is still held.
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 80 });
+        // The assertion that pins the fix rather than its symptom: the commit asked the
+        // host for nothing, so no acknowledgement could have harmed anything at all.
+        expect(transform_requests(post_message)).toHaveLength(0);
+    });
+
+    it('still clears auto-fit when a sibling transform installs', async () => {
+        const { post_message } = await editing_with_auto_fit_over_a_sort();
+
+        // A sibling changed the durable sort, so this reconciliation is real work and
+        // the ask has to go out.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: {
+                ...STORED_STATE,
+                transforms: [SIBLING_SORT],
+                columnWidths: [{ 0: 200 }],
+            },
+        }));
+        const install = latest_transform_request(post_message);
+        expect(install.state.sort).toEqual(SIBLING_SORT.sort);
+        // The refresh itself keeps the fit — the widths it reinstalls are the fitted
+        // ones — so whatever clears it below is the acknowledgement's doing.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: install.state,
+            rowCount: 4,
+            requestId: install.requestId,
+            generation: 3,
+            sourceGeneration: install.sourceGeneration,
+            intent: install.intent,
+        });
+
+        // A different sort re-populates the rows auto-fit sampled, so the measurement
+        // behind the toggle is stale: the toggle goes off and the snapshot with it.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 200 });
+        // Proof the snapshot went too: one click measures afresh instead of restoring
+        // the pre-fit 80.
+        grid_shell_mock.auto_fit_result = { 0: 300 };
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 300 });
     });
 
     it('uninstalls it when a sibling clears the durable sort', async () => {
