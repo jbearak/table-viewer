@@ -1,8 +1,8 @@
 # Table Viewer
 
-Fast, full-featured viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files in VS Code, with persistent layouts, sorting, filtering, and auto-refresh.
+Fast, full-featured viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files, available as a standalone desktop app and a VS Code extension, with persistent layouts, sorting, filtering, and auto-refresh.
 
-You do not need to be an existing VS Code user to use Table Viewer—VS Code can simply be the app that hosts the viewer. [Install Table Viewer from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer), or follow the [setup and 10-minute try-out guide](docs/setup-guide.md) from installing VS Code through trying two sample workbooks and a safe revised-file exercise.
+Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
 ## Why
 
