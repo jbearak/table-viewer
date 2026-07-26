@@ -2477,6 +2477,14 @@ export function attach_viewer(
     }
 
     async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
+        // Recorded before the CAS, not after it. Reaching this function already means
+        // every early rejection cleared, so this operation is the kind that makes its
+        // edits durable — and the durable write inside `compare_and_set` can commit
+        // and *then* lose currency (a release landing during the medium's filesystem
+        // persist), which throws below. Adding afterwards would skip the tombstone
+        // for a save whose edits are already on disk: exactly the leak this gate
+        // exists to prevent.
+        persisted_save_identities.add(operation.identity);
         const committed = await update_file_state((current) => ({
             ...current,
             pendingEdits: Object.fromEntries(
@@ -2489,7 +2497,6 @@ export function attach_viewer(
         if (!committed || !save_operation_is_current(operation)) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
-        persisted_save_identities.add(operation.identity);
         notify_edit_state(committed);
     }
 

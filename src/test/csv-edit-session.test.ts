@@ -4,6 +4,7 @@ import type * as vscode from 'vscode';
 import type { ExtensionContext } from 'vscode';
 import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
 import {
+    create_authority_store,
     create_file_state_store,
     type FileStateSnapshot,
     type FileStateStore,
@@ -1969,6 +1970,86 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).pendingEdits).toEqual(newer);
     });
 
+    // The tombstone gate records which saves actually made their edits durable, and
+    // it has to record that *before* the CAS, not after. `compare_and_set` validates
+    // currency and then awaits the medium's own durable write, which on a real
+    // disk-backed memento is a filesystem write milliseconds wide. A release landing
+    // in that window costs `persist_accepted_save` its currency, so it throws — after
+    // the edits are already on disk. Recording afterwards would skip the tombstone
+    // for exactly the save that needs one, and the folded live-editor edit (never
+    // posted, so nothing the user still has open contains it) would survive into the
+    // next session. Uses the real authority store, since the gap lives in the medium.
+    it('tombstones a save whose durable write outlived its currency', async () => {
+        const file_path = '/tmp/failed-save-persist-race.csv';
+        let blob: unknown = {};
+        let gate: ReturnType<typeof deferred<void>> | undefined;
+        let arm = false;
+        const store = create_authority_store({
+            runtime_key: {},
+            read: () => blob,
+            write: async (envelope) => {
+                // Suspend inside the medium's write, after the entry is installed.
+                if (arm && JSON.stringify(envelope).includes('UNPOSTED')) {
+                    arm = false;
+                    gate = deferred();
+                    await gate.promise;
+                }
+                blob = envelope;
+            },
+        });
+        const read_pending = async () => (
+            (await store.read(file_path)).state as PerFileState
+        ).pendingEdits;
+        // Two data rows so the folded '1:0' edit validates instead of being rejected.
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\nb\n'));
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('write failed');
+        });
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-a' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: { '0:0': { value: 'A', base: 'a' } },
+        });
+        await flush_promises();
+
+        // `request_save` folds the open live editor in, so '1:0' was never posted.
+        arm = true;
+        const save = panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'failed-a',
+                edits: { '0:0': 'A', '1:0': 'UNPOSTED' },
+                dirtyEdits: {
+                    '0:0': { value: 'A', base: 'a' },
+                    '1:0': { value: 'UNPOSTED', base: 'b' },
+                },
+            },
+        });
+        await flush_promises();
+        expect(gate).toBeDefined();
+
+        // The tab closes while that durable write is still in flight.
+        const release = panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_a,
+        });
+        await flush_promises();
+        gate!.resolve();
+        await Promise.all([save, release]);
+        await flush_promises();
+
+        expect((await read_pending()) ?? {}).not.toHaveProperty('1:0');
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        expect(latest_edit_session_message(panel)!.pendingEdits ?? {})
+            .not.toHaveProperty('1:0');
+    });
+
     // Discard-then-retype after a failed save. Both discard paths in the webview
     // (`clear_dirty()` on the save-dialog's Discard and on "Discard All") post
     // `edits: null`, and emptying the map is the user moving on from the failed save
@@ -2041,6 +2122,12 @@ describe('CSV edit sessions', () => {
     it('retires a failed save when a post drops one of its edits', async () => {
         const file_path = '/tmp/failed-save-partial-post.csv';
         const versioned = state_store();
+        // Two data rows, so both '0:0' and '1:0' have real bases to validate against.
+        // The default 'h\na\n' seed has only one, which makes '1:0' a rowsRemoved
+        // rejection — and that path returns before `persist_accepted_save`, so no
+        // tombstone is written at all and the key-count guard this test exists to pin
+        // is never reached. The guard could then be deleted with the suite still green.
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\nb\n'));
         vscode_mock.__setWriteFileImplementation(async () => {
             throw new Error('write failed');
         });
