@@ -5815,6 +5815,177 @@ describe('snapshots arriving during an in-flight transform', () => {
     });
 });
 
+// The rows a same-basis refresh delivers are the rows already on screen: the host
+// installed nothing and dropped nothing, so an *applied* transform is still applied
+// behind it. Every edit commit during an owned session provokes one of these, and
+// `transformed` reading false while the loader is still permuted is what re-offers
+// the display-keyed row-height affordances — a height written for the wrong row.
+describe('an applied transform across a refresh', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    // The same sheet sorted the other way, as a sibling panel would leave it.
+    const SIBLING_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+    // A row height the user set, and a natural count the transformed count can be
+    // told apart from — with make_meta's rowCount of 1 the reset is invisible.
+    const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
+    const FILTERED_ROW_COUNT = 3;
+
+    function five_row_meta(): WorkbookMeta {
+        const meta = make_meta(['Sheet1'], false);
+        return {
+            ...meta,
+            sheets: meta.sheets.map((sheet) => ({
+                ...sheet,
+                rowCount: 5,
+                sourceRowCount: 5,
+            })),
+        };
+    }
+
+    /** An owned edit session over a CSV whose stored sort is installed and applied. */
+    async function editing_with_an_applied_sort() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: restore.state,
+            rowCount: FILTERED_ROW_COUNT,
+            requestId: restore.requestId,
+            generation: 2,
+            sourceGeneration: restore.sourceGeneration,
+            intent: restore.intent,
+        });
+        // The snapshot already names a session this panel owns, so it opens in edit
+        // mode — the state in which every commit provokes a same-basis refresh.
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+        return { post_message };
+    }
+
+    it('keeps it applied across a same-basis refresh', async () => {
+        await editing_with_an_applied_sort();
+
+        // What committing an edit provokes: pending edits written, capabilities
+        // re-projected, a 'refresh' on the same source and the same view generation.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // Asserted here, before any restore echo: the window this closes is exactly
+        // the one between the refresh and the echo. A filtered view must not flash
+        // its natural row count, and the sort must not read as uninstalled.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+    });
+
+    it('does not re-offer row resizing across a same-basis refresh', async () => {
+        await editing_with_an_applied_sort();
+        // Heights are suppressed under a transform, which is what unmounts the resize
+        // overlay and disarms hover in the real shell.
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The hazard, stated as the grid sees it: were `transformed` to read false
+        // here the overlay would mount over permuted rows and persist a display-keyed
+        // height against the wrong source row — durable corruption, not a flicker.
+        expect(grid_shell_mock.latest_props?.transformed).toBe(true);
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+    });
+
+    it('still asks for a durable transform a sibling panel changed', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        // Settle first, on the state this panel already has: the refresh fires one
+        // redundant restore, and acking it leaves the capability projection exactly
+        // where the next refresh will find it. So the ask below can only have come
+        // from the sibling's change, not from a capability moving underneath.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+        const echo = latest_transform_request(post_message);
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: echo.state,
+            rowCount: FILTERED_ROW_COUNT,
+            requestId: echo.requestId,
+            generation: 2,
+            sourceGeneration: echo.sourceGeneration,
+            intent: echo.intent,
+        });
+        post_message.mockClear();
+
+        // Durable transform state is shared between panels, and a sibling changing it
+        // arrives here as a refresh on an unchanged row basis and nothing else. So
+        // "preserve the applied transform across a same-basis refresh" must not extend
+        // to treating the source as handled: the ask has to still go out.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [SIBLING_SORT] },
+        }));
+
+        await vi.waitUntil(() => post_message.mock.calls
+            .some((call) => (call[0] as WebviewMessage).type === 'setTransform'));
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(SIBLING_SORT.sort);
+    });
+
+    it('drops it when the refresh changes the row basis', async () => {
+        await editing_with_an_applied_sort();
+
+        // A reload: the host drops permutations because matching schema does not
+        // imply matching values, so the applied transform and the transformed count
+        // both have to revert until a fresh restore lands.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+        // And with nothing applied, the stored height is the user's again.
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{"2":44}');
+    });
+});
+
 // A refusal always means the host changed nothing. `transientRefusal` says whether
 // the reason will clear on its own, which decides whether the webview may adopt the
 // echo (terminal validation) or must keep its own copy and retry (the admission
@@ -6026,6 +6197,135 @@ describe('refused transforms', () => {
         post_message.mockClear();
         await click_button('Cancel');
         expect(transform_requests(post_message)).toHaveLength(1);
+    });
+});
+
+// The panel that is *not* editing. Its persisted sort is refused for as long as
+// another panel owns the session, and every edit that owner commits redelivers a
+// same-basis snapshot here. Asking again each time buys nothing and costs a global
+// VS Code warning per keystroke-batch. Latching the ask is safe precisely because
+// this request is restore-origin in a panel with no editor to disturb.
+describe('a refused restore in a sibling panel', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    // What the host projects to a panel while another one holds the session.
+    const NOT_EDITABLE = { csvEditable: false, csvEditingSupported: true };
+    const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    function warnings(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning');
+    }
+
+    /** The owner commits an edit: same source, same view generation, new state. */
+    async function owner_commits_an_edit(
+        capabilities: { csvEditable: boolean; csvEditingSupported: boolean },
+    ) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities,
+                state: { transforms: [STORED_SORT] },
+            },
+        ));
+    }
+
+    async function refuse(
+        request: Extract<WebviewMessage, { type: 'setTransform' }>,
+    ) {
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: request.sheetIndex,
+            // A refusal echoes the host's own unchanged state, which here is none.
+            state: { sort: [], filters: [] },
+            rowCount: 1,
+            requestId: request.requestId,
+            generation: 99,
+            sourceGeneration: request.sourceGeneration,
+            intent: request.intent,
+            error: 'Another editor is holding this file.',
+            transientRefusal: true,
+        });
+    }
+
+    async function restore_refused_by_the_owner() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: NOT_EDITABLE, state: { transforms: [STORED_SORT] } },
+        ));
+        const request = latest_transform_request(post_message);
+        expect(request.intent).toBe('restore');
+        await refuse(request);
+        return { post_message, request };
+    }
+
+    it('is not repeated while the blocker is unchanged', async () => {
+        const { post_message, request } = await restore_refused_by_the_owner();
+        // One ask, one warning: the refusal that has already happened.
+        expect(transform_requests(post_message)).toHaveLength(1);
+        expect(warnings(post_message)).toHaveLength(1);
+
+        for (let commit = 0; commit < 2; commit += 1) {
+            await owner_commits_an_edit(NOT_EDITABLE);
+            // The host would refuse a repeat too, so a repeat costs another warning
+            // here exactly as it does in the real thing.
+            const latest = transform_requests(post_message).at(-1)!;
+            if (latest.requestId !== request.requestId) await refuse(latest);
+        }
+
+        // Nothing about the refusal changed, so the ask is not repeated and — the
+        // user-visible part — no further global warning is raised.
+        expect(warnings(post_message)).toHaveLength(1);
+        expect(transform_requests(post_message)).toHaveLength(1);
+    });
+
+    it('is asked again once the owner releases the session', async () => {
+        const { post_message, request } = await restore_refused_by_the_owner();
+        await owner_commits_an_edit(NOT_EDITABLE);
+        // Leave nothing in flight, so what the release has to overcome is the latch
+        // and not the pending-request guard that sits above it.
+        const latest = transform_requests(post_message).at(-1)!;
+        if (latest.requestId !== request.requestId) await refuse(latest);
+        post_message.mockClear();
+
+        // Release: the host projects this panel editable again, which is the only
+        // observable this webview has for "the refusing condition cleared".
+        await owner_commits_an_edit(EDITABLE);
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('is asked again when the source reloads under the same blocker', async () => {
+        const { post_message } = await restore_refused_by_the_owner();
+        post_message.mockClear();
+
+        // A reload, with the owner still holding the session. The host dropped the
+        // permutation over rows that no longer exist, so the earlier refusal has
+        // nothing to say about this one and the latch must not suppress it.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: NOT_EDITABLE, state: { transforms: [STORED_SORT] } },
+        ));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
     });
 });
 

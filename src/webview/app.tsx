@@ -416,6 +416,12 @@ export function App(): React.JSX.Element {
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
+    // Per sheet, the `restore_blocker_epoch` in force when the restore effect last
+    // asked for the persisted transform, cleared once one installs. Not a record of
+    // what is installed — `transform_applied_for_source_ref` and `applied_transforms`
+    // remain the only answer to that — only of what has already been asked and
+    // refused, so the ask is not repeated verbatim.
+    const restore_request_blockers_ref = useRef<(number | undefined)[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
@@ -1082,7 +1088,22 @@ export function App(): React.JSX.Element {
                         pending_transform_request_ids_ref.current = [];
                         pending_transform_states_ref.current = [];
                         pending_transform_origins_ref.current = [];
+                        // Different rows mean the earlier refusal was about a basis
+                        // that no longer exists, and the permutation the host dropped
+                        // has to be asked for again regardless of what is blocking.
+                        restore_request_blockers_ref.current = [];
                     }
+                    // Deliberately NOT gated on row_basis_changed, unlike the
+                    // in-flight bookkeeping above and the applied/effective view
+                    // state below. The transform the restore effect compares against
+                    // comes from *durable* state, which a sibling panel can change
+                    // without touching either generation, so a same-basis refresh is
+                    // exactly how such a change arrives. Clearing this is what lets
+                    // the restore effect notice it; gating it would silently break
+                    // cross-panel durable-transform propagation. The cost is a
+                    // redundant restore request after every same-basis refresh, which
+                    // is idempotent and invisible now that the applied/effective state
+                    // survives — and, when it is refused, latched below.
                     transform_applied_for_source_ref.current = [];
 
                     let correction_required = false;
@@ -1205,14 +1226,30 @@ export function App(): React.JSX.Element {
                         });
                         set_column_widths(next_column_widths);
                         set_row_heights(next_row_heights);
-                        set_effective_row_counts(
-                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
-                        );
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
-                        set_applied_transforms(next_transforms.map((state) => (
-                            state && !transform_is_active(state) ? state : undefined
-                        )));
+                        // Only a changed row basis un-installs the permutation. On a
+                        // genuine reload the host drops it (matching schema does not
+                        // imply matching values), so the applied transform and the
+                        // transformed row count both revert to the natural metadata —
+                        // an active transform has to be re-requested. A same-basis
+                        // refresh, which every edit commit during an owned session
+                        // redelivers, installs nothing and drops nothing: the loader
+                        // is still permuted and the row count is still the
+                        // transformed one. Resetting these there would make
+                        // `transform_active` read false while the rows are still
+                        // permuted, which un-suppresses the display-keyed row-height
+                        // affordances (the resize overlay, hover-arming, multiline
+                        // auto-grow) and lets a height be persisted for the wrong
+                        // row — durable corruption, not just a flicker.
+                        if (row_basis_changed) {
+                            set_effective_row_counts(
+                                snapshot.meta.sheets.map((sheet) => sheet.rowCount),
+                            );
+                            set_applied_transforms(next_transforms.map((state) => (
+                                state && !transform_is_active(state) ? state : undefined
+                            )));
+                        }
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -1274,8 +1311,14 @@ export function App(): React.JSX.Element {
                     // and warns, and touches neither the generation, nor the
                     // saved/applied transforms, nor transform_applied_for_source_ref —
                     // leaving the latter false is what lets the restore effect ask
-                    // again for a *persisted* transform once the refusing condition (a
-                    // save in flight) settles.
+                    // again for a *persisted* transform once the refusing condition
+                    // settles. It does not ask again *before* then: the stamp the
+                    // restore effect left in restore_request_blockers_ref is
+                    // deliberately not cleared here, so the same doomed request is not
+                    // resent — with its global warning — on every same-basis refresh,
+                    // and every edit commit during an owned session produces one of
+                    // those. Only restore requests are stamped, so this latch cannot
+                    // reach a user-initiated one.
                     //
                     // A user-initiated request has no such durable copy, and clearing
                     // pending_transform_states_ref below therefore drops it outright.
@@ -1373,6 +1416,9 @@ export function App(): React.JSX.Element {
                 set_generation(msg.generation);
                 generation_ref.current = msg.generation;
                 transform_applied_for_source_ref.current[msg.sheetIndex] = true;
+                // Something installed, so whatever was refusing has cleared: the next
+                // restore is free to ask again.
+                restore_request_blockers_ref.current[msg.sheetIndex] = undefined;
                 set_effective_row_counts((prev) => {
                     const next = [...prev];
                     next[msg.sheetIndex] = msg.rowCount;
@@ -1544,6 +1590,19 @@ export function App(): React.JSX.Element {
     // on `editing_status` is deliberate — the grid reports editing status on every
     // commit, so the object would re-run this on every keystroke.
     const save_in_flight = editing_status?.save_in_flight === true;
+    // Counts observed movements of the conditions under which the host refuses a
+    // transform and which this webview can actually see: another panel owning the
+    // edit session projects `csvEditable: false` here and true again once it
+    // releases, and a save of our own is reported through editing status. A count
+    // rather than the values themselves, because what matters is that a blocker
+    // *moved* — a save goes in and back out of flight, leaving the boolean where it
+    // started, and the restore has to be retried on the way out. Stamped on each
+    // restore request and compared on the next run: see
+    // `restore_request_blockers_ref`.
+    const [restore_blocker_epoch, set_restore_blocker_epoch] = useState(0);
+    useEffect(() => {
+        set_restore_blocker_epoch((n) => n + 1);
+    }, [csv_editable, save_in_flight]);
     useEffect(() => {
         if (!meta || preview_mode || pending_excel_header !== null) return;
         if (save_in_flight) return;
@@ -1555,6 +1614,19 @@ export function App(): React.JSX.Element {
         ) {
             return;
         }
+        // A restore already asked under exactly these conditions and nothing
+        // installed, so asking again would only repeat the refusal — and its global
+        // warning — once per edit commit, because every commit during an owned
+        // session redelivers a snapshot and so bumps `source_epoch`. The stamp is
+        // dropped when a transform does install, when the row basis changes, and
+        // whenever a blocking condition moves, so the restore still lands once the
+        // blocker clears.
+        if (
+            restore_request_blockers_ref.current[active_sheet_index]
+            === restore_blocker_epoch
+        ) {
+            return;
+        }
         const state = sanitize_transform_state(
             state_ref.current.transforms?.[active_sheet_index],
             sheet.columnCount,
@@ -1562,6 +1634,8 @@ export function App(): React.JSX.Element {
             sheet.sourceRowCount,
         );
         if (state && transform_is_active(state)) {
+            restore_request_blockers_ref.current[active_sheet_index] =
+                restore_blocker_epoch;
             request_transform(active_sheet_index, state, 'restore', 'restore');
         }
     }, [
@@ -1572,6 +1646,7 @@ export function App(): React.JSX.Element {
         active_sheet_index,
         request_transform,
         save_in_flight,
+        restore_blocker_epoch,
     ]);
 
     const handle_sheet_select = useCallback(
