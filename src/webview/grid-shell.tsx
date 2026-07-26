@@ -723,17 +723,43 @@ export function GridShell({
         });
     }, [dirty_cells, conflicted_keys, live_uncommitted, on_editing_change, save_in_flight]);
 
+    // Last payload actually posted, per session. Guards against re-posting a map
+    // the host already holds — which is not merely wasted work, because the host
+    // reads *any* pendingEditsChanged as "the user moved on from the failed save":
+    // it clears `failedSaveTombstone` and retires the `failed` lifecycle. A failed
+    // save re-installs the session store, and install force-notifies across the
+    // hydration boundary, so the effect below re-runs with the failed operation's
+    // *own* map. Echoing that back would satisfy the host's "unused shared state"
+    // predicate with the cleanup obligation unmet, and the failed edits would
+    // survive into the next edit session. Keying on the session id as well as the
+    // payload keeps a freshly granted session from being stranded with a map the
+    // host recorded under the previous one.
+    const last_posted_ref = useRef<{ session: string; payload: string } | null>(null);
+
     // Persist the dirty map to the host so edits survive a webview reload. Posting
     // null clears the stored state. Runs on the initial render too: a restored map
     // simply round-trips back (harmless), and an empty map posts null (already so).
+    //
+    // The deps carry `save_in_flight` (the state) rather than `save_in_flight_ref`,
+    // whose identity never changes and so could never fire this effect. The swap is
+    // housekeeping, not a behaviour change: while the ref is true every mutation
+    // path is already guarded, so `dirty_cells` cannot change under a save, and the
+    // settle's `replace_dirty` changes `dirty_cells`, which is in the deps already.
+    // The guard still reads the ref because it is current within the flush —
+    // `request_save` sets it synchronously, ahead of any render.
     useEffect(() => {
         if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
+        const edits = dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null;
+        const payload = JSON.stringify(edits);
+        const last = last_posted_ref.current;
+        if (last && last.session === edit_session_id && last.payload === payload) return;
+        last_posted_ref.current = { session: edit_session_id, payload };
         host_bridge.postMessage({
             type: 'pendingEditsChanged',
             editSessionId: edit_session_id,
-            edits: dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
+            edits,
         });
-    }, [dirty_cells, edit_mode, edit_session_id, save_in_flight_ref]);
+    }, [dirty_cells, edit_mode, edit_session_id, save_in_flight]);
 
     // Mirror read imperatively by the save handle (which must stay stable so the
     // ref App holds doesn't churn): the current selection. The dirty map needs no

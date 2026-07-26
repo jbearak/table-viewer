@@ -241,9 +241,10 @@ describe('edit session store', () => {
     // workspace-state write — and the host's pendingEditsChanged handler clears
     // the failed-save tombstone and retires the save lifecycle, so a no-op post
     // is not purely wasted work. These tests pin the store's half of that: the
-    // notification does not fire. They deliberately do not claim the host
-    // consequence is gone, because a failed save also re-installs and install
-    // force-notifies, so one post still gets through (see the plan doc).
+    // notification does not fire. The other half now lives elsewhere — a failed
+    // save still re-installs and install force-notifies, but grid-shell dedupes
+    // against the last payload it posted and the host's handler only clears the
+    // tombstone for a post that genuinely supersedes the failed operation.
     describe('suppresses no-op mutations', () => {
         it('commit with an identical value and base', () => {
             const store = create_edit_session_store({ session_id: 's' }, {

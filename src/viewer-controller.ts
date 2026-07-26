@@ -362,6 +362,11 @@ export function attach_viewer(
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
     let active_save_operation: CsvSaveHostOperation | undefined;
+    // Save identities whose edits `persist_accepted_save` wrote into durable state.
+    // A failed save only needs a tombstone if it got that far; see the write site in
+    // `release_edit_session`. Weak so a retired operation's entry goes with it —
+    // `save_lifecycle.operation` is the only strong reference either way.
+    const persisted_save_identities = new WeakSet<CsvSaveOperation>();
     let save_lifecycle: CsvSaveLifecycle = Object.freeze({
         revision: 0,
         state: 'idle',
@@ -788,7 +793,18 @@ export function attach_viewer(
             save_lifecycle.state === 'failed'
             && save_lifecycle.operation.editSessionId === edit_session_id
         ) {
-            file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+            // Only a save that got as far as `persist_accepted_save` leaves anything
+            // for the tombstone to undo. The early rejections — base mismatch,
+            // removed rows, serialize failure, "still refreshing" — return before
+            // `active_save_operation` is even assigned, so the only pending edits on
+            // disk are the ones the *user's own* posts made durable. A tombstone
+            // there would have `ensure_failed_save_cleanup` strip them by value,
+            // silently discarding work the user still has open in the grid: hit Save
+            // on an externally-changed file, read the "try again" warning, close the
+            // tab, and the edit is gone.
+            if (persisted_save_identities.has(save_lifecycle.operation)) {
+                file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+            }
             retire_save_lifecycle(edit_session_id, 'failed');
         }
 
@@ -890,6 +906,28 @@ export function attach_viewer(
             }),
         );
         return Object.keys(retained).length > 0 ? retained : undefined;
+    }
+
+    /**
+     * True when `pending_edits` is nothing more than `operation`'s own entries,
+     * unchanged and complete — the webview echoing a failed operation's map back
+     * rather than the user moving on from it.
+     *
+     * `strip_operation_owned_pending_edits` returns `undefined` for two situations
+     * that mean opposite things here: a map with nothing left after its owned
+     * entries are removed (an echo), and a map that was empty or absent to begin
+     * with (a discard — the user moving on *more* decisively than by replacing the
+     * map). Comparing key counts separates them, and covers the partial case too:
+     * a post missing one of the operation's keys dropped that edit deliberately.
+     */
+    function post_echoes_operation(
+        pending_edits: PerFileState['pendingEdits'],
+        operation: CsvSaveOperation,
+    ): boolean {
+        const owned = Object.keys(operation.dirtyEdits).length;
+        if (owned === 0 || !pending_edits) return false;
+        if (Object.keys(pending_edits).length !== owned) return false;
+        return strip_operation_owned_pending_edits(pending_edits, operation) === undefined;
     }
 
     function pending_edits_for_current_session(
@@ -2451,6 +2489,7 @@ export function attach_viewer(
         if (!committed || !save_operation_is_current(operation)) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
+        persisted_save_identities.add(operation.identity);
         notify_edit_state(committed);
     }
 
@@ -3706,10 +3745,52 @@ export function attach_viewer(
                             },
                         );
                     if (result.type !== 'aborted') {
-                        if (file_edit_state) {
+                        // A post used to be taken as proof the user moved on from a
+                        // failed save, retiring its lifecycle and dropping the
+                        // tombstone unconditionally. But the webview can echo the
+                        // failed operation's *own* map back: `request_save` folds an
+                        // open live editor into the operation before the mutation
+                        // boundary closes, so that map was never posted and no
+                        // webview-side dedupe can recognise the echo — the ordinary
+                        // "type in a cell and hit save without pressing Enter" flow.
+                        // Dropping the tombstone there satisfies
+                        // `shared_edit_state_is_unused()` with the cleanup obligation
+                        // unmet, so `ensure_failed_save_cleanup` never runs and the
+                        // edits `persist_accepted_save` made durable *before* the
+                        // failed disk write survive into the next edit session.
+                        //
+                        // So compare values, not just identity: a post supersedes a
+                        // failed operation unless it is that operation's own map
+                        // echoed back. A genuinely newer edit retires the lifecycle;
+                        // so does an *emptying* post, which is the user discarding —
+                        // moving on more decisively than by replacing the map. Only a
+                        // complete, unchanged echo leaves the tombstone standing, so
+                        // this asks `post_echoes_operation` rather than merely whether
+                        // anything unowned remains (an empty map retains nothing, and
+                        // treating that as "not superseding" would let the tombstone
+                        // strip a value the user discarded and then retyped).
+                        const committed = result.snapshot.state as PerFileState;
+                        const supersedes = (operation: CsvSaveOperation) => (
+                            !post_echoes_operation(committed.pendingEdits, operation)
+                        );
+                        const tombstone = file_edit_state?.failedSaveTombstone;
+                        if (
+                            file_edit_state
+                            && tombstone
+                            && tombstone.editSessionId === edit_session_id
+                            && supersedes(tombstone)
+                        ) {
                             file_edit_state.failedSaveTombstone = undefined;
                         }
-                        retire_save_lifecycle(undefined, 'failed');
+                        if (
+                            save_lifecycle.state === 'failed'
+                            && (
+                                save_lifecycle.operation.editSessionId !== edit_session_id
+                                || supersedes(save_lifecycle.operation)
+                            )
+                        ) {
+                            retire_save_lifecycle(undefined, 'failed');
+                        }
                         notify_edit_state(result.snapshot);
                         delete_shared_edit_state_if_unused();
                     }
