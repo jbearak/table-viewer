@@ -4995,6 +4995,185 @@ describe('CSV edit sessions', () => {
         expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
     });
 
+    it('projects cached edits on reopen while a sibling transform is still computing', async () => {
+        // `may_rehydrate_session()` is the one transform-shaped question whose answer
+        // is unconditionally yes, and this is the case that distinguishes it from
+        // `may_begin_editing()`: the same in-flight work that refuses a *fresh* entry
+        // into edit mode must not refuse a reopened panel the session its durable
+        // edits already describe. Nothing is being started here — the session exists
+        // in durable state — so a refusal would not serialize anything, it would just
+        // strip the user's unsaved work out of the projection.
+        const file_path = '/tmp/rehydrate-during-transform-compute.csv';
+        const shared = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const owner = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const pendingEdits = { '0:0': { value: 'cached-edit', base: 'c' } };
+        await owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: pendingEdits,
+        });
+        await owner.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+        // The precondition: durable work with no panel holding the session, which is
+        // what a closed tab leaves behind.
+        expect(shared.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+
+        const owner_snapshot = latest_snapshot(owner);
+        const transform = owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'computing-during-reopen',
+            generation: owner_snapshot.generation,
+            sourceGeneration: owner_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        // `compute_transform` yields on `setImmediate`, so awaiting microtasks below
+        // cannot let it land. Asserted rather than assumed: without this the test
+        // would silently become the already-covered installed-transform case.
+        expect(transform_answers(owner)).toEqual([]);
+
+        const reopened = open_csv_table(uri(file_path), shared.store);
+        await reopened.__receive({ type: 'ready' });
+        expect(transform_answers(owner)).toEqual([]);
+
+        const snapshot = latest_snapshot(reopened);
+        expect(snapshot.state.pendingEdits).toEqual(pendingEdits);
+        expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
+
+        await transform;
+    });
+
+    it('refuses to rehydrate a session another panel is still releasing', async () => {
+        // The other half of the same split: `may_rehydrate_session()` answering yes
+        // must not have loosened the claim serialization underneath it. A phase this
+        // panel does not hold is still not this panel's to take, and the durable
+        // edits stay with the panel that is finishing with them — the one drop
+        // `project_state_for_panel` is allowed to make.
+        const file_path = '/tmp/rehydrate-during-release.csv';
+        const committed = { '0:0': { value: 'committed-draft', base: 'c' } };
+        const versioned = state_store({ pendingEdits: committed });
+        const compare_started = deferred();
+        const compare_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits?.['0:1']) {
+                    compare_started.resolve();
+                    await compare_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const bytes = enc.encode('h,i\nc,c\na,a\nb,b\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const owner = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        const session_id = latest_snapshot(owner).capabilities.csvEditSessionId!;
+        expect(session_id).toBeDefined();
+
+        // A second update whose write is gated, so the release below has something to
+        // drain and the phase sits at `releasing` while the reopen happens. Durable
+        // state still holds the first update throughout.
+        const pending = owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { ...committed, '0:1': { value: 'later-draft', base: 'c' } },
+        });
+        await compare_started.promise;
+        const release = owner.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_id,
+        });
+
+        const reopened = open_csv_table(uri(file_path), store);
+        await reopened.__receive({ type: 'ready' });
+        const blocked = latest_snapshot(reopened);
+        expect(blocked.state.pendingEdits).toBeUndefined();
+        expect(blocked.capabilities.csvEditSessionId).toBeUndefined();
+        // Dropped for the one legitimate reason, so the loss assertion in
+        // `project_state_for_panel` must stay quiet.
+        expect(console_error.mock.calls.map((call) => call[0])).not.toContain(
+            'Dropped durable CSV pending edits with no panel holding the session',
+        );
+
+        compare_gate.resolve();
+        await Promise.all([pending, release]);
+        console_error.mockRestore();
+
+        // And nothing was lost by refusing: once the release finishes, the reopened
+        // panel gets the whole durable set.
+        await reopened.__receive({ type: 'requestEditSession' } as never);
+        expect(latest_edit_session_message(reopened)).toMatchObject({
+            granted: true,
+            pendingEdits: { ...committed, '0:1': { value: 'later-draft', base: 'c' } },
+        });
+    });
+
+    it('withholds the edit capability from a panel opened while a transform computes', async () => {
+        // The in-flight half of `may_retain_capability()` on its non-owner path, which
+        // is a statement about the *affordance* rather than about the claim: a panel
+        // told `csvEditable` inside a window where the request would be refused shows
+        // an edit control that cannot work, and stamps a blocker epoch that never
+        // moves. Pinned through a panel's first adoption, because that is where
+        // capabilities are projected live — a repeat `ready` replays the retained
+        // projection and would make this assertion vacuous.
+        const file_path = '/tmp/capability-during-transform-compute.csv';
+        const shared = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const transformer = open_csv_table(uri(file_path), shared.store);
+        await transformer.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(transformer);
+
+        const transform = transformer.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'in-flight-capability',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(transform_answers(transformer)).toEqual([]);
+
+        const during = open_csv_table(uri(file_path), shared.store);
+        await during.__receive({ type: 'ready' });
+        expect(transform_answers(transformer)).toEqual([]);
+        expect(latest_snapshot(during).capabilities.csvEditable).toBe(false);
+
+        await transform;
+        expect(transform_installs(transformer)).toHaveLength(1);
+
+        // And the refusal really was the window, not the installed sort: a panel
+        // opened after it lands is editable under the permutation.
+        const after = open_csv_table(uri(file_path), shared.store);
+        await after.__receive({ type: 'ready' });
+        expect(latest_snapshot(after).capabilities.csvEditable).toBe(true);
+    });
+
     it('makes a sibling editable again when the owner releasing it left a sort installed', async () => {
         // The sibling's `csvEditable` is the only signal its webview has that a
         // refusing condition moved; it stamps each refused transform restore with a
@@ -5535,6 +5714,7 @@ describe('CSV edit sessions', () => {
     });
 
     it('does not grant edit mode while a transform is computing', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
         await panel.__receive({ type: 'ready' });
 
@@ -5556,6 +5736,14 @@ describe('CSV edit sessions', () => {
         expect(edit_session_results(panel)).toEqual([
             { type: 'editSessionResult', granted: false },
         ]);
+        // The refusal has to reach the user, and has to name the real reason. This is
+        // the only observable `may_begin_editing()` owns on its own: the grant itself
+        // is refused a second time by `may_reserve_claim()`, so without this assertion
+        // the whole suite stays green with `may_begin_editing()` stubbed to yes — and
+        // the user gets an unexplained no-op on the edit control.
+        expect(warning).toHaveBeenCalledWith(
+            'Wait for sorting and filtering to finish before entering edit mode.',
+        );
     });
 
     it('projects pending edits for the owner but not a pre-ready watcher adoption in a nonowner', async () => {

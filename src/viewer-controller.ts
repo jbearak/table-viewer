@@ -573,12 +573,21 @@ export function attach_viewer(
     }
 
     /**
-     * Transform work is mid-flight across state I/O somewhere on this file. This
-     * is genuine file-level concurrency, and it is the *only* transform-shaped
-     * reason editing is refused: `compute_transform` yields at cancellation
-     * checkpoints and publishes the resulting rules through the shared state
-     * store, so granting an edit claim — or beginning a save — concurrently
-     * races the operation that is about to replace the row basis.
+     * Transform work is mid-flight across state I/O somewhere on this file:
+     * `compute_transform` yields at cancellation checkpoints and publishes the
+     * resulting rules through the shared state store, so anything that crosses
+     * state I/O concurrently races the operation that is about to replace the row
+     * basis. Genuine file-level concurrency.
+     *
+     * This is a *fact*, not a policy. It used to be consulted through one shared
+     * predicate by four editing-side sites that turned out to be asking four
+     * different questions — the conflation review round 6 spent three findings on
+     * — so each site now names its own: `may_begin_editing`,
+     * `may_retain_capability`, `may_reserve_claim` and `may_rehydrate_session`.
+     * Two of those answers coincide today, one adds an owner escape, and one does
+     * not consult this fact at all. Anything that reads this predicate directly is
+     * therefore stating that concurrency is the whole of its question — which is
+     * true of `handle_save`, the mirror of `save_blocks_transform()`.
      *
      * Deliberately *not* included: `activeTransformPanels` and
      * `durableTransform.active`, i.e. a transform that is merely **installed**.
@@ -596,18 +605,44 @@ export function attach_viewer(
         return !!file_edit_state && file_edit_state.transformOperations.size > 0;
     }
 
-    function editing_available_for_panel(): boolean {
+    /**
+     * May a panel holding no session *start* one?
+     *
+     * No while transform work is in flight. Starting a session is a new,
+     * user-initiated request, and the operation in flight is about to publish a
+     * different row basis through the same state store the grant reads and writes;
+     * admitting across that hands the user an editor over rows being renumbered
+     * underneath it. A transform merely *installed* is not a reason — edits are
+     * source-keyed and an installed permutation never recomputes during a live
+     * session, so entering edit mode under a sort moves nothing.
+     *
+     * The refusal is transient by construction, and the request is *dropped* rather
+     * than queued: replaying an edit-mode entry a moment later would open an editor
+     * over a view the user has since moved on from.
+     */
+    function may_begin_editing(): boolean {
+        return !transform_work_in_flight();
+    }
+
+    /**
+     * May this panel be told it still has the edit capability — `csvEditable`?
+     *
+     * The owner: yes, unconditionally. Rows deliberately stay put mid-edit, so a
+     * sort the user installs in the very panel they are editing must not revoke the
+     * capability and eject them from edit mode. This is exactly why the answer
+     * cannot be `may_begin_editing()`: an existing session's capability has to
+     * survive the same condition that refuses a fresh start.
+     *
+     * A non-owner: only from a free phase with no work in flight. `csvEditable` is
+     * also the one signal a sibling's webview watches to retry a transform restore
+     * that was refused while the owner held the session, so it has to go true again
+     * the moment the session is released — holding it false for the lifetime of an
+     * *installed* sort would strand that sibling's grid under a toolbar showing
+     * rules it never received.
+     */
+    function may_retain_capability(): boolean {
         const phase = edit_phase();
-        // An owned session survives transforms installed from the owning panel.
-        // Rows deliberately stay put mid-edit, so a sort the user just installed
-        // in the panel they are editing must not revoke `csvEditable` and eject
-        // them from edit mode.
         if (phase.type === 'owned' && phase.token === edit_session_token) return true;
-        // A sibling's availability turns only on in-flight work and a free
-        // phase. An installed transform must not appear here: `csvEditable` is
-        // what the webview watches to retry a refused restore, so holding it
-        // false for the lifetime of an installed sort would strand a sibling
-        // whose own restore was refused while the owner held the session.
         return !transform_work_in_flight() && phase.type === 'free';
     }
 
@@ -815,11 +850,38 @@ export function attach_viewer(
         session.recapture_current_projection({ deliver });
     }
 
+    /**
+     * May a claim be reserved ahead of the state I/O a grant needs?
+     *
+     * No while transform work is in flight. The reservation exists precisely to
+     * serialize against work that crosses state I/O — it pins the phase across
+     * `read_file_state()` so a sibling transform cannot overtake it — so taking one
+     * while such work is *already* in flight would be entering that race from the
+     * losing side, with a transform poised to publish a new basis under the read
+     * the reservation is protecting.
+     *
+     * The same answer as `may_begin_editing()` today, and deliberately its own
+     * function rather than a call to it: that one is about a user's request, this
+     * one about a window across I/O, and they are not required to agree forever. A
+     * reservation refused here is simply not taken; nothing is held for a retry.
+     *
+     * It also cannot currently *observe* a refusal, and that is worth knowing before
+     * anyone tries to test it: `reserve_edit_claim` has one caller, which evaluates
+     * `may_begin_editing()` synchronously a few statements earlier with no await
+     * between, so this can only differ from that answer once some future caller —
+     * or an await inserted into that gap — makes the two evaluations separable in
+     * time. Kept for the same reason `save_blocks_transform()` keeps its overlapping
+     * halves: a false refusal here is a momentary no-op, while a reservation taken
+     * into an in-flight window is a race over durable state.
+     */
+    function may_reserve_claim(): boolean {
+        return !transform_work_in_flight();
+    }
+
     function reserve_edit_claim(): symbol | undefined {
-        // In-flight transform work only; an installed permutation is not a
-        // reason to refuse a reservation (see `transform_work_in_flight`). Every
-        // phase check below is unchanged — those are the claim serialization.
-        if (!file_edit_state || transform_work_in_flight()) return undefined;
+        // Every phase check below is unchanged — those are the claim serialization,
+        // not the transform-shaped question this site asks.
+        if (!file_edit_state || !may_reserve_claim()) return undefined;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned' && phase.token === edit_session_token) {
             return undefined;
@@ -846,16 +908,50 @@ export function attach_viewer(
         delete_shared_edit_state_if_unused();
     }
 
+    /**
+     * May a reopened panel reclaim a session that exists only in durable state?
+     *
+     * Yes, whenever durable `pendingEdits` exist — which is why this function
+     * consults nothing at all. A reopened panel holding durable edits is not
+     * *starting* anything: the session already exists in durable state, and the
+     * only live question is whether the running system can represent it. Refusing
+     * to represent existing user work is data loss, not policy. That is round 6's
+     * worst finding — the reclaim was refused on a transform, so
+     * `project_state_for_panel` stripped the edits and the viewer opened looking
+     * clean over work the user could neither see nor recover.
+     *
+     * Why "yes" is safe here when `may_begin_editing()` says no to the same
+     * condition. Computed row permutations are deliberately never persisted (see
+     * the `transforms` field in types.ts: "Computed row permutations are
+     * deliberately never persisted"), so a close leaves only the *rules* behind.
+     * The permutation the user was looking at is gone by construction, which means
+     * the "rows must not move under an editor" guarantee cannot bind across a
+     * close/reopen — there is no prior order left to preserve, so recomputation
+     * here is not something we are in a position to decline. What the user gets
+     * back is an order over *saved* values with their dirty overlay drawn on top:
+     * the same stale-view semantics the banner already explains for a live session,
+     * and safe to key edits into because edits are source-keyed and therefore valid
+     * under any permutation.
+     *
+     * This answer stops at the transform-shaped question. The phase checks in
+     * `try_claim_edit_session` are untouched and still decide the rest: a session
+     * another panel owns, is releasing, or is cleaning up after is not ours to
+     * take, and no amount of durable work makes it ours.
+     */
+    function may_rehydrate_session(): boolean {
+        return true;
+    }
+
     function try_claim_edit_session(
         notify = true,
         claim?: symbol,
     ): boolean {
-        // In-flight transform work only, matching `reserve_edit_claim`. This is
-        // also what lets a reopened panel reclaim a session whose durable state
-        // holds both pending edits and an active transform — a combination that
-        // is legitimate now that transforms are admitted during an owned session,
-        // and whose edits `project_state_for_panel` would otherwise strip.
-        if (!file_edit_state || transform_work_in_flight()) return false;
+        // The transform-shaped question at this site is `may_rehydrate_session()`,
+        // and its answer is unconditional — see there for why declining would be
+        // data loss. Both callers that need a concurrency refusal already have one:
+        // `requestEditSession` re-evaluates `may_begin_editing()` after its read,
+        // and `reserve_edit_claim` asked `may_reserve_claim()` before it.
+        if (!file_edit_state || !may_rehydrate_session()) return false;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned') {
             if (phase.token !== edit_session_token) return false;
@@ -1104,7 +1200,18 @@ export function attach_viewer(
         return cleanup;
     }
 
-    /** Project durable state for this panel without mutating shared authority. */
+    /**
+     * Project durable state for this panel without mutating shared authority.
+     *
+     * Being a *projection* is the point, and the one way it can quietly stop being
+     * one is by dropping `pendingEdits`. Round 6's worst finding arrived through
+     * exactly that shape: a reclaim refused upstream, and this function discarding
+     * durable user work as an incidental fallthrough — the viewer opened looking
+     * clean over edits the user could not see. The claim relaxation fixed that
+     * cause; this structure is so the next one cannot hide. The discard is a named
+     * branch with a stated reason, and there is only ever one legitimate reason:
+     * the session those edits belong to is not this panel's to represent.
+     */
     function project_state_for_panel(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
@@ -1114,14 +1221,25 @@ export function attach_viewer(
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
         }
+        // Not live work: a read older than a clear this panel already completed
+        // still carries edits the clear removed.
         const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
             && snapshot.revision <= file_edit_state.clearedStateRevision;
-        if (
-            !predates_completed_clear
+        // `may_rehydrate_session()` is asked here by name, not left implicit inside
+        // the claim, because this is the site where its answer decides whether
+        // durable user work reaches the panel at all.
+        const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
             && profile.editing
-            && (owns_edit_session() || (allow_claim && try_claim_edit_session(false)))
-        ) {
+            && (
+                owns_edit_session()
+                || (
+                    allow_claim
+                    && may_rehydrate_session()
+                    && try_claim_edit_session(false)
+                )
+            );
+        if (represents_session) {
             const pending_edits = pending_edits_for_current_session(state.pendingEdits);
             if (pending_edits === state.pendingEdits) {
                 return { revision: snapshot.revision, state };
@@ -1134,6 +1252,27 @@ export function attach_viewer(
             }
             const { pendingEdits: _drop, ...rest } = state;
             return { revision: snapshot.revision, state: rest };
+        }
+        // The session belongs to another panel: it owns the phase, is releasing it,
+        // or is clearing state behind it, so these edits are its work to show and
+        // not ours to duplicate. (Or this panel was not asked to claim, or cannot
+        // edit at all, or the snapshot predates a completed clear.)
+        //
+        // Everything else is silent loss of unsaved user work, so assert rather than
+        // hope: reaching here from a free phase with a claim permitted means
+        // `try_claim_edit_session` refused a session nobody holds, which
+        // `may_rehydrate_session()` is written to make impossible.
+        if (
+            allow_claim
+            && profile.editing
+            && !!file_edit_state
+            && !predates_completed_clear
+            && edit_phase().type === 'free'
+        ) {
+            console.error(
+                'Dropped durable CSV pending edits with no panel holding the session',
+                file_key,
+            );
         }
         const { pendingEdits: _drop, ...rest } = state;
         return { revision: snapshot.revision, state: rest };
@@ -1882,7 +2021,7 @@ export function attach_viewer(
                             capabilities: {
                                 csvEditingSupported: profile.editing,
                                 csvEditable: profile.editing
-                                    && editing_available_for_panel()
+                                    && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
                                 ...(owns_edit_session() && active_edit_session_id
@@ -2030,7 +2169,7 @@ export function attach_viewer(
                                     capabilities: {
                                         csvEditingSupported: profile.editing,
                                         csvEditable: profile.editing
-                                            && editing_available_for_panel()
+                                            && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
@@ -3688,7 +3827,7 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_work_in_flight();
+                    && may_begin_editing();
                 const denied_by_owner = can_edit
                     && ((phase.type === 'owned' && phase.token !== edit_session_token)
                         || phase.type === 'claiming');
@@ -3729,7 +3868,9 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_work_in_flight();
+                    // Re-asked after the state read, because the window this
+                    // question is about is exactly the one the read just crossed.
+                    && may_begin_editing();
                 const owner_still_available = already_owned
                     ? phase.type === 'owned' && phase.token === edit_session_token
                     : phase.type === 'claiming' && phase.claim === claim;
@@ -3738,13 +3879,14 @@ export function attach_viewer(
                     && try_claim_edit_session(true, claim);
                 if (!granted) cancel_edit_claim(claim);
                 if (edit_state) update_session_state_material(edit_state);
-                // An installed sort or filter is not a denial: editing under one
-                // is supported, and the rows stay exactly where they are. Only
-                // work in flight refuses, and it refuses transiently.
+                // The reason half of the same question `can_edit` asked: an installed
+                // sort or filter is not a denial, because editing under one is
+                // supported and the rows stay exactly where they are. Only work in
+                // flight refuses, and it refuses transiently.
                 const denied_by_transform = profile.editing
                     && !!source
                     && !source.truncationMessage
-                    && transform_work_in_flight();
+                    && !may_begin_editing();
                 const pendingEdits = granted
                     ? pending_edits_for_current_session(
                         (edit_state?.state as PerFileState | undefined)?.pendingEdits,

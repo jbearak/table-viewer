@@ -323,6 +323,30 @@ export function transform_progress_label(
  * non-resident rows — and a wrong count in a banner is worse than no count. It
  * would also mean relocating the host's filter compiler into the webview.
  *
+ * Nor a count of edited cells the view currently *hides*, which is the sharper
+ * version of the same question: after a close and reopen the view is recomputed
+ * from saved values, so a row whose durable edits make it fail an enabled filter
+ * is simply absent, and the user holds unsaved work they cannot see. That is worth
+ * saying, and it is still not ours to say from here. Two independent reasons:
+ *
+ *  - Membership of the view never reaches the webview. `transformInstalled`
+ *    carries basis, rules, row count and `permuted` — no index list — and
+ *    display-to-source identity arrives only per fetched page, as
+ *    `rowData.sourceRows`, behind RowLoader's page LRU. "Is source row R in the
+ *    current view?" is therefore answerable only for rows that happen to be
+ *    resident right now, so any count derived from it would move with the
+ *    scrollbar.
+ *  - Recomputing membership instead of observing it needs each filtered column's
+ *    *saved* value for every dirty row, non-resident ones included, plus the
+ *    host's filter compiler — the two things ruled out just above.
+ *
+ * Note the asymmetry that makes this tempting: explicitly hidden rows *are*
+ * source-keyed and exactly knowable here (`hiddenRows`), so a count over those
+ * alone is computable. It would under-report whenever a filter is also enabled,
+ * which is exactly the case such a count exists for, so it would be a number that
+ * is right only sometimes — the worse of the two failures. Saying this honestly
+ * needs the host, which owns the permutation, to send the count.
+ *
  * @param dirty_keys `"sourceRow:sourceColumn"` keys, as PR 2 rekeyed them.
  */
 export function stale_view_signature(
