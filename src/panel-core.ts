@@ -1,4 +1,4 @@
-import type { DataSource } from './data-source/interface';
+import type { DataSource, SheetMeta } from './data-source/interface';
 import {
     projected_row_for_source,
     read_source_row_indices,
@@ -26,6 +26,7 @@ import {
     type FilterEntry,
     type HostMessage,
     type SheetTransformState,
+    type SheetViewRecord,
     type WebviewMessage,
 } from './types';
 
@@ -572,29 +573,46 @@ export class ViewerPanelCore {
             && this.commit_transform_reconciliation(prepared);
     }
 
+    /**
+     * Describe the view this core holds for a sheet *right now*. Every install
+     * acknowledgement is built from this after the mutation, so the record and the
+     * core cannot disagree about what was installed.
+     */
+    private installed_view(sheet_index: number, sheet: SheetMeta): SheetViewRecord {
+        const indices = this.transform_indices.get(sheet_index);
+        const rules = this.transform_states.get(sheet_index);
+        return {
+            basis: {
+                generation: this._generation,
+                sourceGeneration: this._source_generation,
+                schema: transform_schema_for_sheet(sheet),
+            },
+            // Normalized to `undefined` here rather than by each consumer: rules
+            // with no entries are not a view, they are the absence of one.
+            rules: transform_has_entries(rules)
+                ? clone_transform(rules!)
+                : undefined,
+            rowCount: indices?.length ?? sheet.rowCount,
+            permuted: indices !== undefined,
+        };
+    }
+
     private async handle_set_transform(
         msg: SetTransformMessage,
     ): Promise<void> {
         const receiver_epoch = this.receiver_epoch;
         const sheet = this.source.meta().sheets[msg.sheetIndex];
         if (!sheet) {
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: this.transform_states.get(msg.sheetIndex) ?? EMPTY_TRANSFORM,
-                rowCount: 0,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-                error: `Sheet index ${msg.sheetIndex} is out of range.`,
-            }, receiver_epoch);
+            await this.post_transform_refusal(
+                msg,
+                `Sheet index ${msg.sheetIndex} is out of range.`,
+                receiver_epoch,
+            );
             return;
         }
         if (msg.sourceGeneration !== this._source_generation) {
-            await this.post_transform_error(
+            await this.post_transform_refusal(
                 msg,
-                sheet.rowCount,
                 'The source changed before this table view request arrived.',
                 receiver_epoch,
             );
@@ -604,9 +622,8 @@ export class ViewerPanelCore {
             transform_has_entries(msg.state)
             && msg.state.schema !== transform_schema_for_sheet(sheet)
         ) {
-            await this.post_transform_error(
+            await this.post_transform_refusal(
                 msg,
-                sheet.rowCount,
                 'The saved table view no longer matches this sheet.',
                 receiver_epoch,
             );
@@ -619,16 +636,14 @@ export class ViewerPanelCore {
             && installed_state
             && transform_states_equal(installed_state, msg.state)
         ) {
+            // A no-op ack, and truthfully an install: the view the record describes
+            // is the one already in place, on an unmoved generation.
             await this.post({
-                type: 'transformApplied',
+                type: 'transformInstalled',
                 sheetIndex: msg.sheetIndex,
-                state: clone_transform(installed_state),
-                rowCount: this.transform_indices.get(msg.sheetIndex)?.length
-                    ?? sheet.rowCount,
                 requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
                 intent: msg.intent,
+                view: this.installed_view(msg.sheetIndex, sheet),
             }, receiver_epoch);
             return;
         }
@@ -655,28 +670,21 @@ export class ViewerPanelCore {
                 );
                 if (!source_request_is_current()) return;
                 await this.post({
-                    type: 'transformApplied',
+                    type: 'transformInstalled',
                     sheetIndex: msg.sheetIndex,
-                    state: clone_transform(installed_state),
-                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
                     requestId: msg.requestId,
-                    generation: this._generation,
-                    sourceGeneration: this._source_generation,
                     intent: msg.intent,
+                    view: this.installed_view(msg.sheetIndex, sheet),
                 }, receiver_epoch);
             } catch (error) {
                 if (!source_request_is_current()) return;
-                await this.post({
-                    type: 'transformApplied',
-                    sheetIndex: msg.sheetIndex,
-                    state: clone_transform(installed_state),
-                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
-                    requestId: msg.requestId,
-                    generation: this._generation,
-                    sourceGeneration: this._source_generation,
-                    intent: msg.intent,
-                    error: error instanceof Error ? error.message : String(error),
-                }, receiver_epoch);
+                // Persisting the cancel failed, so nothing changed and nothing will
+                // change by asking again.
+                await this.post_transform_refusal(
+                    msg,
+                    error instanceof Error ? error.message : String(error),
+                    receiver_epoch,
+                );
             } finally {
                 if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                     this.transforms_in_flight.delete(msg.sheetIndex);
@@ -728,15 +736,15 @@ export class ViewerPanelCore {
             this.transform_states.set(msg.sheetIndex, clone_transform(msg.state));
             this._generation += 1;
             this.cache.clear();
+            // Built after the mutation above, so the record's basis carries the
+            // bumped generation and its rules/rowCount/permuted come from what was
+            // actually installed rather than from what was asked for.
             await this.post({
-                type: 'transformApplied',
+                type: 'transformInstalled',
                 sheetIndex: msg.sheetIndex,
-                state: clone_transform(msg.state),
-                rowCount: result.rowCount,
                 requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
                 intent: msg.intent,
+                view: this.installed_view(msg.sheetIndex, sheet),
             }, receiver_epoch);
         } catch (error) {
             if (
@@ -747,8 +755,6 @@ export class ViewerPanelCore {
             }
             const previous = this.transform_states.get(msg.sheetIndex)
                 ?? EMPTY_TRANSFORM;
-            const previous_count = this.transform_indices.get(msg.sheetIndex)?.length
-                ?? sheet.rowCount;
             const persisted_error = error instanceof InvalidNumericFilterOperandError
                 ? new InvalidPersistedTransformError(
                     msg.sheetIndex,
@@ -774,19 +780,25 @@ export class ViewerPanelCore {
                 !source_request_is_current()
                 || (msg.intent === 'restore' && !receiver_is_current())
             ) return;
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: clone_transform(previous),
-                rowCount: previous_count,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-                ...(recovered
-                    ? {}
-                    : { error: error instanceof Error ? error.message : String(error) }),
-            }, receiver_epoch);
+            if (recovered) {
+                // The controller dropped the invalid saved transform durably, so
+                // there is nothing left to warn about: the view that stands is the
+                // one already installed, and saying so as an install is what stops
+                // the restore effect asking for the dropped rules again.
+                await this.post({
+                    type: 'transformInstalled',
+                    sheetIndex: msg.sheetIndex,
+                    requestId: msg.requestId,
+                    intent: msg.intent,
+                    view: this.installed_view(msg.sheetIndex, sheet),
+                }, receiver_epoch);
+            } else {
+                await this.post_transform_refusal(
+                    msg,
+                    error instanceof Error ? error.message : String(error),
+                    receiver_epoch,
+                );
+            }
         } finally {
             if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                 this.transforms_in_flight.delete(msg.sheetIndex);
@@ -797,45 +809,39 @@ export class ViewerPanelCore {
     /**
      * `transient` says the refusal will clear on its own and the request is worth
      * retrying; the default is a terminal validation refusal, which the webview
-     * answers by adopting the echoed state.
+     * answers by keeping the view it already has and not asking again.
      */
     reject_transform(
         msg: SetTransformMessage,
         error: string,
         transient = false,
     ): Promise<boolean> {
-        const natural_count =
-            this.source.meta().sheets[msg.sheetIndex]?.rowCount ?? 0;
-        return this.post_transform_error(
+        return this.post_transform_refusal(
             msg,
-            natural_count,
             error,
             this.receiver_epoch,
             transient,
         );
     }
 
-    private post_transform_error(
+    /**
+     * Nothing changed, so nothing about the view is sent. The refusal deliberately
+     * cannot describe a state, a generation or a row count — a refusal that could
+     * would be adopted as one, which is the bug class this split removes.
+     */
+    private post_transform_refusal(
         msg: SetTransformMessage,
-        natural_row_count: number,
-        error: string,
+        reason: string,
         receiver_epoch = this.receiver_epoch,
         transient = false,
     ): Promise<boolean> {
-        const previous = this.transform_states.get(msg.sheetIndex)
-            ?? EMPTY_TRANSFORM;
         return this.post({
-            type: 'transformApplied',
+            type: 'transformRefused',
             sheetIndex: msg.sheetIndex,
-            state: clone_transform(previous),
-            rowCount: this.transform_indices.get(msg.sheetIndex)?.length
-                ?? natural_row_count,
             requestId: msg.requestId,
-            generation: this._generation,
-            sourceGeneration: this._source_generation,
             intent: msg.intent,
-            error,
-            ...(transient ? { transientRefusal: true } : {}),
+            reason,
+            terminal: !transient,
         }, receiver_epoch);
     }
 

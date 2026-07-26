@@ -8,6 +8,7 @@ import type {
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
+    TransformIntent,
     WebviewMessage,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
@@ -468,20 +469,58 @@ function latest_transform_request(post_message: ReturnType<typeof vi.fn>) {
     return request!;
 }
 
+/**
+ * The install message the host would post, built the way PanelCore builds it: the
+ * record describes what is installed, with rules normalized to `undefined` when
+ * they carry no entries, and `permuted` following whether anything is active.
+ */
+function transform_installed_message(
+    request: {
+        sheetIndex: number;
+        requestId: string;
+        intent: TransformIntent;
+        state: SheetTransformState;
+        sourceGeneration: number;
+    },
+    options: {
+        generation: number;
+        rowCount?: number;
+        state?: SheetTransformState;
+        permuted?: boolean;
+    },
+): Extract<HostMessage, { type: 'transformInstalled' }> {
+    const rules = options.state ?? request.state;
+    const has_entries = rules.sort.length > 0
+        || rules.filters.length > 0
+        || (rules.hiddenRows?.length ?? 0) > 0;
+    const is_active = rules.sort.length > 0
+        || rules.filters.some((filter) => filter.enabled)
+        || (rules.hiddenRows?.length ?? 0) > 0;
+    return {
+        type: 'transformInstalled',
+        sheetIndex: request.sheetIndex,
+        requestId: request.requestId,
+        intent: request.intent,
+        view: {
+            basis: {
+                generation: options.generation,
+                sourceGeneration: request.sourceGeneration,
+                schema: rules.schema ?? '["Sheet1",1,null]',
+            },
+            rules: has_entries ? rules : undefined,
+            rowCount: options.rowCount ?? 1,
+            permuted: options.permuted ?? is_active,
+        },
+    };
+}
+
 async function acknowledge_transform(
     request: Extract<WebviewMessage, { type: 'setTransform' }>,
     generation: number,
 ) {
-    await dispatch_host_message({
-        type: 'transformApplied',
-        sheetIndex: request.sheetIndex,
-        state: request.state,
-        rowCount: 1,
-        requestId: request.requestId,
-        generation,
-        sourceGeneration: request.sourceGeneration,
-        intent: request.intent,
-    });
+    await dispatch_host_message(
+        transform_installed_message(request, { generation }),
+    );
 }
 
 async function flush_focus_restore() {
@@ -4586,11 +4625,9 @@ describe('sorting and filtering', () => {
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: restore.state,
-            rowCount: 1, requestId: restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
         post_message.mockClear();
         const mount_id = grid_stub().getAttribute('data-mount-id');
         const on_transform_change = grid_shell_mock.latest_props?.on_transform_change as
@@ -4617,11 +4654,9 @@ describe('sorting and filtering', () => {
         }));
         const sort_restore = post_message.mock.calls.map((call) => call[0])
             .filter((message) => message.type === 'setTransform').at(-1);
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: sort_restore.state,
-            rowCount: 1, requestId: sort_restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: sort_restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(sort_restore, { generation: 2 }),
+        );
         post_message.mockClear();
         const sort_mount_id = grid_stub().getAttribute('data-mount-id');
         const change_sort = grid_shell_mock.latest_props?.on_transform_change as
@@ -4661,12 +4696,11 @@ describe('sorting and filtering', () => {
             state: { transforms: [invalid] },
         }));
         const restore = latest_transform_request(post_message);
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0,
-            state: { sort: [], filters: [] }, rowCount: 1,
-            requestId: restore.requestId, generation: 1,
-            sourceGeneration: restore.sourceGeneration, intent: 'restore',
-        });
+        // Recovery arrives as an install of the view that stands, not a refusal.
+        await dispatch_host_message(transform_installed_message(restore, {
+            generation: 1,
+            state: { sort: [], filters: [] },
+        }));
         expect(post_message.mock.calls.map((call) => call[0])
             .filter((message) => message.type === 'showWarning')).toHaveLength(0);
 
@@ -4704,11 +4738,9 @@ describe('sorting and filtering', () => {
         expect(request).toBeDefined();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 2,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2 }),
+        );
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
 
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
@@ -4762,11 +4794,9 @@ describe('sorting and filtering', () => {
         expect(restore_old_grid).not.toHaveBeenCalled();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 2,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2 }),
+        );
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
@@ -4783,10 +4813,12 @@ describe('sorting and filtering', () => {
             .find((message) => message.type === 'setTransform');
 
         await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0,
-            state: { sort: [], filters: [] }, rowCount: 1,
-            requestId: request.requestId, generation: 1,
-            sourceGeneration: 1, intent: request.intent, error: 'failed',
+            type: 'transformRefused',
+            sheetIndex: 0,
+            requestId: request.requestId,
+            intent: request.intent,
+            reason: 'failed',
+            terminal: true,
         });
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
 
@@ -4858,11 +4890,9 @@ describe('sorting and filtering', () => {
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: restore.state,
-            rowCount: 1, requestId: restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
         const chip = document.querySelector('.filter-chip-body') as HTMLButtonElement;
         chip.focus();
         await act(async () => chip.click());
@@ -4882,11 +4912,9 @@ describe('sorting and filtering', () => {
         expect(chip.disabled).toBe(false);
         expect(chip.getAttribute('aria-disabled')).toBe('true');
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 3,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 3 }),
+        );
         expect(document.activeElement).toBe(chip);
         expect(chip.getAttribute('aria-disabled')).toBeNull();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
@@ -5143,16 +5171,9 @@ describe('sorting and filtering', () => {
         expect(request).toBeDefined();
 
         post_message.mockClear();
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: request.state,
-            rowCount: 2,
-            requestId: request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2, rowCount: 2 }),
+        );
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(post_message.mock.calls
@@ -5188,16 +5209,9 @@ describe('sorting and filtering', () => {
         expect(post_message.mock.calls.map((call) => call[0])
             .some((message) => message.type === 'setTransform')).toBe(false);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: cancel_request.state,
-            rowCount: 1,
-            requestId: cancel_request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: cancel_request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(cancel_request, { generation: 2 }),
+        );
         expect(document.body.textContent).not.toContain('Sort:');
     });
 
@@ -5258,16 +5272,9 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(get_button('Edit').disabled).toBe(true);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: request.state,
-            rowCount: 2,
-            requestId: request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2, rowCount: 2 }),
+        );
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
@@ -5284,16 +5291,10 @@ describe('sorting and filtering', () => {
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
         expect(disable_request.state.filters[0].enabled).toBe(false);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: disable_request.state,
-            rowCount: 3,
-            requestId: disable_request.requestId,
-            generation: 3,
-            sourceGeneration: 1,
-            intent: disable_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            disable_request,
+            { generation: 3, rowCount: 3 },
+        ));
         expect(document.body.textContent).toContain('✗');
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
@@ -5306,16 +5307,10 @@ describe('sorting and filtering', () => {
         const enable_request = post_message.mock.calls
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: enable_request.state,
-            rowCount: 2,
-            requestId: enable_request.requestId,
-            generation: 4,
-            sourceGeneration: 1,
-            intent: enable_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            enable_request,
+            { generation: 4, rowCount: 2 },
+        ));
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
 
         post_message.mockClear();
@@ -5331,16 +5326,10 @@ describe('sorting and filtering', () => {
             schema: '["Sheet1",1,null]',
         });
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: clear_request.state,
-            rowCount: 3,
-            requestId: clear_request.requestId,
-            generation: 5,
-            sourceGeneration: 1,
-            intent: clear_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            clear_request,
+            { generation: 5, rowCount: 3 },
+        ));
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
@@ -5537,13 +5526,18 @@ describe('edit session store hydration', () => {
         await enter_edit_mode(post_message);
 
         // Bump the generation so the shell's listener is re-registered last.
+        // No requestId, matching the undefined pending id, so the guard admits it:
+        // what this needs is the generation bump, not a particular request.
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformInstalled',
             sheetIndex: 0,
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            rowCount: 1,
-            generation: 5,
-            sourceGeneration: 1,
+            intent: 'user',
+            view: {
+                basis: { generation: 5, sourceGeneration: 1, schema: '["Sheet1",1,null]' },
+                rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+                rowCount: 1,
+                permuted: true,
+            },
         });
 
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -5597,13 +5591,18 @@ describe('edit session store hydration', () => {
         });
         const mount_id = grid_stub().getAttribute('data-mount-id');
 
+        // No requestId, matching the undefined pending id, so the guard admits it:
+        // what this needs is the generation bump, not a particular request.
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformInstalled',
             sheetIndex: 0,
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            rowCount: 1,
-            generation: 5,
-            sourceGeneration: 1,
+            intent: 'user',
+            view: {
+                basis: { generation: 5, sourceGeneration: 1, schema: '["Sheet1",1,null]' },
+                rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+                rowCount: 1,
+                permuted: true,
+            },
         });
 
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
@@ -5890,16 +5889,10 @@ describe('an applied transform across a refresh', () => {
         }));
         const restore = latest_transform_request(post_message);
         expect(restore.intent).toBe('restore');
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: restore.state,
-            rowCount: FILTERED_ROW_COUNT,
-            requestId: restore.requestId,
-            generation: 2,
-            sourceGeneration: restore.sourceGeneration,
-            intent: restore.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+        ));
         // The snapshot already names a session this panel owns, so it opens in edit
         // mode — the state in which every commit provokes a same-basis refresh.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
@@ -6027,16 +6020,10 @@ describe('an applied transform across a refresh', () => {
             state: { ...STORED_STATE, columnWidths: [{ 0: 80 }] },
         }));
         const restore = latest_transform_request(post_message);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: restore.state,
-            rowCount: FILTERED_ROW_COUNT,
-            requestId: restore.requestId,
-            generation: 2,
-            sourceGeneration: restore.sourceGeneration,
-            intent: restore.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+        ));
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
 
         await click_button('Auto-fit Columns');
@@ -6066,16 +6053,10 @@ describe('an applied transform across a refresh', () => {
         // the acknowledgement alone discards auto-fit. So answer anything asked here
         // rather than presupposing that nothing was.
         for (const request of transform_requests(post_message)) {
-            await dispatch_host_message({
-                type: 'transformApplied',
-                sheetIndex: 0,
-                state: request.state,
-                rowCount: FILTERED_ROW_COUNT,
-                requestId: request.requestId,
-                generation: 2,
-                sourceGeneration: request.sourceGeneration,
-                intent: request.intent,
-            });
+            await dispatch_host_message(transform_installed_message(
+                request,
+                { generation: 2, rowCount: FILTERED_ROW_COUNT },
+            ));
         }
 
         // Nothing about the rows moved, so nothing justifies dropping the fit.
@@ -6112,16 +6093,9 @@ describe('an applied transform across a refresh', () => {
         // ones — so whatever clears it below is the acknowledgement's doing.
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: install.state,
-            rowCount: 4,
-            requestId: install.requestId,
-            generation: 3,
-            sourceGeneration: install.sourceGeneration,
-            intent: install.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 3, rowCount: 4 }),
+        );
 
         // A different sort re-populates the rows auto-fit sampled, so the measurement
         // behind the toggle is stale: the toggle goes off and the snapshot with it.
@@ -6160,16 +6134,9 @@ describe('an applied transform across a refresh', () => {
         expect(uninstall.state.filters).toEqual([]);
         expect(uninstall.state.hiddenRows ?? []).toEqual([]);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: uninstall.state,
-            rowCount: 5,
-            requestId: uninstall.requestId,
-            generation: 3,
-            sourceGeneration: uninstall.sourceGeneration,
-            intent: uninstall.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
+        );
 
         // And the grid agrees with the toolbar again: natural order, natural count.
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
@@ -6208,16 +6175,9 @@ describe('an applied transform across a refresh', () => {
         }));
         const restore = latest_transform_request(post_message);
         expect(restore.state.hiddenRows).toEqual(STORED_HIDDEN_ROWS.hiddenRows);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: restore.state,
-            rowCount: 3,
-            requestId: restore.requestId,
-            generation: 2,
-            sourceGeneration: restore.sourceGeneration,
-            intent: restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2, rowCount: 3 }),
+        );
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         post_message.mockClear();
@@ -6233,16 +6193,9 @@ describe('an applied transform across a refresh', () => {
         await vi.waitUntil(() => transform_requests(post_message).length > 0);
         const uninstall = latest_transform_request(post_message);
         expect(uninstall.state.hiddenRows ?? []).toEqual([]);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: uninstall.state,
-            rowCount: 5,
-            requestId: uninstall.requestId,
-            generation: 3,
-            sourceGeneration: uninstall.sourceGeneration,
-            intent: uninstall.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
+        );
 
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
@@ -6266,10 +6219,24 @@ describe('an applied transform across a refresh', () => {
     });
 });
 
-// A refusal always means the host changed nothing. `transientRefusal` says whether
-// the reason will clear on its own, which decides whether the webview may adopt the
-// echo (terminal validation) or must keep its own copy and retry (the admission
-// matrix).
+// A refusal always means the host changed nothing, and `transformRefused` carries
+// nothing about the view for that reason — there is no state, generation or row count
+// on the message to adopt by accident. `terminal` says only whether the reason will
+// clear on its own, which decides whether the webview stops asking (terminal
+// validation) or keeps its own copy and retries (the admission matrix).
+//
+// The first guarantee below is enforced by the compiler, not by any test: six review
+// rounds of this feature were each a consumer adopting a refusal's echo of the host's
+// unchanged view, so the fields are gone from the arm rather than merely
+// unread. `Extract` of them from the refusal's keys must be `never`, or this alias
+// resolves to `never` and the assignment stops compiling.
+type _RefusalCarriesNoView = Extract<
+    keyof Extract<HostMessage, { type: 'transformRefused' }>,
+    'view' | 'state' | 'rowCount' | 'generation' | 'sourceGeneration'
+> extends never ? true : never;
+const _refusal_carries_no_view: _RefusalCarriesNoView = true;
+void _refusal_carries_no_view;
+
 describe('refused transforms', () => {
     const STORED_SORT: SheetTransformState = {
         sort: [{ colIndex: 0, direction: 'desc' }],
@@ -6303,22 +6270,22 @@ describe('refused transforms', () => {
         return rendered;
     }
 
+    /**
+     * The whole refusal, exhaustively. There is no `state`, `rowCount` or
+     * `generation` to pass: the arm does not have them, which is a type-level
+     * guarantee that no handler can adopt one.
+     */
     async function refuse_transform(
         request: Extract<WebviewMessage, { type: 'setTransform' }>,
-        options: { transient: boolean; generation: number },
+        options: { terminal: boolean },
     ) {
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformRefused',
             sheetIndex: request.sheetIndex,
-            // A refusal echoes the host's own unchanged state, which here is none.
-            state: { sort: [], filters: [] },
-            rowCount: 1,
             requestId: request.requestId,
-            generation: options.generation,
-            sourceGeneration: request.sourceGeneration,
             intent: request.intent,
-            error: 'A save is in progress.',
-            ...(options.transient ? { transientRefusal: true } : {}),
+            reason: 'A save is in progress.',
+            terminal: options.terminal,
         });
     }
 
@@ -6347,13 +6314,14 @@ describe('refused transforms', () => {
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
-        await refuse_transform(request, { transient: true, generation: 99 });
+        await refuse_transform(request, { terminal: false });
 
-        // Nothing adopted: neither the echoed generation nor the emptied state.
+        // Nothing adopted, and now nothing adoptable: the refusal has no generation,
+        // rules or row count on it at all.
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
-        // No generation bump means no unmount, so folding the open overlay would
-        // commit an edit the user never confirmed.
+        // A refusal cannot reach the fold: only an install can move the generation,
+        // and only a moved generation unmounts the grid that owns the overlay.
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
         // The spinner and its label must not stick.
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
@@ -6382,7 +6350,7 @@ describe('refused transforms', () => {
         expect(request.intent).toBe('user');
         post_message.mockClear();
 
-        await refuse_transform(request, { transient: true, generation: 99 });
+        await refuse_transform(request, { terminal: false });
 
         // Visible failure, and that is the whole of it.
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
@@ -6406,34 +6374,64 @@ describe('refused transforms', () => {
         const { post_message } = await editing_csv();
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
+        const generation_before = grid_stub().getAttribute('data-generation');
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
-        await refuse_transform(request, { transient: false, generation: 99 });
+        await refuse_transform(request, { terminal: true });
 
-        // Authoritative, exactly as before: the echoed generation and the empty
-        // state land, and the fold for the impending unmount still happens.
-        expect(grid_stub().getAttribute('data-generation')).toBe('99');
+        // "Adopts the natural state" needs nothing from the wire, which is why the
+        // refusal can carry nothing: the stored sort never installed, so the natural
+        // view is already what this webview shows, and the generation the host holds
+        // is already the one it is on. Both are asserted as *unchanged* rather than
+        // as echoes that landed.
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
-        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalled();
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'showWarning',
         }));
 
-        // And the source counts as handled, which is how a saved transform the sheet
-        // can no longer support stays dropped instead of being asked for forever.
+        // The load-bearing half, and the whole of what `terminal` buys: the source
+        // counts as handled, which is how a saved transform the sheet can no longer
+        // support stays dropped instead of being asked for — with its global warning —
+        // every time a blocker moves.
         post_message.mockClear();
         await settle_a_save();
         expect(transform_requests(post_message)).toEqual([]);
     });
 
+    it('keeps the applied view and its row count across a terminal refusal', async () => {
+        // The counterpart of the test above, where there *is* something to lose. A
+        // refusal has no state, generation or rowCount field to adopt — the type
+        // guarantees it — so an installed sort survives one by construction rather
+        // than because the handler remembered not to overwrite it.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const install = await refresh_with_stored_sort(post_message);
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 7, rowCount: 4 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('4');
+
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await refuse_transform(latest_transform_request(post_message), {
+            terminal: true,
+        });
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('4');
+    });
+
     it('does not fold the live editor for a terminal refusal', async () => {
-        // The real shape of a terminal refusal: post_transform_error echoes
-        // `this._generation`, unchanged, because nothing installed. Editing is
-        // permitted while a transform computes, so the user can be mid-cell when it
-        // arrives — and folding then puts a half-typed value in the dirty store,
-        // where Escape can no longer take it back.
+        // Nothing installed, so nothing remounts. Editing is permitted while a
+        // transform computes, so the user can be mid-cell when the refusal arrives —
+        // and folding then puts a half-typed value in the dirty store, where Escape
+        // can no longer take it back.
         const { post_message } = await editing_csv();
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
@@ -6444,18 +6442,13 @@ describe('refused transforms', () => {
         });
         grid_shell_mock.commit_live_edit.mockClear();
 
-        await refuse_transform(request, {
-            transient: false,
-            generation: generation_before,
-        });
+        await refuse_transform(request, { terminal: true });
 
-        // Stated as the user experiences it: the partial value never reached the
-        // dirty store, so the cell is still cancellable.
         // Stated as the user experiences it: the partial value never reached the
         // dirty store, so the cell is still cancellable.
         expect(store_edits()).toEqual({});
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
-        // The refusal is still authoritative about the view itself.
+        // And the view the webview already had is what it still shows.
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
 
         // The paired direction, here rather than elsewhere so this test cannot pass by
@@ -6463,6 +6456,48 @@ describe('refused transforms', () => {
         // and the overlay has to be folded ahead of that or the value is lost. Cleared
         // first so the count below is attributable to this ack and cannot be satisfied
         // by a fold that already happened above.
+        grid_shell_mock.commit_live_edit.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(
+            latest_transform_request(post_message),
+            generation_before + 1,
+        );
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(store_edits()).toEqual({ '0:0': { value: 'half', base: 'base' } });
+    });
+
+    it('does not fold the live editor for an install that moves no generation', async () => {
+        // The other half of the fold condition, and the one the split does *not*
+        // make structural. Reaching `transformInstalled` is necessary but not
+        // sufficient: the host answers a restore or cancel whose rules it already
+        // holds with a no-op ack, which is a truthful install on an unmoved
+        // generation. Nothing remounts, so folding puts a half-typed value in the
+        // dirty store where Escape can no longer take it back — the same harm the
+        // refusal case does, arriving on the arm that can fold.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = Number(grid_stub().getAttribute('data-generation'));
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half', base: 'base' });
+        });
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await dispatch_host_message(transform_installed_message(request, {
+            generation: generation_before,
+        }));
+
+        expect(store_edits()).toEqual({});
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // Not vacuous: the install landed, so this is the ack being processed and
+        // choosing not to fold, not the requestId guard dropping it.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        // Paired direction, so this cannot pass by never folding: the same install
+        // one generation on does remount, and the overlay has to be folded first.
         grid_shell_mock.commit_live_edit.mockClear();
         await act(async () => (
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
@@ -6578,17 +6613,12 @@ describe('a refused restore in a sibling panel', () => {
         request: Extract<WebviewMessage, { type: 'setTransform' }>,
     ) {
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformRefused',
             sheetIndex: request.sheetIndex,
-            // A refusal echoes the host's own unchanged state, which here is none.
-            state: { sort: [], filters: [] },
-            rowCount: 1,
             requestId: request.requestId,
-            generation: 99,
-            sourceGeneration: request.sourceGeneration,
             intent: request.intent,
-            error: 'Another editor is holding this file.',
-            transientRefusal: true,
+            reason: 'Another editor is holding this file.',
+            terminal: false,
         });
     }
 

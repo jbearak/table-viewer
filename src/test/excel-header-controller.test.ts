@@ -319,7 +319,7 @@ describe('Excel workbook snapshot controller', () => {
             intent: 'restore' as const,
         };
         await panel.__receive(restore);
-        const restored = messages_of(panel, 'transformApplied').find(
+        const restored = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === restore.requestId,
         )!;
 
@@ -329,8 +329,8 @@ describe('Excel workbook snapshot controller', () => {
             sheetName: 'People',
             enabled: true,
             requestId: 'promote-visible',
-            generation: restored.generation,
-            sourceGeneration: restored.sourceGeneration,
+            generation: restored.view.basis.generation,
+            sourceGeneration: restored.view.basis.sourceGeneration,
         });
         await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
             .toMatchObject({ requestId: 'promote-visible', outcome: 'applied' }));
@@ -348,7 +348,7 @@ describe('Excel workbook snapshot controller', () => {
             generation: promoted.generation,
             sourceGeneration: promoted.sourceGeneration,
         });
-        const promoted_restore = messages_of(panel, 'transformApplied').find(
+        const promoted_restore = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'restore-promoted-prefix',
         )!;
         await panel.__receive({
@@ -356,21 +356,21 @@ describe('Excel workbook snapshot controller', () => {
             sheetIndex: 0,
             state: { sort: [], filters: [] },
             requestId: 'bypass-atomic-unhide',
-            generation: promoted_restore.generation,
-            sourceGeneration: promoted_restore.sourceGeneration,
+            generation: promoted_restore.view.basis.generation,
+            sourceGeneration: promoted_restore.view.basis.sourceGeneration,
             intent: 'user',
         });
-        expect(messages_of(panel, 'transformApplied').find(
+        // Terminal, not transient: nothing here clears on its own, so the webview
+        // stops asking rather than retrying. A refusal cannot describe a view at all
+        // now, so what proves the host changed nothing is the durable state, checked
+        // below, not an echo in the message.
+        expect(messages_of(panel, 'transformRefused').find(
             (message) => message.requestId === 'bypass-atomic-unhide',
         )).toMatchObject({
-            error: 'Use Unhide all to restore rows above the active header.',
-            state: { hiddenRows: [0, 1] },
+            reason: 'Use Unhide all to restore rows above the active header.',
+            terminal: true,
         });
-        // Terminal, not transient: nothing here clears on its own, so the webview is
-        // right to adopt the echoed state instead of retrying.
-        expect(messages_of(panel, 'transformApplied').find(
-            (message) => message.requestId === 'bypass-atomic-unhide',
-        )?.transientRefusal).toBeUndefined();
+        expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
         await panel.__receive({
             type: 'setTransform',
             sheetIndex: 0,
@@ -381,16 +381,17 @@ describe('Excel workbook snapshot controller', () => {
                 schema: promoted.state.transforms![0]!.schema,
             },
             requestId: 'hide-promoted-header',
-            generation: promoted_restore.generation,
-            sourceGeneration: promoted_restore.sourceGeneration,
+            generation: promoted_restore.view.basis.generation,
+            sourceGeneration: promoted_restore.view.basis.sourceGeneration,
             intent: 'user',
         });
-        expect(messages_of(panel, 'transformApplied').find(
+        expect(messages_of(panel, 'transformRefused').find(
             (message) => message.requestId === 'hide-promoted-header',
         )).toMatchObject({
-            error: 'The active header row cannot be hidden.',
-            state: { hiddenRows: [0, 1] },
+            reason: 'The active header row cannot be hidden.',
+            terminal: true,
         });
+        expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
         await panel.__receive({
             type: 'setExcelFirstRowHeader',
             sheetIndex: 0,
@@ -398,8 +399,8 @@ describe('Excel workbook snapshot controller', () => {
             enabled: false,
             unhideAll: true,
             requestId: 'unhide-and-disable',
-            generation: promoted_restore.generation,
-            sourceGeneration: promoted_restore.sourceGeneration,
+            generation: promoted_restore.view.basis.generation,
+            sourceGeneration: promoted_restore.view.basis.sourceGeneration,
         });
         await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
             .toMatchObject({ requestId: 'unhide-and-disable', outcome: 'applied' }));
@@ -494,7 +495,7 @@ describe('Excel workbook snapshot controller', () => {
             sourceGeneration: refreshed.sourceGeneration,
             intent: 'restore',
         });
-        const restored = messages_of(panel, 'transformApplied').find(
+        const restored = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'restore-external-hidden-row',
         )!;
         await panel.__receive({
@@ -503,8 +504,8 @@ describe('Excel workbook snapshot controller', () => {
             sheetName: 'People',
             enabled: true,
             requestId: 'retry-candidate',
-            generation: restored.generation,
-            sourceGeneration: restored.sourceGeneration,
+            generation: restored.view.basis.generation,
+            sourceGeneration: restored.view.basis.sourceGeneration,
         });
 
         await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
@@ -541,7 +542,7 @@ describe('Excel workbook snapshot controller', () => {
             sourceGeneration: initial.sourceGeneration,
             intent: 'restore',
         });
-        const restored = messages_of(panel, 'transformApplied').find(
+        const restored = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'restore-all-hidden',
         )!;
         await panel.__receive({
@@ -551,8 +552,8 @@ describe('Excel workbook snapshot controller', () => {
             enabled: false,
             unhideAll: true,
             requestId: 'restore-all-rows',
-            generation: restored.generation,
-            sourceGeneration: restored.sourceGeneration,
+            generation: restored.view.basis.generation,
+            sourceGeneration: restored.view.basis.sourceGeneration,
         });
 
         await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
@@ -610,10 +611,10 @@ describe('Excel workbook snapshot controller', () => {
             sourceGeneration: initial.sourceGeneration,
             intent: 'user',
         });
-        const applied = messages_of(panel, 'transformApplied').find(
+        const applied = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'unsorted-hidden-rows',
         )!;
-        expect(applied.state.hiddenRows).toEqual([0, 1]);
+        expect(applied.view.rules?.hiddenRows).toEqual([0, 1]);
         await panel.__receive({
             type: 'setTransform',
             sheetIndex: 0,
@@ -623,21 +624,20 @@ describe('Excel workbook snapshot controller', () => {
                 schema: '["Other",2,null]',
             },
             requestId: 'wrong-live-schema',
-            generation: applied.generation,
-            sourceGeneration: applied.sourceGeneration,
+            generation: applied.view.basis.generation,
+            sourceGeneration: applied.view.basis.sourceGeneration,
             intent: 'user',
         });
-        expect(messages_of(panel, 'transformApplied').find(
+        // A validation refusal is terminal: the webview marks the source handled so a
+        // saved view the sheet can no longer support gets dropped instead of retried
+        // forever. The refusal itself can no longer describe a view, so what proves
+        // the host changed nothing is the durable state below.
+        expect(messages_of(panel, 'transformRefused').find(
             (message) => message.requestId === 'wrong-live-schema',
         )).toMatchObject({
-            error: 'The saved table view no longer matches this sheet.',
-            state: { hiddenRows: [0, 1] },
+            reason: 'The saved table view no longer matches this sheet.',
+            terminal: true,
         });
-        // A validation refusal is terminal: adopting the echo is how a saved view
-        // the sheet can no longer support gets dropped instead of retried forever.
-        expect(messages_of(panel, 'transformApplied').find(
-            (message) => message.requestId === 'wrong-live-schema',
-        )?.transientRefusal).toBeUndefined();
         expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
 
         await panel.__receive({
@@ -646,8 +646,8 @@ describe('Excel workbook snapshot controller', () => {
             sheetName: 'People',
             enabled: true,
             requestId: 'promote-after-unsorted',
-            generation: applied.generation,
-            sourceGeneration: applied.sourceGeneration,
+            generation: applied.view.basis.generation,
+            sourceGeneration: applied.view.basis.sourceGeneration,
         });
         await vi.waitFor(() => expect(snapshots(panel).at(-1)?.commandResult)
             .toMatchObject({ requestId: 'promote-after-unsorted', outcome: 'applied' }));

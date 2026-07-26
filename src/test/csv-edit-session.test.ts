@@ -9,7 +9,7 @@ import {
     type FileStateSnapshot,
     type FileStateStore,
 } from '../state';
-import type { PerFileState } from '../types';
+import type { HostMessage, PerFileState } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -262,6 +262,40 @@ function initial_snapshot(panel: { __messages: unknown[] }): {
         identity: WorkbookSnapshotIdentity;
     } };
     return message.snapshot;
+}
+
+type TransformAnswer =
+    | Extract<HostMessage, { type: 'transformInstalled' }>
+    | Extract<HostMessage, { type: 'transformRefused' }>;
+
+/** Every answer to a setTransform, whichever arm it arrived on. */
+function transform_answers(panel: { __messages: unknown[] }): TransformAnswer[] {
+    return panel.__messages.filter((message): message is TransformAnswer => (
+        typeof message === 'object'
+        && message !== null
+        && 'type' in message
+        && (message.type === 'transformInstalled'
+            || message.type === 'transformRefused')
+    ));
+}
+
+/** Only the installs: the answers that describe a view and can be quoted back. */
+function transform_installs(
+    panel: { __messages: unknown[] },
+): Array<Extract<HostMessage, { type: 'transformInstalled' }>> {
+    return transform_answers(panel).filter((message) => (
+        message.type === 'transformInstalled'
+    )) as Array<Extract<HostMessage, { type: 'transformInstalled' }>>;
+}
+
+/** The basis a following request should quote, read off an install. */
+function basis_of(
+    installed: Extract<HostMessage, { type: 'transformInstalled' }>,
+): { generation: number; sourceGeneration: number } {
+    return {
+        generation: installed.view.basis.generation,
+        sourceGeneration: installed.view.basis.sourceGeneration,
+    };
 }
 
 function sheet_meta_count(panel: { __messages: unknown[] }) {
@@ -3447,12 +3481,7 @@ describe('CSV edit sessions', () => {
         } as never);
         expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
 
-        const restore_ack = first.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied',
-        ) as { generation: number };
+        const restore_ack = transform_installs(first)[0];
         await first.__receive({
             type: 'setTransform',
             sheetIndex: 0,
@@ -3468,7 +3497,7 @@ describe('CSV edit sessions', () => {
                 schema: saved_transform.schema,
             },
         } as never);
-        expect(restore_ack.generation).toBeGreaterThan(meta.generation);
+        expect(restore_ack.view.basis.generation).toBeGreaterThan(meta.generation);
         expect(state.get_state(file_path).transforms).toEqual([undefined]);
 
         // A debounced snapshot captured before Cancel must not resurrect it.
@@ -3537,20 +3566,12 @@ describe('CSV edit sessions', () => {
             },
         } as never);
         await Promise.resolve();
-        expect(panel.__messages.some((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied')).toBe(false);
+        expect(transform_answers(panel)).toEqual([]);
 
         gate.resolve();
         await cancel;
         expect(current.transforms).toEqual([undefined]);
-        expect(panel.__messages.some((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied')).toBe(true);
+        expect(transform_answers(panel)).toHaveLength(1);
     });
 
     it('invalidates transform persistence when ready starts around CAS validation', async () => {
@@ -3592,12 +3613,7 @@ describe('CSV edit sessions', () => {
         await Promise.all([transform, ready]);
 
         expect(versioned.get_state(file_path).transforms).toBeUndefined();
-        expect(panel.__messages.some((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-        ))).toBe(false);
+        expect(transform_answers(panel)).toEqual([]);
         expect(latest_snapshot(panel).generation).toBe(snapshot.generation);
     });
 
@@ -3641,12 +3657,7 @@ describe('CSV edit sessions', () => {
             },
         });
         const transformed = latest_snapshot(panel);
-        const applied = [...panel.__messages].reverse().find((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-        )) as { generation: number; sourceGeneration: number };
+        const applied = basis_of(transform_installs(panel).at(-1)!);
 
         panel.__messages.length = 0;
         block_update = true;
@@ -3675,12 +3686,8 @@ describe('CSV edit sessions', () => {
 
         const durable = await store.read(file_path);
         expect((durable.state as PerFileState).transforms).toEqual([undefined]);
-        expect(panel.__messages.some((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-            && (message as { requestId?: string }).requestId === 'clear-transform'
+        expect(transform_answers(panel).some((message) => (
+            message.requestId === 'clear-transform'
         ))).toBe(false);
         const ready_snapshot = latest_snapshot(panel);
         expect(ready_snapshot.generation).toBe(applied.generation + 1);
@@ -3756,13 +3763,9 @@ describe('CSV edit sessions', () => {
             intent: 'user',
             state: preferred,
         });
-        const installed = [...panel.__messages].reverse().find((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-            && (message as { requestId?: string }).requestId === 'install-preferred'
-        )) as { generation: number; sourceGeneration: number };
+        const installed = basis_of(transform_installs(panel).filter((message) => (
+            message.requestId === 'install-preferred'
+        )).at(-1)!);
 
         block_ascending = true;
         const a = panel.__receive({
@@ -4380,13 +4383,11 @@ describe('CSV edit sessions', () => {
             state: saved_transform,
         } as never);
 
-        const ack = panel.__messages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied',
-        ) as { error?: string };
-        expect(ack.error).toContain('column read failed');
+        const ack = transform_answers(panel)[0];
+        expect(ack).toMatchObject({
+            type: 'transformRefused',
+            reason: expect.stringContaining('column read failed'),
+        });
         expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
     });
 
@@ -4419,12 +4420,13 @@ describe('CSV edit sessions', () => {
             intent: 'restore', state: saved_transform,
         });
 
-        const ack = panel.__messages.find((message) =>
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'transformApplied') as
-            { state: unknown; error?: string };
-        expect(ack.state).toEqual({ sort: [], filters: [] });
-        expect(ack.error).toBeUndefined();
+        // A recovered invalid restore is an install of the view that stands, so the
+        // webview stops asking for the rules the host has just dropped durably.
+        const ack = transform_answers(panel)[0];
+        expect(ack).toMatchObject({
+            type: 'transformInstalled',
+            view: { rules: undefined, permuted: false },
+        });
         expect(state.get_state(file_path).transforms).toEqual([undefined]);
     });
 
@@ -4465,12 +4467,12 @@ describe('CSV edit sessions', () => {
 
         panel.__messages.length = 0;
         await restore('failed-cleanup');
-        const failed = panel.__messages.find((message) =>
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'transformApplied') as
-            { state: unknown; error?: string };
-        expect(failed.state).toEqual({ sort: [], filters: [] });
-        expect(failed.error).toContain('finite numbers');
+        const failed = transform_answers(panel)[0];
+        expect(failed).toMatchObject({
+            type: 'transformRefused',
+            reason: expect.stringContaining('finite numbers'),
+            terminal: true,
+        });
         expect(versioned.get_state(file_path).transforms).toEqual([invalid]);
         expect(error).toHaveBeenCalledWith(
             'Failed to clear an invalid saved table transform',
@@ -4479,11 +4481,7 @@ describe('CSV edit sessions', () => {
 
         panel.__messages.length = 0;
         await restore('successful-retry');
-        const recovered = panel.__messages.find((message) =>
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'transformApplied') as
-            { error?: string };
-        expect(recovered.error).toBeUndefined();
+        expect(transform_answers(panel)[0].type).toBe('transformInstalled');
         expect(versioned.get_state(file_path).transforms).toEqual([undefined]);
     });
 
@@ -4582,11 +4580,7 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path)).toMatchObject({
             transforms: [winner], rowHeights: [{ 0: 27 }],
         });
-        const ack = panel.__messages.find((message) =>
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'transformApplied') as
-            { error?: string };
-        expect(ack.error).toBeUndefined();
+        expect(transform_answers(panel)[0].type).toBe('transformInstalled');
     });
 
     it('retries invalid-restore cleanup after an unrelated CAS winner', async () => {
@@ -4661,15 +4655,9 @@ describe('CSV edit sessions', () => {
             },
         });
 
-        const applied = panel.__messages.find((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-            && 'requestId' in message
-            && message.requestId === 'owner-sort'
-        )) as { generation: number; error?: string };
-        expect(applied.error).toBeUndefined();
+        const applied = basis_of(transform_installs(panel).find((message) => (
+            message.requestId === 'owner-sort'
+        ))!);
         expect(state.get_state(file_path).transforms?.[0]?.sort).toEqual([
             { colIndex: 0, direction: 'asc' },
         ]);
@@ -4770,12 +4758,13 @@ describe('CSV edit sessions', () => {
         // the permutation would move the owner's rows mid-edit.
         expect(shared.get_state(file_path).transforms).toBeUndefined();
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sibling-during-edit',
-            error: 'Another panel is editing this file.',
+            reason: 'Another panel is editing this file.',
             // The other panel's session ends, so this is worth retrying and the
-            // sibling must keep its own copy of the request rather than adopt ours.
-            transientRefusal: true,
+            // sibling keeps its own copy of the request; there is nothing of ours it
+            // could adopt instead.
+            terminal: false,
         }));
     });
 
@@ -4826,9 +4815,9 @@ describe('CSV edit sessions', () => {
         });
         expect(versioned.get_state(file_path).transforms).toBeUndefined();
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'overtaking-transform',
-            error: 'Finishing edit-session work; try again in a moment.',
+            reason: 'Finishing edit-session work; try again in a moment.',
         }));
     });
 
@@ -4889,7 +4878,7 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(transformer.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformInstalled',
             requestId: 'installed-transform',
         }));
         // The transform really is installed, so this is not the vacuous case of a
@@ -4938,10 +4927,9 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         });
-        const applied = panel.__messages.find((message: any) => (
-            message?.type === 'transformApplied' && message.requestId === 'sort-before-edit'
-        )) as { generation: number; error?: string };
-        expect(applied.error).toBeUndefined();
+        const applied = basis_of(transform_installs(panel).find((message) => (
+            message.requestId === 'sort-before-edit'
+        ))!);
 
         function displayed_rows(request_id: string, generation: number) {
             return panel.__receive({
@@ -5118,11 +5106,9 @@ describe('CSV edit sessions', () => {
 
         // The transform the refused save would otherwise have cancelled still lands.
         await transform;
-        const applied = owner.__messages.find((message: any) => (
-            message?.type === 'transformApplied'
-            && message.requestId === 'sort-during-save-attempt'
-        )) as { error?: string };
-        expect(applied.error).toBeUndefined();
+        expect(transform_answers(owner).find((message) => (
+            message.requestId === 'sort-during-save-attempt'
+        ))?.type).toBe('transformInstalled');
         expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
             { colIndex: 0, direction: 'asc' },
         ]);
@@ -5175,9 +5161,9 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sort-while-owned',
-            error: 'Another panel is editing this file.',
+            reason: 'Another panel is editing this file.',
         }));
         expect(shared.get_state(file_path).transforms).toBeUndefined();
 
@@ -5242,15 +5228,9 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         });
-        const applied = owner.__messages.find((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-            && 'requestId' in message
-            && message.requestId === 'owner-sort-before-save'
-        )) as { generation: number; error?: string };
-        expect(applied.error).toBeUndefined();
+        const applied = basis_of(transform_installs(owner).find((message) => (
+            message.requestId === 'owner-sort-before-save'
+        ))!);
         await owner.__receive({
             type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
             requestId: 'owner-sorted-before-save', generation: applied.generation,
@@ -5331,12 +5311,12 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sort-during-save',
-            error: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
-            // Flagged transient so the webview keeps the request and retries once the
-            // save lands, instead of adopting the unchanged state it just echoed.
-            transientRefusal: true,
+            reason: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+            // Non-terminal so the webview keeps the request and retries once the save
+            // lands. There is no echoed state it could adopt in the meantime.
+            terminal: false,
         }));
         // The save itself persists a sheet-shaped transforms array, so the
         // meaningful assertion is that the refused sort left no entry in it.
@@ -5363,10 +5343,9 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         });
-        const after_applied = owner.__messages.find((message: any) => (
-            message?.type === 'transformApplied' && message.requestId === 'sort-after-save'
-        )) as { error?: string };
-        expect(after_applied.error).toBeUndefined();
+        expect(transform_answers(owner).find((message) => (
+            message.requestId === 'sort-after-save'
+        ))?.type).toBe('transformInstalled');
         expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
             { colIndex: 0, direction: 'asc' },
         ]);
@@ -5422,9 +5401,9 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sort-during-cleanup',
-            error: 'Finishing edit-session work; try again in a moment.',
+            reason: 'Finishing edit-session work; try again in a moment.',
         }));
         // The save wrote a sheet-shaped transforms array of its own, so the
         // meaningful assertion is that the refused sort left sheet 0 untouched.
@@ -5483,9 +5462,9 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sort-during-release',
-            error: 'Finishing edit-session work; try again in a moment.',
+            reason: 'Finishing edit-session work; try again in a moment.',
         }));
         expect(versioned.get_state(file_path).transforms).toBeUndefined();
 
@@ -5546,9 +5525,9 @@ describe('CSV edit sessions', () => {
             },
         });
         expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'sort-during-uncertain',
-            error: 'Finishing edit-session work; try again in a moment.',
+            reason: 'Finishing edit-session work; try again in a moment.',
         }));
         // A sheet-shaped transforms array survives the save; the refusal is
         // observable as sheet 0 still carrying no installed transform.
@@ -5810,12 +5789,7 @@ describe('CSV edit sessions', () => {
 
         expect(source.reads).toBe(0);
         expect(panel.__messages).toHaveLength(message_count);
-        expect(panel.__messages.some((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-        ))).toBe(false);
+        expect(transform_answers(panel)).toEqual([]);
         expect(state.revision(file_path)).toBe(revision);
         expect(state.get_state(file_path)).toEqual({ columnWidths: [{ 0: 133 }] });
         expect(latest_snapshot(panel)).toMatchObject({
@@ -5867,16 +5841,10 @@ describe('CSV edit sessions', () => {
             intent: 'user',
         } as never);
 
-        const applied = panel.__messages.find((message) => (
-            typeof message === 'object'
-            && message !== null
-            && 'type' in message
-            && message.type === 'transformApplied'
-            && 'requestId' in message
-            && message.requestId === 'normal-sort'
-        )) as { generation: number; sourceGeneration: number; error?: string };
+        const applied = basis_of(transform_installs(panel).find((message) => (
+            message.requestId === 'normal-sort'
+        ))!);
         expect(source.reads).toBeGreaterThan(0);
-        expect(applied.error).toBeUndefined();
         expect(applied.generation).toBe(snapshot.generation + 1);
         expect(applied.sourceGeneration).toBe(snapshot.sourceGeneration);
         expect(state.get_state(file_path).transforms?.[0]?.sort).toEqual([

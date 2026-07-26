@@ -113,6 +113,32 @@ export interface SheetTransformState {
     schema?: string;
 }
 
+/**
+ * Everything the webview needs to know about a view the host actually installed,
+ * in one value. Only `transformInstalled` carries it, so holding one is proof that
+ * an install happened — a refusal has no way to produce one.
+ */
+export type SheetViewRecord = {
+    /**
+     * What the installed view was computed against. A record whose basis differs
+     * from an incoming snapshot's describes rows that no longer exist.
+     *
+     * `generation` and `sourceGeneration` are between them sufficient: an Excel
+     * header promotion reaches the view only through `PanelCore.adopt_source`,
+     * which bumps both, so a changed header row cannot arrive on an unchanged
+     * basis. `schema` is not redundant with them — it is the fingerprint
+     * `SheetTransformState.schema` is matched against, so keeping it here lets a
+     * record be checked against a sheet directly rather than via the generations.
+     */
+    basis: { generation: number; sourceGeneration: number; schema: string };
+    /** The rules actually installed — not the durable intent. */
+    rules: SheetTransformState | undefined;
+    /** Effective row count, post-filter. */
+    rowCount: number;
+    /** Whether display order differs from source order. */
+    permuted: boolean;
+};
+
 /** Allocation/persistence guard shared by webview sanitization and host plans. */
 export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
 
@@ -367,27 +393,40 @@ export type HostMessage =
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
     /**
-     * `error` present always means the host changed nothing and is echoing its own
-     * unchanged state, generation and row count.
+     * The host installed a view. This is the *only* answer that describes one, and
+     * the only message that can move the view generation, so a consumer that reads
+     * `view` is by construction reading something that actually happened.
      *
-     * `transientRefusal` distinguishes *why*: the host refused for a reason that
-     * clears on its own (an edit-session phase, a save in flight). Nothing about the
-     * view changed, so the webview must not adopt the echo as the new truth —
-     * neither the echoed generation nor the emptied state.
-     *
-     * What happens to the request then depends on where it came from, and only the
-     * durable half is retried. A *persisted* transform is asked for again by the
-     * restore effect once the refusing condition clears: the stored state is still
-     * the answer, and the sheet would otherwise sit unsorted for the rest of the
-     * session. A *user-initiated* request is dropped with a warning and deliberately
-     * not queued — replaying it later would move rows under a user who has since
-     * moved on — so it must fail visibly and stay failed until the user asks again.
-     *
-     * Absent means the refusal is terminal validation (out-of-range sheet, stale
-     * source generation, schema mismatch) — the echo *is* the answer, and adopting
-     * it is how an invalid saved transform gets dropped from the UI.
+     * The generation lives in `view.basis` rather than beside it, unlike the other
+     * host messages: two copies of it in one message is two things that can
+     * disagree, and the fold guard in the webview's install handler compares
+     * against exactly the generation the record was computed on.
      */
-    | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string; transientRefusal?: boolean };
+    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord }
+    /**
+     * The host changed nothing. It deliberately carries no `view`, no `state`, no
+     * `rowCount` and no `generation`: six review rounds of this feature were each a
+     * consumer adopting an echo of the host's *unchanged* state as if it were an
+     * install, so the fix is to make those fields unreachable rather than to
+     * remember not to read them. What the view is remains whatever the last
+     * `transformInstalled` (or snapshot) said.
+     *
+     * `terminal` says whether the request is worth retrying, and only the durable
+     * half ever is. `false` — the admission matrix refusing on an edit-session phase
+     * or a save in flight — clears on its own, so the restore effect asks again for a
+     * *persisted* transform once it does: the stored state is still the answer, and
+     * the sheet would otherwise sit unsorted for the rest of the session. A
+     * *user-initiated* request is dropped with a warning and deliberately not queued —
+     * replaying it later would move rows under a user who has since moved on — so it
+     * must fail visibly and stay failed until the user asks again.
+     *
+     * `true` is validation (out-of-range sheet, stale source generation, schema
+     * mismatch, an Excel header conflict, preview mode, a failed compute or commit).
+     * Retrying it would only fail again, so the webview marks the source handled
+     * instead, which is how a saved transform this sheet can no longer support stops
+     * being asked for.
+     */
+    | { type: 'transformRefused'; sheetIndex: number; requestId: string; intent: TransformIntent; reason: string; terminal: boolean };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =

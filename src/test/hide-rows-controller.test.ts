@@ -47,12 +47,17 @@ async function ready(panel: ReturnType<typeof open_csv_table>): Promise<Workbook
     return messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
 }
 
+type TransformAnswer = Extract<
+    HostMessage,
+    { type: 'transformInstalled' | 'transformRefused' }
+>;
+
 async function send_hide_rows(
     panel: ReturnType<typeof open_csv_table>,
     basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'>,
     requestId: string,
     displayRows: Array<{ start: number; end: number }>,
-): Promise<Extract<HostMessage, { type: 'transformApplied' }>> {
+): Promise<TransformAnswer> {
     await panel.__receive({
         type: 'hideRows',
         sheetIndex: 0,
@@ -61,12 +66,34 @@ async function send_hide_rows(
         generation: basis.generation,
         sourceGeneration: basis.sourceGeneration,
     } satisfies Extract<WebviewMessage, { type: 'hideRows' }>);
-    await vi.waitFor(() => expect(messages_of(panel, 'transformApplied').some(
-        (message) => message.requestId === requestId,
-    )).toBe(true));
-    return messages_of(panel, 'transformApplied').find(
-        (message) => message.requestId === requestId,
-    )!;
+    const answers = (): TransformAnswer[] => [
+        ...messages_of(panel, 'transformInstalled'),
+        ...messages_of(panel, 'transformRefused'),
+    ].filter((message) => message.requestId === requestId);
+    await vi.waitFor(() => expect(answers()).toHaveLength(1));
+    return answers()[0];
+}
+
+/** A hide request that installed a view. Refusals cannot describe one. */
+async function hide_rows_installed(
+    panel: ReturnType<typeof open_csv_table>,
+    basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'>,
+    requestId: string,
+    displayRows: Array<{ start: number; end: number }>,
+): Promise<Extract<HostMessage, { type: 'transformInstalled' }>> {
+    const answer = await send_hide_rows(panel, basis, requestId, displayRows);
+    expect(answer.type).toBe('transformInstalled');
+    return answer as Extract<HostMessage, { type: 'transformInstalled' }>;
+}
+
+/** The basis a following request should quote, read off an install. */
+function basis_of(
+    installed: Extract<HostMessage, { type: 'transformInstalled' }>,
+): Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'> {
+    return {
+        generation: installed.view.basis.generation,
+        sourceGeneration: installed.view.basis.sourceGeneration,
+    };
 }
 
 beforeEach(() => {
@@ -129,7 +156,7 @@ describe('hide rows controller', () => {
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
 
-        const applied = await send_hide_rows(panel, initial, 'hide-natural', [
+        const applied = await hide_rows_installed(panel, initial, 'hide-natural', [
             { start: 2, end: 2 },
             { start: 0, end: 1 },
             { start: 1, end: 2 },
@@ -137,11 +164,14 @@ describe('hide rows controller', () => {
 
         expect(applied).toMatchObject({
             requestId: 'hide-natural',
-            generation: initial.generation + 1,
-            sourceGeneration: initial.sourceGeneration,
-            state: { hiddenRows: [0, 1, 2] },
+            view: {
+                basis: {
+                    generation: initial.generation + 1,
+                    sourceGeneration: initial.sourceGeneration,
+                },
+                rules: { hiddenRows: [0, 1, 2] },
+            },
         });
-        expect(applied.error).toBeUndefined();
         expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([0, 1, 2]);
     });
 
@@ -162,16 +192,18 @@ describe('hide rows controller', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
-        const sorted = messages_of(panel, 'transformApplied').find(
+        const sorted = messages_of(panel, 'transformInstalled').find(
             (message) => message.requestId === 'sort-ascending',
         )!;
 
-        const applied = await send_hide_rows(panel, sorted, 'hide-sorted', [
-            { start: 0, end: 1 },
-        ]);
+        const applied = await hide_rows_installed(
+            panel,
+            basis_of(sorted),
+            'hide-sorted',
+            [{ start: 0, end: 1 }],
+        );
 
-        expect(applied.error).toBeUndefined();
-        expect(applied.state.hiddenRows).toEqual([1, 2]);
+        expect(applied.view.rules?.hiddenRows).toEqual([1, 2]);
         expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([1, 2]);
     });
 
@@ -179,16 +211,18 @@ describe('hide rows controller', () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
-        const first = await send_hide_rows(panel, initial, 'hide-first', [
+        const first = await hide_rows_installed(panel, initial, 'hide-first', [
             { start: 0, end: 0 },
         ]);
 
-        const second = await send_hide_rows(panel, first, 'hide-second', [
-            { start: 0, end: 0 },
-        ]);
+        const second = await hide_rows_installed(
+            panel,
+            basis_of(first),
+            'hide-second',
+            [{ start: 0, end: 0 }],
+        );
 
-        expect(second.error).toBeUndefined();
-        expect(second.state.hiddenRows).toEqual([0, 1]);
+        expect(second.view.rules?.hiddenRows).toEqual([0, 1]);
         expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([0, 1]);
     });
 
@@ -205,14 +239,17 @@ describe('hide rows controller', () => {
             [{ start: 0, end: 0 }],
         );
 
-        expect(rejected).toMatchObject({
+        // A refusal names the reason and nothing else — no state, no generation, no
+        // row count to be mistaken for an install. That the installed and persisted
+        // view are untouched is proven by the durable store below.
+        expect(rejected).toEqual({
+            type: 'transformRefused',
+            sheetIndex: 0,
             requestId: 'stale-generation',
-            generation: initial.generation,
-            sourceGeneration: initial.sourceGeneration,
-            error: 'The view changed before this table view request arrived.',
-            state: { sort: [], filters: [] },
+            intent: 'user',
+            reason: 'The view changed before this table view request arrived.',
+            terminal: true,
         });
-        expect(rejected.state.hiddenRows).toBeUndefined();
         expect(state.revision(file_path)).toBe(revision);
         expect(state.get_state(file_path)).toEqual({});
     });
@@ -231,13 +268,11 @@ describe('hide rows controller', () => {
         );
 
         expect(rejected).toMatchObject({
+            type: 'transformRefused',
             requestId: 'stale-source-generation',
-            generation: initial.generation,
-            sourceGeneration: initial.sourceGeneration,
-            error: 'The source changed before this table view request arrived.',
-            state: { sort: [], filters: [] },
+            reason: 'The source changed before this table view request arrived.',
+            terminal: true,
         });
-        expect(rejected.state.hiddenRows).toBeUndefined();
         expect(state.revision(file_path)).toBe(revision);
         expect(state.get_state(file_path)).toEqual({});
     });
@@ -253,13 +288,11 @@ describe('hide rows controller', () => {
         ]);
 
         expect(rejected).toMatchObject({
+            type: 'transformRefused',
             requestId: 'out-of-range',
-            generation: initial.generation,
-            sourceGeneration: initial.sourceGeneration,
-            error: 'display row interval 1-3 out of range (3 rows)',
-            state: { sort: [], filters: [] },
+            reason: 'display row interval 1-3 out of range (3 rows)',
+            terminal: true,
         });
-        expect(rejected.state.hiddenRows).toBeUndefined();
         expect(state.revision(file_path)).toBe(revision);
         expect(state.get_state(file_path)).toEqual({});
     });
@@ -278,11 +311,10 @@ describe('hide rows controller', () => {
         ]);
 
         expect(rejected).toMatchObject({
+            type: 'transformRefused',
             requestId: 'preview-hide',
-            generation: initial.generation,
-            sourceGeneration: initial.sourceGeneration,
-            error: 'Row hiding is unavailable in preview mode.',
-            state: { sort: [], filters: [] },
+            reason: 'Row hiding is unavailable in preview mode.',
+            terminal: true,
         });
         expect(state.revision(file_path)).toBe(revision);
         expect(state.get_state(file_path)).toEqual({});

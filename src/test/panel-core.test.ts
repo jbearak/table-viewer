@@ -108,6 +108,13 @@ function make_panel() {
     return { panel: { webview: { postMessage } }, posted, postMessage };
 }
 
+/** Every answer to a setTransform, whichever arm it arrived on. */
+function transform_answers(posted: any[]): any[] {
+    return posted.filter((message) => (
+        message.type === 'transformInstalled' || message.type === 'transformRefused'
+    ));
+}
+
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
     const promise = new Promise<T>((done) => { resolve = done; });
@@ -467,10 +474,21 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) => message.type === 'transformApplied');
+        const applied = posted.find((message) => message.type === 'transformInstalled');
         expect(applied).toMatchObject({
             requestId: 'sort-1',
-            rowCount: 5,
+            view: {
+                rowCount: 5,
+                permuted: true,
+                // The basis is what a stored record will later be checked against, so
+                // its schema has to be this sheet's fingerprint — the same string
+                // SheetTransformState.schema is matched on.
+                basis: {
+                    generation: old_generation + 1,
+                    sourceGeneration: core.source_generation,
+                    schema: '["Sheet1",2,null]',
+                },
+            },
         });
         expect(core.generation).toBe(old_generation + 1);
 
@@ -723,10 +741,13 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) => message.type === 'transformApplied');
-        expect(applied.requestId).toBe('bad');
-        expect(applied.error).toContain('column index 99 out of range');
-        expect(applied.state).toEqual({ sort: [], filters: [] });
+        const refused = posted.find((message) => message.type === 'transformRefused');
+        expect(refused.requestId).toBe('bad');
+        expect(refused.reason).toContain('column index 99 out of range');
+        expect(refused.terminal).toBe(true);
+        // The refusal carries nothing about the view, so the rollback is asserted
+        // against the core itself: nothing installed and the generation held.
+        expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(generation);
     });
 
@@ -761,8 +782,10 @@ describe('ViewerPanelCore', () => {
             retainedState: { sort: [], filters: [] },
             operandError: { filterId: 'bad', operand: 'value' },
         });
-        expect(posted.find((message) => message.type === 'transformApplied'))
-            .not.toHaveProperty('error');
+        // A recovered invalid restore is answered as an install of the view that
+        // stands, not as a refusal: there is nothing left to warn about.
+        expect(transform_answers(posted).map((message) => message.type))
+            .toEqual(['transformInstalled']);
 
         await core.handle_message({
             type: 'setTransform', sheetIndex: 0, requestId: 'user',
@@ -771,7 +794,7 @@ describe('ViewerPanelCore', () => {
         });
         expect(failures).toHaveLength(1);
         expect(posted.find((message) =>
-            message.type === 'transformApplied' && message.requestId === 'user')?.error)
+            message.type === 'transformRefused' && message.requestId === 'user')?.reason)
             .toContain('finite numbers');
     });
 
@@ -801,9 +824,11 @@ describe('ViewerPanelCore', () => {
         });
 
         const rejected = posted.find((message) =>
-            message.type === 'transformApplied' && message.requestId === 'invalid-user');
-        expect(rejected).toMatchObject({ state: valid });
-        expect(rejected?.error).toContain('finite numbers');
+            message.type === 'transformRefused' && message.requestId === 'invalid-user');
+        expect(rejected?.reason).toContain('finite numbers');
+        // The valid view is preserved in the core, which is now the only place a
+        // refusal lets anyone look for it.
+        expect(core.transform_state(0)).toEqual(valid);
         expect(core.generation).toBe(installed_generation);
     });
 
@@ -835,10 +860,10 @@ describe('ViewerPanelCore', () => {
 
         expect(cleanup).toHaveBeenCalledOnce();
         const failed = posted.find((message) =>
-            message.type === 'transformApplied'
+            message.type === 'transformRefused'
             && message.requestId === 'failed-restore-cleanup');
-        expect(failed).toMatchObject({ state: valid });
-        expect(failed?.error).toContain('finite numbers');
+        expect(failed?.reason).toContain('finite numbers');
+        expect(core.transform_state(0)).toEqual(valid);
     });
 
     it('does not request invalid-restore cleanup after receiver cancellation', async () => {
@@ -862,7 +887,7 @@ describe('ViewerPanelCore', () => {
         await restore;
 
         expect(cleanup).not.toHaveBeenCalled();
-        expect(posted.some((message) => message.type === 'transformApplied')).toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('rejects a stale transform request after the source generation changes', async () => {
@@ -886,10 +911,10 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) =>
-            message.type === 'transformApplied');
-        expect(applied.error).toContain('source changed');
-        expect(applied.state).toEqual({ sort: [], filters: [] });
+        const refused = posted.find((message) =>
+            message.type === 'transformRefused');
+        expect(refused.reason).toContain('source changed');
+        expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(stale_generation + 1);
     });
 
@@ -940,8 +965,7 @@ describe('ViewerPanelCore', () => {
         release_persist.resolve();
         await restore;
 
-        expect(posted.filter((message) =>
-            message.type === 'transformApplied').map((message) => message.requestId))
+        expect(transform_answers(posted).map((message) => message.requestId))
             .toEqual(['cancel']);
         expect(core.generation).toBe(2);
     });
@@ -973,8 +997,7 @@ describe('ViewerPanelCore', () => {
         core.dispose();
         release_persist.resolve();
         await work;
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('cancels receiver-owned transform compute synchronously on a new epoch', async () => {
@@ -1001,8 +1024,7 @@ describe('ViewerPanelCore', () => {
 
         expect(core.generation).toBe(1);
         expect(core.has_transform_work).toBe(false);
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('installs a committed transform after receiver turnover without delivering its terminal', async () => {
@@ -1045,8 +1067,7 @@ describe('ViewerPanelCore', () => {
         await old_work;
 
         expect(core.generation).toBe(installed_generation + 1);
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
         await core.handle_message({
             type: 'requestRows', sheetIndex: 0, startRow: 0, count: 2,
             requestId: 'committed', generation: installed_generation + 1,
@@ -1121,9 +1142,10 @@ describe('ViewerPanelCore', () => {
         });
 
         expect(posted).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'source-abort',
-            error: 'source aborted unexpectedly',
+            reason: 'source aborted unexpectedly',
+            terminal: true,
         }));
         expect(core.has_transform_work).toBe(false);
     });
@@ -1243,9 +1265,8 @@ describe('ViewerPanelCore', () => {
 
         expect(previous.closed).toBe(true);
         expect(previous.read_rows_calls).toBe(1);
-        expect(posted.some((message) =>
-            message.type === 'transformApplied'
-            && message.requestId === 'old-source')).toBe(false);
+        expect(transform_answers(posted).some((message) =>
+            message.requestId === 'old-source')).toBe(false);
     });
 
     it('fast-paths Cancel when the complete rollback state is already installed', async () => {
@@ -1276,9 +1297,16 @@ describe('ViewerPanelCore', () => {
         expect(source.read_rows_calls).toBe(reads);
         expect(core.generation).toBe(generation);
         expect(commits).toContain('cancel-fast');
+        // A no-op ack is an install of the view already in place: truthful by
+        // definition, and on an unmoved generation, which is what tells the webview
+        // not to fold an open editor for it.
         expect(posted).toContainEqual(expect.objectContaining({
-            type: 'transformApplied', requestId: 'cancel-fast', rowCount: 5,
-            generation,
+            type: 'transformInstalled',
+            requestId: 'cancel-fast',
+            view: expect.objectContaining({
+                rowCount: 5,
+                basis: expect.objectContaining({ generation }),
+            }),
         }));
     });
 

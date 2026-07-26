@@ -1076,7 +1076,7 @@ export function App(): React.JSX.Element {
                     // An in-flight transform is only invalidated by a snapshot that
                     // changes the rows it is being computed over; on the same row
                     // basis it is still going to answer, and its requestId is the
-                    // only thing the transformApplied guard can match on. Dropping
+                    // only thing the install/refusal guards can match on. Dropping
                     // the id here would make the host's ack fail that guard and be
                     // discarded, leaving this webview on a generation the host has
                     // already left behind — every row request it sends afterwards is
@@ -1299,105 +1299,121 @@ export function App(): React.JSX.Element {
                 queue_preview_scroll(msg.row);
             }
 
-            if (msg.type === 'transformApplied') {
+            if (msg.type === 'transformRefused') {
                 if (
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
                 ) {
                     return;
                 }
-                if (msg.error && msg.transientRefusal) {
-                    // A transient refusal means the host changed nothing, so this path
-                    // is deliberately non-authoritative: it clears the in-flight UI
-                    // and warns, and touches neither the generation, nor the
-                    // saved/applied transforms, nor transform_applied_for_source_ref —
-                    // leaving the latter false is what lets the restore effect ask
-                    // again for a *persisted* transform once the refusing condition
-                    // settles. It does not ask again *before* then: the stamp the
-                    // restore effect left in restore_request_blockers_ref is
-                    // deliberately not cleared here, so the same doomed request is not
-                    // resent — with its global warning — on every same-basis refresh,
-                    // and every edit commit during an owned session produces one of
-                    // those. Only restore requests are stamped, so this latch cannot
-                    // reach a user-initiated one.
-                    //
-                    // A user-initiated request has no such durable copy, and clearing
-                    // pending_transform_states_ref below therefore drops it outright.
-                    // That is the intended outcome, not an oversight to be fixed with
-                    // a queue: a sort or filter replayed seconds later — when a
-                    // sibling's session releases or a save finishes — would move rows
-                    // under a user who is mid-edit and has moved on, which is the one
-                    // thing this whole design exists to prevent, and it would amount
-                    // to the deferred "Resort/Refilter" action the design forbids. A
-                    // refused user request fails visibly (the warning below names the
-                    // reason) and stays failed; the user asks again if they still want
-                    // it.
-                    //
-                    // It also must NOT commit_live_edit(): the fold below exists
-                    // only because a generation bump unmounts the grid that owns the
-                    // overlay. No install means no bump means no unmount, so folding
-                    // here would commit an edit the user never confirmed.
-                    const origin =
-                        pending_transform_origins_ref.current[msg.sheetIndex];
-                    pending_transform_request_ids_ref.current[msg.sheetIndex] =
-                        undefined;
-                    pending_transform_states_ref.current[msg.sheetIndex] = undefined;
-                    pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
-                    // Focus still has to come back. The unchanged generation is
-                    // precisely what the focus effect's
-                    // `grid_focus_restore.generation !== generation` check wants.
-                    if (origin === 'grid') {
-                        set_grid_focus_restore({
-                            sheet_index: msg.sheetIndex,
-                            generation: msg.generation,
-                            document_epoch: document_epoch_ref.current,
-                        });
-                    } else if (origin === 'toolbar') {
-                        set_toolbar_focus_restore({
-                            sheet_index: msg.sheetIndex,
-                            document_epoch: document_epoch_ref.current,
-                        });
-                    }
-                    set_pending_transforms((prev) => {
-                        const next = [...prev];
-                        next[msg.sheetIndex] = false;
-                        return next;
+                // A refusal means the host changed nothing, and this arm of
+                // HostMessage carries nothing about the view for that reason: there
+                // is no generation, state or row count here to adopt by accident.
+                // All this path does is clear the in-flight UI, restore focus, and
+                // warn.
+                //
+                // It cannot commit_live_edit() either, and now cannot be made to by
+                // mistake: the fold in the install handler exists only because a
+                // generation bump unmounts the grid that owns the overlay, and no
+                // generation bump can arrive on this arm.
+                //
+                // The stamp the restore effect left in restore_request_blockers_ref
+                // is deliberately not cleared, so the same doomed request is not
+                // resent — with its global warning — on every same-basis refresh, and
+                // every edit commit during an owned session produces one of those.
+                // Only restore requests are stamped, so this latch cannot reach a
+                // user-initiated one.
+                //
+                // A user-initiated request has no durable copy anywhere, and clearing
+                // pending_transform_states_ref below therefore drops it outright.
+                // That is the intended outcome, not an oversight to be fixed with a
+                // queue: a sort or filter replayed seconds later — when a sibling's
+                // session releases or a save finishes — would move rows under a user
+                // who is mid-edit and has moved on, which is the one thing this whole
+                // design exists to prevent, and it would amount to the deferred
+                // "Resort/Refilter" action the design forbids. A refused user request
+                // fails visibly (the warning below names the reason) and stays failed;
+                // the user asks again if they still want it.
+                const refusal_origin =
+                    pending_transform_origins_ref.current[msg.sheetIndex];
+                pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_states_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                if (msg.terminal) {
+                    // Retrying validation only fails again, so stop asking. This is
+                    // what keeps a saved transform the sheet can no longer support
+                    // from being re-requested — with its warning — once per snapshot.
+                    // Leaving the flag false is conversely what lets the restore
+                    // effect ask again after a refusal that clears on its own.
+                    transform_applied_for_source_ref.current[msg.sheetIndex] = true;
+                }
+                // Focus still has to come back. Our own unchanged generation is
+                // precisely what the focus effect's
+                // `grid_focus_restore.generation !== generation` check wants — and
+                // reading it locally rather than from the message is now the only
+                // option, which is the point.
+                if (refusal_origin === 'grid') {
+                    set_grid_focus_restore({
+                        sheet_index: msg.sheetIndex,
+                        generation: generation_ref.current,
+                        document_epoch: document_epoch_ref.current,
                     });
-                    set_pending_transform_labels((prev) => {
-                        const next = [...prev];
-                        next[msg.sheetIndex] = '';
-                        return next;
+                } else if (refusal_origin === 'toolbar') {
+                    set_toolbar_focus_restore({
+                        sheet_index: msg.sheetIndex,
+                        document_epoch: document_epoch_ref.current,
                     });
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: `Could not update the table view: ${msg.error}`,
-                    });
+                }
+                set_pending_transforms((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = false;
+                    return next;
+                });
+                set_pending_transform_labels((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = '';
+                    return next;
+                });
+                host_bridge.postMessage({
+                    type: 'showWarning',
+                    message: `Could not update the table view: ${msg.reason}`,
+                });
+                return;
+            }
+
+            if (msg.type === 'transformInstalled') {
+                if (
+                    pending_transform_request_ids_ref.current[msg.sheetIndex]
+                    !== msg.requestId
+                ) {
                     return;
                 }
+                const view = msg.view;
                 // Fold the open overlay into the store before the generation bump
                 // below unmounts the grid that owns it — and only when that bump is
-                // real. The discriminator is whether the generation moves, not
-                // whether the refusal was transient: a *terminal* refusal (invalid
-                // filter, persistence failure, schema mismatch) echoes
-                // `this._generation` unchanged too — see post_transform_error in
-                // panel-core.ts — and so do the no-op restore/cancel acks the host
-                // sends when the state it already holds equals the request. None of
-                // those remount anything, so folding for them would commit an edit
-                // the user never confirmed and put a half-typed value in the dirty
-                // store where Escape can no longer take it back. That is reachable
-                // now that a transform may be computing while the user types.
+                // real. Arriving here is necessary but not sufficient: this is the
+                // only message that *can* move the generation, so a refusal can no
+                // longer reach the fold at all, but the host also answers a restore
+                // or cancel whose rules it already holds with a no-op ack, and that
+                // install leaves the generation exactly where it was. Nothing
+                // remounts, so folding for it would commit an edit the user never
+                // confirmed and put a half-typed value in the dirty store where
+                // Escape can no longer take it back. That is reachable now that a
+                // transform may be computing while the user types, so the comparison
+                // stays — against the installed view's own basis, which is the
+                // generation the record was computed on.
+                //
                 // Doable here rather than at dispatch time because GridShell is
                 // still mounted and Glide's .gdg-clip-region overlay is still in
                 // the DOM, so read_live_edit resolves; React batches set_generation
                 // and flushes only after this handler returns. It works at all only
                 // because the store's write is synchronous — the subscription plays
                 // no part. Placed after the requestId guard so a stale or duplicated
-                // ack doesn't fold for no reason. This path installs nothing, which
-                // is exactly where the fold earns its keep; where an authoritative
-                // install does follow, the install runs after the fold and still
-                // wins, preserving "the grant/refresh owns the complete
-                // pending-edit projection, including authoritative absence".
-                if (msg.generation !== generation_ref.current) {
+                // ack doesn't fold for no reason. Where an authoritative install of
+                // pending edits follows, it runs after the fold and still wins,
+                // preserving "the grant/refresh owns the complete pending-edit
+                // projection, including authoritative absence".
+                if (view.basis.generation !== generation_ref.current) {
                     editing_ref.current?.commit_live_edit();
                 }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
@@ -1407,7 +1423,7 @@ export function App(): React.JSX.Element {
                 if (origin === 'grid') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
-                        generation: msg.generation,
+                        generation: view.basis.generation,
                         document_epoch: document_epoch_ref.current,
                     });
                 } else if (origin === 'toolbar') {
@@ -1426,23 +1442,23 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = '';
                     return next;
                 });
-                set_generation(msg.generation);
-                generation_ref.current = msg.generation;
+                set_generation(view.basis.generation);
+                generation_ref.current = view.basis.generation;
                 transform_applied_for_source_ref.current[msg.sheetIndex] = true;
                 // Something installed, so whatever was refusing has cleared: the next
                 // restore is free to ask again.
                 restore_request_blockers_ref.current[msg.sheetIndex] = undefined;
                 set_effective_row_counts((prev) => {
                     const next = [...prev];
-                    next[msg.sheetIndex] = msg.rowCount;
+                    next[msg.sheetIndex] = view.rowCount;
                     return next;
                 });
+                // The record already normalizes rules with no entries to `undefined`,
+                // so both the durable copy and the applied copy take it verbatim.
                 const next_transforms = [
                     ...(state_ref.current.transforms ?? transforms),
                 ];
-                next_transforms[msg.sheetIndex] = transform_has_entries(msg.state)
-                    ? msg.state
-                    : undefined;
+                next_transforms[msg.sheetIndex] = view.rules;
                 state_ref.current = {
                     ...state_ref.current,
                     transforms: next_transforms,
@@ -1450,9 +1466,7 @@ export function App(): React.JSX.Element {
                 set_transforms(next_transforms);
                 set_applied_transforms((prev) => {
                     const next = [...prev];
-                    next[msg.sheetIndex] = transform_has_entries(msg.state)
-                        ? msg.state
-                        : undefined;
+                    next[msg.sheetIndex] = view.rules;
                     return next;
                 });
                 // A transform changes the population sampled by auto-fit. Keep
@@ -1468,12 +1482,6 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = undefined;
                     return next;
                 });
-                if (msg.error) {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: `Could not update the table view: ${msg.error}`,
-                    });
-                }
             }
         };
 
@@ -1652,8 +1660,8 @@ export function App(): React.JSX.Element {
         // `transform_applied_for_source_ref` unconditionally (deliberately — see the
         // snapshot handler), so without this the effect would fire a restore request
         // per keystroke-commit. The host short-circuits an equal restore intent at
-        // the same generation, but the webview's own `transformApplied` handler still
-        // discards `auto_fit_active`/`auto_fit_snapshot` on any ack — correctly, since
+        // the same generation, but that no-op ack is still a `transformInstalled`, and
+        // the install handler discards `auto_fit_active`/`auto_fit_snapshot` — correctly, since
         // a real transform changes the population auto-fit sampled — so the Auto-fit
         // toggle would switch itself off on every commit. Skipping the pointless
         // round-trip removes that and any other side effect a no-op ack could carry.
