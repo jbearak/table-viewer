@@ -117,6 +117,24 @@ export interface SheetTransformState {
  * Everything the webview needs to know about a view the host actually installed,
  * in one value. Only `transformInstalled` carries it, so holding one is proof that
  * an install happened — a refusal has no way to produce one.
+ *
+ * **Every field must be a fact about the rows this view contains.** That is what
+ * makes the webview's same-basis retention sound: "same rows" is the only question a
+ * delivery asks about a held record, so it can only license keeping fields that
+ * "same rows" is evidence about. A field tracking anything else — the user's durable
+ * intent, the pending-edit map, what has already been asked of the host — does not
+ * belong here, because basis equality says nothing about it and the retention will
+ * therefore go on holding a stale copy indefinitely, with no later delivery able to
+ * correct it.
+ *
+ * Written as a rule because two review rounds were spent rediscovering it one field
+ * at a time. `hiddenEditedCellKeys` is edit-derived, and is fixed by the host
+ * re-answering it on every delivery rather than only at an install (see below).
+ * `rules` was doubling as a copy of the durable intent for views that install
+ * nothing, so a sibling panel's change to a *disabled* filter definition — which
+ * moves no row, hence installs nothing and bumps no generation — left the copy stale;
+ * Cancel now reads that intent live instead (see `transform_rollback_baseline`).
+ * Anyone adding a field should expect the same question of it.
  */
 export type SheetViewRecord = {
     /**
@@ -131,7 +149,18 @@ export type SheetViewRecord = {
      * record be checked against a sheet directly rather than via the generations.
      */
     basis: { generation: number; sourceGeneration: number; schema: string };
-    /** The rules actually installed — not the durable intent. */
+    /**
+     * The rules the host was handed — not the durable intent, which a sibling panel
+     * can change with no row movement at all.
+     *
+     * A description of *these rows* only when `permuted`: an active rule set is
+     * exactly the set the host built the permutation from. When `permuted` is false
+     * the host applied none of them, so nothing here describes the rows, and the only
+     * reader entitled to a non-permuted record's rules is the install handler, which
+     * uses them once — on the fresh record, to update durable state — and never from
+     * a retained one. Anything asking "what does the user currently want?" must read
+     * durable state live.
+     */
     rules: SheetTransformState | undefined;
     /** Effective row count, post-filter. */
     rowCount: number;

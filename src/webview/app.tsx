@@ -190,6 +190,44 @@ function view_record_with_hidden_keys(
     return { ...held, hiddenEditedCellKeys: fresh };
 }
 
+/**
+ * The view a Cancel rolls a pending transform request back to.
+ *
+ * Cancel is not an "apply now" affordance — it puts back the view that was already on
+ * screen. When the held record is `permuted` that view is the host's permutation, and
+ * the record's rules are its only description; they are basis-derived, so the record
+ * is the right place to read them, and a sibling cannot move the durable rules out
+ * from under an installed permutation without the restore reconciliation seeing it.
+ *
+ * When nothing is permuted there is no installed view to describe, so the baseline is
+ * the durable intent — read live, at click time. A record's rules cannot serve: a
+ * sibling that replaces or removes a *disabled* filter definition moves no row, so
+ * nothing installs, no generation moves, and the same-basis retention goes on holding
+ * definitions the sibling deleted. Cancel persists what it sends, so reading that copy
+ * would silently resurrect them over the sibling's update. `state_ref.current
+ * .transforms` is the same value the record's copy came from, sanitized against the
+ * delivered schema by the snapshot handler before it was stored, and it is what
+ * `handle_transform_change` already compares a new request against.
+ *
+ * Wholly-inactive durable rules pass through as they are rather than being flattened
+ * to empty: a filter the user merely switched off is a definition the host holds and
+ * the toolbar shows, and sending empty would durably delete it. Rules with an active
+ * part are a different case — they describe a view that is *not* on screen, a saved
+ * transform still being restored — so cancelling that restore means going without it,
+ * which is the empty state.
+ */
+function transform_rollback_baseline(
+    installed: SheetViewRecord | undefined,
+    durable: SheetTransformState | undefined,
+    schema: string | undefined,
+): SheetTransformState {
+    if (installed?.permuted && installed.rules) return installed.rules;
+    if (durable && transform_has_entries(durable) && !transform_is_active(durable)) {
+        return durable;
+    }
+    return { sort: [], filters: [], schema };
+}
+
 export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
@@ -1187,10 +1225,6 @@ export function App(): React.JSX.Element {
                     restore_abandoned_ref.current = [];
 
                     let correction_required = false;
-                    // The durable rules this snapshot delivers, from whichever branch
-                    // below computes them, so the single view-record decision after the
-                    // branch has one place to read them from.
-                    let snapshot_transforms: (SheetTransformState | undefined)[] = [];
                     if (snapshot.presentation === 'initial') {
                         set_load_epoch((n) => n + 1);
                         const normalized = initial_normalized_state!;
@@ -1212,7 +1246,6 @@ export function App(): React.JSX.Element {
                         set_column_visibility(normalized.columnVisibility);
                         set_row_heights(normalized.rowHeights);
                         set_transforms(normalized.transforms);
-                        snapshot_transforms = normalized.transforms;
                         const tab_orient = normalized.tabOrientation;
                         set_vertical_tabs(
                             tab_orient !== null
@@ -1307,7 +1340,6 @@ export function App(): React.JSX.Element {
                         set_row_heights(next_row_heights);
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
-                        snapshot_transforms = next_transforms;
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -1357,6 +1389,13 @@ export function App(): React.JSX.Element {
                     // arrives. The record saying what *we* still hold is what lets the
                     // restore effect see the difference and reconcile it.
                     //
+                    // Sound only because a retained record's rules are read as a
+                    // *description of these rows* and never as the user's current
+                    // intent: keeping them is licensed by the basis, which is evidence
+                    // about the permutation they describe and about nothing else. The
+                    // one reader that wanted intent — Cancel's rollback baseline —
+                    // reads durable state live for exactly this reason.
+                    //
                     // Its hidden edited cells are the one exception, and the exception
                     // is not about durable *rules* at all — it is the host's live
                     // answer about the permutation this record already describes, and
@@ -1387,17 +1426,21 @@ export function App(): React.JSX.Element {
                             // basis it has just read (matching schema does not imply
                             // matching values), so an active transform has to be
                             // re-requested and until it lands the rows are the
-                            // metadata's own. Inactive durable rules are still held —
-                            // a filter the user switched off is a definition the host
-                            // has and the toolbar shows, and reporting it as absent is
-                            // how a later Cancel would delete it.
-                            const durable = snapshot_transforms[index];
+                            // metadata's own.
+                            //
+                            // Which is why no rules are recorded, not even the durable
+                            // definitions a filter the user switched off leaves behind.
+                            // This branch asserts that nothing is installed, so there
+                            // are no installed rules to name, and a record that named
+                            // them anyway would be holding a copy of durable intent
+                            // that basis equality never licensed keeping — see the rule
+                            // on `SheetViewRecord`. Cancel used to read that copy as its
+                            // rollback baseline; it now reads the intent live, which is
+                            // the only way to see a sibling that replaced or removed a
+                            // disabled definition without moving a row.
                             return {
                                 basis,
-                                rules: transform_is_active(durable)
-                                    || !transform_has_entries(durable)
-                                    ? undefined
-                                    : durable,
+                                rules: undefined,
                                 rowCount: sheet.rowCount,
                                 permuted: false,
                                 // A natural view contains every row, so it hides no
@@ -2342,14 +2385,13 @@ export function App(): React.JSX.Element {
         // original in-flight response would stop matching and the webview would sit
         // on a stale generation. Same admission set as handle_transform_change.
         if (save_in_flight_ref.current) return;
-        const previous = sheet_views[active_sheet_index]?.rules
-            ?? {
-                sort: [],
-                filters: [],
-                schema: meta?.sheets[active_sheet_index]
-                    ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
-                    : undefined,
-            };
+        const previous = transform_rollback_baseline(
+            sheet_views[active_sheet_index],
+            state_ref.current.transforms?.[active_sheet_index],
+            meta?.sheets[active_sheet_index]
+                ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
+                : undefined,
+        );
         const pending_state = pending_transform_states_ref.current[active_sheet_index];
         const current = pending_state
             ?? state_ref.current.transforms?.[active_sheet_index];

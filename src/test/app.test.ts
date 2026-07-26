@@ -6475,6 +6475,155 @@ describe('an applied transform across a refresh', () => {
     });
 });
 
+// Cancel rolls a *pending* request back to the view that was already on screen. It is
+// not a "re-apply now" affordance — the design has none — so which view that is
+// depends on what is installed, and when nothing is permuted the answer is the durable
+// intent, read live. See `transform_rollback_baseline`.
+describe('the transform rollback baseline', () => {
+    const SCHEMA = '["Sheet1",1,null]';
+    /**
+     * Inactive but not empty. The sheet has one column and
+     * `sanitize_transform_state` keeps one filter per column, so a *changed* definition
+     * has to be the same filter retyped rather than a second one added.
+     */
+    const disabled_only = (value: string): SheetTransformState => ({
+        sort: [],
+        filters: [{
+            id: 'f1',
+            colIndex: 0,
+            operator: 'contains',
+            value,
+            caseSensitive: false,
+            enabled: false,
+        }],
+        schema: SCHEMA,
+    });
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: SCHEMA,
+    };
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    /** A sibling panel's durable state, arriving the only way it can: same rows. */
+    const same_basis = (
+        generation: number,
+        transforms: (SheetTransformState | undefined)[],
+    ) => refresh_snapshot_message(make_meta(['Sheet1']), {
+        generation,
+        sourceGeneration: 1,
+        reason: 'other',
+        state: { transforms },
+    });
+
+    /** Something to cancel: a sort the grid asked for and no ack for it. */
+    async function start_a_transform(post_message: ReturnType<typeof vi.fn>) {
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        expect(transform_requests(post_message)).toHaveLength(1);
+        post_message.mockClear();
+    }
+
+    it('cancels to the disabled filter a sibling left, not the one it replaced',
+        async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(
+                initial_snapshot_message(make_meta(['Sheet1']), {
+                    state: { transforms: [disabled_only('old')] },
+                }),
+            );
+            // Inactive rules install nothing, so this panel holds the natural view and
+            // there is no record of any rules for a rollback to read.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await dispatch_host_message(same_basis(1, [disabled_only('new')]));
+            // The heart of it: changing a *disabled* filter moves no row, so there is
+            // nothing to install and no generation to bump. This silence is exactly why
+            // nothing can refresh a copy of the durable rules held on the record — the
+            // rollback baseline has to come from durable state itself.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await start_a_transform(post_message);
+            await click_button('Cancel');
+
+            // Cancel persists what it sends, so reading a stale copy would not merely
+            // roll back wrongly — it would resurrect a definition the sibling replaced,
+            // overwriting the sibling's update in shared durable state.
+            expect(latest_transform_request(post_message).state.filters)
+                .toEqual(disabled_only('new').filters);
+        });
+
+    it('cancels to no filter at all once a sibling has removed the definition',
+        async () => {
+            // The same staleness one shape over: rules the host *acknowledged* while
+            // installing nothing. `permuted` is false, so they are no more a description
+            // of these rows than the natural view's would be, and the retention holds
+            // them just as indefinitely.
+            const { post_message } = await render_app();
+            await dispatch_host_message(
+                initial_snapshot_message(make_meta(['Sheet1']), {
+                    state: { transforms: [STORED_SORT] },
+                }),
+            );
+            const restore = latest_transform_request(post_message);
+            await dispatch_host_message(
+                transform_installed_message(restore, { generation: 2 }),
+            );
+            // A sibling switches the sort off and leaves a filter disabled: the
+            // permutation goes, and the ack carries the definition onto the record.
+            await dispatch_host_message(same_basis(2, [disabled_only('old')]));
+            await vi.waitUntil(() => transform_requests(post_message).length > 0);
+            const uninstall = latest_transform_request(post_message);
+            expect(uninstall.state.filters).toEqual(disabled_only('old').filters);
+            await dispatch_host_message(
+                transform_installed_message(uninstall, { generation: 3 }),
+            );
+            expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+            post_message.mockClear();
+            await dispatch_host_message(same_basis(3, [undefined]));
+            // Nothing to reconcile again — neither side permutes anything — so the
+            // record keeps the definition the sibling has just deleted.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await start_a_transform(post_message);
+            await click_button('Cancel');
+
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.state.filters).toEqual([]);
+            expect(cancel.state.sort).toEqual([]);
+        });
+
+    it('cancels to the installed rules while a permutation is in place', async () => {
+        // The other side of the rule: a permuted record's rules *are* basis-derived —
+        // they are the set the host built the permutation from — so they, and not
+        // durable state's notion of inactivity, are what Cancel puts back.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            state: { transforms: [STORED_SORT] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        await start_a_transform(post_message);
+        await click_button('Cancel');
+
+        const cancel = latest_transform_request(post_message);
+        expect(cancel.state.sort).toEqual(STORED_SORT.sort);
+        expect(cancel.intent).toBe('cancel');
+    });
+});
+
 // A refusal always means the host changed nothing, and `transformRefused` carries
 // nothing about the view for that reason — there is no state, generation or row count
 // on the message to adopt by accident. `terminal` says only whether the reason will
