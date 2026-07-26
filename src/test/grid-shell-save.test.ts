@@ -288,6 +288,16 @@ function save_messages(post_message: ReturnType<typeof vi.fn>) {
         .map((msg) => ({ type: msg.type, edits: msg.operation.edits }));
 }
 
+function pending_edit_messages(post_message: ReturnType<typeof vi.fn>) {
+    return post_message.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => (
+            msg && typeof msg === 'object' && 'type' in msg
+            && msg.type === 'pendingEditsChanged'
+        ))
+        .map((msg) => ({ edits: msg.edits }));
+}
+
 afterEach(() => {
     act(() => {
         root?.unmount();
@@ -362,6 +372,44 @@ describe('GridShell CSV save', () => {
         expect(save_messages(post_message)).toEqual([{
             type: 'saveCsv', edits: { '0:0': 'first' },
         }]);
+    });
+
+    // The host reads any pendingEditsChanged as "the user moved on from the failed
+    // save" and retires the failed lifecycle, so an echo of the failed operation's
+    // own map would strand the durable edits it wrote before the disk write.
+    // Standalone harness: no App parent, so the install force-notify that produces
+    // the echo in the real app never fires here. What is pinned is the invariant —
+    // the failed save itself contributes no post.
+    it('posts pendingEditsChanged at most once across a failed save', async () => {
+        const { post_message, editing_ref } = await render_grid();
+        await edit_cell('first');
+
+        post_message.mockClear();
+        expect(await request_save(editing_ref)).toBe(true);
+        // Capture the saveCsv before clearing: save_result searches the mock calls
+        // for it, so a clear here would destroy what settles the save.
+        const save = post_message.mock.calls.map(([msg]) => msg)
+            .find((msg) => msg?.type === 'saveCsv');
+        post_message.mockClear();
+        await save_result_for(save, false);
+
+        expect(pending_edit_messages(post_message).length).toBeLessThanOrEqual(1);
+        // The settle itself must contribute nothing: the map it restores is the
+        // failed operation's own.
+        expect(pending_edit_messages(post_message)).toEqual([]);
+    });
+
+    it('still posts a genuinely new edit after a failed save', async () => {
+        const { post_message, editing_ref } = await render_grid();
+        await edit_cell('first');
+        expect(await request_save(editing_ref)).toBe(true);
+        await save_result(false);
+
+        post_message.mockClear();
+        await edit_cell('second');
+        expect(pending_edit_messages(post_message)).toEqual([
+            { edits: { '0:0': { value: 'second', base: 'base' } } },
+        ]);
     });
 
     it('does not clear dirty edits on a duplicate success after a failed save', async () => {
