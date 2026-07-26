@@ -2879,7 +2879,11 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
         );
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
+        // No remount: the grant no longer bumps `load_epoch`. The store assertion
+        // above is what keeps this non-vacuous — the granted projection has to reach
+        // a subscriber of the *surviving* mount, which is the whole point of lifting
+        // edit state above the grid generation.
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
     it('restores a clean owned edit session after receiver recreation', async () => {
@@ -2901,7 +2905,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-initial-edits')).toBe('{}');
     });
 
-    it('clears stale initial edits and remounts when a granted session has none', async () => {
+    it('clears stale initial edits when a granted session has none', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
@@ -2936,7 +2940,11 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
         expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_grant);
+        // Authoritative absence has to reach the live store too, not just the prop:
+        // the stale entry must be gone from what a mounted grid paints from, and
+        // without a remount to wipe it that install is the only thing that can do it.
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(before_grant);
         expect(post_message.mock.calls.filter(([message]) => (
             (message as { type?: string }).type === 'requestEditSession'
         ))).toHaveLength(2);
@@ -4476,6 +4484,10 @@ describe('sorting and filtering', () => {
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        // Specifically the pending window, not edit mode: once the session is
+        // granted the controls come back, because the host admits a transform from
+        // the panel that owns the session.
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
     });
 
     it('drops and persists invalid saved transforms on initial load', async () => {
@@ -5597,5 +5609,222 @@ describe('edit session store hydration', () => {
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
         expect(store_edits()).toEqual({ '0:0': { value: 'live', base: 'base' } });
+    });
+});
+
+// Sorting and filtering stay available while the user edits; the displayed order
+// simply does not recompute, which is the feature. What still blocks a transform is
+// a window in which the host would refuse it anyway.
+describe('transforms during an edit session', () => {
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+    };
+
+    async function editable_csv() {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES },
+        ));
+        return rendered;
+    }
+
+    function sort_chip_disabled(): string | null {
+        const chip = document.querySelector('.sort-chip');
+        expect(chip).not.toBeNull();
+        return chip!.getAttribute('aria-disabled');
+    }
+
+    /** Enter edit mode, then install a sort on column 0 from inside it. */
+    async function edit_mode_with_sort(post_message: ReturnType<typeof vi.fn>) {
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 2);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+    }
+
+    it('keeps transform controls enabled in edit mode and lets a sort through', async () => {
+        const { post_message } = await editable_csv();
+        await enter_edit_mode(post_message);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        // Not merely offered — the request actually leaves the webview.
+        const request = latest_transform_request(post_message);
+        expect(request.state.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+        // And it lands: the toolbar's own copy of the gate agrees, showing the
+        // installed sort's chip live rather than greyed out.
+        await acknowledge_transform(request, 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(sort_chip_disabled()).toBeNull();
+    });
+
+    it('disables transform controls only while a save is in flight', async () => {
+        const { post_message } = await editable_csv();
+        await edit_mode_with_sort(post_message);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+        expect(sort_chip_disabled()).toBeNull();
+
+        await report_grid_editing(true, true, [], undefined, true);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+        expect(sort_chip_disabled()).toBe('true');
+
+        // The re-enable is the half that stops this passing for the wrong reason:
+        // without it, a permanently disabled control would satisfy the assertion
+        // above just as well.
+        await report_grid_editing(true, true, [], undefined, false);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+        expect(sort_chip_disabled()).toBeNull();
+    });
+
+    it('does not reset column visibility when an edit session is granted', async () => {
+        // The grant used to bump `load_epoch`, which feeds `visibility_reset_key`
+        // and closes the popover. An open popover is the observable form of that.
+        const { post_message } = await editable_csv();
+        await open_columns();
+
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'granted-session',
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(document.querySelector(
+            '[role="dialog"][aria-label="Choose visible columns"]',
+        )).not.toBeNull();
+    });
+
+    it('restores a stored transform during an edit session', async () => {
+        // `edit_mode` is no longer a dep of the restore effect, so a refresh that
+        // ships a persisted transform has to reinstall it even mid-session.
+        const { post_message } = await editable_csv();
+        await enter_edit_mode(post_message);
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    ...CSV_CAPABILITIES,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'desc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual([{ colIndex: 0, direction: 'desc' }]);
+    });
+});
+
+describe('stale-view banner', () => {
+    const BANNER_TEXT = 'Sorting and filters don\'t update while you\'re editing.';
+    // A future contributor must not be able to reintroduce a "Resort"/"Refresh"
+    // action here. Rows staying put is the feature, so there is nothing to apply.
+    const CTA = /re-?sort|re-?filter|refresh|apply|update/i;
+
+    function banner(): HTMLElement | null {
+        return document.querySelector('.stale-view-banner');
+    }
+
+    function expect_no_call_to_action() {
+        const present = banner();
+        if (present) {
+            const labels = Array.from(present.querySelectorAll('button'))
+                .map((button) => button.textContent ?? '');
+            expect(labels).toEqual(['Dismiss']);
+        }
+        // Nowhere on the page, so a CTA cannot sneak in beside the banner either.
+        const offenders = Array.from(document.querySelectorAll('button'))
+            .map((button) => button.textContent ?? '')
+            .filter((label) => CTA.test(label));
+        expect(offenders).toEqual([]);
+    }
+
+    async function edit_mode_sorted_on_column_0() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        return post_message;
+    }
+
+    const dirty = (...keys: string[]) => Object.fromEntries(
+        keys.map((key) => [key, { value: `dirty-${key}`, base: 'base' }]),
+    );
+
+    it('appears when an edit lands in a sorted column', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('disappears when that edit is reverted', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        expect(banner()).not.toBeNull();
+
+        // Derived from the *current* dirty map, not latched: the last relevant edit
+        // leaving takes the banner with it, with nothing to clear explicitly.
+        await report_grid_editing(false, false, [], {});
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('stays away for an edit in a column the order does not read', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('reappears after Dismiss when a second edit lands in the sorted column', async () => {
+        const post_message = await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        post_message.mockClear();
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+        // Dismiss acknowledges; it must not touch the view.
+        expect(post_message.mock.calls
+            .map((call) => (call[0] as WebviewMessage).type)
+            .filter((type) => type === 'setTransform')).toEqual([]);
+
+        // A dismissal covers the edits it was pressed over, not later ones.
+        await report_grid_editing(true, true, [], dirty('0:0', '1:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
     });
 });

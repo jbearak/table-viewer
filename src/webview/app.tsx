@@ -38,6 +38,7 @@ import {
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import {
+    stale_view_signature,
     transform_progress_label,
     upsert_filter,
     type FilterHistogramReady,
@@ -305,6 +306,13 @@ export function App(): React.JSX.Element {
     // if a *different* set of cells later conflicts.
     const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
         useState<string | null>(null);
+    // Stale-view signature the user acknowledged ("Dismiss"). Purely informational:
+    // the banner it silences states that the displayed order does not recompute
+    // mid-edit, which is intended, so acknowledging it must not touch the view. It
+    // reappears once a *different* set of order-relevant edits — or a different
+    // installed sort or filter — makes that statement a new fact.
+    const [acknowledged_stale_signature, set_acknowledged_stale_signature] =
+        useState<string | undefined>(undefined);
     // Keys the *host* refused a save over, from a saveResult's `rejection`. These
     // exist because the webview cannot derive them: is_entry_conflicted is
     // residency-gated, so an edit on a filtered-out row, an evicted page, or a row
@@ -575,6 +583,12 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
         edit_session_ref.current!.install({ session_id }, edits);
+        // An acknowledgement is about a specific set of dirty cells, so it expires
+        // with the map it described. Every lifecycle path that empties or replaces
+        // the dirty map — a successful save plus reload, a discard, a re-grant —
+        // crosses this boundary, so this one reset covers all three and stops a
+        // later, coincidentally identical signature reading as already acknowledged.
+        set_acknowledged_stale_signature(undefined);
         // Deliberately does NOT clear the host's save verdict. Crossing this
         // boundary is not evidence that the judged map is gone: the refresh branch
         // installs on a snapshot for our *own* session, and what it installs is
@@ -2539,6 +2553,16 @@ export function App(): React.JSX.Element {
         || preview_mode
         || excel_header_pending;
 
+    // Stale-view banner: derived from the transform actually *installed* in the grid
+    // (`applied_transform`), not the requested one, because the statement is about
+    // the order the user is looking at. Only meaningful in edit mode — outside it the
+    // order recomputes as normal.
+    const stale_view_current_signature = edit_mode
+        ? stale_view_signature(applied_transform, Object.keys(live_edits ?? {}))
+        : undefined;
+    const show_stale_view_banner = stale_view_current_signature !== undefined
+        && stale_view_current_signature !== acknowledged_stale_signature;
+
     // Conflict banner: a stable signature of the conflicted cell set, so dismissing
     // it ("Keep All") sticks until a *different* set of cells drifts.
     const conflicted_keys = editing_status?.conflicted ?? [];
@@ -2764,6 +2788,26 @@ export function App(): React.JSX.Element {
             )}
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
+            )}
+            {show_stale_view_banner && (
+                // Informational only. Deliberately no "Resort"/"Refilter"/"Refresh"
+                // action: rows staying where the user left them is the feature, so
+                // there is nothing to fix and nothing to apply. Dismiss records the
+                // acknowledgement and touches nothing else. Rendered outside the
+                // content area holding the grid so it never joins GridShell's
+                // remount key.
+                <div className="stale-view-banner">
+                    Sorting and filters don't update while you're editing.
+                    <div className="stale-view-banner-actions">
+                        <button
+                            onClick={() => set_acknowledged_stale_signature(
+                                stale_view_current_signature,
+                            )}
+                        >
+                            Dismiss
+                        </button>
+                    </div>
+                </div>
             )}
             {show_conflict_banner && (
                 <div className="conflict-banner">
