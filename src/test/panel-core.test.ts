@@ -6,7 +6,11 @@ import {
     transform_states_equal,
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
-import type { WebviewMessage } from '../types';
+import type {
+    SheetTransformState,
+    SheetViewRecord,
+    WebviewMessage,
+} from '../types';
 
 class StubSource implements DataSource {
     read_rows_calls = 0;
@@ -503,6 +507,58 @@ describe('ViewerPanelCore', () => {
         const page = posted.find((message) => message.type === 'rowData');
         expect(page.rows.map((row: RenderedCell[]) => row[0].raw))
             .toEqual(['4', '3', '2']);
+    });
+
+    it('reports a permutation for every shape of active rule and none for an inactive one', async () => {
+        // `permuted` is the webview's only answer to "are the rows on screen the source
+        // rows", and it decides whether the display-keyed row-height affordances are
+        // suppressed. It has to follow *activity*, not the presence of rules: hiding
+        // rows and filtering permute without sorting anything, and a filter switched
+        // off leaves rules the host still holds over rows it has not touched.
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const install = async (requestId: string, state: SheetTransformState) => {
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user',
+                state,
+            });
+            const message = posted.filter(
+                (candidate) => candidate.type === 'transformInstalled',
+            ).at(-1);
+            expect(message.requestId).toBe(requestId);
+            return message.view as SheetViewRecord;
+        };
+
+        const hidden = await install('hidden', {
+            sort: [],
+            filters: [],
+            hiddenRows: [1, 3],
+            schema: '["Sheet1",2,null]',
+        });
+        expect(hidden.permuted).toBe(true);
+        expect(hidden.rowCount).toBe(3);
+
+        const disabled = await install('disabled', {
+            sort: [],
+            filters: [{
+                id: 'filter-1',
+                colIndex: 0,
+                operator: 'contains',
+                value: '1',
+                caseSensitive: false,
+                enabled: false,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+        // The definition survives, and the rows are the source's again.
+        expect(disabled.permuted).toBe(false);
+        expect(disabled.rowCount).toBe(5);
+        expect(disabled.rules?.filters).toHaveLength(1);
     });
 
     it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {

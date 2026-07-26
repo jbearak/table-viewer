@@ -25,6 +25,7 @@ import {
     type SheetTransformState,
     type FilterEntry,
     type SheetColumnVisibilityState,
+    type SheetViewRecord,
     type TransformIntent,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
@@ -149,6 +150,21 @@ function sheet_widths_equal(
     ));
 }
 
+/**
+ * Whether two row bases describe the same rows. The whole point of keeping the
+ * basis inside `SheetViewRecord` is that this is the *only* question a snapshot has
+ * to ask about an installed view: same rows, keep the record; different rows,
+ * replace it. There is no way to answer it for the rules and not for the row count.
+ */
+function view_bases_equal(
+    left: SheetViewRecord['basis'],
+    right: SheetViewRecord['basis'],
+): boolean {
+    return left.generation === right.generation
+        && left.sourceGeneration === right.sourceGeneration
+        && left.schema === right.schema;
+}
+
 export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
@@ -249,10 +265,22 @@ export function App(): React.JSX.Element {
     const [transforms, set_transforms] = useState<
         (SheetTransformState | undefined)[]
     >([]);
-    const [applied_transforms, set_applied_transforms] = useState<
-        (SheetTransformState | undefined)[]
+    // Per sheet, the view the host has installed: its rules, its post-filter row
+    // count, whether the order is permuted — and the row basis all three were
+    // computed against, which is what makes this one value rather than three.
+    //
+    // Three separately-stored atoms held this before (`applied_transforms`,
+    // `effective_row_counts`, and a boolean recording that some install had landed),
+    // and three review findings on this PR were the same mistake: a snapshot
+    // invalidating some of them and not the others, so `transform_active` disagreed
+    // with the row count the loader was using, or a reset path was forgotten.
+    // Carrying the basis inside the record makes partial invalidation unwritable —
+    // an incoming snapshot either matches the basis, and the record stands whole, or
+    // it does not, and the record is replaced whole by the natural view that
+    // snapshot describes.
+    const [sheet_views, set_sheet_views] = useState<
+        (SheetViewRecord | undefined)[]
     >([]);
-    const [effective_row_counts, set_effective_row_counts] = useState<number[]>([]);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
     const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
@@ -415,14 +443,25 @@ export function App(): React.JSX.Element {
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
-    const transform_applied_for_source_ref = useRef<boolean[]>([]);
+    // Request-dedup bookkeeping, both of these, and deliberately *not* part of
+    // `sheet_views`: they record what has already been asked of the host, which is a
+    // different fact from what the host installed, and folding them into the view
+    // record would make a refusal — which changes no view — look like one.
+    //
     // Per sheet, the `restore_blocker_epoch` in force when the restore effect last
     // asked the host to reconcile to the persisted transform — installing it, or
     // uninstalling one the durable rules no longer describe — cleared once either
-    // lands. Not a record of what is installed — `transform_applied_for_source_ref`
-    // and `applied_transforms` remain the only answer to that — only of what has
-    // already been asked and refused, so the ask is not repeated verbatim.
+    // lands. Only of what has already been asked and refused, so the ask is not
+    // repeated verbatim; `sheet_views` remains the only answer to what is installed.
     const restore_request_blockers_ref = useRef<(number | undefined)[]>([]);
+    // Per sheet, whether the restore was refused for a reason that will never clear
+    // (out-of-range sheet, stale source generation, schema mismatch, a failed
+    // compute). The blocker stamp above suppresses only a *verbatim* repeat under
+    // unchanged conditions, so without this a saved transform this sheet can no
+    // longer support would be asked for — with its global warning — every time a
+    // blocker moved. Cleared by every applied snapshot, which is the point at which
+    // the sheet may well be able to support it again.
+    const restore_abandoned_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
@@ -1095,19 +1134,17 @@ export function App(): React.JSX.Element {
                         restore_request_blockers_ref.current = [];
                     }
                     // Deliberately NOT gated on row_basis_changed, unlike the
-                    // in-flight bookkeeping above and the applied/effective view
-                    // state below. The transform the restore effect compares against
-                    // comes from *durable* state, which a sibling panel can change
-                    // without touching either generation, so a same-basis refresh is
-                    // exactly how such a change arrives. Clearing this is what lets
-                    // the restore effect notice it; gating it would silently break
-                    // cross-panel durable-transform propagation. The cost is a
-                    // redundant restore request after every same-basis refresh, which
-                    // is idempotent and invisible now that the applied/effective state
-                    // survives — and, when it is refused, latched below.
-                    transform_applied_for_source_ref.current = [];
+                    // in-flight bookkeeping above and the view records below: a sheet
+                    // that could not support its saved transform a moment ago may be
+                    // able to now — different columns, a different header row — and
+                    // this snapshot is the only place that news arrives.
+                    restore_abandoned_ref.current = [];
 
                     let correction_required = false;
+                    // The durable rules this snapshot delivers, from whichever branch
+                    // below computes them, so the single view-record decision after the
+                    // branch has one place to read them from.
+                    let snapshot_transforms: (SheetTransformState | undefined)[] = [];
                     if (snapshot.presentation === 'initial') {
                         set_load_epoch((n) => n + 1);
                         const normalized = initial_normalized_state!;
@@ -1129,12 +1166,7 @@ export function App(): React.JSX.Element {
                         set_column_visibility(normalized.columnVisibility);
                         set_row_heights(normalized.rowHeights);
                         set_transforms(normalized.transforms);
-                        set_applied_transforms(normalized.transforms.map((state) => (
-                            state && !transform_is_active(state) ? state : undefined
-                        )));
-                        set_effective_row_counts(
-                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
-                        );
+                        snapshot_transforms = normalized.transforms;
                         const tab_orient = normalized.tabOrientation;
                         set_vertical_tabs(
                             tab_orient !== null
@@ -1229,28 +1261,7 @@ export function App(): React.JSX.Element {
                         set_row_heights(next_row_heights);
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
-                        // Only a changed row basis un-installs the permutation. On a
-                        // genuine reload the host drops it (matching schema does not
-                        // imply matching values), so the applied transform and the
-                        // transformed row count both revert to the natural metadata —
-                        // an active transform has to be re-requested. A same-basis
-                        // refresh, which every edit commit during an owned session
-                        // redelivers, installs nothing and drops nothing: the loader
-                        // is still permuted and the row count is still the
-                        // transformed one. Resetting these there would make
-                        // `transform_active` read false while the rows are still
-                        // permuted, which un-suppresses the display-keyed row-height
-                        // affordances (the resize overlay, hover-arming, multiline
-                        // auto-grow) and lets a height be persisted for the wrong
-                        // row — durable corruption, not just a flicker.
-                        if (row_basis_changed) {
-                            set_effective_row_counts(
-                                snapshot.meta.sheets.map((sheet) => sheet.rowCount),
-                            );
-                            set_applied_transforms(next_transforms.map((state) => (
-                                state && !transform_is_active(state) ? state : undefined
-                            )));
-                        }
+                        snapshot_transforms = next_transforms;
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -1267,6 +1278,76 @@ export function App(): React.JSX.Element {
                                 : {}),
                         };
                     }
+                    // The whole of this snapshot's effect on what view is installed,
+                    // as one decision per sheet. The basis is derived the way the host
+                    // derives it in `PanelCore.installed_view`, and a record whose
+                    // basis matches describes rows this snapshot did not move: it
+                    // stands, entirely. A record whose basis differs describes rows
+                    // that no longer exist, so it is replaced, entirely, by the
+                    // natural view this snapshot does describe.
+                    //
+                    // Both halves are load-bearing, and splitting them is what three
+                    // of this PR's findings were. Keeping a stale record would make
+                    // `transform_active` read true over rows the host has re-read.
+                    // Dropping a live one would make it read false while the loader is
+                    // still permuted, which un-suppresses the display-keyed row-height
+                    // affordances (the resize overlay, hover-arming, multiline
+                    // auto-grow) and lets a height be persisted for the wrong row —
+                    // durable corruption, not a flicker. Every edit commit during an
+                    // owned session redelivers a same-basis refresh, so that second
+                    // case is the common one.
+                    //
+                    // `header_changed` is not consulted: an Excel promotion reaches
+                    // the view only through adopt_source, which bumps both
+                    // generations, and it names the promoted row in the schema too — so
+                    // the basis has already caught it. Its other use in the refresh
+                    // branch above, clearing that sheet's stored heights and scroll
+                    // offset, is a different concern.
+                    //
+                    // A retained record deliberately does NOT take its rules from
+                    // this snapshot's durable state. The two are different facts: a
+                    // sibling panel can change the durable rules with no generation
+                    // movement at all, and a same-basis refresh is exactly how that
+                    // arrives. The record saying what *we* still hold is what lets the
+                    // restore effect see the difference and reconcile it.
+                    set_sheet_views((previous) => snapshot.meta.sheets.map(
+                        (sheet, index) => {
+                            const basis = {
+                                generation: snapshot.generation,
+                                sourceGeneration: snapshot.sourceGeneration,
+                                schema: transform_schema_for_sheet(sheet),
+                            };
+                            const held = previous[index];
+                            if (
+                                // A new document restarts from the host's own
+                                // counters, so equal generations here are a
+                                // coincidence rather than evidence about the rows.
+                                snapshot.presentation === 'refresh'
+                                && held
+                                && view_bases_equal(held.basis, basis)
+                            ) {
+                                return held;
+                            }
+                            // The natural view: the host installs no permutation for a
+                            // basis it has just read (matching schema does not imply
+                            // matching values), so an active transform has to be
+                            // re-requested and until it lands the rows are the
+                            // metadata's own. Inactive durable rules are still held —
+                            // a filter the user switched off is a definition the host
+                            // has and the toolbar shows, and reporting it as absent is
+                            // how a later Cancel would delete it.
+                            const durable = snapshot_transforms[index];
+                            return {
+                                basis,
+                                rules: transform_is_active(durable)
+                                    || !transform_has_entries(durable)
+                                    ? undefined
+                                    : durable,
+                                rowCount: sheet.rowCount,
+                                permuted: false,
+                            };
+                        },
+                    ));
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
                     set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
@@ -1345,7 +1426,11 @@ export function App(): React.JSX.Element {
                     // from being re-requested — with its warning — once per snapshot.
                     // Leaving the flag false is conversely what lets the restore
                     // effect ask again after a refusal that clears on its own.
-                    transform_applied_for_source_ref.current[msg.sheetIndex] = true;
+                    //
+                    // Bookkeeping about the *request*, which is why it is not in
+                    // `sheet_views`: nothing was installed, so there is no view here
+                    // to record. The record still says what it always said.
+                    restore_abandoned_ref.current[msg.sheetIndex] = true;
                 }
                 // Focus still has to come back. Our own unchanged generation is
                 // precisely what the focus effect's
@@ -1444,17 +1529,20 @@ export function App(): React.JSX.Element {
                 });
                 set_generation(view.basis.generation);
                 generation_ref.current = view.basis.generation;
-                transform_applied_for_source_ref.current[msg.sheetIndex] = true;
                 // Something installed, so whatever was refusing has cleared: the next
                 // restore is free to ask again.
                 restore_request_blockers_ref.current[msg.sheetIndex] = undefined;
-                set_effective_row_counts((prev) => {
+                // The record arrives whole and is stored whole — the host built it
+                // from its own state after the mutation, so there is nothing here to
+                // recombine and no way to store the rules without the row count and
+                // the basis they were computed with.
+                set_sheet_views((prev) => {
                     const next = [...prev];
-                    next[msg.sheetIndex] = view.rowCount;
+                    next[msg.sheetIndex] = view;
                     return next;
                 });
                 // The record already normalizes rules with no entries to `undefined`,
-                // so both the durable copy and the applied copy take it verbatim.
+                // so the durable copy takes it verbatim.
                 const next_transforms = [
                     ...(state_ref.current.transforms ?? transforms),
                 ];
@@ -1464,11 +1552,6 @@ export function App(): React.JSX.Element {
                     transforms: next_transforms,
                 };
                 set_transforms(next_transforms);
-                set_applied_transforms((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = view.rules;
-                    return next;
-                });
                 // A transform changes the population sampled by auto-fit. Keep
                 // current widths, but discard the toggle/snapshot so restoring
                 // cannot apply a stale pre-transform measurement.
@@ -1630,7 +1713,7 @@ export function App(): React.JSX.Element {
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
-            transform_applied_for_source_ref.current[active_sheet_index]
+            restore_abandoned_ref.current[active_sheet_index]
             || pending_transform_request_ids_ref.current[active_sheet_index]
         ) {
             return;
@@ -1654,73 +1737,63 @@ export function App(): React.JSX.Element {
             transform_schema_for_sheet(sheet),
             sheet.sourceRowCount,
         );
-        // Nothing to reconcile when the durable rules already describe what our core
-        // holds, so ask for neither direction. Every edit commit during an owned
-        // session redelivers a same-basis refresh, which clears
-        // `transform_applied_for_source_ref` unconditionally (deliberately — see the
-        // snapshot handler), so without this the effect would fire a restore request
-        // per keystroke-commit. The host short-circuits an equal restore intent at
-        // the same generation, but that no-op ack is still a `transformInstalled`, and
-        // the install handler discards `auto_fit_active`/`auto_fit_snapshot` — correctly, since
-        // a real transform changes the population auto-fit sampled — so the Auto-fit
-        // toggle would switch itself off on every commit. Skipping the pointless
-        // round-trip removes that and any other side effect a no-op ack could carry.
+        const installed = sheet_views[active_sheet_index];
+        // One comparison, both directions, one request. An install branch with no
+        // else was how a sibling's cleared sort came to leave the rows permuted
+        // under a toolbar showing no rules: only the host can un-permute the loader,
+        // so a reconciliation that can only ever add rules has no way back. What
+        // reconciling means is decided by the data below rather than by which branch
+        // the reader happens to be in.
         //
-        // This comparison is a strictly more precise test than
-        // `transform_applied_for_source_ref`, which only records whether *some*
-        // transform installed against the current source; the flag is kept because
-        // round 3's cross-panel propagation trap depends on its clearing. Folding the
-        // two into one signal belongs to a separate pre-PR-4 refactor.
-        if (transforms_semantically_equal(
-            state,
-            applied_transforms[active_sheet_index],
-        )) {
-            return;
-        }
-        if (state && transform_is_active(state)) {
-            restore_request_blockers_ref.current[active_sheet_index] =
-                restore_blocker_epoch;
-            request_transform(active_sheet_index, state, 'restore', 'restore');
-            return;
-        }
-        // The other direction, and the reason this reconciliation cannot be a
-        // one-way install: a sibling panel clearing the shared durable sort, filter
-        // or hidden rows never un-installs *our* permutation, and a same-basis
-        // refresh deliberately retains `applied_transforms` (it describes what our
-        // core still holds, which such a refresh changes not at all). With no
-        // uninstall the rows would stay permuted under a toolbar showing no rules.
-        // So when the durable rules have gone inactive while an active permutation
-        // is still installed, ask for the rule-free view. Sending the sanitized
-        // inactive state rather than a bare EMPTY_TRANSFORM keeps disabled filter
-        // definitions the user may re-enable; only when there is nothing durable
-        // left at all is the empty state sent, stamped with this sheet's schema the
-        // way handle_transform_change does.
+        // Nothing to reconcile when the durable rules already describe the view we
+        // hold. Every edit commit during an owned session redelivers a same-basis
+        // refresh and so bumps `source_epoch`, so without this the effect would fire
+        // a restore request per keystroke-commit. The host short-circuits an equal
+        // restore intent at the same generation, but that no-op ack is still a
+        // `transformInstalled`, and the install handler discards
+        // `auto_fit_active`/`auto_fit_snapshot` — correctly, since a real transform
+        // changes the population auto-fit sampled — so the Auto-fit toggle would
+        // switch itself off on every commit. Skipping the pointless round-trip
+        // removes that and any other side effect a no-op ack could carry.
+        if (transforms_semantically_equal(state, installed?.rules)) return;
+        // Differing rules the host has nothing to do about, and the one case that is
+        // not a reconciliation: neither side describes a permutation, so the rules
+        // differ only in definitions nobody is applying — a filter a sibling added
+        // and left switched off, say. The toolbar already reads those from durable
+        // state. Asking the host to "install" them would bump the generation, remount
+        // the grid and fold whatever the user was typing, all for a view identical to
+        // the one on screen.
+        if (!transform_is_active(state) && !installed?.permuted) return;
+        // Sending the sanitized durable state — rather than the active half of it, or
+        // a bare EMPTY_TRANSFORM — is what carries both directions. When it is active
+        // this installs it. When it is not, it is the rule-free view, and sending it
+        // as-is keeps disabled filter definitions the user may re-enable; only when
+        // there is nothing durable left at all is the empty state sent, stamped with
+        // this sheet's schema the way handle_transform_change does.
         //
         // Deliberately not gated on edit mode. `admit_transform_for_phase` refuses a
         // sibling's transform while we own the session, so the durable rules cannot
         // go inactive from a sibling mid-session; a gate here would instead create a
         // state that never reconciles, since leaving edit mode moves no dep of this
         // effect.
-        if (transform_is_active(applied_transforms[active_sheet_index])) {
-            restore_request_blockers_ref.current[active_sheet_index] =
-                restore_blocker_epoch;
-            request_transform(
-                active_sheet_index,
-                state ?? {
-                    ...EMPTY_TRANSFORM,
-                    schema: transform_schema_for_sheet(sheet),
-                },
-                'restore',
-                'restore',
-            );
-        }
+        restore_request_blockers_ref.current[active_sheet_index] =
+            restore_blocker_epoch;
+        request_transform(
+            active_sheet_index,
+            state ?? {
+                ...EMPTY_TRANSFORM,
+                schema: transform_schema_for_sheet(sheet),
+            },
+            'restore',
+            'restore',
+        );
     }, [
         source_epoch,
         meta,
         preview_mode,
         pending_excel_header,
         active_sheet_index,
-        applied_transforms,
+        sheet_views,
         request_transform,
         save_in_flight,
         restore_blocker_epoch,
@@ -2180,7 +2253,7 @@ export function App(): React.JSX.Element {
         // original in-flight response would stop matching and the webview would sit
         // on a stale generation. Same admission set as handle_transform_change.
         if (save_in_flight_ref.current) return;
-        const previous = applied_transforms[active_sheet_index]
+        const previous = sheet_views[active_sheet_index]?.rules
             ?? {
                 sort: [],
                 filters: [],
@@ -2198,9 +2271,9 @@ export function App(): React.JSX.Element {
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
-        applied_transforms,
         meta,
         request_transform,
+        sheet_views,
     ]);
 
     useEffect(() => {
@@ -2756,8 +2829,12 @@ export function App(): React.JSX.Element {
     // filter stays visible while the user edits, and deliberately does not
     // recompute, so rows keep their positions mid-edit.
     const visible_transform = preview_mode ? EMPTY_TRANSFORM : current_transform;
-    const applied_transform = applied_transforms[active_sheet_index];
-    const transform_active = transform_is_active(applied_transform);
+    const installed_view = sheet_views[active_sheet_index];
+    // What the loader is actually doing, straight from the record rather than
+    // re-derived from the rules: the host set it from whether it holds an index
+    // permutation for this sheet, which is the thing the display-keyed row-height
+    // affordances have to be suppressed against.
+    const transform_active = installed_view?.permuted ?? false;
     const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
@@ -2788,8 +2865,7 @@ export function App(): React.JSX.Element {
             ? 'Making row header…'
             : 'Updating column names…'
         : 'Wait for sorting and filtering to finish.';
-    const effective_row_count =
-        effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
+    const effective_row_count = installed_view?.rowCount ?? current_sheet.rowCount;
     const visibility_reset_key = [
         load_epoch,
         active_sheet_index,
@@ -2813,12 +2889,12 @@ export function App(): React.JSX.Element {
         || preview_mode
         || excel_header_pending;
 
-    // Stale-view banner: derived from the transform actually *installed* in the grid
-    // (`applied_transform`), not the requested one, because the statement is about
-    // the order the user is looking at. Only meaningful in edit mode — outside it the
-    // order recomputes as normal.
+    // Stale-view banner: derived from the rules actually *installed* in the grid, not
+    // the requested ones, because the statement is about the order the user is
+    // looking at. Only meaningful in edit mode — outside it the order recomputes as
+    // normal.
     const stale_view_current_signature = edit_mode
-        ? stale_view_signature(applied_transform, Object.keys(live_edits ?? {}))
+        ? stale_view_signature(installed_view?.rules, Object.keys(live_edits ?? {}))
         : undefined;
     const show_stale_view_banner = stale_view_current_signature !== undefined
         && stale_view_current_signature !== acknowledged_stale_signature;

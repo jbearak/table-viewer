@@ -5868,16 +5868,20 @@ describe('an applied transform across a refresh', () => {
             .filter((message) => message.type === 'setTransform');
     }
 
-    function five_row_meta(): WorkbookMeta {
+    function sized_meta(row_count: number): WorkbookMeta {
         const meta = make_meta(['Sheet1'], false);
         return {
             ...meta,
             sheets: meta.sheets.map((sheet) => ({
                 ...sheet,
-                rowCount: 5,
-                sourceRowCount: 5,
+                rowCount: row_count,
+                sourceRowCount: row_count,
             })),
         };
+    }
+
+    function five_row_meta(): WorkbookMeta {
+        return sized_meta(5);
     }
 
     /** An owned edit session over a CSV whose stored sort is installed and applied. */
@@ -6217,6 +6221,158 @@ describe('an applied transform across a refresh', () => {
         // And with nothing applied, the stored height is the user's again.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{"2":44}');
     });
+
+    /**
+     * Everything a snapshot can invalidate about the installed view, read together.
+     * Three separately-stored atoms used to hold these, and three review findings on
+     * this PR were a snapshot moving some and not the others; asserted as one object
+     * so no future change can move one of them past this test. `asks_again` is the
+     * third: it stands for the fact that an install has landed against these rows,
+     * which the restore effect answers by comparing the durable rules against the
+     * record's own.
+     */
+    function view_state(post_message: ReturnType<typeof vi.fn>) {
+        return {
+            transformed: grid_stub().getAttribute('data-transformed'),
+            row_count: grid_stub().getAttribute('data-row-count'),
+            asks_again: transform_requests(post_message).length > 0,
+        };
+    }
+
+    it('keeps every part of the record across a same-basis refresh', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // What committing an edit provokes: same source, same view generation, the
+        // rows already on screen.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The permutation, the row count and the landed install stand or fall
+        // together, because they are one value with one basis. Any partial
+        // invalidation shows up here as a mismatched field.
+        expect(view_state(post_message)).toEqual({
+            transformed: 'true',
+            row_count: String(FILTERED_ROW_COUNT),
+            asks_again: false,
+        });
+    });
+
+    it('drops every part of the record when the basis changes', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A reload. The host re-read the rows and installed no permutation over them,
+        // so nothing the record said is true any more.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The same three, all the other way — including the ask, which is what makes
+        // the stored sort come back rather than being silently forgotten.
+        expect(view_state(post_message)).toEqual({
+            transformed: 'false',
+            row_count: '5',
+            asks_again: true,
+        });
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('does not carry a record into a newly loaded document', async () => {
+        // The basis is built from the host's own counters, and a new document restarts
+        // them: an 'initial' snapshot can arrive on the very generation and source
+        // generation the outgoing file's record was computed against, over a sheet of
+        // the same name and shape. Equal numbers are a coincidence there rather than
+        // evidence about the rows, so identity of the basis alone cannot be what
+        // retains a record — the second file would be shown the first one's row count.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+        }));
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+
+        await dispatch_host_message(initial_snapshot_message(sized_meta(9), {
+            capabilities: CSV_CAPABILITIES,
+        }));
+
+        expect(grid_stub().getAttribute('data-row-count')).toBe('9');
+    });
+
+    // One comparison — the durable rules against the record's — decides both
+    // directions and the two ways of doing nothing. Walked in one test from one
+    // fixture, because the failure the shape prevents is a reader adding a case to
+    // the install side and not to the uninstall side.
+    it('reconciles in either direction from the same comparison', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        // The same disabled filter, retyped. The last phase below needs durable rules
+        // that differ from the installed ones without either describing a
+        // permutation, and an edited value is the way to get there on this fixture:
+        // the sheet has one column, and `sanitize_transform_state` keeps only one
+        // filter per column, so a *second* disabled filter would be dropped before
+        // the comparison ever saw it.
+        const retyped_disabled_filter: SheetTransformState = {
+            ...DISABLED_FILTER_ONLY,
+            filters: DISABLED_FILTER_ONLY.filters.map((filter) => ({
+                ...filter,
+                value: 'z',
+            })),
+        };
+        const same_basis = (
+            generation: number,
+            transforms: (SheetTransformState | undefined)[],
+        ) => refresh_snapshot_message(five_row_meta(), {
+            generation,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms },
+        });
+
+        // Agreeing: neither direction.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(2, [STORED_SORT]));
+        expect(transform_requests(post_message)).toHaveLength(0);
+
+        // Durable rules active and differing — a sibling re-sorted — so install them.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(2, [SIBLING_SORT]));
+        expect(transform_requests(post_message)).toHaveLength(1);
+        const install = latest_transform_request(post_message);
+        expect(install.state.sort).toEqual(SIBLING_SORT.sort);
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 3, rowCount: 4 }),
+        );
+
+        // Durable rules inactive while a permutation is still installed, so ask for
+        // the rule-free view — carrying the disabled definition, which is still the
+        // user's. Only the host can un-permute the loader, so nothing else can fix it.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(3, [DISABLED_FILTER_ONLY]));
+        expect(transform_requests(post_message)).toHaveLength(1);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual(DISABLED_FILTER_ONLY.filters);
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 4, rowCount: 5 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // Differing rules with nothing to reconcile: a sibling retyped a filter it had
+        // already switched off, so neither side describes a permutation and the
+        // toolbar reads the definition from durable state anyway. Asking would bump
+        // the generation, remount the grid and fold whatever is being typed, all for a
+        // view identical to the one on screen.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(4, [retyped_disabled_filter]));
+        expect(transform_requests(post_message)).toHaveLength(0);
+    });
 });
 
 // A refusal always means the host changed nothing, and `transformRefused` carries
@@ -6399,6 +6555,34 @@ describe('refused transforms', () => {
         post_message.mockClear();
         await settle_a_save();
         expect(transform_requests(post_message)).toEqual([]);
+    });
+
+    it('asks again for a terminally refused transform once the source reloads', async () => {
+        // The other half of `terminal`, and the half that keeps it from being a
+        // one-way door. "Stop asking" is bookkeeping about a request the host refused
+        // over *these* rows: a reload replaces them, and a sheet that could not support
+        // the saved sort a moment ago — wrong columns, a promoted header row — may well
+        // support it now. Latching past that would drop the user's sort for the rest of
+        // the session, with nothing to show they still have one.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        await refuse_transform(request, { terminal: true });
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 3,
+                sourceGeneration: 3,
+                capabilities: CSV_CAPABILITIES,
+                state: { transforms: [STORED_SORT] },
+            },
+        ));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
     });
 
     it('keeps the applied view and its row count across a terminal refusal', async () => {
