@@ -239,13 +239,15 @@ export interface PerFileState {
      *    data-source/csv-source.ts:139-140), so for the one editable format
      *    display rows and source rows are the same numbers whenever no transform
      *    is installed.
-     *  - A transform can never be installed while editing. The host refuses it
-     *    (`transform_blocks_editing`, viewer-controller.ts:547, consulted by
-     *    `editing_available_for_panel` and the transform admission path) and the
-     *    webview refuses both directions independently: entering edit mode under a
-     *    transform (`handle_toggle_edit_mode`, webview/app.tsx:1518-1527) and
-     *    applying a transform while in edit mode (`handle_transform_change`,
-     *    webview/app.tsx:1571-1576).
+     *  - No version that could have written one of these keys allowed a transform
+     *    to be installed while editing: the host refused it whenever an edit
+     *    session existed, and the webview refused both directions independently.
+     *    That is a statement about the versions that wrote the data, and it is
+     *    what the reinterpretation rests on — not a live invariant. Transforms and
+     *    edit sessions now coexist (see `admit_transform_for_phase` in
+     *    viewer-controller.ts), which is safe for the *conclusion* below because
+     *    commits resolve the canonical source row before keying, so a key written
+     *    under a permutation is canonical too.
      *  - `resolve_csv_save_hydration` (webview/csv-save-lifecycle.ts) passes keys
      *    through verbatim, so a round-trip through the save lifecycle cannot
      *    rewrite one either.
