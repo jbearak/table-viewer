@@ -229,3 +229,107 @@ jobs:
             dist/desktop-packages/table-viewer-*.dmg
             dist/desktop-packages/table-viewer-*.zip
             dist/desktop-packages/*.sha256
+
+  # The standalone Windows app: an NSIS installer and a portable single-file
+  # exe, each for x64 and arm64. Its own job because electron-builder's Windows
+  # targets must be built on Windows, and so that a Windows packaging failure
+  # is immediately attributable rather than hidden inside the macOS job.
+  #
+  # It is NOT isolated in the blast-radius sense, and that is deliberate: this
+  # job failing fails the whole Release Build run, and release-publish.yml only
+  # triggers on `workflow_run.conclusion == 'success'`, so nothing publishes
+  # until the Windows build is fixed and the run re-run. The alternative
+  # (continue-on-error) would quietly ship a release missing its Windows
+  # downloads. The missing-artifact tolerance on the publish side is for a
+  # different case: old tags built before this job existed, and runs whose
+  # artifacts have aged out.
+  #
+  # Deliberately no `environment: release` here: unlike the macOS job there are
+  # no secrets to read. Windows builds ship unsigned — an Authenticode
+  # certificate is a paid annual subscription we have chosen not to buy, so
+  # SmartScreen shows its "Windows protected your PC" prompt on first run and
+  # the user clicks More info -> Run anyway. That is documented in the README.
+  desktop-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          # The job never runs an authenticated git or gh command — only a local
+          # `git rev-parse` against the fetched tag — so there is no reason to
+          # leave the job token in .git/config where a package script could
+          # reach it.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Validate tag + version
+        shell: bash
+        env:
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$THE_TAG" =~ ^v[0-9] ]]; then
+            echo "ERROR: tag must start with 'v' and a digit (e.g., v0.1.1). Got: $THE_TAG" >&2
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
+            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
+            exit 1
+          fi
+
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "$THE_TAG" != "v${PKG_VERSION}" ]]; then
+            echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package desktop app (unsigned)
+        run: npm run desktop:package:win
+        env:
+          # No Authenticode certificate is configured, and a runner picking one
+          # up from its certificate store would make the artifact
+          # non-reproducible. Be explicit rather than relying on there being
+          # none to find.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # Four exes are expected: {x64,arm64} x {setup,portable}. Assert the count
+      # rather than trusting the glob, so a silently dropped target shows up
+      # here and not as a missing download on the release page.
+      - name: Calculate checksums
+        shell: bash
+        working-directory: dist/desktop-packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          exes=(table-viewer-*.exe)
+          if [[ "${#exes[@]}" -ne 4 ]]; then
+            echo "ERROR: expected 4 .exe files (x64/arm64 x setup/portable), found ${#exes[@]}." >&2
+            ls -la >&2
+            exit 1
+          fi
+          for exe in "${exes[@]}"; do
+            sha256sum "$exe" | tee "$exe.sha256"
+          done
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: windows-${{ inputs.tag || github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/desktop-packages/table-viewer-*.exe
+            dist/desktop-packages/table-viewer-*.exe.sha256

@@ -24,6 +24,7 @@ is the only thing that does — CI runs it):
 - `npm run desktop:dev` — build the bundles and launch the app with Electron
 - `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
 - `npm run desktop:package:dir` — unpacked `.app` only (faster, for local checks)
+- `npm run desktop:package:win` — Windows setup + portable exe (x64 + arm64); must be run on Windows
 - `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
 
 See [desktop/README.md](../desktop/README.md) for more on the desktop shell.
@@ -50,7 +51,7 @@ What it does, in order:
    - Deletes any `table-viewer-*.vsix` at the repo root, then `npm run package` to produce `table-viewer-<version>.vsix`, where `<version>` comes from `package.json`. The clean means the installed file can only be this run's build, and stale older-version VSIXes (which vsce leaves behind) don't accumulate. A missing VSIX at the expected path afterward is a hard error.
    - Installs that VSIX with `--install-extension … --force` into every editor found on `PATH`, trying `code`, `code-insiders`, `codium`, `kiro`, `antigravity`, `cursor`, and `windsurf`. Editors that aren't installed are reported as `not found` and skipped; an install that fails is reported as `failed` and does not stop the run. Finding no editors at all is a warning, not an error.
 4. **Desktop app** (skipped with `--no-desktop`):
-   - Skipped with a warning — not an error — on non-macOS hosts, since `desktop/electron-builder.yml` only configures a macOS target.
+   - Skipped with a warning — not an error — on non-macOS hosts. `desktop/electron-builder.yml` does configure Windows targets, but the script's install step is macOS-specific (it copies into `/Applications` and clears the quarantine attribute), so it stays macOS-only. On Windows, run `npm run desktop:package:win` and install by hand: it writes four files to `dist/desktop-packages/`, so run the `table-viewer-<version>-<arch>-setup.exe` matching your machine's architecture (`x64` or `arm64`). The `-portable.exe` of the same architecture is the alternative — it runs as-is with nothing installed and no Start Menu entry or file associations.
    - `npm run desktop:package:dir` builds the unpacked bundle at `dist/desktop-packages/mac-<arch>/Table Viewer.app`.
    - Deletes any existing `/Applications/Table Viewer.app` and copies the fresh build in its place. Note this **replaces** an app installed there by other means.
    - Clears the quarantine attribute (`xattr -dr com.apple.quarantine`) on the installed copy, so the unsigned build launches without the Gatekeeper prompt described in [desktop/README.md](../desktop/README.md).
@@ -83,7 +84,7 @@ What it does, in order:
 
 Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag.
 
-`release-build.yml` has two jobs: `build` packages the `.vsix` on Linux, and `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
+`release-build.yml` has three jobs: `build` packages the `.vsix` on Linux, `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner, and `desktop-windows` packages the unsigned Windows exes (setup + portable, x64 + arm64) on a Windows runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
 
 ```sh
 git push && git push --tags

@@ -100,6 +100,17 @@ jobs:
 
           gh run download "$BUILD_RUN_ID" --name "$ARTIFACT_NAME"
 
+          # Only an *absent* artifact is tolerable (see below); a download that
+          # fails on an artifact the run really has is a transient or permission
+          # problem, and swallowing it would publish a release quietly missing
+          # its downloads. So list the run's artifacts up front and let gh's exit
+          # status stand for anything the list says is there. A failure of the
+          # listing call itself is fatal too — it must not be mistaken for "the
+          # run built no desktop artifacts".
+          RUN_ARTIFACTS=$(gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${BUILD_RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | .name')
+
           # The desktop job of the same run produces the macOS app that the
           # Homebrew cask downloads. Land it in desktop-dist/ rather than the
           # workspace root: `table-viewer-*` would otherwise match both the
@@ -111,11 +122,23 @@ jobs:
           # runs whose artifacts have aged out, have no desktop-* artifact. The
           # extension publish must not be held hostage to that — the release
           # simply ships without the app, and the cask bump is skipped.
-          if gh run download "$BUILD_RUN_ID" --name "desktop-${THE_TAG}" --dir desktop-dist; then
+          if grep -Fxq "desktop-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
+            gh run download "$BUILD_RUN_ID" --name "desktop-${THE_TAG}" --dir desktop-dist
             echo "desktop=true" >> "$GITHUB_OUTPUT"
           else
             echo "desktop=false" >> "$GITHUB_OUTPUT"
             echo "::warning::No desktop-${THE_TAG} artifact; publishing without the macOS app and skipping the Homebrew bump."
+          fi
+
+          # Same story for the Windows exes, in their own directory for the same
+          # reason. Nothing downstream depends on them beyond being attached to
+          # the release, so a missing artifact is a warning, not a failure.
+          if grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
+            gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
+            echo "windows=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app."
           fi
 
       - name: Verify checksums
@@ -125,6 +148,9 @@ jobs:
           sha256sum -c table-viewer-*.vsix.sha256
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
             (cd desktop-dist && sha256sum -c ./*.sha256)
+          fi
+          if [[ "${{ steps.artifacts.outputs.windows }}" == "true" ]]; then
+            (cd windows-dist && sha256sum -c ./*.sha256)
           fi
 
       - name: Install publish tools
@@ -157,6 +183,8 @@ jobs:
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
             desktop-dist/*.sha256
+            windows-dist/table-viewer-*.exe
+            windows-dist/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

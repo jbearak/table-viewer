@@ -188,6 +188,7 @@
     "desktop:package": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac -c.mac.identity=null -c.dmg.sign=false",
     "desktop:package:dir": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac --dir -c.mac.identity=null",
     "desktop:package:release": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac --arm64",
+    "desktop:package:win": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --win --x64 --arm64",
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
