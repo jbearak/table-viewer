@@ -5647,6 +5647,652 @@ describe('CSV edit sessions', () => {
         });
     });
 
+    /**
+     * A reopen is where every durable fact about an edit session has to be read back
+     * at once, and round 7's blocker was reopen-shaped: found by review, not by a
+     * test. So the surface is walked as a matrix rather than as anecdotes.
+     *
+     * The dimensions are durable `pendingEdits`, an active durable transform, a
+     * `failedSaveTombstone`, the `clearedStateRevision` boundary, the edit phase at
+     * the moment the new panel opens, and the order two panels reopen in. Every cell
+     * asks the same three user-facing questions — are my edits here, do I have a
+     * session, and is the view the one I left — and the load-bearing one is the
+     * first: durable edits must never be silently dropped, which is the failure that
+     * has now appeared twice on this PR.
+     *
+     * Pruned deliberately, with reasons, rather than generated:
+     *
+     * - **No `pendingEdits` × anything.** `project_state_for_panel` returns at its
+     *   first branch when the map is absent, before the tombstone, the cleared
+     *   revision, the phase or the claim is consulted, so the whole half-space
+     *   collapses to the two control cells below.
+     * - **A durable transform × tombstone / cleared revision / phase.** The rules
+     *   reach the *view* and never `represents_session`; they are crossed with the
+     *   edits (where they decide what is visible and what the hidden set names) and
+     *   with nothing else.
+     * - **A non-free phase × transform / tombstone / cleared revision.** The phase
+     *   and cleanup terms short-circuit ahead of the claim, so those cells repeat
+     *   the phase cell's observation with more scaffolding.
+     * - **Two panels × every other dimension.** Order matters only for who holds the
+     *   session, so it is crossed with the baseline alone.
+     */
+    describe('the reopen matrix', () => {
+        const SOURCE = 'h\nc\na\nb\n';
+        // Two edits, on the rows the hiding views below drop, plus none on the row
+        // they keep — so "hidden" and "visible" are distinguishable in one fixture.
+        const EDITS = {
+            '0:0': { value: 'edited-c', base: 'c' },
+            '2:0': { value: 'edited-b', base: 'b' },
+        };
+        const SCHEMA = '["Sheet1",1,["h"]]';
+        const SORT = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: SCHEMA,
+        };
+        const HIDING_FILTER = {
+            sort: [],
+            filters: [{
+                id: 'keep-a',
+                colIndex: 0,
+                operator: 'equals' as const,
+                value: 'a',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: SCHEMA,
+        };
+        const HIDDEN_ROWS = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 2],
+            schema: SCHEMA,
+        };
+        const LOSS = 'Dropped durable CSV pending edits with no panel holding the session';
+
+        function csv_fixture() {
+            const bytes = enc.encode(SOURCE);
+            vscode_mock.__setStatImplementation(async () => ({
+                size: bytes.byteLength, mtime: 1,
+            }));
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            return bytes;
+        }
+
+        function displayed_rows(
+            panel: { __messages: unknown[]; __receive(msg: unknown): Promise<void> },
+            request_id: string,
+            generation: number,
+        ) {
+            return panel.__receive({
+                type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+                requestId: request_id, generation,
+            }).then(() => (panel.__messages.find((message: any) => (
+                message?.type === 'rowData' && message.requestId === request_id
+            )) as { rows: Array<Array<{ raw: string }>> }).rows.map((row) => row[0].raw));
+        }
+
+        /** The restore the webview's effect sends for whatever rules it was given. */
+        async function restore_durable_view(
+            panel: ReturnType<typeof open_csv_table>,
+            rules: object,
+        ) {
+            const snapshot = latest_snapshot(panel);
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId: 'reopen-restore',
+                generation: snapshot.generation,
+                sourceGeneration: snapshot.sourceGeneration,
+                intent: 'restore',
+                state: rules,
+            });
+            const installed = transform_installs(panel).at(-1)!;
+            expect(installed.requestId).toBe('reopen-restore');
+            return installed;
+        }
+
+        it.each([
+            ['no durable view', undefined, 3, [] as string[], ['c', 'a', 'b']],
+            ['a durable sort', SORT, 3, [] as string[], ['a', 'b', 'c']],
+            ['a durable hiding filter', HIDING_FILTER, 1, ['0:0', '2:0'], ['a']],
+            ['durable hidden rows', HIDDEN_ROWS, 1, ['0:0', '2:0'], ['a']],
+        ])(
+            'hands a reopened owner its edits and a session under %s',
+            async (label, rules, row_count, hidden, order) => {
+                const file_path = `/tmp/reopen-matrix-${label.replace(/\s+/g, '-')}.csv`;
+                const shared = state_store({
+                    pendingEdits: EDITS,
+                    ...(rules ? { transforms: [rules] } : {}),
+                });
+                csv_fixture();
+                const reopened = open_csv_table(uri(file_path), shared.store);
+                await reopened.__receive({ type: 'ready' });
+
+                // The load-bearing question first, and the same one in all four cells:
+                // the work is here and it is this panel's to hold.
+                const snapshot = latest_snapshot(reopened);
+                expect(snapshot.state.pendingEdits).toEqual(EDITS);
+                expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
+                expect(snapshot.capabilities.csvEditable).toBe(true);
+
+                if (!rules) {
+                    // Nothing to restore, so the natural order is the whole answer.
+                    expect(await displayed_rows(reopened, 'reopen-natural', snapshot.generation))
+                        .toEqual(order);
+                    return;
+                }
+                const installed = await restore_durable_view(reopened, rules);
+                // The recomputed view over *saved* values: the permutation was never
+                // persisted, so there is no prior order to preserve and recomputation
+                // is not declinable. 'edited-c' does not sort as 'edited-c'.
+                expect(installed.view.rowCount).toBe(row_count);
+                expect([...installed.view.hiddenEditedCellKeys].sort()).toEqual(hidden);
+                expect(await displayed_rows(
+                    reopened,
+                    'reopen-restored',
+                    installed.view.basis.generation,
+                )).toEqual(order);
+            },
+        );
+
+        it.each([
+            ['no durable view', undefined],
+            ['an active durable transform', SORT],
+        ])('grants nothing and claims nothing on a clean reopen with %s', async (label, rules) => {
+            // The whole `pendingEdits`-absent half of the matrix, which
+            // `project_state_for_panel` answers at its first branch. Kept as controls
+            // rather than crossed with anything: there is no second decision to make.
+            const file_path = `/tmp/reopen-matrix-clean-${label.replace(/\s+/g, '-')}.csv`;
+            const shared = state_store(rules ? { transforms: [rules] } : {});
+            csv_fixture();
+            const reopened = open_csv_table(uri(file_path), shared.store);
+            await reopened.__receive({ type: 'ready' });
+
+            const snapshot = latest_snapshot(reopened);
+            expect(snapshot.state.pendingEdits).toBeUndefined();
+            // No durable work means no session to represent, so a reopen must not
+            // silently take one — the file stays free for whichever panel asks.
+            expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+            expect(snapshot.capabilities.csvEditable).toBe(true);
+            if (rules) {
+                const installed = await restore_durable_view(reopened, rules);
+                expect(installed.view.rowCount).toBe(3);
+                expect(installed.view.hiddenEditedCellKeys).toEqual([]);
+            }
+        });
+
+        /**
+         * A phase another panel holds. The drop `project_state_for_panel` is allowed
+         * to make, and the assertion that it is only ever a deferral: the edits stay
+         * durable and reach the reopened panel once the phase frees.
+         */
+        it.each([
+            ['owns the session', 'owned'],
+            ['is mid-claim', 'claiming'],
+            ['is still releasing it', 'releasing'],
+        ] as const)('defers a reopen while a sibling %s, losing nothing', async (label, phase) => {
+            const file_path = `/tmp/reopen-matrix-${phase}.csv`;
+            const versioned = state_store({ pendingEdits: EDITS });
+            const parked = deferred();
+            const gate = deferred();
+            let arm_read = false;
+            let arm_write = false;
+            const store: FileStateStore = {
+                ...versioned.store,
+                async read(path) {
+                    // One-shot, armed immediately before the sibling's own request, so
+                    // the only read it can catch is the one that pins the claim.
+                    if (arm_read) {
+                        arm_read = false;
+                        parked.resolve();
+                        await gate.promise;
+                    }
+                    return versioned.store.read(path);
+                },
+                async compare_and_set(path, expected, next, validate) {
+                    if (arm_write && next.pendingEdits?.['1:0']) {
+                        arm_write = false;
+                        parked.resolve();
+                        await gate.promise;
+                    }
+                    return versioned.store.compare_and_set(path, expected, next, validate);
+                },
+            };
+            csv_fixture();
+            const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const sibling = open_csv_table(uri(file_path), store);
+            await sibling.__receive({ type: 'ready' });
+            const session_id = latest_snapshot(sibling).capabilities.csvEditSessionId!;
+            expect(session_id).toBeDefined();
+
+            let outstanding: Promise<unknown> = Promise.resolve();
+            if (phase === 'claiming') {
+                // Released first, so the sibling's next request has to reserve a claim
+                // rather than already owning one.
+                await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+                arm_read = true;
+                outstanding = sibling.__receive({
+                    type: 'requestEditSession', requestId: 'sibling-claim',
+                });
+                await parked.promise;
+            } else if (phase === 'releasing') {
+                arm_write = true;
+                const pending = sibling.__receive({
+                    type: 'pendingEditsChanged',
+                    editSessionId: session_id,
+                    edits: { ...EDITS, '1:0': { value: 'draining', base: 'a' } },
+                });
+                await parked.promise;
+                const release = sibling.__receive({
+                    type: 'releaseEditSession', editSessionId: session_id,
+                });
+                outstanding = Promise.all([pending, release]);
+            }
+
+            const reopened = open_csv_table(uri(file_path), store);
+            await reopened.__receive({ type: 'ready' });
+            const snapshot = latest_snapshot(reopened);
+            expect(snapshot.state.pendingEdits).toBeUndefined();
+            expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+            // Dropped for the one legitimate reason, so the loss assertion inside
+            // `project_state_for_panel` must stay silent.
+            expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
+            // Nothing was lost, only withheld.
+            expect(versioned.get_state(file_path).pendingEdits).toMatchObject(EDITS);
+
+            gate.resolve();
+            await outstanding;
+            await flush_promises();
+            // A parked claim still completes once its read lands, so both of these
+            // phases end with the sibling holding the session it was reaching for.
+            if (phase === 'owned' || phase === 'claiming') {
+                await sibling.__receive({
+                    type: 'releaseEditSession',
+                    editSessionId: phase === 'claiming'
+                        ? latest_edit_session_message(sibling)!.editSessionId!
+                        : session_id,
+                });
+            }
+            console_error.mockRestore();
+
+            // And the deferral ends: whatever the sibling was finishing, the reopened
+            // panel gets the complete durable set when it asks.
+            await reopened.__receive({ type: 'requestEditSession', requestId: 'after-defer' });
+            const granted = latest_edit_session_message(reopened)!;
+            expect(granted.granted).toBe(true);
+            expect(granted.pendingEdits).toMatchObject(EDITS);
+        });
+
+        /**
+         * The two phases `edit_cleanup_blocked()` covers. Here the durable entries are
+         * a *saved* operation's, so withholding them is not withholding unsaved work —
+         * the assertion is that no session is handed out over state nobody can vouch
+         * for, and that the panel recovers once the clear settles.
+         */
+        it.each([
+            ['a post-save clear is in flight', 'cleanupPending'],
+            ['a clear has failed and state is uncertain', 'uncertain'],
+        ] as const)('withholds a session on reopen while %s', async (label, phase) => {
+            const file_path = `/tmp/reopen-matrix-${phase}.csv`;
+            const versioned = state_store({ pendingEdits: { '0:0': { value: 'edited-c', base: 'c' } } });
+            const clear_started = deferred();
+            const clear_gate = deferred();
+            let bytes = enc.encode(SOURCE);
+            vscode_mock.__setStatImplementation(async () => ({
+                size: bytes.byteLength, mtime: 1,
+            }));
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            vscode_mock.__setWriteFileImplementation(async (_target, content) => {
+                bytes = new Uint8Array(content);
+            });
+            const store: FileStateStore = {
+                ...versioned.store,
+                async compare_and_set(path, expected, next, validate) {
+                    const current = await versioned.store.read(path);
+                    if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                        if (phase === 'uncertain') throw new Error('cleanup storage failed');
+                        clear_started.resolve();
+                        await clear_gate.promise;
+                    }
+                    return versioned.store.compare_and_set(path, expected, next, validate);
+                },
+            };
+            const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const owner = open_csv_table(uri(file_path), store);
+            await owner.__receive({ type: 'ready' });
+            const session_id = latest_snapshot(owner).capabilities.csvEditSessionId!;
+            const save = owner.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: session_id,
+                    saveRequestId: 'save-before-reopen',
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                },
+            });
+            if (phase === 'cleanupPending') {
+                await clear_started.promise;
+            } else {
+                await save;
+                await flush_promises();
+                expect(owner.__messages).toContainEqual(expect.objectContaining({
+                    type: 'saveResult', success: true,
+                }));
+            }
+
+            // The precondition that makes this cell about the cleanup phases at all:
+            // the entries the clear could not remove are still on disk, so the
+            // projection below has something it could wrongly hand over.
+            expect(versioned.get_state(file_path).pendingEdits).toEqual({
+                '0:0': { value: 'edited-c', base: 'c' },
+            });
+
+            const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+            const reopened = open_csv_table(uri(file_path), store);
+            await reopened.__receive({ type: 'ready' });
+            const snapshot = latest_snapshot(reopened);
+            expect(snapshot.state.pendingEdits).toBeUndefined();
+            expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+            expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
+            // The bytes did reach disk either way, which is what makes withholding the
+            // durable entries correct rather than lossy.
+            expect(new TextDecoder().decode(bytes)).toBe('h\nedited-c\na\nb\n');
+
+            // And the reopened panel cannot talk its way in either, which is the
+            // observable the user gets: the request is refused and says why, rather
+            // than handing out a session over durable state nobody can vouch for.
+            await reopened.__receive({
+                type: 'requestEditSession', requestId: 'during-cleanup',
+            });
+            expect(latest_edit_session_message(reopened)).toMatchObject({ granted: false });
+            expect(warning).toHaveBeenCalledWith(
+                'Editing is temporarily unavailable while saved edit state is being cleared.',
+            );
+
+            if (phase === 'cleanupPending') {
+                clear_gate.resolve();
+                await save;
+                await flush_promises();
+                await reopened.__receive({
+                    type: 'requestEditSession', requestId: 'after-clear',
+                });
+                const granted = latest_edit_session_message(reopened)!;
+                expect(granted.granted).toBe(true);
+                // Saved, so cleared: a session with nothing left to restore.
+                expect(granted.pendingEdits).toBeUndefined();
+            }
+            console_error.mockRestore();
+        });
+
+        it.each([
+            ['every durable entry', { '0:0': 'edited-c', '2:0': 'edited-b' }, undefined],
+            ['only some of them', { '0:0': 'edited-c' }, { '2:0': EDITS['2:0'] }],
+        ] as const)(
+            'strips a standing tombstone covering %s from a reopened session',
+            async (label, saved, expected) => {
+                // The reopen path does not await `ensure_failed_save_cleanup` the way a
+                // grant does, so the tombstone strip in
+                // `pending_edits_for_current_session` is the only thing keeping a failed
+                // save's durable entries from being handed to the next session as its
+                // own work — which the user would then see, and be unable to explain.
+                // Reaching it needs a cleanup write that keeps failing; the ordinary
+                // route removes those entries before any reopen can see them.
+                const file_path = `/tmp/reopen-matrix-tombstone-${Object.keys(saved).length}.csv`;
+                const versioned = state_store();
+                let cleanup_writes = 0;
+                const store: FileStateStore = {
+                    ...versioned.store,
+                    async compare_and_set(path, expected_revision, next, validate) {
+                        const current = await versioned.store.read(path);
+                        const shrinking = Object.keys(
+                            (current.state as PerFileState).pendingEdits ?? {},
+                        ).length > Object.keys(next.pendingEdits ?? {}).length;
+                        if (shrinking) {
+                            cleanup_writes += 1;
+                            throw new Error('cleanup write failed');
+                        }
+                        return versioned.store.compare_and_set(
+                            path, expected_revision, next, validate,
+                        );
+                    },
+                };
+                csv_fixture();
+                vscode_mock.__setWriteFileImplementation(async () => {
+                    throw new Error('disk write failed');
+                });
+                const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+                const owner = open_csv_table(uri(file_path), store);
+                await owner.__receive({ type: 'ready' });
+                await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+                const session_id = latest_edit_session_message(owner)!.editSessionId!;
+                await owner.__receive({
+                    type: 'pendingEditsChanged',
+                    editSessionId: session_id,
+                    edits: EDITS,
+                });
+                const dirtyEdits = Object.fromEntries(
+                    Object.keys(saved).map((key) => [key, EDITS[key as keyof typeof EDITS]]),
+                );
+                await owner.__receive({
+                    type: 'saveCsv',
+                    operation: {
+                        editSessionId: session_id,
+                        saveRequestId: 'failing-save',
+                        edits: saved,
+                        dirtyEdits,
+                    },
+                });
+                await owner.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+                await flush_promises();
+                // Preconditions: the cleanup was attempted and refused, so the failed
+                // operation's entries are still on disk under a standing tombstone.
+                expect(cleanup_writes).toBeGreaterThan(0);
+                expect(versioned.get_state(file_path).pendingEdits).toEqual(EDITS);
+
+                const reopened = open_csv_table(uri(file_path), store);
+                await reopened.__receive({ type: 'ready' });
+
+                const snapshot = latest_snapshot(reopened);
+                expect(snapshot.state.pendingEdits).toEqual(expected);
+                // Still a session either way: the tombstone says which entries are not
+                // this panel's, not that the panel may not edit.
+                expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
+                expect(snapshot.capabilities.csvEditSessionId).not.toBe(session_id);
+                console_error.mockRestore();
+            },
+        );
+
+        it('keeps an edit a reopened session retypes over a tombstoned value', async () => {
+            // The hole the tombstone cells above open onto. A standing tombstone strips
+            // by *value*, and the reopened session's projection is what installs the
+            // grid's dirty map — so retyping the value the failed save had put the
+            // user's own work straight back into the strip's sights, and the next
+            // projection took it out of the grid again. Silent loss of unsaved work, on
+            // the ordinary "Save failed, close the tab, reopen, type it again" flow.
+            //
+            // A different session cannot be echoing that map back, which is the one
+            // thing the tombstone exists to catch: the projection it started from had
+            // those entries stripped, and neither `resolve_csv_save_hydration` nor the
+            // grant path will hand a failed operation to a session that does not own
+            // it. So anything it posts was genuinely typed, and the tombstone's job is
+            // done the moment it posts.
+            const file_path = '/tmp/reopen-matrix-tombstone-retype.csv';
+            const versioned = state_store();
+            let cleanup_writes = 0;
+            const store: FileStateStore = {
+                ...versioned.store,
+                async compare_and_set(path, expected, next, validate) {
+                    const current = await versioned.store.read(path);
+                    if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                        cleanup_writes += 1;
+                        throw new Error('cleanup write failed');
+                    }
+                    return versioned.store.compare_and_set(path, expected, next, validate);
+                },
+            };
+            csv_fixture();
+            vscode_mock.__setWriteFileImplementation(async () => {
+                throw new Error('disk write failed');
+            });
+            const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const owner = open_csv_table(uri(file_path), store);
+            await owner.__receive({ type: 'ready' });
+            await owner.__receive({ type: 'requestEditSession', requestId: 'owner' });
+            const failed_session = latest_edit_session_message(owner)!.editSessionId!;
+            const dirtyEdits = { '2:0': EDITS['2:0'] };
+            await owner.__receive({
+                type: 'pendingEditsChanged',
+                editSessionId: failed_session,
+                edits: dirtyEdits,
+            });
+            await owner.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: failed_session,
+                    saveRequestId: 'failing-save',
+                    edits: { '2:0': 'edited-b' },
+                    dirtyEdits,
+                },
+            });
+            await owner.__receive({
+                type: 'releaseEditSession', editSessionId: failed_session,
+            });
+            owner.dispose();
+            await flush_promises();
+            expect(cleanup_writes).toBeGreaterThan(0);
+            expect(versioned.get_state(file_path).pendingEdits).toEqual(dirtyEdits);
+
+            const reopened = open_csv_table(uri(file_path), store);
+            await reopened.__receive({ type: 'ready' });
+            const session_id = latest_snapshot(reopened).capabilities.csvEditSessionId!;
+            expect(session_id).toBeDefined();
+            expect(session_id).not.toBe(failed_session);
+            // The precondition: the tombstone really is standing, so the panel opened
+            // over the failed save's entries without being shown them.
+            expect(latest_snapshot(reopened).state.pendingEdits).toBeUndefined();
+
+            // The user types the same value again, and the host writes it.
+            await reopened.__receive({
+                type: 'pendingEditsChanged',
+                editSessionId: session_id,
+                edits: dirtyEdits,
+            });
+            expect(latest_snapshot(reopened).state.pendingEdits).toEqual(dirtyEdits);
+
+            // And it survives the next projection, whatever provokes one — here a
+            // second post, which is what any further typing does.
+            await reopened.__receive({
+                type: 'pendingEditsChanged',
+                editSessionId: session_id,
+                edits: { ...dirtyEdits, '0:0': EDITS['0:0'] },
+            });
+            expect(latest_snapshot(reopened).state.pendingEdits).toEqual({
+                ...dirtyEdits,
+                '0:0': EDITS['0:0'],
+            });
+            console_error.mockRestore();
+        });
+
+        it('shows no edits from a read that predates a clear this file already completed', async () => {
+            // The `clearedStateRevision` boundary. A read issued before a post-save
+            // clear committed still carries the entries the clear removed, and the
+            // revision is the only thing that can tell it apart from live work. Below
+            // the boundary the edits are gone for good, so withholding them is right —
+            // and must not trip the silent-loss assertion, which is about work nobody
+            // is holding rather than work already saved.
+            const file_path = '/tmp/reopen-matrix-cleared-revision.csv';
+            const versioned = state_store({
+                pendingEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+            });
+            let stale: FileStateSnapshot | undefined;
+            let serve_stale = false;
+            let bytes = enc.encode(SOURCE);
+            vscode_mock.__setStatImplementation(async () => ({
+                size: bytes.byteLength, mtime: 1,
+            }));
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            vscode_mock.__setWriteFileImplementation(async (_target, content) => {
+                bytes = new Uint8Array(content);
+            });
+            const store: FileStateStore = {
+                ...versioned.store,
+                async read(path) {
+                    const snapshot = await versioned.store.read(path);
+                    // Replay the pre-clear revision verbatim, which is what a read
+                    // that started before the clear committed would return.
+                    if (serve_stale && stale) return stale;
+                    if ((snapshot.state as PerFileState).pendingEdits) stale = snapshot;
+                    return snapshot;
+                },
+            };
+            const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const owner = open_csv_table(uri(file_path), store);
+            await owner.__receive({ type: 'ready' });
+            const session_id = latest_snapshot(owner).capabilities.csvEditSessionId!;
+            await owner.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: session_id,
+                    saveRequestId: 'save-then-clear',
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                },
+            });
+            await flush_promises();
+            // Preconditions: the clear committed, and a pre-clear revision is on hand
+            // to replay. The owner stays attached so the record — and with it the
+            // recorded boundary — survives into the reopen.
+            expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+            expect(stale).toBeDefined();
+
+            serve_stale = true;
+            const reopened = open_csv_table(uri(file_path), store);
+            await reopened.__receive({ type: 'ready' });
+
+            const snapshot = latest_snapshot(reopened);
+            expect(snapshot.state.pendingEdits).toBeUndefined();
+            expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+            expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
+            console_error.mockRestore();
+        });
+
+        it('gives the durable edits to the first panel to reopen and to the second only after', async () => {
+            // The order dimension. Rehydration is unconditional, so two panels opening
+            // over the same durable work must not both be told it is theirs: the dirty
+            // maps would diverge and whichever saved last would silently overwrite the
+            // other. Crossed with the baseline alone, because order decides only who
+            // holds the session.
+            const file_path = '/tmp/reopen-matrix-order.csv';
+            const shared = state_store({ pendingEdits: EDITS });
+            csv_fixture();
+            const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const first = open_csv_table(uri(file_path), shared.store);
+            await first.__receive({ type: 'ready' });
+            const second = open_csv_table(uri(file_path), shared.store);
+            await second.__receive({ type: 'ready' });
+
+            const first_snapshot = latest_snapshot(first);
+            expect(first_snapshot.state.pendingEdits).toEqual(EDITS);
+            const first_session = first_snapshot.capabilities.csvEditSessionId;
+            expect(first_session).toBeDefined();
+            const second_snapshot = latest_snapshot(second);
+            expect(second_snapshot.state.pendingEdits).toBeUndefined();
+            expect(second_snapshot.capabilities.csvEditSessionId).toBeUndefined();
+            expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
+
+            // The first panel closes, the way a reopen leaves one behind.
+            first.dispose();
+            await flush_promises();
+            await second.__receive({ type: 'requestEditSession', requestId: 'second-turn' });
+            const granted = latest_edit_session_message(second)!;
+            expect(granted.granted).toBe(true);
+            expect(granted.editSessionId).not.toBe(first_session);
+            expect(granted.pendingEdits).toEqual(EDITS);
+            console_error.mockRestore();
+        });
+    });
+
     it('withholds the edit capability from a panel opened while a transform computes', async () => {
         // The in-flight half of `may_retain_capability()` on its non-owner path, which
         // is a statement about the *affordance* rather than about the claim: a panel
@@ -5961,6 +6607,175 @@ describe('CSV edit sessions', () => {
             type: 'saveResult', success: true,
         }));
         expect(new TextDecoder().decode(bytes)).toBe('h\nedited-c\na\nb\n');
+    });
+
+    // `serialize_csv` walks the untransformed source and looks up edits by its own
+    // absolute row counter, so the bytes a save writes are a function of the source
+    // and the dirty map and of nothing else. The installed view is a display concern
+    // and must not reach the file — including the two ways it can *hide* an edited
+    // row, which is what the hidden-edited-cells banner exists to warn about, and
+    // which would be a lie if those edits then failed to save.
+    describe('saving under an installed view', () => {
+        const SOURCE = 'h\nc\na\nb\n';
+        const KEEP_A = {
+            sort: [],
+            filters: [{
+                id: 'keep-a',
+                colIndex: 0,
+                operator: 'equals' as const,
+                value: 'a',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const HIDE_C_AND_B = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 2],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        // Two edits on rows the views below drop, and one on the row they keep.
+        const EDITS = { '0:0': 'edited-c', '1:0': 'edited-a', '2:0': 'edited-b' };
+        const DIRTY = {
+            '0:0': { value: 'edited-c', base: 'c' },
+            '1:0': { value: 'edited-a', base: 'a' },
+            '2:0': { value: 'edited-b', base: 'b' },
+        };
+        const SAVED = 'h\nedited-c\nedited-a\nedited-b\n';
+
+        /**
+         * Save `dirty` from a fresh panel over an unmodified copy of the fixture,
+         * optionally installing `rules` first and asserting they really took effect.
+         * Returns the bytes on disk afterwards, so two runs are comparable.
+         */
+        async function save_under(
+            file_path: string,
+            rules: typeof KEEP_A | typeof HIDE_C_AND_B | undefined,
+            dirty: Record<string, { value: string; base: string }> = DIRTY,
+            expected_row_count?: number,
+        ) {
+            const shared = state_store();
+            let bytes = enc.encode(SOURCE);
+            vscode_mock.__setStatImplementation(async () => ({
+                size: bytes.byteLength, mtime: 1,
+            }));
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            vscode_mock.__setWriteFileImplementation(async (_target, content) => {
+                bytes = new Uint8Array(content);
+            });
+            const panel = open_csv_table(uri(file_path), shared.store);
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive({ type: 'requestEditSession' } as never);
+            const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+            if (rules) {
+                const snapshot = latest_snapshot(panel);
+                await panel.__receive({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId: 'view-before-save',
+                    generation: snapshot.generation,
+                    sourceGeneration: snapshot.sourceGeneration,
+                    intent: 'user',
+                    state: rules,
+                });
+                const installed = transform_installs(panel).at(-1)!;
+                // The precondition: without it a refused install would leave the
+                // natural view and make the save below prove nothing.
+                expect(installed.requestId).toBe('view-before-save');
+                if (expected_row_count !== undefined) {
+                    expect(installed.view.rowCount).toBe(expected_row_count);
+                }
+            }
+            await panel.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: edit_session_id,
+                    saveRequestId: 'save-under-view',
+                    edits: Object.fromEntries(
+                        Object.entries(dirty).map(([key, entry]) => [key, entry.value]),
+                    ),
+                    dirtyEdits: dirty,
+                },
+            });
+            await flush_promises();
+            return { panel, text: new TextDecoder().decode(bytes) };
+        }
+
+        it('writes the same bytes with a sort installed as with no sort at all', async () => {
+            const natural = await save_under('/tmp/save-bytes-natural.csv', undefined);
+            const sorted = await save_under('/tmp/save-bytes-sorted.csv', {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            } as never);
+
+            // Byte equality rather than "the right row changed": a display-keyed save
+            // under this sort would permute the three values among the three lines and
+            // still produce a plausible-looking file.
+            expect(natural.text).toBe(SAVED);
+            expect(sorted.text).toBe(natural.text);
+        });
+
+        it('saves an edit on a row an enabled filter hides', async () => {
+            // The case the banner promises: the user is told two edited cells are in
+            // rows the view doesn't show. They are still dirty, still durable, and
+            // still theirs — so Save has to write them.
+            const { panel, text } = await save_under(
+                '/tmp/save-under-filter.csv',
+                KEEP_A,
+                DIRTY,
+                1,
+            );
+
+            expect(text).toBe(SAVED);
+            expect(panel.__messages).toContainEqual(expect.objectContaining({
+                type: 'saveResult', success: true,
+            }));
+        });
+
+        it('saves an edit on an explicitly hidden row', async () => {
+            // Hidden rows funnel into the same permutation as filters, so they hide
+            // edits the same way and must save the same way.
+            const { panel, text } = await save_under(
+                '/tmp/save-under-hidden-rows.csv',
+                HIDE_C_AND_B,
+                DIRTY,
+                1,
+            );
+
+            expect(text).toBe(SAVED);
+            expect(panel.__messages).toContainEqual(expect.objectContaining({
+                type: 'saveResult', success: true,
+            }));
+        });
+
+        it('still rejects a hidden row whose base drifted, and writes nothing', async () => {
+            // The other half of "the view does not reach the save": validation walks
+            // the same untransformed source, so a filtered-away row is checked exactly
+            // like a visible one. This is the only place it can be checked at all —
+            // the webview's conflict detection is residency-gated, and a filtered row
+            // is never resident.
+            const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+            const { panel, text } = await save_under(
+                '/tmp/save-under-filter-drift.csv',
+                KEEP_A,
+                {
+                    // Source row 2 holds 'b'; the view drops it, and its base is wrong.
+                    '2:0': { value: 'edited-b', base: 'not-b' },
+                    '1:0': { value: 'edited-a', base: 'a' },
+                },
+                1,
+            );
+
+            expect(text).toBe(SOURCE);
+            expect(panel.__messages).toContainEqual(expect.objectContaining({
+                type: 'saveResult',
+                success: false,
+                rejection: { reason: 'baseMismatch', keys: ['2:0'] },
+            }));
+            expect(warning).toHaveBeenCalled();
+        });
     });
 
     it('refuses a transform while a save is in flight, then admits one after it lands', async () => {

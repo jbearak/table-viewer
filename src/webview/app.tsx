@@ -959,7 +959,28 @@ export function App(): React.JSX.Element {
                     // false and therefore nothing installs. Only on the applied
                     // branch — a duplicate or stale snapshot must not touch edit
                     // state at all.
-                    editing_ref.current?.commit_live_edit();
+                    //
+                    // And only when this snapshot actually remounts, which is the same
+                    // discriminator round 4 established for the transform ack: the
+                    // fold exists because the remount destroys the grid that owns the
+                    // overlay, so a snapshot that remounts nothing has nothing to
+                    // rescue and folding for it commits a value the user never
+                    // confirmed, past the point where Escape could take it back. The
+                    // predicate is GridShell's remount key: `generation` (still the
+                    // previous one here), `load_epoch` — which only an 'initial'
+                    // snapshot bumps — and the active sheet, which a refresh can move
+                    // only by clamping to a shrunken sheet list. A same-basis refresh
+                    // is the common case by far, since every edit commit during an
+                    // owned session and every sibling touch of durable state delivers
+                    // one.
+                    const remounts_the_grid =
+                        snapshot.presentation === 'initial'
+                        || snapshot.generation !== generation_ref.current
+                        || clamp_sheet_index(
+                            active_sheet_index,
+                            snapshot.meta.sheets.length,
+                        ) !== active_sheet_index;
+                    if (remounts_the_grid) editing_ref.current?.commit_live_edit();
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets = new Map(
                         (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
@@ -1542,8 +1563,28 @@ export function App(): React.JSX.Element {
                 // from its own state after the mutation, so there is nothing here to
                 // recombine and no way to store the rules without the row count and
                 // the basis they were computed with.
+                //
+                // Every *other* sheet's record is rebased onto the same generation,
+                // because the generation is the core's and the indices are per sheet:
+                // `handle_set_transform` writes `transform_indices` for its own sheet
+                // and bumps one shared counter, so an install on this sheet moved no
+                // row anywhere else. Left un-rebased, those records quote a generation
+                // the core has passed, and the next refresh — which any capability
+                // re-projection delivers — reads their basis as stale and replaces a
+                // live permutation with the natural view. That is the same failure the
+                // same-basis retention exists to prevent, one sheet over:
+                // `transform_active` false and a natural row count over rows the
+                // loader is still permuting. Only same-source records are rebased; a
+                // different `sourceGeneration` is genuinely other rows, and the
+                // snapshot handler's replacement is right for those.
                 set_sheet_views((prev) => {
-                    const next = [...prev];
+                    const next = prev.map((held, index) => (
+                        index !== msg.sheetIndex
+                        && held
+                        && held.basis.sourceGeneration === view.basis.sourceGeneration
+                            ? { ...held, basis: { ...held.basis, generation: view.basis.generation } }
+                            : held
+                    ));
                     next[msg.sheetIndex] = view;
                     return next;
                 });

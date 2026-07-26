@@ -5409,6 +5409,45 @@ describe('edit session store hydration', () => {
         expect(grid_stub().getAttribute('data-generation')).toBe(generation);
     });
 
+    it('does not fold the open editor for a refresh that remounts nothing', async () => {
+        // The same rule round 4 applied to the transform ack, on the path that
+        // delivers far more of these: the fold exists because a remount destroys the
+        // grid that owns the overlay, so the discriminator is whether this snapshot
+        // actually remounts. GridShell is keyed on the generation, and a same-basis
+        // refresh leaves it exactly where it was — every edit commit during an owned
+        // session provokes one, as does any sibling panel touching durable state. The
+        // user has a cell open and half-typed when it lands; folding would commit that
+        // value into the dirty store, where Escape can no longer take it back.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half-typed', base: 'base' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+
+        // Nothing remounted, so the overlay is still on screen and still the user's to
+        // confirm or abandon.
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        expect(store_edits()).toEqual({});
+    });
+
     it('keeps a committed edit across a refresh that bumps the generation', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -5798,6 +5837,57 @@ describe('snapshots arriving during an in-flight transform', () => {
         expect(grid_stub().getAttribute('data-generation')).toBe('7');
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+    });
+
+    it('loses no edit across commits interleaved with a compute that lands last', async () => {
+        // The whole sequence the feature makes reachable: type and commit, keep
+        // typing while the sort is still computing, then let it land. Each commit
+        // provokes a same-basis refresh, and the landing bumps the generation and
+        // remounts the grid that owns the open overlay — three separate ways an edit
+        // could be dropped, exercised in one order.
+        const { request } = await sorting_while_editing();
+        const store = () => grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        const store_edits = () => JSON.parse(grid_stub().getAttribute('data-store-edits')!);
+
+        await act(async () => {
+            store().commit('test-edit-session', '0:0', { value: 'first', base: 'a' });
+        });
+        // The refresh that commit provokes: same rows, same generation, and the
+        // host's authoritative projection of what it has just written.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV_CAPABILITIES,
+                state: { pendingEdits: { '0:0': { value: 'first', base: 'a' } } },
+            },
+        ));
+        // A second confirmed edit, typed while the compute is still outstanding.
+        await act(async () => {
+            store().commit('test-edit-session', '2:0', { value: 'second', base: 'c' });
+        });
+        // And a third cell still open in the editor when the ack arrives, which only
+        // the fold can carry across the remount.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await acknowledge_transform(request, 7);
+
+        // The remount really happened, so the survival below is not vacuous.
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        // All three, under the source-row keys they were typed against. Display row 0
+        // under this sort is not source row 0, so a display-keyed map would name
+        // different cells here.
+        expect(store_edits()).toEqual({
+            '0:0': { value: 'first', base: 'a' },
+            '1:0': { value: 'live', base: 'b' },
+            '2:0': { value: 'second', base: 'c' },
+        });
     });
 
     it('discards the in-flight transform when the source moves', async () => {
@@ -7456,5 +7546,141 @@ describe('stale-view banner', () => {
         // the cells happen to coincide.
         expect(banner()?.textContent).toContain(BANNER_TEXT);
         expect_no_call_to_action();
+    });
+});
+
+// One `SheetViewRecord` per sheet, one generation for the whole core: an install
+// bumps the core's counter, so every *other* sheet's record is left quoting a
+// generation the core has moved past even though its own rows never moved. What a
+// long compute plus a sheet switch reaches, and what the next refresh then decides.
+describe('per-sheet view records', () => {
+    function two_sheet_meta(row_count = 5): WorkbookMeta {
+        const meta = make_meta(['First', 'Second'], false);
+        return {
+            ...meta,
+            sheets: meta.sheets.map((sheet) => ({
+                ...sheet,
+                rowCount: row_count,
+                sourceRowCount: row_count,
+            })),
+        };
+    }
+
+    const FIRST_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+        schema: '["First",1,null]',
+    };
+    const SECOND_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Second",1,null]',
+    };
+    const DURABLE = { transforms: [FIRST_SORT, SECOND_SORT] };
+
+    function view(): { sheet: string | null; transformed: string | null; rows: string | null } {
+        return {
+            sheet: grid_stub().getAttribute('data-sheet-index'),
+            transformed: grid_stub().getAttribute('data-transformed'),
+            rows: grid_stub().getAttribute('data-row-count'),
+        };
+    }
+
+    /**
+     * Both sheets permuted, each by its own install, so the two records carry
+     * different generations — 2 for First, 3 for Second — while the core's counter
+     * ends at 3. Row counts differ from each other and from the natural 5, so a
+     * record swapped for another sheet's or for the natural view is distinguishable
+     * from a record that stood.
+     */
+    async function both_sheets_installed() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(two_sheet_meta(), {
+            state: DURABLE,
+        }));
+        const first = latest_transform_request(post_message);
+        expect(first.sheetIndex).toBe(0);
+        await dispatch_host_message(transform_installed_message(
+            first,
+            { generation: 2, rowCount: 3 },
+        ));
+        await click_button('Second');
+        const second = latest_transform_request(post_message);
+        expect(second.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            second,
+            { generation: 3, rowCount: 4 },
+        ));
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        return { post_message };
+    }
+
+    it('does not disturb another sheet\'s record when an install lands', async () => {
+        await both_sheets_installed();
+
+        await click_button('First');
+
+        // Each record is the one its own install wrote: the second install bumped
+        // the shared generation but moved no row on this sheet.
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+    });
+
+    it('keeps a record whose rows an install on another sheet never moved', async () => {
+        const { post_message } = await both_sheets_installed();
+        post_message.mockClear();
+
+        // The refresh every capability re-projection delivers, on the core's current
+        // generation. First's record was written at generation 2 and Second's install
+        // moved the counter to 3 without touching First's rows, so a basis comparison
+        // that reads the generation alone calls First's record stale and replaces it
+        // with the natural view — while the host's loader is still permuting those
+        // rows and still reporting three of them.
+        await dispatch_host_message(refresh_snapshot_message(two_sheet_meta(), {
+            generation: 3,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: DURABLE,
+        }));
+
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        await click_button('First');
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        // And nothing had to be re-asked to get back there: a dropped record shows up
+        // as a restore request for rules the host already holds.
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform')).toEqual([]);
+    });
+
+    it('lands a compute for the sheet the user has since left without corrupting either record', async () => {
+        // The sequence: a slow install is in flight on First, the user switches to
+        // Second, and the ack then arrives for a sheet that is no longer active.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(two_sheet_meta(), {
+            state: DURABLE,
+        }));
+        const first = latest_transform_request(post_message);
+        expect(first.sheetIndex).toBe(0);
+
+        await click_button('Second');
+        const second = latest_transform_request(post_message);
+        expect(second.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            second,
+            { generation: 2, rowCount: 4 },
+        ));
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+
+        // First's compute lands last, on the generation the core reached after both.
+        await dispatch_host_message(transform_installed_message(
+            first,
+            { generation: 3, rowCount: 3 },
+        ));
+
+        // The active sheet is Second, and its record must be untouched by an ack
+        // addressed to another sheet.
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        await click_button('First');
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
     });
 });

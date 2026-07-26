@@ -1287,6 +1287,16 @@ export function attach_viewer(
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
         }
+        // `edit_cleanup_blocked()` below is defence in depth and honestly cannot be
+        // observed on its own: `begin_edit_cleanup` clears `active_edit_session_id`,
+        // so `owns_edit_session()` is already false under both cleanup phases, and
+        // `try_claim_edit_session` already refuses any phase that is not `free`.
+        // Probing for a mutation that isolates it found none — every way of letting
+        // the claim through those phases breaks the cleanup-recovery machinery
+        // wholesale. Kept on the precedent `may_reserve_claim` sets rather than
+        // removed, because the term states the projection's own reason for
+        // withholding instead of borrowing the claim's.
+        //
         // Not live work: a read older than a clear this panel already completed
         // still carries edits the clear removed.
         const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
@@ -4149,8 +4159,30 @@ export function attach_viewer(
                         if (
                             file_edit_state
                             && tombstone
-                            && tombstone.editSessionId === edit_session_id
-                            && supersedes(tombstone)
+                            && (
+                                // The echo hazard is same-session only, and asking
+                                // `supersedes` outside that session was silent loss of
+                                // unsaved work. A later session starts from a
+                                // projection with the tombstoned entries already
+                                // stripped, and neither `resolve_csv_save_hydration`
+                                // nor the grant path will hand it a failed operation it
+                                // does not own — so it has nothing to echo, and a post
+                                // that happens to carry the failed operation's exact
+                                // values was typed. Left asking `supersedes`, retyping
+                                // the value the failed save had — "Save failed, close
+                                // the tab, reopen, type it again" — put the user's own
+                                // work back inside a strip that then took it out of the
+                                // grid on the next projection.
+                                //
+                                // Dropping the tombstone here also discharges the
+                                // cleanup obligation honestly rather than abandoning
+                                // it: a post *replaces* the durable map, so nothing the
+                                // failed save persisted and the user did not post is
+                                // still there for `ensure_failed_save_cleanup` to
+                                // remove.
+                                tombstone.editSessionId !== edit_session_id
+                                || supersedes(tombstone)
+                            )
                         ) {
                             file_edit_state.failedSaveTombstone = undefined;
                         }
