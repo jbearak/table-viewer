@@ -572,12 +572,28 @@ export function attach_viewer(
             || save_lifecycle.state === 'active';
     }
 
-    function transform_blocks_editing(): boolean {
-        return !!file_edit_state && (
-            file_edit_state.transformOperations.size > 0
-            || file_edit_state.activeTransformPanels.size > 0
-            || file_edit_state.durableTransform.active
-        );
+    /**
+     * Transform work is mid-flight across state I/O somewhere on this file. This
+     * is genuine file-level concurrency, and it is the *only* transform-shaped
+     * reason editing is refused: `compute_transform` yields at cancellation
+     * checkpoints and publishes the resulting rules through the shared state
+     * store, so granting an edit claim — or beginning a save — concurrently
+     * races the operation that is about to replace the row basis.
+     *
+     * Deliberately *not* included: `activeTransformPanels` and
+     * `durableTransform.active`, i.e. a transform that is merely **installed**.
+     * That used to block editing because the dirty map was keyed by display row,
+     * so typing under a permutation wrote the wrong source row. #110 made edits
+     * source-keyed and retired that hazard: an installed sort or filter is now
+     * just a view, and editing under one is safe precisely because the
+     * permutation never recomputes during a live session — rows stay put.
+     *
+     * The mirror of this predicate is `save_blocks_transform()`: transforms
+     * refuse during a save, saves and edit claims refuse during transform work.
+     * Both directions read the same in-flight set, `transformOperations`.
+     */
+    function transform_work_in_flight(): boolean {
+        return !!file_edit_state && file_edit_state.transformOperations.size > 0;
     }
 
     function editing_available_for_panel(): boolean {
@@ -585,14 +601,19 @@ export function attach_viewer(
         // An owned session survives transforms installed from the owning panel.
         // Rows deliberately stay put mid-edit, so a sort the user just installed
         // in the panel they are editing must not revoke `csvEditable` and eject
-        // them from edit mode. Entering edit mode is still refused while a
-        // transform is installed — that direction lives in `reserve_edit_claim`
-        // and `try_claim_edit_session`, both of which still consult
-        // `transform_blocks_editing()`.
+        // them from edit mode.
         if (phase.type === 'owned' && phase.token === edit_session_token) return true;
-        return !transform_blocks_editing() && phase.type === 'free';
+        // A sibling's availability turns only on in-flight work and a free
+        // phase. An installed transform must not appear here: `csvEditable` is
+        // what the webview watches to retry a refused restore, so holding it
+        // false for the lifetime of an installed sort would strand a sibling
+        // whose own restore was refused while the owner held the session.
+        return !transform_work_in_flight() && phase.type === 'free';
     }
 
+    // Teardown safety, not editing availability: `activeTransformPanels` is a
+    // live registration on this shared record, so deleting the record while one
+    // is present would drop it. Editing no longer consults it.
     function shared_edit_state_is_unused(): boolean {
         return !!file_edit_state
             && file_edit_state.attachments === 0
@@ -795,7 +816,10 @@ export function attach_viewer(
     }
 
     function reserve_edit_claim(): symbol | undefined {
-        if (!file_edit_state || transform_blocks_editing()) return undefined;
+        // In-flight transform work only; an installed permutation is not a
+        // reason to refuse a reservation (see `transform_work_in_flight`). Every
+        // phase check below is unchanged — those are the claim serialization.
+        if (!file_edit_state || transform_work_in_flight()) return undefined;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned' && phase.token === edit_session_token) {
             return undefined;
@@ -826,7 +850,12 @@ export function attach_viewer(
         notify = true,
         claim?: symbol,
     ): boolean {
-        if (!file_edit_state || transform_blocks_editing()) return false;
+        // In-flight transform work only, matching `reserve_edit_claim`. This is
+        // also what lets a reopened panel reclaim a session whose durable state
+        // holds both pending edits and an active transform — a combination that
+        // is legitimate now that transforms are admitted during an owned session,
+        // and whose edits `project_state_for_panel` would otherwise strip.
+        if (!file_edit_state || transform_work_in_flight()) return false;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned') {
             if (phase.token !== edit_session_token) return false;
@@ -2610,8 +2639,20 @@ export function attach_viewer(
         const expected_digest = session.acknowledged_physical_digest();
         const src = source;
         const expected_authority = source_authority.authorityRevision;
+        // `transform_work_in_flight()` is the other half of the exclusion
+        // `save_blocks_transform()` states: transforms refuse during a save, and
+        // saves refuse during transform work. Same in-flight set on both sides.
+        // Without it the owner could start a slow sort and save immediately;
+        // `compute_transform` yields at its cancellation checkpoints, so the save
+        // would refresh and replace the source first, cancelling the transform,
+        // and the webview would clear its request on the row-basis change with no
+        // ack — the requested sort silently lost. Refusing rather than waiting
+        // matches this gate's existing shape: the save reports a failed lifecycle
+        // the webview already knows how to restore from, and transform work is
+        // short, so a retry costs the user one keystroke.
         if (
             edit_cleanup_blocked()
+            || transform_work_in_flight()
             || !profile.editing
             || !src
             || !!src.truncationMessage
@@ -2624,7 +2665,9 @@ export function attach_viewer(
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
             show_owner_warning(
-                'The table view is still refreshing. Please try saving again.',
+                transform_work_in_flight()
+                    ? 'Wait for sorting and filtering to finish, then save again.'
+                    : 'The table view is still refreshing. Please try saving again.',
             );
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
             return;
@@ -3645,7 +3688,7 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_blocks_editing();
+                    && !transform_work_in_flight();
                 const denied_by_owner = can_edit
                     && ((phase.type === 'owned' && phase.token !== edit_session_token)
                         || phase.type === 'claiming');
@@ -3686,7 +3729,7 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_blocks_editing();
+                    && !transform_work_in_flight();
                 const owner_still_available = already_owned
                     ? phase.type === 'owned' && phase.token === edit_session_token
                     : phase.type === 'claiming' && phase.claim === claim;
@@ -3695,10 +3738,13 @@ export function attach_viewer(
                     && try_claim_edit_session(true, claim);
                 if (!granted) cancel_edit_claim(claim);
                 if (edit_state) update_session_state_material(edit_state);
+                // An installed sort or filter is not a denial: editing under one
+                // is supported, and the rows stay exactly where they are. Only
+                // work in flight refuses, and it refuses transiently.
                 const denied_by_transform = profile.editing
                     && !!source
                     && !source.truncationMessage
-                    && transform_blocks_editing();
+                    && transform_work_in_flight();
                 const pendingEdits = granted
                     ? pending_edits_for_current_session(
                         (edit_state?.state as PerFileState | undefined)?.pendingEdits,
@@ -3723,7 +3769,7 @@ export function attach_viewer(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
                     show_owner_warning(
-                        'Clear sorting, filters, and hidden rows before entering edit mode.');
+                        'Wait for sorting and filtering to finish before entering edit mode.');
                 }
                 return;
             }

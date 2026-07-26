@@ -1859,13 +1859,14 @@ export function App(): React.JSX.Element {
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
             if (edit_session_pending) return;
-            if (
-                transform_is_active(transforms[active_sheet_index])
-                || pending_transforms[active_sheet_index]
-            ) {
+            // Only work in flight, and only because the host refuses it: warning
+            // locally saves a round-trip whose answer is already known. An
+            // *installed* sort, filter, or hidden-row rule is no longer a reason
+            // to warn — editing under one is supported and moves no rows.
+            if (pending_transforms[active_sheet_index]) {
                 host_bridge.postMessage({
                     type: 'showWarning',
-                    message: 'Clear sorting, filters, and hidden rows before entering edit mode.',
+                    message: 'Wait for sorting and filtering to finish before entering edit mode.',
                 });
                 return;
             }
@@ -1902,7 +1903,6 @@ export function App(): React.JSX.Element {
     }, [
         edit_mode,
         leave_edit_mode,
-        transforms,
         pending_transforms,
         edit_session_pending,
         active_sheet_index,
@@ -3002,11 +3002,16 @@ export function App(): React.JSX.Element {
                 is_dirty={editing_status?.is_dirty ?? false}
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
+                // `transform_active` is deliberately absent: an *installed* sort,
+                // filter, or row-hiding rule no longer disables Edit. Edits are
+                // source-keyed (#110) and an installed permutation never
+                // recomputes during a session, so entering edit mode under one
+                // moves no rows. `transform_pending` — work in flight — still
+                // disables, matching the host's own transient refusal.
                 edit_disabled={
                     editing_status?.save_in_flight === true
                     || (!edit_mode && (
                         edit_session_pending
-                        || transform_active
                         || transform_pending
                     ))
                 }
@@ -3015,9 +3020,8 @@ export function App(): React.JSX.Element {
                         ? 'Saving changes.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'
-                        : transform_pending
-                        ? 'Wait for sorting and filtering to finish.'
-                        : 'Clear sorting, filters, and hidden rows before editing.'
+                        // Transform work in flight is the only disabler left.
+                        : 'Wait for sorting and filtering to finish.'
                 }
             />
             {filter_editor && (

@@ -6660,6 +6660,71 @@ describe('a refused restore in a sibling panel', () => {
     });
 });
 
+describe('the Edit button and an installed transform', () => {
+    const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+    // Descending, so the grid stub's ascending shortcut is a real change and
+    // actually leaves a request in flight.
+    const SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+
+    function warnings(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning');
+    }
+
+    async function sorted_sheet_not_yet_editing() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: EDITABLE, state: { transforms: [SORT] } },
+        ));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        post_message.mockClear();
+        return post_message;
+    }
+
+    it('leaves Edit enabled while a sort is installed', async () => {
+        // An *installed* transform is just a view. Edits are source-keyed and the
+        // permutation never recomputes mid-session, so there is nothing to clear.
+        const post_message = await sorted_sheet_not_yet_editing();
+        expect(get_button('Edit').disabled).toBe(false);
+        expect(warnings(post_message)).toEqual([]);
+    });
+
+    it('requests a session from a sorted sheet instead of warning', async () => {
+        const post_message = await sorted_sheet_not_yet_editing();
+
+        await click_button('Edit');
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+            requestId: expect.any(String),
+        }));
+        expect(warnings(post_message)).toEqual([]);
+    });
+
+    it('disables Edit while transform work is in flight', async () => {
+        // The half that still blocks: work in flight is file-level concurrency and
+        // the host refuses an edit claim during it, so the button must agree.
+        const post_message = await sorted_sheet_not_yet_editing();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        // Deliberately unacknowledged: the request is in flight.
+        expect(latest_transform_request(post_message)).toBeDefined();
+
+        expect(get_button('Edit').disabled).toBe(true);
+        // The retired copy: nothing in this build tells the user to clear sorting
+        // before editing, in a tooltip or anywhere else.
+        expect(document.body.textContent ?? '').not.toContain('Clear sorting');
+    });
+});
+
 describe('stale-view banner', () => {
     const BANNER_TEXT = 'Sorting and filters don\'t update while you\'re editing.';
     // A future contributor must not be able to reintroduce a "Resort"/"Refresh"
