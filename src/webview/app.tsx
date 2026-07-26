@@ -165,6 +165,31 @@ function view_bases_equal(
         && left.schema === right.schema;
 }
 
+/**
+ * A held record carrying the delivery's fresh hidden edited cells.
+ *
+ * Exactly one field of `SheetViewRecord` is edit-derived; `rules`, `rowCount`,
+ * `permuted` and `basis` are all row-derived, and a same-basis refresh is by
+ * definition news about neither the rows nor the rules. Taking only this one field is
+ * therefore not partial invalidation of the record — it is the only field a delivery
+ * that moved no row can have a newer answer for. What licenses taking it is the same
+ * basis equality that licenses keeping the rest: the host samples these keys and the
+ * generation together, so a generation still equal to the record's is proof these keys
+ * were computed against the very permutation that record describes.
+ *
+ * Deliberately unconditional rather than returning `held` unchanged when the keys
+ * match. Probed rather than assumed: preserving the object's identity fails no test,
+ * and it cannot — `set_sheet_views` rebuilds the array on every applied snapshot
+ * regardless, and every consumer reads the record by value, the restore effect
+ * included. A guard nothing can hold to account is worse than the allocation it saves.
+ */
+function view_record_with_hidden_keys(
+    held: SheetViewRecord,
+    fresh: readonly string[],
+): SheetViewRecord {
+    return { ...held, hiddenEditedCellKeys: fresh };
+}
+
 export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
@@ -1331,6 +1356,12 @@ export function App(): React.JSX.Element {
                     // movement at all, and a same-basis refresh is exactly how that
                     // arrives. The record saying what *we* still hold is what lets the
                     // restore effect see the difference and reconcile it.
+                    //
+                    // Its hidden edited cells are the one exception, and the exception
+                    // is not about durable *rules* at all — it is the host's live
+                    // answer about the permutation this record already describes, and
+                    // the only field of the record a delivery that moved no row can
+                    // have news about. See `view_record_with_hidden_keys`.
                     set_sheet_views((previous) => snapshot.meta.sheets.map(
                         (sheet, index) => {
                             const basis = {
@@ -1347,7 +1378,10 @@ export function App(): React.JSX.Element {
                                 && held
                                 && view_bases_equal(held.basis, basis)
                             ) {
-                                return held;
+                                return view_record_with_hidden_keys(
+                                    held,
+                                    snapshot.hiddenEditedCellKeys[index] ?? [],
+                                );
                             }
                             // The natural view: the host installs no permutation for a
                             // basis it has just read (matching schema does not imply
@@ -1371,6 +1405,14 @@ export function App(): React.JSX.Element {
                                 // reason `permuted: false` is: this snapshot's rows
                                 // are the metadata's own until an install lands, and
                                 // that install carries the host's real set.
+                                //
+                                // Deliberately not `snapshot.hiddenEditedCellKeys`,
+                                // even though the delivery has one: this branch is
+                                // building a record that says no permutation is in
+                                // place, and the host's answer is about whatever
+                                // permutation it does hold. Adopting it here would
+                                // make the record self-contradictory — cells named as
+                                // out of sight of a view claiming to show every row.
                                 hiddenEditedCellKeys: [],
                             };
                         },
@@ -2949,15 +2991,19 @@ export function App(): React.JSX.Element {
     // could hold to account. The one below is now pinned: see "goes silent when edit
     // mode ends with the dirty map still reported", which deleting it fails.
     //
-    // Narrowed to keys the dirty map still holds, and that intersection is the whole
-    // of the refresh this needs. The host answers *membership*, which only an install
-    // can change; the number of hidden cells depends on the edit set too, and that
-    // moves with every `pendingEditsChanged`, discard and save — none of which install
+    // Narrowed to keys the dirty map still holds, which is the *subtracting* half of
+    // keeping this current. The host answers membership, which only an install can
+    // change; the number of hidden cells depends on the edit set too, and that moves
+    // with every `pendingEditsChanged`, discard and save — none of which install
     // anything, so a count from the host would go on claiming a discarded edit is out
-    // of sight forever. Between installs the set can only shrink, and only by entries
-    // leaving the dirty map: a new edit can only be typed into a row the view is
-    // showing, so nothing can join. Subtracting what left is therefore exact, and
-    // needs no message from the host at all.
+    // of sight forever. An entry that left the dirty map is not out of sight, it is
+    // gone, so subtracting it here is exact and needs no message from the host.
+    //
+    // The adding half is not here and cannot be: it needs view membership, which never
+    // reaches the webview. An edit typed while a hiding transform computed is missing
+    // from the install's own answer for good, so the host re-answers on every delivery
+    // and the snapshot handler takes the fresh keys onto the record it keeps — see
+    // `view_record_with_hidden_keys`. This intersection then subtracts from *that*.
     //
     // Membership in the map, not identity of the entry — deliberately unlike
     // `live_rejected_keys` above, which compares value and base because a re-typed

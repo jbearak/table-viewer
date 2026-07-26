@@ -189,6 +189,10 @@ describe('ViewerPanelCore', () => {
                     hasFormatting: false,
                     sheets: [expect.objectContaining({ rowCount: 4 })],
                 },
+                // Per sheet, and empty with no permutation installed and no dirty-map
+                // provider wired — but present, because every delivery is built from
+                // this and the webview reads it positionally.
+                hiddenEditedCellKeys: [[]],
             },
             diagnostics: { truncationMessage: 'Showing 4 rows' },
         });
@@ -647,41 +651,68 @@ describe('ViewerPanelCore', () => {
                 .toEqual(['1:0', '3:0', '3:1']);
         });
 
-        it('reports none for a sort, without consulting the dirty map at all', async () => {
-            // A sort permutes without dropping, so there is nothing to scan — and the
-            // untouched provider is the observable proving the scan was skipped
-            // rather than merely returning 0.
-            const { install, durablePendingEditKeys } = counting_core(['0:0', '4:0']);
+        const sort_only = (): SheetTransformState => ({
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        });
 
-            const view = await install('sort', {
-                sort: [{ colIndex: 0, direction: 'desc' }],
-                filters: [],
-                schema: '["Sheet1",2,null]',
-            });
+        const matches_every_row = (): SheetTransformState => ({
+            sort: [],
+            filters: [{
+                id: 'filter-wide',
+                colIndex: 0,
+                operator: 'isNotEmpty',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+
+        it('reports none for a sort, whose rows are all still there', async () => {
+            // A sort permutes without dropping, so every row it was given is somewhere
+            // in the view.
+            const { install } = counting_core(['0:0', '4:0']);
+
+            const view = await install('sort', sort_only());
 
             expect(view.permuted).toBe(true);
             expect(view.hiddenEditedCellKeys).toEqual([]);
-            expect(durablePendingEditKeys).not.toHaveBeenCalled();
         });
 
         it('reports none for a filter that excluded nothing', async () => {
-            const { install, durablePendingEditKeys } = counting_core(['0:0']);
+            const { install } = counting_core(['0:0']);
 
-            const view = await install('wide', {
-                sort: [],
-                filters: [{
-                    id: 'filter-wide',
-                    colIndex: 0,
-                    operator: 'isNotEmpty',
-                    caseSensitive: false,
-                    enabled: true,
-                }],
-                schema: '["Sheet1",2,null]',
-            });
+            const view = await install('wide', matches_every_row());
 
             expect(view.rowCount).toBe(5);
             expect(view.hiddenEditedCellKeys).toEqual([]);
-            expect(durablePendingEditKeys).not.toHaveBeenCalled();
+        });
+
+        it('names a vanished row under a filter that excluded nothing', async () => {
+            // The all-rows-match case, which used to return before inspecting a single
+            // key. An enabled filter can match every row the file still has while an
+            // edited row an external shrink removed is genuinely absent from the view —
+            // and if that edit is in a column no rule reads, nothing else raises the
+            // notice, so the user is never told the work is out of sight. StubSource(5)
+            // has no row 9, which is what the shrink leaves behind.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            const view = await install('wide', matches_every_row());
+
+            expect(view.rowCount).toBe(5);
+            expect(view.hiddenEditedCellKeys).toEqual(['9:0']);
+        });
+
+        it('names a vanished row under a bare sort', async () => {
+            // Same defect behind the other short-circuit: "no rule excludes rows" was
+            // read as "no row can be missing", and a sort is exactly the view where the
+            // permutation drops nothing and the *source* has still lost the row.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            const view = await install('sort', sort_only());
+
+            expect(view.hiddenEditedCellKeys).toEqual(['9:0']);
         });
 
         it('reports none when the session holds no pending edits', async () => {

@@ -98,6 +98,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
                 columnNames: ['Value'],
             }],
         },
+        hiddenEditedCellKeys: [[]],
     };
     const diagnostics = overrides.diagnostics ?? { truncationMessage: null };
     const live_material = structuredClone({ core, diagnostics });
@@ -344,6 +345,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         await settle();
         const initial = snapshot(posted);
         expect(initial.generation).toBe(5);
+        expect(initial.hiddenEditedCellKeys).toEqual([[]]);
         expect(sample).toHaveBeenCalledOnce();
         expect(project).toHaveBeenCalledOnce();
 
@@ -363,6 +365,13 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                         columnNames: ['Value'],
                     }],
                 },
+                // Re-sampled with the generation beside it, which is the property the
+                // hidden-edited-cells notice depends on: the webview keeps its held
+                // record when the generation matches and takes these keys onto it, so
+                // a delivery must never pair one adoption's keys with another's
+                // generation. Carried on the projection instead — sampled once, at
+                // replacement — it would do exactly that.
+                hiddenEditedCellKeys: [['4:0']],
             },
             diagnostics: { truncationMessage: 'current diagnostics' },
         });
@@ -377,6 +386,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(superseding.generation).toBe(6);
         expect(superseding.sourceGeneration).toBe(4);
         expect(superseding.meta.sheets[0].name).toBe('Locally transformed');
+        expect(superseding.hiddenEditedCellKeys).toEqual([['4:0']]);
         expect(superseding.truncationMessage).toBe('current diagnostics');
         expect(sample).toHaveBeenCalledTimes(2);
         expect(project).toHaveBeenCalledOnce();

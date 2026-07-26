@@ -5121,6 +5121,174 @@ describe('CSV edit sessions', () => {
         expect(installed.view.hiddenEditedCellKeys).toEqual(['2:0']);
     });
 
+    it('names an edit typed while the hiding filter was still computing', async () => {
+        // The install's own answer cannot include this edit, and no later install will
+        // ever be asked. The user types into a row the view is still showing; the
+        // keystroke lives in the webview's map behind the persistence debounce; the
+        // filter lands and excludes that row, reading a durable map the edit has not
+        // reached. `installed_view` is then never rebuilt for this permutation again, so
+        // the record the webview keeps understates the unsaved work permanently — and
+        // understating is the direction that matters, since the user is left unaware
+        // that work is off screen.
+        //
+        // The gate parks the transform one CAS short of durable, which is where the
+        // keystroke belongs: admitted, computed, nothing installed, every row still on
+        // screen to be typed into.
+        const file_path = '/tmp/hidden-edited-cells-typed-mid-compute.csv';
+        const versioned = state_store();
+        const commit_read_started = deferred();
+        const commit_read_gate = deferred();
+        let gate_commit_read = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                if (gate_commit_read) {
+                    gate_commit_read = false;
+                    commit_read_started.resolve();
+                    await commit_read_gate.promise;
+                }
+                return versioned.store.read(path);
+            },
+        };
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        const snapshot = latest_snapshot(panel);
+        gate_commit_read = true;
+        const transform = panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'filter-computing-while-typing',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [{
+                    id: 'keep-a',
+                    colIndex: 0,
+                    operator: 'equals',
+                    value: 'a',
+                    caseSensitive: false,
+                    enabled: true,
+                }],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await commit_read_started.promise;
+        // Parked, and asserted rather than assumed: nothing is installed, so the view
+        // the user is looking at still contains source row 0 and typing into it is a
+        // thing they can actually do. Without this the test would silently become the
+        // already-covered "filter installed over a durable edit" case.
+        expect(transform_answers(panel)).toEqual([]);
+        // The keystroke. Deliberately *not* posted here — the whole point is that the
+        // durable map the install is about to read does not have it. The host has no way
+        // to observe a live-only edit, so there is nothing to deliver at this moment.
+
+        commit_read_gate.resolve();
+        await transform;
+        const installed = transform_installs(panel).at(-1)!;
+        expect(installed.requestId).toBe('filter-computing-while-typing');
+        expect(installed.view.rowCount).toBe(1);
+        // The omission itself, pinned: the install answers honestly for what it could
+        // see, and this is why the fix cannot live in the install.
+        expect(installed.view.hiddenEditedCellKeys).toEqual([]);
+
+        // The debounce fires. The ordinary post, no different from any other.
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { '0:0': { value: 'edited-c', base: 'c' } },
+        });
+
+        const refreshed = latest_snapshot(panel);
+        expect(refreshed.hiddenEditedCellKeys).toEqual([['0:0']]);
+        // On the generation the install published, which is what lets the webview take
+        // these keys onto the record it is keeping rather than replacing it: an equal
+        // generation is proof the permutation these were computed against is that
+        // record's own.
+        expect(refreshed.generation).toBe(installed.view.basis.generation);
+
+        // The other direction, so the fresh answer cannot be a blanket "everything the
+        // user is holding": the same post shape naming only the row the filter kept
+        // says nothing is out of sight.
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { '1:0': { value: 'edited-a', base: 'a' } },
+        });
+        expect(latest_snapshot(panel).hiddenEditedCellKeys).toEqual([[]]);
+    });
+
+    it('names a vanished row under a filter that keeps every row the file still has', async () => {
+        // The all-rows-match short-circuit, reached the way a user reaches it: the tab
+        // was closed holding unsaved edits and a durable filter, the file shrank on disk
+        // meanwhile, and the reopen recomputes the filter over what is left. The filter
+        // matches every surviving row, so the permutation drops nothing and the row
+        // count equals the sheet's — which used to return before a single key was
+        // inspected — while the edited row the shrink took is as absent from the view as
+        // any filtered-out row would be.
+        //
+        // The edit is in column 1, which no rule reads, so nothing else in the notice
+        // can speak for it: without this the user is told nothing at all about unsaved
+        // work they cannot see until they press Save.
+        const file_path = '/tmp/hidden-edited-cells-after-shrink.csv';
+        const filter = {
+            sort: [],
+            filters: [{
+                id: 'keeps-everything',
+                colIndex: 0,
+                operator: 'isNotEmpty' as const,
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",2,["h","g"]]',
+        };
+        const shared = state_store({
+            pendingEdits: {
+                '0:1': { value: 'edited-visible', base: 'x' },
+                '2:1': { value: 'edited-gone', base: 'z' },
+            },
+            transforms: [filter],
+        });
+        // One row left where there were three: source row 2 no longer exists.
+        const bytes = enc.encode('h,g\na,x\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const reopened = open_csv_table(uri(file_path), shared.store);
+        await reopened.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(reopened);
+        expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
+        expect(snapshot.meta.sheets[0].rowCount).toBe(1);
+
+        await reopened.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore-filter-after-shrink',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore',
+            state: filter,
+        });
+
+        const installed = transform_installs(reopened).at(-1)!;
+        expect(installed.requestId).toBe('restore-filter-after-shrink');
+        // The precondition that used to end the scan: the filter excluded nothing.
+        expect(installed.view.rowCount).toBe(snapshot.meta.sheets[0].rowCount);
+        expect(installed.view.hiddenEditedCellKeys).toEqual(['2:1']);
+        // And not the surviving row's edit, so this is not simply naming everything.
+        expect(installed.view.hiddenEditedCellKeys).not.toContain('0:1');
+    });
+
     it('does not count another session\'s tombstoned edits as hidden work', async () => {
         // The count reports what *this* session is holding, which is why it reads
         // through pending_edits_for_current_session rather than the durable map.

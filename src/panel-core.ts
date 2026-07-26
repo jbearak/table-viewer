@@ -353,6 +353,16 @@ export class ViewerPanelCore {
                 generation: this._generation,
                 sourceGeneration: this._source_generation,
                 meta: this.source.meta(),
+                // Sampled here, beside the generation, and that adjacency is the
+                // whole point: PanelSession builds every delivery from one
+                // `snapshot_material()` call, so the keys and the generation the
+                // webview tests its held record against were read at the same
+                // instant. A generation still equal to the record's is proof the
+                // permutation has not moved, so it is proof these keys were computed
+                // against the very view that record describes. Carried on the
+                // projected capabilities instead they would be sampled at a
+                // different moment and could name another permutation's rows.
+                hiddenEditedCellKeys: this.hidden_edited_cell_keys_by_sheet(),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,
@@ -590,39 +600,54 @@ export class ViewerPanelCore {
      * only place membership is answerable, and why the answer is keys rather than a
      * count the webview would have no way to correct.
      *
-     * Nothing is scanned unless rows can actually be missing. A sort permutes
-     * without dropping, so only an enabled filter or an explicit `hiddenRows` can
-     * hide anything, and a filter that matched every row has dropped nothing either
-     * — which the index length answers for free.
+     * Two independent ways a key's row can be absent, and only one of them is about
+     * the rules. An enabled filter or an explicit `hiddenRows` drops rows from the
+     * permutation, which `indices.length < sheet.rowCount` detects for free. But a
+     * key can also name a row the *source* no longer has — an external shrink, the
+     * `rowsRemoved` case — and that is true of a permutation that dropped nothing at
+     * all, a bare sort included. There used to be a short-circuit here for "no rule
+     * excludes rows" and for "the filter matched everything", and both were wrong for
+     * exactly that second reason: a filter can match every surviving row while an
+     * edited row it was never asked about has vanished from the file. Deliberately
+     * covered rather than left to the save-time conflict banner, because that banner
+     * only speaks once the user presses Save, and this notice exists to say what is
+     * out of sight *before* then — which is also why the copy says the view does not
+     * *show* the row rather than that it hides it.
      *
-     * Membership then comes from `display_row_for_source`, deliberately reusing the
-     * inverse permutation it already builds and caches beside the indices it
-     * inverts. The install that produced those indices has just invalidated the old
-     * inverse, so the first lookup costs O(rows) at a moment that was already
-     * O(rows), and every edit after it is O(1).
+     * So the scan is skipped only when there are no keys to scan. What the length test
+     * still buys is the *cost*: when the permutation kept every row, membership in the
+     * view reduces to membership in the projection, and `projected_row_for_source`
+     * answers that per key without materializing the O(rows) inverse that
+     * `display_row_for_source` would. When rows really were dropped there is no
+     * shortcut, and `display_row_for_source` reuses the inverse cached beside the
+     * indices it inverts: the install that produced those indices has just
+     * invalidated the old inverse, so the first lookup costs O(rows) at a moment that
+     * was already O(rows), and every lookup after it is O(1).
      *
-     * Deliberately reads the *durable* map rather than the live one, which can lag
-     * it by the webview's persistence debounce. Under-reporting from that lag is
-     * benign: an edit too new to be durable was just typed, so its row was on screen
-     * to be typed into, so it is not hidden. Over-reporting from it — an entry the
-     * user has already discarded but whose removal has not been persisted yet — is
-     * not benign, and is exactly what the webview's intersection against its live
-     * dirty map removes.
+     * Deliberately reads the *durable* map rather than the live one, which can lag it
+     * by the webview's persistence debounce. Over-reporting from that lag — an entry
+     * the user has already discarded but whose removal has not been persisted yet — is
+     * removed by the webview's intersection against its live dirty map.
+     * Under-reporting from it is not benign and is not tolerated either: an edit typed
+     * *while* a hiding transform computed was in no durable map when the install read
+     * one, and the install then excluded its row, so the "just typed, hence visible"
+     * argument does not hold across an install. That direction is answered by
+     * recomputing this on every delivery — see `snapshot_material` — rather than only
+     * at an install.
      */
     private hidden_edited_cell_keys(
         sheet_index: number,
         sheet: SheetMeta,
-        rules: SheetTransformState | undefined,
         indices: Uint32Array | undefined,
     ): readonly string[] {
         if (!indices || !this.durable_pending_edit_keys) return [];
-        const excludes_rows = !!rules && (
-            rules.filters.some((entry) => entry.enabled)
-            || (rules.hiddenRows?.length ?? 0) > 0
-        );
-        if (!excludes_rows || indices.length === sheet.rowCount) return [];
         const keys = this.durable_pending_edit_keys();
         if (keys.length === 0) return [];
+        // Whether the permutation itself left rows out. `rules` is not consulted:
+        // whatever an enabled filter or a `hiddenRows` list asked for, what a row's
+        // presence actually turns on is whether the indices kept it, and a rule that
+        // excluded nothing is indistinguishable from no rule at all.
+        const drops_rows = indices.length !== sheet.rowCount;
         const hidden: string[] = [];
         // Several cells in one row ask the same question, and the answer is per row.
         const row_is_present = new Map<number, boolean>();
@@ -633,8 +658,26 @@ export class ViewerPanelCore {
             if (!parsed) continue;
             let present = row_is_present.get(parsed.sourceRow);
             if (present === undefined) {
-                present = this.display_row_for_source(sheet_index, parsed.sourceRow)
-                    !== undefined;
+                present = drops_rows
+                    ? this.display_row_for_source(sheet_index, parsed.sourceRow)
+                        !== undefined
+                    // Every kept row is somewhere in the view, so all that is left to
+                    // ask is whether the source still projects the row at all — the
+                    // cheap half of what `display_row_for_source` does, without the
+                    // Int32Array(rows) inverse it would build to answer the other half.
+                    //
+                    // Cost only, and deliberately so: the two branches must agree
+                    // wherever both are defined, and when the permutation kept every
+                    // row they do, which is why no test can tell them apart. Probed
+                    // both ways: forcing `drops_rows` true fails nothing, forcing it
+                    // false fails every filter and hidden-row case in the suite. So the
+                    // equivalence is real, and the cheap arm buys an allocation this
+                    // question never needed.
+                    : projected_row_for_source(
+                        this.source,
+                        sheet_index,
+                        parsed.sourceRow,
+                    ) !== undefined;
                 row_is_present.set(parsed.sourceRow, present);
             }
             // The key as given rather than rebuilt from the parse. The two coincide
@@ -645,6 +688,29 @@ export class ViewerPanelCore {
             if (!present) hidden.push(key);
         }
         return hidden;
+    }
+
+    /**
+     * The same answer for every sheet, positionally, so a delivery can carry it
+     * without knowing which sheet the user is looking at.
+     *
+     * This is the *additive* half of keeping the notice honest, and it needs a
+     * per-delivery answer rather than a per-install one. Membership changes only at an
+     * install, but the durable map this reads changes on its own — and an edit typed
+     * while a hiding transform was still computing reaches the durable map only
+     * *after* the install that excluded its row, so no install will ever name it. The
+     * webview's intersection against its live dirty map cannot add it back; that
+     * subtracts. Recomputing here, on the delivery `pendingEditsChanged` already
+     * triggers, is what adds it.
+     */
+    private hidden_edited_cell_keys_by_sheet(): readonly (readonly string[])[] {
+        return this.source.meta().sheets.map((sheet, sheet_index) => (
+            this.hidden_edited_cell_keys(
+                sheet_index,
+                sheet,
+                this.transform_indices.get(sheet_index),
+            )
+        ));
     }
 
     /**
@@ -673,7 +739,6 @@ export class ViewerPanelCore {
             hiddenEditedCellKeys: this.hidden_edited_cell_keys(
                 sheet_index,
                 sheet,
-                rules,
                 indices,
             ),
         };

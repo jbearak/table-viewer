@@ -669,10 +669,13 @@ export function attach_viewer(
      * because `installed_view` builds its record synchronously and an install must
      * not gain a state read it did not need before.
      *
-     * Staleness here is benign, and the reason is worth stating: this can lag the
-     * live dirty map by the webview's persistence debounce, but an edit too new to
-     * appear here was just typed, so its row was on screen to be typed into, so it
-     * is not one of the hidden ones. Omitting it is correct, not a gap.
+     * Staleness here is bounded rather than benign, and the distinction matters: this
+     * can lag the live dirty map by the webview's persistence debounce, and an edit
+     * typed *while a hiding transform computed* really is one of the hidden ones even
+     * though it was on screen when it was typed. What makes the lag harmless is that
+     * the answer is recomputed on every delivery rather than only at an install, and
+     * the durable write that ends the lag triggers one — see
+     * `PanelCore.snapshot_material` and `WorkbookSnapshot.hiddenEditedCellKeys`.
      */
     let durable_pending_edits: PerFileState['pendingEdits'];
 

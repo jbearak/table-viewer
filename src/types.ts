@@ -142,24 +142,33 @@ export type SheetViewRecord = {
      * whose source row this view does not contain.
      *
      * Computed on the host because that is the only place both halves of the
-     * question exist at once — the permutation and the durable dirty map — and
-     * computed at an install because that is the only moment *membership* can change.
-     * An edit cannot hide its own row: the user can only edit rows the view is
-     * showing, and an installed filter reads saved values and deliberately never
-     * recomputes mid-session.
+     * question exist at once — the permutation and the durable dirty map. Membership
+     * moves only at an install: an installed filter reads saved values and
+     * deliberately never recomputes mid-session, and the user can only type into rows
+     * the view is showing.
      *
      * Keys rather than a bare count, and this is the refinement worth keeping
      * straight. Membership moves only at an install, but the *count* is a function of
      * two things — membership and the set of edits — and the second moves on any
      * `pendingEditsChanged`, discard or successful save, none of which install
      * anything. A count sent from here therefore went stale the moment a filtered-out
-     * edit was discarded, with no later install to correct it. Keys have no such
-     * problem: between installs this set can only *shrink*, and only by entries
-     * leaving the dirty map, because a new edit can only be typed into a row the view
-     * is showing. So the webview intersects these keys with its live dirty map and
-     * gets the current answer with no refresh at all — and both the number it renders
-     * and the acknowledgement identity it derives come from that one value, which is
-     * why they cannot disagree (see `stale_view_signature`).
+     * edit was discarded, with no later install to correct it. Keys do not: the
+     * webview intersects them with its live dirty map, which subtracts every entry
+     * that left it, exactly and with no message from the host.
+     *
+     * Subtraction is only half of it, though, and the other half is why every
+     * *delivery* carries these keys too and not only `transformInstalled` (see
+     * `WorkbookSnapshot.hiddenEditedCellKeys`). "A new edit can only be typed into a
+     * row the view is showing" is true of an installed view and false across an
+     * install: an edit typed while a hiding transform was still computing is in no
+     * durable map when the install reads one, and the install then excludes its row,
+     * so that install's answer omits a genuinely hidden edit and no later install will
+     * correct it. Nothing the webview holds can add it back. So the host re-answers on
+     * the same-basis refresh `pendingEditsChanged` already triggers, the webview takes
+     * the fresh keys onto the record it is keeping, and the two directions are
+     * complete: deliveries add, the live intersection subtracts. Both the number the
+     * webview renders and the acknowledgement identity it derives come from that one
+     * value, which is why they cannot disagree (see `stale_view_signature`).
      *
      * Unbounded in principle and deliberately uncapped: the set is a subset of the
      * dirty map's keys, and the whole dirty map — keys plus values plus bases —

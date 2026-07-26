@@ -332,9 +332,10 @@ export function transform_progress_label(
  * LRU, so a webview-side answer would move with the scrollbar. Recomputing
  * membership instead of observing it is worse still: it needs every filtered
  * column's *saved* value for every dirty row, non-resident ones included, plus the
- * host's filter compiler. The host has both halves at the one moment membership can
- * change — see `SheetViewRecord.hiddenEditedCellKeys` — so it sends the keys, the
- * caller intersects them with the live dirty map, and this reads the result.
+ * host's filter compiler. The host has both halves — see
+ * `SheetViewRecord.hiddenEditedCellKeys` — so it sends the keys, on the install and
+ * again on every delivery after it, the caller intersects them with the live dirty
+ * map, and this reads the result.
  *
  * Keys and not a count, here as on the wire, because this signature is the identity
  * of *what the notice is saying* and a count cannot express that. Two views can hide

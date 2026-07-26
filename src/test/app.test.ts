@@ -674,6 +674,11 @@ function workbook_snapshot_message(
             presentation: 'initial',
             reason: 'ready',
             meta,
+            // One entry per sheet, empty by default: a delivery that says nothing is
+            // out of sight is the ordinary case. Tests about a held record's hidden
+            // cells surviving (or not surviving) a refresh must name this explicitly —
+            // a default that guessed would decide the question they are asking.
+            hiddenEditedCellKeys: meta.sheets.map(() => []),
             state: {
                 columnWidths: [],
                 rowHeights: [],
@@ -7167,6 +7172,129 @@ describe('stale-view banner', () => {
         expect_no_call_to_action();
     });
 
+    /**
+     * The refresh a `pendingEditsChanged` produces: same generation, same source
+     * generation, same schema — so the record stands — carrying the host's fresh answer
+     * about which edited rows the permutation it already holds does not show.
+     */
+    async function same_basis_refresh(hidden: readonly string[]) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 2,
+                sourceGeneration: 1,
+                hiddenEditedCellKeys: [hidden],
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+    }
+
+    it('names a hidden cell only a refresh could have told it about', async () => {
+        // The additive direction, which the live intersection cannot reach: an edit
+        // typed while a hiding transform was still computing is in no durable map when
+        // the install reads one, so the install's record omits it and no later install
+        // is ever asked. Here the install says nothing is hidden, the dirty map never
+        // changes, and the only new information is the host's re-answer on the refresh
+        // the durable write triggers.
+        await edit_mode_sorted_on_column_0();
+        // Column 1, which the installed sort does not read, so the column half of the
+        // signature is silent throughout and only the hidden cells can speak.
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        expect(banner()).toBeNull();
+
+        await same_basis_refresh(['0:1']);
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        // Still the installed view: the record was kept, not replaced by a natural one,
+        // which is what makes the fresh keys about the permutation it describes.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect_no_call_to_action();
+
+        // Withdrawn the same way it arrived. The host is the authority on membership,
+        // so a refresh naming nothing is news too — taking the fresh answer only when
+        // it is non-empty would leave the claim standing forever.
+        await same_basis_refresh([]);
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('reads consistently beside the shrink conflict banner over the same row', async () => {
+        // The two notices can stand together, and they are about the same vanished row:
+        // this one says unsaved work is in a row the view does not show, the conflict
+        // banner says the save was cancelled because that row is gone. Checked rather
+        // than assumed, because they are the same fact at two moments — before Save this
+        // is the only notice there is, and after a rejection the conflict banner adds
+        // what the stale-view notice deliberately never says: which row, and that
+        // something was cancelled.
+        //
+        // No contradiction to fix: "this view doesn't show" was chosen over "hides"
+        // precisely so it stays true of a removed row, and the counts differ by design
+        // and by unit — cells out of sight here, rows lost there, each stated in its own
+        // sentence with its own noun.
+        await edit_mode_sorted_on_column_0();
+        const removed = { '7:1': { value: 'orphan', base: 'gone' } };
+        await report_grid_editing(true, true, [], removed);
+        await same_basis_refresh(['7:1']);
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 901,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-shrunk',
+                    edits: { '7:1': 'orphan' },
+                    dirtyEdits: removed,
+                },
+            },
+            rejection: { reason: 'rowsRemoved', keys: ['7:1'] },
+        });
+        await report_grid_editing(true, true, [], removed);
+
+        // Both up, neither restated as the other, and only the conflict banner offers a
+        // way out — the stale-view notice is still informational.
+        expect(container!.querySelector('.conflict-banner')?.textContent)
+            .toContain('1 edited row no longer exists');
+        expect(container!.querySelector('.conflict-banner')?.textContent)
+            .toContain('Affected row: 8');
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain('cancelled');
+        expect_no_call_to_action();
+    });
+
+    it('does not claim a refreshed key the dirty map never held', async () => {
+        // The paired direction, so the fresh answer cannot pass by naming everything:
+        // the host reads the *durable* map, which can name an entry the user has
+        // already discarded, and the intersection still has to run over what a refresh
+        // brings in exactly as it does over what an install brings in.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+
+        await same_basis_refresh(['2:1']);
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
     it('drops the claim entirely when the last hidden edit is discarded', async () => {
         // The end of the same road, and the shape codex named: with nothing else to
         // say, the whole notice goes rather than standing there over an empty claim.
@@ -7250,6 +7378,11 @@ describe('stale-view banner', () => {
             {
                 generation: 2,
                 sourceGeneration: 1,
+                // Re-asserted, not dropped: a same-basis refresh now hands the record
+                // a fresh answer, and letting this default to empty would silence the
+                // notice through the record and leave the `edit_mode` gate untested
+                // again — the exact hole this test was written to hold.
+                hiddenEditedCellKeys: [['0:1']],
                 capabilities: { csvEditable: false, csvEditingSupported: true },
                 state: {
                     transforms: [{
@@ -7389,10 +7522,18 @@ describe('stale-view banner', () => {
         // they are kept on the record (a disabled filter is still a definition), and
         // they read no column, so the fabricated count would be the only thing
         // speaking.
+        //
+        // The delivery deliberately *does* name a hidden cell, which is the second
+        // probe: now that a same-basis refresh takes the host's fresh keys, letting this
+        // branch take them too fails nothing unless the snapshot carries some — and it
+        // must not take them, because the record being built here says no permutation is
+        // in place, so the keys would name cells as out of sight of a view claiming to
+        // show every row.
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
+                hiddenEditedCellKeys: [['0:0']],
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
