@@ -9,7 +9,11 @@ import type {
     SheetTransformState,
     SortDirection,
 } from './types';
-import { is_range_filter_operator, transform_is_active } from './types';
+import {
+    is_range_filter_operator,
+    transform_is_active,
+    transform_read_columns,
+} from './types';
 import {
     canonical_numeric_string,
     cell_can_be_numeric,
@@ -919,21 +923,19 @@ export function transformed_window(
     };
 }
 
+/**
+ * Which columns the permutation reads, bounds-checked. The membership rule itself
+ * lives in `transform_read_columns` so the host and the webview cannot drift on
+ * what "a column the displayed order depends on" means; the bounds check stays
+ * here, because only the host holds the sheet's column count.
+ */
 function needed_columns(
     state: SheetTransformState,
     column_count: number,
 ): number[] {
-    const result = new Set<number>();
-    for (const key of state.sort) {
-        validate_column(key.colIndex, column_count);
-        result.add(key.colIndex);
-    }
-    for (const entry of state.filters) {
-        if (!entry.enabled) continue;
-        validate_column(entry.colIndex, column_count);
-        result.add(entry.colIndex);
-    }
-    return [...result];
+    const columns = [...transform_read_columns(state)];
+    for (const column of columns) validate_column(column, column_count);
+    return columns;
 }
 
 function validate_column(col: number, count: number): void {

@@ -172,6 +172,28 @@ export function transform_has_entries(state: SheetTransformState | undefined): b
     );
 }
 
+/**
+ * Columns whose *values* the installed transform reads: sort keys plus the
+ * columns of enabled filters. `hiddenRows` contributes nothing — hiding is by row
+ * identity, not by value, so no edit can change whether a row is hidden.
+ *
+ * Lives here rather than in `table-transform.ts` because both bundles need it:
+ * the host computes permutations from it (`needed_columns` delegates), and the
+ * webview decides from it whether an edit lands in a column the displayed order
+ * depends on. `table-transform.ts` is host-only.
+ */
+export function transform_read_columns(
+    state: SheetTransformState | undefined,
+): Set<number> {
+    const columns = new Set<number>();
+    if (!state) return columns;
+    for (const key of state.sort) columns.add(key.colIndex);
+    for (const entry of state.filters) {
+        if (entry.enabled) columns.add(entry.colIndex);
+    }
+    return columns;
+}
+
 export function transform_schema_for_sheet(
     sheet: WorkbookMeta['sheets'][number],
 ): string {

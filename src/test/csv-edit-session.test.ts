@@ -4637,34 +4637,112 @@ describe('CSV edit sessions', () => {
         });
     });
 
-    it('rejects transforms while an edit session is owned', async () => {
-        const panel = open_csv_table(uri('/tmp/session.csv'), state_store().store);
+    it('admits a transform from the panel that owns the edit session', async () => {
+        const file_path = '/tmp/owner-transform-admitted.csv';
+        const state = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        const panel = open_csv_table(uri(file_path), state.store);
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' } as never);
+        expect(edit_session_results(panel).at(-1)?.granted).toBe(true);
+        const snapshot = latest_snapshot(panel);
 
         await panel.__receive({
             type: 'setTransform',
             sheetIndex: 0,
-            requestId: 'during-edit',
-            sourceGeneration: 1,
+            requestId: 'owner-sort',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
             intent: 'user',
             state: {
                 sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],
                 schema: '["Sheet1",1,["h"]]',
             },
-        } as never);
+        });
 
-        const response = panel.__messages.find((message) =>
+        const applied = panel.__messages.find((message) => (
             typeof message === 'object'
             && message !== null
             && 'type' in message
-            && message.type === 'transformApplied',
-        ) as { error?: string } | undefined;
-        expect(response?.error).toContain('Exit edit mode');
+            && message.type === 'transformApplied'
+            && 'requestId' in message
+            && message.requestId === 'owner-sort'
+        )) as { generation: number; error?: string };
+        expect(applied.error).toBeUndefined();
+        expect(state.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+
+        // The owner's own view really is sorted: admission is not a silent no-op.
+        await panel.__receive({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+            requestId: 'owner-sorted-rows', generation: applied.generation,
+        });
+        const rows = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'rowData'
+            && 'requestId' in message
+            && message.requestId === 'owner-sorted-rows'
+        )) as { rows: Array<Array<{ raw: string }>> };
+        expect(rows.rows.map((row) => row[0].raw)).toEqual(['a', 'b', 'c']);
     });
 
-    it('rejects a sibling transform while another panel owns CSV editing', async () => {
+    it('keeps csvEditable true after the owning panel installs a transform', async () => {
+        // Without this the webview's `edit_mode && !csv_editable` guard would eject
+        // the user from edit mode the instant their own sort landed, so admission
+        // would undo itself. A transform alone re-projects nothing, so the stale
+        // capability rides along until something recaptures — and the very next
+        // thing the user does after sorting is keep typing. That posts
+        // pendingEditsChanged, whose notify_edit_state recaptures the projection
+        // with the owner's own transform installed, which is exactly where the
+        // capability would flip false.
+        const file_path = '/tmp/owner-transform-capability.csv';
+        const state = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+        const snapshot = latest_snapshot(panel);
+        expect(snapshot.capabilities.csvEditable).toBe(true);
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'capability-sort',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(state.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+        panel.__messages.length = 0;
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: edit_session_id,
+            edits: { '0:0': { value: 'still-editing', base: 'c' } },
+        });
+        await flush_promises();
+        const after = latest_snapshot(panel);
+        expect(after.capabilities.csvEditable).toBe(true);
+        expect(after.capabilities.csvEditSessionId).toBe(edit_session_id);
+    });
+
+    it('refuses a sibling transform because another panel owns the edit session', async () => {
         const file_path = '/tmp/cross-panel-owned-transform.csv';
         const shared = state_store();
         const owner = open_csv_table(uri(file_path), shared.store);
@@ -4688,11 +4766,13 @@ describe('CSV edit sessions', () => {
             },
         });
 
+        // The owner may sort its own view; a sibling may not, because recomputing
+        // the permutation would move the owner's rows mid-edit.
         expect(shared.get_state(file_path).transforms).toBeUndefined();
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
             type: 'transformApplied',
             requestId: 'sibling-during-edit',
-            error: expect.stringContaining('edit mode'),
+            error: 'Another panel is editing this file.',
         }));
     });
 
@@ -4745,7 +4825,7 @@ describe('CSV edit sessions', () => {
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
             type: 'transformApplied',
             requestId: 'overtaking-transform',
-            error: expect.stringContaining('edit mode'),
+            error: 'Finishing edit-session work; try again in a moment.',
         }));
     });
 
@@ -4781,7 +4861,7 @@ describe('CSV edit sessions', () => {
         ]);
     });
 
-    it('keeps ready natural during an owned edit session and saves the same physical row', async () => {
+    it('refuses a sibling sort, keeps ready natural, and saves the same physical row', async () => {
         const file_path = '/tmp/edit-transform-row-identity.csv';
         const shared = state_store();
         let bytes = enc.encode('h\nc\na\nb\n');
@@ -4811,6 +4891,13 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         });
+        expect(sibling.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sort-while-owned',
+            error: 'Another panel is editing this file.',
+        }));
+        expect(shared.get_state(file_path).transforms).toBeUndefined();
+
         owner.__messages.length = 0;
         await owner.__receive({ type: 'ready' });
         const remounted = latest_snapshot(owner);
@@ -4839,6 +4926,347 @@ describe('CSV edit sessions', () => {
         });
         await flush_promises();
         expect(new TextDecoder().decode(bytes)).toBe('h\nedited-c\na\nb\n');
+    });
+
+    it('saves the same physical row after the owner itself installs a sort', async () => {
+        // The valuable half: source-keyed edits (#110) must survive a transform the
+        // owner installed. Display row 0 under an ascending sort is source row 1
+        // ('a'), so a display-keyed save would corrupt the wrong line.
+        const file_path = '/tmp/owner-transform-row-identity.csv';
+        const shared = state_store();
+        let bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const owner = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const edit_session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const snapshot = latest_snapshot(owner);
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'owner-sort-before-save',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        const applied = owner.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'transformApplied'
+            && 'requestId' in message
+            && message.requestId === 'owner-sort-before-save'
+        )) as { generation: number; error?: string };
+        expect(applied.error).toBeUndefined();
+        await owner.__receive({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+            requestId: 'owner-sorted-before-save', generation: applied.generation,
+        });
+        const rows = owner.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && 'type' in message
+            && message.type === 'rowData'
+            && 'requestId' in message
+            && message.requestId === 'owner-sorted-before-save'
+        )) as { rows: Array<Array<{ raw: string }>> };
+        expect(rows.rows.map((row) => row[0].raw)).toEqual(['a', 'b', 'c']);
+
+        // Source row 0 ('c'), which the sort moved to display row 2.
+        await owner.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'save-under-owner-sort',
+                edits: { '0:0': 'edited-c' },
+                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+            },
+        });
+        await flush_promises();
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult', success: true,
+        }));
+        expect(new TextDecoder().decode(bytes)).toBe('h\nedited-c\na\nb\n');
+    });
+
+    it('refuses a transform while a save is in flight, then admits one after it lands', async () => {
+        // Host-enforced, not merely UI-disabled: a stale or injected webview message
+        // reaches handle_transform_message directly. The second half is what proves
+        // the refusal is transient rather than a new permanent barrier.
+        const file_path = '/tmp/transform-during-save.csv';
+        const shared = state_store();
+        let bytes = enc.encode('h\nc\na\nb\n');
+        const write_gate = deferred();
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            await write_gate.promise;
+            bytes = new Uint8Array(content);
+        });
+        const owner = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const edit_session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const before_save = latest_snapshot(owner);
+
+        const save = owner.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'gated-save',
+                edits: { '0:0': 'edited-c' },
+                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+            },
+        });
+        await vi.waitFor(() => expect(owner.__messages).toContainEqual(
+            expect.objectContaining({ type: 'saveOperationStarted' }),
+        ));
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-during-save',
+            generation: before_save.generation,
+            sourceGeneration: before_save.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sort-during-save',
+            error: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+        }));
+        // The save itself persists a sheet-shaped transforms array, so the
+        // meaningful assertion is that the refused sort left no entry in it.
+        expect(shared.get_state(file_path).transforms?.[0]).toBeUndefined();
+
+        write_gate.resolve();
+        await save;
+        await vi.waitFor(() => expect(owner.__messages).toContainEqual(
+            expect.objectContaining({ type: 'saveResult', success: true }),
+        ));
+        await flush_promises();
+
+        const after_save = latest_snapshot(owner);
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-after-save',
+            generation: after_save.generation,
+            sourceGeneration: after_save.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        const after_applied = owner.__messages.find((message: any) => (
+            message?.type === 'transformApplied' && message.requestId === 'sort-after-save'
+        )) as { error?: string };
+        expect(after_applied.error).toBeUndefined();
+        expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+    });
+
+    it('refuses a transform while post-save pending-edit cleanup is still in flight', async () => {
+        // cleanupPending: the CAS that clears durable pending edits has not
+        // committed, so clearedStateRevision is unrecorded and a transform write
+        // would race it.
+        const file_path = '/tmp/transform-during-cleanup.csv';
+        const versioned = state_store({
+            pendingEdits: { '0:0': { value: 'edited-a', base: 'a' } },
+        });
+        const cleanup_started = deferred();
+        const cleanup_gate = deferred();
+        let bytes = enc.encode('h\na\nb\nc\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    cleanup_started.resolve();
+                    await cleanup_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const snapshot = latest_snapshot(owner);
+        const save = owner.__receive({ type: 'saveCsv', edits: { '0:0': 'edited-a' } });
+        await cleanup_started.promise;
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-during-cleanup',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sort-during-cleanup',
+            error: 'Finishing edit-session work; try again in a moment.',
+        }));
+        // The save wrote a sheet-shaped transforms array of its own, so the
+        // meaningful assertion is that the refused sort left sheet 0 untouched.
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
+
+        cleanup_gate.resolve();
+        await save;
+        await flush_promises();
+    });
+
+    it('refuses a transform while a release is still draining admitted edit writes', async () => {
+        // releasing: release_edit_session is awaiting pending_edit_writes, so
+        // durable pending edits may yet be written.
+        const file_path = '/tmp/transform-during-release.csv';
+        const versioned = state_store();
+        const compare_started = deferred();
+        const compare_gate = deferred();
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (next.pendingEdits?.['0:0']) {
+                    compare_started.resolve();
+                    await compare_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const owner = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(owner)!.editSessionId!;
+        const snapshot = latest_snapshot(owner);
+
+        const pending = owner.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { '0:0': { value: 'draining', base: 'c' } },
+        });
+        await compare_started.promise;
+        const release = owner.__receive({
+            type: 'releaseEditSession',
+            editSessionId: session_id,
+        });
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-during-release',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sort-during-release',
+            error: 'Finishing edit-session work; try again in a moment.',
+        }));
+        expect(versioned.get_state(file_path).transforms).toBeUndefined();
+
+        compare_gate.resolve();
+        await Promise.all([pending, release]);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            '0:0': { value: 'draining', base: 'c' },
+        });
+    });
+
+    it('refuses a transform while durable edit state is uncertain after a failed clear', async () => {
+        // uncertain: the clear rejected, so durable pending-edit state may or may
+        // not exist. Never admit under unknown durable state.
+        const file_path = '/tmp/transform-during-uncertain.csv';
+        const versioned = state_store({
+            pendingEdits: { '0:0': { value: 'edited-a', base: 'a' } },
+        });
+        let bytes = enc.encode('h\na\nb\nc\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    throw new Error('cleanup storage failed');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const owner = open_csv_table(uri(file_path), store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        const snapshot = latest_snapshot(owner);
+        await owner.__receive({ type: 'saveCsv', edits: { '0:0': 'edited-a' } });
+        await flush_promises();
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult', success: true,
+        }));
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-during-uncertain',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        expect(owner.__messages).toContainEqual(expect.objectContaining({
+            type: 'transformApplied',
+            requestId: 'sort-during-uncertain',
+            error: 'Finishing edit-session work; try again in a moment.',
+        }));
+        // A sheet-shaped transforms array survives the save; the refusal is
+        // observable as sheet 0 still carrying no installed transform.
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
     });
 
     it('does not grant edit mode while a transform is computing', async () => {

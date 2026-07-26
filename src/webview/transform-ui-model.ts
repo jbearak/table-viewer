@@ -7,7 +7,7 @@ import type {
     SortKey,
     TransformIntent,
 } from '../types';
-import { is_range_filter_operator } from '../types';
+import { is_range_filter_operator, transform_read_columns } from '../types';
 
 export { is_range_filter_operator };
 
@@ -301,6 +301,55 @@ export function transform_progress_label(
     if (has_sort && has_filter) return 'Applying sort & filters…';
     if (has_sort) return 'Sorting…';
     return 'Filtering…';
+}
+
+/**
+ * Signature of the dirty cells whose column the installed transform reads, or
+ * undefined when there are none.
+ *
+ * An installed sort or filter deliberately does not recompute during a live edit
+ * session — rows stay where the user left them, which is the feature. The
+ * displayed order can therefore disagree with the current values, and it is worth
+ * saying so exactly when some edited cell is in a column the order depends on.
+ *
+ * Derived from the *current* dirty map rather than latched, so reverting or
+ * discarding the last relevant edit clears it for free. The transform's own
+ * signature is folded in so changing the installed sort is a new fact rather than
+ * a previously acknowledged one.
+ *
+ * Deliberately no count of rows that no longer match an enabled filter. Judging
+ * that needs every filtered column's value for the row, and the webview holds
+ * only dirty cells plus resident rows, so the number would be wrong for
+ * non-resident rows — and a wrong count in a banner is worse than no count. It
+ * would also mean relocating the host's filter compiler into the webview.
+ *
+ * @param dirty_keys `"sourceRow:sourceColumn"` keys, as PR 2 rekeyed them.
+ */
+export function stale_view_signature(
+    state: SheetTransformState | undefined,
+    dirty_keys: readonly string[],
+): string | undefined {
+    const columns = transform_read_columns(state);
+    if (columns.size === 0) return undefined;
+    const affected = dirty_keys
+        .filter((key) => {
+            const separator = key.indexOf(':');
+            if (separator < 0) return false;
+            const text = key.slice(separator + 1);
+            const column = Number(text);
+            // Number('') is 0, so an empty tail would otherwise read as column 0.
+            return text.length > 0 && Number.isInteger(column) && columns.has(column);
+        })
+        .sort();
+    if (affected.length === 0) return undefined;
+    // The transform half changes whenever the installed rules do — including a
+    // filter's operator or value, not just which columns it names — so an
+    // acknowledgement cannot carry over to a different view.
+    const rules = JSON.stringify([
+        state!.sort,
+        state!.filters.filter((entry) => entry.enabled),
+    ]);
+    return `${rules}|${affected.join(',')}`;
 }
 
 export type TransformShortcut =

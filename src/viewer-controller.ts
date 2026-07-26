@@ -550,6 +550,28 @@ export function attach_viewer(
         return phase.type === 'cleanupPending' || phase.type === 'uncertain';
     }
 
+    /**
+     * A save in flight refuses transform work regardless of edit phase: the save
+     * validated every edit's base against the natural source and is about to
+     * write those bytes, so a permutation landing in between would be persisted
+     * against a basis the save never saw.
+     *
+     * Both halves are checked because they answer different questions and no
+     * single site owns both. `active_save_operation` is the host's own
+     * preparing → accepted → writing reference, and outlives the terminal
+     * lifecycle transition: after a successful write the lifecycle already reads
+     * 'succeeded' while the operation stays live until `begin_edit_cleanup`
+     * clears it. `save_lifecycle.state === 'active'` is the window the webview
+     * has been told about, and is what a future path clearing the operation
+     * before posting its terminal lifecycle would still expose. Today they
+     * overlap almost exactly; the redundancy is deliberate, because a false
+     * refusal is a momentary no-op while a false admit corrupts durable state.
+     */
+    function save_blocks_transform(): boolean {
+        return active_save_operation !== undefined
+            || save_lifecycle.state === 'active';
+    }
+
     function transform_blocks_editing(): boolean {
         return !!file_edit_state && (
             file_edit_state.transformOperations.size > 0
@@ -560,10 +582,15 @@ export function attach_viewer(
 
     function editing_available_for_panel(): boolean {
         const phase = edit_phase();
-        return !transform_blocks_editing() && (
-            phase.type === 'free'
-            || (phase.type === 'owned' && phase.token === edit_session_token)
-        );
+        // An owned session survives transforms installed from the owning panel.
+        // Rows deliberately stay put mid-edit, so a sort the user just installed
+        // in the panel they are editing must not revoke `csvEditable` and eject
+        // them from edit mode. Entering edit mode is still refused while a
+        // transform is installed — that direction lives in `reserve_edit_claim`
+        // and `try_claim_edit_session`, both of which still consult
+        // `transform_blocks_editing()`.
+        if (phase.type === 'owned' && phase.token === edit_session_token) return true;
+        return !transform_blocks_editing() && phase.type === 'free';
     }
 
     function shared_edit_state_is_unused(): boolean {
@@ -602,12 +629,75 @@ export function attach_viewer(
         }
     }
 
-    function begin_transform_admission(): symbol | undefined {
-        if (!file_edit_state) return Symbol(file_key);
-        if (file_edit_state.phase.type !== 'free') return undefined;
+    type TransformAdmission =
+        | { readonly operation: symbol }
+        | { readonly refusal: string };
+
+    /**
+     * Which edit phases admit transform work, and why the rest do not. The
+     * trailing `never` assignment is what makes adding a phase to
+     * `CsvEditFilePhase` a compile error here rather than a silent admit: this
+     * project does not set `noImplicitReturns`, so a bare `switch` with no
+     * `default` would let a new phase fall through and return `undefined` —
+     * which means "admit". The unreachable branch still refuses, so even a
+     * compile run that someone forces through cannot admit under an unknown
+     * phase.
+     *
+     * `owned` admits only the panel holding the session. A sibling's sort would
+     * recompute the permutation and publish it to durable state, moving the
+     * owner's rows out from under them mid-edit — the exact thing stable-rows
+     * editing exists to prevent. The owner's own request is different in kind:
+     * the user, in the panel they are editing, changing their own view. Rows do
+     * not move for edits already made, because an installed transform never
+     * recomputes during a live session.
+     */
+    function admit_transform_for_phase(phase: CsvEditFilePhase): string | undefined {
+        switch (phase.type) {
+            case 'free':
+                return undefined;
+            case 'owned':
+                // The owning panel only; see above.
+                return phase.token === edit_session_token
+                    ? undefined
+                    : 'Another panel is editing this file.';
+            case 'claiming':
+                // A claim is mid-flight across state I/O. Admitting here lets a
+                // transform overtake the very reservation `reserve_edit_claim`
+                // exists to serialize.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'releasing':
+                // `release_edit_session` is still awaiting `pending_edit_writes`;
+                // durable pending edits may yet be written.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'cleanupPending':
+                // A post-write state clear is in flight and
+                // `clearedStateRevision` is not yet recorded, so a transform
+                // write would race the CAS clear.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'uncertain':
+                // Durable pending-edit state may or may not exist. Never admit
+                // under unknown durable state.
+                return 'Finishing edit-session work; try again in a moment.';
+        }
+        const exhaustive: never = phase;
+        console.error('Unhandled CSV edit phase in transform admission', exhaustive);
+        return 'Finishing edit-session work; try again in a moment.';
+    }
+
+    function begin_transform_admission(): TransformAdmission {
+        // No shared edit state means no edit session can exist for this file, so
+        // there is nothing to serialize against.
+        if (!file_edit_state) return { operation: Symbol(file_key) };
+        if (save_blocks_transform()) {
+            return {
+                refusal: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+            };
+        }
+        const refusal = admit_transform_for_phase(file_edit_state.phase);
+        if (refusal !== undefined) return { refusal };
         const operation = Symbol(file_key);
         file_edit_state.transformOperations.add(operation);
-        return operation;
+        return { operation };
     }
 
     function finish_transform_admission(operation: symbol): void {
@@ -2922,14 +3012,11 @@ export function attach_viewer(
                 return;
             }
         }
-        const transform_admission = profile.editing
+        const transform_admission: TransformAdmission = profile.editing
             ? begin_transform_admission()
-            : Symbol(file_key);
-        if (!transform_admission) {
-            await core?.reject_transform(
-                message,
-                'Exit edit mode before sorting, filtering, or hiding rows.',
-            );
+            : { operation: Symbol(file_key) };
+        if ('refusal' in transform_admission) {
+            await core?.reject_transform(message, transform_admission.refusal);
             return;
         }
         let resolve_completion!: () => void;
@@ -2968,7 +3055,7 @@ export function attach_viewer(
             transform_commit_barriers.delete(transform_authority);
             transform_authority.resolveCompletion();
             if (profile.editing) {
-                finish_transform_admission(transform_admission);
+                finish_transform_admission(transform_admission.operation);
             }
         }
     }
@@ -3034,13 +3121,15 @@ export function attach_viewer(
                             || ready_core.source_generation !== ready_source_generation
                         ) continue;
 
-                        const transform_admission = profile.editing
+                        const transform_admission: TransformAdmission = profile.editing
                             ? begin_transform_admission()
-                            : Symbol(file_key);
-                        if (!transform_admission) {
-                            // Edit ownership intentionally keeps the installed view
-                            // natural, but ready must still cross a serialized revision
-                            // barrier before publishing its state material.
+                            : { operation: Symbol(file_key) };
+                        if ('refusal' in transform_admission) {
+                            // Every still-refusing phase reaches here — a sibling's
+                            // session, a claim, a release, cleanup, or uncertainty —
+                            // and keeps the installed view natural. Ready must still
+                            // cross a serialized revision barrier before publishing
+                            // its state material.
                             const confirmed = await read_state_for_ready_epoch(
                                 begun.receiverEpoch,
                             );
@@ -3174,7 +3263,7 @@ export function attach_viewer(
                             break;
                         } finally {
                             if (profile.editing) {
-                                finish_transform_admission(transform_admission);
+                                finish_transform_admission(transform_admission.operation);
                             }
                         }
                         if (!reconciled) continue;

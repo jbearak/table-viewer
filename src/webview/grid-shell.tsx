@@ -1665,9 +1665,15 @@ export function GridShell({
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
-            // TODO(PR 4): row heights are still keyed by *display* row, so the
-            // on_row_resize call below stays display-keyed and ungated here.
-            if (text.includes('\n')) {
+            // TODO(PR 4): row heights are still keyed by *display* row, so this is
+            // gated on `transformed` — matching hover-arming and the resize overlay
+            // — rather than writing a display-keyed height against a permuted view.
+            // Now that transforms and edit mode coexist this is reachable, and
+            // skipping the whole block (not just the on_row_resize call) falls
+            // through to the single-cell updateCells below, which is the correct
+            // paint when no height changed. PR 4 makes heights source-keyed and
+            // removes the guard.
+            if (text.includes('\n') && !transformed) {
                 const needed = natural_row_height(
                     text,
                     line_height_for_font(font_size_px),
@@ -1697,6 +1703,7 @@ export function GridShell({
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
+            transformed,
         ],
     );
 
@@ -2746,10 +2753,13 @@ export function GridShell({
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
             is_multi_cell: !!range && range.width * range.height > 1,
             preview_mode,
+            // Hiding rows is offered in edit mode: it is a transform like any
+            // other, and the host admits it from the panel holding the session.
+            // Preview keeps its refusal — natural source order is a trust
+            // boundary there.
             can_hide_rows: !!selected_rows
                 && transform_sections
                 && !transform_pending
-                && !edit_mode
                 && !preview_mode,
             selected_row_count,
             selected_column_count: hide_column_targets.length,
@@ -2889,10 +2899,19 @@ export function GridShell({
                             : `Row actions for ${selected_row_count} selected rows`}
                         items={row_context_menu_items({
                             selected_row_count,
+                            // Offered in edit mode, refused in preview; see the
+                            // cell menu's can_hide_rows above.
                             can_hide_rows: transform_sections
                                 && !transform_pending
-                                && !edit_mode
                                 && !preview_mode,
+                            // Left as it was, `!edit_mode` included. The sort/filter
+                            // restriction is about row order — promoting a row hides
+                            // the rows above it, which only means anything in
+                            // natural order — and README documents the action as
+                            // available only when nothing is reordering the view.
+                            // With transform_state no longer emptied in edit mode
+                            // that restriction now *also* sees an edit-mode sort, so
+                            // the two terms agree rather than one masking the other.
                             can_promote_row_to_header: can_promote_row_to_header
                                 && transform_sections
                                 && !transform_pending

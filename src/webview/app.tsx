@@ -373,6 +373,13 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    // Mirrors editing_status.save_in_flight for the transform request paths. A ref
+    // rather than the state value in their dep arrays: the grid reports editing
+    // status on every commit, so depending on it would rebuild these callbacks —
+    // and with them GridShell's props — on each keystroke. Written synchronously
+    // in handle_editing_change, so a request always reads the latest report and
+    // there is no closure to go stale.
+    const save_in_flight_ref = useRef(false);
     const pending_excel_header_unhide_ref = useRef(false);
     const pending_excel_header_promote_ref = useRef(false);
     const pending_edit_request_ref = useRef<string | null>(null);
@@ -1415,8 +1422,15 @@ export function App(): React.JSX.Element {
     // Recompute persisted transforms against each freshly loaded source. The
     // host intentionally drops permutations on reload because matching schema
     // does not imply matching values.
+    //
+    // Not gated on edit_mode: the host admits a transform from the panel holding
+    // the session, so re-requesting the stored transform during an owned session
+    // is legitimate — and skipping it would leave the user's own saved sort
+    // silently uninstalled for the rest of the session. Preview keeps its gate
+    // (natural source order is a trust boundary there) and so does a pending
+    // Excel header change, which is about to reshape the rows itself.
     useEffect(() => {
-        if (!meta || preview_mode || edit_mode || pending_excel_header !== null) return;
+        if (!meta || preview_mode || pending_excel_header !== null) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
@@ -1438,7 +1452,6 @@ export function App(): React.JSX.Element {
         source_epoch,
         meta,
         preview_mode,
-        edit_mode,
         pending_excel_header,
         active_sheet_index,
         request_transform,
@@ -1637,8 +1650,12 @@ export function App(): React.JSX.Element {
 
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
+            // Edit mode is deliberately not a refusal: the host admits a transform
+            // from the panel that owns the session. A save in flight is, because
+            // it has already validated every edit's base against the natural
+            // source (see save_blocks_transform in viewer-controller.ts).
             if (
-                edit_mode
+                save_in_flight_ref.current
                 || edit_session_pending
                 || preview_mode
                 || pending_excel_header_ref.current !== null
@@ -1672,7 +1689,6 @@ export function App(): React.JSX.Element {
         },
         [
             active_sheet_index,
-            edit_mode,
             edit_session_pending,
             meta,
             preview_mode,
@@ -1681,8 +1697,9 @@ export function App(): React.JSX.Element {
     );
 
     const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
+        // Same admission set as handle_transform_change; see the comment there.
         if (
-            edit_mode
+            save_in_flight_ref.current
             || edit_session_pending
             || preview_mode
             || pending_excel_header_ref.current !== null
@@ -1717,7 +1734,6 @@ export function App(): React.JSX.Element {
         });
     }, [
         active_sheet_index,
-        edit_mode,
         edit_session_pending,
         pending_transforms,
         preview_mode,
@@ -1765,8 +1781,9 @@ export function App(): React.JSX.Element {
             window.clearTimeout(filter_restore_timer_ref.current);
             filter_restore_timer_ref.current = undefined;
         }
+        // Same admission set as handle_transform_change; see the comment there.
         if (
-            edit_mode
+            save_in_flight_ref.current
             || edit_session_pending
             || preview_mode
             || pending_excel_header_ref.current !== null
@@ -1775,7 +1792,6 @@ export function App(): React.JSX.Element {
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
-        edit_mode,
         edit_session_pending,
         pending_transforms,
         preview_mode,
@@ -1932,8 +1948,16 @@ export function App(): React.JSX.Element {
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
+                    //
+                    // The boundary is `install_edit_session` plus the `adopt_session`
+                    // layout effect, not a remount. Since #104 the dirty map lives in
+                    // App's own store; `use_editing` reads it through
+                    // useSyncExternalStore rather than a useState initializer, and
+                    // `install` force-notifies, so a changed map — including an empty
+                    // one — installs into the mounted grid. Bumping load_epoch here
+                    // would also reset column visibility, and entering edit mode is
+                    // not a data reload.
                     install_edit_session(msg.pendingEdits, msg.editSessionId);
-                    set_load_epoch((n) => n + 1);
                     set_edit_mode(true);
                 } else {
                     pending_exit_ref.current = false;
@@ -2060,6 +2084,7 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = Object.keys(status.edits).length > 0
             ? status.edits
             : undefined;
+        save_in_flight_ref.current = status.save_in_flight;
         set_editing_status(status);
     }, []);
 
@@ -2446,8 +2471,17 @@ export function App(): React.JSX.Element {
     const has_multiple_sheets = meta.sheets.length > 1;
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
     const current_transform = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
-    const visible_transform =
-        edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
+    // Synchronized preview panes are shown their rows in natural source order.
+    // This is preview's own rule and has nothing to do with editing: the host
+    // treats it as a trust boundary because `visibleRowChanged` indexes the
+    // source-line map by display row, so a permutation would scroll the text
+    // editor to the wrong line (see the guard above `handle_transform_message`
+    // and the `hideRows` preview reject in viewer-controller.ts).
+    //
+    // Edit mode, separately, no longer suppresses anything: an installed sort or
+    // filter stays visible while the user edits, and deliberately does not
+    // recompute, so rows keep their positions mid-edit.
+    const visible_transform = preview_mode ? EMPTY_TRANSFORM : current_transform;
     const applied_transform = applied_transforms[active_sheet_index];
     const transform_active = transform_is_active(applied_transform);
     const any_transform_pending = pending_transforms.some(Boolean);
@@ -2489,6 +2523,21 @@ export function App(): React.JSX.Element {
     ].join(':');
     const no_visible_columns =
         current_column_projection.visible_to_source.length === 0;
+
+    /**
+     * The one reason set that hides or disables transform affordances, shared by
+     * the grid's header sections and the toolbar so the two can never disagree.
+     * Edit mode is deliberately absent — sorting and filtering stay available
+     * while editing. What remains are the windows in which the host would refuse
+     * the request anyway (a save in flight, a claim mid-flight) or in which the
+     * displayed order is not the user's to change (preview, an Excel header
+     * change reshaping the rows underneath).
+     */
+    const transform_ui_blocked =
+        editing_status?.save_in_flight === true
+        || edit_session_pending
+        || preview_mode
+        || excel_header_pending;
 
     // Conflict banner: a stable signature of the conflicted cell set, so dismissing
     // it ("Keep All") sticks until a *different* set of cells drifts.
@@ -2581,12 +2630,7 @@ export function App(): React.JSX.Element {
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
             transform_state={visible_transform}
-            transform_sections={
-                !edit_mode
-                && !edit_session_pending
-                && !preview_mode
-                && !excel_header_pending
-            }
+            transform_sections={!transform_ui_blocked}
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -2608,12 +2652,7 @@ export function App(): React.JSX.Element {
             <Toolbar
                 ref={toolbar_focus_ref}
                 transform={visible_transform}
-                transform_disabled={
-                    edit_mode
-                    || edit_session_pending
-                    || preview_mode
-                    || excel_header_pending
-                }
+                transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 hidden_rows={{
