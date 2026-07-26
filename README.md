@@ -129,7 +129,7 @@ On macOS (Apple Silicon, macOS 12+) download `table-viewer-<version>-arm64.dmg` 
 brew install --cask jbearak/table-viewer/table-viewer
 ```
 
-macOS builds are signed and notarized. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
+Builds are not yet signed or notarized, so macOS blocks the first launch; the cask prints how to approve it. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
 
 On Windows (10/11, x64 or arm64) download from the [latest release](https://github.com/jbearak/table-viewer/releases/latest):
 
