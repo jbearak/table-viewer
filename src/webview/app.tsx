@@ -417,10 +417,11 @@ export function App(): React.JSX.Element {
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
     const transform_applied_for_source_ref = useRef<boolean[]>([]);
     // Per sheet, the `restore_blocker_epoch` in force when the restore effect last
-    // asked for the persisted transform, cleared once one installs. Not a record of
-    // what is installed — `transform_applied_for_source_ref` and `applied_transforms`
-    // remain the only answer to that — only of what has already been asked and
-    // refused, so the ask is not repeated verbatim.
+    // asked the host to reconcile to the persisted transform — installing it, or
+    // uninstalling one the durable rules no longer describe — cleared once either
+    // lands. Not a record of what is installed — `transform_applied_for_source_ref`
+    // and `applied_transforms` remain the only answer to that — only of what has
+    // already been asked and refused, so the ask is not repeated verbatim.
     const restore_request_blockers_ref = useRef<(number | undefined)[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
@@ -1374,19 +1375,31 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 // Fold the open overlay into the store before the generation bump
-                // below unmounts the grid that owns it. Doable here rather than at
-                // dispatch time because GridShell is still mounted and Glide's
-                // .gdg-clip-region overlay is still in the DOM, so read_live_edit
-                // resolves; React batches set_generation and flushes only after
-                // this handler returns. It works at all only because the store's
-                // write is synchronous — the subscription plays no part.
-                // Placed after the requestId guard so a stale or duplicated ack
-                // doesn't fold for no reason. This path installs nothing, which is
-                // exactly where the fold earns its keep; where an authoritative
+                // below unmounts the grid that owns it — and only when that bump is
+                // real. The discriminator is whether the generation moves, not
+                // whether the refusal was transient: a *terminal* refusal (invalid
+                // filter, persistence failure, schema mismatch) echoes
+                // `this._generation` unchanged too — see post_transform_error in
+                // panel-core.ts — and so do the no-op restore/cancel acks the host
+                // sends when the state it already holds equals the request. None of
+                // those remount anything, so folding for them would commit an edit
+                // the user never confirmed and put a half-typed value in the dirty
+                // store where Escape can no longer take it back. That is reachable
+                // now that a transform may be computing while the user types.
+                // Doable here rather than at dispatch time because GridShell is
+                // still mounted and Glide's .gdg-clip-region overlay is still in
+                // the DOM, so read_live_edit resolves; React batches set_generation
+                // and flushes only after this handler returns. It works at all only
+                // because the store's write is synchronous — the subscription plays
+                // no part. Placed after the requestId guard so a stale or duplicated
+                // ack doesn't fold for no reason. This path installs nothing, which
+                // is exactly where the fold earns its keep; where an authoritative
                 // install does follow, the install runs after the fold and still
                 // wins, preserving "the grant/refresh owns the complete
                 // pending-edit projection, including authoritative absence".
-                editing_ref.current?.commit_live_edit();
+                if (msg.generation !== generation_ref.current) {
+                    editing_ref.current?.commit_live_edit();
+                }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
@@ -1637,6 +1650,38 @@ export function App(): React.JSX.Element {
             restore_request_blockers_ref.current[active_sheet_index] =
                 restore_blocker_epoch;
             request_transform(active_sheet_index, state, 'restore', 'restore');
+            return;
+        }
+        // The other direction, and the reason this reconciliation cannot be a
+        // one-way install: a sibling panel clearing the shared durable sort, filter
+        // or hidden rows never un-installs *our* permutation, and a same-basis
+        // refresh deliberately retains `applied_transforms` (it describes what our
+        // core still holds, which such a refresh changes not at all). With no
+        // uninstall the rows would stay permuted under a toolbar showing no rules.
+        // So when the durable rules have gone inactive while an active permutation
+        // is still installed, ask for the rule-free view. Sending the sanitized
+        // inactive state rather than a bare EMPTY_TRANSFORM keeps disabled filter
+        // definitions the user may re-enable; only when there is nothing durable
+        // left at all is the empty state sent, stamped with this sheet's schema the
+        // way handle_transform_change does.
+        //
+        // Deliberately not gated on edit mode. `admit_transform_for_phase` refuses a
+        // sibling's transform while we own the session, so the durable rules cannot
+        // go inactive from a sibling mid-session; a gate here would instead create a
+        // state that never reconciles, since leaving edit mode moves no dep of this
+        // effect.
+        if (transform_is_active(applied_transforms[active_sheet_index])) {
+            restore_request_blockers_ref.current[active_sheet_index] =
+                restore_blocker_epoch;
+            request_transform(
+                active_sheet_index,
+                state ?? {
+                    ...EMPTY_TRANSFORM,
+                    schema: transform_schema_for_sheet(sheet),
+                },
+                'restore',
+                'restore',
+            );
         }
     }, [
         source_epoch,
@@ -1644,6 +1689,7 @@ export function App(): React.JSX.Element {
         preview_mode,
         pending_excel_header,
         active_sheet_index,
+        applied_transforms,
         request_transform,
         save_in_flight,
         restore_blocker_epoch,

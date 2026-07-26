@@ -5837,10 +5837,37 @@ describe('an applied transform across a refresh', () => {
         csvEditingSupported: true,
         csvEditSessionId: 'test-edit-session',
     };
+    // Inactive but not empty: `transform_is_active` is false, yet the definition is
+    // still the user's and must survive the uninstall.
+    const DISABLED_FILTER_ONLY: SheetTransformState = {
+        sort: [],
+        filters: [{
+            id: 'f1',
+            colIndex: 0,
+            operator: 'contains',
+            value: 'x',
+            caseSensitive: false,
+            enabled: false,
+        }],
+        schema: '["Sheet1",1,null]',
+    };
+    // The other durable shape `transform_is_active` counts, hidden by a sibling.
+    const STORED_HIDDEN_ROWS: SheetTransformState = {
+        sort: [],
+        filters: [],
+        hiddenRows: [1, 3],
+        schema: '["Sheet1",1,null]',
+    };
     // A row height the user set, and a natural count the transformed count can be
     // told apart from — with make_meta's rowCount of 1 the reset is invisible.
     const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
     const FILTERED_ROW_COUNT = 3;
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
 
     function five_row_meta(): WorkbookMeta {
         const meta = make_meta(['Sheet1'], false);
@@ -5968,6 +5995,143 @@ describe('an applied transform across a refresh', () => {
             .toEqual(SIBLING_SORT.sort);
     });
 
+    it('does not ask to uninstall rules that are still active', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // Unchanged durable state, unchanged row basis: round 3's retention holds and
+        // the reconciliation must reach for the install branch.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // Exactly one ask, and it is the install. The two branches are exclusive: an
+        // empty ask alongside it would un-sort a view nobody asked to un-sort, which is
+        // what a reconciliation that read "inactive" from anything but the durable rules
+        // would produce.
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(transform_requests(post_message)).toHaveLength(1);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+    });
+
+    it('uninstalls it when a sibling clears the durable sort', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A sibling panel cleared the shared sort. That never un-installs *our*
+        // permutation, and it arrives as a same-basis refresh — the one shape that
+        // deliberately keeps `applied_transforms`. Without an uninstall the rows stay
+        // sorted behind a toolbar that shows no rules.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [undefined] },
+        }));
+
+        // The ask itself, not merely a state change: only the host can un-permute the
+        // loader, so nothing is fixed unless the empty view is actually requested.
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual([]);
+        expect(uninstall.state.hiddenRows ?? []).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: uninstall.state,
+            rowCount: 5,
+            requestId: uninstall.requestId,
+            generation: 3,
+            sourceGeneration: uninstall.sourceGeneration,
+            intent: uninstall.intent,
+        });
+
+        // And the grid agrees with the toolbar again: natural order, natural count.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+    });
+
+    it('keeps a disabled filter while uninstalling the sort around it', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A sibling dropped the sort and switched its filter off. The rules are now
+        // inactive, so the permutation has to go — but the filter definition is still
+        // the user's, one click from being re-enabled. Asking with a bare empty state
+        // would make the host record "no transform" and delete it.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [DISABLED_FILTER_ONLY] },
+        }));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual(DISABLED_FILTER_ONLY.filters);
+    });
+
+    it('uninstalls hidden rows a sibling unhid', async () => {
+        // Hidden rows travel the same durable path but are a different shape, so the
+        // empty view has to clear them too rather than only sorts and filters.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: { transforms: [STORED_HIDDEN_ROWS] },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.state.hiddenRows).toEqual(STORED_HIDDEN_ROWS.hiddenRows);
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: restore.state,
+            rowCount: 3,
+            requestId: restore.requestId,
+            generation: 2,
+            sourceGeneration: restore.sourceGeneration,
+            intent: restore.intent,
+        });
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { transforms: [undefined] },
+        }));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.hiddenRows ?? []).toEqual([]);
+        await dispatch_host_message({
+            type: 'transformApplied',
+            sheetIndex: 0,
+            state: uninstall.state,
+            rowCount: 5,
+            requestId: uninstall.requestId,
+            generation: 3,
+            sourceGeneration: uninstall.sourceGeneration,
+            intent: uninstall.intent,
+        });
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+    });
+
     it('drops it when the refresh changes the row basis', async () => {
         await editing_with_an_applied_sort();
 
@@ -6046,6 +6210,10 @@ describe('refused transforms', () => {
         return post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'setTransform');
+    }
+
+    function store_edits() {
+        return JSON.parse(grid_stub().getAttribute('data-store-edits')!);
     }
 
     /** Move the save in and back out of flight, the one dep the restore effect
@@ -6142,6 +6310,53 @@ describe('refused transforms', () => {
         post_message.mockClear();
         await settle_a_save();
         expect(transform_requests(post_message)).toEqual([]);
+    });
+
+    it('does not fold the live editor for a terminal refusal', async () => {
+        // The real shape of a terminal refusal: post_transform_error echoes
+        // `this._generation`, unchanged, because nothing installed. Editing is
+        // permitted while a transform computes, so the user can be mid-cell when it
+        // arrives — and folding then puts a half-typed value in the dirty store,
+        // where Escape can no longer take it back.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = Number(grid_stub().getAttribute('data-generation'));
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half', base: 'base' });
+        });
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await refuse_transform(request, {
+            transient: false,
+            generation: generation_before,
+        });
+
+        // Stated as the user experiences it: the partial value never reached the
+        // dirty store, so the cell is still cancellable.
+        // Stated as the user experiences it: the partial value never reached the
+        // dirty store, so the cell is still cancellable.
+        expect(store_edits()).toEqual({});
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // The refusal is still authoritative about the view itself.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // The paired direction, here rather than elsewhere so this test cannot pass by
+        // never folding at all: an ack that does move the generation remounts the grid,
+        // and the overlay has to be folded ahead of that or the value is lost. Cleared
+        // first so the count below is attributable to this ack and cannot be satisfied
+        // by a fold that already happened above.
+        grid_shell_mock.commit_live_edit.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(
+            latest_transform_request(post_message),
+            generation_before + 1,
+        );
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(store_edits()).toEqual({ '0:0': { value: 'half', base: 'base' } });
     });
 
     it('holds the stored transform back until a save settles', async () => {
