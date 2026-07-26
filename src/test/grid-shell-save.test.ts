@@ -16,6 +16,17 @@ const grid_mock = vi.hoisted(() => ({
         onGridSelectionChange?: (selection: unknown) => void;
         getCellContent?: (cell: [number, number]) => { data?: string };
     },
+    // Display row → canonical source row, and source row → that row's raw text.
+    //
+    // Both default to the identity/one-row fixture below, which is what a CSV
+    // with no transform installed actually reports. They are overridable because
+    // under an identity mapping a display-keyed and a source-keyed implementation
+    // are indistinguishable: any assertion about *which* row space a durable edit
+    // key is in is vacuous unless the two spaces are made to diverge. Keying the
+    // text fixture by source row (not display row) keeps the cell contents
+    // attached to the right row however the mapping is permuted.
+    source_row_for_display: null as null | ((display_row: number) => number | undefined),
+    text_for_source_row: null as null | ((source_row: number) => readonly string[]),
 }));
 
 vi.mock('@glideapps/glide-data-grid', () => {
@@ -34,15 +45,60 @@ vi.mock('@glideapps/glide-data-grid', () => {
     };
 });
 
+// Text a source row carries, honouring the overridable fixture.
+const source_row_text = vi.hoisted(() => (source_row: number): readonly string[] => (
+    grid_mock.text_for_source_row
+        ? grid_mock.text_for_source_row(source_row)
+        : (source_row === 0 ? ['base', 'middle', 'source-two'] : ['', '', ''])
+));
+
+// Residency, modelled the way the real loader's source→page index defines it: a
+// source row is readable exactly when some *display* row in the window claims it.
+// Scanning a bounded display window stands in for the index; the harness only ever
+// renders a handful of rows.
+const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
+    for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
+        const claimed = grid_mock.source_row_for_display
+            ? grid_mock.source_row_for_display(display_row)
+            : display_row;
+        if (claimed === source_row) return display_row;
+    }
+    return undefined;
+});
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: () => ({
         ensure_rows: vi.fn(),
-        get_row: (row: number) => [
-            { raw: row === 0 ? 'base' : '', formatted: row === 0 ? 'base' : '', bold: false, italic: false },
-            { raw: row === 0 ? 'middle' : '', formatted: row === 0 ? 'middle' : '', bold: false, italic: false },
-            { raw: row === 0 ? 'source-two' : '', formatted: row === 0 ? 'source-two' : '', bold: false, italic: false },
-        ],
-        get_source_row: (row: number) => row,
+        // Rows are looked up by display row but their *contents* are addressed by
+        // source row, exactly as the real loader does: the host ships each page's
+        // sourceRows alongside its rows, and a permuted view reorders the rows
+        // without renaming their canonical identities.
+        get_row: (display_row: number) => {
+            const source_row = grid_mock.source_row_for_display
+                ? grid_mock.source_row_for_display(display_row)
+                : display_row;
+            // Page not resident: the real loader returns undefined, which
+            // get_cell_raw must forward as "unknown", never as a blank cell.
+            if (source_row === undefined) return undefined;
+            return source_row_text(source_row).map((raw) => ({
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+            }));
+        },
+        get_source_row: (display_row: number) => (
+            grid_mock.source_row_for_display
+                ? grid_mock.source_row_for_display(display_row)
+                : display_row
+        ),
+        get_cell_raw_for_source: (source_row: number, col: number) => {
+            if (resident_display_row(source_row) === undefined) return undefined;
+            const raw = source_row_text(source_row)[col];
+            return raw === undefined ? '' : String(raw);
+        },
+        has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
         version: 0,
     }),
@@ -91,6 +147,14 @@ async function render_grid(
         save_lifecycle?: CsvSaveLifecycle;
         initial_edits?: Record<string, string | { value: string; base: string }>;
         edit_session?: EditSessionStore;
+        host_rejected_keys?: readonly string[];
+        on_editing_change?: (status: {
+            is_dirty: boolean;
+            has_live_uncommitted: boolean;
+            save_in_flight: boolean;
+            edits: Record<string, { value: string; base: string }>;
+            conflicted: readonly string[];
+        }) => void;
         generation?: number;
     } = {},
 ) {
@@ -236,6 +300,10 @@ afterEach(() => {
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    // Back to the identity mapping: a leaked permutation would silently change
+    // which source row every later test's edits land on.
+    grid_mock.source_row_for_display = null;
+    grid_mock.text_for_source_row = null;
     vi.unstubAllGlobals();
 });
 
@@ -626,5 +694,162 @@ describe('GridShell edits across a generation bump', () => {
         expect(Object.fromEntries(store.snapshot())).toEqual({
             '0:1': { value: 'store-only', base: 'middle' },
         });
+    });
+});
+
+// Every test here installs a NON-IDENTITY display→source mapping, because under
+// identity a display-keyed and a source-keyed save payload are byte-identical and
+// the assertions would prove nothing.
+describe('GridShell source-keyed save payloads', () => {
+    // Display row 0 shows source row 5 — what a sort or a filter produces.
+    function permute_display_0_to_source_5() {
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        grid_mock.text_for_source_row = (source_row: number) => (
+            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+        );
+    }
+
+    // Mount the Glide overlay editor Glide portals into `.gdg-clip-region`, and
+    // select the cell it belongs to, so read_live_edit sees an open editor.
+    async function open_overlay(value: string, cell: [number, number]) {
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = value;
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                columns: {},
+                rows: {},
+                current: {
+                    cell,
+                    range: { x: cell[0], y: cell[1], width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+    }
+
+    function posted_save(post_message: ReturnType<typeof vi.fn>) {
+        return [...post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message)
+            .find((message) => message?.type === 'saveCsv')?.operation;
+    }
+
+    it('posts a committed edit under its source-row key with that row\'s base', async () => {
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await edit_cell('typed');
+        expect(await request_save(editing_ref)).toBe(true);
+
+        // Display-keyed, this would post '0:0' — and its base would be whatever
+        // source row 0 holds, which is not the text the user was looking at.
+        const operation = posted_save(post_message);
+        expect(operation.edits).toEqual({ '5:0': 'typed' });
+        expect(operation.dirtyEdits).toEqual({
+            '5:0': { value: 'typed', base: 'five-a' },
+        });
+    });
+
+    it('folds an open overlay into the save under its source-row key', async () => {
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await open_overlay('overlay-text', [0, 0]);
+        expect(await request_save(editing_ref)).toBe(true);
+
+        // read_live_edit builds the key, so a display-keyed LiveEdit would poison
+        // the collectors even though nothing was ever committed through commit_edit.
+        const operation = posted_save(post_message);
+        expect(operation.edits).toEqual({ '5:0': 'overlay-text' });
+        expect(operation.dirtyEdits).toEqual({
+            '5:0': { value: 'overlay-text', base: 'five-a' },
+        });
+    });
+
+    it('drops an open overlay that reverts to the source row\'s own text', async () => {
+        // The fold rule reads `original` from the same source-keyed reader. Typing
+        // the display row's text back is a revert and must not save; a display-keyed
+        // `original` would read some other row and save a spurious edit.
+        permute_display_0_to_source_5();
+        const { post_message, editing_ref } = await render_grid();
+
+        await open_overlay('five-a', [0, 0]);
+        expect(await request_save(editing_ref)).toBe(false);
+        expect(posted_save(post_message)).toBeUndefined();
+    });
+
+    it('commit_live_edit writes the open overlay under its source-row key', async () => {
+        permute_display_0_to_source_5();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await open_overlay('typed but not closed', [0, 0]);
+        editing_ref.current!.commit_live_edit();
+
+        // Outside act on purpose, as in the identity-mapped test above: the
+        // write-through is synchronous.
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '5:0': { value: 'typed but not closed', base: 'five-a' },
+        });
+    });
+});
+
+describe('GridShell host-rejected save keys', () => {
+    it('discard_keys drops a host-named edit that discard_conflicted retains', async () => {
+        // Display row 0 shows source row 5, and source row 5's text still matches
+        // the edit's base, so is_entry_conflicted is false for it — the residency /
+        // agreement gate that makes discard_conflicted a no-op here.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        grid_mock.text_for_source_row = (source_row: number) => (
+            source_row === 5 ? ['five-a', 'five-b', 'five-c'] : ['', '', '']
+        );
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await edit_cell('typed');
+        expect(Object.keys(Object.fromEntries(store.snapshot()))).toEqual(['5:0']);
+
+        await act(async () => { editing_ref.current!.discard_conflicted(); });
+        expect(Object.fromEntries(store.snapshot())).toHaveProperty('5:0');
+
+        await act(async () => { editing_ref.current!.discard_keys(['5:0']); });
+        expect(Object.fromEntries(store.snapshot())).toEqual({});
+    });
+
+    it('reports a host-named key as conflicted only while the store holds it', async () => {
+        const statuses: { conflicted: readonly string[] }[] = [];
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+            host_rejected_keys: ['0:0'],
+            on_editing_change: (status) => { statuses.push(status); },
+        });
+
+        // Before any edit exists there is nothing to mark: a stale rejection must
+        // not tint a cell the store does not hold.
+        expect(statuses.at(-1)!.conflicted).toEqual([]);
+
+        // The edit's base agrees with the source, so the webview derives no
+        // conflict of its own — the union is the only thing that can report it.
+        await edit_cell('typed');
+        expect(statuses.at(-1)!.conflicted).toEqual(['0:0']);
+
+        await act(async () => { editing_ref.current!.discard_keys(['0:0']); });
+        expect(statuses.at(-1)!.conflicted).toEqual([]);
     });
 });

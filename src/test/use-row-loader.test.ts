@@ -127,6 +127,184 @@ describe('RowLoader', () => {
         expect(loader.get_source_row(3)).toBeUndefined();
     });
 
+    // Durable CSV edit keys are source-keyed, so conflict detection reads cells by
+    // canonical source row. Every test here permutes sourceRows away from the
+    // identity mapping: under identity a source-keyed read and a display-keyed one
+    // are indistinguishable, so an identity fixture would assert nothing.
+    describe('source-row index', () => {
+        it('reads a cell by canonical source row under a permuted page', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn());
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            expect(loader.on_row_data(
+                row_data(0, 0, 1, last_request(post).requestId, 3, [42, 7, 99]),
+            )).toBe(true);
+
+            // Source row 7 sits at display offset 1, whose cells are r1c*.
+            expect(loader.get_cell_raw_for_source(7, 0)).toBe('r1c0');
+            expect(loader.get_cell_raw_for_source(42, 1)).toBe('r0c1');
+            expect(loader.get_cell_raw_for_source(99, 0)).toBe('r2c0');
+            // Display rows are not source rows: 1 and 2 are not claimed at all.
+            expect(loader.has_source_row(7)).toBe(true);
+            expect(loader.has_source_row(1)).toBe(false);
+            expect(loader.get_cell_raw_for_source(1, 0)).toBeUndefined();
+        });
+
+        it('distinguishes a resident-blank cell from a non-resident source row', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn());
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            const reply = row_data(0, 0, 1, last_request(post).requestId, 2, [42, 7]);
+            // A blank cell and an absent cell must both read as '' when resident:
+            // that is exactly get_cell_raw's contract, which the source reader
+            // mirrors so `undefined` keeps meaning "unknown, never a conflict".
+            reply.rows = [[cell(''), null], [cell('x'), cell('y')]];
+            expect(loader.on_row_data(reply)).toBe(true);
+
+            expect(loader.get_cell_raw_for_source(42, 0)).toBe('');
+            expect(loader.get_cell_raw_for_source(42, 1)).toBe('');
+            expect(loader.get_cell_raw_for_source(7, 0)).toBe('x');
+            // Not resident at all — distinct from a resident blank.
+            expect(loader.get_cell_raw_for_source(500, 0)).toBeUndefined();
+            expect(loader.has_source_row(500)).toBe(false);
+        });
+
+        it('drops source claims when a page is evicted', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn(), 2); // cap = 2
+            loader.configure(0, 100_000, 1);
+            for (const start of [0, 100]) {
+                loader.ensure_rows(start, start + 10);
+                loader.on_row_data(
+                    row_data(0, start, 1, last_request(post, start).requestId, 2,
+                        [start + 1000, start + 1001]),
+                );
+            }
+            expect(loader.has_source_row(1000)).toBe(true);
+
+            // Push page 0 out: viewport is on 200, so nothing protects it.
+            loader.ensure_rows(200, 210);
+            loader.on_row_data(
+                row_data(0, 200, 1, last_request(post, 200).requestId, 2, [1200, 1201]),
+            );
+
+            // Assert residency, not the read: a leaked claim pointing at an evicted
+            // page still reads undefined, so a read-only assertion would pass with
+            // the retraction removed.
+            expect(loader.has_source_row(1000)).toBe(false);
+            expect(loader.has_source_row(1001)).toBe(false);
+            expect(loader.has_source_row(1100)).toBe(true);
+            expect(loader.has_source_row(1200)).toBe(true);
+        });
+
+        it('retracts stale claims when a page is redelivered with different identities', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn(), 2); // cap = 2
+            loader.configure(0, 100_000, 1);
+            loader.ensure_rows(0, 10);
+            expect(loader.on_row_data(
+                row_data(0, 0, 1, last_request(post, 0).requestId, 3, [42, 7, 99]),
+            )).toBe(true);
+
+            // Push page 0 out of the cache, then scroll back to it. Replacing a
+            // still-resident page is unreachable (a request is only posted for an
+            // absent page, and its pending id is consumed by the first reply), so
+            // evict-then-refetch is the reachable route to a page start being
+            // re-claimed — e.g. a refresh under a changed transform renames the
+            // rows it covers and drops one.
+            for (const start of [100, 200]) {
+                loader.ensure_rows(start, start + 10);
+                loader.on_row_data(
+                    row_data(0, start, 1, last_request(post, start).requestId, 2,
+                        [start + 1000, start + 1001]),
+                );
+            }
+            expect(loader.has_source_row(42)).toBe(false);
+
+            loader.ensure_rows(0, 10);
+            expect(loader.on_row_data(
+                row_data(0, 0, 1, last_request(post, 0).requestId, 2, [42, 55]),
+            )).toBe(true);
+
+            expect(loader.has_source_row(42)).toBe(true);
+            expect(loader.has_source_row(55)).toBe(true);
+            // 7 and 99 were page 0's before; nothing claims them now.
+            expect(loader.has_source_row(7)).toBe(false);
+            expect(loader.has_source_row(99)).toBe(false);
+            expect(loader.get_cell_raw_for_source(55, 0)).toBe('r1c0');
+        });
+
+        it('empties the source index on clear', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn());
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(
+                row_data(0, 0, 1, last_request(post).requestId, 2, [42, 7]),
+            );
+            expect(loader.has_source_row(42)).toBe(true);
+
+            loader.clear();
+            expect(loader.has_source_row(42)).toBe(false);
+            expect(loader.has_source_row(7)).toBe(false);
+            expect(loader.get_cell_raw_for_source(42, 0)).toBeUndefined();
+        });
+
+        it('lets the last ingest win a duplicated source row, and keeps it when the older page is evicted', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn(), 2); // cap = 2
+            loader.configure(0, 100_000, 1);
+            // Two pages both claiming source row 500. Only a host bug produces this
+            // (transform_indices is a permutation), but the map must stay total.
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(
+                row_data(0, 0, 1, last_request(post, 0).requestId, 2, [500, 501]),
+            );
+            loader.ensure_rows(100, 110);
+            loader.on_row_data(
+                row_data(0, 100, 1, last_request(post, 100).requestId, 2, [500, 601]),
+            );
+            // Last ingest wins: page 100's offset 0 renders r100c0.
+            expect(loader.get_cell_raw_for_source(500, 0)).toBe('r100c0');
+
+            // Evicting the OLDER page must not retract the newer claim.
+            loader.ensure_rows(200, 210);
+            loader.on_row_data(
+                row_data(0, 200, 1, last_request(post, 200).requestId, 2, [700, 701]),
+            );
+            expect(loader.has_source_row(501)).toBe(false); // page 0 is gone
+            expect(loader.has_source_row(500)).toBe(true);
+            expect(loader.get_cell_raw_for_source(500, 0)).toBe('r100c0');
+        });
+
+        it('leaves the source index untouched when an ingest is rejected', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, vi.fn());
+            loader.configure(0, 1000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(row_data(0, 0, 1, last_request(post, 0).requestId, 2, [42, 7]));
+
+            // Page 100's reply is malformed: length mismatch, then a negative
+            // identity. Every validation early-return must run before any indexing,
+            // so neither may leave a partial claim behind — nor disturb page 0's.
+            loader.ensure_rows(100, 110);
+            const request_id = last_request(post, 100).requestId;
+            expect(loader.on_row_data(row_data(0, 100, 1, request_id, 3, [900, 901]))).toBe(false);
+            expect(loader.on_row_data(row_data(0, 100, 1, request_id, 2, [900, -1]))).toBe(false);
+
+            expect(loader.has_source_row(900)).toBe(false);
+            expect(loader.has_source_row(901)).toBe(false);
+            expect(loader.has_source_row(42)).toBe(true);
+            expect(loader.get_cell_raw_for_source(7, 0)).toBe('r1c0');
+
+            // The request was never consumed, so the retry still lands.
+            expect(loader.on_row_data(row_data(0, 100, 1, request_id, 2, [900, 901]))).toBe(true);
+            expect(loader.has_source_row(900)).toBe(true);
+        });
+    });
+
     it('rejects mismatched rows and sourceRows atomically without consuming the request', () => {
         const post = vi.fn();
         const on_change = vi.fn();
@@ -318,6 +496,79 @@ describe('RowLoader', () => {
         expect(loader.get_source_row(100)).toBeUndefined();
         expect(loader.get_row(200)).toBeDefined();
         expect(loader.get_source_row(200)).toBe(1200);
+    });
+
+    // Explicit eviction holds. An open cell editor is the motivating case: Glide's
+    // overlay does not close on scroll, so the row whose identity the pending commit
+    // needs can be scrolled clean out of the viewport, and the viewport is the only
+    // thing `evict` protects by default.
+    describe('pin_rows', () => {
+        it('protects a pinned page that has left the viewport', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2); // cap = 2
+            loader.configure(0, 100_000, 1);
+
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            loader.pin_rows(0, 0);
+
+            // Scroll away far enough that page 0 is neither in the viewport nor the
+            // most recently used, so without the pin it is the eviction victim.
+            for (const start of [100, 200]) {
+                loader.ensure_rows(start, start + 10);
+                loader.on_row_data(reply_for(post, 0, start, 1));
+            }
+
+            expect(loader.pin_count).toBe(1);
+            expect(loader.get_row(0)).toBeDefined();
+            expect(loader.get_source_row(0)).toBe(0);
+            // The pin adds to the protected set rather than raising the cap: some
+            // other page paid for page 0's survival.
+            expect(loader.page_count).toBe(2);
+        });
+
+        it('lets the cap reclaim a page once its pin is released', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 100_000, 1);
+
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            const pin = loader.pin_rows(0, 0);
+
+            loader.ensure_rows(100, 110);
+            loader.on_row_data(reply_for(post, 0, 100, 1));
+
+            loader.unpin_rows(pin);
+            expect(loader.pin_count).toBe(0);
+            // Releasing does not itself evict (there is no call site for that); the
+            // next page landing is what trims, and now nothing shields page 0.
+            loader.ensure_rows(200, 210);
+            loader.on_row_data(reply_for(post, 0, 200, 1));
+
+            expect(loader.get_row(0)).toBeUndefined();
+            expect(loader.get_source_row(0)).toBeUndefined();
+            expect(loader.page_count).toBe(2);
+
+            // Releasing an already-released token is a no-op, so GridShell's
+            // belt-and-braces release legs cannot corrupt the map.
+            loader.unpin_rows(pin);
+            expect(loader.pin_count).toBe(0);
+        });
+
+        it('drops every pin on clear so a sheet switch cannot shrink the cap forever', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 100_000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            loader.pin_rows(0, 0);
+            expect(loader.pin_count).toBe(1);
+
+            loader.clear();
+
+            expect(loader.pin_count).toBe(0);
+        });
     });
 
     it('does not request pages past the row count', () => {

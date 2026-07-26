@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     changed_highlight_keys,
     changed_tint_keys,
-    visible_highlight_damage,
+    visible_source_key_damage,
 } from '../webview/grid-repaint-model';
 
 const s = (...keys: string[]): Set<string> => new Set(keys);
@@ -43,7 +43,7 @@ describe('highlight repaint', () => {
     });
 
     it('maps source keys through visible transformed rows and columns', () => {
-        const damage = visible_highlight_damage(
+        const damage = visible_source_key_damage(
             s('10:2', '11:1', '99:2'),
             { x: 0, y: 5, width: 2, height: 2 },
             (source_column) => source_column === 2 ? 1 : undefined,
@@ -53,7 +53,7 @@ describe('highlight repaint', () => {
     });
 
     it('ignores offscreen rows, hidden columns, and malformed keys', () => {
-        expect(visible_highlight_damage(
+        expect(visible_source_key_damage(
             s('2:3', 'bad'),
             { x: 0, y: 0, width: 3, height: 2 },
             () => undefined,

@@ -64,8 +64,18 @@ const grid_mock = vi.hoisted(() => ({
         x: 30, y: 10, width: 100, height: 36,
     })),
     loader_enabled: [] as boolean[],
+    // Display row → canonical source row; null means identity, which is what a
+    // CSV with no transform installed reports. Overridable so a test can make the
+    // two row spaces diverge — the only condition under which an assertion about
+    // durable edit-key row space is non-vacuous.
+    source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
     ensure_rows_loaded: vi.fn(async () => true),
+    // Eviction holds. Recorded rather than simulated: what the loader does with a
+    // pin is pinned by use-row-loader.test.ts; what matters here is that GridShell
+    // takes one when an overlay opens and gives it back when the overlay closes.
+    pin_rows: vi.fn((_start: number, _end: number) => Symbol('test-pin')),
+    unpin_rows: vi.fn((_token: symbol) => {}),
     post_message: vi.fn(),
     get_row: vi.fn((_row?: number) => [
         { raw: 'source-a', formatted: 'source-a', bold: false, italic: false },
@@ -104,6 +114,20 @@ vi.mock('@glideapps/glide-data-grid', () => {
     };
 });
 
+// Lowest display row claiming `source_row`, or undefined if none does. Scanning a
+// bounded display window stands in for the loader's source→page index; the harness
+// only ever renders a handful of rows.
+const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
+    for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
+        const claimed = grid_mock.source_row_for_display
+            ? grid_mock.source_row_for_display(display_row)
+            : display_row;
+        if (claimed === source_row) return display_row;
+    }
+    return undefined;
+});
+
 vi.mock('../webview/use-row-loader', () => ({
     use_row_loader: (
         _sheet: number,
@@ -115,8 +139,28 @@ vi.mock('../webview/use-row-loader', () => ({
         return {
             ensure_rows: grid_mock.ensure_rows,
             ensure_rows_loaded: grid_mock.ensure_rows_loaded,
+            pin_rows: grid_mock.pin_rows,
+            unpin_rows: grid_mock.unpin_rows,
             get_row: grid_mock.get_row,
-            get_source_row: (row: number) => row,
+            // Identity unless a test installs a permutation. See the knob's
+            // declaration: with display === source, a display-keyed and a
+            // source-keyed implementation cannot be told apart.
+            get_source_row: (display_row: number) => (
+                grid_mock.source_row_for_display
+                    ? grid_mock.source_row_for_display(display_row)
+                    : display_row
+            ),
+            // Residency as the real loader's source→page index defines it: a source
+            // row is readable exactly when some display row in the window claims it.
+            get_cell_raw_for_source: (source_row: number, col: number) => {
+                const display_row = resident_display_row(source_row);
+                if (display_row === undefined) return undefined;
+                const cell = grid_mock.get_row(display_row)?.[col];
+                return cell ? String(cell.raw ?? '') : '';
+            },
+            has_source_row: (source_row: number) => (
+                resident_display_row(source_row) !== undefined
+            ),
             sample_loaded_rows: () => [],
             version: 0,
         };
@@ -193,6 +237,46 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
     };
 }
 
+// Mount the overlay editor Glide would portal into `.gdg-clip-region`, for the
+// currently rendered grid. Selecting the cell first is load-bearing: the capture
+// reads the selection, exactly as Glide's overlay does (it owns the overlay's
+// coordinates and our hook's editing_cell stays null). A separate React root
+// stands in for the portal; the component still closes over this GridShell's
+// refs, which is all the capture needs.
+async function open_tracking_overlay(cell: [number, number], text: string) {
+    const on_selection_change = grid_mock.props!.onGridSelectionChange as
+        (selection: unknown) => void;
+    await act(async () => on_selection_change({
+        columns: compact([]),
+        rows: compact([]),
+        current: {
+            cell,
+            range: { x: cell[0], y: cell[1], width: 1, height: 1 },
+            rangeStack: [],
+        },
+    }));
+    const value = { kind: 'text', data: text, displayData: text, allowOverlay: true };
+    const provide_editor = grid_mock.props!.provideEditor as
+        (cell: unknown) => { editor: React.ComponentType<any> } | undefined;
+    const provided = provide_editor(value);
+    if (!provided) throw new Error('No overlay editor provided');
+    const clip = document.createElement('div');
+    clip.className = 'gdg-clip-region';
+    document.body.appendChild(clip);
+    const overlay_root = createRoot(clip);
+    await act(async () => {
+        overlay_root.render(React.createElement(provided.editor, {
+            value,
+            onChange: () => {},
+            onFinishedEditing: () => {},
+        }));
+    });
+    return async function close_overlay() {
+        await act(async () => overlay_root.unmount());
+        clip.remove();
+    };
+}
+
 async function render_grid(initial: GridShellProps) {
     vi.resetModules();
     vi.stubGlobal('acquireVsCodeApi', () => ({
@@ -217,6 +301,9 @@ afterEach(() => {
     container = null;
     document.body.innerHTML = '';
     grid_mock.props = null;
+    // Back to identity: a leaked permutation would silently change which source
+    // row every later test's edits land on.
+    grid_mock.source_row_for_display = null;
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.overlay_repaint.mockReset();
@@ -230,6 +317,9 @@ afterEach(() => {
     grid_mock.ensure_rows.mockReset();
     grid_mock.ensure_rows_loaded.mockReset();
     grid_mock.ensure_rows_loaded.mockImplementation(async () => true);
+    grid_mock.pin_rows.mockReset();
+    grid_mock.pin_rows.mockImplementation(() => Symbol('test-pin'));
+    grid_mock.unpin_rows.mockReset();
     grid_mock.post_message.mockReset();
     grid_mock.get_row.mockReset();
     grid_mock.get_row.mockImplementation(() => [
@@ -1758,6 +1848,315 @@ describe('GridShell column projection', () => {
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
         expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 40);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+});
+
+// Every test here installs a NON-IDENTITY display→source mapping. Under identity
+// a display-keyed and a source-keyed implementation are indistinguishable, so an
+// identity fixture would make each of these assertions vacuous.
+describe('GridShell source-row edit identity', () => {
+    // Display row 1's source identity is unresolved (its page has not landed);
+    // every other display row maps to itself.
+    const unresolved_row_1 = (display_row: number) => (
+        display_row === 1 ? undefined : display_row
+    );
+
+    it('refuses to open an overlay on a row whose source identity is unresolved', async () => {
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowOverlay: boolean; readonly?: boolean };
+
+        // No source row ⇒ no durable key ⇒ no overlay, and `readonly` closes
+        // Glide's paste path, which never consults allowOverlay.
+        const blocked = get_cell_content([0, 1]);
+        expect(blocked.allowOverlay).toBe(false);
+        expect(blocked.readonly).toBe(true);
+
+        // A resolved row on the same render stays editable.
+        const open = get_cell_content([0, 0]);
+        expect(open.allowOverlay).toBe(true);
+        expect(open.readonly).toBeUndefined();
+    });
+
+    it('keeps a resident blank cell editable', async () => {
+        // Today's behavior, and the thing the overlay-open gate must not regress:
+        // a resident row whose cell is empty is still typeable.
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '', formatted: '', bold: false, italic: false },
+            { raw: '', formatted: '', bold: false, italic: false },
+            { raw: '', formatted: '', bold: false, italic: false },
+        ] as any);
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data: string; allowOverlay: boolean };
+        const blank = get_cell_content([0, 2]);
+        expect(blank.data).toBe('');
+        expect(blank.allowOverlay).toBe(true);
+    });
+
+    // Mid-edit eviction. The overlay's lifetime spans "opened" and "committed", and
+    // Glide's overlay does not close on scroll, so the page holding the edited row
+    // can be evicted between the two. Re-deriving identity at commit time then
+    // yields undefined for a row that was resolvable when the user started typing,
+    // and the commit guards — there to refuse a *genuinely* unresolvable row —
+    // silently drop the text instead. `has_uncommitted_changes` would then report
+    // false, so the exit dialog would not even offer to save it.
+    //
+    // Both tests below use display 0 ↔ source 5 so the surviving key proves *which*
+    // identity was used, and flip the mapping to fully-unresolved to model the
+    // eviction rather than a permutation change.
+    const evict_everything = () => { grid_mock.source_row_for_display = () => undefined; };
+
+    it('commits an evicted overlay under the source key it opened with', async () => {
+        const statuses: { edits: Record<string, { value: string; base: string }> }[] = [];
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            on_editing_change: (status) => { statuses.push(status as never); },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowOverlay: boolean };
+        // Resolvable at open time — the precondition the drop silently violates.
+        expect(get_cell_content([0, 0]).allowOverlay).toBe(true);
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        // Opening takes an eviction hold on the edited display row, which is the
+        // other half of the fix: without it the base below is unreadable.
+        expect(grid_mock.pin_rows).toHaveBeenCalledWith(0, 0);
+
+        evict_everything();
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
+
+        // Under the captured identity, not a guess and not nothing: '0:0' would be
+        // some other row's cell, and dropping it would lose typed text.
+        expect(Object.keys(statuses.at(-1)!.edits)).toEqual(['5:0']);
+        expect(statuses.at(-1)!.edits['5:0'].value).toBe('typed');
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+
+        // And the hold is given back on close, so the pin cannot outlive the edit.
+        await close_overlay();
+        const token = grid_mock.pin_rows.mock.results[0]!.value as symbol;
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(token);
+    });
+
+    it('folds an evicted overlay into the save under the key it opened with', async () => {
+        // The same drop on the read_live_edit path, which is what collect_save_edits
+        // consumes: an overlay the user never closed before hitting Save.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 0 ? 5 : display_row + 100
+        );
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            edit_session_id: 'session-1',
+            on_save_request: (edits, dirty_edits) => ({
+                editSessionId: 'session-1',
+                saveRequestId: 'save-1',
+                edits,
+                dirtyEdits: dirty_edits,
+            }),
+        }));
+
+        await open_tracking_overlay([0, 0], 'live text');
+        evict_everything();
+
+        let posted = false;
+        await act(async () => { posted = editing_ref.current!.request_save(); });
+        expect(posted).toBe(true);
+
+        const save = [...grid_mock.post_message.mock.calls]
+            .reverse()
+            .map(([message]) => message as { type?: string; operation?: {
+                edits: Record<string, string>;
+            } })
+            .find((message) => message?.type === 'saveCsv');
+        // Dropped, this save posts nothing at all (request_save returns false on an
+        // empty map); display-keyed, it posts '0:0'.
+        expect(save!.operation!.edits).toEqual({ '5:0': 'live text' });
+    });
+
+    it('commits nothing when onCellEdited fires on an unresolved row', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.source_row_for_display = unresolved_row_1;
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+        }));
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+
+        // Glide's paste path can reach onCellEdited without an overlay, so this is
+        // the second guard: an unresolvable row must land no edit at all rather
+        // than land one under a guessed key.
+        await act(async () => on_cell_edited([0, 1], { kind: 'text', data: 'pasted' }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(false);
+
+        // Same grid, resolved row: the edit does land, so the guard is not simply
+        // disabling all editing.
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('discards the edit under the clicked row\'s source key and reports it dirty', async () => {
+        // Display row 1 ↔ source row 7. A display-keyed discard would target
+        // '1:2' — an entry that does not exist — and leave '7:2' dirty.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        }));
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        // The menu's `dirty` probe is source-keyed too: a display-keyed probe would
+        // miss and hide this item entirely.
+        const discard = Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Discard edit');
+        expect(discard).toBeDefined();
+
+        await act(async () => discard!.click());
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(false);
+    });
+
+    it('copies a dirty cell keyed by source row under a permuted mapping', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '7:2': { value: 'edited-c', base: 'source-c' } },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy cell')!.click());
+        // A display-keyed copy overlay would miss the edit and copy 'source-c'.
+        expect(write_text).toHaveBeenCalledWith('edited-c');
+    });
+
+    it('damages the display coordinates of a source-keyed tint change', async () => {
+        // Source row 7 is displayed at row 1. A tint repaint that treated the
+        // changed key's row as a display coordinate would damage row 7 — outside
+        // the visible region entirely — and paint nothing.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            editing_ref,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        }));
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 2, height: 3 }));
+        grid_mock.update_cells.mockClear();
+
+        // Bulk transition: clear_dirty drops '7:2' from the dirty set.
+        await act(async () => editing_ref.current!.clear_dirty());
+
+        // Source column 2 is display column 1; source row 7 is display row 1.
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+    });
+
+    it('repaints a cell the host named on a rejected save', async () => {
+        // The webview cannot derive this conflict: '7:2' still agrees with source
+        // row 7's text, so is_entry_conflicted is false for it. Only the union with
+        // the host's rejected keys can tint the cell — and the targeted repaint
+        // effect has to actually notice that union change, which is the leg this
+        // test pins rather than assumes.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const base_props = props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '7:2': { value: 'dirty-c', base: 'source-c' } },
+        });
+        const GridShell = await render_grid(base_props);
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 2, height: 3 }));
+        grid_mock.update_cells.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base_props,
+                host_rejected_keys: ['7:2'],
+            }));
+        });
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+
+        // Un-marked by the same machinery once the rejection is resolved.
+        grid_mock.update_cells.mockClear();
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...base_props,
+                host_rejected_keys: [],
+            }));
+        });
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
     });
 });
 

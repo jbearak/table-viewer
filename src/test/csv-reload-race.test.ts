@@ -1348,15 +1348,20 @@ describe('CSV reload races', () => {
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
         let call = 0;
 
+        // Two data rows from the start, and the save edits a row that exists.
+        // Previously this file had one row and the save was keyed at row 1, relying
+        // on serialize_csv appending a row to reach rowCount 2 — a policy that is
+        // gone (an edit past the last source row is now rejected before the write,
+        // see validate_dirty_bases), and which was never what this test is about.
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => {
             call++;
-            if (call <= 2) return enc.encode('h\na\n'); // initial parse + verification
+            if (call <= 2) return enc.encode('h\na\nb\n'); // initial parse + verification
             if (call === 3) return stale.promise; // in-flight watcher parse
-            if (call === 4) return enc.encode('h\na\n'); // save conflict check
+            if (call === 4) return enc.encode('h\na\nb\n'); // save conflict check
             // The postSave candidate and stale candidate verification see the
             // written bytes, so the older candidate must be rejected.
-            return enc.encode('h\na\nb\n');
+            return enc.encode('h\nA\nb\n');
         });
 
         open_csv_table(uri('/tmp/save.csv'));
@@ -1368,7 +1373,9 @@ describe('CSV reload races', () => {
         const reload_done = watcher.__fireChange();      // starts the in-flight reload
         await flush_promises();
 
-        await panel.__receive({ type: 'saveCsv', edits: { '1:0': 'b' } });
+        // Row 0, whose on-disk text is 'a' — which is also the base the mock's
+        // legacy `edits` shorthand synthesizes, so this save validates.
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'A' } });
 
         // The older reload resolves only after the save has adopted its result.
         stale.resolve(enc.encode('h\nx\ny\nz\n'));                  // rowCount 3
@@ -1682,7 +1689,11 @@ describe('CSV reload races', () => {
 
     it('lets a same-stat external watcher supersede a stalled postSave candidate', async () => {
         const file_path = '/tmp/post-save-external-supersede.csv';
-        let bytes = enc.encode('h\naaaaa\n');
+        // 'a' rather than 'aaaaa': host-side base validation compares the save's
+        // base against this text, and the mock's legacy `edits` shorthand
+        // synthesizes `base: 'a'`. The external bytes below are still chosen to
+        // match the saved bytes in size and mtime, which is the point of the test.
+        let bytes = enc.encode('h\na\n');
         let builds = 0;
         const post_save_started = deferred<void>();
         const release_post_save = deferred<void>();

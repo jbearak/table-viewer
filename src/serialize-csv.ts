@@ -10,6 +10,18 @@ import type { CellData } from './types';
  * full `(CellData | null)[][]` keep working unchanged. The absolute row index is
  * tracked manually as we iterate, since `edits` and `original_column_counts` are
  * both keyed/indexed by absolute row number.
+ *
+ * An edit keyed past the last source row is **dropped**, not appended. Under
+ * source-keyed edit identity a stale edit at row 90,000 in a file that shrank to
+ * 10 rows would have padded ~89,990 blank lines out to it — and because
+ * `build_line_index` counts a field per LF, those blank lines re-parse as rows, so
+ * a 10-row CSV would reopen as a 90,001-row table. Nothing in `src/` uses
+ * `WorkspaceEdit`/`applyEdit`, so `write_file` is a raw filesystem write with
+ * nothing on VS Code's undo stack: that outcome is unrecoverable. Saves carrying
+ * such an edit are rejected before serialization instead — see
+ * `validate_dirty_bases` (csv-base-validation.ts), whose `removedRows` outcome
+ * covers exactly this case — so dropping here is the safe residual behavior for a
+ * caller that skipped validation, not the policy the user ever sees.
  */
 export function serialize_csv(
     rows: Iterable<(CellData | null)[]>,
@@ -21,19 +33,16 @@ export function serialize_csv(
 ): string {
     const lines: string[] = [];
 
-    // Precompute per-row max edited column so the inner loop is O(1), and the
-    // highest edited row so edits that land past the source's last row (e.g. a
-    // stale edit left over after the file shrank on an external reload) are
-    // still written instead of being silently dropped on save.
+    // Precompute per-row max edited column so the inner loop is O(1). Column
+    // growth *is* a supported feature (an edit beyond a row's original field
+    // count widens that row); row growth is not — see the header comment.
     let max_edit_col: Map<number, number> | undefined;
-    let max_edit_row = -1;
     if (edits) {
         max_edit_col = new Map();
         for (const key of Object.keys(edits)) {
             const [er, ec] = key.split(':').map(Number);
             const cur = max_edit_col.get(er);
             if (cur === undefined || ec > cur) max_edit_col.set(er, ec);
-            if (er > max_edit_row) max_edit_row = er;
         }
     }
 
@@ -63,13 +72,6 @@ export function serialize_csv(
     for (const row of rows) {
         lines.push(serialize_row(r, row));
         r++;
-    }
-
-    // Append any edits keyed beyond the last source row, filling the gap with
-    // empty rows. serialize_row reads only `edits` for these (the source row is
-    // empty), so a gap row with no edit collapses to a blank line.
-    for (; r <= max_edit_row; r++) {
-        lines.push(serialize_row(r, []));
     }
 
     // A logically empty sheet serializes to empty output, not a lone terminator.

@@ -22,16 +22,21 @@ export interface DirtyEntry extends CsvDirtyEntry {
 }
 
 /**
- * Reads a cell's current persisted raw text from the paged cache. A loaded but
- * blank cell yields ''; a row whose page is NOT resident (evicted from / not yet
- * fetched into the row-loader LRU) yields `undefined`. This distinction is
- * load-bearing: conflict detection treats `undefined` as "unknown", never as a
- * changed value, so an evicted page can never produce a false conflict. The hook
- * never holds onto the full grid, so editing scales to ~1M rows; conflict
+ * Reads a cell's current persisted raw text from the paged cache, addressed by
+ * **canonical source row** — the same row space durable edit keys are in, which
+ * is what lets this store stay row-space-agnostic: it splits a key and hands the
+ * row component straight here, and the two agree by construction.
+ *
+ * A loaded but blank cell yields ''; a source row that is NOT resident yields
+ * `undefined` — its page was evicted from (or never fetched into) the row-loader
+ * LRU, or the row is filtered out of the current view entirely. This distinction
+ * is load-bearing: conflict detection treats `undefined` as "unknown", never as a
+ * changed value, so a non-resident row can never produce a false conflict. The
+ * hook never holds onto the full grid, so editing scales to ~1M rows; conflict
  * detection compares against {@link DirtyEntry.base}, snapshotted at edit-start,
  * so it never depends on a page that may since have been evicted.
  */
-export type GetCellRaw = (row: number, col: number) => string | undefined;
+export type GetCellRaw = (source_row: number, col: number) => string | undefined;
 
 export function clear_saved_dirty_entries(
     dirty: ReadonlyMap<string, DirtyEntry>,

@@ -109,7 +109,7 @@ import { read_overlay_editor_value } from './live-editor';
 import {
     changed_highlight_keys,
     changed_tint_keys,
-    visible_highlight_damage,
+    visible_source_key_damage,
 } from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
 import {
@@ -179,6 +179,15 @@ export interface EditingHandle {
     clear_dirty(): void;
     /** Drop only edits whose underlying cell drifted (conflict resolution). */
     discard_conflicted(): void;
+    /**
+     * Drop exactly the named source-keyed edits. Separate from
+     * {@link discard_conflicted}, whose meaning is defined by
+     * `is_entry_conflicted` and is therefore residency-gated: the keys the *host*
+     * names on a rejected save are precisely the ones that predicate cannot see
+     * (a filtered-out row, an evicted page, a row past the row count), so
+     * overloading it would leave the blocking entry in place.
+     */
+    discard_keys(keys: readonly string[]): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
     commit_live_edit(): void;
     /** True when there are committed edits or an open editor with changes. */
@@ -263,6 +272,14 @@ export interface GridShellProps {
      * mount-scoped store seeded from `initial_edits`.
      */
     edit_session?: EditSessionStore;
+    /**
+     * Source-keyed keys the host refused the last save over. Unioned into the
+     * conflict tint so a `baseMismatch` cell is visibly marked even though the
+     * webview's own residency-gated conflict detection cannot flag it. A
+     * `rowsRemoved` key has no cell to tint (its row is past `row_count`), which is
+     * why the banner names its row numbers instead.
+     */
+    host_rejected_keys?: readonly string[];
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
     // actions so App's toolbar + conflict banner can drive editing that lives here.
@@ -335,6 +352,7 @@ export function GridShell({
     on_save_request = () => undefined,
     initial_edits,
     edit_session,
+    host_rejected_keys,
     on_editing_change,
     editing_ref,
     auto_fit_ref,
@@ -503,8 +521,11 @@ export function GridShell({
     const {
         ensure_rows,
         ensure_rows_loaded,
+        pin_rows,
+        unpin_rows,
         get_row,
         get_source_row,
+        get_cell_raw_for_source,
         sample_loaded_rows,
         version,
     } = loader;
@@ -546,33 +567,66 @@ export function GridShell({
     const save_in_flight_ref = useRef(restored_save_operation !== undefined);
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
-    // Stabilized against get_row's per-render identity; `version` in the deps
-    // makes conflict detection re-run as freshly-loaded pages arrive.
+    // Stabilized against the loader's per-render callback identities; `version` in
+    // the deps makes conflict detection re-run as freshly-loaded pages arrive.
+    // `get_row_ref` is still the copy path's reader (display-keyed, by design).
     const get_row_ref = useRef(get_row);
     get_row_ref.current = get_row;
+    const get_cell_raw_for_source_ref = useRef(get_cell_raw_for_source);
+    get_cell_raw_for_source_ref.current = get_cell_raw_for_source;
+    // First parameter is a **canonical source row**, not a display row: durable
+    // edit keys are source-keyed, and the store hands the row component of a key
+    // straight to this reader (is_entry_conflicted / resolve_pending_bases).
+    //
+    // The `saved_edits_ref` lookup below is the subtle part. Those keys come from
+    // the in-flight save operation's edits, which are source-keyed after this PR,
+    // so the lookup lines up automatically — *but only because this row parameter
+    // is now a source row too*. A display-keyed reader over a source-keyed store
+    // would type-check, compile, and miss on every permuted row, silently
+    // comparing conflicts against the wrong base.
     const get_cell_raw = useCallback(
-        (r: number, c: number): string | undefined => {
-            const saved = saved_edits_ref.current[`${r}:${c}`];
+        (source_row: number, c: number): string | undefined => {
+            const saved = saved_edits_ref.current[`${source_row}:${c}`];
             if (saved !== undefined) return saved;
-            const row = get_row_ref.current(r);
-            // Page not resident (evicted / not yet fetched): return undefined so
-            // conflict detection treats it as unknown, never as a changed value.
-            if (row === undefined) return undefined;
-            const cell = row[c];
-            return cell ? String(cell.raw ?? '') : '';
+            // Source row not resident (evicted, not yet fetched, or filtered out of
+            // the current view): undefined so conflict detection treats it as
+            // unknown, never as a changed value.
+            return get_cell_raw_for_source_ref.current(source_row, c);
         },
         [version],
     );
 
     const {
         dirty_cells,
-        conflicted_keys,
+        conflicted_keys: derived_conflicted_keys,
         commit_edit,
         clear_dirty,
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
     } = use_editing(get_cell_raw, generation, edit_session_id, store);
+
+    // Tint set = what the webview can derive ∪ what the host named. The union is
+    // what everything downstream consumes (the paint callback's ref, the targeted
+    // repaint effect's diff, and the status reported to App), so a host-named cell
+    // is marked and un-marked by exactly the same machinery as a derived one. Only
+    // keys the store actually holds are included: a stale rejection naming an
+    // already-discarded edit must not keep tinting, and `dirty_cells` is what
+    // decides whether a cell is painted with an overlay at all.
+    //
+    // `conflicted` reported up to App stays this union too. That is deliberate: a
+    // host-named mismatch *is* a conflict from the user's point of view, and the
+    // alternative (App reconciling two sets) would put the same union in two places.
+    const conflicted_keys = useMemo(() => {
+        if (!host_rejected_keys || host_rejected_keys.length === 0) {
+            return derived_conflicted_keys;
+        }
+        const union = new Set(derived_conflicted_keys);
+        for (const key of host_rejected_keys) {
+            if (dirty_cells.has(key)) union.add(key);
+        }
+        return union;
+    }, [derived_conflicted_keys, host_rejected_keys, dirty_cells]);
     const applied_save_lifecycle_revision_ref = useRef(save_lifecycle.revision);
     const [save_in_flight, set_save_in_flight] = useState(
         restored_save_operation !== undefined,
@@ -690,8 +744,9 @@ export function GridShell({
     // stable across edits — otherwise every commit would rebuild the closure and
     // invalidate Glide's whole per-cell cache. Targeted repaints (below) drive the
     // actual damage instead.
-    // conflicted_keys still needs a mirror: it is derived in the hook from
-    // get_cell_raw rather than stored, so there is nothing stable to read it from.
+    // conflicted_keys still needs a mirror: it is derived (in the hook from
+    // get_cell_raw, then unioned with the host's rejected keys above) rather than
+    // stored, so there is nothing stable to read it from.
     const conflicted_keys_ref = useRef(conflicted_keys);
     conflicted_keys_ref.current = conflicted_keys;
     const grid_selection_ref = useRef(grid_selection);
@@ -887,6 +942,104 @@ export function GridShell({
         schedule_pending_preview_restore,
     ]);
 
+    // --- Open-overlay identity capture + page pin -----------------------------
+    // Durable edit identity has a *lifetime*, not an instant: the user opens an
+    // overlay on display row 12, types, and only later presses Enter. Between
+    // those two moments the page holding row 12 can leave — Glide's overlay does
+    // not close on scroll (its ClickOutsideContainer listens for pointer events
+    // only), and every page that lands while scrolling away runs `evict`, whose
+    // protect set is the current viewport plus in-flight bulk copies. Nothing
+    // there covers the row under an open editor.
+    //
+    // Re-deriving the source row at commit time therefore yields `undefined` for a
+    // row that was perfectly resolvable when the overlay opened, and the commit
+    // guards would discard text the user typed and watched appear — the exact
+    // failure the overlay-open gate exists to prevent, arrived at from the other
+    // side. So resolve identity once, when the overlay mounts, and hold it:
+    //
+    //  - capture: the commit falls back to the identity the overlay opened with,
+    //    which keeps the typed text even if the page is already gone;
+    //  - pin: the page stays resident, so `get_cell_raw` can still read the
+    //    entry's conflict base (capture alone cannot supply that).
+    //
+    // Both are needed. The pin alone still loses the row across a sheet switch or
+    // reload (which clear the cache outright); the capture alone leaves the base
+    // unreadable.
+    const open_overlay_row_ref = useRef<{
+        display_row: number;
+        source_row: number;
+        pin: symbol;
+    } | null>(null);
+    // Stable handles so the tracking editor's memo identity never churns: Glide
+    // remounts (and unfocuses) the overlay editor whenever the component identity
+    // changes, which would defeat the very capture below.
+    const pin_rows_ref = useRef(pin_rows);
+    pin_rows_ref.current = pin_rows;
+    const unpin_rows_ref = useRef(unpin_rows);
+    unpin_rows_ref.current = unpin_rows;
+    const get_source_row_ref = useRef(get_source_row);
+    get_source_row_ref.current = get_source_row;
+
+    const release_open_overlay_row = useCallback(() => {
+        const captured = open_overlay_row_ref.current;
+        if (!captured) return;
+        open_overlay_row_ref.current = null;
+        unpin_rows_ref.current(captured.pin);
+    }, []);
+
+    const capture_open_overlay_row = useCallback(() => {
+        // Defensive: an overlay opening while a previous capture is still live
+        // would otherwise strand that pin forever, permanently shrinking the LRU
+        // cap. Glide only ever has one overlay open, so this is belt and braces.
+        release_open_overlay_row();
+        const loc = grid_selection_ref.current.current?.cell;
+        if (!loc) return;
+        const display_row = loc[1];
+        const source_row = get_source_row_ref.current(display_row);
+        // Unresolved identity: nothing to remember and nothing worth pinning. The
+        // overlay-open gate means this is unreachable for a real editor mount, and
+        // leaving the ref null keeps the commit guards' early return intact.
+        if (source_row === undefined) return;
+        open_overlay_row_ref.current = {
+            display_row,
+            source_row,
+            pin: pin_rows_ref.current(display_row, display_row),
+        };
+    }, [release_open_overlay_row]);
+
+    /**
+     * Canonical source row for a commit arriving from the open overlay. Live
+     * residency first — that is the truth for every path that did not come through
+     * an overlay (Glide's paste path, most importantly, which never opens one).
+     * Only when the row is no longer resident does the identity captured at
+     * overlay-open time stand in, and only for the row it was captured for: a
+     * mismatched display row means this commit is not that overlay's, so the
+     * caller's early return still applies.
+     */
+    const commit_source_row = useCallback((row: number): number | undefined => {
+        const resident = get_source_row(row);
+        if (resident !== undefined) return resident;
+        const captured = open_overlay_row_ref.current;
+        return captured !== null && captured.display_row === row
+            ? captured.source_row
+            : undefined;
+    }, [get_source_row]);
+
+    // Leaving edit mode (or a save taking the grid read-only) makes provide_editor
+    // stop supplying an editor, which unmounts it and runs the cleanup below — but
+    // only if Glide re-renders the overlay. Releasing here too makes the lifecycle
+    // independent of that: an unreleased pin would hold a page resident for the
+    // rest of the session.
+    useEffect(() => {
+        if (editable_cells) return;
+        release_open_overlay_row();
+    }, [editable_cells, release_open_overlay_row]);
+
+    // Unmount (a generation/sheet remount, or the webview closing). The loader's
+    // own unmount clears its pins as well, so this is the belt to that braces —
+    // kept because the two are separate objects and only this one knows the ref.
+    useEffect(() => release_open_overlay_row, [release_open_overlay_row]);
+
     // Read the value + location of an open Glide overlay editor. Glide owns the
     // overlay (our hook's editing_cell stays null), so the location comes from the
     // selected cell and the live text from the portalled .gdg-clip-region input.
@@ -898,12 +1051,20 @@ export function GridShell({
         const [display_column, row] = loc;
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return null;
+        // The `key` is a durable edit key, so it must be fully source-keyed: the
+        // save collectors (collect_save_edits / collect_exact_dirty_edits) merge it
+        // straight into the source-keyed dirty map, and a display-keyed LiveEdit
+        // would poison them. Falls back to the identity captured when this overlay
+        // opened, so an editor whose page left mid-edit still reaches the save
+        // rather than being silently dropped (see commit_source_row).
+        const source_row = commit_source_row(row);
+        if (source_row === undefined) return null;
         return {
-            key: `${row}:${source_column}`,
+            key: `${source_row}:${source_column}`,
             value,
-            original: get_cell_raw(row, source_column) ?? '',
+            original: get_cell_raw(source_row, source_column) ?? '',
         };
-    }, [get_cell_raw, source_column_for_display]);
+    }, [commit_source_row, get_cell_raw, source_column_for_display]);
 
     // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
     // open and on every keystroke and clears it on close, so the editing-status
@@ -938,13 +1099,16 @@ export function GridShell({
             || operation.saveRequestId.length === 0
         ) return false;
         if (live) {
-            const [row, source_column] = live.key.split(':').map(Number);
-            if (Number.isInteger(row) && Number.isInteger(source_column)) {
+            // `source_row` despite reading like a display row: `live.key` is
+            // source-keyed (see read_live_edit) and commit_edit's first parameter is
+            // a source row, so this split needs no conversion.
+            const [source_row, source_column] = live.key.split(':').map(Number);
+            if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
                 // Accept the open editor's current value before closing the mutation
                 // boundary. The store's write is synchronous, so the value is
                 // visible to every synchronous guard below and to failure
                 // restoration, without waiting for React to commit.
-                commit_edit(row, source_column, live.value);
+                commit_edit(source_row, source_column, live.value);
             }
         }
         save_operation_ref.current = operation;
@@ -975,9 +1139,11 @@ export function GridShell({
         if (save_in_flight_ref.current) return;
         const live = read_live_edit();
         if (!live) return;
-        const [row, source_column] = live.key.split(':').map(Number);
-        if (!Number.isInteger(row) || !Number.isInteger(source_column)) return;
-        commit_edit(row, source_column, live.value);
+        // Source-keyed already: `live.key` comes from read_live_edit and
+        // commit_edit's first parameter is a source row. No conversion here.
+        const [source_row, source_column] = live.key.split(':').map(Number);
+        if (!Number.isInteger(source_row) || !Number.isInteger(source_column)) return;
+        commit_edit(source_row, source_column, live.value);
         set_live_uncommitted(false);
     }, [commit_edit, read_live_edit, save_in_flight_ref]);
 
@@ -1009,6 +1175,14 @@ export function GridShell({
         if (save_in_flight_ref.current) return;
         discard_conflicted();
     }, [discard_conflicted, save_in_flight_ref]);
+    const guarded_discard_keys = useCallback((keys: readonly string[]) => {
+        if (save_in_flight_ref.current) return;
+        if (keys.length === 0) return;
+        // Host-named keys are already source-keyed, so they go straight into the
+        // source-keyed store with no conversion — the payoff for having moved
+        // durable identity to the source row first.
+        clear_dirty_keys(new Set(keys));
+    }, [clear_dirty_keys, save_in_flight_ref]);
 
     // Expose the imperative actions to App through the ref it provides.
     useEffect(() => {
@@ -1017,6 +1191,7 @@ export function GridShell({
             request_save,
             clear_dirty: guarded_clear_dirty,
             discard_conflicted: guarded_discard_conflicted,
+            discard_keys: guarded_discard_keys,
             commit_live_edit,
             has_uncommitted_changes,
         };
@@ -1028,6 +1203,7 @@ export function GridShell({
         request_save,
         guarded_clear_dirty,
         guarded_discard_conflicted,
+        guarded_discard_keys,
         commit_live_edit,
         has_uncommitted_changes,
     ]);
@@ -1089,8 +1265,13 @@ export function GridShell({
         (display_column: number, row: number): string => {
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return '';
-            const key = `${row}:${source_column}`;
-            const dirty = store.get(key);
+            // Source-keyed dirty lookup. When the source row is unresolved there
+            // can be no edit to show, so fall through to the persisted-cell path
+            // below (which reads the same non-resident row and yields '').
+            const source_row = get_source_row(row);
+            const dirty = source_row === undefined
+                ? undefined
+                : store.get(`${source_row}:${source_column}`);
             if (dirty) return dirty.value;
 
             const merge = merge_index.entry_at(row, source_column);
@@ -1108,7 +1289,14 @@ export function GridShell({
             if (!cell) return '';
             return show_formatting ? cell.formatted : (cell.raw ?? '');
         },
-        [get_row, merge_index, show_formatting, source_column_for_display, store],
+        [
+            get_row,
+            get_source_row,
+            merge_index,
+            show_formatting,
+            source_column_for_display,
+            store,
+        ],
     );
 
     const measure_line_width = useCallback(
@@ -1177,6 +1365,11 @@ export function GridShell({
             row: number,
             cell_bounds: { x: number; y: number; width: number; height: number },
         ) => {
+            // Deliberately a **display**-space key, unlike the dirty-map keys: this
+            // is a hover-dedup cache for the cell the pointer is physically over,
+            // not an edit identity. Keying it by source row would make two display
+            // rows that share a source row dedup against each other and suppress
+            // the second one's tooltip.
             const key = `${row}:${display_column}`;
             // Same cell still hovered — keep an already-visible tooltip, or let
             // the pending timer fire. Avoid restarting the dwell on every move.
@@ -1324,10 +1517,37 @@ export function GridShell({
                     allowOverlay: false,
                 };
             }
-            const key = `${row}:${source_column}`;
-            const dirty = store.get(key);
+            // Resolve durable edit identity at overlay-open time, not at commit:
+            // the one thing we must never do is accept typed text and then drop it
+            // for want of a source row. No key ⇒ no dirty lookup, no conflict tint,
+            // and no overlay.
+            //
+            // Deliberately does NOT call ensure_rows to fetch the missing page.
+            // This is Glide's per-cell paint callback (every visible cell, every
+            // frame) and ensure_rows *overwrites* the loader's `viewport`, so one
+            // cell's coordinates would clobber the real visible range. It is also
+            // unnecessary: `on_visible_region_changed` already requests exactly the
+            // rows Glide paints, so the page is in flight, and the `version` dep
+            // below repaints the cell — making it editable — once it lands.
+            //
+            // That does mean a real, if small, behavior change: a cell on a
+            // not-yet-landed page is briefly non-editable where today it is
+            // immediately editable. It self-heals within one host round-trip, and
+            // the alternative (editable now, silently discard the edit later) is
+            // not acceptable.
+            const source_row = get_source_row(row);
+            const key = source_row === undefined
+                ? undefined
+                : `${source_row}:${source_column}`;
+            const dirty = key === undefined ? undefined : store.get(key);
             const merge = merge_index.entry_at(row, source_column);
-            const highlight_source_row = get_source_row(merge?.startRow ?? row);
+            // Reuse the row's own resolution when there is no merge, which is the
+            // overwhelmingly common case: `entry_at` returns null on a sheet with no
+            // merges, and a second get_source_row for the identical row is a second
+            // `locate()` allocation per cell per frame.
+            const highlight_source_row = merge === null
+                ? source_row
+                : get_source_row(merge.startRow);
             const highlight_source_column = merge?.startCol ?? source_column;
             const highlight_bg = highlight_source_row === undefined
                 ? undefined
@@ -1336,18 +1556,27 @@ export function GridShell({
                     highlight_source_column,
                 );
             // Tint + dirty text whenever an edit exists; open the overlay only in
-            // edit mode. Empty/unloaded cells stay editable so blanks can be typed.
+            // edit mode and only where source identity resolved. A resident blank
+            // cell stays editable so blanks can still be typed.
             // dirty read through the stable `store` handle and conflict through
             // conflicted_keys_ref — never through the subscribed dirty_cells — so
             // this closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
+            const editable = editable_cells && source_row !== undefined;
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || highlight_bg) {
                 overlay = {
-                    editable: editable_cells,
+                    editable,
+                    // `refused` is narrower than `!editable` on purpose: it means
+                    // "editing is on here and we are refusing this cell", which is
+                    // the only situation where Glide's paste path needs closing. A
+                    // read-only sheet is not refusing anything — it never offered —
+                    // and it does reach this branch, via highlight_bg, which is
+                    // plain view state independent of edit mode.
+                    refused: editable_cells && source_row === undefined,
                     dirty_value: dirty?.value,
                     bg: dirty
-                        ? conflicted_keys_ref.current.has(key)
+                        ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
                             : dirty_bg
                         : highlight_bg,
@@ -1391,12 +1620,27 @@ export function GridShell({
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return;
+            // Resolve source identity here as well as at overlay-open time.
+            // get_cell_content's `editable` gate covers the overlay and Glide's
+            // activation/delete paths, but Glide's paste path never consults
+            // `allowOverlay` (see the `readonly` flag in cell-renderer.ts), so this
+            // is the second of the two guards keeping an unresolvable row from
+            // landing an edit under the wrong key.
+            //
+            // Live residency first, then the identity this overlay opened with:
+            // Glide passes `overlay.cell` (the coordinates the editor opened on) to
+            // onFinishEditing, so the captured entry names exactly this commit's row
+            // and the guard keeps refusing only the genuinely unresolvable case.
+            const source_row = commit_source_row(row);
+            if (source_row === undefined) return;
             const text =
                 new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
-            commit_edit(row, source_column, text);
+            commit_edit(source_row, source_column, text);
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
+            // TODO(PR 4): row heights are still keyed by *display* row, so the
+            // on_row_resize call below stays display-keyed and ungated here.
             if (text.includes('\n')) {
                 const needed = natural_row_height(
                     text,
@@ -1425,6 +1669,7 @@ export function GridShell({
             on_row_resize,
             display_column_count,
             source_column_for_display,
+            commit_source_row,
             save_in_flight_ref,
         ],
     );
@@ -1434,11 +1679,27 @@ export function GridShell({
     // Refreshes on open and on every keystroke, clears on close. Memoized so its
     // identity is stable — Glide would otherwise remount (and unfocus) the editor
     // on each parent render.
+    //
+    // Its mount/unmount is also the "overlay opened / closed" hook, and the only
+    // one available: Glide owns the overlay's lifetime and exposes no open
+    // callback, and onFinishedEditing fires on close but not on open. So the same
+    // effect that arms live_uncommitted captures this overlay's source-row identity
+    // and pins its page, and the cleanup releases both — which is what makes the
+    // pin release airtight for the ordinary close (Enter/Esc/click-away), a
+    // selection move, and an unmount.
     const tracking_editor = useMemo(() => {
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
+                capture_open_overlay_row();
                 refresh_live_uncommitted();
-                return () => set_live_uncommitted(false);
+                return () => {
+                    // Ordering matters: on_cell_edited already ran by the time Glide
+                    // tears the editor down (onFinishEditing commits, then clears the
+                    // overlay), so releasing here cannot strip the capture out from
+                    // under the commit that needs it.
+                    release_open_overlay_row();
+                    set_live_uncommitted(false);
+                };
             }, []);
             const handle_change = (next: GridCell) => {
                 if (save_in_flight_ref.current) return;
@@ -1448,7 +1709,12 @@ export function GridShell({
             return <CsvCellEditor {...props} onChange={handle_change} />;
         }
         return TrackingCsvCellEditor;
-    }, [refresh_live_uncommitted, save_in_flight_ref]);
+    }, [
+        capture_open_overlay_row,
+        refresh_live_uncommitted,
+        release_open_overlay_row,
+        save_in_flight_ref,
+    ]);
 
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
     // cancel). Only consulted for editable Text cells.
@@ -1776,17 +2042,25 @@ export function GridShell({
         const get_displayed_row = (
             row_index: number,
         ): (RenderedCell | null)[] | undefined => {
-            const source_row = get_row_ref.current(row_index);
+            // `source_cells` is the row's *cells* (formerly misnamed source_row),
+            // renamed so the real source row below can carry that name.
+            const source_cells = get_row_ref.current(row_index);
+            if (source_cells === undefined) return undefined;
+            // Edit keys are source-keyed, so the dirty/live lookups need this row's
+            // canonical identity. Bailing when it is unresolved matches the residency
+            // rule above: a row must be resident before edits are overlaid, and a
+            // resolved source row is exactly what residency means here.
+            const source_row = get_source_row(row_index);
             if (source_row === undefined) return undefined;
             let displayed_row: (RenderedCell | null)[] | undefined;
             for (const source_column of selection.source_columns) {
-                const key = `${row_index}:${source_column}`;
+                const key = `${source_row}:${source_column}`;
                 const displayed_value = live?.key === key
                     ? live.value
                     : dirty.get(key)?.value;
                 if (displayed_value === undefined) continue;
-                displayed_row ??= [...source_row];
-                const source_cell = source_row[source_column];
+                displayed_row ??= [...source_cells];
+                const source_cell = source_cells[source_column];
                 displayed_row[source_column] = {
                     raw: displayed_value,
                     formatted: displayed_value,
@@ -1795,7 +2069,7 @@ export function GridShell({
                     rawType: 'string',
                 };
             }
-            return displayed_row ?? source_row;
+            return displayed_row ?? source_cells;
         };
         const result = format_selection_tsv(
             selection,
@@ -1820,6 +2094,7 @@ export function GridShell({
     }, [
         columns,
         display_column_for_source,
+        get_source_row,
         merge_index,
         read_live_edit,
         sheet_meta.columnNames,
@@ -1919,10 +2194,16 @@ export function GridShell({
     const discard_edit = useCallback(
         (row: number, display_column: number, source_column: number) => {
             if (save_in_flight_ref.current) return;
-            clear_dirty_keys(new Set([`${row}:${source_column}`]));
+            // Source-keyed, so resolve the row's identity. A dirty cell was resident
+            // when it was committed, but its page may have been evicted since — with
+            // no source row there is no key to remove, and guessing one would delete
+            // some other row's edit.
+            const source_row = get_source_row(row);
+            if (source_row === undefined) return;
+            clear_dirty_keys(new Set([`${source_row}:${source_column}`]));
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
-        [clear_dirty_keys, save_in_flight_ref],
+        [clear_dirty_keys, get_source_row, save_in_flight_ref],
     );
 
     const apply_column_sort = useCallback((
@@ -2346,23 +2627,19 @@ export function GridShell({
         prev_conflicted_keys_ref.current = conflicted_keys;
         const grid = grid_ref.current;
         if (!grid || changed.size === 0) return;
-        const r = visible_ref.current;
-        const cells: { cell: Item }[] = [];
-        for (const key of changed) {
-            const [row, source_column] = key.split(':').map(Number);
-            const display_column = display_column_for_source(source_column);
-            if (
-                display_column !== undefined &&
-                display_column >= r.x &&
-                display_column < r.x + r.width &&
-                row >= r.y &&
-                row < r.y + r.height
-            ) {
-                cells.push({ cell: [display_column, row] });
-            }
-        }
+        // Dirty keys are source-keyed, so a changed key's row is a source row and
+        // cannot be used as a display coordinate. Reuse the shared visible-row scan
+        // the highlight effect already uses: it maps source → display over the
+        // visible range and handles one source row appearing at several display
+        // rows, which a reverse display lookup could not.
+        const cells = visible_source_key_damage(
+            changed,
+            visible_ref.current,
+            display_column_for_source,
+            get_source_row,
+        ).map(({ cell }) => ({ cell: cell as Item }));
         if (cells.length > 0) grid.updateCells(cells);
-    }, [dirty_cells, conflicted_keys, display_column_for_source]);
+    }, [dirty_cells, conflicted_keys, display_column_for_source, get_source_row]);
 
     const previous_highlights_ref = useRef<SheetCellHighlightState['cells']>();
     const [highlight_version, set_highlight_version] = useState(0);
@@ -2376,7 +2653,7 @@ export function GridShell({
         // land before Glide's first draw still paint (the one-shot repaint()
         // below can lose that race).
         set_highlight_version((n) => n + 1);
-        const cells = visible_highlight_damage(
+        const cells = visible_source_key_damage(
             changed,
             visible_ref.current,
             display_column_for_source,
@@ -2434,8 +2711,13 @@ export function GridShell({
                 0,
             ) * highlight_selection.sourceColumns.length
             : 0;
+        // Source-keyed dirty probe. An unresolved source row reports `false` rather
+        // than guessing: it is also the case where discard_edit would have no key to
+        // remove, so hiding "Discard edit" is the consistent answer.
+        const menu_source_row = get_source_row(row);
         cell_menu_items = cell_context_menu_items({
-            dirty: dirty_cells.has(`${row}:${source_col}`),
+            dirty: menu_source_row !== undefined
+                && dirty_cells.has(`${menu_source_row}:${source_col}`),
             is_multi_cell: !!range && range.width * range.height > 1,
             preview_mode,
             can_hide_rows: !!selected_rows

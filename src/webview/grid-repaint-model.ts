@@ -43,8 +43,16 @@ export interface VisibleCellDamage {
     cell: readonly [number, number];
 }
 
-/** Map changed canonical source keys to currently visible display cells only. */
-export function visible_highlight_damage(
+/**
+ * Map changed canonical source keys (`"source_row:source_column"`) to currently
+ * visible display cells only. Shared by both source-keyed repaint effects — cell
+ * highlights and dirty/conflict tints — hence the space-neutral name.
+ *
+ * Builds a source→display map over the visible rows rather than consulting a
+ * reverse display lookup: one source row can legitimately occupy several display
+ * rows, and every one of them has to be damaged.
+ */
+export function visible_source_key_damage(
     changed: ReadonlySet<string>,
     visible: { x: number; y: number; width: number; height: number },
     display_column_for_source: (source_column: number) => number | undefined,

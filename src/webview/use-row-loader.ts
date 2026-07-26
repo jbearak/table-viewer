@@ -14,9 +14,27 @@ export interface UseRowLoader {
      * caller can abandon the operation.
      */
     ensure_rows_loaded(start_row: number, end_row: number): Promise<boolean>;
+    /**
+     * Hold the pages covering the inclusive range resident until the returned
+     * token is released. For a row whose identity something outside the viewport
+     * depends on — an open cell editor — since the viewport-based protection in
+     * `evict` cannot see it.
+     */
+    pin_rows(start_row: number, end_row: number): symbol;
+    /** Release a {@link pin_rows} hold. Unknown/stale tokens are ignored. */
+    unpin_rows(token: symbol): void;
     get_row(row: number): (RenderedCell | null)[] | undefined;
     /** Canonical source-row identity for a resident display row. */
     get_source_row(row: number): number | undefined;
+    /**
+     * A cell's persisted raw text addressed by canonical source row. `''` for a
+     * resident-but-blank cell, `undefined` when the source row is not resident —
+     * the contract source-keyed conflict detection reads through (see
+     * `GetCellRaw` in edit-session-store.ts).
+     */
+    get_cell_raw_for_source(source_row: number, col: number): string | undefined;
+    /** Whether a canonical source row is currently resident on some cached page. */
+    has_source_row(source_row: number): boolean;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
@@ -70,15 +88,29 @@ export function use_row_loader(
         (s: number, en: number) => loader.ensure_rows_loaded(s, en),
         [loader],
     );
+    const pin_rows = useCallback(
+        (s: number, en: number) => loader.pin_rows(s, en),
+        [loader],
+    );
+    const unpin_rows = useCallback((token: symbol) => loader.unpin_rows(token), [loader]);
     const get_row = useCallback((r: number) => loader.get_row(r), [loader]);
     const get_source_row = useCallback((r: number) => loader.get_source_row(r), [loader]);
+    const get_cell_raw_for_source = useCallback(
+        (source_row: number, col: number) => loader.get_cell_raw_for_source(source_row, col),
+        [loader],
+    );
+    const has_source_row = useCallback((source_row: number) => loader.has_source_row(source_row), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
         ensure_rows,
         ensure_rows_loaded,
+        pin_rows,
+        unpin_rows,
         get_row,
         get_source_row,
+        get_cell_raw_for_source,
+        has_source_row,
         sample_loaded_rows,
         version,
     };

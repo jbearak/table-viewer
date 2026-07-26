@@ -89,14 +89,14 @@ describe('use_editing', () => {
         await render();
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 1); });
-        expect(hook_result!.editing_cell).toEqual({ row: 0, col: 1, value: 'b' });
+        expect(hook_result!.editing_cell).toEqual({ source_row: 0, source_col: 1, value: 'b' });
     });
 
     it('start_editing on null cell uses empty string', async () => {
         await render();
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(2, 1); });
-        expect(hook_result!.editing_cell).toEqual({ row: 2, col: 1, value: '' });
+        expect(hook_result!.editing_cell).toEqual({ source_row: 2, source_col: 1, value: '' });
     });
 
     it('confirm_edit stores the dirty value', async () => {
@@ -167,6 +167,32 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.confirm_edit('X'); });
         const entry = hook_result!.dirty_cells.get('2:1');
         expect(entry).toEqual({ value: 'X', base: '' });
+    });
+
+    it('names the open cell in source space, on a row only the source reader resolves', async () => {
+        // The hook takes and reports source coordinates end to end: EditingCell's
+        // fields are source_row/source_col, the store key is built from them, and
+        // get_cell_raw's domain is source rows. Pin that with a reader that
+        // resolves *only* source row 7 — no viewport-relative offset can reach it,
+        // so a conversion sneaking back onto this path would read an unloaded row
+        // and both assertions below would collapse to ''.
+        const resident: (CellData | null)[][] = [];
+        resident[7] = [cell('base')];
+        await render(resident, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.start_editing(7, 0); });
+        expect(hook_result!.editing_cell).toEqual({
+            source_row: 7,
+            source_col: 0,
+            value: 'base',
+        });
+
+        await act(async () => { hook_result!.confirm_edit('edited'); });
+        expect(hook_result!.dirty_cells.get('7:0')).toEqual({
+            value: 'edited',
+            base: 'base',
+        });
+        expect(hook_result!.editing_cell).toBe(null);
     });
 });
 
@@ -246,6 +272,29 @@ describe('conflict detection', () => {
         expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
     });
 
+    it('detects a conflict on a source row the reader resolves in isolation', async () => {
+        // Durable edit keys are source-keyed, and the store splits a key and hands
+        // the row component straight to get_cell_raw — so the reader's domain is
+        // source rows, not display offsets. Model that with a reader that resolves
+        // *only* source row 7: no display-window position is available, so a
+        // conflict can only be found by passing the key's row through unchanged.
+        const resident: (CellData | null)[][] = [];
+        resident[7] = [cell('base')];
+        await render(resident, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(7, 0, 'edited'); });
+        expect(hook_result!.dirty_cells.has('7:0')).toBe(true);
+        expect(hook_result!.dirty_cells.get('7:0')!.base).toBe('base');
+        expect(hook_result!.conflicted_keys.size).toBe(0);
+
+        // Source row 7 drifts (external change to that row).
+        const drifted: (CellData | null)[][] = [];
+        drifted[7] = [cell('drifted')];
+        await rerender(drifted, 1);
+
+        expect(hook_result!.conflicted_keys.has('7:0')).toBe(true);
+    });
+
     it('does not mark conflict when base value unchanged after reload', async () => {
         await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
@@ -321,11 +370,11 @@ describe('conflict detection', () => {
 
         // Now start editing a non-conflicted cell (0:2)
         await act(async () => { hook_result!.start_editing(0, 2); });
-        expect(hook_result!.editing_cell).toEqual({ row: 0, col: 2, value: 'c' });
+        expect(hook_result!.editing_cell).toEqual({ source_row: 0, source_col: 2, value: 'c' });
 
         // Discard conflicted should NOT close the active editor on the non-conflicted cell
         await act(async () => { hook_result!.discard_conflicted(); });
-        expect(hook_result!.editing_cell).toEqual({ row: 0, col: 2, value: 'c' });
+        expect(hook_result!.editing_cell).toEqual({ source_row: 0, source_col: 2, value: 'c' });
         // Conflicted entry removed, non-conflicted entries preserved
         expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
         expect(hook_result!.dirty_cells.has('0:1')).toBe(true);

@@ -168,6 +168,42 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect(to?.bgCell).toBe('#332200');
     });
 
+    it('marks a refused overlay cell readonly, and an editable one not', () => {
+        // Glide's paste path never consults allowOverlay — pasteToCell gates on
+        // isReadWriteCell, which for a Text cell checks only `readonly !== true` —
+        // so a cell we refuse to open an overlay on needs this flag too or a paste
+        // (or cut) still lands on it.
+        const blocked = ecell(1, { editable: false, refused: true, bg: '#332200' });
+        expect((blocked as { allowOverlay: boolean }).allowOverlay).toBe(false);
+        expect((blocked as { readonly?: boolean }).readonly).toBe(true);
+
+        const editable = ecell(1, { editable: true });
+        expect((editable as { readonly?: boolean }).readonly).toBeUndefined();
+    });
+
+    it('leaves a highlight-only overlay on a read-only sheet un-readonly', () => {
+        // Cell highlights are plain view state, available with editing off and on
+        // non-CSV files, and GridShell builds an overlay for them so the tint can be
+        // painted. Keying `readonly` off `!editable` would therefore make a
+        // highlighted read-only cell announce aria-readonly="true" (Glide derives it
+        // from isReadWriteCell) while its unhighlighted neighbour does not — an
+        // accessibility difference keyed on a colour. Nothing is being refused here:
+        // editing was never offered.
+        const highlighted = ecell(1, { bg: 'rgba(0, 128, 255, 0.2)' });
+        expect((highlighted as { allowOverlay: boolean }).allowOverlay).toBe(false);
+        expect('readonly' in highlighted).toBe(false);
+        expect(
+            (highlighted as { themeOverride?: { bgCell?: string } }).themeOverride?.bgCell,
+        ).toBe('rgba(0, 128, 255, 0.2)');
+    });
+
+    it('leaves a no-overlay read-only cell shape untouched', () => {
+        // A read-only sheet passes no overlay at all; the conditional spread must
+        // keep its cell shape (and every snapshot of it) exactly as before.
+        const c = build_grid_cell(0, 1, plain_rows, plain_idx, true);
+        expect('readonly' in c).toBe(false);
+    });
+
     it('renders an empty cell as an editable dirty cell', () => {
         // col 2 is null in the row, but a dirty edit on an empty CSV cell must
         // still display its value and open the editor.

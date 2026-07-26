@@ -24,6 +24,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
+    discard_keys: vi.fn((_keys: readonly string[]) => {}),
     commit_live_edit: vi.fn(),
     focus_grid: vi.fn(),
     select_all: vi.fn(),
@@ -83,12 +84,14 @@ vi.mock('../webview/grid-shell', () => ({
         } | undefined;
         initial_edits?: Record<string, string | { value: string; base: string }>;
         edit_session?: EditSessionStore;
+        host_rejected_keys?: readonly string[];
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
         editing_ref?: {
             current: {
                 request_save: () => boolean;
                 clear_dirty: () => void;
                 discard_conflicted: () => void;
+                discard_keys: (keys: readonly string[]) => void;
                 commit_live_edit: () => void;
                 has_uncommitted_changes: () => boolean;
             } | null;
@@ -234,6 +237,7 @@ vi.mock('../webview/grid-shell', () => ({
                 },
                 clear_dirty: grid_shell_mock.clear_dirty,
                 discard_conflicted: grid_shell_mock.discard_conflicted,
+                discard_keys: grid_shell_mock.discard_keys,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
@@ -254,6 +258,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
+                'data-host-rejected-keys': JSON.stringify(props.host_rejected_keys ?? []),
                 'data-initial-edits': JSON.stringify(props.initial_edits ?? null),
                 'data-store-edits': JSON.stringify(Object.fromEntries(store_edits)),
                 'data-mount-id': String(mount_id.current),
@@ -692,6 +697,7 @@ function cleanup() {
     grid_shell_mock.request_save.mockReturnValue(false);
     grid_shell_mock.clear_dirty.mockReset();
     grid_shell_mock.discard_conflicted.mockReset();
+    grid_shell_mock.discard_keys.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.select_all.mockReset();
@@ -3624,6 +3630,543 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'discardEditSession' }));
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    // Host-rejected saves. These are the deadlock case: the keys the host names are
+    // exactly the ones the webview's residency-gated `is_entry_conflicted` cannot
+    // flag, so every one of these tests reports NO webview-derived conflicts.
+    it('shows the conflict banner for a host base mismatch with no derived conflicts', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 900,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-1',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+
+        // The real shell restores the submitted dirty map on a failed lifecycle and
+        // then reports it; the stub's mount effect re-emits its default status
+        // instead, so replay the report to model the post-rejection state.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        const banner = container!.querySelector('.conflict-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toContain('1 edit no longer matches');
+        expect(banner!.textContent).toContain('save was cancelled');
+        // The host keys reach the grid so the cell is tinted like a derived conflict.
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
+    it('names the affected row numbers when the file shrank under an edit', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '7:0': { value: 'orphan', base: 'gone' },
+            '7:2': { value: 'orphan too', base: 'gone' },
+        });
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 901,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-2',
+                    edits: { '7:0': 'orphan', '7:2': 'orphan too' },
+                    dirtyEdits: {
+                        '7:0': { value: 'orphan', base: 'gone' },
+                        '7:2': { value: 'orphan too', base: 'gone' },
+                    },
+                },
+            },
+            rejection: { reason: 'rowsRemoved', keys: ['7:0', '7:2'] },
+        });
+
+        // The real shell restores the submitted dirty map on a failed lifecycle and
+        // then reports it; the stub's mount effect re-emits its default status
+        // instead, so replay the report to model the post-rejection state.
+        await report_grid_editing(true, true, [], {
+            '7:0': { value: 'orphan', base: 'gone' },
+            '7:2': { value: 'orphan too', base: 'gone' },
+        });
+
+        const banner = container!.querySelector('.conflict-banner');
+        expect(banner).not.toBeNull();
+        // Two edits on one removed row is one row to report, 1-based.
+        expect(banner!.textContent).toContain('File shrank externally');
+        expect(banner!.textContent).toContain('1 edited row no longer exists');
+        expect(banner!.textContent).toContain('Affected row: 8');
+    });
+
+    it('discards exactly the host-named keys from the banner', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '0:0': { value: 'fine', base: 'a' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 902,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-3',
+                    edits: { '4:1': 'edited', '0:0': 'fine' },
+                    dirtyEdits: {
+                        '4:1': { value: 'edited', base: 'stale' },
+                        '0:0': { value: 'fine', base: 'a' },
+                    },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+
+        // The real shell restores the submitted dirty map on a failed lifecycle and
+        // then reports it; the stub's mount effect re-emits its default status
+        // instead, so replay the report to model the post-rejection state. The
+        // reported `conflicted` includes '4:1' because GridShell folds the host keys
+        // into the set it reports — nothing here derived it, which is exactly why
+        // discard_conflicted cannot clear it.
+        await report_grid_editing(true, true, ['4:1'], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '0:0': { value: 'fine', base: 'a' },
+        });
+
+        await click_button('Discard Conflicted');
+
+        // Not discard_conflicted: that predicate is false for every host-named key,
+        // so it would leave the entry that is blocking the save.
+        expect(grid_shell_mock.discard_conflicted).not.toHaveBeenCalled();
+        expect(grid_shell_mock.discard_keys).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
+    });
+
+    it('clears host-named and derived conflicts in one press', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        // '4:1' is the host's verdict; '9:3' is one the webview derived on its own
+        // (its page is resident, so is_entry_conflicted could see the drift). The
+        // grid reports the union, which is what the banner tints.
+        await report_grid_editing(true, true, ['4:1', '9:3'], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '9:3': { value: 'local', base: 'drifted' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 905,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-4',
+                    edits: { '4:1': 'edited', '9:3': 'local' },
+                    dirtyEdits: {
+                        '4:1': { value: 'edited', base: 'stale' },
+                        '9:3': { value: 'local', base: 'drifted' },
+                    },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, ['4:1', '9:3'], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '9:3': { value: 'local', base: 'drifted' },
+        });
+
+        await click_button('Discard Conflicted');
+
+        // Both mechanisms fire: discard_keys can only reach the host's key, and
+        // discard_conflicted can only reach the derived one. Dropping either call
+        // would leave half the tinted cells dirty and the banner still up.
+        expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
+        expect(grid_shell_mock.discard_conflicted).toHaveBeenCalledTimes(1);
+    });
+
+    it('dismisses a host rejection once its edits leave the dirty map', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '0:0': { value: 'fine', base: 'a' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 903,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-4',
+                    edits: { '4:1': 'edited', '0:0': 'fine' },
+                    dirtyEdits: {
+                        '4:1': { value: 'edited', base: 'stale' },
+                        '0:0': { value: 'fine', base: 'a' },
+                    },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+
+        // The real shell restores the submitted dirty map on a failed lifecycle and
+        // then reports it; the stub's mount effect re-emits its default status
+        // instead, so replay the report to model the post-rejection state.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+            '0:0': { value: 'fine', base: 'a' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // The rejected entry is gone (discarded here, but any route out of the map
+        // counts) while an unrelated edit remains: the banner and the tint must both
+        // clear, since the host is no longer refusing anything that still exists.
+        await report_grid_editing(true, true, [], {
+            '0:0': { value: 'fine', base: 'a' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('does not re-raise a resolved rejection when the same cell is edited again', async () => {
+        // Trigger A. Membership in the rejected-key list is not enough: the user
+        // discards the rejected edit and types into the same cell again, and the
+        // fresh entry's base was re-read from the file the host had just changed.
+        // That edit has never been submitted, so a banner claiming "save was
+        // cancelled" over it is describing an event that did not happen — and the
+        // grid would tint a cell nothing is wrong with.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 904,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-5',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // Discard Conflicted drops '4:1'…
+        await report_grid_editing(false, false, [], {});
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+
+        // …and the user retypes into that very cell. Same key, new edit: a fresh
+        // value over a base read from the current file.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'retyped', base: 'their-text' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('does not carry a rejection into a new edit session', async () => {
+        // Trigger B. The adoption guard at the set site gates only *recording*, so
+        // without a session stamp on the state itself a rejection outlives its
+        // session and re-raises against whatever the next session's retained map
+        // happens to hold under the same key.
+        //
+        // The rotation route is a refresh snapshot advancing csvEditSessionId, which
+        // the host does on every applied snapshot. Deliberately *not* the install
+        // path: the refresh does not install when the id is not our own current
+        // session, so nothing here calls clear_save_verdict and the session stamp is
+        // the only thing that can be doing the work.
+        const meta = make_meta(['Sheet1'], false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 905,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-6',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'second-edit-session',
+            },
+        }));
+        // Byte-identical to the map the host rejected, which is the point: only the
+        // session differs.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('keeps a host rejection across a same-session refresh', async () => {
+        // The mirror of the rotation case above, and the one the session stamp cannot
+        // cover: a refresh whose csvEditSessionId is still ours reinstalls the very
+        // map the host judged — same session, same values, same bases — so the
+        // verdict is still true. Any capability/state recapture lands here (entering
+        // the rejection's own aftermath is enough to trigger one), and the banner is
+        // the only recovery affordance for a host-only rejection, so losing it here
+        // reads as "the conflict resolved itself".
+        const meta = make_meta(['Sheet1'], false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 909,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-10',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+
+        // A refresh for our *own* session, carrying back the rejected map: this is
+        // the install path (refresh_editing_current_session is true), unlike the
+        // rotation test above.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            state: {
+                pendingEdits: { '4:1': { value: 'edited', base: 'stale' } },
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+        // The shell reports the restored map after the remount; the stub does not,
+        // so replay it — byte-identical, because nothing about the edit changed.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
+    it('lets a later save result supersede an earlier rejection', async () => {
+        // The adoption block only ever *sets*, so without a clear at the top of the
+        // handler a rejection outlives every later verdict that does not name keys
+        // of its own. Modelled with a second failed save reporting no `rejection`
+        // (a write error rather than a base mismatch), because that is the only
+        // terminal result that leaves edit mode and the session intact — a success
+        // exits edit mode, which would hide the banner for an unrelated reason and
+        // make the assertion vacuous.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 906,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-7',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        // A second save over the same map, refused for a reason that names no keys.
+        // The absence of `rejection` has to speak: this verdict says nothing is
+        // base-mismatched any more.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 907,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-8',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+        });
+        // Same map, unchanged — so only the cleared verdict can move the banner.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('lets Keep All dismiss a host rejection', async () => {
+        // Keep All was a no-op for a host rejection: `show_host_rejection`
+        // short-circuited ahead of the dismissal check, so the button recorded a
+        // signature nothing consulted and the banner stayed up with no way to put it
+        // away short of discarding the edits.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 908,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-9',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        await click_button('Keep All');
+
+        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        // Dismissed, not resolved: the tint stays so the cell is still identifiable,
+        // and the edit is still there to save or discard.
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
     });
 });
 
