@@ -451,6 +451,11 @@ export function create_authority_store(
                 delete all.entries[file_path];
                 all.entries[file_path] = entry;
                 trim_entries(all, runtime, get_max());
+                // Inside the queued operation, deliberately: `validate` above runs before
+                // this write, so a guard that re-asks a live question at CAS time — the
+                // transform-commit admission in `persist_transform_commit` — is only
+                // sound because nothing else can read or write durable state until this
+                // resolves. Publishing outside `enqueue` would reopen that gap.
                 await persist(all);
                 return {
                     type: 'committed',

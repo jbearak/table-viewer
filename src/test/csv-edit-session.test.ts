@@ -35,6 +35,23 @@ async function flush_promises(): Promise<void> {
     for (let index = 0; index < 100; index += 1) await Promise.resolve();
 }
 
+/**
+ * Turn the event loop — microtasks *and* the `setImmediate` queue `compute_transform`
+ * yields on — until a panel has stopped posting, then a few turns more.
+ *
+ * For asserting that something has *not* happened, which `flush_promises` cannot do:
+ * it drains microtasks only, so a path parked behind a macrotask looks identical to a
+ * path parked behind a durable write. Quiescence is the observable polled for, so no
+ * fixed number of turns is being trusted.
+ */
+async function settle_panel(panel: { __messages: unknown[] }): Promise<void> {
+    for (let idle = 0; idle < 5;) {
+        const seen = panel.__messages.length;
+        await new Promise((done) => { setImmediate(done); });
+        idle = panel.__messages.length === seen ? idle + 1 : 0;
+    }
+}
+
 function state_store(initial: PerFileState = {}) {
     return versioned_state_store(initial);
 }
@@ -5681,6 +5698,176 @@ describe('CSV edit sessions', () => {
             edits: { ...pendingEdits, '1:0': { value: 'typed-during', base: 'a' } },
         });
         expect(latest_snapshot(reopened).state.transforms?.[0]).toBeUndefined();
+    });
+
+    // The window one instant narrower than the CAS test above, and the reason that
+    // test's name says "inside the commit CAS" rather than "inside the durable write".
+    // `compare_and_set` in state.ts calls `validate` and *then* awaits the medium's
+    // write (`await persist(all)`), so every evaluation of the admission guard —
+    // pre-read, mutator, and the `validate` the CAS itself calls — happens before the
+    // bytes land. A rehydration inside that gap would leave the rules durable with the
+    // guard having passed, and nothing after the fact re-asks.
+    //
+    // What closes it is not another check but the store's own serialization: every
+    // operation `create_authority_store` exposes — reads and touches included — runs
+    // on one queue per medium, and the durable write happens *inside* the queued
+    // operation. So while a transform's write is in flight no panel can read durable
+    // state, and every free → owned transition is synchronously downstream of such a
+    // read (`read_file_state` → `project_state_for_panel` → `try_claim_edit_session`,
+    // with no await between the read resolving and the claim). The phase therefore
+    // flips either before `validate` — where the round-7 guard refuses, as the two
+    // tests above pin — or after the write has landed, where the session begins over
+    // rules that were already durable. There is no third interleaving to guard.
+    //
+    // This test pins that property, because the argument depends on it: it parks the
+    // transform inside the medium's write, proves the reopening panel cannot even read
+    // durable state there, and then proves the order it does get is the harmless one —
+    // the rules arrive *with* the session's first view, never as a change to it.
+    it('rehydrates over a transform whose durable write is still in flight, never under it', async () => {
+        const file_path = '/tmp/sibling-transform-write-after-rehydrate.csv';
+        let blob: unknown = {};
+        const write_started = deferred();
+        const write_gate = deferred();
+        let arm = false;
+        let reads = 0;
+        // The real authority store, as the tombstone race test above uses: the gap this
+        // is about lives between `validate` and the medium, so an in-memory store whose
+        // CAS validates and mutates in one synchronous step cannot express it.
+        const store = create_authority_store({
+            runtime_key: {},
+            read: () => { reads += 1; return blob; },
+            write: async (envelope) => {
+                // Suspend inside the durable write, after validation passed.
+                if (arm && JSON.stringify(envelope).includes('"direction"')) {
+                    arm = false;
+                    write_started.resolve();
+                    await write_gate.promise;
+                }
+                blob = envelope;
+            },
+        });
+        const durable_transform = () => {
+            const entries = (blob as { entries?: Record<string, { state: PerFileState }> })
+                .entries ?? {};
+            return Object.values(entries)[0]?.state.transforms?.[0];
+        };
+        const durable_pending = () => {
+            const entries = (blob as { entries?: Record<string, { state: PerFileState }> })
+                .entries ?? {};
+            return Object.values(entries)[0]?.state.pendingEdits;
+        };
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const sibling = open_csv_table(uri(file_path), store);
+        await sibling.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(sibling)!.editSessionId!;
+        const pendingEdits = { '0:0': { value: 'cached-edit', base: 'c' } };
+        await sibling.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: pendingEdits,
+        });
+        await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+        await flush_promises();
+        // The precondition: durable work, phase free, so the transform below is admitted
+        // for a legitimate reason and the reopen below has a session to reclaim.
+        expect(durable_pending()).toEqual(pendingEdits);
+
+        const sibling_snapshot = latest_snapshot(sibling);
+        arm = true;
+        const transform = sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'lapsed-inside-write',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await write_started.promise;
+        // Mid-write, not merely pending: validation passed and nothing is durable yet.
+        expect(durable_transform()).toBeUndefined();
+
+        const reopened = open_csv_table(uri(file_path), store);
+        const reads_before = reads;
+        const reopen_ready = reopened.__receive({ type: 'ready' });
+        // Settled, not sampled: the reopen has run as far as it can and stopped.
+        await settle_panel(reopened);
+        // The serialization, stated as the thing that makes the gap unreachable. Not one
+        // durable read got through, so this panel has nothing to project and no way to
+        // take the session while the write is in flight — the claim is always downstream
+        // of a read. Publish the durable write outside the store's queue and this is the
+        // assertion that fails.
+        expect(reads - reads_before).toBe(0);
+        expect(reopened.__messages.some((message: unknown) => (
+            typeof message === 'object' && message !== null && 'type' in message
+            && message.type === 'workbookSnapshot'
+        ))).toBe(false);
+
+        write_gate.resolve();
+        await Promise.all([transform, reopen_ready]);
+        await flush_promises();
+
+        // The paired direction: a transform whose write completes with the phase still
+        // free persists. Admission was current at the last instant durable state could
+        // still refuse it, and the session that follows is not one it moved rows under.
+        expect(durable_transform()?.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+        expect(transform_answers(sibling)).toEqual([expect.objectContaining({
+            type: 'transformInstalled',
+            requestId: 'lapsed-inside-write',
+        })]);
+
+        // The finding's harm, asserted where it would appear: the rehydrated owner is
+        // never *asked to install* these rules, because it never receives them as a
+        // change. Its one and only snapshot already carries them alongside the session,
+        // which is the supported reopen-under-a-transform case, not row movement.
+        const session_snapshots = reopened.__messages.filter((message: any) => (
+            message?.type === 'workbookSnapshot'
+            && message.snapshot.capabilities.csvEditSessionId !== undefined
+        )) as Array<{ snapshot: WorkbookSnapshot }>;
+        expect(session_snapshots.length).toBeGreaterThan(0);
+        for (const { snapshot } of session_snapshots) {
+            expect(snapshot.state.transforms?.[0]?.sort)
+                .toEqual([{ colIndex: 0, direction: 'asc' }]);
+        }
+        const rehydrated = latest_snapshot(reopened);
+        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        const rows = async (requestId: string) => {
+            await reopened.__receive({
+                type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+                requestId, generation: latest_snapshot(reopened).generation,
+            });
+            return (reopened.__messages.find((message: any) => (
+                message?.type === 'rowData' && message.requestId === requestId
+            )) as { rows: Array<Array<{ raw: string }>> }).rows.map((row) => row[0].raw);
+        };
+        const at_session_start = await rows('at-session-start');
+
+        // Typing is the ordinary act that re-reads durable state and reprojects it into
+        // this panel — the delivery that would carry a late rules change to the webview's
+        // restore effect. The rules it carries are the same ones the session opened with,
+        // and the row basis does not move.
+        await reopened.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: rehydrated.capabilities.csvEditSessionId!,
+            edits: { ...pendingEdits, '1:0': { value: 'typed-during', base: 'a' } },
+        });
+        await flush_promises();
+        expect(latest_snapshot(reopened).state.transforms?.[0]?.sort)
+            .toEqual([{ colIndex: 0, direction: 'asc' }]);
+        expect(latest_snapshot(reopened).generation).toBe(rehydrated.generation);
+        expect(await rows('after-typing')).toEqual(at_session_start);
+        // No transform traffic of its own: this panel neither requested nor was refused
+        // one, so the rules it holds arrived only through the projection above.
+        expect(transform_answers(reopened)).toEqual([]);
     });
 
     it('persists the owning panel\'s own transform requested during its own session', async () => {

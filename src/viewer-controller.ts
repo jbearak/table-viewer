@@ -1726,11 +1726,31 @@ export function attach_viewer(
         const authority = transform_authorities.get(message);
         if (!authority || authority.receiverEpoch !== receiver_epoch) return;
         // Currency *and* admission. The admission term is folded in here rather than
-        // written out in the mutator so that all three places this closure is
-        // consulted get it: the pre-read check, the mutator below, and — the one that
-        // matters most — the `validate` the CAS itself calls, which is the last
-        // moment before the rules become durable. See
-        // `transform_commit_admission_refusal` for why re-asking is the fix.
+        // written out in the mutator so that all three places this closure is consulted
+        // get it: the pre-read check, the mutator below, and the `validate` the CAS
+        // itself calls. See `transform_commit_admission_refusal` for why re-asking is
+        // the fix; the mutator alone is not enough, because the phase can flip between
+        // the mutator running and the CAS being reached.
+        //
+        // Be precise about what the `validate` evaluation does and does not close, since
+        // an earlier version of this comment claimed it closed the CAS window outright.
+        // It does not: `compare_and_set` in state.ts calls `validate` and *then* awaits
+        // the medium's durable write, so this closure's last evaluation is still before
+        // the bytes land. Nothing here can observe a phase that flips inside that gap.
+        //
+        // What closes the gap is the store, not another check. Every operation
+        // `create_authority_store` exposes runs on one queue per medium and the durable
+        // write happens inside the queued operation, so no panel can read durable state
+        // while this write is in flight; and every free → owned transition is
+        // synchronously downstream of such a read (`read_file_state` →
+        // `project_state_for_panel` → `try_claim_edit_session`, no await in between —
+        // the paths that are *not*, `requestEditSession` and `reserve_edit_claim`,
+        // refuse on `transform_work_in_flight()` instead). So the phase flips either
+        // before `validate`, where this closure refuses, or after the write landed,
+        // where the session simply begins over rules that were already durable. That is
+        // a dependency on the store's serialization, and it is pinned by
+        // 'rehydrates over a transform whose durable write is still in flight, never
+        // under it' rather than left to be rediscovered.
         const transform_is_current_before_commit = () =>
             authority.receiverEpoch === receiver_epoch
             && transform_authority_is_current(message, authority)
