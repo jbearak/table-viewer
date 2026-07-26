@@ -2477,6 +2477,15 @@ export function attach_viewer(
     }
 
     async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
+        // Recorded *before* the CAS, because `release_edit_session` reads this set
+        // while the CAS is still in flight. `compare_and_set` validates currency and
+        // then awaits the medium's durable write — a real filesystem write on a
+        // disk-backed memento. A release landing in that window writes its tombstone
+        // decision right then, so an add that waits for the CAS to return is already
+        // too late: the edits reach disk, the tombstone is skipped, and they survive
+        // into the next session. That is the leak this gate exists to close, and the
+        // surviving edit is the folded live-editor value the user never posted.
+        persisted_save_identities.add(operation.identity);
         const committed = await update_file_state((current) => ({
             ...current,
             pendingEdits: Object.fromEntries(
@@ -2489,7 +2498,6 @@ export function attach_viewer(
         if (!committed || !save_operation_is_current(operation)) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
-        persisted_save_identities.add(operation.identity);
         notify_edit_state(committed);
     }
 
