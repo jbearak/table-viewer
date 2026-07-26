@@ -339,6 +339,13 @@ pages load — scrollbar jitter.
   re-sorting dirty data. **Not wanted**, not merely deferred — rows moving while
   the user types is the behavior this design exists to avoid. Recorded here only
   so a future reader doesn't mistake its absence for an oversight.
-- `PerFileState.scrollPosition` is row-addressed with the same latent question.
+- `PerFileState.scrollPosition` — **corrected while auditing PR 3:** it is not
+  row-addressed. `ScrollPosition` is `{ top, left }` pixel offsets
+  (`types.ts:266`), so restoring it under a different permutation lands on
+  whatever rows occupy that offset. Cosmetic, and not the row-heights failure
+  mode — nothing durable is misattributed to a row. `cellHighlights` was checked
+  at the same time and is genuinely source-keyed (`ParsedCellHighlightKey
+  { sourceRow, sourceColumn }`, `cell-highlights.ts:18`). So `rowHeights` is the
+  only display-keyed durable state, which is PR 4's whole subject.
 - Enabling Glide search later: its result `Item`s are display coordinates and
   would need generation-scoping.
