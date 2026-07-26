@@ -377,11 +377,17 @@ describe('GridShell CSV save', () => {
     // The host reads any pendingEditsChanged as "the user moved on from the failed
     // save" and retires the failed lifecycle, so an echo of the failed operation's
     // own map would strand the durable edits it wrote before the disk write.
-    // Standalone harness: no App parent, so the install force-notify that produces
-    // the echo in the real app never fires here. What is pinned is the invariant —
-    // the failed save itself contributes no post.
+    //
+    // The echo needs App's half of the flow to appear: on a failed saveResult App
+    // re-installs the session store with resolve_csv_save_hydration's restore, and
+    // install force-notifies across that hydration boundary (edit-session-store.ts
+    // set_entries(..., true)), so the persistence effect re-runs with a fresh map
+    // identity carrying the failed operation's own edits. There is no App here, so
+    // the install is driven directly on a store passed in as `edit_session` —
+    // exactly what app.tsx's failed branch does, same arguments.
     it('posts pendingEditsChanged at most once across a failed save', async () => {
-        const { post_message, editing_ref } = await render_grid();
+        const edit_session = create_edit_session_store({ session_id: 'session-1' });
+        const { post_message, editing_ref } = await render_grid(undefined, { edit_session });
         await edit_cell('first');
 
         post_message.mockClear();
@@ -393,18 +399,35 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         await save_result_for(save, false);
 
-        expect(pending_edit_messages(post_message).length).toBeLessThanOrEqual(1);
-        // The settle itself must contribute nothing: the map it restores is the
-        // failed operation's own.
+        // App's install at the hydration boundary, with the restore the real failed
+        // branch computes: the failed operation's own dirtyEdits.
+        await act(async () => {
+            edit_session.install(
+                { session_id: 'session-1' },
+                save!.operation!.dirtyEdits,
+            );
+        });
+
         expect(pending_edit_messages(post_message)).toEqual([]);
     });
 
     it('still posts a genuinely new edit after a failed save', async () => {
-        const { post_message, editing_ref } = await render_grid();
+        const edit_session = create_edit_session_store({ session_id: 'session-1' });
+        const { post_message, editing_ref } = await render_grid(undefined, { edit_session });
         await edit_cell('first');
         expect(await request_save(editing_ref)).toBe(true);
         await save_result(false);
+        // Same hydration-boundary install as above, so the dedupe ref is primed with
+        // the failed map before the new keystroke.
+        await act(async () => {
+            edit_session.install(
+                { session_id: 'session-1' },
+                { '0:0': { value: 'first', base: 'base' } },
+            );
+        });
 
+        // A real keystroke after the failure must still reach the host: the dedupe
+        // suppresses the echo, never a genuine change.
         post_message.mockClear();
         await edit_cell('second');
         expect(pending_edit_messages(post_message)).toEqual([

@@ -740,9 +740,12 @@ export function GridShell({
     // null clears the stored state. Runs on the initial render too: a restored map
     // simply round-trips back (harmless), and an empty map posts null (already so).
     //
-    // `save_in_flight` (the state, not the ref) is in the deps so edits suppressed
-    // by the guard while a save was in flight get flushed once it settles. The
-    // guard itself still reads the ref, which is always current within a flush —
+    // The deps carry `save_in_flight` (the state) rather than `save_in_flight_ref`,
+    // whose identity never changes and so could never fire this effect. The swap is
+    // housekeeping, not a behaviour change: while the ref is true every mutation
+    // path is already guarded, so `dirty_cells` cannot change under a save, and the
+    // settle's `replace_dirty` changes `dirty_cells`, which is in the deps already.
+    // The guard still reads the ref because it is current within the flush —
     // `request_save` sets it synchronously, ahead of any render.
     useEffect(() => {
         if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;

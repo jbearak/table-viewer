@@ -892,6 +892,28 @@ export function attach_viewer(
         return Object.keys(retained).length > 0 ? retained : undefined;
     }
 
+    /**
+     * True when `pending_edits` is nothing more than `operation`'s own entries,
+     * unchanged and complete — the webview echoing a failed operation's map back
+     * rather than the user moving on from it.
+     *
+     * `strip_operation_owned_pending_edits` returns `undefined` for two situations
+     * that mean opposite things here: a map with nothing left after its owned
+     * entries are removed (an echo), and a map that was empty or absent to begin
+     * with (a discard — the user moving on *more* decisively than by replacing the
+     * map). Comparing key counts separates them, and covers the partial case too:
+     * a post missing one of the operation's keys dropped that edit deliberately.
+     */
+    function post_echoes_operation(
+        pending_edits: PerFileState['pendingEdits'],
+        operation: CsvSaveOperation,
+    ): boolean {
+        const owned = Object.keys(operation.dirtyEdits).length;
+        if (owned === 0 || !pending_edits) return false;
+        if (Object.keys(pending_edits).length !== owned) return false;
+        return strip_operation_owned_pending_edits(pending_edits, operation) === undefined;
+    }
+
     function pending_edits_for_current_session(
         pending_edits: PerFileState['pendingEdits'],
     ): PerFileState['pendingEdits'] {
@@ -3720,16 +3742,19 @@ export function attach_viewer(
                         // edits `persist_accepted_save` made durable *before* the
                         // failed disk write survive into the next edit session.
                         //
-                        // So compare values, not just identity: the post supersedes a
-                        // failed operation only when the committed map retains an
-                        // entry the operation does not own. A genuinely newer edit
-                        // still retires the lifecycle; a byte-identical echo does not.
+                        // So compare values, not just identity: a post supersedes a
+                        // failed operation unless it is that operation's own map
+                        // echoed back. A genuinely newer edit retires the lifecycle;
+                        // so does an *emptying* post, which is the user discarding —
+                        // moving on more decisively than by replacing the map. Only a
+                        // complete, unchanged echo leaves the tombstone standing, so
+                        // this asks `post_echoes_operation` rather than merely whether
+                        // anything unowned remains (an empty map retains nothing, and
+                        // treating that as "not superseding" would let the tombstone
+                        // strip a value the user discarded and then retyped).
                         const committed = result.snapshot.state as PerFileState;
                         const supersedes = (operation: CsvSaveOperation) => (
-                            strip_operation_owned_pending_edits(
-                                committed.pendingEdits,
-                                operation,
-                            ) !== undefined
+                            !post_echoes_operation(committed.pendingEdits, operation)
                         );
                         const tombstone = file_edit_state?.failedSaveTombstone;
                         if (
