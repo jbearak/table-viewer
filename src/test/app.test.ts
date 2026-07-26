@@ -5739,6 +5739,82 @@ describe('transforms during an edit session', () => {
     });
 });
 
+// A transform admitted during an owned edit session can be in flight for seconds
+// while the host keeps redelivering the projection — every committed edit provokes
+// one. Those redeliveries change nothing about the rows, so they must not discard
+// the request whose requestId is the only thing the eventual ack can match on.
+describe('snapshots arriving during an in-flight transform', () => {
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+
+    /** Edit mode over an editable CSV with a user-initiated grid sort outstanding. */
+    async function sorting_while_editing() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(true);
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+        return { post_message, request };
+    }
+
+    it('still honours the ack after a same-generation refresh', async () => {
+        const { request } = await sorting_while_editing();
+
+        // What committing an edit provokes: the host writes the pending edits and
+        // re-projects capabilities, so a 'refresh' arrives on the same source and the
+        // same view generation. The transform is still running behind it.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV_CAPABILITIES,
+            },
+        ));
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+        // The work is still outstanding, so the progress affordance must not clear.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(true);
+
+        await acknowledge_transform(request, 7);
+
+        // The ack is matched, not dropped: the generation advances to the host's and
+        // the sort installs. Were the requestId discarded above, the webview would
+        // sit on generation 1 and the host would refuse every row request after.
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+    });
+
+    it('discards the in-flight transform when the source moves', async () => {
+        const { request } = await sorting_while_editing();
+
+        // A reload replaces the rows the transform was being computed over, so the
+        // request is genuinely void and its ack must not be allowed to land.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES },
+        ));
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+
+        await acknowledge_transform(request, 7);
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+    });
+});
+
 // A refusal always means the host changed nothing. `transientRefusal` says whether
 // the reason will clear on its own, which decides whether the webview may adopt the
 // echo (terminal validation) or must keep its own copy and retry (the admission
@@ -5838,6 +5914,37 @@ describe('refused transforms', () => {
         await vi.waitUntil(() => transform_requests(post_message).length > 0);
         expect(latest_transform_request(post_message).state.sort)
             .toEqual(STORED_SORT.sort);
+    });
+
+    it('drops a transiently refused user request instead of queueing it', async () => {
+        const { post_message } = await editing_csv();
+        // No stored transform anywhere, so anything asked for later could only be a
+        // replay of what the user just did.
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        expect(request.intent).toBe('user');
+        post_message.mockClear();
+
+        await refuse_transform(request, { transient: true, generation: 99 });
+
+        // Visible failure, and that is the whole of it.
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // The counterpart of 'keeps a transiently refused transform retriable': there
+        // the *stored* transform is asked for again, because the sheet would otherwise
+        // sit unsorted for the session. A request the user made has no such standing.
+        // Replaying it once the refusing condition lifts would reorder rows under
+        // someone mid-edit who has moved on — the deferred "Resort" this design
+        // forbids — so it must stay dropped.
+        post_message.mockClear();
+        await settle_a_save();
+        expect(transform_requests(post_message)).toEqual([]);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
     });
 
     it('adopts the natural state for a terminal refusal', async () => {

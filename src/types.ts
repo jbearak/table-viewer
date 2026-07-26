@@ -371,12 +371,21 @@ export type HostMessage =
      * unchanged state, generation and row count.
      *
      * `transientRefusal` distinguishes *why*: the host refused for a reason that
-     * clears on its own (an edit-session phase, a save in flight), so the request
-     * is worth retrying and the webview must keep its own copy of the requested
-     * transform rather than adopting the echo. Absent means the refusal is
-     * terminal validation (out-of-range sheet, stale source generation, schema
-     * mismatch) — the echo *is* the answer, and adopting it is how an invalid
-     * saved transform gets dropped from the UI.
+     * clears on its own (an edit-session phase, a save in flight). Nothing about the
+     * view changed, so the webview must not adopt the echo as the new truth —
+     * neither the echoed generation nor the emptied state.
+     *
+     * What happens to the request then depends on where it came from, and only the
+     * durable half is retried. A *persisted* transform is asked for again by the
+     * restore effect once the refusing condition clears: the stored state is still
+     * the answer, and the sheet would otherwise sit unsorted for the rest of the
+     * session. A *user-initiated* request is dropped with a warning and deliberately
+     * not queued — replaying it later would move rows under a user who has since
+     * moved on — so it must fail visibly and stay failed until the user asks again.
+     *
+     * Absent means the refusal is terminal validation (out-of-range sheet, stale
+     * source generation, schema mismatch) — the echo *is* the answer, and adopting
+     * it is how an invalid saved transform gets dropped from the UI.
      */
     | { type: 'transformApplied'; sheetIndex: number; state: SheetTransformState; rowCount: number; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; error?: string; transientRefusal?: boolean };
 

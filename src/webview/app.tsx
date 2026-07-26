@@ -1022,17 +1022,20 @@ export function App(): React.JSX.Element {
                         pending_save_dialog_ref.current = null;
                     }
                     set_source_epoch((n) => n + 1);
-                    // Auto-fit measures the loaded rows, so anything that changes
-                    // the measured population invalidates it: a new source, a new
-                    // view generation (durable transform reconciliation bumps the
-                    // generation without the source, and reports it only here), or
-                    // a changed header row. A same-generation capability refresh —
-                    // entering edit mode redelivers the projection — must not.
-                    if (
+                    // What the rows *are* changes with a new source, a new view
+                    // generation (durable transform reconciliation bumps the
+                    // generation without the source, and reports it only here), or a
+                    // changed header row — and with nothing else. A same-generation
+                    // capability refresh, which entering edit mode and every
+                    // edit-store notification during an owned session redeliver,
+                    // leaves the rows exactly where they were.
+                    const row_basis_changed =
                         source_changed
                         || view_generation_changed
-                        || header_changed.size > 0
-                    ) {
+                        || header_changed.size > 0;
+                    // Auto-fit measures the loaded rows, so a changed row basis
+                    // invalidates the measurement.
+                    if (row_basis_changed) {
                         auto_fit_active_ref.current = [];
                         auto_fit_snapshot_ref.current = [];
                         set_auto_fit_active([]);
@@ -1063,11 +1066,23 @@ export function App(): React.JSX.Element {
                             set_auto_fit_snapshot(next_snapshot);
                         }
                     }
-                    set_pending_transforms([]);
-                    set_pending_transform_labels([]);
-                    pending_transform_request_ids_ref.current = [];
-                    pending_transform_states_ref.current = [];
-                    pending_transform_origins_ref.current = [];
+                    // An in-flight transform is only invalidated by a snapshot that
+                    // changes the rows it is being computed over; on the same row
+                    // basis it is still going to answer, and its requestId is the
+                    // only thing the transformApplied guard can match on. Dropping
+                    // the id here would make the host's ack fail that guard and be
+                    // discarded, leaving this webview on a generation the host has
+                    // already left behind — every row request it sends afterwards is
+                    // then refused. That is reachable now that a transform may be in
+                    // flight during an owned edit session, where committing an edit
+                    // makes the host redeliver the projection at the same generation.
+                    if (row_basis_changed) {
+                        set_pending_transforms([]);
+                        set_pending_transform_labels([]);
+                        pending_transform_request_ids_ref.current = [];
+                        pending_transform_states_ref.current = [];
+                        pending_transform_origins_ref.current = [];
+                    }
                     transform_applied_for_source_ref.current = [];
 
                     let correction_required = false;
@@ -1254,13 +1269,25 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 if (msg.error && msg.transientRefusal) {
-                    // A transient refusal means the host changed nothing and the
-                    // request is worth retrying, so this path is deliberately
-                    // non-authoritative: it clears the in-flight UI and warns, and
-                    // touches neither the generation, nor the saved/applied
-                    // transforms, nor transform_applied_for_source_ref — leaving the
-                    // latter false is what lets the restore effect retry once the
-                    // refusing condition (a save in flight) settles.
+                    // A transient refusal means the host changed nothing, so this path
+                    // is deliberately non-authoritative: it clears the in-flight UI
+                    // and warns, and touches neither the generation, nor the
+                    // saved/applied transforms, nor transform_applied_for_source_ref —
+                    // leaving the latter false is what lets the restore effect ask
+                    // again for a *persisted* transform once the refusing condition (a
+                    // save in flight) settles.
+                    //
+                    // A user-initiated request has no such durable copy, and clearing
+                    // pending_transform_states_ref below therefore drops it outright.
+                    // That is the intended outcome, not an oversight to be fixed with
+                    // a queue: a sort or filter replayed seconds later — when a
+                    // sibling's session releases or a save finishes — would move rows
+                    // under a user who is mid-edit and has moved on, which is the one
+                    // thing this whole design exists to prevent, and it would amount
+                    // to the deferred "Resort/Refilter" action the design forbids. A
+                    // refused user request fails visibly (the warning below names the
+                    // reason) and stays failed; the user asks again if they still want
+                    // it.
                     //
                     // It also must NOT commit_live_edit(): the fold below exists
                     // only because a generation bump unmounts the grid that owns the
