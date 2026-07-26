@@ -142,8 +142,6 @@ Windows builds are unsigned — code signing certificates are expensive, and thi
 
 **In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
 
-**Extension-only, not just unbuilt:** the CSV side-by-side text preview with scroll sync, VS Code remote filesystems, and extension commands/menus. Each of these is the extension borrowing something VS Code already provides — a text editor beside the grid, the remote filesystem layer, the command palette — so they aren't features a standalone app is waiting on.
-
 **Deferred:** auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
 
 ## Development
