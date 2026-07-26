@@ -75,7 +75,7 @@ Table Viewer is the result.
 - Sorting and filtering use raw cell values rather than formatted display text
 - Empty values sort last in both directions
 - When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
-- Sorting, filtering, and row-hiding work freely alongside CSV/TSV edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
+- Sorting, filtering, and row-hiding work alongside CSV/TSV edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab is editing a file, it is the tab that can change that file's view; another tab showing the same file can change it again once the edit session ends. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
 
 **Editing (CSV/TSV only)**
 - Click the **Edit** button in the toolbar to enter edit mode

@@ -3171,7 +3171,12 @@ export function App(): React.JSX.Element {
                 // acknowledgement and touches nothing else. Rendered outside the
                 // content area holding the grid so it never joins GridShell's
                 // remount key.
-                <div className="stale-view-banner">
+                //
+                // A polite live region: it appears in response to typing rather than
+                // to an explicit action, so without role="status" a screen-reader
+                // user gets no signal it is there. Announced once, without taking
+                // focus from the cell being edited.
+                <div className="stale-view-banner" role="status">
                     {stale_view_message}
                     <div className="stale-view-banner-actions">
                         <button
