@@ -198,8 +198,9 @@ export class ViewerPanelCore {
             /**
              * Canonical `"sourceRow:sourceColumn"` keys of the durable pending edits
              * the current edit session owns. The core owns view membership and the
-             * authority layer owns the dirty map, so `hiddenEditedCells` needs both;
-             * absent (Excel, or any caller with no edit sessions) it is always 0.
+             * authority layer owns the dirty map, so `hiddenEditedCellKeys` needs
+             * both; absent (Excel, or any caller with no edit sessions) it is always
+             * empty.
              */
             durablePendingEditKeys?: () => readonly string[];
         },
@@ -584,9 +585,10 @@ export class ViewerPanelCore {
     }
 
     /**
-     * How many of the session's durable pending-edit cells sit in rows this view
-     * does not contain — see `SheetViewRecord.hiddenEditedCells` for why this is the
-     * only place and the only moment the question is answerable.
+     * Which of the session's durable pending-edit cells sit in rows this view does
+     * not contain — see `SheetViewRecord.hiddenEditedCellKeys` for why this is the
+     * only place membership is answerable, and why the answer is keys rather than a
+     * count the webview would have no way to correct.
      *
      * Nothing is scanned unless rows can actually be missing. A sort permutes
      * without dropping, so only an enabled filter or an explicit `hiddenRows` can
@@ -600,25 +602,28 @@ export class ViewerPanelCore {
      * O(rows), and every edit after it is O(1).
      *
      * Deliberately reads the *durable* map rather than the live one, which can lag
-     * it by the webview's persistence debounce. That cannot under-report anything
-     * that matters: an edit too new to be durable was just typed, so its row was on
-     * screen to be typed into, so it is not hidden.
+     * it by the webview's persistence debounce. Under-reporting from that lag is
+     * benign: an edit too new to be durable was just typed, so its row was on screen
+     * to be typed into, so it is not hidden. Over-reporting from it — an entry the
+     * user has already discarded but whose removal has not been persisted yet — is
+     * not benign, and is exactly what the webview's intersection against its live
+     * dirty map removes.
      */
-    private hidden_edited_cells(
+    private hidden_edited_cell_keys(
         sheet_index: number,
         sheet: SheetMeta,
         rules: SheetTransformState | undefined,
         indices: Uint32Array | undefined,
-    ): number {
-        if (!indices || !this.durable_pending_edit_keys) return 0;
+    ): readonly string[] {
+        if (!indices || !this.durable_pending_edit_keys) return [];
         const excludes_rows = !!rules && (
             rules.filters.some((entry) => entry.enabled)
             || (rules.hiddenRows?.length ?? 0) > 0
         );
-        if (!excludes_rows || indices.length === sheet.rowCount) return 0;
+        if (!excludes_rows || indices.length === sheet.rowCount) return [];
         const keys = this.durable_pending_edit_keys();
-        if (keys.length === 0) return 0;
-        let hidden = 0;
+        if (keys.length === 0) return [];
+        const hidden: string[] = [];
         // Several cells in one row ask the same question, and the answer is per row.
         const row_is_present = new Map<number, boolean>();
         for (const key of keys) {
@@ -632,7 +637,12 @@ export class ViewerPanelCore {
                     !== undefined;
                 row_is_present.set(parsed.sourceRow, present);
             }
-            if (!present) hidden += 1;
+            // The key as given rather than rebuilt from the parse. The two coincide
+            // today — the parse accepts only canonical keys, so there is nothing to
+            // normalize — but the webview matches these against its own dirty map by
+            // string, and rebuilding would put that agreement at the mercy of a
+            // future relaxation of the parse.
+            if (!present) hidden.push(key);
         }
         return hidden;
     }
@@ -659,8 +669,8 @@ export class ViewerPanelCore {
             rowCount: indices?.length ?? sheet.rowCount,
             permuted: indices !== undefined,
             // Every install arm builds its record here, including the two no-op
-            // equal-state acks, so none of them can answer this with a stale number.
-            hiddenEditedCells: this.hidden_edited_cells(
+            // equal-state acks, so none of them can answer this with a stale set.
+            hiddenEditedCellKeys: this.hidden_edited_cell_keys(
                 sheet_index,
                 sheet,
                 rules,

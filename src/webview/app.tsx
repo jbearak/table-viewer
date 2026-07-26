@@ -1346,11 +1346,11 @@ export function App(): React.JSX.Element {
                                 rowCount: sheet.rowCount,
                                 permuted: false,
                                 // A natural view contains every row, so it hides no
-                                // edit. Fabricating the count here is safe for the
-                                // same reason `permuted: false` is: this snapshot's
-                                // rows are the metadata's own until an install lands,
-                                // and that install carries the host's real count.
-                                hiddenEditedCells: 0,
+                                // edit. Fabricating this here is safe for the same
+                                // reason `permuted: false` is: this snapshot's rows
+                                // are the metadata's own until an install lands, and
+                                // that install carries the host's real set.
+                                hiddenEditedCellKeys: [],
                             };
                         },
                     ));
@@ -2900,18 +2900,41 @@ export function App(): React.JSX.Element {
     // looking at. Only meaningful in edit mode — outside it the order recomputes as
     // normal.
     //
-    // The hidden-cell count rides the same record, so it needs no state of its own and
-    // cannot disagree with the rules it was computed against. No `edit_mode` term of
-    // its own either: the signature below carries the only one there should be, and
-    // the message is rendered only when the banner is. Probed rather than assumed — a
-    // second copy of that gate here fails no test, which makes it a guard nothing
-    // could hold to account.
-    const hidden_edited_cells = installed_view?.hiddenEditedCells ?? 0;
+    // The hidden cells ride the same record, so they need no state of their own and
+    // cannot disagree with the rules they were computed against. No `edit_mode` term
+    // of their own either: the signature below carries the only one there should be,
+    // and the message is rendered only when the banner is. Probed rather than assumed
+    // — a second copy of that gate here fails no test, which makes it a guard nothing
+    // could hold to account. The one below is now pinned: see "goes silent when edit
+    // mode ends with the dirty map still reported", which deleting it fails.
+    //
+    // Narrowed to keys the dirty map still holds, and that intersection is the whole
+    // of the refresh this needs. The host answers *membership*, which only an install
+    // can change; the number of hidden cells depends on the edit set too, and that
+    // moves with every `pendingEditsChanged`, discard and save — none of which install
+    // anything, so a count from the host would go on claiming a discarded edit is out
+    // of sight forever. Between installs the set can only shrink, and only by entries
+    // leaving the dirty map: a new edit can only be typed into a row the view is
+    // showing, so nothing can join. Subtracting what left is therefore exact, and
+    // needs no message from the host at all.
+    //
+    // Membership in the map, not identity of the entry — deliberately unlike
+    // `live_rejected_keys` above, which compares value and base because a re-typed
+    // cell has never been judged. Here the question is only whether unsaved work is
+    // still sitting in a row the user cannot see, and a hidden row's cell cannot be
+    // re-typed to begin with.
+    //
+    // Silent until GridShell's first status report lands, since `live_edits` is that
+    // report. The column half already waits on the same map, so the notice speaks as
+    // one fact over one dirty map rather than half of it arriving early.
+    const hidden_edited_cell_keys = (installed_view?.hiddenEditedCellKeys ?? [])
+        .filter((key) => live_edits?.[key] !== undefined);
+    const hidden_edited_cells = hidden_edited_cell_keys.length;
     const stale_view_current_signature = edit_mode
         ? stale_view_signature(
             installed_view?.rules,
             Object.keys(live_edits ?? {}),
-            hidden_edited_cells,
+            hidden_edited_cell_keys,
         )
         : undefined;
     const show_stale_view_banner = stale_view_current_signature !== undefined
@@ -2921,7 +2944,7 @@ export function App(): React.JSX.Element {
     // anything with it. Noun and verb are pluralized as one phrase, as in
     // conflict_banner_message, so "1 edited cells are" cannot be written.
     //
-    // "doesn't show" rather than "hides" because the host counts every edited row the
+    // "doesn't show" rather than "hides" because the host names every edited row the
     // view does not contain, and one of those is a row an external shrink removed —
     // not hidden, gone. The weaker verb is true of both, and both are the same fact
     // for the user: unsaved work they cannot see.

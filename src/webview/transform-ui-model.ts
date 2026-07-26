@@ -313,38 +313,49 @@ export function transform_progress_label(
  *    filter deliberately does not recompute during a live edit session — rows stay
  *    where the user left them, which is the feature — so the displayed order can
  *    disagree with the current values, and that is worth saying.
- *  - The installed view hides rows holding unsaved edits (`hidden_edited_cells`).
- *    This one cannot be reduced to the first: hidden-ness is a property of the
- *    *row*, so an edit in a column no rule reads is hidden just the same, and the
- *    reopen case — durable edits plus a durable filter whose saved values exclude
- *    their rows — is exactly that shape. Gating it behind the column test would
- *    silence the notice in the case it exists for.
+ *  - The installed view does not show rows holding unsaved edits
+ *    (`hidden_edited_cell_keys`). This one cannot be reduced to the first:
+ *    hidden-ness is a property of the *row*, so an edit in a column no rule reads is
+ *    hidden just the same, and the reopen case — durable edits plus a durable filter
+ *    whose saved values exclude their rows — is exactly that shape. Gating it behind
+ *    the column test would silence the notice in the case it exists for.
  *
  * The column half is derived from the *current* dirty map rather than latched, so
  * reverting or discarding the last relevant edit clears it for free. The
  * transform's own signature is folded in so changing the installed sort is a new
- * fact rather than a previously acknowledged one, and the count is folded in so a
- * dismissal cannot outlive the number it was pressed over.
+ * fact rather than a previously acknowledged one.
  *
- * The count is *not* computable here, which is why it is a parameter: view
+ * The hidden half is *not* computable here, which is why it is a parameter: view
  * membership never reaches the webview. `transformInstalled` carries basis, rules,
  * row count and `permuted` — no index list — and display-to-source identity
  * arrives only per fetched page, as `rowData.sourceRows`, behind RowLoader's page
- * LRU, so a webview-side count would move with the scrollbar. Recomputing
+ * LRU, so a webview-side answer would move with the scrollbar. Recomputing
  * membership instead of observing it is worse still: it needs every filtered
  * column's *saved* value for every dirty row, non-resident ones included, plus the
- * host's filter compiler. The host has both halves and needs them only at the one
- * moment the number can change — see `SheetViewRecord.hiddenEditedCells` — so it
- * sends the count and this reads it.
+ * host's filter compiler. The host has both halves at the one moment membership can
+ * change — see `SheetViewRecord.hiddenEditedCellKeys` — so it sends the keys, the
+ * caller intersects them with the live dirty map, and this reads the result.
+ *
+ * Keys and not a count, here as on the wire, because this signature is the identity
+ * of *what the notice is saying* and a count cannot express that. Two views can hide
+ * one edited cell each and be entirely different news; a dismissal of the first must
+ * not silence the second. Folding the keys in also makes the rules half below
+ * complete without `state.hiddenRows`: hiding a different row changes which keys are
+ * out of sight, so the change arrives through the keys rather than needing a rule
+ * field someone must remember to serialize. When hiding a row changes no key, the
+ * notice says the same two things it already said and the dismissal correctly holds.
+ * (`transform_read_columns` excludes `hiddenRows` for an unrelated reason — it
+ * answers whether an *edit* can change membership, which hiding by row identity
+ * cannot. Neither exclusion licenses the other; see its doc.)
  *
  * @param dirty_keys `"sourceRow:sourceColumn"` keys, as PR 2 rekeyed them.
- * @param hidden_edited_cells `SheetViewRecord.hiddenEditedCells` for the installed
- *   view, straight from the host.
+ * @param hidden_edited_cell_keys the installed view's
+ *   `hiddenEditedCellKeys` already narrowed to entries the dirty map still holds.
  */
 export function stale_view_signature(
     state: SheetTransformState | undefined,
     dirty_keys: readonly string[],
-    hidden_edited_cells: number,
+    hidden_edited_cell_keys: readonly string[],
 ): string | undefined {
     // No installed rules is no view to be stale about, and nothing can be hidden by
     // one either — so this also makes the rules serialization below total.
@@ -364,7 +375,9 @@ export function stale_view_signature(
                     && columns.has(column);
             })
             .sort();
-    if (affected.length === 0 && hidden_edited_cells <= 0) return undefined;
+    if (affected.length === 0 && hidden_edited_cell_keys.length === 0) {
+        return undefined;
+    }
     // The transform half changes whenever the installed rules do — including a
     // filter's operator or value, not just which columns it names — so an
     // acknowledgement cannot carry over to a different view.
@@ -372,7 +385,10 @@ export function stale_view_signature(
         state.sort,
         state.filters.filter((entry) => entry.enabled),
     ]);
-    return `${rules}|${affected.join(',')}|${hidden_edited_cells}`;
+    // Sorted, because the host's key order follows `Object.keys` on the durable map
+    // and an echo of the same view must be the same signature.
+    const hidden = [...hidden_edited_cell_keys].sort();
+    return `${rules}|${affected.join(',')}|${hidden.join(',')}`;
 }
 
 export type TransformShortcut =

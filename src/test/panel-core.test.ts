@@ -561,7 +561,7 @@ describe('ViewerPanelCore', () => {
         expect(disabled.rules?.filters).toHaveLength(1);
     });
 
-    describe('hiddenEditedCells', () => {
+    describe('hiddenEditedCellKeys', () => {
         // StubSource's column 0 is the row index as text, so `equals '2'` keeps
         // exactly source row 2 and drops the other four.
         const keeps_only_row_2 = (id = 'filter-1'): SheetTransformState => ({
@@ -606,26 +606,28 @@ describe('ViewerPanelCore', () => {
             return { core, install, durablePendingEditKeys };
         }
 
-        it('counts the cells a filter excludes and not one in a surviving row', async () => {
+        it('names the cells a filter excludes and not one in a surviving row', async () => {
             const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
 
             const view = await install('filter', keeps_only_row_2());
 
             expect(view.rowCount).toBe(1);
-            // Row 2 survives, so its edit is visible and uncounted; rows 0 and 4 do
+            // Row 2 survives, so its edit is visible and unnamed; rows 0 and 4 do
             // not, and row 0 contributes both of its cells.
-            expect(view.hiddenEditedCells).toBe(3);
+            expect([...view.hiddenEditedCellKeys].sort())
+                .toEqual(['0:0', '0:1', '4:0']);
         });
 
         it('counts several cells in one hidden row as several cells', async () => {
-            // Counted in cells, not rows: three pieces of unsaved work are out of
-            // sight, and saying "1" would understate what the user is holding. The
-            // conflict banner counts *rows* for removed rows because there the cell
-            // no longer exists; here it does.
+            // In cells, not rows: three pieces of unsaved work are out of sight, and
+            // saying "1" would understate what the user is holding. The conflict
+            // banner counts *rows* for removed rows because there the cell no longer
+            // exists; here it does.
             const { install } = counting_core(['0:0', '0:1', '4:0']);
 
-            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
-                .toBe(3);
+            expect([...(await install('filter', keeps_only_row_2()))
+                .hiddenEditedCellKeys].sort())
+                .toEqual(['0:0', '0:1', '4:0']);
         });
 
         it('counts the cells explicitly hidden rows exclude', async () => {
@@ -641,7 +643,8 @@ describe('ViewerPanelCore', () => {
             });
 
             expect(view.rowCount).toBe(3);
-            expect(view.hiddenEditedCells).toBe(3);
+            expect([...view.hiddenEditedCellKeys].sort())
+                .toEqual(['1:0', '3:0', '3:1']);
         });
 
         it('reports none for a sort, without consulting the dirty map at all', async () => {
@@ -657,7 +660,7 @@ describe('ViewerPanelCore', () => {
             });
 
             expect(view.permuted).toBe(true);
-            expect(view.hiddenEditedCells).toBe(0);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
             expect(durablePendingEditKeys).not.toHaveBeenCalled();
         });
 
@@ -677,15 +680,15 @@ describe('ViewerPanelCore', () => {
             });
 
             expect(view.rowCount).toBe(5);
-            expect(view.hiddenEditedCells).toBe(0);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
             expect(durablePendingEditKeys).not.toHaveBeenCalled();
         });
 
         it('reports none when the session holds no pending edits', async () => {
             const { install } = counting_core([]);
 
-            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
-                .toBe(0);
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual([]);
         });
 
         it('carries the count on both no-op equal-state acks', async () => {
@@ -694,12 +697,14 @@ describe('ViewerPanelCore', () => {
             // view in place, and that view hides the same cells.
             const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
             const installed = keeps_only_row_2();
-            expect((await install('user', installed)).hiddenEditedCells).toBe(3);
+            const hidden = ['0:0', '0:1', '4:0'];
+            expect([...(await install('user', installed)).hiddenEditedCellKeys].sort())
+                .toEqual(hidden);
 
-            expect((await install('restore', installed, 'restore')).hiddenEditedCells)
-                .toBe(3);
-            expect((await install('cancel', installed, 'cancel')).hiddenEditedCells)
-                .toBe(3);
+            expect([...(await install('restore', installed, 'restore'))
+                .hiddenEditedCellKeys].sort()).toEqual(hidden);
+            expect([...(await install('cancel', installed, 'cancel'))
+                .hiddenEditedCellKeys].sort()).toEqual(hidden);
         });
 
         it('counts an edit whose row the source no longer has', async () => {
@@ -711,15 +716,15 @@ describe('ViewerPanelCore', () => {
             // that it hides it.
             const { install } = counting_core(['9:0', '2:0']);
 
-            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
-                .toBe(1);
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual(['9:0']);
         });
 
         it('ignores keys that name no cell', async () => {
             const { install } = counting_core(['0:', ':', 'nonsense', '4', '4:0']);
 
-            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
-                .toBe(1);
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual(['4:0']);
         });
 
         it('reports none with no provider wired at all', async () => {
@@ -742,7 +747,7 @@ describe('ViewerPanelCore', () => {
                 (message) => message.type === 'transformInstalled',
             ).view) as SheetViewRecord;
             expect(view.rowCount).toBe(1);
-            expect(view.hiddenEditedCells).toBe(0);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
         });
     });
 

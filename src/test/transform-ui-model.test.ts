@@ -253,47 +253,47 @@ describe('stale_view_signature', () => {
     };
 
     it('says nothing without an installed transform', () => {
-        expect(stale_view_signature(undefined, ['5:2'], 0)).toBeUndefined();
-        expect(stale_view_signature({ sort: [], filters: [] }, ['5:2'], 0))
+        expect(stale_view_signature(undefined, ['5:2'], [])).toBeUndefined();
+        expect(stale_view_signature({ sort: [], filters: [] }, ['5:2'], []))
             .toBeUndefined();
     });
 
     it('is defined for a dirty cell in a sorted column', () => {
-        expect(stale_view_signature(sort_on_2, ['5:2'], 0)).toBeDefined();
+        expect(stale_view_signature(sort_on_2, ['5:2'], [])).toBeDefined();
     });
 
     it('says nothing for a dirty cell in a column the order does not read', () => {
-        expect(stale_view_signature(sort_on_2, ['5:3'], 0)).toBeUndefined();
+        expect(stale_view_signature(sort_on_2, ['5:3'], [])).toBeUndefined();
     });
 
     it('says nothing for a disabled filter on the dirty column', () => {
         expect(stale_view_signature(
             { sort: [], filters: [{ ...enabled_filter(2), enabled: false }] },
             ['5:2'],
-            0,
+            [],
         )).toBeUndefined();
         // Same state, filter enabled: the column is now read, so it does speak.
         expect(stale_view_signature(
             { sort: [], filters: [enabled_filter(2)] },
             ['5:2'],
-            0,
+            [],
         )).toBeDefined();
     });
 
     it('changes when the installed rules change for the same dirty cells', () => {
         // Folding the rules in is what stops an acknowledgement of one view being
         // honoured against a different one.
-        const ascending = stale_view_signature(sort_on_2, ['5:2'], 0);
+        const ascending = stale_view_signature(sort_on_2, ['5:2'], []);
         const descending = stale_view_signature(
             { sort: [{ colIndex: 2, direction: 'desc' }], filters: [] },
             ['5:2'],
-            0,
+            [],
         );
         expect(descending).not.toBe(ascending);
         // Including a filter's operand, not just which column it names.
-        expect(stale_view_signature({ sort: [], filters: [enabled_filter(2, '5')] }, ['5:2'], 0))
+        expect(stale_view_signature({ sort: [], filters: [enabled_filter(2, '5')] }, ['5:2'], []))
             .not.toBe(
-                stale_view_signature({ sort: [], filters: [enabled_filter(2, '6')] }, ['5:2'], 0),
+                stale_view_signature({ sort: [], filters: [enabled_filter(2, '6')] }, ['5:2'], []),
             );
     });
 
@@ -303,13 +303,13 @@ describe('stale_view_signature', () => {
         expect(stale_view_signature(
             { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
             ['5:', ':', 'nonsense', '5'],
-            0,
+            [],
         )).toBeUndefined();
     });
 
     it('does not depend on the order dirty keys arrive in', () => {
-        expect(stale_view_signature(sort_on_2, ['5:2', '1:2'], 0))
-            .toBe(stale_view_signature(sort_on_2, ['1:2', '5:2'], 0));
+        expect(stale_view_signature(sort_on_2, ['5:2', '1:2'], []))
+            .toBe(stale_view_signature(sort_on_2, ['1:2', '5:2'], []));
     });
 
     it('speaks for a hidden edited cell in a column no rule reads', () => {
@@ -320,28 +320,52 @@ describe('stale_view_signature', () => {
             sort: [],
             filters: [enabled_filter(2)],
         };
-        expect(stale_view_signature(filtered, ['5:3'], 0)).toBeUndefined();
-        expect(stale_view_signature(filtered, ['5:3'], 1)).toBeDefined();
+        expect(stale_view_signature(filtered, ['5:3'], [])).toBeUndefined();
+        expect(stale_view_signature(filtered, ['5:3'], ['5:3'])).toBeDefined();
     });
 
     it('speaks for hidden rows alone, which read no column at all', () => {
         // `hiddenRows` contributes no read columns by construction
-        // (`transform_read_columns`), so without the count folded in this view could
-        // never say anything, however many edits it is hiding.
+        // (`transform_read_columns`), so without the hidden cells folded in this view
+        // could never say anything, however many edits it is keeping out of sight.
         const hidden_only: SheetTransformState = {
             sort: [],
             filters: [],
             hiddenRows: [5],
         };
-        expect(stale_view_signature(hidden_only, ['5:3'], 0)).toBeUndefined();
-        expect(stale_view_signature(hidden_only, ['5:3'], 2)).toBeDefined();
+        expect(stale_view_signature(hidden_only, ['5:3'], [])).toBeUndefined();
+        expect(stale_view_signature(hidden_only, ['5:3'], ['5:3'])).toBeDefined();
     });
 
-    it('changes when only the hidden-cell count changes', () => {
+    it('changes when only the number of hidden cells changes', () => {
         // What makes a dismissal expire when the number the user acknowledged does.
-        expect(stale_view_signature(sort_on_2, ['5:2'], 1))
-            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], 2));
-        expect(stale_view_signature(sort_on_2, ['5:2'], 0))
-            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], 1));
+        expect(stale_view_signature(sort_on_2, ['5:2'], ['5:2']))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], ['5:2', '5:3']));
+        expect(stale_view_signature(sort_on_2, ['5:2'], []))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], ['5:2']));
+    });
+
+    it('changes when different cells are hidden and the count does not move', () => {
+        // Why the parameter is keys and not a count. Hide one dirty row, dismiss,
+        // unhide it and hide a *different* dirty row: same count, same dirty map, and —
+        // because `hiddenRows` is deliberately not in the rules serialization — the
+        // same rules half. Only the keys distinguish the two, and they must, because
+        // it is different unsaved work that has gone out of sight.
+        const hiding = (row: number): SheetTransformState => ({
+            sort: [],
+            filters: [],
+            hiddenRows: [row],
+        });
+        const dirty = ['5:0', '7:0'];
+        expect(stale_view_signature(hiding(5), dirty, ['5:0']))
+            .not.toBe(stale_view_signature(hiding(7), dirty, ['7:0']));
+    });
+
+    it('is unchanged by an echo of the same hidden cells in another order', () => {
+        // The other direction, and what keeps Dismiss sticking under a hiding filter:
+        // the host's key order follows `Object.keys` on the durable map, which is not
+        // a promise about anything.
+        expect(stale_view_signature(sort_on_2, ['5:2'], ['9:1', '3:4']))
+            .toBe(stale_view_signature(sort_on_2, ['5:2'], ['3:4', '9:1']));
     });
 });

@@ -138,26 +138,45 @@ export type SheetViewRecord = {
     /** Whether display order differs from source order. */
     permuted: boolean;
     /**
-     * Durable pending-edit *cells* whose source row this view does not contain.
+     * Canonical `"sourceRow:sourceColumn"` keys of the durable pending-edit *cells*
+     * whose source row this view does not contain.
      *
-     * Counted on the host because that is the only place both halves exist at the
-     * same moment — the permutation and the durable dirty map — and computed once per
-     * install because typing cannot change it. An edit cannot hide its own row: the
-     * user can only edit rows the view is showing, and an installed filter reads
-     * saved values and deliberately never recomputes mid-session. So the number moves
-     * only when the permutation does.
+     * Computed on the host because that is the only place both halves of the
+     * question exist at once — the permutation and the durable dirty map — and
+     * computed at an install because that is the only moment *membership* can change.
+     * An edit cannot hide its own row: the user can only edit rows the view is
+     * showing, and an installed filter reads saved values and deliberately never
+     * recomputes mid-session.
+     *
+     * Keys rather than a bare count, and this is the refinement worth keeping
+     * straight. Membership moves only at an install, but the *count* is a function of
+     * two things — membership and the set of edits — and the second moves on any
+     * `pendingEditsChanged`, discard or successful save, none of which install
+     * anything. A count sent from here therefore went stale the moment a filtered-out
+     * edit was discarded, with no later install to correct it. Keys have no such
+     * problem: between installs this set can only *shrink*, and only by entries
+     * leaving the dirty map, because a new edit can only be typed into a row the view
+     * is showing. So the webview intersects these keys with its live dirty map and
+     * gets the current answer with no refresh at all — and both the number it renders
+     * and the acknowledgement identity it derives come from that one value, which is
+     * why they cannot disagree (see `stale_view_signature`).
+     *
+     * Unbounded in principle and deliberately uncapped: the set is a subset of the
+     * dirty map's keys, and the whole dirty map — keys plus values plus bases —
+     * already crosses this protocol on every persist, so this is strictly smaller
+     * than traffic the design already accepts.
      *
      * `commit_transform_reconciliation` is the one other writer of a permutation, and
      * it is not an exception so much as a non-event: it publishes no record at all, so
-     * a reconciliation leaves this number exactly as stale as the `rowCount` and
-     * `permuted` beside it, and the same later `transformInstalled` refreshes all
-     * three. That is the argument for carrying it on the record rather than beside it
+     * a reconciliation leaves the membership half exactly as stale as the `rowCount`
+     * and `permuted` beside it, and the same later `transformInstalled` refreshes all
+     * three. That is the argument for carrying this on the record rather than beside it
      * — one fact about one installed view cannot drift out of step with itself.
      *
      * Cells, not rows, because two edits in one hidden row are two pieces of unsaved
      * work the user cannot see.
      */
-    hiddenEditedCells: number;
+    hiddenEditedCellKeys: readonly string[];
 };
 
 /** Allocation/persistence guard shared by webview sanitization and host plans. */
@@ -223,6 +242,14 @@ export function transform_has_entries(state: SheetTransformState | undefined): b
  * Columns whose *values* the installed transform reads: sort keys plus the
  * columns of enabled filters. `hiddenRows` contributes nothing — hiding is by row
  * identity, not by value, so no edit can change whether a row is hidden.
+ *
+ * That exclusion is about this question only, and it is easy to mistake for a
+ * general claim that `hiddenRows` never matters to the stale-view notice. It does:
+ * hiding a row takes any unsaved edit in it out of sight, which is a different
+ * question — not "can an edit change membership?" but "which unsaved cells is the
+ * user not being shown?". `SheetViewRecord.hiddenEditedCellKeys` answers that one,
+ * over `hiddenRows` and enabled filters alike, and `stale_view_signature` folds
+ * both answers in. Neither belongs in the other.
  *
  * Lives here rather than in `table-transform.ts` because both bundles need it:
  * the host computes permutations from it (`needed_columns` delegates), and the

@@ -5049,10 +5049,11 @@ describe('CSV edit sessions', () => {
 
         const restored = transform_installs(reopened).at(-1)!;
         expect(restored.view.rowCount).toBe(1);
-        expect(restored.view.hiddenEditedCells).toBe(3);
+        expect([...restored.view.hiddenEditedCellKeys].sort())
+            .toEqual(['0:0', '0:1', '2:0']);
 
         // Clearing the filter puts every row back, so the same edits are visible and
-        // the count has to fall to 0 rather than latch.
+        // the set has to fall to empty rather than latch.
         await reopened.__receive({
             type: 'setTransform',
             sheetIndex: 0,
@@ -5066,7 +5067,7 @@ describe('CSV edit sessions', () => {
         const cleared = transform_installs(reopened).at(-1)!;
         expect(cleared.requestId).toBe('clear-hiding-filter');
         expect(cleared.view.rowCount).toBe(3);
-        expect(cleared.view.hiddenEditedCells).toBe(0);
+        expect(cleared.view.hiddenEditedCellKeys).toEqual([]);
     });
 
     it('counts an edit made in this session once a filter is installed over it', async () => {
@@ -5117,7 +5118,7 @@ describe('CSV edit sessions', () => {
 
         const installed = transform_installs(panel).at(-1)!;
         expect(installed.requestId).toBe('filter-over-live-edit');
-        expect(installed.view.hiddenEditedCells).toBe(1);
+        expect(installed.view.hiddenEditedCellKeys).toEqual(['2:0']);
     });
 
     it('does not count another session\'s tombstoned edits as hidden work', async () => {
@@ -5212,9 +5213,9 @@ describe('CSV edit sessions', () => {
         const installed = transform_installs(panel).at(-1)!;
         expect(installed.requestId).toBe('filter-over-tombstone');
         // Source row 2 is exactly the row the filter drops, so an unscoped read of the
-        // durable map would report 1 here.
+        // durable map would name its cell here.
         expect(installed.view.rowCount).toBe(1);
-        expect(installed.view.hiddenEditedCells).toBe(0);
+        expect(installed.view.hiddenEditedCellKeys).toEqual([]);
         error.mockRestore();
     });
 
@@ -5276,6 +5277,304 @@ describe('CSV edit sessions', () => {
         expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
 
         await transform;
+    });
+
+    it('never moves a rehydrated owner\'s rows for a sibling transform admitted before the reopen', async () => {
+        // The race `may_rehydrate_session()` answering yes unconditionally opens, and
+        // the reason the admission question is asked a second time at the commit.
+        // The sibling's transform was admitted from a `free` phase, so nothing was
+        // wrong when it started; while it computes, a reopened panel takes the
+        // session its durable pending edits describe. Admission has lapsed — the
+        // phase is now `owned` by a panel that is not the requester — but the
+        // currency guard cannot tell, because no receiver epoch, source authority or
+        // generation moved. Persisting anyway would put the rules where the reopened
+        // owner's restore effect reads them, and its rows would move mid-session.
+        const file_path = '/tmp/sibling-transform-commit-after-rehydrate.csv';
+        const versioned = state_store();
+        const commit_read_started = deferred();
+        const commit_read_gate = deferred();
+        let gate_commit_read = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async read(path) {
+                // One-shot, armed immediately before the transform is posted: the
+                // only state read between arming and the commit is the commit's own,
+                // because admission and `compute_transform` touch no durable state.
+                // This parks the sibling exactly where the finding lives — admitted,
+                // computed, one CAS short of durable.
+                if (gate_commit_read) {
+                    gate_commit_read = false;
+                    commit_read_started.resolve();
+                    await commit_read_gate.promise;
+                }
+                return versioned.store.read(path);
+            },
+        };
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const sibling = open_csv_table(uri(file_path), store);
+        await sibling.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(sibling)!.editSessionId!;
+        const pendingEdits = { '0:0': { value: 'cached-edit', base: 'c' } };
+        await sibling.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: pendingEdits,
+        });
+        await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+        // The precondition: durable work, phase free, so the transform below is
+        // admitted for a legitimate reason and the reopen below can claim.
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+
+        const sibling_snapshot = latest_snapshot(sibling);
+        gate_commit_read = true;
+        const transform = sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'admitted-then-lapsed',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await commit_read_started.promise;
+        // Deterministic, not timing-dependent: the transform is provably past
+        // admission and past compute, and provably has not written anything.
+        expect(transform_answers(sibling)).toEqual([]);
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
+
+        const reopened = open_csv_table(uri(file_path), store);
+        await reopened.__receive({ type: 'ready' });
+        const rehydrated = latest_snapshot(reopened);
+        // The reopen really did rehydrate — the whole point of the unconditional
+        // answer — so the phase the sibling was admitted under is gone.
+        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
+        const natural = await reopened.__receive({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+            requestId: 'before-sibling-commit', generation: rehydrated.generation,
+        }).then(() => (reopened.__messages.find((message: any) => (
+            message?.type === 'rowData' && message.requestId === 'before-sibling-commit'
+        )) as { rows: Array<Array<{ raw: string }>> }).rows.map((row) => row[0].raw));
+        expect(natural).toEqual(['c', 'a', 'b']);
+
+        commit_read_gate.resolve();
+        await transform;
+        await flush_promises();
+
+        // The finding: the sibling's rules must not become durable, because durable
+        // is how they would reach the panel that now owns editing.
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
+        // Refused with the admission's own reason rather than a currency error, so
+        // the sibling's toolbar tells the user something true.
+        expect(transform_answers(sibling)).toEqual([expect.objectContaining({
+            type: 'transformRefused',
+            requestId: 'admitted-then-lapsed',
+            reason: 'Another panel is editing this file.',
+        })]);
+
+        // The load-bearing half, and it needs the owner to *touch* durable state to
+        // be worth anything: a transform commit does not notify siblings, so the
+        // rules would reach this panel on its next read. Typing another cell is that
+        // read — `update_edit_session_state` re-reads and notifies every subscriber,
+        // which reprojects durable state into this panel's snapshot, and the
+        // webview's restore effect installs whatever rules that snapshot describes.
+        // That is the row movement, mid-session, on the ordinary act of editing.
+        // The projected `transforms` is the assertion that carries it: the install
+        // itself happens in the webview, so the three host-side checks after it
+        // document the guarantee without being able to prove it alone.
+        await reopened.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: rehydrated.capabilities.csvEditSessionId!,
+            edits: { ...pendingEdits, '1:0': { value: 'typed-during', base: 'a' } },
+        });
+        expect(latest_snapshot(reopened).state.transforms?.[0]).toBeUndefined();
+        expect(transform_answers(reopened)).toEqual([]);
+        expect(latest_snapshot(reopened).generation).toBe(rehydrated.generation);
+        const after = await reopened.__receive({
+            type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
+            requestId: 'after-sibling-commit', generation: rehydrated.generation,
+        }).then(() => (reopened.__messages.find((message: any) => (
+            message?.type === 'rowData' && message.requestId === 'after-sibling-commit'
+        )) as { rows: Array<Array<{ raw: string }>> }).rows.map((row) => row[0].raw));
+        expect(after).toEqual(natural);
+        expect(latest_snapshot(reopened).state.pendingEdits).toMatchObject(pendingEdits);
+    });
+
+    it('declines a sibling transform whose admission lapses inside the commit CAS', async () => {
+        // The same finding one window narrower, and the reason the admission term
+        // lives in the predicate the CAS calls as `validate` rather than only in the
+        // mutator. Here the transform is parked *inside* `compare_and_set`, so it has
+        // already passed every pre-write check under a `free` phase; the reopen
+        // rehydrates while it sits there. A guard evaluated only before the write
+        // would let these rules land, and the finding would be narrowed instead of
+        // closed.
+        const file_path = '/tmp/sibling-transform-cas-after-rehydrate.csv';
+        const versioned = state_store();
+        const cas_started = deferred();
+        const cas_gate = deferred();
+        let gate_transform_cas = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (gate_transform_cas && next.transforms?.[0]) {
+                    gate_transform_cas = false;
+                    cas_started.resolve();
+                    await cas_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const sibling = open_csv_table(uri(file_path), store);
+        await sibling.__receive({ type: 'ready' });
+        await sibling.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(sibling)!.editSessionId!;
+        const pendingEdits = { '0:0': { value: 'cached-edit', base: 'c' } };
+        await sibling.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: pendingEdits,
+        });
+        await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+
+        const sibling_snapshot = latest_snapshot(sibling);
+        gate_transform_cas = true;
+        const transform = sibling.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'lapsed-inside-cas',
+            generation: sibling_snapshot.generation,
+            sourceGeneration: sibling_snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        await cas_started.promise;
+        // Every check the write passes before this point passed, and nothing is
+        // durable yet: the write is mid-flight, not merely pending.
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
+
+        const reopened = open_csv_table(uri(file_path), store);
+        await reopened.__receive({ type: 'ready' });
+        const rehydrated = latest_snapshot(reopened);
+        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
+
+        cas_gate.resolve();
+        await transform;
+        await flush_promises();
+
+        expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
+        expect(transform_answers(sibling)).toEqual([expect.objectContaining({
+            type: 'transformRefused',
+            requestId: 'lapsed-inside-cas',
+        })]);
+        await reopened.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: rehydrated.capabilities.csvEditSessionId!,
+            edits: { ...pendingEdits, '1:0': { value: 'typed-during', base: 'a' } },
+        });
+        expect(latest_snapshot(reopened).state.transforms?.[0]).toBeUndefined();
+    });
+
+    it('persists the owning panel\'s own transform requested during its own session', async () => {
+        // The paired direction, and the reason the guard is `admit_transform_for_phase`
+        // rather than a blanket refusal at the commit: without this, declining every
+        // commit would satisfy the test above while destroying the feature this PR
+        // exists to add. The owner sorting the panel they are editing is the user
+        // changing their own view, and it has to survive the reopen the rules are
+        // written for.
+        const file_path = '/tmp/owner-own-transform-commit.csv';
+        const shared = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const owner = open_csv_table(uri(file_path), shared.store);
+        await owner.__receive({ type: 'ready' });
+        await owner.__receive({ type: 'requestEditSession' } as never);
+        expect(latest_edit_session_message(owner)).toMatchObject({ granted: true });
+        const snapshot = latest_snapshot(owner);
+
+        await owner.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'owner-own-sort',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+
+        expect(transform_answers(owner)).toEqual([expect.objectContaining({
+            type: 'transformInstalled',
+            requestId: 'owner-own-sort',
+        })]);
+        expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
+    });
+
+    it('persists a transform committed with no edit session anywhere', async () => {
+        // The unconditioned case: nothing to serialize against, so the commit
+        // boundary must be invisible. Pinned because the guard reads a *shared* edit
+        // record that may not exist at all, and a refusal derived from its absence
+        // would break sorting for every file nobody is editing.
+        const file_path = '/tmp/no-session-transform-commit.csv';
+        const shared = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), shared.store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'unowned-sort',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+
+        expect(transform_answers(panel)).toEqual([expect.objectContaining({
+            type: 'transformInstalled',
+            requestId: 'unowned-sort',
+        })]);
+        expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
+            { colIndex: 0, direction: 'asc' },
+        ]);
     });
 
     it('refuses to rehydrate a session another panel is still releasing', async () => {

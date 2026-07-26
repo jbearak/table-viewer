@@ -487,7 +487,7 @@ function transform_installed_message(
         rowCount?: number;
         state?: SheetTransformState;
         permuted?: boolean;
-        hiddenEditedCells?: number;
+        hiddenEditedCellKeys?: readonly string[];
     },
 ): Extract<HostMessage, { type: 'transformInstalled' }> {
     const rules = options.state ?? request.state;
@@ -511,7 +511,7 @@ function transform_installed_message(
             rules: has_entries ? rules : undefined,
             rowCount: options.rowCount ?? 1,
             permuted: options.permuted ?? is_active,
-            hiddenEditedCells: options.hiddenEditedCells ?? 0,
+            hiddenEditedCellKeys: options.hiddenEditedCellKeys ?? [],
         },
     };
 }
@@ -519,10 +519,10 @@ function transform_installed_message(
 async function acknowledge_transform(
     request: Extract<WebviewMessage, { type: 'setTransform' }>,
     generation: number,
-    hiddenEditedCells = 0,
+    hiddenEditedCellKeys: readonly string[] = [],
 ) {
     await dispatch_host_message(
-        transform_installed_message(request, { generation, hiddenEditedCells }),
+        transform_installed_message(request, { generation, hiddenEditedCellKeys }),
     );
 }
 
@@ -5540,7 +5540,7 @@ describe('edit session store hydration', () => {
                 rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
                 rowCount: 1,
                 permuted: true,
-                hiddenEditedCells: 0,
+                hiddenEditedCellKeys: [],
             },
         });
 
@@ -5606,7 +5606,7 @@ describe('edit session store hydration', () => {
                 rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
                 rowCount: 1,
                 permuted: true,
-                hiddenEditedCells: 0,
+                hiddenEditedCellKeys: [],
             },
         });
 
@@ -6989,12 +6989,17 @@ describe('stale-view banner', () => {
     );
 
     /**
-     * Re-answer with the same rules on the same generation and a new hidden-cell
-     * count — the no-op-ack shape, and the smallest change that isolates the count:
-     * an unmoved generation remounts nothing and the rules half of the signature is
-     * untouched, so only the number can be doing the work.
+     * Re-answer with the same rules on the same generation and a new set of hidden
+     * cells — the no-op-ack shape, and the smallest change that isolates them: an
+     * unmoved generation remounts nothing and the rules half of the signature is
+     * untouched, so only the keys can be doing the work.
+     *
+     * `hiddenRows` deliberately not named on the rules here: hiding is what puts
+     * these keys out of sight in the real host, but the rules half must stay fixed
+     * for these tests to be about the keys, and the record is the host's word either
+     * way.
      */
-    async function reinstall_with_hidden_cells(hidden: number) {
+    async function reinstall_with_hidden_cells(hidden: readonly string[]) {
         await dispatch_host_message({
             type: 'transformInstalled',
             sheetIndex: 0,
@@ -7012,7 +7017,7 @@ describe('stale-view banner', () => {
                 },
                 rowCount: 1,
                 permuted: true,
-                hiddenEditedCells: hidden,
+                hiddenEditedCellKeys: hidden,
             },
         });
     }
@@ -7026,7 +7031,7 @@ describe('stale-view banner', () => {
         await report_grid_editing(true, true, [], dirty('0:1'));
         expect(banner()).toBeNull();
 
-        await reinstall_with_hidden_cells(1);
+        await reinstall_with_hidden_cells(['0:1']);
 
         expect(banner()?.textContent).toContain(BANNER_TEXT);
         expect(banner()?.textContent)
@@ -7037,13 +7042,52 @@ describe('stale-view banner', () => {
 
     it('pluralizes the hidden-cell sentence as one phrase', async () => {
         await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
 
-        await reinstall_with_hidden_cells(2);
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
 
         expect(banner()?.textContent)
             .toContain('2 edited cells are in rows this view doesn\'t show.');
         // Noun and verb agree, as in the conflict banner: never "2 edited cell is".
         expect(banner()?.textContent).not.toContain('edited cell is');
+        expect_no_call_to_action();
+    });
+
+    it('names only the hidden cells the dirty map still holds', async () => {
+        // The count is a function of two things — which rows the view contains and
+        // which cells are edited — and only the first is the host's to observe. The
+        // second moves with every discard, and none of them install a transform, so a
+        // number sent from the host would sit here claiming forever that work the user
+        // has already thrown away is out of sight. Narrowing to the live map is what
+        // makes the sentence answerable at all times rather than only just after an
+        // install.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
+        expect(banner()?.textContent)
+            .toContain('2 edited cells are in rows this view doesn\'t show.');
+
+        // The discard: one of the two hidden edits leaves the map. No install follows
+        // — the view did not change, only the work in it.
+        await report_grid_editing(true, true, [], dirty('1:1'));
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain('2 edited cells');
+        expect_no_call_to_action();
+    });
+
+    it('drops the claim entirely when the last hidden edit is discarded', async () => {
+        // The end of the same road, and the shape codex named: with nothing else to
+        // say, the whole notice goes rather than standing there over an empty claim.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()).not.toBeNull();
+
+        await report_grid_editing(false, false, [], {});
+
+        expect(banner()).toBeNull();
         expect_no_call_to_action();
     });
 
@@ -7061,30 +7105,186 @@ describe('stale-view banner', () => {
 
     it('reappears after Dismiss when the hidden-cell count changes', async () => {
         await edit_mode_sorted_on_column_0();
-        await reinstall_with_hidden_cells(1);
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1']);
         expect(banner()).not.toBeNull();
         await click_button('Dismiss');
         expect(banner()).toBeNull();
 
-        // Same rules, same generation, same dirty map — a different number of cells
-        // out of sight, which the acknowledgement did not cover.
-        await reinstall_with_hidden_cells(2);
+        // Same rules, same generation, same dirty map — a different set of cells out
+        // of sight, which the acknowledgement did not cover.
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
 
         expect(banner()?.textContent)
             .toContain('2 edited cells are in rows this view doesn\'t show.');
         expect_no_call_to_action();
     });
 
-    it('keeps a dismissal that the same count re-asserts', async () => {
-        // The other direction: folding the count in must not make every echo of the
+    it('keeps a dismissal that the same hidden cells re-assert', async () => {
+        // The other direction: folding the keys in must not make every echo of the
         // same view a new fact, or Dismiss would never stick under a hiding filter.
+        // Including an echo that names them in another order, which is all
+        // `Object.keys` on the host's durable map promises.
         await edit_mode_sorted_on_column_0();
-        await reinstall_with_hidden_cells(2);
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
         await click_button('Dismiss');
 
-        await reinstall_with_hidden_cells(2);
+        await reinstall_with_hidden_cells(['1:1', '0:1']);
 
         expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('goes silent when edit mode ends with the dirty map still reported', async () => {
+        // Probing for holes rather than only mutating the new code found this one: the
+        // `edit_mode` term on the signature was holding up the whole notice and no test
+        // was holding it to account — deleting it failed nothing across the suite.
+        //
+        // Reachable without a discard: the file becoming uneditable (a truncating
+        // reload, a sibling taking the session) leaves edit mode through
+        // `leave_edit_mode`, which releases the session but keeps the dirty map, so
+        // GridShell goes on reporting the same edits. The statement is about editing;
+        // outside it the order recomputes as normal and there is nothing to say.
+        //
+        // Same-basis refresh deliberately — a moved basis would replace the record
+        // with a natural view and the hidden half would fall silent for that reason
+        // instead, which is what makes this pin the gate rather than the record.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()).not.toBeNull();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 2,
+                sourceGeneration: 1,
+                capabilities: { csvEditable: false, csvEditingSupported: true },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+        await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        // Not vacuous: the record the count came from is still the installed one.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('re-shows the notice when a different dirty row is the hidden one', async () => {
+        // Hide the first of two dirty rows, dismiss, unhide it, hide the second. The
+        // count, the dirty map, the sorts and the enabled filters are all identical
+        // across the two hiding views, so nothing but the *identity* of what is out of
+        // sight distinguishes them — and different unsaved work has disappeared, which
+        // the user has not been told. `hiddenRows` is deliberately not in the rules
+        // half of the signature; making the keys the acknowledged fact is what closes
+        // this without anyone having to remember to serialize another rule field.
+        //
+        // Driven the way the app drives it: durable rules arrive on a snapshot (a
+        // sibling panel's hide, or the user's own restored on reload), the restore
+        // effect asks the host for them, and the host answers with the record.
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 3,
+                sourceRowCount: 3,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const schema = '["Sheet1",2,null]';
+        // Both edits are in column 1, which no rule reads, so the column half of the
+        // signature says nothing throughout and only the hidden cells can speak.
+        const edits = dirty('1:1', '2:1');
+        const hiding = (rows: number[]): SheetTransformState => (
+            { sort: [], filters: [], hiddenRows: rows, schema }
+        );
+        const { post_message } = await render_app();
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            // One session throughout: a new session id would expire the dismissal for
+            // an unrelated reason and make this pass without the keys.
+            csvEditSessionId: 'hidden-row-identity',
+        };
+        // Each step delivers the durable rules, lets the restore effect ask, and
+        // answers with the record the host would build for them.
+        const install_durable = async (
+            snapshot: Extract<HostMessage, { type: 'workbookSnapshot' }>,
+            rules: SheetTransformState | undefined,
+            installed_generation: number,
+            hidden: readonly string[],
+        ) => {
+            await dispatch_host_message(snapshot);
+            if (rules) {
+                await dispatch_host_message(transform_installed_message(
+                    latest_transform_request(post_message),
+                    {
+                        generation: installed_generation,
+                        rowCount: 2,
+                        hiddenEditedCellKeys: hidden,
+                    },
+                ));
+            }
+            // Last, because an install that moves the generation remounts the grid and
+            // the stub reports a fresh (empty) status on mount, exactly as the real
+            // shell does. The dirty map the user is holding is what this reports.
+            await report_grid_editing(true, true, [], edits);
+        };
+        const durable = (rules: SheetTransformState | undefined) => ({
+            capabilities,
+            state: { transforms: [rules], pendingEdits: edits },
+        });
+
+        await install_durable(
+            initial_snapshot_message(meta, durable(hiding([1]))),
+            hiding([1]),
+            2,
+            ['1:1'],
+        );
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // Unhidden: every row is back, so the notice has nothing left to say and goes
+        // on its own. Nothing here clears the acknowledgement — a signature of
+        // `undefined` is silence, not a dismissal expiring.
+        await install_durable(
+            refresh_snapshot_message(meta, {
+                generation: 3,
+                sourceGeneration: 3,
+                ...durable(undefined),
+            }),
+            undefined,
+            0,
+            [],
+        );
+        expect(banner()).toBeNull();
+
+        await install_durable(
+            refresh_snapshot_message(meta, {
+                generation: 4,
+                sourceGeneration: 4,
+                ...durable(hiding([2])),
+            }),
+            hiding([2]),
+            5,
+            ['2:1'],
+        );
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
         expect_no_call_to_action();
     });
 

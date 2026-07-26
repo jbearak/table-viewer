@@ -692,7 +692,7 @@ export function attach_viewer(
 
     /**
      * Keys of the durable pending edits the *current* session owns, which is what
-     * `hiddenEditedCells` counts. Scoped through
+     * `hiddenEditedCellKeys` is drawn from. Scoped through
      * `pending_edits_for_current_session` so a retired save's or another session's
      * tombstoned entries — durably present but not this session's to show — cannot
      * be counted as work the user is holding.
@@ -790,6 +790,43 @@ export function attach_viewer(
         sync_active_transform_panel();
         file_edit_state.transformOperations.delete(operation);
         delete_shared_edit_state_if_unused();
+    }
+
+    /**
+     * The admission question, asked again at the commit boundary. Admission at
+     * entry is not enough, because the phase can change under an operation that is
+     * already in flight: `may_rehydrate_session()` answers yes unconditionally — a
+     * reopened panel holding durable pending edits gets its session back, because
+     * refusing to represent existing user work is data loss — so the phase can go
+     * from `free` to `owned` by *another* panel while a transform computes.
+     * Persisting then would put new rules into durable state, the reopened owner's
+     * restore effect would install them, and the rows would move under a live edit
+     * session: exactly what admitting transforms only from the owning panel exists
+     * to prevent.
+     *
+     * The currency guard cannot see this. Receiver epoch, source authority and
+     * generation say nothing about the edit phase, so a transform whose panel and
+     * source never moved is perfectly "current" while its admission has lapsed.
+     * Round 6's finding 13 had the same shape — a gate that knew only one direction
+     * of a race — and asking one predicate at both ends of the operation is what
+     * stops that recurring: `admit_transform_for_phase` cannot drift from itself.
+     *
+     * What the requesting panel gives up is a view preference. Declining the write
+     * makes the commit fail, and `panel-core` answers a failed commit with a refusal
+     * rather than an install — so the requester keeps the view it already had and
+     * nothing about it diverges from durable state. Better than persisting, and
+     * better than installing locally: the user re-asks for the sort once the other
+     * panel is done. That is the right trade — a view preference asked for twice is
+     * recoverable, rows moving under an editor is not.
+     *
+     * Silent when there is no shared edit record, exactly as
+     * `begin_transform_admission` is: no record means no session can exist on this
+     * file — a non-editing profile never builds one — so there is nothing to
+     * serialize against.
+     */
+    function transform_commit_admission_refusal(): string | undefined {
+        if (!file_edit_state) return undefined;
+        return admit_transform_for_phase(file_edit_state.phase);
     }
 
     function projected_save_lifecycle(): CsvSaveLifecycle {
@@ -1675,9 +1712,16 @@ export function attach_viewer(
         if (message.intent === 'restore') return;
         const authority = transform_authorities.get(message);
         if (!authority || authority.receiverEpoch !== receiver_epoch) return;
+        // Currency *and* admission. The admission term is folded in here rather than
+        // written out in the mutator so that all three places this closure is
+        // consulted get it: the pre-read check, the mutator below, and — the one that
+        // matters most — the `validate` the CAS itself calls, which is the last
+        // moment before the rules become durable. See
+        // `transform_commit_admission_refusal` for why re-asking is the fix.
         const transform_is_current_before_commit = () =>
             authority.receiverEpoch === receiver_epoch
-            && transform_authority_is_current(message, authority);
+            && transform_authority_is_current(message, authority)
+            && transform_commit_admission_refusal() === undefined;
         transform_commit_barriers.add(authority);
         const committed = await update_file_state((current) => {
             const sheet = source?.meta().sheets[message.sheetIndex];
@@ -1701,7 +1745,13 @@ export function attach_viewer(
             return { ...current, transforms };
         }, undefined, transform_is_current_before_commit);
         if (!committed) {
-            throw new Error('The source changed before this table view could be saved.');
+            // Name the real reason when it is the admission that lapsed: "the source
+            // changed" would be a lie, and the phases that refuse here all end on
+            // their own, so the user's next attempt is the one that works.
+            throw new Error(
+                transform_commit_admission_refusal()
+                ?? 'The source changed before this table view could be saved.',
+            );
         }
     }
 
