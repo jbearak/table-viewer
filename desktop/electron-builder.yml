@@ -99,12 +99,14 @@ mac:
   target:
     - dmg
     - zip
-# Windows ships unsigned: an Authenticode certificate is a recurring paid
-# subscription we have chosen not to buy, so SmartScreen shows its
-# "Windows protected your PC" interstitial on first run and the user clicks
-# More info -> Run anyway. Nothing in this config or the release workflow
-# tries to sign, and CSC_IDENTITY_AUTO_DISCOVERY is pinned off in CI so a
-# stray certificate in a runner's store can't silently change the artifact.
+# Windows ships unsigned: certificates are expensive and this project isn't
+# developed on Windows. So SmartScreen shows its "Windows protected your PC"
+# interstitial on first run and the user clicks More info -> Run anyway. Worth
+# knowing before buying one: a cheap OV cert wouldn't remove that interstitial,
+# since SmartScreen reputation accrues per publisher against download volume.
+# Nothing in this config or the release workflow tries to sign, and
+# CSC_IDENTITY_AUTO_DISCOVERY is pinned off in CI so a stray certificate in a
+# runner's store can't silently change the artifact.
 win:
   # Same 1024x1024 master as macOS; electron-builder renders the .ico slices.
   icon: build/icon.png

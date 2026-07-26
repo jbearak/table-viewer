@@ -24,7 +24,7 @@ For Table Viewer, the important parts are much simpler:
 - The **Activity Bar** is a strip of shortcuts along one edge of the VS Code window.
 - Selecting an Activity Bar icon opens the **Side Bar**. The file icon opens Explorer, the magnifying glass opens Search, and the blocks icon opens Extensions.
 
-The screenshots in the [setup and try-out guide](setup-guide.md) keep only those three Activity Bar views: Explorer, Search, and Extensions. You may see more icons, and that is completely normal.
+The screenshots in the [VS Code extension setup and try-out guide](setup-guide-vscode-extension.md) keep only those three Activity Bar views: Explorer, Search, and Extensions. You may see more icons, and that is completely normal.
 
 ## Open a table file without a workspace
 
@@ -125,6 +125,6 @@ VS Code also includes several themes out of the box. You can preview them from t
 
 ## Continue with Table Viewer
 
-Once the window feels comfortable, return to the [setup and 10-minute try-out guide](setup-guide.md) to install Table Viewer and open the sample workbook.
+Once the window feels comfortable, return to the [VS Code extension setup and 10-minute try-out guide](setup-guide-vscode-extension.md) to install Table Viewer and open the sample workbook.
 
 For more detail, VS Code's official documentation explains its [user interface](https://code.visualstudio.com/docs/editing/userinterface), [layout controls](https://code.visualstudio.com/docs/configure/custom-layout), [AI settings](https://code.visualstudio.com/docs/agents/reference/ai-settings), and [color themes](https://code.visualstudio.com/docs/configure/themes).
