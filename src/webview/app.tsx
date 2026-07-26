@@ -568,14 +568,23 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
         edit_session_ref.current!.install({ session_id }, edits);
-        // This is the single hydration boundary, so it is also the single place
-        // every replacement of the edit map passes through — a grant, a refresh, a
-        // save's restore. A host verdict is a statement about one specific map, so
-        // it cannot outlive one: the map it judged is no longer the map we hold.
-        // Callers that go on to record a *new* verdict (the saveResult handler) do
-        // so after this returns, so this clear cannot swallow it.
-        clear_save_verdict();
-    }, [clear_save_verdict]);
+        // Deliberately does NOT clear the host's save verdict. Crossing this
+        // boundary is not evidence that the judged map is gone: the refresh branch
+        // installs on a snapshot for our *own* session, and what it installs is
+        // resolve_csv_save_hydration's restore of the failed operation's own
+        // dirtyEdits — byte-identical to the map the host just judged. A capability
+        // recapture is enough to land there (the rejection's own pendingEdits write
+        // notifies edit state), so clearing here dropped the banner, the tint, and
+        // both of its exits while the rejection was still true — and for a host-only
+        // rejection the banner is the only recovery affordance there is.
+        //
+        // The verdict expires on its own facts instead: the session stamp and the
+        // per-key value/base comparison in `live_rejected_keys` (a replaced or
+        // departed entry stops matching), the clear at the top of the saveResult
+        // handler for a superseding result, leave_edit_mode/discard_edit_session for
+        // a session that ends, and the explicit clear in the 'initial' reset block
+        // for a fresh document.
+    }, []);
 
     const apply_save_lifecycle = useCallback((incoming: CsvSaveLifecycle) => {
         const previous = save_projection_ref.current;
@@ -599,6 +608,11 @@ export function App(): React.JSX.Element {
                 install_edit_session(hydrated, current_session_id);
             }
         } else if (incoming.state === 'idle') {
+            // Currently unreachable, and pre-existing: reduce_csv_save_projection
+            // carries `current.operation` forward unchanged on every idle incoming,
+            // so `previous.operation && !next.operation` cannot hold. Left in place
+            // as the restore for an idle projection that does drop the lock, rather
+            // than removed and re-derived if the reducer ever gains one.
             if (
                 previous.operation
                 && !next.operation
@@ -1080,9 +1094,11 @@ export function App(): React.JSX.Element {
                         );
                         set_editing_status(null);
                         // A fresh document: the rejection and the dismissal go
-                        // together (install_edit_session above already does this, but
-                        // stating it here keeps the reset block self-contained rather
-                        // than dependent on that call's internals).
+                        // together. The install above deliberately does not clear the
+                        // verdict (a same-session refresh reinstalls the very map the
+                        // host judged), so this is the clear for the reset — and it
+                        // was already written to stand on its own rather than depend
+                        // on that call's internals.
                         clear_save_verdict();
                         pending_exit_ref.current = false;
                     } else {

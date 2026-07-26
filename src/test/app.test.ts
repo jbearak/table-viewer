@@ -3943,6 +3943,73 @@ describe('edit mode save exit', () => {
             .toEqual([]);
     });
 
+    it('keeps a host rejection across a same-session refresh', async () => {
+        // The mirror of the rotation case above, and the one the session stamp cannot
+        // cover: a refresh whose csvEditSessionId is still ours reinstalls the very
+        // map the host judged — same session, same values, same bases — so the
+        // verdict is still true. Any capability/state recapture lands here (entering
+        // the rejection's own aftermath is enough to trigger one), and the banner is
+        // the only recovery affordance for a host-only rejection, so losing it here
+        // reads as "the conflict resolved itself".
+        const meta = make_meta(['Sheet1'], false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 909,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-10',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+
+        // A refresh for our *own* session, carrying back the rejected map: this is
+        // the install path (refresh_editing_current_session is true), unlike the
+        // rotation test above.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 3,
+            sourceGeneration: 3,
+            state: {
+                pendingEdits: { '4:1': { value: 'edited', base: 'stale' } },
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+        // The shell reports the restored map after the remount; the stub does not,
+        // so replay it — byte-identical, because nothing about the edit changed.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
     it('lets a later save result supersede an earlier rejection', async () => {
         // The adoption block only ever *sets*, so without a clear at the top of the
         // handler a rejection outlives every later verdict that does not name keys
