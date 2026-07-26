@@ -664,7 +664,20 @@ export function attach_viewer(
         if (shared_edit_state_is_unused()) csv_edit_file_states.delete(file_key);
     }
 
-    function observe_durable_transform(snapshot: Readonly<FileStateSnapshot>): void {
+    /**
+     * The durable pending edits this panel last observed. Latched rather than read,
+     * because `installed_view` builds its record synchronously and an install must
+     * not gain a state read it did not need before.
+     *
+     * Staleness here is benign, and the reason is worth stating: this can lag the
+     * live dirty map by the webview's persistence debounce, but an edit too new to
+     * appear here was just typed, so its row was on screen to be typed into, so it
+     * is not one of the hidden ones. Omitting it is correct, not a gap.
+     */
+    let durable_pending_edits: PerFileState['pendingEdits'];
+
+    /** Latched facts about durable state, refreshed on every read of it. */
+    function observe_durable_state(snapshot: Readonly<FileStateSnapshot>): void {
         if (
             !file_edit_state
             || snapshot.revision < file_edit_state.durableTransform.revision
@@ -674,6 +687,22 @@ export function attach_viewer(
             revision: snapshot.revision,
             active: state.transforms?.some(transform_is_active) ?? false,
         };
+        durable_pending_edits = state.pendingEdits;
+    }
+
+    /**
+     * Keys of the durable pending edits the *current* session owns, which is what
+     * `hiddenEditedCells` counts. Scoped through
+     * `pending_edits_for_current_session` so a retired save's or another session's
+     * tombstoned entries — durably present but not this session's to show — cannot
+     * be counted as work the user is holding.
+     *
+     * No sheet qualification, because there is none to give: `pendingEdits` is
+     * file-scoped, and CSV — the one editable format — has exactly one sheet.
+     */
+    function durable_pending_edit_keys(): readonly string[] {
+        const scoped = pending_edits_for_current_session(durable_pending_edits);
+        return scoped ? Object.keys(scoped) : [];
     }
 
     function sync_active_transform_panel(): void {
@@ -1095,7 +1124,7 @@ export function attach_viewer(
             ? { type: 'free' }
             : { type: 'uncertain', operation };
         if (success && cleared_snapshot !== undefined) {
-            observe_durable_transform(cleared_snapshot);
+            observe_durable_state(cleared_snapshot);
             file_edit_state.clearedStateRevision = Math.max(
                 file_edit_state.clearedStateRevision ?? -1,
                 cleared_snapshot.revision,
@@ -1216,7 +1245,7 @@ export function attach_viewer(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): FileStateSnapshot {
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         const state = snapshot.state as PerFileState;
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
@@ -1282,7 +1311,7 @@ export function attach_viewer(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): boolean {
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         return session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
     }
 
@@ -1297,7 +1326,7 @@ export function attach_viewer(
     async function read_file_state(touch = true): Promise<FileStateSnapshot> {
         await file_coordinator.state_ready();
         const snapshot = await state_store.read(state_path);
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         if (touch) await state_store.touch(state_path);
         return snapshot;
     }
@@ -1320,7 +1349,7 @@ export function attach_viewer(
                 validate,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
@@ -1468,7 +1497,7 @@ export function attach_viewer(
                 is_current,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed && is_current()) update_session_state_material(result.snapshot);
                 return { type: 'committed', snapshot: result.snapshot };
             }
@@ -1598,13 +1627,13 @@ export function attach_viewer(
                 is_current,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed && is_current()) {
                     update_session_state_material(result.snapshot, false);
                 }
                 return 'committed';
             }
-            observe_durable_transform(result.snapshot);
+            observe_durable_state(result.snapshot);
             if (!disposed && is_current() && core === cleanup_core) {
                 update_session_state_material(result.snapshot, false);
             }
@@ -1996,6 +2025,7 @@ export function attach_viewer(
                 {
                     onTransformCommit: persist_transform_commit,
                     onInvalidRestore: cleanup_invalid_restore,
+                    durablePendingEditKeys: durable_pending_edit_keys,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);

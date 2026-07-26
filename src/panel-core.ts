@@ -3,6 +3,7 @@ import {
     projected_row_for_source,
     read_source_row_indices,
 } from './data-source/interface';
+import { parse_cell_highlight_key } from './cell-highlights';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram, type ColumnHistogram } from './histograms';
 import {
@@ -184,6 +185,7 @@ export class ViewerPanelCore {
     private disposed = false;
     private readonly on_transform_commit?: TransformCommit;
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
+    private readonly durable_pending_edit_keys?: () => readonly string[];
 
     constructor(
         private readonly panel: PanelLike,
@@ -193,6 +195,13 @@ export class ViewerPanelCore {
             maxCachedTransformCells?: number;
             onTransformCommit?: TransformCommit;
             onInvalidRestore?: InvalidRestoreCleanup;
+            /**
+             * Canonical `"sourceRow:sourceColumn"` keys of the durable pending edits
+             * the current edit session owns. The core owns view membership and the
+             * authority layer owns the dirty map, so `hiddenEditedCells` needs both;
+             * absent (Excel, or any caller with no edit sessions) it is always 0.
+             */
+            durablePendingEditKeys?: () => readonly string[];
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -201,6 +210,7 @@ export class ViewerPanelCore {
         );
         this.on_transform_commit = opts?.onTransformCommit;
         this.on_invalid_restore = opts?.onInvalidRestore;
+        this.durable_pending_edit_keys = opts?.durablePendingEditKeys;
     }
 
     get generation(): number {
@@ -574,6 +584,60 @@ export class ViewerPanelCore {
     }
 
     /**
+     * How many of the session's durable pending-edit cells sit in rows this view
+     * does not contain — see `SheetViewRecord.hiddenEditedCells` for why this is the
+     * only place and the only moment the question is answerable.
+     *
+     * Nothing is scanned unless rows can actually be missing. A sort permutes
+     * without dropping, so only an enabled filter or an explicit `hiddenRows` can
+     * hide anything, and a filter that matched every row has dropped nothing either
+     * — which the index length answers for free.
+     *
+     * Membership then comes from `display_row_for_source`, deliberately reusing the
+     * inverse permutation it already builds and caches beside the indices it
+     * inverts. The install that produced those indices has just invalidated the old
+     * inverse, so the first lookup costs O(rows) at a moment that was already
+     * O(rows), and every edit after it is O(1).
+     *
+     * Deliberately reads the *durable* map rather than the live one, which can lag
+     * it by the webview's persistence debounce. That cannot under-report anything
+     * that matters: an edit too new to be durable was just typed, so its row was on
+     * screen to be typed into, so it is not hidden.
+     */
+    private hidden_edited_cells(
+        sheet_index: number,
+        sheet: SheetMeta,
+        rules: SheetTransformState | undefined,
+        indices: Uint32Array | undefined,
+    ): number {
+        if (!indices || !this.durable_pending_edit_keys) return 0;
+        const excludes_rows = !!rules && (
+            rules.filters.some((entry) => entry.enabled)
+            || (rules.hiddenRows?.length ?? 0) > 0
+        );
+        if (!excludes_rows || indices.length === sheet.rowCount) return 0;
+        const keys = this.durable_pending_edit_keys();
+        if (keys.length === 0) return 0;
+        let hidden = 0;
+        // Several cells in one row ask the same question, and the answer is per row.
+        const row_is_present = new Map<number, boolean>();
+        for (const key of keys) {
+            // Pending edits and cell highlights share one canonical key format, so
+            // this is the same parse, refusing the same malformed keys.
+            const parsed = parse_cell_highlight_key(key);
+            if (!parsed) continue;
+            let present = row_is_present.get(parsed.sourceRow);
+            if (present === undefined) {
+                present = this.display_row_for_source(sheet_index, parsed.sourceRow)
+                    !== undefined;
+                row_is_present.set(parsed.sourceRow, present);
+            }
+            if (!present) hidden += 1;
+        }
+        return hidden;
+    }
+
+    /**
      * Describe the view this core holds for a sheet *right now*. Every install
      * acknowledgement is built from this after the mutation, so the record and the
      * core cannot disagree about what was installed.
@@ -594,6 +658,14 @@ export class ViewerPanelCore {
                 : undefined,
             rowCount: indices?.length ?? sheet.rowCount,
             permuted: indices !== undefined,
+            // Every install arm builds its record here, including the two no-op
+            // equal-state acks, so none of them can answer this with a stale number.
+            hiddenEditedCells: this.hidden_edited_cells(
+                sheet_index,
+                sheet,
+                rules,
+                indices,
+            ),
         };
     }
 
@@ -948,6 +1020,7 @@ export function adopt_source_into_core(
     opts?: {
         onTransformCommit?: TransformCommit;
         onInvalidRestore?: InvalidRestoreCleanup;
+        durablePendingEditKeys?: () => readonly string[];
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

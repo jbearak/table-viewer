@@ -1345,6 +1345,12 @@ export function App(): React.JSX.Element {
                                     : durable,
                                 rowCount: sheet.rowCount,
                                 permuted: false,
+                                // A natural view contains every row, so it hides no
+                                // edit. Fabricating the count here is safe for the
+                                // same reason `permuted: false` is: this snapshot's
+                                // rows are the metadata's own until an install lands,
+                                // and that install carries the host's real count.
+                                hiddenEditedCells: 0,
                             };
                         },
                     ));
@@ -2893,11 +2899,40 @@ export function App(): React.JSX.Element {
     // the requested ones, because the statement is about the order the user is
     // looking at. Only meaningful in edit mode — outside it the order recomputes as
     // normal.
+    //
+    // The hidden-cell count rides the same record, so it needs no state of its own and
+    // cannot disagree with the rules it was computed against. No `edit_mode` term of
+    // its own either: the signature below carries the only one there should be, and
+    // the message is rendered only when the banner is. Probed rather than assumed — a
+    // second copy of that gate here fails no test, which makes it a guard nothing
+    // could hold to account.
+    const hidden_edited_cells = installed_view?.hiddenEditedCells ?? 0;
     const stale_view_current_signature = edit_mode
-        ? stale_view_signature(installed_view?.rules, Object.keys(live_edits ?? {}))
+        ? stale_view_signature(
+            installed_view?.rules,
+            Object.keys(live_edits ?? {}),
+            hidden_edited_cells,
+        )
         : undefined;
     const show_stale_view_banner = stale_view_current_signature !== undefined
         && stale_view_current_signature !== acknowledged_stale_signature;
+    // One notice, one sentence per fact. The second sentence is still a statement,
+    // not a prompt: it says where the unsaved work is, and nothing about doing
+    // anything with it. Noun and verb are pluralized as one phrase, as in
+    // conflict_banner_message, so "1 edited cells are" cannot be written.
+    //
+    // "doesn't show" rather than "hides" because the host counts every edited row the
+    // view does not contain, and one of those is a row an external shrink removed —
+    // not hidden, gone. The weaker verb is true of both, and both are the same fact
+    // for the user: unsaved work they cannot see.
+    const stale_view_message = [
+        'Sorting and filters don\'t update while you\'re editing.',
+        ...(hidden_edited_cells > 0
+            ? [hidden_edited_cells === 1
+                ? '1 edited cell is in a row this view doesn\'t show.'
+                : `${hidden_edited_cells} edited cells are in rows this view doesn't show.`]
+            : []),
+    ].join(' ');
 
     // Conflict banner: a stable signature of the conflicted cell set, so dismissing
     // it ("Keep All") sticks until a *different* set of cells drifts.
@@ -3137,7 +3172,7 @@ export function App(): React.JSX.Element {
                 // content area holding the grid so it never joins GridShell's
                 // remount key.
                 <div className="stale-view-banner">
-                    Sorting and filters don't update while you're editing.
+                    {stale_view_message}
                     <div className="stale-view-banner-actions">
                         <button
                             onClick={() => set_acknowledged_stale_signature(

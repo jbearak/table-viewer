@@ -304,76 +304,75 @@ export function transform_progress_label(
 }
 
 /**
- * Signature of the dirty cells whose column the installed transform reads, or
- * undefined when there are none.
+ * Signature of everything the stale-view notice is currently saying, or undefined
+ * when it has nothing to say.
  *
- * An installed sort or filter deliberately does not recompute during a live edit
- * session — rows stay where the user left them, which is the feature. The
- * displayed order can therefore disagree with the current values, and it is worth
- * saying so exactly when some edited cell is in a column the order depends on.
+ * There are two independent reasons to say something, and either alone is enough:
  *
- * Derived from the *current* dirty map rather than latched, so reverting or
- * discarding the last relevant edit clears it for free. The transform's own
- * signature is folded in so changing the installed sort is a new fact rather than
- * a previously acknowledged one.
+ *  - A dirty cell sits in a column the installed order reads. An installed sort or
+ *    filter deliberately does not recompute during a live edit session — rows stay
+ *    where the user left them, which is the feature — so the displayed order can
+ *    disagree with the current values, and that is worth saying.
+ *  - The installed view hides rows holding unsaved edits (`hidden_edited_cells`).
+ *    This one cannot be reduced to the first: hidden-ness is a property of the
+ *    *row*, so an edit in a column no rule reads is hidden just the same, and the
+ *    reopen case — durable edits plus a durable filter whose saved values exclude
+ *    their rows — is exactly that shape. Gating it behind the column test would
+ *    silence the notice in the case it exists for.
  *
- * Deliberately no count of rows that no longer match an enabled filter. Judging
- * that needs every filtered column's value for the row, and the webview holds
- * only dirty cells plus resident rows, so the number would be wrong for
- * non-resident rows — and a wrong count in a banner is worse than no count. It
- * would also mean relocating the host's filter compiler into the webview.
+ * The column half is derived from the *current* dirty map rather than latched, so
+ * reverting or discarding the last relevant edit clears it for free. The
+ * transform's own signature is folded in so changing the installed sort is a new
+ * fact rather than a previously acknowledged one, and the count is folded in so a
+ * dismissal cannot outlive the number it was pressed over.
  *
- * Nor a count of edited cells the view currently *hides*, which is the sharper
- * version of the same question: after a close and reopen the view is recomputed
- * from saved values, so a row whose durable edits make it fail an enabled filter
- * is simply absent, and the user holds unsaved work they cannot see. That is worth
- * saying, and it is still not ours to say from here. Two independent reasons:
- *
- *  - Membership of the view never reaches the webview. `transformInstalled`
- *    carries basis, rules, row count and `permuted` — no index list — and
- *    display-to-source identity arrives only per fetched page, as
- *    `rowData.sourceRows`, behind RowLoader's page LRU. "Is source row R in the
- *    current view?" is therefore answerable only for rows that happen to be
- *    resident right now, so any count derived from it would move with the
- *    scrollbar.
- *  - Recomputing membership instead of observing it needs each filtered column's
- *    *saved* value for every dirty row, non-resident ones included, plus the
- *    host's filter compiler — the two things ruled out just above.
- *
- * Note the asymmetry that makes this tempting: explicitly hidden rows *are*
- * source-keyed and exactly knowable here (`hiddenRows`), so a count over those
- * alone is computable. It would under-report whenever a filter is also enabled,
- * which is exactly the case such a count exists for, so it would be a number that
- * is right only sometimes — the worse of the two failures. Saying this honestly
- * needs the host, which owns the permutation, to send the count.
+ * The count is *not* computable here, which is why it is a parameter: view
+ * membership never reaches the webview. `transformInstalled` carries basis, rules,
+ * row count and `permuted` — no index list — and display-to-source identity
+ * arrives only per fetched page, as `rowData.sourceRows`, behind RowLoader's page
+ * LRU, so a webview-side count would move with the scrollbar. Recomputing
+ * membership instead of observing it is worse still: it needs every filtered
+ * column's *saved* value for every dirty row, non-resident ones included, plus the
+ * host's filter compiler. The host has both halves and needs them only at the one
+ * moment the number can change — see `SheetViewRecord.hiddenEditedCells` — so it
+ * sends the count and this reads it.
  *
  * @param dirty_keys `"sourceRow:sourceColumn"` keys, as PR 2 rekeyed them.
+ * @param hidden_edited_cells `SheetViewRecord.hiddenEditedCells` for the installed
+ *   view, straight from the host.
  */
 export function stale_view_signature(
     state: SheetTransformState | undefined,
     dirty_keys: readonly string[],
+    hidden_edited_cells: number,
 ): string | undefined {
+    // No installed rules is no view to be stale about, and nothing can be hidden by
+    // one either — so this also makes the rules serialization below total.
+    if (!state) return undefined;
     const columns = transform_read_columns(state);
-    if (columns.size === 0) return undefined;
-    const affected = dirty_keys
-        .filter((key) => {
-            const separator = key.indexOf(':');
-            if (separator < 0) return false;
-            const text = key.slice(separator + 1);
-            const column = Number(text);
-            // Number('') is 0, so an empty tail would otherwise read as column 0.
-            return text.length > 0 && Number.isInteger(column) && columns.has(column);
-        })
-        .sort();
-    if (affected.length === 0) return undefined;
+    const affected = columns.size === 0
+        ? []
+        : dirty_keys
+            .filter((key) => {
+                const separator = key.indexOf(':');
+                if (separator < 0) return false;
+                const text = key.slice(separator + 1);
+                const column = Number(text);
+                // Number('') is 0, so an empty tail would otherwise read as column 0.
+                return text.length > 0
+                    && Number.isInteger(column)
+                    && columns.has(column);
+            })
+            .sort();
+    if (affected.length === 0 && hidden_edited_cells <= 0) return undefined;
     // The transform half changes whenever the installed rules do — including a
     // filter's operator or value, not just which columns it names — so an
     // acknowledgement cannot carry over to a different view.
     const rules = JSON.stringify([
-        state!.sort,
-        state!.filters.filter((entry) => entry.enabled),
+        state.sort,
+        state.filters.filter((entry) => entry.enabled),
     ]);
-    return `${rules}|${affected.join(',')}`;
+    return `${rules}|${affected.join(',')}|${hidden_edited_cells}`;
 }
 
 export type TransformShortcut =

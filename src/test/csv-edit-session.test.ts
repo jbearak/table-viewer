@@ -4995,6 +4995,229 @@ describe('CSV edit sessions', () => {
         expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
     });
 
+    it('counts the reopened edits a restored filter hides, and none once it is cleared', async () => {
+        // The case the count exists for. The user edited rows and closed the tab; the
+        // filter is recomputed on reopen from *saved* values, so rows holding those
+        // edits are simply absent and the work is unreachable in the grid. Nothing in
+        // the webview can see that — membership never crosses the protocol — so the
+        // number has to arrive on the install record.
+        const file_path = '/tmp/hidden-edited-cells-on-reopen.csv';
+        const filter = {
+            sort: [],
+            filters: [{
+                id: 'keep-a',
+                colIndex: 0,
+                operator: 'equals' as const,
+                value: 'a',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const shared = state_store({
+            // Source rows are c, a, b. Row 0 carries two edited cells and row 2 one;
+            // row 1 is the only row the filter keeps, so its edit stays visible.
+            pendingEdits: {
+                '0:0': { value: 'edited-c', base: 'c' },
+                '0:1': { value: 'new-column', base: '' },
+                '1:0': { value: 'edited-a', base: 'a' },
+                '2:0': { value: 'edited-b', base: 'b' },
+            },
+            transforms: [filter],
+        });
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const reopened = open_csv_table(uri(file_path), shared.store);
+        await reopened.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(reopened);
+        // The precondition: the panel holds the session, so these edits are its work
+        // to report on. Without this the count would be about nobody's session.
+        expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
+
+        await reopened.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'restore-hiding-filter',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'restore',
+            state: filter,
+        });
+
+        const restored = transform_installs(reopened).at(-1)!;
+        expect(restored.view.rowCount).toBe(1);
+        expect(restored.view.hiddenEditedCells).toBe(3);
+
+        // Clearing the filter puts every row back, so the same edits are visible and
+        // the count has to fall to 0 rather than latch.
+        await reopened.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'clear-hiding-filter',
+            generation: restored.view.basis.generation,
+            sourceGeneration: restored.view.basis.sourceGeneration,
+            intent: 'user',
+            state: { sort: [], filters: [] },
+        });
+
+        const cleared = transform_installs(reopened).at(-1)!;
+        expect(cleared.requestId).toBe('clear-hiding-filter');
+        expect(cleared.view.rowCount).toBe(3);
+        expect(cleared.view.hiddenEditedCells).toBe(0);
+    });
+
+    it('counts an edit made in this session once a filter is installed over it', async () => {
+        // The live half of the same fact, and the proof that the durable map is read
+        // rather than a start-of-session copy: the edit is typed, persisted, and only
+        // then does a filter the *saved* value fails take its row out of the view.
+        const file_path = '/tmp/hidden-edited-cells-after-typing.csv';
+        const shared = state_store();
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), shared.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const session_id = latest_edit_session_message(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_id,
+            edits: { '2:0': { value: 'edited-b', base: 'b' } },
+        });
+        expect(shared.get_state(file_path).pendingEdits).toEqual({
+            '2:0': { value: 'edited-b', base: 'b' },
+        });
+
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'filter-over-live-edit',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [{
+                    id: 'keep-a',
+                    colIndex: 0,
+                    operator: 'equals',
+                    value: 'a',
+                    caseSensitive: false,
+                    enabled: true,
+                }],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+
+        const installed = transform_installs(panel).at(-1)!;
+        expect(installed.requestId).toBe('filter-over-live-edit');
+        expect(installed.view.hiddenEditedCells).toBe(1);
+    });
+
+    it('does not count another session\'s tombstoned edits as hidden work', async () => {
+        // The count reports what *this* session is holding, which is why it reads
+        // through pending_edits_for_current_session rather than the durable map.
+        //
+        // Reaching the window takes work, and that is the point: the ordinary route
+        // awaits `ensure_failed_save_cleanup` before granting the next session, so the
+        // failed operation's entries are normally gone from durable state by the time
+        // any install can see them. Here the cleanup *write* keeps failing, so the
+        // next session runs with the tombstone still standing over entries still on
+        // disk — the one shape where the durable map and this session's work differ.
+        // The projection already strips them, so counting them would put a number in
+        // the banner naming cells the grid does not hold.
+        const file_path = '/tmp/hidden-edited-cells-ignores-tombstone.csv';
+        const versioned = state_store();
+        let cleanup_writes = 0;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                const current = await versioned.store.read(path);
+                if ((current.state as PerFileState).pendingEdits && !next.pendingEdits) {
+                    cleanup_writes += 1;
+                    throw new Error('cleanup write failed');
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const bytes = enc.encode('h\nc\na\nb\n');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength, mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk write failed');
+        });
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-a' });
+        const session_a = latest_edit_session_message(panel)!.editSessionId!;
+        const dirtyEdits = { '2:0': { value: 'edited-b', base: 'b' } };
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session_a,
+            edits: dirtyEdits,
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_a,
+                saveRequestId: 'failing-save',
+                edits: { '2:0': 'edited-b' },
+                dirtyEdits,
+            },
+        });
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session_a });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'session-b' });
+        const session_b = latest_edit_session_message(panel)!.editSessionId!;
+        await flush_promises();
+
+        // The preconditions, asserted rather than assumed: a different session, the
+        // failed operation's entries still durable, and a cleanup that has actually
+        // been attempted and refused.
+        expect(session_b).not.toBe(session_a);
+        expect(session_b).toBeDefined();
+        expect(cleanup_writes).toBeGreaterThan(0);
+        expect(versioned.get_state(file_path).pendingEdits).toEqual(dirtyEdits);
+
+        const snapshot = latest_snapshot(panel);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'filter-over-tombstone',
+            generation: snapshot.generation,
+            sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [{
+                    id: 'keep-a',
+                    colIndex: 0,
+                    operator: 'equals',
+                    value: 'a',
+                    caseSensitive: false,
+                    enabled: true,
+                }],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+
+        const installed = transform_installs(panel).at(-1)!;
+        expect(installed.requestId).toBe('filter-over-tombstone');
+        // Source row 2 is exactly the row the filter drops, so an unscoped read of the
+        // durable map would report 1 here.
+        expect(installed.view.rowCount).toBe(1);
+        expect(installed.view.hiddenEditedCells).toBe(0);
+        error.mockRestore();
+    });
+
     it('projects cached edits on reopen while a sibling transform is still computing', async () => {
         // `may_rehydrate_session()` is the one transform-shaped question whose answer
         // is unconditionally yes, and this is the case that distinguishes it from

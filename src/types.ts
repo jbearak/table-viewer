@@ -137,6 +137,27 @@ export type SheetViewRecord = {
     rowCount: number;
     /** Whether display order differs from source order. */
     permuted: boolean;
+    /**
+     * Durable pending-edit *cells* whose source row this view does not contain.
+     *
+     * Counted on the host because that is the only place both halves exist at the
+     * same moment — the permutation and the durable dirty map — and computed once per
+     * install because typing cannot change it. An edit cannot hide its own row: the
+     * user can only edit rows the view is showing, and an installed filter reads
+     * saved values and deliberately never recomputes mid-session. So the number moves
+     * only when the permutation does.
+     *
+     * `commit_transform_reconciliation` is the one other writer of a permutation, and
+     * it is not an exception so much as a non-event: it publishes no record at all, so
+     * a reconciliation leaves this number exactly as stale as the `rowCount` and
+     * `permuted` beside it, and the same later `transformInstalled` refreshes all
+     * three. That is the argument for carrying it on the record rather than beside it
+     * — one fact about one installed view cannot drift out of step with itself.
+     *
+     * Cells, not rows, because two edits in one hidden row are two pieces of unsaved
+     * work the user cannot see.
+     */
+    hiddenEditedCells: number;
 };
 
 /** Allocation/persistence guard shared by webview sanitization and host plans. */

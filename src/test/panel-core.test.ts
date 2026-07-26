@@ -561,6 +561,191 @@ describe('ViewerPanelCore', () => {
         expect(disabled.rules?.filters).toHaveLength(1);
     });
 
+    describe('hiddenEditedCells', () => {
+        // StubSource's column 0 is the row index as text, so `equals '2'` keeps
+        // exactly source row 2 and drops the other four.
+        const keeps_only_row_2 = (id = 'filter-1'): SheetTransformState => ({
+            sort: [],
+            filters: [{
+                id,
+                colIndex: 0,
+                operator: 'equals',
+                value: '2',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+
+        function counting_core(keys: readonly string[]) {
+            const { panel, posted } = make_panel();
+            const durablePendingEditKeys = vi.fn(() => keys);
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durablePendingEditKeys,
+            });
+            const install = async (
+                requestId: string,
+                state: SheetTransformState,
+                intent: 'user' | 'restore' | 'cancel' = 'user',
+            ) => {
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId,
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent,
+                    state,
+                });
+                const message = posted.filter(
+                    (candidate) => candidate.type === 'transformInstalled',
+                ).at(-1);
+                expect(message.requestId).toBe(requestId);
+                return message.view as SheetViewRecord;
+            };
+            return { core, install, durablePendingEditKeys };
+        }
+
+        it('counts the cells a filter excludes and not one in a surviving row', async () => {
+            const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
+
+            const view = await install('filter', keeps_only_row_2());
+
+            expect(view.rowCount).toBe(1);
+            // Row 2 survives, so its edit is visible and uncounted; rows 0 and 4 do
+            // not, and row 0 contributes both of its cells.
+            expect(view.hiddenEditedCells).toBe(3);
+        });
+
+        it('counts several cells in one hidden row as several cells', async () => {
+            // Counted in cells, not rows: three pieces of unsaved work are out of
+            // sight, and saying "1" would understate what the user is holding. The
+            // conflict banner counts *rows* for removed rows because there the cell
+            // no longer exists; here it does.
+            const { install } = counting_core(['0:0', '0:1', '4:0']);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
+                .toBe(3);
+        });
+
+        it('counts the cells explicitly hidden rows exclude', async () => {
+            // The other exclusion mechanism, and the one that reads no column at all,
+            // so nothing about the *columns* edited can be standing in for this.
+            const { install } = counting_core(['1:0', '3:0', '3:1', '0:0']);
+
+            const view = await install('hidden', {
+                sort: [],
+                filters: [],
+                hiddenRows: [1, 3],
+                schema: '["Sheet1",2,null]',
+            });
+
+            expect(view.rowCount).toBe(3);
+            expect(view.hiddenEditedCells).toBe(3);
+        });
+
+        it('reports none for a sort, without consulting the dirty map at all', async () => {
+            // A sort permutes without dropping, so there is nothing to scan — and the
+            // untouched provider is the observable proving the scan was skipped
+            // rather than merely returning 0.
+            const { install, durablePendingEditKeys } = counting_core(['0:0', '4:0']);
+
+            const view = await install('sort', {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet1",2,null]',
+            });
+
+            expect(view.permuted).toBe(true);
+            expect(view.hiddenEditedCells).toBe(0);
+            expect(durablePendingEditKeys).not.toHaveBeenCalled();
+        });
+
+        it('reports none for a filter that excluded nothing', async () => {
+            const { install, durablePendingEditKeys } = counting_core(['0:0']);
+
+            const view = await install('wide', {
+                sort: [],
+                filters: [{
+                    id: 'filter-wide',
+                    colIndex: 0,
+                    operator: 'isNotEmpty',
+                    caseSensitive: false,
+                    enabled: true,
+                }],
+                schema: '["Sheet1",2,null]',
+            });
+
+            expect(view.rowCount).toBe(5);
+            expect(view.hiddenEditedCells).toBe(0);
+            expect(durablePendingEditKeys).not.toHaveBeenCalled();
+        });
+
+        it('reports none when the session holds no pending edits', async () => {
+            const { install } = counting_core([]);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
+                .toBe(0);
+        });
+
+        it('carries the count on both no-op equal-state acks', async () => {
+            // These two short-circuit before any compute, so they could easily answer
+            // with a default. They are `transformInstalled` messages describing the
+            // view in place, and that view hides the same cells.
+            const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
+            const installed = keeps_only_row_2();
+            expect((await install('user', installed)).hiddenEditedCells).toBe(3);
+
+            expect((await install('restore', installed, 'restore')).hiddenEditedCells)
+                .toBe(3);
+            expect((await install('cancel', installed, 'cancel')).hiddenEditedCells)
+                .toBe(3);
+        });
+
+        it('counts an edit whose row the source no longer has', async () => {
+            // Reachable after an external shrink: adopt_source drops the permutation,
+            // then the restore recomputes it over fewer rows while the durable edits
+            // still name the old ones. Counted deliberately — the row is certainly not
+            // in the view, and the user is certainly holding work they cannot see,
+            // which is why the copy says the view does not *show* the row rather than
+            // that it hides it.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
+                .toBe(1);
+        });
+
+        it('ignores keys that name no cell', async () => {
+            const { install } = counting_core(['0:', ':', 'nonsense', '4', '4:0']);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCells)
+                .toBe(1);
+        });
+
+        it('reports none with no provider wired at all', async () => {
+            // Excel and every other non-editing caller: no dirty map exists, so the
+            // record still has to be truthful rather than absent.
+            const { panel, posted } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5));
+
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId: 'no-provider',
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user',
+                state: keeps_only_row_2(),
+            });
+
+            const view = (posted.find(
+                (message) => message.type === 'transformInstalled',
+            ).view) as SheetViewRecord;
+            expect(view.rowCount).toBe(1);
+            expect(view.hiddenEditedCells).toBe(0);
+        });
+    });
+
     it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {
         const { panel } = make_panel();
         const source = new TrackingColumnSource();
