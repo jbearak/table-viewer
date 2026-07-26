@@ -123,26 +123,28 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 
 Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
 
-On macOS (Apple Silicon, macOS 12+) install it with Homebrew:
+On macOS (Apple Silicon, macOS 12+) download `table-viewer-<version>-arm64.dmg` from the [latest release](https://github.com/jbearak/table-viewer/releases/latest), or install it with Homebrew:
 
 ```sh
 brew install --cask jbearak/table-viewer/table-viewer
 ```
 
-Builds are not yet signed or notarized, so macOS blocks the first launch; the cask prints how to approve it. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
+macOS builds are signed and notarized. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
 
 On Windows (10/11, x64 or arm64) download from the [latest release](https://github.com/jbearak/table-viewer/releases/latest):
 
 - `table-viewer-<version>-<arch>-setup.exe` — installer. Adds a Start Menu entry, lists Table Viewer under "Open with…" for table files (without taking over your existing default for `.csv`/`.xlsx`), and registers an uninstaller in Add/Remove Programs. It offers a choice of installing just for you (no admin rights, the default) or for all users (requires admin).
 - `table-viewer-<version>-<arch>-portable.exe` — single file, runs without installing. No Start Menu entry and no file associations; useful where installing software isn't permitted.
 
-Pick `x64` unless you have an Arm-based PC (Surface Pro X/11, Snapdragon laptops); the x64 build also runs on those under emulation, just slower.
+Pick `x64` unless you have an Arm-based PC (Surface Pro X/11, Snapdragon laptops), in which case pick `arm64`.
 
-Windows builds are unsigned — a code signing certificate is a recurring paid subscription this project doesn't buy — so SmartScreen shows **"Windows protected your PC"** the first time you run either exe. Click **More info**, then **Run anyway**. Each `.exe` has a matching `.sha256` on the release page if you want to verify the download first.
+Windows builds are unsigned — code signing certificates are expensive, and this project isn't developed on Windows — so SmartScreen shows **"Windows protected your PC"** the first time you run either exe. Click **More info**, then **Run anyway**. Each `.exe` has a matching `.sha256` on the release page if you want to verify the download first.
 
 **In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
 
-**Out of scope for v1:** the CSV side-by-side text preview with scroll sync, VS Code remote filesystems, extension commands/menus, signed/notarized builds and auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
+**Extension-only, not just unbuilt:** the CSV side-by-side text preview with scroll sync, VS Code remote filesystems, and extension commands/menus. Each of these is the extension borrowing something VS Code already provides — a text editor beside the grid, the remote filesystem layer, the command palette — so they aren't features a standalone app is waiting on.
+
+**Deferred:** auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
 
 ## Development
 

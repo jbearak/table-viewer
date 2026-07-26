@@ -1,6 +1,6 @@
 # Desktop app setup and 10-minute try-out
 
-The standalone Table Viewer app opens Excel workbooks without VS Code and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored separately from the workbook. The Excel file itself is not changed.
+The standalone Table Viewer app opens Excel (`.xlsx` or `.xls`) workbooks as well as comma-separated (`.csv`) and tab-delimited (`.tsv`) files, without VS Code, and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored separately from the workbook. The Excel file itself is not changed.
 
 You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment:
 
@@ -15,23 +15,26 @@ The standalone app currently supports Apple Silicon Macs running macOS 12 or lat
 
 ### macOS
 
-Install Table Viewer with [Homebrew](https://brew.sh/):
+Install Table Viewer one of two ways:
 
-```sh
-brew install --cask jbearak/table-viewer/table-viewer
-```
+- **Disk image.** Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/releases/latest), download `table-viewer-…-arm64.dmg`, open it, and drag **Table Viewer** into your Applications folder.
+- **Homebrew.** If you use [Homebrew](https://brew.sh/), run:
 
-Then open **Table Viewer** from the Applications folder or Spotlight. The current build is not signed or notarized, so macOS may block its first launch. If it does, follow the approval instructions printed by Homebrew after installation. You only need to approve that build once.
+  ```sh
+  brew install --cask jbearak/table-viewer/table-viewer
+  ```
+
+Then open **Table Viewer** from the Applications folder or Spotlight.
 
 ### Windows
 
 Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/releases/latest) and download the file for your computer:
 
 - Choose `table-viewer-…-x64-setup.exe` for most PCs.
-- Choose `table-viewer-…-arm64-setup.exe` for an Arm-based PC such as a Snapdragon laptop or Surface Pro X/11. The x64 version also runs there under emulation.
+- Choose `table-viewer-…-arm64-setup.exe` for an Arm-based PC such as a Snapdragon laptop or Surface Pro X/11.
 - If you cannot install software, choose the matching `…-portable.exe` instead. It runs directly and does not add Start Menu or **Open with** entries.
 
-Run the downloaded file. The installer defaults to installing only for your account, which does not require administrator access. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time. Click **More info**, confirm that the app is Table Viewer, then click **Run anyway**.
+Run the downloaded file. The installer defaults to installing only for your account, which does not require administrator access. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time. Click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. If you would rather check the download first, each `.exe` on the release page has a matching `.sha256` file; run `Get-FileHash <file>` in PowerShell and compare.
 
 ## 2. Open the sample workbook
 
@@ -45,7 +48,7 @@ The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, ci
 
 ## 3. Try the main viewing tools
 
-Nothing in this section edits the `.xlsx` file, so feel free to poke around.
+Table Viewer never writes to an Excel workbook, so nothing below—or anywhere else in this guide—changes the `.xlsx` file. Feel free to poke around.
 
 1. Click **Vertical Tabs** to move the worksheet tabs between the top and left side. With this many sheets, the left side is usually easier to scan.
 2. Click **Auto-fit Columns**, or drag a column border. Double-clicking a column border fits that column to its contents.
@@ -92,12 +95,10 @@ You can repeat the replacement while keeping the file open—handy when a script
 - Each open file gets its own window. Opening a file that is already open focuses its existing window.
 - Sorts and filters follow column names, so Table Viewer may discard them if a revised workbook no longer has a compatible column structure.
 - Highlights are positional annotations. They will reappear when temporarily missing rows, columns, or worksheets return, so you do not lose that time and effort.
-- CSV and TSV files open directly in Table Viewer and, unlike Excel workbooks, have an optional edit mode. The desktop app does not include the VS Code extension's synchronized side-by-side text preview.
+- CSV and TSV files open directly in Table Viewer and, unlike Excel workbooks, have an optional edit mode. In VS Code, the extension can also show a file's raw text beside the grid with synchronized scrolling; that pane is VS Code's own text editor, so it belongs to the extension rather than being something the standalone app lacks.
 - Choose **Preferences…** to change the app's appearance, color theme, font, default worksheet-tab orientation, or new-window size. On macOS, Preferences is in the Table Viewer app menu; on Windows, it is in the File menu.
 
 ## Troubleshooting
-
-**macOS blocks the first launch.** Follow the approval instructions that Homebrew printed when it installed the app. The app is currently unsigned and unnotarized, so this is expected for a newly installed build.
 
 **Windows shows “Windows protected your PC.”** Click **More info**, verify that you downloaded Table Viewer from its GitHub release page, then click **Run anyway**. The Windows build is currently unsigned.
 
@@ -105,7 +106,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 **The revised data appears in a separate window or view.** Check that it replaced the working file at exactly the same folder and filename. Saved views are tied to the file path.
 
-**You want to remove Table Viewer.** On macOS, run `brew uninstall --cask table-viewer`. On Windows, uninstall it from **Installed apps**. If you chose the portable Windows version, close it and delete the downloaded `.exe`.
+**You want to remove Table Viewer.** On macOS, move the application to the Trash, or, if you installed it with Homebrew, run `brew uninstall --cask table-viewer`. On Windows, uninstall it from **Installed apps**. If you chose the portable Windows version, close it and delete the downloaded `.exe`.
 
 ## What feedback would be most helpful?
 
