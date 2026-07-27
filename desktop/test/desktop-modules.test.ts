@@ -39,6 +39,7 @@ import {
     build_edit_tints_from_vars,
     build_theme_from_vars,
     CONFLICT_BG_FALLBACK,
+    tint_from_color,
 } from '../../src/webview/vscode-theme';
 import { notices_file_path } from '../main/notices-path';
 import { REPOSITORY_URL, about_link_url } from '../main/about-links';
@@ -581,7 +582,11 @@ describe('theme × Glide grid theme', () => {
             expect(theme.textDark, id).toBe(vars['--vscode-editor-foreground']);
             expect(theme.accentColor, id).toBe(vars['--vscode-focusBorder']);
             expect(theme.accentFg, id).toBe(vars['--vscode-list-activeSelectionForeground']);
-            expect(theme.accentLight, id).toBe(vars['--vscode-editor-selectionBackground']);
+            // The selection fill is the theme's channels but a clamped alpha —
+            // opaque would hide highlights and edit tints under selection.
+            expect(theme.accentLight, id).toBe(
+                tint_from_color(vars['--vscode-editor-selectionBackground'], 0.35, 'FAIL'),
+            );
             expect(theme.bgHeader, id).toBe(vars['--vscode-editorGroupHeader-tabsBackground']);
             expect(theme.bgHeaderHovered, id).toBe(vars['--vscode-list-hoverBackground']);
             expect(theme.borderColor, id).toBe(vars['--vscode-editorWidget-border']);
