@@ -175,6 +175,134 @@ describe('pure Excel header state planning', () => {
         expect(plan.state.scrollPosition).toEqual([undefined]);
     });
 
+    /**
+     * The one-time re-keying of `PerFileState.rowHeights` from display rows to canonical
+     * source rows. The only case with any arithmetic in it is a promotion that was
+     * *already recorded as active* when the state was written — every other case either
+     * leaves the keys alone or drops them — and it is the case the two tests above both
+     * miss: `first_migration` and a recorded `previous_active` of `false` are both proofs
+     * that the keys are already canonical.
+     */
+    describe('the one-time row-height re-keying', () => {
+        /** State whose heights were written under a promotion recorded as active. */
+        const previously_promoted = (
+            rowHeights: PerFileState['rowHeights'],
+            overrides?: Record<string, 'on' | 'off'>,
+        ): PerFileState => ({
+            excelFirstRowHeaderVersion: 1,
+            excelFirstRowHeaderActive: { People: true },
+            ...(overrides ? { excelFirstRowHeaders: overrides } : {}),
+            rowHeights,
+        });
+
+        it('shifts the keys of a previously auto-promoted sheet by exactly one', () => {
+            const ds = source();
+            // Auto-detected: the header takes source row 0 out of the display space, so
+            // display d was source d + 1. Nothing else in the state changes — the
+            // promotion was active before and is active now, which is exactly why this
+            // load reaches the migration through the `rowHeightsVersion` marker rather
+            // than through a projection change.
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{ 0: 40, 3: 60 }]),
+                ds.planning_input(),
+            );
+
+            expect(plan.state.rowHeights).toEqual([{ 1: 40, 4: 60 }]);
+            // The pass ran at all despite an unchanged header map, and marked itself
+            // done so the next load cannot shift the same keys a second time.
+            expect(plan.changed).toBe(true);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+            expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: true });
+        });
+
+        it('drops non-canonical keys instead of coercing them', () => {
+            const ds = source();
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{
+                    0: 40,
+                    '01': 30,
+                    '1.5': 22,
+                    '-1': 21,
+                } as unknown as Record<number, number>]),
+                ds.planning_input(),
+            );
+
+            // '01' would shift to 2 if it were read as a number, silently resizing a row
+            // no writer ever named; the same for a fractional or negative key.
+            expect(plan.state.rowHeights).toEqual([{ 1: 40 }]);
+        });
+
+        it('drops the keys when the previous promotion had a manual header row', () => {
+            const rows = [
+                [text('Report'), text('')],
+                [text('Notes'), text('')],
+                [text('Name'), text('Age')],
+                [text('Alice'), number(30)],
+            ];
+            // Header on source row 2, the rows above it hidden. `excelFirstRowHeaderActive`
+            // is a boolean, so a manual header row that moved while the promotion stayed
+            // active leaves no trace — the shift would be silently wrong, and wrong
+            // heights are indistinguishable from right ones.
+            const ds = source('on', rows, [[0, 1]]);
+            expect(ds.meta().sheets[0].excelFirstRowHeader)
+                .toMatchObject({ active: true, sourceRow: 2 });
+
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{ 0: 40, 1: 60 }], { People: 'on' }),
+                ds.planning_input(),
+            );
+
+            expect(plan.state.rowHeights).toEqual([undefined]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+        });
+
+        it('drops the keys when durable state records no projection for the sheet', () => {
+            const ds = source();
+            // Neither proof is available: the state has been read by a header-aware
+            // version (so `first_migration` says nothing) but names no projection for
+            // this sheet, so which space the keys are in is simply unknown.
+            const plan = plan_excel_candidate_state({
+                excelFirstRowHeaderVersion: 1,
+                excelFirstRowHeaderActive: {},
+                rowHeights: [{ 0: 40 }],
+            }, ds.planning_input());
+
+            expect(plan.state.rowHeights).toEqual([undefined]);
+        });
+
+        it('runs once: a marked state is left alone even as the promotion goes off', () => {
+            const ds = source('off');
+            // Everything the shift case has — a promotion recorded active, an
+            // auto-detected header row — plus the marker. The load also switches the
+            // promotion off, which is the transition that used to *clear* the map, so
+            // this pins both halves: no second shift, and no clearing.
+            const plan = plan_excel_candidate_state({
+                ...previously_promoted([{ 0: 40, 3: 60 }], { People: 'off' }),
+                rowHeightsVersion: 1,
+            }, ds.planning_input());
+
+            expect(plan.changed).toBe(true);
+            expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: false });
+            expect(plan.state.rowHeights).toEqual([{ 0: 40, 3: 60 }]);
+            // The scroll offset still goes: it is a pixel measurement of the layout this
+            // transition changes, and no key space preserves it.
+            expect(plan.state.scrollPosition).toEqual([undefined]);
+        });
+
+        it('leaves a marked, unchanged state untouched entirely', () => {
+            const ds = source();
+            const current: PerFileState = {
+                ...previously_promoted([{ 1: 40 }]),
+                rowHeightsVersion: 1,
+            };
+
+            const plan = plan_excel_candidate_state(current, ds.planning_input());
+
+            expect(plan.changed).toBe(false);
+            expect(plan.state).toBe(current);
+        });
+    });
+
     it("treats absent authoritative state as auto when the DTO captured 'off'", () => {
         const ds = source('off');
         const plan = plan_excel_candidate_state({
