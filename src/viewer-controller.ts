@@ -4423,6 +4423,30 @@ export function attach_viewer(
                  * acknowledgement behind it.
                  */
                 let unchanged_at_current_height = false;
+                /*
+                 * `resize_is_current` is consulted four times on the way to a durable
+                 * write — once before the first await, then inside the layout-write tail,
+                 * inside the CAS updater, and as `update_file_state`'s own validate hook —
+                 * and a mutation audit found that *no single one* of them can be deleted
+                 * and caught by a test. Recorded rather than trimmed, because the reason
+                 * is not that they are unnecessary.
+                 *
+                 * They are ordered in time, not in logic: each covers a distinct await the
+                 * request has to survive, and the interleaving that reaches one reaches
+                 * every later one too. So a test that opens a window anywhere is answered
+                 * by whichever check comes next, and any one of them alone is enough *at
+                 * that window* — which makes them individually unfalsifiable and jointly
+                 * load-bearing. Deleting all three post-await checks together does fail
+                 * ('abandons a resize whose sheet is permuted while its durable read is in
+                 * flight'), which is the assertion that pins the set.
+                 *
+                 * Kept as four because the windows they cover are not interchangeable in
+                 * production even though they are in any one test: the CAS check is the
+                 * only one re-evaluated per losing retry, and the validate hook is the only
+                 * one inside the store's own commit. What they prevent is not a wasted
+                 * write but a display-keyed request mapped through a permutation it never
+                 * saw — a height painted on rows the user did not drag.
+                 */
                 const committed = await enqueue_layout_write(async () => {
                     if (!resize_is_current()) return undefined;
                     const written = await update_file_state((current) => {

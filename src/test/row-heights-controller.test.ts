@@ -833,4 +833,59 @@ describe('setRowHeights currency across sheets', () => {
         expect(state.get_state(file_path).rowHeights?.[0]).toBeUndefined();
         expect(warnings()).toEqual([]);
     });
+
+    it('abandons a resize whose sheet is permuted while its durable read is in flight', async () => {
+        // The two cases above both decide currency *before* the handler awaits anything,
+        // so they are answered by the first of its four checks and pass with the other
+        // three deleted — mutation testing is how that was found. This is the case that
+        // separates them: the request is current when it is admitted and stops being
+        // current part-way through, which is reachable precisely because the write path
+        // is asynchronous (a durable read, a serialized layout-write tail, then a CAS
+        // that re-runs its updater on conflict).
+        //
+        // The window is opened by the store rather than by a fake timer: the handler
+        // awaits `read`, so installing a sort from inside one lands the permutation
+        // between the admission check and the write, which is the real interleaving
+        // rather than a simulation of one. A resize honoured here would map display rows
+        // through a mapping the request never saw, and paint the height on rows the user
+        // did not drag — the exact silent-corruption failure the fences exist to stop.
+        const state = versioned_state_store();
+        let intercept: (() => Promise<void>) | undefined;
+        const gated_store: FileStateStore = {
+            ...state.store,
+            async read(path) {
+                const pending = intercept;
+                intercept = undefined;
+                if (pending) await pending();
+                return state.store.read(path);
+            },
+        };
+        const panel = open_two_sheet_workbook(gated_store);
+        const initial = await ready(panel);
+
+        // Sheet 0 is sorted first so the resize below is quoted against a real
+        // permutation, and its basis is what the resize will carry.
+        const sorted = await sort_sheet_ascending(panel, initial, 0);
+        const basis = sorted.view.basis;
+
+        // The next durable read the handler performs installs a *second* sort on sheet 0,
+        // moving that sheet's own mapping past the generation the pending resize quotes.
+        intercept = async () => {
+            await sort_sheet_ascending(
+                panel,
+                { ...initial, generation: basis.generation },
+                0,
+            );
+        };
+        await resize_sheet(panel, basis, 0, [{ start: 0, end: 1 }], 44);
+
+        // A current request afterwards proves the abandoned one wrote nothing and was not
+        // queued behind it — silence alone would also be consistent with "not finished".
+        const current = messages_of(panel, 'transformInstalled').at(-1)!.view.basis;
+        await resize_sheet(panel, current, 0, [{ start: 0, end: 0 }], 55);
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 1: 55 }));
+        expect(warnings()).toEqual([]);
+    });
 });
