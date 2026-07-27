@@ -12,6 +12,7 @@ import type {
     TransformIntent,
     WebviewMessage,
 } from '../types';
+import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
@@ -307,6 +308,20 @@ vi.mock('../webview/grid-shell', () => ({
                     ),
                 },
                 'row-resize'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-row-resize-over-cap',
+                    // A select-all resize on a sheet larger than a sheet may keep custom
+                    // heights for: one interval, so it costs nothing to build, and the
+                    // whole request is over the cap rather than the accumulated map.
+                    onClick: () => props.on_row_resize(
+                        [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
+                        50,
+                    ),
+                },
+                'row-resize-over-cap'
             ),
             React.createElement(
                 'button',
@@ -1868,6 +1883,64 @@ describe('Excel first-row header toggle', () => {
             .toEqual({ 2: 77 });
     });
 
+    it('keeps custom row heights across a first-row-header promotion', async () => {
+        // The end-to-end shape of the change to `header_changed`. Both halves are named
+        // non-empty on purpose: an assertion that the grid shows `{}` after a promotion
+        // is satisfied just as well by the old clearing as by a delivery that carries no
+        // projection, so it distinguishes nothing. Here source row 2 keeps its height and
+        // simply *moves*, from display row 2 to display row 1, because the promoted header
+        // leaves the display space — which is the whole claim of a source-keyed map.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(false), {
+            state: {
+                columnWidths: [{ 0: 140 }],
+                rowHeights: [{ 2: 44 }],
+                scrollPosition: [{ top: 30, left: 5 }],
+            },
+            rowHeightProjection: [{ 2: 44 }],
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 44 });
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            state: {
+                columnWidths: [{ 0: 140 }],
+                // Unchanged, because a promotion renumbers no source row.
+                rowHeights: [{ 2: 44 }],
+                scrollPosition: [{ top: 30, left: 5 }],
+            },
+            rowHeightProjection: [{ 1: 44 }],
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: 'promote',
+                outcome: 'applied',
+            },
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 44 });
+        // And the durable copy this panel carries is untouched too, so the next
+        // `stateChanged` it posts for some other leaf cannot quietly erase the heights.
+        // The scroll offset beside it *is* cleared, which is the asymmetry: pixels down a
+        // row layout the promotion changed have no key space in which they survive.
+        await act(async () => {
+            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
+        });
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'stateChanged')
+            .at(-1)).toMatchObject({
+                state: {
+                    rowHeights: [{ 2: 44 }],
+                    scrollPosition: [undefined],
+                },
+            });
+    });
+
     it('does not persist a clean reload that has no authoritative state', async () => {
         const { post_message } = await render_app();
         const meta = make_meta(['People']);
@@ -2665,6 +2738,219 @@ describe('row height persistence', () => {
         // Dropped rather than left to shadow the projection: kept, it would mask a later
         // height for those rows for the rest of the generation.
         expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    /**
+     * A resize the overlay painted, with the delivery that answers it withheld. Every
+     * test below then delivers something *other* than the answer and reads the overlay.
+     */
+    async function pending_resize(): Promise<{ post_message: ReturnType<typeof vi.fn> }> {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+        expect(grid_stub().getAttribute('data-row-height-overlay')).not.toBe('null');
+        return rendered;
+    }
+
+    it('discards the overlay when a delivery moves the view generation', async () => {
+        await pending_resize();
+
+        // A moved generation means a different arrangement of rows, and the overlay's
+        // keys are display rows read off the old one. Reconciling by value cannot save
+        // it: the projection that arrives is about rows this layer never named, so it
+        // would neither agree with the layer nor make it right — it would just keep
+        // masking whatever row 3 is now.
+        //
+        // Held by two gates, deliberately: the delivery drops the overlay outright and the
+        // render site refuses to hand on an overlay whose generation is not the current
+        // one. Probing found each survives its own removal because the other still holds,
+        // and removing both fails here — so this pins the behaviour rather than either
+        // line. The pair is worth keeping: the discard is what stops a layer accumulating
+        // across generations, and the render gate is the same test the *sheet* gate beside
+        // it needs anyway (a tab switch moves no generation, so it must be read there).
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [{ 1: 33 }, undefined],
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 33 });
+    });
+
+    it('discards the overlay when a new document arrives', async () => {
+        await pending_resize();
+
+        // An `initial` presentation is a different document, or the same one reloaded
+        // from scratch. Its generation may well repeat the one the layer was tagged
+        // with — generations restart per source — so the presentation is the only thing
+        // that catches this, and a layer surviving it would paint a height the user set
+        // on a file they are no longer looking at.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    const PENDING_LAYER = [{
+        rows: [
+            { start: 3, end: 3 },
+            { start: 5, end: 5 },
+            { start: 8, end: 8 },
+        ],
+        height: 50,
+    }];
+
+    it('does not paint one sheet\'s pending resize on another sheet', async () => {
+        await pending_resize();
+
+        // A tab switch moves no generation, so nothing about the overlay's own tags
+        // changes — the sheet test has to be applied where it is *read*. Painted on the
+        // other sheet it would show heights at display rows 3, 5 and 8 of a sheet nobody
+        // resized, and the delivery that answers the real resize would not clear them.
+        await click_button('Other');
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+    });
+
+    it('leaves the overlay alone when an install lands on another sheet', async () => {
+        const { post_message } = await pending_resize();
+
+        // The other sheet's stored sort, restored when its tab is opened, so the ack below
+        // is one the app is actually waiting for. Its projection is made to agree with
+        // sheet 0's pending layer *exactly*, which is the only arrangement in which the
+        // per-sheet gate on the install path is visible: value reconciliation would
+        // otherwise read this ack as the answer to sheet 0's resize and drop the layer,
+        // discarding a resize the user is still waiting on.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Other",1,null]',
+                }],
+            },
+        }));
+        await click_button('Other');
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 4, rowHeights: { 3: 50, 5: 50, 8: 50 } },
+        ));
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+    });
+
+    it('does not paint a resize the host is bound to refuse', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize-over-cap') as HTMLButtonElement)
+                .click();
+        });
+
+        // Posted anyway, because the warning naming the limit is the host's to raise and
+        // the request is what asks for it.
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            rows: [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
+        });
+        // But not painted: the host refuses the whole request and delivers nothing, so a
+        // layer for it would have no delivery to reconcile against and would show a
+        // height no file holds until the generation next moved. Springing back as the
+        // drag ends is the truth.
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    it('keeps every other sheet\'s projection across an install', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            rowHeightProjection: [{ 0: 31 }, { 2: 77 }],
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }, undefined],
+            },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // An install carries the projection for the one sheet it permuted. Replacing the
+        // whole array from it would blank every sibling until some unrelated delivery
+        // came along — and an install posts no snapshot, so nothing is guaranteed to.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: { 1: 31 } },
+        ));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 31 });
+        await click_button('Other');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 77 });
+    });
+
+    it('posts a resize against the generation an install moved to', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+        await dispatch_host_message(transform_installed_message(
+            latest_transform_request(post_message),
+            { generation: 9, rowHeights: {} },
+        ));
+        post_message.mockClear();
+
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+
+        // The resize affordance is unconditional under a permutation now, and the request
+        // it posts has to name the *installed* generation: the host refuses anything else,
+        // and the display rows the drag named only mean anything in the arrangement the
+        // install put on screen. Painted at once too, so a permuted view is no different
+        // from a natural one.
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            generation: 9,
+            sourceGeneration: 7,
+            height: 50,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toHaveLength(1);
     });
 
     it('renders the delivered projection from an initial snapshot', async () => {

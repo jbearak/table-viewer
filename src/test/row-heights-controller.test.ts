@@ -360,6 +360,18 @@ describe('the setRowHeights host handler', () => {
     });
 
     it('rejects a malformed interval and a non-finite height', async () => {
+        // The interval half is held jointly with `map_display_rows_to_source`, which
+        // validates the same shapes and throws. Probing found the handler's own guards
+        // survive their removal one at a time because the mapper still refuses, and this
+        // fails only when both are gone — so what is pinned is that a malformed request
+        // writes nothing, not which of the two defences refuses it. The handler keeps its
+        // copy because it runs *before* the mapper allocates two `Uint32Array`s the size
+        // of the request, and because a descending interval otherwise subtracts from the
+        // pre-mapping row count.
+        //
+        // An empty `rows` array is deliberately not among the cases below: it is
+        // unfalsifiable. No entry is written for it whatever the guards do, so an
+        // assertion about it would pass with every implementation.
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
@@ -367,7 +379,6 @@ describe('the setRowHeights host handler', () => {
 
         await resize(panel, initial, [{ start: 2, end: 0 }], 44);
         await resize(panel, initial, [{ start: 0.5, end: 1 }], 44);
-        await resize(panel, initial, [], 44);
         await resize(panel, initial, [{ start: 0, end: 0 }], Number.NaN);
         await resize(panel, initial, [{ start: 1, end: 1 }], 55);
 
@@ -526,24 +537,13 @@ describe('the setRowHeights host handler', () => {
         }
     });
 
-    it('ignores a sheet index the workbook does not have', async () => {
-        const state = versioned_state_store();
-        const panel = open_csv_table(state.store);
-        const initial = await ready(panel);
-        const revision = state.revision(file_path);
-
-        await panel.__receive({
-            type: 'setRowHeights',
-            sheetIndex: 4,
-            rows: [{ start: 0, end: 0 }],
-            height: 44,
-            generation: initial.generation,
-            sourceGeneration: initial.sourceGeneration,
-        } satisfies Extract<WebviewMessage, { type: 'setRowHeights' }>);
-        await resize(panel, initial, [{ start: 1, end: 1 }], 55);
-
-        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
-            .toEqual({ 1: 55 }));
-        expect(state.revision(file_path)).toBe(revision + 1);
-    });
+    // No test for "ignores a sheet index the workbook does not have". The handler's guard
+    // was probed by deleting it, then by deleting the `RangeError` in
+    // `map_display_rows_to_source` beside it, then by making the row count tolerate a
+    // missing sheet as well — and nothing failed at any step, because the sheet lookup
+    // inside `read_source_row_indices` still refuses and the handler's `catch` returns.
+    // There is no reachable variant in which a bogus sheet index writes anything, so a
+    // test asserting that it does not would pass with every implementation. The guard
+    // stays as the cheapest of the three refusals; `map_display_rows_to_source`'s own
+    // range test is where the behaviour is covered.
 });

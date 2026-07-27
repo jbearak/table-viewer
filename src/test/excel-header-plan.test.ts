@@ -215,7 +215,7 @@ describe('pure Excel header state planning', () => {
             expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: true });
         });
 
-        it('drops non-canonical keys instead of coercing them', () => {
+        it('drops non-canonical keys and unusable heights instead of coercing them', () => {
             const ds = source();
             const plan = plan_excel_candidate_state(
                 previously_promoted([{
@@ -223,6 +223,11 @@ describe('pure Excel header state planning', () => {
                     '01': 30,
                     '1.5': 22,
                     '-1': 21,
+                    // Durable state is JSON somebody else wrote, so `null` is reachable
+                    // where `NaN` is not. Carried through the shift it becomes a height
+                    // the projection would hand to Glide, collapsing the row and every
+                    // total scroll height computed over it.
+                    3: null,
                 } as unknown as Record<number, number>]),
                 ds.planning_input(),
             );

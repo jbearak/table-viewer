@@ -948,6 +948,83 @@ describe('ViewerPanelCore', () => {
         });
     });
 
+    /**
+     * What `compute_row_height_projection` refuses to project, as opposed to how often it
+     * recomputes. Each of these is a durable entry that has no display row to name, and
+     * the failure mode they share is the dangerous one: not a missing height but a height
+     * painted on some *other* row, which looks like a height the user set and is not.
+     */
+    describe('rowHeightProjection entry filtering', () => {
+        function core_with(
+            heights: Record<number, number>,
+        ): { core: ViewerPanelCore; hide: (rows: number[]) => Promise<void> } {
+            const { panel } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durableRowHeights: () => ({ revision: 1, heights: [heights] }),
+            });
+            return {
+                core,
+                hide: async (rows) => {
+                    await core.handle_message({
+                        type: 'setTransform',
+                        sheetIndex: 0,
+                        requestId: 'hide',
+                        generation: core.generation,
+                        sourceGeneration: core.source_generation,
+                        intent: 'user',
+                        state: {
+                            sort: [],
+                            filters: [],
+                            hiddenRows: rows,
+                            schema: '["Sheet1",2,null]',
+                        },
+                    });
+                },
+            };
+        }
+
+        it('omits a source row the installed view does not contain', async () => {
+            // Source row 2 hidden: it has no display row at all, while source row 4 moves
+            // up to display row 3. Keeping the hidden entry under its source key — the
+            // natural slip, since the two spaces agree until something moves — would paint
+            // hidden row 2's height on whatever row is at display 2 now, and the entry
+            // that *is* in view proves the projection is not simply passing keys through.
+            const { core, hide } = core_with({ 2: 44, 4: 55 });
+            await hide([2]);
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 3: 55 }]);
+        });
+
+        it('skips a key no writer could have produced', () => {
+            // The same canonicality test `layout-state-patch.ts` applies to these maps.
+            // `Number('01')` is 1, so coercing would move a height onto row 1 — a row the
+            // user never resized — and `Number('1.5')` would key the projection at 1.5,
+            // which no `rowHeight(row)` lookup can ever hit.
+            const { core } = core_with({
+                0: 40,
+                '01': 30,
+                '1.5': 22,
+                '-1': 21,
+            } as unknown as Record<number, number>);
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 40 }]);
+        });
+
+        it('skips a height that is not a finite number', () => {
+            // Durable state is JSON a previous version (or a hand edit) wrote, so `null`
+            // is reachable where `NaN` is not. Projected through, it reaches Glide's
+            // `rowHeight` callback and the row collapses — and so does every total scroll
+            // height computed from it.
+            const { core } = core_with({
+                0: 40,
+                1: null as unknown as number,
+                2: Number.NaN,
+            });
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 40 }]);
+        });
+    });
+
     it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {
         const { panel } = make_panel();
         const source = new TrackingColumnSource();
