@@ -737,6 +737,77 @@ export function attach_viewer(
      */
     let durable_row_heights_revision = -1;
 
+    /**
+     * `incoming`, but with each sheet's map replaced by the latched one it is equal to.
+     *
+     * Identity is the core's per-sheet memo key (`memoized_row_height_projection`), and
+     * without this that key is defeated on every real read. The store structured-clones
+     * state on read and on CAS commit, so a snapshot always brings *fresh* map objects,
+     * even for sheets nothing touched: sorting sheet B would reproject sheet A, which is
+     * the cost the per-sheet memo exists to remove. In tests backed by an object the
+     * memo appeared to work, which is exactly the shape of bug that ships.
+     *
+     * Compared by content rather than assumed, and the comparison is the cheap half of
+     * what it saves. It is O(entries) with an early exit on the key count, over maps
+     * bounded by `MAX_PERSISTED_ROW_HEIGHTS` for anything this version wrote — and for a
+     * pre-cap legacy map it is one pass to avoid a walk *plus* an allocation plus every
+     * downstream reprojection for the rest of the file's life. The common case is that
+     * nothing changed, which is the case it makes fastest.
+     *
+     * Correctness does not rest on this: a missed retention costs a recomputation, never
+     * a wrong answer, since the memo verifies the mapping generation separately and a
+     * fresh identity simply misses.
+     */
+    function retained_row_height_maps(
+        previous: StoredPerFileState['rowHeights'],
+        incoming: StoredPerFileState['rowHeights'],
+    ): StoredPerFileState['rowHeights'] {
+        if (!previous || !incoming || previous === incoming) return incoming;
+        // Both shapes are latched un-normalized (see below), so both are handled here
+        // rather than after the array conversion — the conversion happens per *read* in
+        // `durable_row_heights` and shares the maps by reference, so retaining identity
+        // at this level is what carries through it. Keyed alike either way: an array
+        // indexes by sheet position, a `LegacyPerFileState` by sheet name, and a slot only
+        // ever retains against the same key.
+        const keys = Array.isArray(incoming)
+            ? incoming.map((_entry, index) => index)
+            : Object.keys(incoming);
+        const read = (
+            source: NonNullable<StoredPerFileState['rowHeights']>,
+            key: string | number,
+        ): Record<number, number> | undefined => (
+            (source as Record<string | number, Record<number, number> | undefined>)[key]
+        );
+        let next: NonNullable<StoredPerFileState['rowHeights']> | undefined;
+        for (const key of keys) {
+            const before = read(previous, key);
+            const after = read(incoming, key);
+            if (before === after || before === undefined || after === undefined) continue;
+            if (!row_height_maps_equal(before, after)) continue;
+            next ??= Array.isArray(incoming) ? [...incoming] : { ...incoming };
+            (next as Record<string | number, Record<number, number>>)[key] = before;
+        }
+        return next ?? incoming;
+    }
+
+    /** Whether two durable height maps hold the same entries. */
+    function row_height_maps_equal(
+        a: Record<number, number>,
+        b: Record<number, number>,
+    ): boolean {
+        const a_keys = Object.keys(a);
+        if (a_keys.length !== Object.keys(b).length) return false;
+        for (const key of a_keys) {
+            const left = (a as Record<string, number>)[key];
+            if (left !== (b as Record<string, number>)[key]) return false;
+            // `hasOwnProperty` is not needed beside that: a key absent from `b` reads as
+            // `undefined`, which cannot equal a value `a` holds — the maps are numbers,
+            // and a non-finite entry never reaches durable state (the write path rejects
+            // it and the projection skips it).
+        }
+        return true;
+    }
+
     /** Latched facts about durable state, refreshed on every read of it. */
     function observe_durable_state(snapshot: Readonly<FileStateSnapshot>): void {
         const state = snapshot.state as PerFileState;
@@ -757,7 +828,10 @@ export function attach_viewer(
         // costs nothing: the conversion is O(sheets) and does not touch the height maps.
         if (snapshot.revision >= durable_row_heights_revision) {
             durable_row_heights_revision = snapshot.revision;
-            durable_row_heights_state = (snapshot.state as StoredPerFileState).rowHeights;
+            durable_row_heights_state = retained_row_height_maps(
+                durable_row_heights_state,
+                (snapshot.state as StoredPerFileState).rowHeights,
+            );
         }
         if (
             !file_edit_state

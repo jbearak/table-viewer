@@ -834,6 +834,72 @@ describe('setRowHeights currency across sheets', () => {
         expect(warnings()).toEqual([]);
     });
 
+    it('keeps an untouched sheet\'s projection across a sibling sheet\'s write', async () => {
+        // The core memoizes each sheet's projection against that sheet's mapping
+        // generation and the *identity* of its durable height map. Identity is the only
+        // per-sheet fact available — the durable `revision` is file-wide — and it is only
+        // a fact if the latch preserves it, because the store structured-clones state on
+        // every read and every CAS commit. Without that, a snapshot brings fresh map
+        // objects for sheets nothing touched, the identity check misses, and a pre-cap
+        // legacy map with millions of entries is walked and reallocated during a sibling
+        // sheet's resize — the exact cost the memo exists to remove.
+        //
+        // Asserted through the delivered projection's object identity rather than by
+        // counting recomputations, because identity is what the memo actually promises
+        // and what the delivery path shares by reference. It is also the observable a
+        // test backed by a non-cloning store could not distinguish, which is how this
+        // shipped green the first time.
+        const state = versioned_state_store();
+        const panel = open_two_sheet_workbook(state.store);
+        const initial = await ready(panel);
+
+        await resize_sheet(panel, initial, 0, [{ start: 0, end: 0 }], 44);
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: 44 }));
+        const projection_of = () => messages_of(panel, 'workbookSnapshot')
+            .at(-1)!.snapshot.rowHeightProjection;
+        const sheet_0_before = projection_of()[0];
+        expect(sheet_0_before).toEqual({ 0: 44 });
+
+        // A write to the *other* sheet: same file, new revision, cloned state on the way
+        // back in. Sheet 0's heights did not move.
+        const basis = messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+        await resize_sheet(panel, basis, 1, [{ start: 0, end: 0 }], 55);
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[1])
+            .toEqual({ 0: 55 }));
+
+        await vi.waitFor(() => expect(projection_of()[1]).toEqual({ 0: 55 }));
+        // Sheet 0 was neither recomputed nor reallocated.
+        expect(projection_of()[0]).toBe(sheet_0_before);
+        expect(warnings()).toEqual([]);
+    });
+
+    it('reprojects a sheet that gained a height rather than retaining the old map', async () => {
+        // The other side of the retention, and the one where a mistake is silent rather
+        // than merely slow. Retention is by content, and the subset case is the one an
+        // entry-by-entry comparison gets wrong without a count: every entry of the old
+        // map is still present and unchanged, so a check that only walked the old map's
+        // keys would call the two equal and keep serving a projection that is missing the
+        // row the user just resized. The height would simply never appear.
+        const state = versioned_state_store();
+        const panel = open_two_sheet_workbook(state.store);
+        const initial = await ready(panel);
+
+        await resize_sheet(panel, initial, 0, [{ start: 0, end: 0 }], 44);
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: 44 }));
+
+        // A strict superset: row 0 keeps the height it had, row 1 is added.
+        const basis = messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
+        await resize_sheet(panel, basis, 0, [{ start: 1, end: 1 }], 44);
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: 44, 1: 44 }));
+
+        await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot')
+            .at(-1)!.snapshot.rowHeightProjection[0]).toEqual({ 0: 44, 1: 44 }));
+        expect(warnings()).toEqual([]);
+    });
+
     it('abandons a resize whose sheet is permuted while its durable read is in flight', async () => {
         // The two cases above both decide currency *before* the handler awaits anything,
         // so they are answered by the first of its four checks and pass with the other
