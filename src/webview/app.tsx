@@ -123,9 +123,16 @@ const GRID_FOCUS_RESTORE_RETRY_MS = 16;
 
 /**
  * No sheet has a resize in flight — the initial value, and the one a new document resets
- * to. A shared frozen constant so that "nothing pending" is always the *same* array: a
- * fresh `[]` on every delivery would be a new React state value each time and would
- * re-render the grid for no change at all.
+ * to. A shared frozen constant so that "nothing pending" is always the *same* array, and
+ * frozen so that neither use can be written through.
+ *
+ * Its *identity* is not load-bearing, and saying so is the point of this note: both uses
+ * are one-shot. `useState` reads its initial value once, and the other is the
+ * new-document reset, which re-renders the grid wholesale anyway — so substituting a fresh
+ * `[]` at either site changes nothing observable, and probing confirms it (no test fails).
+ * The identity that *does* matter is `mapped_row_height_overlays` handing back the very
+ * array it was given when no sheet's verdict changed: that runs on every delivery and
+ * every install ack, and it is pinned by its own unit test.
  */
 const NO_ROW_HEIGHT_OVERLAYS: readonly (RowHeightOverlay | undefined)[] = Object.freeze([]);
 
@@ -3075,9 +3082,24 @@ export function App(): React.JSX.Element {
                 const next = [...previous];
                 // Appended to this sheet's own overlay, and every other sheet's is left
                 // exactly as it was — a resize on one sheet says nothing about a resize in
-                // flight on another. An existing overlay tagged with an older generation is
-                // replaced rather than added to: its display rows named an arrangement this
-                // sheet has left, so there is nothing to accumulate onto.
+                // flight on another. Both halves of that are pinned: reading or writing
+                // slot 0 instead of the active sheet's fails outright.
+                //
+                // The generation comparison is the exception, and is kept and labelled
+                // rather than dressed up as load-bearing — the same treatment, for the same
+                // reason, as the render-site generation gate below. Its stated intent is
+                // that an existing overlay tagged with an older generation is replaced
+                // rather than added to, its display rows having named an arrangement this
+                // sheet has left. But a stale slot is unreachable by construction: the only
+                // two writers of `generation_ref.current` (the `workbookSnapshot` and
+                // `transformInstalled` handlers) each reach their overlay reconciliation
+                // unconditionally in the same block, and that reconciliation either voids a
+                // surviving overlay or rebases it onto the very generation the ref was just
+                // set to. So `existing` always carries the current generation, and dropping
+                // the comparison is an equivalent mutant — verified by probing it against
+                // the whole of `app.test.ts`. Kept because it states the invariant the two
+                // handlers are responsible for, and would be the thing that fails safe if a
+                // third writer of the generation ever appeared without one.
                 next[active_sheet_index] = existing
                     && existing.generation === generation_ref.current
                     ? {
