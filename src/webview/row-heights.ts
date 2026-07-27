@@ -230,6 +230,37 @@ export function row_height_layers_with(
  * Not a substitute for discarding the overlay on a generation change, which callers
  * must still do — a delivery on a *new* permutation says nothing about display rows
  * read off the old one, so the whole overlay is void rather than partly satisfied.
+ *
+ * ## The one residue this leaves, and why it is left
+ *
+ * Reconciling by value means a layer is kept until a delivery *agrees* with it, which is
+ * right for the ordinary case (the answer has not arrived yet) and wrong for exactly one:
+ * a write the host refused on the accumulated-map bound
+ * (`MAX_PERSISTED_ROW_HEIGHTS`). No delivery will ever agree with that layer, because
+ * nothing was persisted and the refusal path delivers nothing at all; so it sits over the
+ * projection, showing a height no file holds, until the view generation next moves and
+ * the whole overlay is discarded. The user does learn what happened — the host warns,
+ * naming the limit — but the row they dragged keeps its new size on screen meanwhile.
+ *
+ * Three fixes were considered and all three cost more than the residue:
+ *
+ * - *Tell the webview it was refused.* A refusal reply is a new protocol message on the
+ *   hot path of every drag, and every reader of it would then have to reason about a
+ *   reply arriving after the generation it named has gone. A whole round-trip shape for a
+ *   stale rectangle.
+ * - *Predict it here.* The webview never holds the durable map — that is the point of the
+ *   design — and cannot recover its size from the projection, which omits every source
+ *   row the installed view does not show. Any estimate would sometimes drop a layer whose
+ *   write actually succeeded, turning a cosmetic residue into a visible flicker on the
+ *   common path.
+ * - *Drop the layer on any delivery that disagrees.* This is the tempting one-liner and
+ *   it is wrong: the common case for "delivered, disagrees" is a delivery provoked by
+ *   something else (a sibling's write, an edit commit) racing ahead of the answer to this
+ *   resize. Dropping then makes every in-flight resize flicker.
+ *
+ * Deferring the write for a retry is not on the list: replaying a refused user request is
+ * forbidden by design, and the request would be refused again anyway — the bound it hit
+ * does not lift on its own.
  */
 export function row_height_layers_for_delivery(
     layers: readonly RowHeightLayer[],

@@ -56,7 +56,6 @@ vi.mock('../webview/grid-shell', () => ({
         sheet_index: number;
         generation: number;
         row_count?: number;
-        transformed?: boolean;
         show_formatting: boolean;
         preview_mode?: boolean;
         column_projection: {
@@ -266,7 +265,6 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-sheet-index': String(props.sheet_index),
                 'data-generation': String(props.generation),
                 'data-row-count': String(props.row_count ?? ''),
-                'data-transformed': String(props.transformed ?? false),
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
@@ -5263,7 +5261,8 @@ describe('sorting and filtering', () => {
             },
         }));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // The merges standing unflattened *are* "nothing is applied yet": flattening is
+        // the one thing an installed permutation still changes about the rendered grid.
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
             meta.sheets[0].merges,
@@ -5277,7 +5276,6 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2, rowCount: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(post_message.mock.calls
             .map((call) => call[0])
@@ -5378,7 +5376,6 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2, rowCount: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(document.body.textContent).toContain('Merged cells shown unmerged');
@@ -5399,7 +5396,6 @@ describe('sorting and filtering', () => {
             { generation: 3, rowCount: 3 },
         ));
         expect(document.body.textContent).toContain('✗');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
 
         post_message.mockClear();
@@ -5414,7 +5410,7 @@ describe('sorting and filtering', () => {
             enable_request,
             { generation: 4, rowCount: 2 },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
 
         post_message.mockClear();
         await act(async () => (
@@ -5433,7 +5429,6 @@ describe('sorting and filtering', () => {
             clear_request,
             { generation: 5, rowCount: 3 },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
             meta.sheets[0].merges,
@@ -5790,7 +5785,9 @@ describe('transforms during an edit session', () => {
         const request = latest_transform_request(post_message);
         await acknowledge_transform(request, 2);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The ack landed rather than being dropped by the requestId guard: only an
+        // install moves the generation, and the rules it carried describe a permutation.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
     }
 
     it('keeps transform controls enabled in edit mode and lets a sort through', async () => {
@@ -5809,7 +5806,7 @@ describe('transforms during an edit session', () => {
         // And it lands: the toolbar's own copy of the gate agrees, showing the
         // installed sort's chip live rather than greyed out.
         await acknowledge_transform(request, 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(sort_chip_disabled()).toBeNull();
     });
@@ -5937,7 +5934,6 @@ describe('snapshots arriving during an in-flight transform', () => {
         // the sort installs. Were the requestId discarded above, the webview would
         // sit on generation 1 and the host would refuse every row request after.
         expect(grid_stub().getAttribute('data-generation')).toBe('7');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
     });
 
@@ -6006,16 +6002,17 @@ describe('snapshots arriving during an in-flight transform', () => {
 
         await acknowledge_transform(request, 7);
 
+        // Still on the reload's generation, so the ack never landed. That is the whole
+        // of it: nothing else the install carries could have been adopted either.
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
     });
 });
 
 // The rows a same-basis refresh delivers are the rows already on screen: the host
 // installed nothing and dropped nothing, so an *applied* transform is still applied
 // behind it. Every edit commit during an owned session provokes one of these, and
-// `transformed` reading false while the loader is still permuted would give the grid a
-// natural row count over permuted rows.
+// dropping the record while the loader is still permuted would give the grid a natural
+// row count over permuted rows, and un-flatten merges the permutation has flattened.
 describe('an applied transform across a refresh', () => {
     const STORED_SORT: SheetTransformState = {
         sort: [{ colIndex: 0, direction: 'desc' }],
@@ -6068,6 +6065,14 @@ describe('an applied transform across a refresh', () => {
             .filter((message) => message.type === 'setTransform');
     }
 
+    /**
+     * A sheet with a merge in it, because merge flattening is what an installed
+     * permutation still *does* to the rendered grid. Nothing else about the view records
+     * below is visible in the shell's own props: heights arrive already projected into
+     * display space and the row count is carried on both arms of the record, so
+     * `data-merges` is the observable that distinguishes a permuted record from a natural
+     * one. One merge is enough — the assertions read its count, not its geometry.
+     */
     function sized_meta(row_count: number): WorkbookMeta {
         const meta = make_meta(['Sheet1'], false);
         return {
@@ -6076,6 +6081,7 @@ describe('an applied transform across a refresh', () => {
                 ...sheet,
                 rowCount: row_count,
                 sourceRowCount: row_count,
+                merges: [{ startRow: 0, startCol: 0, endRow: 1, endCol: 0 }],
             })),
         };
     }
@@ -6106,7 +6112,7 @@ describe('an applied transform across a refresh', () => {
         // The snapshot already names a session this panel owns, so it opens in edit
         // mode — the state in which every commit provokes a same-basis refresh.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
         return { post_message };
@@ -6127,8 +6133,9 @@ describe('an applied transform across a refresh', () => {
 
         // Asserted here, before any restore echo: the window this closes is exactly
         // the one between the refresh and the echo. A filtered view must not flash
-        // its natural row count, and the sort must not read as uninstalled.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // its natural row count, and the sort must not read as uninstalled — which on
+        // screen means its merges must not spring back unflattened.
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
     });
@@ -6153,7 +6160,9 @@ describe('an applied transform across a refresh', () => {
             rowHeightProjection: [PROJECTED_HEIGHTS],
         }));
 
-        expect(grid_shell_mock.latest_props?.transformed).toBe(true);
+        // Still the permuted record, so the heights below are the projection *of that
+        // permutation* rather than of a natural view that happens to agree.
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
             .toEqual(PROJECTED_HEIGHTS);
     });
@@ -6216,7 +6225,7 @@ describe('an applied transform across a refresh', () => {
         // A request would be posted synchronously inside the dispatch above, so its
         // absence is already observable here.
         expect(transform_requests(post_message)).toHaveLength(0);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
     });
@@ -6238,7 +6247,7 @@ describe('an applied transform across a refresh', () => {
             restore,
             { generation: 2, rowCount: FILTERED_ROW_COUNT },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
@@ -6352,8 +6361,9 @@ describe('an applied transform across a refresh', () => {
             transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
         );
 
-        // And the grid agrees with the toolbar again: natural order, natural count.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // And the grid agrees with the toolbar again: natural order, natural count, and
+        // the sheet's merges back the way the file has them.
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
     });
 
@@ -6392,7 +6402,7 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(
             transform_installed_message(restore, { generation: 2, rowCount: 3 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         post_message.mockClear();
 
@@ -6411,7 +6421,7 @@ describe('an applied transform across a refresh', () => {
             transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
         );
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
     });
 
@@ -6429,7 +6439,7 @@ describe('an applied transform across a refresh', () => {
             rowHeightProjection: [{ 2: 44 }],
         }));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
         // And the height follows the rows: same durable entry, a display key that moved
         // with the permutation being dropped.
@@ -6444,10 +6454,16 @@ describe('an applied transform across a refresh', () => {
      * third: it stands for the fact that an install has landed against these rows,
      * which the restore effect answers by comparing the durable rules against the
      * record's own.
+     *
+     * `merges` is how the *permutation* half is read. `SheetViewRecord.permuted` reaches
+     * the rendered grid through exactly one thing now — merge flattening — so that is
+     * what a test about it asserts; the shell is no longer told whether its rows are
+     * permuted, because nothing in it needs to know (see `GridShellProps.row_count`).
+     * `'0'` is the permuted reading, `'1'` the natural one.
      */
     function view_state(post_message: ReturnType<typeof vi.fn>) {
         return {
-            transformed: grid_stub().getAttribute('data-transformed'),
+            merges: grid_stub().getAttribute('data-merges'),
             row_count: grid_stub().getAttribute('data-row-count'),
             asks_again: transform_requests(post_message).length > 0,
         };
@@ -6471,7 +6487,7 @@ describe('an applied transform across a refresh', () => {
         // together, because they are one value with one basis. Any partial
         // invalidation shows up here as a mismatched field.
         expect(view_state(post_message)).toEqual({
-            transformed: 'true',
+            merges: '0',
             row_count: String(FILTERED_ROW_COUNT),
             asks_again: false,
         });
@@ -6491,7 +6507,7 @@ describe('an applied transform across a refresh', () => {
         // The same three, all the other way — including the ask, which is what makes
         // the stored sort come back rather than being silently forgotten.
         expect(view_state(post_message)).toEqual({
-            transformed: 'false',
+            merges: '1',
             row_count: '5',
             asks_again: true,
         });
@@ -6576,7 +6592,8 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(
             transform_installed_message(uninstall, { generation: 4, rowCount: 5 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
 
         // Differing rules with nothing to reconcile: a sibling retyped a filter it had
         // already switched off, so neither side describes a permutation and the
@@ -6699,7 +6716,10 @@ describe('the transform rollback baseline', () => {
             await dispatch_host_message(
                 transform_installed_message(uninstall, { generation: 3 }),
             );
-            expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+            // The ack landed — only an install moves the generation — and the rules it
+            // carried were rule-free, so the record standing here is the non-permuted
+            // arm. That is the state the rollback below has to read a baseline from.
+            expect(grid_stub().getAttribute('data-generation')).toBe('3');
 
             post_message.mockClear();
             await dispatch_host_message(same_basis(3, [undefined]));
@@ -6727,7 +6747,10 @@ describe('the transform rollback baseline', () => {
         await dispatch_host_message(
             transform_installed_message(restore, { generation: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The ack landed, and the rules it carried are an active sort, so the record
+        // standing here is the permuted arm — the precondition this test contrasts with
+        // 'cancels to no filter at all once a sibling has removed the definition'.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
 
         await start_a_transform(post_message);
         await click_button('Cancel');
@@ -6830,15 +6853,17 @@ describe('refused transforms', () => {
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
         const generation_before = grid_stub().getAttribute('data-generation');
+        const row_count_before = grid_stub().getAttribute('data-row-count');
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
         await refuse_transform(request, { terminal: false });
 
         // Nothing adopted, and now nothing adoptable: the refusal has no generation,
-        // rules or row count on it at all.
+        // rules or row count on it at all. Both of the fields it could have carried are
+        // read back unchanged, rather than only the one.
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe(row_count_before);
         // A refusal cannot reach the fold: only an install can move the generation,
         // and only a moved generation unmounts the grid that owns the overlay.
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
@@ -6871,15 +6896,18 @@ describe('refused transforms', () => {
         ).click());
         const request = latest_transform_request(post_message);
         expect(request.intent).toBe('user');
+        const generation_before = grid_stub().getAttribute('data-generation');
         post_message.mockClear();
 
         await refuse_transform(request, { terminal: false });
 
-        // Visible failure, and that is the whole of it.
+        // Visible failure, and that is the whole of it: the user is told, and the view
+        // they were looking at is the view they are still looking at. Only an install
+        // moves the generation, so an unmoved one is "no view was adopted".
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'showWarning',
         }));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
 
         // The counterpart of 'keeps a transiently refused transform retriable': there
         // the *stored* transform is asked for again, because the sheet would otherwise
@@ -6890,7 +6918,7 @@ describe('refused transforms', () => {
         post_message.mockClear();
         await settle_a_save();
         expect(transform_requests(post_message)).toEqual([]);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
     });
 
     it('adopts the natural state for a terminal refusal', async () => {
@@ -6898,6 +6926,7 @@ describe('refused transforms', () => {
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
         const generation_before = grid_stub().getAttribute('data-generation');
+        const row_count_before = grid_stub().getAttribute('data-row-count');
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
@@ -6909,7 +6938,7 @@ describe('refused transforms', () => {
         // is already the one it is on. Both are asserted as *unchanged* rather than
         // as echoes that landed.
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe(row_count_before);
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
         // And it warns, even though this is a restore nobody asked for. The transient
         // case above is silent because the effect will ask again; here nothing will,
@@ -6967,7 +6996,7 @@ describe('refused transforms', () => {
         await dispatch_host_message(
             transform_installed_message(install, { generation: 7, rowCount: 4 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
         expect(grid_stub().getAttribute('data-row-count')).toBe('4');
 
         await act(async () => (
@@ -6978,7 +7007,6 @@ describe('refused transforms', () => {
         });
 
         expect(grid_stub().getAttribute('data-generation')).toBe('7');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('4');
     });
 
@@ -7003,8 +7031,10 @@ describe('refused transforms', () => {
         // dirty store, so the cell is still cancellable.
         expect(store_edits()).toEqual({});
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
-        // And the view the webview already had is what it still shows.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // And the view the webview already had is what it still shows: only an install
+        // moves the generation, and this refusal moved nothing.
+        expect(Number(grid_stub().getAttribute('data-generation')))
+            .toBe(generation_before);
 
         // The paired direction, here rather than elsewhere so this test cannot pass by
         // never folding at all: an ack that does move the generation remounts the grid,
@@ -7048,8 +7078,10 @@ describe('refused transforms', () => {
         expect(store_edits()).toEqual({});
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
         // Not vacuous: the install landed, so this is the ack being processed and
-        // choosing not to fold, not the requestId guard dropping it.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // choosing not to fold, not the requestId guard dropping it. The generation is
+        // no evidence here — the whole point of this case is that it did not move — so
+        // the spinner clearing is what says the ack was matched to its request.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
 
         // Paired direction, so this cannot pass by never folding: the same install
         // one generation on does remount, and the overlay has to be folded first.
@@ -7269,7 +7301,9 @@ describe('the Edit button and an installed transform', () => {
             { capabilities: EDITABLE, state: { transforms: [SORT] } },
         ));
         await acknowledge_transform(latest_transform_request(post_message), 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The restore landed and installed an active sort, so what follows is judged
+        // against a permuted view rather than an unsorted one.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         post_message.mockClear();
         return post_message;
     }
@@ -7346,7 +7380,9 @@ describe('stale-view banner', () => {
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
         await acknowledge_transform(latest_transform_request(post_message), 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The sort installed — only an install moves the generation — so the banner's
+        // silence below is a choice about a permuted view, not the absence of one.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(banner()).toBeNull();
         return post_message;
     }
@@ -7499,9 +7535,9 @@ describe('stale-view banner', () => {
         expect(banner()?.textContent).not.toContain(BANNER_TEXT);
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
-        // Still the installed view: the record was kept, not replaced by a natural one,
-        // which is what makes the fresh keys about the permutation it describes.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Still the installed view, and the sentence above is itself the evidence:
+        // `hiddenEditedCellKeys` exists only on the record's `permuted` arm, so a record
+        // replaced by a natural one could not have produced that count at all.
         expect_no_call_to_action();
 
         // Withdrawn the same way it arrived. The host is the authority on membership,
@@ -7677,8 +7713,11 @@ describe('stale-view banner', () => {
         await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        // Not vacuous: the record the count came from is still the installed one.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Not vacuous: the record the count came from is still the installed one. The
+        // refresh above was same-basis and stayed on generation 2, which is the record
+        // written by the install in `edit_mode_sorted_on_column_0` — a dropped record
+        // would have taken the natural view with it and there would be no count to gate.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(banner()).toBeNull();
         expect_no_call_to_action();
     });
@@ -7841,7 +7880,10 @@ describe('stale-view banner', () => {
         // Deliberately unacknowledged: the record standing here is the snapshot's own,
         // which is the one under test.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // The fabricated record's row count, which is the constant this test exists to
+        // hold to account: the sheet's own count, because a record built here says no
+        // permutation is in place and therefore shows every row.
+        expect(grid_stub().getAttribute('data-row-count')).toBe('1');
 
         expect(banner()).toBeNull();
         expect_no_call_to_action();
@@ -7922,7 +7964,9 @@ describe('stale-view banner', () => {
         await acknowledge_transform(latest_transform_request(post_message), 3);
         await report_grid_editing(true, true, [], dirty('0:0'));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The restore echo's own install landed, so the dismissal below is being held
+        // against a live permuted record rather than surviving because nothing arrived.
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
         expect(banner()).toBeNull();
         expect_no_call_to_action();
     });
@@ -7954,7 +7998,9 @@ describe('stale-view banner', () => {
             await acknowledge_transform(latest_transform_request(post_message), 2);
             await report_grid_editing(true, true, [], dirty('0:0'));
             expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-            expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+            // The restore installed the stored sort, so each session opens over a
+            // permuted view — which is what the banner has something to say about.
+            expect(grid_stub().getAttribute('data-generation')).toBe('2');
         };
 
         await restored_session('first-session');
@@ -8014,7 +8060,9 @@ describe('stale-view banner', () => {
             { generation: 2, rowCount: 2, hiddenEditedCellKeys: hidden },
         ));
         await report_grid_editing(true, true, [], edits);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Two of the sheet's three rows: the hiding record really installed, which is
+        // what makes the `permuted` arm below the host's word and not a default.
+        expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         return post_message;
     }
 
@@ -8140,10 +8188,15 @@ describe('per-sheet view records', () => {
     };
     const DURABLE = { transforms: [FIRST_SORT, SECOND_SORT] };
 
-    function view(): { sheet: string | null; transformed: string | null; rows: string | null } {
+    /**
+     * Which sheet is on screen and how many rows its record claims. The row count is the
+     * whole discriminant here and is meant to be: the fixture below gives the two sheets
+     * different counts, both different from the natural 5, so a record swapped for
+     * another sheet's or for the natural view shows up as a wrong number.
+     */
+    function view(): { sheet: string | null; rows: string | null } {
         return {
             sheet: grid_stub().getAttribute('data-sheet-index'),
-            transformed: grid_stub().getAttribute('data-transformed'),
             rows: grid_stub().getAttribute('data-row-count'),
         };
     }
@@ -8173,7 +8226,7 @@ describe('per-sheet view records', () => {
             second,
             { generation: 3, rowCount: 4 },
         ));
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         return { post_message };
     }
 
@@ -8184,7 +8237,7 @@ describe('per-sheet view records', () => {
 
         // Each record is the one its own install wrote: the second install bumped
         // the shared generation but moved no row on this sheet.
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
     });
 
     it('keeps a record whose rows an install on another sheet never moved', async () => {
@@ -8204,9 +8257,9 @@ describe('per-sheet view records', () => {
             state: DURABLE,
         }));
 
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
         // And nothing had to be re-asked to get back there: a dropped record shows up
         // as a restore request for rules the host already holds.
         expect(post_message.mock.calls
@@ -8231,7 +8284,7 @@ describe('per-sheet view records', () => {
             second,
             { generation: 2, rowCount: 4 },
         ));
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
 
         // First's compute lands last, on the generation the core reached after both.
         await dispatch_host_message(transform_installed_message(
@@ -8241,8 +8294,8 @@ describe('per-sheet view records', () => {
 
         // The active sheet is Second, and its record must be untouched by an ack
         // addressed to another sheet.
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
     });
 });

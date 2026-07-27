@@ -272,20 +272,37 @@ export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
 /**
  * Cap on one sheet's durable custom row heights.
  *
- * A row resize commits the user's whole row selection, which can be select-all, so
- * `setRowHeights` can legitimately name every row of the sheet. That is intended and
- * supported up to this bound; past it the cost is not the persisted bytes but the work
- * every later delivery does. The host allocates two `Uint32Array`s the size of the
- * request in `map_display_rows_to_source`, and then re-derives the display-keyed
- * projection once per sheet per delivery — an O(overrides) walk whose `overrides` would
- * be the row count from then on, for the life of the file.
+ * **This bound is a deliberate behaviour regression, said plainly here because it is the
+ * kind of thing a reader deserves to find at the constant rather than in a bug report.**
+ * Before heights became source-keyed the webview wrote `PerFileState.rowHeights` itself
+ * and nothing counted the entries, so a select-all row resize on a sheet of *any* size
+ * was persisted. From this change on, a select-all resize on a sheet with more than this
+ * many rows is refused outright: nothing is written, no row keeps its new height, and the
+ * user is warned with the limit named (`ROW_HEIGHT_LIMIT_WARNING`, `viewer-controller`).
+ * Sheets at or under the bound are unaffected.
  *
- * Two orders of magnitude below `MAX_PERSISTED_HIDDEN_ROWS` because the two collections
- * cost differently. Hidden rows persist as a sorted integer array and are consumed once,
- * when a permutation is computed; heights persist as a key/value map, are re-projected on
- * every delivery, and every entry is a row the user resized by hand. Ten thousand of
- * those is already far past any real gesture except select-all on a small sheet, and
- * select-all on a large one is the case this exists to bound.
+ * The refusal is the price of the projection. A row resize commits the user's whole row
+ * selection, which can be select-all, so `setRowHeights` can legitimately name every row
+ * of the sheet. That is intended and supported up to this bound; past it the cost is not
+ * the persisted bytes but the work every later delivery does. The host allocates two
+ * `Uint32Array`s the size of the request in `map_display_rows_to_source`, and then
+ * re-derives the display-keyed projection once per sheet per delivery — an O(overrides)
+ * walk whose `overrides` would be the row count from then on, for the life of the file.
+ * An uncapped map makes every snapshot O(rows), which is the cost this renderer exists
+ * to have stopped paying.
+ *
+ * The nearest relative is `MAX_HIGHLIGHTED_CELLS_PER_FILE` (100_000), not
+ * `MAX_PERSISTED_HIDDEN_ROWS` (1_000_000). Highlights are the other durable, host-owned,
+ * key/value collection built one user gesture at a time, re-counted whole on every
+ * mutation, and refused as a whole with a warning that names the limit — the same shape
+ * in every respect. Hidden rows are the poor comparison: a sorted integer array, consumed
+ * once when a permutation is computed, produced by a gesture whose entire point is to
+ * name many rows at once.
+ *
+ * An order of magnitude below the highlight cap because a height is re-projected on
+ * *every delivery* where a highlight is not, and because ten thousand hand-resized rows
+ * is already far past any real gesture except select-all on a small sheet. Select-all on
+ * a large one is the case this exists to bound, and refusing it is the accepted cost.
  */
 export const MAX_PERSISTED_ROW_HEIGHTS = 10_000;
 

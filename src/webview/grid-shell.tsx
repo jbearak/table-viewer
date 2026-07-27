@@ -238,24 +238,21 @@ export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
     generation: number;
-    /** Effective displayed row count (may be filtered). */
-    row_count?: number;
     /**
-     * True while display rows are a view-only permutation of source rows.
+     * Effective displayed row count (may be filtered).
      *
-     * Nothing in this shell reads it any more, and that is worth stating rather than
-     * leaving to be discovered. Its three readers were all row-height suppressions —
-     * the resize overlay's mount, hover-arming, multiline auto-grow — and all three are
-     * gone now that durable heights are keyed by canonical source row and reach the
-     * webview already projected into display space. The flattening it also used to be
-     * cited for is decided in App, which simply passes `merges` empty.
-     *
-     * Kept, deliberately, as the one place a mounted shell states whether its rows are
-     * permuted: it is the fact every removed guard was reaching for, and the fact a
-     * future one would reach for again. Remove it only with something to say about why
-     * a shell no longer needs to know.
+     * There is deliberately no `transformed` beside it any more, and the absence is worth
+     * a sentence. The shell used to be told whether its display rows were a permutation
+     * of source rows, and its three readers were all row-height suppressions — the resize
+     * overlay's mount, hover-arming, multiline auto-grow. All three are gone: durable
+     * heights are keyed by canonical source row and arrive already projected into display
+     * space, so a permuted view is no different here from an unpermuted one. The merge
+     * flattening the flag was also cited for is decided in App, which simply passes
+     * `merges` empty. Nothing in a shell that reads a display-keyed projection and posts
+     * display intervals needs to know which it is looking at; a future guard that thinks
+     * it does is a display→source mapping trying to grow a second home.
      */
-    transformed?: boolean;
+    row_count?: number;
     show_formatting: boolean;
     column_projection: ColumnProjection;
     /** Persisted widths keyed by canonical source column. */
@@ -1698,7 +1695,8 @@ export function GridShell({
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
             //
-            // No longer gated on `transformed`. It used to be, because a height was
+            // No longer gated on a `transformed` prop — which no longer exists, having had
+            // no readers left once this was its last one. It used to be, because a height was
             // persisted under the display row it was measured at, which under a
             // permutation named some other source row — durable corruption, so the
             // whole affordance was suppressed rather than risked. Now the height goes
@@ -1885,7 +1883,8 @@ export function GridShell({
                     args.bounds,
                 );
             }
-            // No `transformed` bail here any more. Arming the strip was suppressed
+            // No `transformed` bail here any more; the prop it read is gone with it.
+            // Arming the strip was suppressed
             // under a permutation only because the resize it leads to used to persist a
             // display-keyed height; the resize now names display intervals the host
             // maps, so there is nothing left for a permutation to mis-key.

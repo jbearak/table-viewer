@@ -169,6 +169,26 @@ const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
 
+/**
+ * The one sentence a refused `setRowHeights` says, whichever bound it hit.
+ *
+ * There are two enforcement points and they cannot be merged — one counts the rows a
+ * single request names, before `map_display_rows_to_source` allocates against them; the
+ * other counts the map the file would end up holding, which only the durable state can
+ * answer. But they are the same bound and the same disappointment, so they say the same
+ * thing: a user who reached the limit by one select-all and a user who reached it by a
+ * hundred small drags have the identical problem and the identical remedy.
+ *
+ * Names the number, on `MAX_HIGHLIGHTED_CELLS_PER_FILE`'s wording ("A file may contain
+ * at most …"), because "too many" alone is a dead end — it tells the user they are over
+ * a line without telling them where the line is, and there is no UI that shows them how
+ * many custom heights the sheet already holds. Locale is pinned so the message is
+ * stable in tests and in every host's log.
+ */
+const ROW_HEIGHT_LIMIT_WARNING =
+    'Too many resized rows to persist: a sheet may keep at most '
+    + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
+
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
 }
@@ -4229,7 +4249,7 @@ export function attach_viewer(
                 }
                 if (requested_rows === 0) return;
                 if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
-                    show_owner_warning('Too many resized rows to persist.');
+                    show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
                     return;
                 }
                 let mapped: Uint32Array;
@@ -4244,6 +4264,13 @@ export function attach_viewer(
                     // rather than a stale one, and there is nothing to write either way.
                     return;
                 }
+                // Set by the updater when the accumulated map would pass the bound, and
+                // read after the write settles. The warning cannot be raised from inside
+                // the updater: `update_file_state` re-runs it once per losing CAS, so a
+                // warning there would pop once per retry. A flag is idempotent, and the
+                // updater's own return value cannot carry the reason — refusing and
+                // writing nothing both surface as `undefined`.
+                let refused_at_bound = false;
                 const committed = await enqueue_layout_write(async () => {
                     if (!resize_is_current()) return undefined;
                     return update_file_state((current) => {
@@ -4268,13 +4295,22 @@ export function attach_viewer(
                         // past a bound one large one would have been refused at.
                         // All-or-nothing rather than partial, because a sheet resized up
                         // to an arbitrary row and default below it reads as corruption.
+                        //
+                        // And not silent. This is the path a user reaches by a hundred
+                        // small resizes rather than one large one: nothing about the
+                        // gesture was unreasonable, the webview cannot predict the
+                        // refusal because it never sees the durable map, and without the
+                        // warning below the row simply fails to keep its new height with
+                        // no explanation anywhere.
                         if (Object.keys(next).length > MAX_PERSISTED_ROW_HEIGHTS) {
+                            refused_at_bound = true;
                             return current;
                         }
                         rowHeights[message.sheetIndex] = next;
                         return { ...current, rowHeights };
                     }, undefined, resize_is_current);
                 });
+                if (refused_at_bound) show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
                 if (committed && resize_is_current()) {
                     session.update_state_snapshot(
                         project_state_for_panel(committed),

@@ -2322,7 +2322,6 @@ describe('GridShell stable rows during an edit session', () => {
                 source_to_visible: [0, 1, 2],
                 hidden_count: 0,
             },
-            transformed: true,
             transform_state,
             transform_sections: true,
             edit_mode: true,
@@ -2441,11 +2440,17 @@ describe('GridShell stable rows during an edit session', () => {
         expect(posted_transforms()).toEqual([]);
     });
 
-    // Multiline auto-grow used to be gated on `transformed`, because the height it
+    // Multiline auto-grow used to be gated on a `transformed` prop, because the height it
     // wrote was keyed by the display row it measured and that named another source row
     // under a permutation. The write is now a display *interval* the host maps through
-    // the permutation it installed, so the gate is gone — asserted as a pair, permuted
-    // and not, since a permuted view is the one place transforms and edit mode coexist.
+    // the permutation it installed, so the gate is gone — and so is the prop, since
+    // nothing in the shell needed to know any more.
+    //
+    // Still asserted as a pair, over rules that describe a permutation and rules that do
+    // not, because a permuted view is the one place transforms and edit mode coexist and
+    // this row's rendered position is a permuted one in both runs. That the two runs now
+    // differ only in the rule set — and grow the same row to the same height either way —
+    // is the point: the shell has no notion of being permuted left to branch on.
     const MULTILINE = 'one\ntwo\nthree';
     const expected_grown_height = natural_row_height(
         MULTILINE,
@@ -2454,15 +2459,15 @@ describe('GridShell stable rows during an edit session', () => {
         default_row_height_for_font(13),
     );
 
-    async function commit_multiline(transformed: boolean, on_row_resize: () => void) {
+    async function commit_multiline(sorted: boolean, on_row_resize: () => void) {
         const display_to_source = [1, 3, 0, 2];
         install_permutation(display_to_source);
         await render_grid(stable_props(
             display_to_source,
-            transformed
+            sorted
                 ? { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] }
                 : { sort: [], filters: [] },
-            { transformed, on_row_resize },
+            { on_row_resize },
         ));
         grid_mock.update_cells.mockClear();
         const on_cell_edited = grid_mock.props!.onCellEdited as

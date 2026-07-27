@@ -2958,9 +2958,15 @@ export function App(): React.JSX.Element {
             // the owner, delivering nothing — so an overlay layer for it would have no
             // delivery to reconcile against and would show a height nothing persisted
             // until the generation next moved. Better to let the row spring back as the
-            // drag ends, which is the truth. (The same cap applied to the *accumulated*
-            // map is a refusal this panel cannot predict, since it never sees the durable
-            // map; that one does leave a stale layer behind.)
+            // drag ends, which is the truth.
+            //
+            // The same cap applied to the *accumulated* durable map is a refusal this
+            // panel cannot predict — it never holds that map, and the projection is not a
+            // proxy for its size — so that one does leave a layer with nothing behind it
+            // until the generation next moves. The user is told (the host warns, naming
+            // the limit); the stale rectangle is accepted rather than bought off with a
+            // refusal message on the hot path of every drag. Reasoning in full at
+            // `row_height_layers_for_delivery`.
             if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
             set_row_height_overlay((previous) => {
                 const layer: RowHeightLayer = { rows, height: clamped };
@@ -3172,8 +3178,14 @@ export function App(): React.JSX.Element {
     const installed_view = sheet_views[active_sheet_index];
     // What the loader is actually doing, straight from the record rather than
     // re-derived from the rules: the host set it from whether it holds an index
-    // permutation for this sheet, which is the thing the display-keyed row-height
-    // affordances have to be suppressed against.
+    // permutation for this sheet.
+    //
+    // Its only remaining consumer in the rendered grid is merge flattening below. The
+    // row-height affordances it used to suppress no longer care — heights are durable
+    // against canonical source rows and arrive already projected into display space — so
+    // `GridShell` is not told about it at all, and the merge decision is made here rather
+    // than there. If you are looking for what a permutation still *changes* on screen,
+    // `merges` is the answer.
     const transform_active = installed_view?.permuted ?? false;
     const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
@@ -3394,7 +3406,6 @@ export function App(): React.JSX.Element {
             sheet_index={active_sheet_index}
             generation={generation}
             row_count={effective_row_count}
-            transformed={transform_active}
             show_formatting={show_formatting}
             column_projection={current_column_projection}
             column_widths={column_widths[active_sheet_index] ?? {}}
