@@ -254,15 +254,32 @@ export class ViewerPanelCore {
     private readonly durable_pending_edit_keys?: () => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
     /**
-     * The last computed display-keyed projection, with the two facts it is a function
-     * of. See `row_height_projection_by_sheet` for why both are needed and why a memo
-     * is needed at all.
+     * The last computed display-keyed projection, with the facts it is a function of.
+     * See `row_height_projection_by_sheet` for why each is needed and why a memo is
+     * needed at all.
+     *
+     * `by_sheet` is the assembled answer, cached for its own reference identity —
+     * `snapshot_material` shares it, so rebuilding an identical array on every delivery
+     * would defeat the sharing. `per_sheet` is what makes the rebuild cheap when it does
+     * happen: each entry carries the *sheet's own* mapping generation beside the durable
+     * revision, so a sheet whose neither fact moved is reused rather than recomputed.
      */
     private row_height_projection_memo?: {
         readonly generation: number;
         readonly revision: number;
         readonly by_sheet: readonly (Readonly<Record<number, number>> | undefined)[];
     };
+
+    /**
+     * One entry per sheet index, each keyed by the pair that sheet's projection actually
+     * depends on. Kept across the events that invalidate `row_height_projection_memo`,
+     * which is the entire point: see `row_height_projection_by_sheet`.
+     */
+    private readonly row_height_projection_per_sheet = new Map<number, {
+        readonly mapping_generation: number;
+        readonly source: Record<number, number> | undefined;
+        readonly projection: Readonly<Record<number, number>> | undefined;
+    }>();
 
     constructor(
         private readonly panel: PanelLike,
@@ -523,6 +540,20 @@ export class ViewerPanelCore {
         // memo key would get wrong silently. Dropped beside every other per-source cache
         // so it is invalidated by the same reflex.
         this.row_height_projection_memo = undefined;
+        // That narrowing now exists, and the per-sheet cache is dropped with it — also
+        // unfalsifiable, and for a reason worth writing down rather than repeating the
+        // line above, because the narrowing is exactly the change that could have made it
+        // load-bearing and did not. Its entries are keyed by sheet index and by the
+        // sheet's `mapping_generation`, so the question is whether an adopted source can
+        // land a *different* workbook's sheet at an index whose cached mapping generation
+        // still matches. It cannot: the floor two lines up is set to `_generation` *after*
+        // the bump, so every sheet now reports a mapping generation strictly greater than
+        // any this cache could hold, and every entry misses. Probed by deleting this line,
+        // and nothing failed, exactly as that argument predicts. Kept because the argument
+        // rests on the bump and the floor staying in this order, which nothing else here
+        // enforces, and because a stale entry would be a height painted on another
+        // workbook's row — the one failure this projection exists to prevent.
+        this.row_height_projection_per_sheet.clear();
         return { type: 'adopted' };
     }
 
@@ -606,6 +637,10 @@ export class ViewerPanelCore {
         this.transform_column_cache.clear();
         this.cache.clear();
         this.row_height_projection_memo = undefined;
+        // Dropped here for the memory rather than for correctness — unlike the small
+        // numbers above, these entries retain a projection per sheet, and a pre-cap legacy
+        // map makes that the largest thing this core holds.
+        this.row_height_projection_per_sheet.clear();
     }
 
     /** Entry point for webview->host messages the core is responsible for. */
@@ -1034,7 +1069,10 @@ export class ViewerPanelCore {
             && memo.revision === durable.revision
         ) return memo.by_sheet;
         const by_sheet = Object.freeze(sheets.map((_sheet, sheet_index) => (
-            this.compute_row_height_projection(sheet_index, durable.heights[sheet_index])
+            this.memoized_row_height_projection(
+                sheet_index,
+                durable.heights[sheet_index],
+            )
         )));
         this.row_height_projection_memo = {
             generation: this._generation,
@@ -1042,6 +1080,59 @@ export class ViewerPanelCore {
             by_sheet,
         };
         return by_sheet;
+    }
+
+    /**
+     * One sheet's projection, recomputed only when a fact *that sheet's* answer depends
+     * on has moved.
+     *
+     * The outer memo above is keyed core-wide, and that is too coarse for the one input
+     * size this design has to stay honest about. A pre-cap legacy map can hold millions
+     * of entries, and the outer key moves on events that cannot have changed this sheet's
+     * answer: `_generation` rises when *any* sheet installs or clears a transform, and
+     * `revision` rises on *any* durable write to the file — a column resize, a scroll
+     * position, a sibling sheet's heights. Sorting sheet B would then synchronously walk
+     * and reallocate sheet A's million-entry projection, on the acknowledgement path,
+     * having changed nothing about it.
+     *
+     * The per-sheet key is the same pair narrowed to this sheet. `mapping_generation` is
+     * the permutation half — it is by construction the generation at which this sheet's
+     * display→source mapping last moved, so a core-wide bump that left this sheet alone
+     * does not move it. The durable half is narrowed by *identity* rather than by number:
+     * `revision` is file-wide with no per-sheet counterpart, but the height map handed in
+     * is shared by reference all the way from the latch (`durable_row_heights` normalizes
+     * into an array without copying the maps), so an unchanged `source` is the proof that
+     * this sheet's durable heights did not move even though some other field did.
+     *
+     * The revision is deliberately *not* compared beside the identity, and that is the
+     * narrowing that does the work rather than an omission: comparing it too would rebuild
+     * every sheet on any file-wide write, which is exactly the cost this exists to remove.
+     * Identity is the stronger fact of the two here — the maps are immutable durable state
+     * republished as a new object by every writer, so equal identity means equal content,
+     * while equal revision would only mean nobody wrote anything at all.
+     *
+     * Both halves are required and neither implies the other: heights change under a fixed
+     * permutation on every resize, and the permutation changes under fixed heights on
+     * every install.
+     */
+    private memoized_row_height_projection(
+        sheet_index: number,
+        source: Record<number, number> | undefined,
+    ): Readonly<Record<number, number>> | undefined {
+        const mapping_generation = this.mapping_generation(sheet_index);
+        const cached = this.row_height_projection_per_sheet.get(sheet_index);
+        if (
+            cached
+            && cached.mapping_generation === mapping_generation
+            && cached.source === source
+        ) return cached.projection;
+        const projection = this.compute_row_height_projection(sheet_index, source);
+        this.row_height_projection_per_sheet.set(sheet_index, {
+            mapping_generation,
+            source,
+            projection,
+        });
+        return projection;
     }
 
     /** One sheet's entry of the memoized projection. */

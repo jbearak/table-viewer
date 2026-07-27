@@ -947,12 +947,126 @@ describe('ViewerPanelCore', () => {
             expect(Object.isFrozen(core.snapshot_material().core)).toBe(true);
         });
 
-        // No test for "adoption does not serve a stale memo". Adoption bumps
-        // `_generation`, so the memo key misses whatever else is or is not done beside it,
-        // and the explicit drop in `adopt_source` is unfalsifiable — probed by deleting it,
-        // and nothing failed. A test asserting the behaviour would pass with the drop
-        // reverted, which makes it a test of nothing; `adopt_source`'s comment carries the
-        // argument instead.
+        /**
+         * The per-sheet layer under the core-wide memo. The outer key moves on events
+         * that cannot have changed a given sheet's answer, and the cost of taking it at
+         * face value is paid in the one size this design has to stay honest about: a
+         * pre-cap legacy map with millions of entries, walked and reallocated
+         * synchronously on the acknowledgement path for a sheet nobody touched.
+         *
+         * Counted the same way as above, but *per sheet* — `display_row_for_source` takes
+         * the sheet index as its first argument, so the calls separate cleanly and a test
+         * can assert that one sheet recomputed while the other did not. Asserting only
+         * the total would pass for an implementation that recomputed the wrong one.
+         */
+        describe('per-sheet scoping', () => {
+            function two_sheet_core(
+                heights: (Record<number, number> | undefined)[] = [{ 1: 44 }, { 2: 55 }],
+            ) {
+                const { panel, posted } = make_panel();
+                const durable: {
+                    revision: number;
+                    heights: (Record<number, number> | undefined)[];
+                } = { revision: 1, heights };
+                const core = new ViewerPanelCore(
+                    panel,
+                    new TrackingColumnSource(5, 2),
+                    { durableRowHeights: () => durable },
+                );
+                const scans = vi.spyOn(core, 'display_row_for_source');
+                const scans_for = (sheet: number) => scans.mock.calls
+                    .filter((call) => call[0] === sheet).length;
+                const sort = async (sheetIndex: number, requestId: string) => {
+                    await core.handle_message({
+                        type: 'setTransform',
+                        sheetIndex,
+                        requestId,
+                        generation: core.generation,
+                        sourceGeneration: core.source_generation,
+                        intent: 'user',
+                        state: {
+                            sort: [{ colIndex: 0, direction: 'desc' }],
+                            filters: [],
+                            schema: `["Sheet${sheetIndex + 1}",3,null]`,
+                        },
+                    });
+                    return posted.filter((m) => m.type === 'transformInstalled').at(-1);
+                };
+                return { core, durable, scans_for, sort };
+            }
+
+            it('leaves an untouched sheet alone when a sibling installs a view', async () => {
+                // A sort on sheet B bumps the core-wide generation, which is what the
+                // outer memo is keyed on — but sheet A's `mapping_generation` does not
+                // move, and its projection is a function of that and its own heights.
+                const { core, scans_for, sort } = two_sheet_core();
+                core.snapshot_material();
+                const sheet_a = scans_for(0);
+                expect(sheet_a).toBeGreaterThan(0);
+
+                const installed = await sort(1, 'desc-b');
+
+                // Sheet B genuinely moved: source row 2 sits at display row 2 under a
+                // descending sort of 5 rows. The point is that A did not pay for it.
+                expect(installed.rowHeights).toEqual({ 2: 55 });
+                expect(scans_for(0)).toBe(sheet_a);
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 2: 55 }]);
+                expect(scans_for(0)).toBe(sheet_a);
+            });
+
+            it('leaves both sheets alone when an unrelated durable write bumps the revision', () => {
+                // `revision` is file-wide: a column resize, a scroll position or a
+                // sibling's write all move it while the height maps stay identical. The
+                // maps are shared by reference from the latch, so an unchanged identity
+                // is the proof that nothing this projection reads has moved.
+                const { core, durable, scans_for } = two_sheet_core();
+                core.snapshot_material();
+                const before = [scans_for(0), scans_for(1)];
+
+                durable.revision = 2;
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 2: 55 }]);
+                expect([scans_for(0), scans_for(1)]).toEqual(before);
+            });
+
+            it('recomputes only the sheet whose durable heights actually moved', () => {
+                // The other side of the identity check: a revision bump that *does* carry
+                // a new map for one sheet must recompute that sheet and only that sheet.
+                const { core, durable, scans_for } = two_sheet_core();
+                core.snapshot_material();
+                const before = [scans_for(0), scans_for(1)];
+
+                durable.revision = 2;
+                durable.heights = [durable.heights[0], { 3: 66 }];
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 3: 66 }]);
+                expect(scans_for(0)).toBe(before[0]);
+                expect(scans_for(1)).toBeGreaterThan(before[1]);
+            });
+
+            it('projects the adopted source rather than the one it replaced', () => {
+                // Behaviour, not the cache. The per-sheet drop in `adopt_source` is
+                // unfalsifiable for the same reason the whole-memo drop beside it is —
+                // adoption raises every sheet's mapping generation above anything the
+                // cache holds, so every entry misses whether or not it was cleared — and
+                // this deliberately does not pretend otherwise. What it does pin is the
+                // outcome that would be catastrophic if the narrowing were ever taken
+                // further: after adoption the projection describes the new source.
+                const { core, durable } = two_sheet_core([{ 1: 44 }, undefined]);
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, undefined]);
+
+                durable.revision = 2;
+                durable.heights = [{ 3: 77 }, undefined];
+                core.adopt_source(new TrackingColumnSource(5, 2));
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 3: 77 }, undefined]);
+            });
+        });
 
         it('asks for the projection indexed against its own source sheets', () => {
             // The provider is handed sheet names rather than assuming an index array,
