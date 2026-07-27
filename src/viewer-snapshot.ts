@@ -164,6 +164,30 @@ export interface WorkbookSnapshot {
      * it.
      */
     readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
+    /**
+     * Per sheet, positionally matching `meta.sheets`, the value `generation` took when
+     * *that sheet's* display→source mapping last moved — `ViewerPanelCore.mapping_generation`
+     * serialised, and produced by calling it so the two cannot disagree.
+     *
+     * `generation` is core-wide; a permutation is per sheet. So a display-keyed value the
+     * webview holds — the optimistic row-height overlay — cannot be judged against
+     * `generation` alone without discarding it every time some *other* sheet moves, which
+     * a background sort finishing or a saved transform restoring on a background sheet
+     * both do. The rule this field exists to make expressible is the host's own:
+     * an overlay created at generation `G` for sheet `S` is still valid iff
+     * `mappingGenerations[S] <= G`. Below or equal, no display row on `S` has moved since
+     * `G`; above, its rows were rearranged and its keys name other rows now.
+     *
+     * Sampled beside `generation` and `rowHeightProjection` in the same statement, for the
+     * reason given on those: a permutation-relative answer read at any other instant can
+     * describe a permutation the delivery's own generation does not name.
+     *
+     * Read once and never retained, which is what keeps it out of the stale-copy class
+     * `SheetViewRecord` exists to police — see `ViewerPanelCore.mapping_generations_by_sheet`
+     * for the full argument, including why the local `sourceGeneration` heuristic that
+     * would have avoided this field is unsound.
+     */
+    readonly mappingGenerations: readonly number[];
     readonly state: NormalizedPerFileState;
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
@@ -191,6 +215,12 @@ export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = Workbo
      * above, for the same reason. See `WorkbookSnapshot.rowHeightProjection`.
      */
     readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
+    /**
+     * Per sheet, the generation at which that sheet's display→source mapping last moved.
+     * Sampled in the same statement as the generation and the two values above, and for
+     * the same reason. See `WorkbookSnapshot.mappingGenerations`.
+     */
+    readonly mappingGenerations: readonly number[];
 }
 
 export interface WorkbookSnapshotDiagnostics {
@@ -268,6 +298,7 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         reason: input.reason,
         meta: input.core.meta,
         hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
+        mappingGenerations: input.core.mappingGenerations,
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,

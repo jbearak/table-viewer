@@ -173,6 +173,86 @@ export interface RowHeightLayer {
 }
 
 /**
+ * The resizes this panel has committed but not yet seen answered, for one sheet, tagged
+ * with the view generation their display rows were read off.
+ *
+ * One sheet, not a map of them, because a resize commits the *active* sheet's row
+ * selection and the panel shows one sheet at a time: a second sheet's overlay could only
+ * be created by switching tabs mid-drag, which is not reachable.
+ */
+export interface RowHeightOverlay {
+    readonly sheet_index: number;
+    readonly generation: number;
+    readonly layers: readonly RowHeightLayer[];
+}
+
+/**
+ * The overlay that survives an event which moved the core generation to
+ * `next_generation`, rebased onto it — or `undefined` if its display keys can no longer
+ * be trusted.
+ *
+ * `sheet_mapping_generation` is the generation at which *the overlay's own sheet's*
+ * display→source mapping last moved, and it is the entire decision. The rule is the
+ * host's rule, character for character: the host accepts a display-keyed write iff
+ * `msg.generation >= core.mapping_generation(sheet)`; this keeps a display-keyed overlay
+ * iff `sheet_mapping_generation <= previous.generation`. One predicate, evaluated on both
+ * sides of the protocol against the same numbers, which is the only way the two can be
+ * guaranteed not to disagree — and a disagreement here is user-visible in both
+ * directions. Host accepts and webview discards: the row snaps back at the end of the
+ * drag and then silently springs to its new height when the write is delivered. Host
+ * refuses and webview keeps: the row shows a height no file holds until the generation
+ * next moves.
+ *
+ * ## Why the generation alone is not enough
+ *
+ * A permutation is per sheet but the generation is core-wide, so plenty of events move
+ * the generation without moving one display row on the overlay's sheet: an install for a
+ * sibling sheet, and — the case that motivated delivering this — a terminal transform
+ * reconciliation, where a background sort finishing bumps the generation while
+ * `commit_transform_reconciliation` rewrites only the reconciled sheet's indices.
+ *
+ * ## Why the local `sourceGeneration` heuristic was rejected
+ *
+ * "Discard only when `sourceGeneration` moved too" needs nothing delivered and is
+ * unsound. An unchanged source generation with a bumped view generation means *some*
+ * sheet's permutation moved and the webview cannot tell which; when the sheet that moved
+ * *is* this overlay's sheet, that rule paints old display keys onto a new arrangement —
+ * the right height on the wrong row, silently, and looking exactly like durable state.
+ * Which sheet moved is information only the host has, so the host sends it
+ * (`WorkbookSnapshot.mappingGenerations`).
+ *
+ * ## The three verdicts
+ *
+ * - **Unknown** (`undefined`): the delivery has no entry for this sheet, so the workbook
+ *   no longer has it. Nothing vouches for the keys; discard.
+ * - **Moved after the overlay was created**: its display keys named the old arrangement.
+ *   Discard. Adoption reaches this arm without a special case — `adopt_source` raises
+ *   `mapping_generation_floor` to the generation it installs, so *every* sheet reports
+ *   having moved, which is right: adoption replaces the rows themselves.
+ * - **Otherwise**: retain, and rebase onto `next_generation`. The rebase is not
+ *   bookkeeping — the render site only paints an overlay whose generation equals the
+ *   current one, so an overlay retained without being rebased is an overlay silently not
+ *   drawn.
+ *
+ * Reconciliation by value against the delivered projection is *not* done here and remains
+ * the caller's, because the two callers read the projection from different places (a
+ * delivery's `rowHeightProjection`, an install's `rowHeights`). See
+ * `row_height_layers_for_delivery`.
+ */
+export function retained_row_height_overlay(
+    previous: RowHeightOverlay | undefined,
+    next_generation: number,
+    sheet_mapping_generation: number | undefined,
+): RowHeightOverlay | undefined {
+    if (previous === undefined) return undefined;
+    if (sheet_mapping_generation === undefined) return undefined;
+    if (sheet_mapping_generation > previous.generation) return undefined;
+    return previous.generation === next_generation
+        ? previous
+        : { ...previous, generation: next_generation };
+}
+
+/**
  * Height for `row`: the newest overlay layer that names it, else the delivered
  * projection, else the default.
  *

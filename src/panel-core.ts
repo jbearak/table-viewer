@@ -340,11 +340,11 @@ export class ViewerPanelCore {
      * means "posted no earlier than the arrangement this sheet still has", which is
      * exactly what a display row naming the intended source row requires.
      *
-     * Deliberately *not* exposed on the wire. The webview keeps posting the one global
-     * generation it holds, because the whole point is that the host knows something the
-     * webview does not; a per-sheet generation in the protocol would have to be
-     * delivered, retained and rebased in the webview, which is the class of stale
-     * copy `SheetViewRecord` exists to prevent.
+     * The *request* side needs nothing on the wire for this: the webview keeps posting the
+     * one global generation it holds, and the host answers with a fact it alone has. The
+     * *rendering* side turned out to need the same fact delivered, because the webview is
+     * making the identical judgement about a display-keyed value of its own — see
+     * `mapping_generations_by_sheet`, which serialises exactly this function.
      *
      * Not a substitute for the `sourceGeneration` term beside it. Adoption replaces the
      * rows themselves, so it invalidates every sheet at once and no per-sheet fact can
@@ -353,6 +353,59 @@ export class ViewerPanelCore {
     mapping_generation(sheet_index: number): number {
         return this.sheet_mapping_generations.get(sheet_index)
             ?? this.mapping_generation_floor;
+    }
+
+    /**
+     * `mapping_generation` for every sheet the current source has, positionally matching
+     * `meta.sheets` — the delivered form of the fact above.
+     *
+     * ## Why the webview needs it
+     *
+     * The webview holds a display-keyed optimistic row-height overlay tagged with the
+     * generation its display rows were read off, and it has to decide, on every delivery,
+     * whether those keys still name the rows they named. Judged against the bare
+     * `generation` it gets the same wrong answer the host used to give: a terminal
+     * transform reconciliation for sheet B — a sibling sort finishing in the background —
+     * bumps the core-wide generation while `commit_transform_reconciliation` touches only
+     * B's `transform_indices`, so sheet A's overlay is thrown away though not one of its
+     * display rows moved. Meanwhile the host, asking the scoped question, has *accepted*
+     * A's queued write. The row springs back and then silently reappears when that write
+     * is delivered. The two sides must ask one question, and this is it.
+     *
+     * ## Why not infer it from `sourceGeneration`
+     *
+     * The tempting local heuristic is "discard only when `sourceGeneration` also moved".
+     * It is unsafe, and not marginally: a snapshot with an unchanged source generation and
+     * a bumped view generation means *some* sheet's permutation moved, and the webview
+     * cannot tell which. Keeping sheet A's overlay under that rule paints the old display
+     * keys over the new arrangement whenever A is the sheet that moved — a wrong height on
+     * a wrong row, not a cosmetic lag. The whole point is that the sheet identity is
+     * information only the host has, so the host has to send it.
+     *
+     * ## Why sending it is not the stale copy `SheetViewRecord` forbids
+     *
+     * Because nothing retains it. It is read once, in the same handler that receives it,
+     * and reduced immediately to a keep-or-discard verdict; no state holds the numbers
+     * afterwards. That is the `transformInstalled.rules` precedent — a fact read once and
+     * never held travels beside the record rather than on it — and it is why this is
+     * sampled in `snapshot_material` beside `generation`, not carried on the projected
+     * capabilities, which are sampled only when something re-projects them.
+     *
+     * ## Consistency with the host's own predicate
+     *
+     * Every entry is produced by calling `mapping_generation` itself, deliberately, rather
+     * than by reading `sheet_mapping_generations` and merging the floor here. The map is
+     * sparse and falls back to `mapping_generation_floor`, so a second implementation is a
+     * second chance to disagree with the predicate the host validates writes against — and
+     * a disagreement is precisely the failure this exists to remove. Bounded to the sheets
+     * the current source has, so a stale entry for a sheet a shrunken workbook no longer
+     * holds cannot be published; the webview treats a missing entry as "discard", which is
+     * the safe direction for an overlay on a sheet that is gone.
+     */
+    private mapping_generations_by_sheet(): readonly number[] {
+        return this.source.meta().sheets.map(
+            (_sheet, sheet_index) => this.mapping_generation(sheet_index),
+        );
     }
 
     /** Map inclusive installed display-row intervals to canonical source rows. */
@@ -506,6 +559,15 @@ export class ViewerPanelCore {
                 // projected capabilities instead they would be sampled at a
                 // different moment and could name another permutation's rows.
                 hiddenEditedCellKeys: this.hidden_edited_cell_keys_by_sheet(),
+                // Third value sampled in this same statement, and the adjacency
+                // argument above is not merely reused here but *needed* here: this
+                // array is what lets the webview ask, of the generation beside it,
+                // "did *this sheet's* rows move?". Read a moment later it could
+                // answer about a different permutation than `generation` names, and
+                // then it would license keeping a display-keyed overlay across the
+                // very install that invalidated it. See `mapping_generations_by_sheet`
+                // for why the host has to send it at all.
+                mappingGenerations: this.mapping_generations_by_sheet(),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,

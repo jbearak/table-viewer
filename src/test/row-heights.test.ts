@@ -7,6 +7,7 @@ import {
     clamp_row_height,
     natural_row_height,
     resolved_row_height,
+    retained_row_height_overlay,
     row_height,
     row_height_layers_for_delivery,
     row_height_layers_with,
@@ -336,6 +337,61 @@ describe('the optimistic row-height overlay', () => {
             // every row here — the interval's read budget is what catches it.
             const layers = [layer(select_all_rows(10_000_000), 72)];
             expect(row_height_layers_for_delivery(layers, { 0: 72, 1: 72 })).toBe(layers);
+        });
+    });
+
+    /**
+     * The one predicate both sides of the protocol use to decide whether a display-keyed
+     * overlay is still meaningful. The host's form is
+     * `msg.generation >= core.mapping_generation(sheet)`; this is the same comparison from
+     * the other end, fed by `WorkbookSnapshot.mappingGenerations`.
+     */
+    describe('retained_row_height_overlay', () => {
+        const overlay = {
+            sheet_index: 0,
+            generation: 4,
+            layers: [layer([{ start: 3, end: 3 }], 50)],
+        };
+
+        it('retains an overlay whose sheet has not moved, rebased onto the new generation', () => {
+            // The whole point of delivering per-sheet mapping generations: the core-wide
+            // generation moved to 5 because *another* sheet was reconciled, and sheet 0's
+            // mapping still dates from 4. The host accepts this overlay's queued write for
+            // exactly that reason, so discarding it here would spring the row back and
+            // then have the height silently reappear when the write is delivered.
+            //
+            // Rebased rather than merely kept, because the render site paints only an
+            // overlay whose generation is the current one — retaining without rebasing is
+            // indistinguishable from discarding, on screen.
+            expect(retained_row_height_overlay(overlay, 5, 4))
+                .toEqual({ ...overlay, generation: 5 });
+        });
+
+        it('discards an overlay whose own sheet moved', () => {
+            // The other direction, and the one that must not be traded away for the first:
+            // this sheet's rows were rearranged after the overlay's display keys were read
+            // off them, so those keys now name other source rows. Painting them would put
+            // the user's height on whichever rows moved into those positions.
+            expect(retained_row_height_overlay(overlay, 5, 5)).toBeUndefined();
+        });
+
+        it('discards an overlay for a sheet the delivery does not describe', () => {
+            // A missing entry means the workbook no longer has that sheet, so nothing
+            // vouches for the keys. Distinct from the comparison above rather than a
+            // rewording of it: `undefined > 4` is false, so a rule that only compared
+            // would *keep* this one.
+            expect(retained_row_height_overlay(overlay, 5, undefined)).toBeUndefined();
+        });
+
+        it('returns the same object when the generation has not moved', () => {
+            // Identity, not just equality: App decides whether to replace overlay state at
+            // all by comparing references, so a fresh object here would re-render on every
+            // delivery that changed nothing.
+            expect(retained_row_height_overlay(overlay, 4, 4)).toBe(overlay);
+        });
+
+        it('has nothing to retain when there is no overlay', () => {
+            expect(retained_row_height_overlay(undefined, 5, 4)).toBeUndefined();
         });
     });
 });

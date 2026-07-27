@@ -66,6 +66,7 @@ describe('workbook snapshot builder', () => {
                 meta: { sheets: [], hasFormatting: false },
                 hiddenEditedCellKeys: [],
                 rowHeightProjection: [],
+                mappingGenerations: [],
             },
             presentation: 'refresh',
             reason: 'retry',
@@ -154,6 +155,12 @@ describe('workbook snapshot builder', () => {
         // half-frozen case further down, where the array is frozen and the map is not.
         const row_height_projection: (Readonly<Record<number, number>> | undefined)[] =
             [Object.freeze({ 2: 44 })];
+        // And once more for the third permutation-relative value sampled in the same
+        // statement. Numbers, so there is no entry half to freeze — but the array is
+        // resampled on every delivery just like the two above, and an issued snapshot
+        // sharing it would let a later install rewrite the verdict an earlier delivery
+        // gave a webview about whether its display-keyed overlay was still valid.
+        const mapping_generations = [2];
         const commandResult: RetainedSnapshotCommandResult = {
             type: 'excelFirstRowHeader',
             requestId: 'header:1',
@@ -179,6 +186,7 @@ describe('workbook snapshot builder', () => {
                 meta,
                 hiddenEditedCellKeys: hidden_edited_cell_keys,
                 rowHeightProjection: row_height_projection,
+                mappingGenerations: mapping_generations,
             },
             presentation: 'initial',
             reason: 'ready',
@@ -198,6 +206,7 @@ describe('workbook snapshot builder', () => {
         diagnostics.truncationMessage = null;
         hidden_edited_cell_keys[0].push('3:0');
         row_height_projection[0] = { 9: 99 };
+        mapping_generations[0] = 99;
         (commandResult as { error?: string }).error = 'Changed';
 
         expect(snapshot.meta.sheets[0]).toMatchObject({
@@ -222,10 +231,12 @@ describe('workbook snapshot builder', () => {
         expect(snapshot.truncationMessage).toBe('Rows were truncated.');
         expect(snapshot.hiddenEditedCellKeys).toEqual([['2:0']]);
         expect(snapshot.rowHeightProjection).toEqual([{ 2: 44 }]);
+        expect(snapshot.mappingGenerations).toEqual([2]);
         expect(snapshot.commandResult?.error).toBe('Ambiguous finalization was reconciled.');
         expect(Object.isFrozen(snapshot)).toBe(true);
         expect(Object.isFrozen(snapshot.hiddenEditedCellKeys[0])).toBe(true);
         expect(Object.isFrozen(snapshot.rowHeightProjection[0])).toBe(true);
+        expect(Object.isFrozen(snapshot.mappingGenerations)).toBe(true);
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
@@ -259,6 +270,7 @@ describe('workbook snapshot builder', () => {
                 meta: { sheets: [], hasFormatting: false },
                 hiddenEditedCellKeys: [],
                 rowHeightProjection: projection,
+                mappingGenerations: [],
             },
             presentation: 'initial',
             reason: 'ready',
@@ -304,6 +316,7 @@ describe('workbook snapshot builder', () => {
                 meta: { sheets: [], hasFormatting: false },
                 hiddenEditedCellKeys: [],
                 rowHeightProjection: projection,
+                mappingGenerations: [],
             },
             presentation: 'initial',
             reason: 'ready',
@@ -363,6 +376,7 @@ describe('workbook snapshot builder', () => {
                 meta: { sheets: [sheet], hasFormatting: false },
                 hiddenEditedCellKeys: [[]],
                 rowHeightProjection: [undefined],
+                mappingGenerations: [1],
             },
             presentation: 'initial',
             reason: 'ready',

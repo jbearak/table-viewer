@@ -770,6 +770,17 @@ function workbook_snapshot_message(
                 ...identity,
             },
             ...snapshot_extra,
+            // One entry per sheet, defaulting to *this delivery's own* generation, i.e.
+            // "every sheet's mapping moved at this generation". Faithful rather than
+            // convenient: the ordinary reason a delivery's generation has moved at all is
+            // an adoption, and `adopt_source` raises the floor for every sheet, so that is
+            // what the host really sends. It also keeps the interesting case — a generation
+            // that moved because *another* sheet's mapping did — something a test has to
+            // state outright instead of inheriting from a default that guessed.
+            //
+            // After the spread, so an explicit value still wins.
+            mappingGenerations: snapshot_extra.mappingGenerations
+                ?? meta.sheets.map(() => snapshot_extra.generation ?? 1),
         },
     };
 }
@@ -2754,31 +2765,96 @@ describe('row height persistence', () => {
         return rendered;
     }
 
-    it('discards the overlay when a delivery moves the view generation', async () => {
+    it('discards the overlay when a delivery moves its own sheet\'s mapping', async () => {
         await pending_resize();
 
-        // A moved generation means a different arrangement of rows, and the overlay's
-        // keys are display rows read off the old one. Reconciling by value cannot save
-        // it: the projection that arrives is about rows this layer never named, so it
-        // would neither agree with the layer nor make it right — it would just keep
+        // A moved mapping *for this sheet* means a different arrangement of its rows, and
+        // the overlay's keys are display rows read off the old one. Reconciling by value
+        // cannot save it: the projection that arrives is about rows this layer never named,
+        // so it would neither agree with the layer nor make it right — it would just keep
         // masking whatever row 3 is now.
         //
-        // Held by two gates, deliberately: the delivery drops the overlay outright and the
-        // render site refuses to hand on an overlay whose generation is not the current
-        // one. Probing found each survives its own removal because the other still holds,
-        // and removing both fails here — so this pins the behaviour rather than either
-        // line. The pair is worth keeping: the discard is what stops a layer accumulating
-        // across generations, and the render gate is the same test the *sheet* gate beside
-        // it needs anyway (a tab switch moves no generation, so it must be read there).
+        // `mappingGenerations` says outright that sheet 0 is the sheet that moved, which is
+        // the half of the rule the retention test below must not be allowed to swallow.
+        //
+        // Pinned by one line now, and it used to take two. This was a pair of gates held
+        // jointly — the delivery dropped the overlay and the render site refused any
+        // overlay whose generation was not current, each surviving its own removal because
+        // the other held. Scoping the discard per sheet moved the decision into
+        // `retained_row_height_overlay`, where inverting the comparison fails this test on
+        // its own; the render-site generation gate is what is now unfalsifiable, and says so
+        // at its call site.
         await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
             generation: 5,
             sourceGeneration: 7,
             reason: 'other',
+            mappingGenerations: [5, 4],
             rowHeightProjection: [{ 1: 33 }, undefined],
         }));
 
         expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 33 });
+    });
+
+    it('keeps the overlay when a delivery moves another sheet\'s mapping', async () => {
+        await pending_resize();
+
+        // The case that made `mappingGenerations` necessary. A terminal transform
+        // reconciliation — a background sort on sheet 1 finishing — bumps the core-wide
+        // generation and forces a delivery, while `commit_transform_reconciliation` rewrites
+        // only sheet 1's indices. Sheet 0's display rows have not moved, and the host, which
+        // asks the scoped question through `mapping_generation`, still *accepts* the resize
+        // this layer is waiting on. Discarding here — which the old `previous.generation !==
+        // snapshot.generation` test did, because a snapshot names no sheet — sprang the row
+        // back and then let the height silently reappear when the write was delivered.
+        //
+        // Deliberately not inferred from `sourceGeneration`: it is unchanged here, and it is
+        // equally unchanged when the sheet that moved is sheet 0, so it cannot tell the two
+        // apart. See `retained_row_height_overlay`.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            mappingGenerations: [4, 5],
+            rowHeightProjection: [undefined, { 1: 33 }],
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        // Rebased, not merely retained: the render site compares the overlay's generation
+        // with the current one, so a layer left at 4 would be held in state and painted
+        // nowhere — which is exactly what the assertion above would catch. Proved a second
+        // way by the reconciliation still working at the new generation.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            mappingGenerations: [4, 5],
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }, { 1: 33 }],
+        }));
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+    });
+
+    it('discards the overlay when an adoption moves every sheet\'s mapping', async () => {
+        await pending_resize();
+
+        // Adoption needs no special case, and this is the test of that claim. A physical
+        // refresh or an Excel header promotion replaces the rows themselves, so
+        // `adopt_source` clears the per-sheet map and raises `mapping_generation_floor` to
+        // the generation it installs — every sheet reports having moved, and the uniform
+        // rule discards. Were adoption to leave any sheet's mapping generation behind, the
+        // overlay would survive a source change, which is the one thing no per-sheet fact
+        // can license.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 8,
+            reason: 'fileReload',
+            mappingGenerations: [5, 5],
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
     });
 
     it('discards the overlay when a new document arrives', async () => {

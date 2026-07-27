@@ -199,6 +199,9 @@ describe('ViewerPanelCore', () => {
                 // provider wired: the projection says "this sheet has no custom heights",
                 // which is what an unwired core and an unresized sheet both mean.
                 rowHeightProjection: [undefined],
+                // And per sheet again: the generation at which each sheet's mapping last
+                // moved, which on a fresh core is the initial floor for every sheet.
+                mappingGenerations: [1],
             },
             diagnostics: { truncationMessage: 'Showing 4 rows' },
         });
@@ -1768,6 +1771,43 @@ describe('ViewerPanelCore', () => {
             .toEqual([2, 1, 3]);
     });
 
+    it('delivers the same mapping generations the write predicate answers', async () => {
+        // The webview judges its display-keyed row-height overlay by the delivered array
+        // and the host judges the matching write by `mapping_generation`. If those two
+        // disagree the row either springs back while the write is accepted, or keeps
+        // painting a height nothing persisted — so the array is built by *calling* the
+        // predicate, and this is the assertion that the sparse map and its floor are not
+        // being re-merged by a second implementation that could drift.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        core.begin_receiver_epoch(1);
+        // A deliberately mixed state: one sheet with an entry in the sparse map, two
+        // answered only by the floor.
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 2,
+            requestId: 'sort-sheet-2',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet3",3,null]',
+            },
+        });
+
+        const delivered = core.snapshot_material().core.mappingGenerations;
+
+        expect([...delivered]).toEqual([1, 1, 2]);
+        // One entry per sheet the source has, positionally matching `meta.sheets`, and
+        // equal to the predicate at every index.
+        expect(delivered).toHaveLength(core.snapshot_material().core.meta.sheets.length);
+        expect([...delivered]).toEqual(
+            [0, 1, 2].map((sheet) => core.mapping_generation(sheet)),
+        );
+    });
+
     it('raises every sheet\'s mapping generation on source adoption', async () => {
         // Adoption replaces the rows themselves, so it invalidates every sheet at once and
         // no per-sheet exemption may survive it. Carried as a floor rather than an entry
@@ -1799,6 +1839,13 @@ describe('ViewerPanelCore', () => {
         // Including a sheet index the new source does not have, which a per-sheet map
         // could not have answered at all.
         expect(core.mapping_generation(7)).toBe(3);
+        // And the delivered form says the same, which is the answer to "does adoption need
+        // a special case in the webview's retention rule?" — no: every sheet reports having
+        // moved at the generation the adoption installed, so the uniform rule voids every
+        // overlay. This also pins the *floor* half of the serialisation: the per-sheet map
+        // is empty here, so an implementation reading it without falling back would report
+        // the initial 1 and license an overlay across a source change.
+        expect([...core.snapshot_material().core.mappingGenerations]).toEqual([3, 3, 3]);
     });
 
     it('rejects a prepared reconciliation after source adoption', async () => {

@@ -2483,7 +2483,11 @@ describe('GridShell stable rows during an edit session', () => {
         // The display row it was measured at, as a one-row interval. This site knows the
         // source row too (it resolved one to key the edit) and deliberately does not use
         // it: the host is the only display→source mapper.
-        expect(on_row_resize).toHaveBeenCalledWith(
+        //
+        // Exactly once, for the same reason as the forced-commit case below: one commit
+        // must produce one durable host write, and `auto_grow_row_for_text` now has two
+        // callers between which a double post is the plausible regression.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
         );
@@ -2493,7 +2497,7 @@ describe('GridShell stable rows during an edit session', () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);
 
-        expect(on_row_resize).toHaveBeenCalledWith(
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 0, end: 0 }],
             expected_grown_height,
         );
@@ -2569,7 +2573,12 @@ describe('GridShell stable rows during an edit session', () => {
         // arrangement that has moved. The shell's job is to ask.
         const on_row_resize = await fold_open_editor(MULTILINE);
 
-        expect(on_row_resize).toHaveBeenCalledWith(
+        // Exactly once, not merely at least once, and the exactness is the point of the
+        // refactor this test guards: `auto_grow_row_for_text` is now reached from two
+        // callers (`on_cell_edited` and this forced-commit path), so a fold that reached it
+        // through both would post two `setRowHeights` — two durable host writes and two
+        // deliveries for one keystroke — and the permissive matcher would have passed.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
             [{ start: 1, end: 1 }],
             expected_grown_height,
         );

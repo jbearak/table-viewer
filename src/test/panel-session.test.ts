@@ -100,6 +100,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
         },
         hiddenEditedCellKeys: [[]],
         rowHeightProjection: [undefined],
+        mappingGenerations: [1],
     };
     const diagnostics = overrides.diagnostics ?? { truncationMessage: null };
     const live_material = structuredClone({ core, diagnostics });
@@ -377,6 +378,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 // display-keyed height map paired with another adoption's generation
                 // renders every custom height against the wrong row.
                 rowHeightProjection: [{ 0: 40 }],
+                mappingGenerations: [1],
             },
             diagnostics: { truncationMessage: 'current diagnostics' },
         });
