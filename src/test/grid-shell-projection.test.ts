@@ -11,6 +11,7 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
 import {
+    MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
@@ -2322,7 +2323,6 @@ describe('GridShell stable rows during an edit session', () => {
                 source_to_visible: [0, 1, 2],
                 hidden_count: 0,
             },
-            transformed: true,
             transform_state,
             transform_sections: true,
             edit_mode: true,
@@ -2441,10 +2441,17 @@ describe('GridShell stable rows during an edit session', () => {
         expect(posted_transforms()).toEqual([]);
     });
 
-    // Row heights are still keyed by *display* row (PR 4 moves them to source
-    // keys), so the multiline auto-grow write is gated on `transformed` — the one
-    // place transforms and edit mode now coexist. Asserted as a pair: alone, the
-    // first test would also pass if auto-grow were broken outright.
+    // Multiline auto-grow used to be gated on a `transformed` prop, because the height it
+    // wrote was keyed by the display row it measured and that named another source row
+    // under a permutation. The write is now a display *interval* the host maps through
+    // the permutation it installed, so the gate is gone — and so is the prop, since
+    // nothing in the shell needed to know any more.
+    //
+    // Still asserted as a pair, over rules that describe a permutation and rules that do
+    // not, because a permuted view is the one place transforms and edit mode coexist and
+    // this row's rendered position is a permuted one in both runs. That the two runs now
+    // differ only in the rule set — and grow the same row to the same height either way —
+    // is the point: the shell has no notion of being permuted left to branch on.
     const MULTILINE = 'one\ntwo\nthree';
     const expected_grown_height = natural_row_height(
         MULTILINE,
@@ -2453,15 +2460,15 @@ describe('GridShell stable rows during an edit session', () => {
         default_row_height_for_font(13),
     );
 
-    async function commit_multiline(transformed: boolean, on_row_resize: () => void) {
+    async function commit_multiline(sorted: boolean, on_row_resize: () => void) {
         const display_to_source = [1, 3, 0, 2];
         install_permutation(display_to_source);
         await render_grid(stable_props(
             display_to_source,
-            transformed
+            sorted
                 ? { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] }
                 : { sort: [], filters: [] },
-            { transformed, on_row_resize },
+            { on_row_resize },
         ));
         grid_mock.update_cells.mockClear();
         const on_cell_edited = grid_mock.props!.onCellEdited as
@@ -2469,22 +2476,174 @@ describe('GridShell stable rows during an edit session', () => {
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: MULTILINE }));
     }
 
-    it('does not write a row height for a multiline edit while transformed', async () => {
+    it('grows the row for a multiline edit while transformed', async () => {
         const on_row_resize = vi.fn();
         await commit_multiline(true, on_row_resize);
 
-        expect(on_row_resize).not.toHaveBeenCalled();
-        // Fell through to the single-cell repaint rather than returning early: the
-        // edit still has to be painted, there is just no height change to spread
-        // across the row.
-        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [0, 0] }]);
+        // The display row it was measured at, as a one-row interval. This site knows the
+        // source row too (it resolved one to key the edit) and deliberately does not use
+        // it: the host is the only display→source mapper.
+        //
+        // Exactly once, for the same reason as the forced-commit case below: one commit
+        // must produce one durable host write, and `auto_grow_row_for_text` now has two
+        // callers between which a double post is the plausible regression.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 0, end: 0 }],
+            expected_grown_height,
+        );
     });
 
     it('grows the row for a multiline edit when not transformed', async () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);
 
-        expect(on_row_resize).toHaveBeenCalledWith([0], expected_grown_height);
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 0, end: 0 }],
+            expected_grown_height,
+        );
+    });
+
+    /**
+     * An open Glide overlay editor holding `value`, portalled where the shell reads it.
+     *
+     * A `textarea`, not an `input`, and that is not incidental: `HTMLInputElement.value`
+     * strips newlines, so a single-line element cannot express the only value auto-grow
+     * reacts to — the multiline case would silently arrive as `onetwothree` and the test
+     * would pass against an implementation that never grew anything. Glide's overlay is a
+     * textarea for a multiline editor anyway, and the shell's selector accepts both.
+     */
+    function open_overlay_editor(value: string): () => void {
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const editor = document.createElement('textarea');
+        editor.value = value;
+        clip.appendChild(editor);
+        document.body.appendChild(clip);
+        return () => clip.remove();
+    }
+
+    /**
+     * Mount permuted with an editor open on display row 1 — not row 0, so a handler that
+     * read a source row (3 here) or defaulted to the first row would name a visibly wrong
+     * interval — then fold it the way App does.
+     */
+    async function fold_open_editor(value: string): Promise<ReturnType<typeof vi.fn>> {
+        const display_to_source = [1, 3, 0, 2];
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_row_resize = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            { on_row_resize, editing_ref },
+        ));
+        await act(async () => {
+            (grid_mock.props!.onGridSelectionChange as (selection: unknown) => void)({
+                columns: {},
+                rows: {},
+                current: {
+                    cell: [0, 1],
+                    range: { x: 0, y: 1, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+        const close = open_overlay_editor(value);
+        try {
+            await act(async () => editing_ref.current?.commit_live_edit());
+        } finally {
+            close();
+        }
+        return on_row_resize;
+    }
+
+    it('grows the row when a forced commit folds an open multiline editor', async () => {
+        // The commit path that is *not* Glide's. App folds an open editor through
+        // `commit_live_edit` whenever something is about to remount or re-project the grid
+        // — a transform completing, a column-visibility change — and that path wrote through
+        // `commit_edit` directly, so it skipped auto-grow entirely: the text survived, the
+        // row kept its old height, and it clipped what the user had just typed with nothing
+        // to explain why. Newly reachable precisely because auto-grow stopped being gated
+        // on an unpermuted view, which is what makes it this change's to fix.
+        //
+        // Whether the *host* keeps the height depends on why the fold happened, and that is
+        // deliberately not the shell's business: a fold for a column-visibility change or an
+        // install on another sheet is accepted (`mapping_generation` in `viewer-controller`),
+        // one for an install on this sheet is refused like any other resize naming an
+        // arrangement that has moved. The shell's job is to ask.
+        const on_row_resize = await fold_open_editor(MULTILINE);
+
+        // Exactly once, not merely at least once, and the exactness is the point of the
+        // refactor this test guards: `auto_grow_row_for_text` is now reached from two
+        // callers (`on_cell_edited` and this forced-commit path), so a fold that reached it
+        // through both would post two `setRowHeights` — two durable host writes and two
+        // deliveries for one keystroke — and the permissive matcher would have passed.
+        expect(on_row_resize).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 1, end: 1 }],
+            expected_grown_height,
+        );
+    });
+
+    it('leaves the row alone when a forced commit folds a single-line editor', async () => {
+        // The negative half, so the test above pins "grows for hard line breaks" rather
+        // than "posts a resize on every fold" — which would cost a durable write and a
+        // delivery on every column-visibility change made with an editor open.
+        //
+        // Held *jointly* by the two guards in `auto_grow_row_for_text`, and probing says so:
+        // the newline test survives its own deletion because `natural_row_height` floors at
+        // the default, so a one-line value measures exactly the default and the height
+        // comparison refuses it; the comparison survives its deletion because the newline
+        // test refuses it first. This fails only when both are gone. What is pinned is the
+        // behaviour, therefore, not either line.
+        const on_row_resize = await fold_open_editor('one line only');
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+    });
+
+    it('caps auto-grow at the ceiling and stops re-posting once it is reached', async () => {
+        // `natural_row_height` is `lines * line_height + padding`, unbounded in the number
+        // of hard newlines a cell holds — so this path, not a malformed message, is the
+        // realistic way to reach an absurd height. It is also the path where an unclamped
+        // height does more than persist a silly number: the comparison guarding this post
+        // is against the *stored* height, which is clamped, so an unclamped `needed` stays
+        // strictly greater forever and re-posts a resize on every single edit commit to
+        // that row — each one a no-op the host now answers with a delivery.
+        //
+        // Both halves in one case because they are one behaviour: the value posted is the
+        // ceiling, and a row already sitting at the ceiling posts nothing at all.
+        const huge = 'x\n'.repeat(5_000);
+        expect(natural_row_height(huge, line_height_for_font(13)))
+            .toBeGreaterThan(MAX_ROW_HEIGHT_PX);
+        const display_to_source = [1, 3, 0, 2];
+
+        const from_default = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [] },
+            { on_row_resize: from_default },
+        ));
+        await act(async () => (grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void
+        )([0, 0], { kind: 'text', data: huge }));
+
+        expect(from_default).toHaveBeenCalledWith(
+            [{ start: 0, end: 0 }],
+            MAX_ROW_HEIGHT_PX,
+        );
+
+        const already_capped = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [] },
+            { on_row_resize: already_capped, row_heights: { 0: MAX_ROW_HEIGHT_PX } },
+        ));
+        await act(async () => (grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void
+        )([0, 0], { kind: 'text', data: huge }));
+
+        expect(already_capped).not.toHaveBeenCalled();
     });
 });
 
@@ -2536,7 +2695,11 @@ describe('GridShell row resizing', () => {
         expect(grid_mock.overlay_repaint).toHaveBeenCalled();
         act(() => on_resize_end(3, 52));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([1, 3, 4], 52);
+        // Coalesced into display-row intervals: 1 alone, then 3–4.
+        expect(on_row_resize).toHaveBeenCalledWith(
+            [{ start: 1, end: 1 }, { start: 3, end: 4 }],
+            52,
+        );
     });
 
     it('previews all selected rows when dragging the first selected row', async () => {
@@ -2608,7 +2771,7 @@ describe('GridShell row resizing', () => {
         expect(on_row_resize).not.toHaveBeenCalled();
         act(() => on_resize_end(2, 48));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([2], 48);
+        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48);
         expect(grid_mock.update_cells).not.toHaveBeenCalled();
     });
 
@@ -2651,7 +2814,10 @@ describe('GridShell row resizing', () => {
         ]);
         act(() => on_resize_end(0, 60));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize.mock.calls[0][0]).toHaveLength(10_000);
+        // Ten thousand contiguous selected rows leave as one interval, not ten thousand
+        // row numbers: the request that crosses to the host is the size of the gesture,
+        // not of the selection.
+        expect(on_row_resize.mock.calls[0][0]).toEqual([{ start: 0, end: 9_999 }]);
     });
 
     it('repaints merge geometry after committed row heights render', async () => {

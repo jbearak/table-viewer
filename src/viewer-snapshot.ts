@@ -79,9 +79,25 @@ export interface WorkbookSnapshotCapabilities {
     readonly csvSaveLifecycle: CsvSaveLifecycle;
 }
 
-export interface NormalizedPerFileState extends PerFileState {
+/**
+ * Durable per-file state with every layout/view leaf the protocol requires filled in.
+ *
+ * `rowHeights` is the one `PerFileState` field this shape deliberately **removes** rather
+ * than completes, and the `Omit` is load-bearing: it is what makes "the webview is not
+ * sent durable heights" a type error to undo instead of a convention. Two readers use
+ * this shape and neither wants the map. `WorkbookSnapshot.state` is what crosses to the
+ * webview, which renders from `rowHeightProjection` and never reads the durable map —
+ * sending it would be a source-keyed map sitting beside a display-keyed one, which is
+ * exactly the confusion this PR exists to end, and for a pre-cap legacy select-all map it
+ * would be hundreds of thousands of entries structured-cloned across the bridge on every
+ * delivery. `derive_layout_state_patch`'s basis/incoming pair is the other, and
+ * `LayoutStatePatch` has no `rowHeights` leaf to derive, so it never looks.
+ *
+ * The durable map itself is unaffected: the host reads and writes it through
+ * `PerFileState` (`normalize_host_state`, `update_file_state`), which keeps the field.
+ */
+export interface NormalizedPerFileState extends Omit<PerFileState, 'rowHeights'> {
     columnWidths: (Record<number, number> | undefined)[];
-    rowHeights: (Record<number, number> | undefined)[];
     scrollPosition: (ScrollPosition | undefined)[];
     activeSheetIndex: number;
     tabOrientation: 'horizontal' | 'vertical' | null;
@@ -118,6 +134,60 @@ export interface WorkbookSnapshot {
      * identifies.
      */
     readonly hiddenEditedCellKeys: readonly (readonly string[])[];
+    /**
+     * The durable custom row heights re-keyed into the display space of the view the
+     * host holds for each sheet, positionally matching `meta.sheets`. Sparse — an absent
+     * key is the default height — and `undefined` for a sheet with no custom heights at
+     * all, which is the overwhelmingly common case and so worth not sending as `{}`.
+     *
+     * This is what the webview renders from. It cannot compute it: durable heights are
+     * keyed by canonical source row (`PerFileState.rowHeights`) and the permutation plus
+     * the source→projected mapping that invert one into the other live only on the host.
+     *
+     * Sampled beside `hiddenEditedCellKeys` for the identical reason, and the argument
+     * transfers verbatim because both values are meaningless except against one specific
+     * permutation. `create_desired` samples the core live and synchronously for every
+     * delivery, so this and `generation` above are read in the same instant and cannot
+     * name different permutations — whereas a value carried on the projected
+     * capabilities is sampled only when something re-projects them, and could describe a
+     * permutation two installs old. Applied to the wrong permutation a display-keyed
+     * height map is not stale but *wrong*: every height renders against a different row,
+     * which is the exact bug source-keyed durable heights exist to end.
+     *
+     * Every delivery, and not only the ones that moved a row, because both halves of
+     * this join move independently. The permutation moves at an install; the durable
+     * heights move on a `setRowHeights`, a sibling panel's write, or an excel-header plan
+     * edit, none of which install anything or bump a generation. So there is no event
+     * that can be relied on to be the last word, and the answer is simply recomputed
+     * whenever anything is delivered. The install case is the one gap a delivery does not
+     * cover — an install posts no snapshot — and `transformInstalled.rowHeights` covers
+     * it.
+     */
+    readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
+    /**
+     * Per sheet, positionally matching `meta.sheets`, the value `generation` took when
+     * *that sheet's* display→source mapping last moved — `ViewerPanelCore.mapping_generation`
+     * serialised, and produced by calling it so the two cannot disagree.
+     *
+     * `generation` is core-wide; a permutation is per sheet. So a display-keyed value the
+     * webview holds — the optimistic row-height overlay — cannot be judged against
+     * `generation` alone without discarding it every time some *other* sheet moves, which
+     * a background sort finishing or a saved transform restoring on a background sheet
+     * both do. The rule this field exists to make expressible is the host's own:
+     * an overlay created at generation `G` for sheet `S` is still valid iff
+     * `mappingGenerations[S] <= G`. Below or equal, no display row on `S` has moved since
+     * `G`; above, its rows were rearranged and its keys name other rows now.
+     *
+     * Sampled beside `generation` and `rowHeightProjection` in the same statement, for the
+     * reason given on those: a permutation-relative answer read at any other instant can
+     * describe a permutation the delivery's own generation does not name.
+     *
+     * Read once and never retained, which is what keeps it out of the stale-copy class
+     * `SheetViewRecord` exists to police — see `ViewerPanelCore.mapping_generations_by_sheet`
+     * for the full argument, including why the local `sourceGeneration` heuristic that
+     * would have avoided this field is unsound.
+     */
+    readonly mappingGenerations: readonly number[];
     readonly state: NormalizedPerFileState;
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
@@ -139,6 +209,18 @@ export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = Workbo
      * that record describes. See `WorkbookSnapshot.hiddenEditedCellKeys`.
      */
     readonly hiddenEditedCellKeys: readonly (readonly string[])[];
+    /**
+     * The display-keyed row-height projection for the view this core holds right now,
+     * one entry per sheet. Sampled in the same statement as the generation and the keys
+     * above, for the same reason. See `WorkbookSnapshot.rowHeightProjection`.
+     */
+    readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
+    /**
+     * Per sheet, the generation at which that sheet's display→source mapping last moved.
+     * Sampled in the same statement as the generation and the two values above, and for
+     * the same reason. See `WorkbookSnapshot.mappingGenerations`.
+     */
+    readonly mappingGenerations: readonly number[];
 }
 
 export interface WorkbookSnapshotDiagnostics {
@@ -182,7 +264,22 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
     const state_snapshot = input.source === 'commitReceipt'
         ? input.receipt.stateSnapshot
         : input.state_snapshot;
-    const snapshot: WorkbookSnapshot = {
+    // Lifted out of the `deep_clone_and_freeze` below and re-attached after it. The core
+    // freezes this value at its source (`compute_row_height_projection` freezes each map,
+    // `row_height_projection_by_sheet` the array) precisely so it can be shared, and
+    // `snapshot_material` already shares it — cloning it here would put the copy the memo
+    // exists to avoid straight back on the delivery path, once for a legacy select-all map
+    // that can hold hundreds of thousands of entries. Guarded rather than assumed: a
+    // caller whose material is not already frozen gets the clone, so no mutable object can
+    // escape into an immutable snapshot. The check is O(sheets) and reads only the two
+    // levels that exist — the leaf values are numbers.
+    const row_height_projection = Object.isFrozen(input.core.rowHeightProjection)
+        && input.core.rowHeightProjection.every(
+            (entry) => entry === undefined || Object.isFrozen(entry),
+        )
+        ? input.core.rowHeightProjection
+        : deep_clone_and_freeze(input.core.rowHeightProjection);
+    const snapshot: Omit<WorkbookSnapshot, 'rowHeightProjection'> = {
         identity: {
             deliveryId: input.deliveryId,
             authority: {
@@ -201,6 +298,7 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         reason: input.reason,
         meta: input.core.meta,
         hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
+        mappingGenerations: input.core.mappingGenerations,
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,
@@ -213,7 +311,14 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
             ? {}
             : { commandResult: input.commandResult }),
     };
-    return deep_clone_and_freeze(snapshot);
+    // `rowHeightProjection` is attached after the clone rather than carried through it, for
+    // the reason given where it is sampled above — it is never a member of the object
+    // handed to `structuredClone`. Everything else keeps the clone-and-freeze contract
+    // exactly.
+    return Object.freeze({
+        ...deep_clone_and_freeze(snapshot),
+        rowHeightProjection: row_height_projection,
+    });
 }
 
 /**
@@ -277,6 +382,16 @@ export function normalize_complete_per_file_state(
     ) {
         normalized.excelFirstRowHeaderVersion = 1;
     }
+    // Same shape and the same reason as the marker above: a migration marker is only
+    // ever exactly `1`, so anything else on disk — a truncated write, a hand edit, a
+    // future version's `2` read by this one — must normalize to "not migrated" and let
+    // the pass run again rather than be trusted as "already done". Carried through here
+    // rather than in `normalize_per_file_state` because, like the Excel markers, it is
+    // host-owned: no webview state ever names it, so the webview's normalizer has no
+    // business preserving it.
+    if ('rowHeightsVersion' in stored && stored.rowHeightsVersion === 1) {
+        normalized.rowHeightsVersion = 1;
+    }
     return normalized;
 }
 
@@ -285,11 +400,14 @@ export function complete_normalized_per_file_state(
     stored: StoredPerFileState,
     sheet_names: string[],
 ): NormalizedPerFileState {
-    const normalized = normalize_complete_per_file_state(stored, sheet_names);
+    // Dropped, not completed — see `NormalizedPerFileState`. Destructured away rather than
+    // simply left out of the literal, because the spread below would otherwise carry the
+    // normalizer's copy straight through.
+    const { rowHeights: _drop_row_heights, ...normalized } =
+        normalize_complete_per_file_state(stored, sheet_names);
     return {
         ...normalized,
         columnWidths: normalized.columnWidths ?? [],
-        rowHeights: normalized.rowHeights ?? [],
         scrollPosition: normalized.scrollPosition ?? [],
         activeSheetIndex: normalized.activeSheetIndex ?? 0,
         tabOrientation: normalized.tabOrientation ?? null,

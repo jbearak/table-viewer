@@ -110,9 +110,15 @@ describe('paginated protocol message shapes', () => {
                 reason: 'excelHeader',
                 meta,
                 hiddenEditedCellKeys: [[]],
+                rowHeightProjection: [undefined],
+                // One entry per sheet, and here below the delivery's own generation: the
+                // shape a webview overlay tagged with generation 5 is allowed to survive.
+                mappingGenerations: [3],
+                // No `rowHeights`: `NormalizedPerFileState` omits it, so the durable
+                // source-keyed map has no place on the wire and `rowHeightProjection`
+                // above is the only height fact a delivery carries.
                 state: {
                     columnWidths: [],
-                    rowHeights: [],
                     scrollPosition: [],
                     activeSheetIndex: 0,
                     tabOrientation: null,

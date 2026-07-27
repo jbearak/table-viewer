@@ -7,6 +7,7 @@ import {
     transform_states_equal,
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
+import { MAX_ROW_HEIGHT_PX, MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type {
     HostMessage,
     SheetTransformState,
@@ -195,6 +196,13 @@ describe('ViewerPanelCore', () => {
                 // provider wired — but present, because every delivery is built from
                 // this and the webview reads it positionally.
                 hiddenEditedCellKeys: [[]],
+                // Also per sheet, but `undefined` rather than `{}` with no durable-height
+                // provider wired: the projection says "this sheet has no custom heights",
+                // which is what an unwired core and an unresized sheet both mean.
+                rowHeightProjection: [undefined],
+                // And per sheet again: the generation at which each sheet's mapping last
+                // moved, which on a fresh core is the initial floor for every sheet.
+                mappingGenerations: [1],
             },
             diagnostics: { truncationMessage: 'Showing 4 rows' },
         });
@@ -808,6 +816,472 @@ describe('ViewerPanelCore', () => {
             if (!view.permuted) throw new Error('expected a permuted view');
             expect(view.rowCount).toBe(1);
             expect(view.hiddenEditedCellKeys).toEqual([]);
+        });
+    });
+
+    /**
+     * The memo over the display-keyed row-height projection.
+     *
+     * Counted through `display_row_for_source`, which the projection calls exactly once
+     * per durable override entry and which nothing else in these cases calls at all —
+     * there is no `durablePendingEditKeys` provider, so the hidden-key scan never enters
+     * its loop. The call count is therefore the number of recomputations, which is the
+     * thing under test: the delivered values are identical with or without the memo, so a
+     * test that only compared values would pass with the memo deleted.
+     */
+    describe('rowHeightProjection memoization', () => {
+        function projection_core(overrides: Record<number, number> = { 2: 44 }) {
+            const { panel, posted } = make_panel();
+            const durable: {
+                revision: number;
+                heights: (Record<number, number> | undefined)[];
+            } = { revision: 1, heights: [overrides] };
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durableRowHeights: () => durable,
+            });
+            const scans = vi.spyOn(core, 'display_row_for_source');
+            const sort = async (requestId: string) => {
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId,
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: {
+                        sort: [{ colIndex: 0, direction: 'desc' }],
+                        filters: [],
+                        schema: '["Sheet1",2,null]',
+                    },
+                });
+                return posted.filter((m) => m.type === 'transformInstalled').at(-1);
+            };
+            return { core, durable, scans, sort };
+        }
+
+        it('recomputes once for a run of deliveries on one generation and revision', () => {
+            const { core, scans } = projection_core();
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 2: 44 }]);
+            const first = scans.mock.calls.length;
+            expect(first).toBeGreaterThan(0);
+
+            // Deliveries are triggered by scrolling, focus and sibling writes among
+            // others, so a run like this is the ordinary case rather than a stress case.
+            // Releases before `MAX_PERSISTED_ROW_HEIGHTS` existed could persist a
+            // select-all map, so "walk the map on every delivery" can be a walk over
+            // millions of entries already on disk — which is why a bound applied only to
+            // new writes does not fix the cost on its own.
+            for (let i = 0; i < 5; i += 1) {
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 2: 44 }]);
+            }
+
+            expect(scans.mock.calls.length).toBe(first);
+        });
+
+        it('recomputes when the durable revision moves with no generation change', () => {
+            // The half a generation key cannot see: a `setRowHeights`, a sibling panel's
+            // write and an excel-header plan edit all land as a new state revision, and
+            // none of them installs a view.
+            const { core, durable, scans } = projection_core();
+            core.snapshot_material();
+            const first = scans.mock.calls.length;
+
+            durable.heights = [{ 3: 55 }];
+            durable.revision = 2;
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 3: 55 }]);
+            expect(scans.mock.calls.length).toBeGreaterThan(first);
+        });
+
+        it('recomputes when an install moves the rows under an unchanged revision', async () => {
+            // The other half, and the one where a wrong answer is silent rather than
+            // merely stale: the durable map has not moved, but source row 4 is at display
+            // row 0 under a descending sort, so a memo keyed on the revision alone would
+            // paint the height on whatever row 4 used to be.
+            const { core, scans, sort } = projection_core({ 4: 44 });
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 4: 44 }]);
+            const first = scans.mock.calls.length;
+
+            const installed = await sort('desc');
+
+            expect(scans.mock.calls.length).toBeGreaterThan(first);
+            expect(installed.rowHeights).toEqual({ 0: 44 });
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 44 }]);
+        });
+
+        it('hands out a projection no reader can mutate', async () => {
+            // The memo returns the identical object to every reader until its key
+            // changes, so a reader that mutated what it got back would be editing the
+            // cache and the edit would surface on unrelated later deliveries. The
+            // snapshot path publishes the object by reference too now, so both readers
+            // would have noticed; the freeze is what makes sharing it safe at all.
+            const { core, sort } = projection_core();
+            const installed = await sort('desc');
+
+            expect(() => {
+                (installed.rowHeights as Record<number, number>)[2] = 99;
+            }).toThrow(TypeError);
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 2: 44 }]);
+        });
+
+        it('publishes the memoized projection by reference, not as a copy', () => {
+            // The memo only pays for itself if the delivery path stops copying what it
+            // returns, and `snapshot_material` used to hand the whole material through
+            // `deep_clone_and_freeze` — so a legacy select-all map was structured-cloned
+            // once per delivery and the memoized walk saved nothing on the path that
+            // matters. Identity is the only observable that separates a share from a copy
+            // (the *values* are equal either way, which is why the assertions above cannot
+            // see this), so identity is what this pins, on both levels of the shape.
+            const { core } = projection_core();
+
+            const first = core.snapshot_material().core.rowHeightProjection;
+            const second = core.snapshot_material().core.rowHeightProjection;
+
+            expect(second).toBe(first);
+            expect(second[0]).toBe(first[0]);
+            // And the rest of the material still keeps its clone-and-freeze contract:
+            // `meta` comes off the source afresh and must be an isolated frozen copy.
+            expect(core.snapshot_material().core.meta)
+                .not.toBe(core.snapshot_material().core.meta);
+            expect(Object.isFrozen(core.snapshot_material().core)).toBe(true);
+        });
+
+        /**
+         * The per-sheet layer under the core-wide memo. The outer key moves on events
+         * that cannot have changed a given sheet's answer, and the cost of taking it at
+         * face value is paid in the one size this design has to stay honest about: a
+         * pre-cap legacy map with millions of entries, walked and reallocated
+         * synchronously on the acknowledgement path for a sheet nobody touched.
+         *
+         * Counted the same way as above, but *per sheet* — `display_row_for_source` takes
+         * the sheet index as its first argument, so the calls separate cleanly and a test
+         * can assert that one sheet recomputed while the other did not. Asserting only
+         * the total would pass for an implementation that recomputed the wrong one.
+         */
+        describe('per-sheet scoping', () => {
+            function two_sheet_core(
+                heights: (Record<number, number> | undefined)[] = [{ 1: 44 }, { 2: 55 }],
+            ) {
+                const { panel, posted } = make_panel();
+                const durable: {
+                    revision: number;
+                    heights: (Record<number, number> | undefined)[];
+                } = { revision: 1, heights };
+                const core = new ViewerPanelCore(
+                    panel,
+                    new TrackingColumnSource(5, 2),
+                    { durableRowHeights: () => durable },
+                );
+                const scans = vi.spyOn(core, 'display_row_for_source');
+                const scans_for = (sheet: number) => scans.mock.calls
+                    .filter((call) => call[0] === sheet).length;
+                const sort = async (sheetIndex: number, requestId: string) => {
+                    await core.handle_message({
+                        type: 'setTransform',
+                        sheetIndex,
+                        requestId,
+                        generation: core.generation,
+                        sourceGeneration: core.source_generation,
+                        intent: 'user',
+                        state: {
+                            sort: [{ colIndex: 0, direction: 'desc' }],
+                            filters: [],
+                            schema: `["Sheet${sheetIndex + 1}",3,null]`,
+                        },
+                    });
+                    return posted.filter((m) => m.type === 'transformInstalled').at(-1);
+                };
+                return { core, durable, posted, scans_for, sort };
+            }
+
+            it('holds a sheet\'s mapping generation when an install permutes nothing', async () => {
+                // A filter added but left disabled changes the rules — so the core-wide
+                // generation must move, and the ack must carry it — but `compute_transform`
+                // returns no indices and the sheet had none, so display row `r` is still
+                // source row `r`. A resize already in flight against the previous
+                // generation still names exactly the rows it meant, and the host's
+                // admission rule is `msg.generation >= mapping_generation(sheet)`. If this
+                // moved, that resize would be refused and the webview — told its sheet's
+                // mapping had moved — would throw the optimistic layer away with it.
+                const { core, posted } = two_sheet_core();
+                const mapping_before = core.mapping_generation(0);
+                const generation_before = core.generation;
+
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId: 'disabled-filter',
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: {
+                        sort: [],
+                        filters: [{
+                            id: 'f1',
+                            colIndex: 0,
+                            operator: 'contains',
+                            value: 'z',
+                            caseSensitive: false,
+                            enabled: false,
+                        }],
+                        schema: '["Sheet1",3,null]',
+                    },
+                });
+
+                expect(core.generation).toBeGreaterThan(generation_before);
+                expect(core.mapping_generation(0)).toBe(mapping_before);
+                // And the projection the held generation now licenses the memo to reuse is
+                // the right one. Holding the generation is only safe because absent →
+                // absent leaves display↔source as the identity on both sides; if that were
+                // ever untrue the memo would serve a stale projection and nothing else
+                // here would notice.
+                expect(core.snapshot_material().core.rowHeightProjection[0])
+                    .toEqual({ 1: 44 });
+                // And the ack tells the webview the same scoped fact, not the bumped view
+                // generation beside it. Without this the two sides disagree: the host goes
+                // on accepting the in-flight resize while the webview, reading the view
+                // generation as a mapping change, has already discarded its layer.
+                const ack = posted.filter((m) => m.type === 'transformInstalled').at(-1);
+                expect(ack.view.basis.generation).toBe(core.generation);
+                expect(ack.mappingGeneration).toBe(mapping_before);
+            });
+
+            it('moves a sheet\'s mapping generation when an install does permute', async () => {
+                // The other direction, so the test above cannot be satisfied by never
+                // moving the mapping generation at all.
+                const { core, sort } = two_sheet_core();
+                const mapping_before = core.mapping_generation(0);
+
+                const installed = await sort(0, 'desc-a');
+
+                expect(core.mapping_generation(0)).toBeGreaterThan(mapping_before);
+                // The ack reports the moved value, so the field cannot be satisfied by
+                // sending a constant — the sheet's mapping generation before any install.
+                expect(installed.mappingGeneration).toBe(core.mapping_generation(0));
+                expect(installed.mappingGeneration).toBeGreaterThan(mapping_before);
+            });
+
+            it('moves it back when a permuting view is cleared', async () => {
+                // Present → absent also moves every display row, and is the case a
+                // one-sided check ("next has no indices, so nothing moved") would miss.
+                const { core, sort } = two_sheet_core();
+                await sort(0, 'desc-a');
+                const mapping_after_sort = core.mapping_generation(0);
+
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId: 'clear-a',
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: { sort: [], filters: [], schema: '["Sheet1",3,null]' },
+                });
+
+                expect(core.mapping_generation(0)).toBeGreaterThan(mapping_after_sort);
+            });
+
+            it('leaves an untouched sheet alone when a sibling installs a view', async () => {
+                // A sort on sheet B bumps the core-wide generation, which is what the
+                // outer memo is keyed on — but sheet A's `mapping_generation` does not
+                // move, and its projection is a function of that and its own heights.
+                const { core, scans_for, sort } = two_sheet_core();
+                core.snapshot_material();
+                const sheet_a = scans_for(0);
+                expect(sheet_a).toBeGreaterThan(0);
+
+                const installed = await sort(1, 'desc-b');
+
+                // Sheet B genuinely moved: source row 2 sits at display row 2 under a
+                // descending sort of 5 rows. The point is that A did not pay for it.
+                expect(installed.rowHeights).toEqual({ 2: 55 });
+                expect(scans_for(0)).toBe(sheet_a);
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 2: 55 }]);
+                expect(scans_for(0)).toBe(sheet_a);
+            });
+
+            it('leaves both sheets alone when an unrelated durable write bumps the revision', () => {
+                // `revision` is file-wide: a column resize, a scroll position or a
+                // sibling's write all move it while the height maps stay identical. The
+                // maps are shared by reference from the latch, so an unchanged identity
+                // is the proof that nothing this projection reads has moved.
+                const { core, durable, scans_for } = two_sheet_core();
+                core.snapshot_material();
+                const before = [scans_for(0), scans_for(1)];
+
+                durable.revision = 2;
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 2: 55 }]);
+                expect([scans_for(0), scans_for(1)]).toEqual(before);
+            });
+
+            it('recomputes only the sheet whose durable heights actually moved', () => {
+                // The other side of the identity check: a revision bump that *does* carry
+                // a new map for one sheet must recompute that sheet and only that sheet.
+                const { core, durable, scans_for } = two_sheet_core();
+                core.snapshot_material();
+                const before = [scans_for(0), scans_for(1)];
+
+                durable.revision = 2;
+                durable.heights = [durable.heights[0], { 3: 66 }];
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, { 3: 66 }]);
+                expect(scans_for(0)).toBe(before[0]);
+                expect(scans_for(1)).toBeGreaterThan(before[1]);
+            });
+
+            it('projects the adopted source rather than the one it replaced', () => {
+                // Behaviour, not the cache. The per-sheet drop in `adopt_source` is
+                // unfalsifiable for the same reason the whole-memo drop beside it is —
+                // adoption raises every sheet's mapping generation above anything the
+                // cache holds, so every entry misses whether or not it was cleared — and
+                // this deliberately does not pretend otherwise. What it does pin is the
+                // outcome that would be catastrophic if the narrowing were ever taken
+                // further: after adoption the projection describes the new source.
+                const { core, durable } = two_sheet_core([{ 1: 44 }, undefined]);
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 1: 44 }, undefined]);
+
+                durable.revision = 2;
+                durable.heights = [{ 3: 77 }, undefined];
+                core.adopt_source(new TrackingColumnSource(5, 2));
+
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 3: 77 }, undefined]);
+            });
+        });
+
+        it('asks for the projection indexed against its own source sheets', () => {
+            // The provider is handed sheet names rather than assuming an index array,
+            // because a legacy durable map is keyed by sheet *name* and only the core
+            // knows which sheets, in which order, those names have to line up with.
+            const { panel } = make_panel();
+            const asked: (readonly string[])[] = [];
+            const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 2), {
+                durableRowHeights: (names) => {
+                    asked.push(names);
+                    return { revision: 1, heights: [] };
+                },
+            });
+
+            core.snapshot_material();
+
+            expect(asked).toEqual([['Sheet1', 'Sheet2']]);
+        });
+    });
+
+    /**
+     * What `compute_row_height_projection` refuses to project, as opposed to how often it
+     * recomputes. Each of these is a durable entry that has no display row to name, and
+     * the failure mode they share is the dangerous one: not a missing height but a height
+     * painted on some *other* row, which looks like a height the user set and is not.
+     */
+    describe('rowHeightProjection entry filtering', () => {
+        function core_with(
+            heights: Record<number, number>,
+        ): { core: ViewerPanelCore; hide: (rows: number[]) => Promise<void> } {
+            const { panel } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durableRowHeights: () => ({ revision: 1, heights: [heights] }),
+            });
+            return {
+                core,
+                hide: async (rows) => {
+                    await core.handle_message({
+                        type: 'setTransform',
+                        sheetIndex: 0,
+                        requestId: 'hide',
+                        generation: core.generation,
+                        sourceGeneration: core.source_generation,
+                        intent: 'user',
+                        state: {
+                            sort: [],
+                            filters: [],
+                            hiddenRows: rows,
+                            schema: '["Sheet1",2,null]',
+                        },
+                    });
+                },
+            };
+        }
+
+        it('omits a source row the installed view does not contain', async () => {
+            // Source row 2 hidden: it has no display row at all, while source row 4 moves
+            // up to display row 3. Keeping the hidden entry under its source key — the
+            // natural slip, since the two spaces agree until something moves — would paint
+            // hidden row 2's height on whatever row is at display 2 now, and the entry
+            // that *is* in view proves the projection is not simply passing keys through.
+            const { core, hide } = core_with({ 2: 44, 4: 55 });
+            await hide([2]);
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 3: 55 }]);
+        });
+
+        it('skips a key no writer could have produced', () => {
+            // The same canonicality test `layout-state-patch.ts` applies to these maps.
+            // `Number('01')` is 1, so coercing would move a height onto row 1 — a row the
+            // user never resized — and `Number('1.5')` would key the projection at 1.5,
+            // which no `rowHeight(row)` lookup can ever hit.
+            const { core } = core_with({
+                0: 40,
+                '01': 30,
+                '1.5': 22,
+                '-1': 21,
+            } as unknown as Record<number, number>);
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 40 }]);
+        });
+
+        it('skips a height that is not a finite number', () => {
+            // Durable state is JSON a previous version (or a hand edit) wrote, so `null`
+            // is reachable where `NaN` is not. Projected through, it reaches Glide's
+            // `rowHeight` callback and the row collapses — and so does every total scroll
+            // height computed from it.
+            const { core } = core_with({
+                0: 40,
+                1: null as unknown as number,
+                2: Number.NaN,
+            });
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 40 }]);
+        });
+
+        it('clamps a durable height the bound was never applied to', () => {
+            // Unlike the two above this is not a key with no row — it is a real row with
+            // an out-of-range height, so dropping it would lose a height the user set.
+            // Every *write* path clamps, but the durable map is not something this
+            // version wrote: releases before the bound existed persisted whatever
+            // arithmetic produced, and a state file is editable besides.
+            //
+            // The floor is the half that is not merely cosmetic. A row at zero or a
+            // negative height renders with no edge to grab, and there is no UI that
+            // deletes a height entry — so without this the file puts the row beyond the
+            // user's reach permanently. The ceiling keeps Glide's total-scroll-height
+            // sum, which adds `rowHeight(r)` over every row, from being dominated by one
+            // absurd entry.
+            //
+            // Values are asserted exactly rather than by range: the webview reconciles
+            // its optimistic overlay against this projection *by value*, so the number
+            // here has to be the same number `clamp_row_height` produces on the write
+            // side, not merely one inside the bounds.
+            const { core } = core_with({
+                0: -50,
+                1: 0,
+                2: 1e9,
+                3: 44,
+            });
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{
+                0: MIN_ROW_HEIGHT_PX,
+                1: MIN_ROW_HEIGHT_PX,
+                2: MAX_ROW_HEIGHT_PX,
+                3: 44,
+            }]);
         });
     });
 
@@ -1472,6 +1946,141 @@ describe('ViewerPanelCore', () => {
         expect(core.commit_transform_reconciliation(prepared!)).toBe(true);
         expect(core.generation).toBe(2);
         expect(core.has_active_transform).toBe(true);
+    });
+
+    it('records a mapping generation per sheet, not one for the whole core', async () => {
+        // `generation` is core-wide, but `transform_indices` is written per sheet, so an
+        // install on one sheet moves the counter without moving a display row anywhere
+        // else. `mapping_generation` is what lets a display-keyed request be judged against
+        // the arrangement of the sheet it actually names — without it, a resize on the sheet
+        // the user is looking at dies because a background sheet finished a sort.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([1, 1, 1]);
+
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 1,
+            requestId: 'sort-sheet-1',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet2",3,null]',
+            },
+        });
+
+        expect(core.generation).toBe(2);
+        // Only sheet 1 moved. The other two are still answerable at the generation a
+        // webview held before this install, which is the whole point.
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([1, 2, 1]);
+    });
+
+    it('gives each reconciled sheet its own generation, not the last one bumped', async () => {
+        // A reconciliation can carry changes for several sheets and bumps the generation
+        // once per change. Recorded after the loop, or from one shared value, the sheet
+        // reconciled *first* would inherit the generation of the sheet reconciled after it
+        // — and would then refuse a request quoting its own install, the very arrangement
+        // it still has.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        core.begin_receiver_epoch(1);
+        const desc = (name: string) => ({
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: `["${name}",3,null]`,
+        });
+        const prepared = await core.prepare_transform_reconciliation(
+            [desc('Sheet1'), undefined, desc('Sheet3')],
+            () => false,
+        );
+
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(true);
+
+        expect(core.generation).toBe(3);
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([2, 1, 3]);
+    });
+
+    it('delivers the same mapping generations the write predicate answers', async () => {
+        // The webview judges its display-keyed row-height overlay by the delivered array
+        // and the host judges the matching write by `mapping_generation`. If those two
+        // disagree the row either springs back while the write is accepted, or keeps
+        // painting a height nothing persisted — so the array is built by *calling* the
+        // predicate, and this is the assertion that the sparse map and its floor are not
+        // being re-merged by a second implementation that could drift.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        core.begin_receiver_epoch(1);
+        // A deliberately mixed state: one sheet with an entry in the sparse map, two
+        // answered only by the floor.
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 2,
+            requestId: 'sort-sheet-2',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet3",3,null]',
+            },
+        });
+
+        const delivered = core.snapshot_material().core.mappingGenerations;
+
+        expect([...delivered]).toEqual([1, 1, 2]);
+        // One entry per sheet the source has, positionally matching `meta.sheets`, and
+        // equal to the predicate at every index.
+        expect(delivered).toHaveLength(core.snapshot_material().core.meta.sheets.length);
+        expect([...delivered]).toEqual(
+            [0, 1, 2].map((sheet) => core.mapping_generation(sheet)),
+        );
+    });
+
+    it('raises every sheet\'s mapping generation on source adoption', async () => {
+        // Adoption replaces the rows themselves, so it invalidates every sheet at once and
+        // no per-sheet exemption may survive it. Carried as a floor rather than an entry
+        // per sheet because a new source can have a different sheet *count* — there is no
+        // set of indices to enumerate, and a leftover entry would license a display-keyed
+        // request against rows that are gone.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 1,
+            requestId: 'sort-sheet-1',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet2",3,null]',
+            },
+        });
+        expect(core.mapping_generation(0)).toBe(1);
+
+        core.adopt_source(new TrackingColumnSource(5, 3));
+
+        expect(core.generation).toBe(3);
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([3, 3, 3]);
+        // Including a sheet index the new source does not have, which a per-sheet map
+        // could not have answered at all.
+        expect(core.mapping_generation(7)).toBe(3);
+        // And the delivered form says the same, which is the answer to "does adoption need
+        // a special case in the webview's retention rule?" — no: every sheet reports having
+        // moved at the generation the adoption installed, so the uniform rule voids every
+        // overlay. This also pins the *floor* half of the serialisation: the per-sheet map
+        // is empty here, so an implementation reading it without falling back would report
+        // the initial 1 and license an overlay across a source change.
+        expect([...core.snapshot_material().core.mappingGenerations]).toEqual([3, 3, 3]);
     });
 
     it('rejects a prepared reconciliation after source adoption', async () => {

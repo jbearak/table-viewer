@@ -12,6 +12,7 @@ import type {
     TransformIntent,
     WebviewMessage,
 } from '../types';
+import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
@@ -56,7 +57,6 @@ vi.mock('../webview/grid-shell', () => ({
         sheet_index: number;
         generation: number;
         row_count?: number;
-        transformed?: boolean;
         show_formatting: boolean;
         preview_mode?: boolean;
         column_projection: {
@@ -64,7 +64,14 @@ vi.mock('../webview/grid-shell', () => ({
             source_to_visible: (number | undefined)[];
         };
         column_widths: Record<number, number>;
+        // The host's display-keyed projection, and the resizes App has committed but
+        // not yet seen delivered back. Reported separately because that is how the real
+        // shell reads them: the projection is authoritative, the overlay sits over it.
         row_heights: Record<number, number>;
+        row_height_overlay?: readonly {
+            rows: readonly { start: number; end: number }[];
+            height: number;
+        }[];
         merges: { startRow: number }[];
         edit_mode?: boolean;
         edit_session_id?: string;
@@ -99,7 +106,10 @@ vi.mock('../webview/grid-shell', () => ({
             } | null;
         };
         on_column_resize: (col: number, width: number) => void;
-        on_row_resize: (rows: readonly number[], height: number) => void;
+        on_row_resize: (
+            rows: readonly { start: number; end: number }[],
+            height: number,
+        ) => void;
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
@@ -256,7 +266,6 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-sheet-index': String(props.sheet_index),
                 'data-generation': String(props.generation),
                 'data-row-count': String(props.row_count ?? ''),
-                'data-transformed': String(props.transformed ?? false),
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
@@ -268,6 +277,9 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-source-to-visible': JSON.stringify(props.column_projection.source_to_visible),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
+                'data-row-height-overlay': JSON.stringify(
+                    props.row_height_overlay ?? null,
+                ),
                 'data-pending-preview-scroll': JSON.stringify(props.pending_preview_scroll ?? null),
                 'data-merges': String(props.merges?.length ?? 0),
                 'data-merges-json': JSON.stringify(props.merges ?? []),
@@ -284,9 +296,32 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-row-resize',
-                    onClick: () => props.on_row_resize([3, 5, 8], 50),
+                    // Display-row intervals, the way the real shell coalesces a row
+                    // selection before handing it up: rows 3, 5 and 8 as three of them.
+                    onClick: () => props.on_row_resize(
+                        [
+                            { start: 3, end: 3 },
+                            { start: 5, end: 5 },
+                            { start: 8, end: 8 },
+                        ],
+                        50,
+                    ),
                 },
                 'row-resize'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-row-resize-over-cap',
+                    // A select-all resize on a sheet larger than a sheet may keep custom
+                    // heights for: one interval, so it costs nothing to build, and the
+                    // whole request is over the cap rather than the accumulated map.
+                    onClick: () => props.on_row_resize(
+                        [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
+                        50,
+                    ),
+                },
+                'row-resize-over-cap'
             ),
             React.createElement(
                 'button',
@@ -309,6 +344,27 @@ vi.mock('../webview/grid-shell', () => ({
                     }),
                 },
                 'grid-header-transform'
+            ),
+            React.createElement(
+                'button',
+                {
+                    // A filter defined but left switched off: entries, so it installs and
+                    // moves the view generation, but nothing active, so it produces no
+                    // permutation and moves no row.
+                    className: 'stub-inactive-filter-transform',
+                    onClick: () => props.on_transform_change({
+                        sort: [],
+                        filters: [{
+                            id: 'f1',
+                            colIndex: 0,
+                            operator: 'contains',
+                            value: 'z',
+                            caseSensitive: false,
+                            enabled: false,
+                        }],
+                    }),
+                },
+                'grid-inactive-filter-transform'
             ),
             props.pending_preview_scroll && React.createElement(
                 'button',
@@ -490,6 +546,8 @@ function transform_installed_message(
         state?: SheetTransformState;
         permuted?: boolean;
         hiddenEditedCellKeys?: readonly string[];
+        rowHeights?: Readonly<Record<number, number>>;
+        mappingGeneration?: number;
     },
 ): Extract<HostMessage, { type: 'transformInstalled' }> {
     const rules = options.state ?? request.state;
@@ -520,6 +578,15 @@ function transform_installed_message(
             }
             : { basis, permuted: false, rowCount: options.rowCount ?? 1 },
         rules: has_entries ? rules : undefined,
+        // Empty by default: an install carries the sheet's display-keyed height
+        // projection beside the record, and having no custom heights is the ordinary
+        // case. A test about heights surviving a permutation names this explicitly.
+        rowHeights: options.rowHeights ?? {},
+        // Defaults to the view generation, which is what the host sends for every install
+        // that actually permutes — the overwhelming majority, and what these tests are
+        // about. A test about an install that moves no row passes the older mapping
+        // generation explicitly.
+        mappingGeneration: options.mappingGeneration ?? options.generation,
     };
 }
 
@@ -686,9 +753,15 @@ function workbook_snapshot_message(
             // cells surviving (or not surviving) a refresh must name this explicitly —
             // a default that guessed would decide the question they are asking.
             hiddenEditedCellKeys: meta.sheets.map(() => []),
+            // Likewise one entry per sheet, `undefined` by default: that is what the host
+            // sends for a sheet with no custom row heights.
+            rowHeightProjection: meta.sheets.map(() => undefined),
+            // No `rowHeights` in `state`, and that is not an omission: the field is
+            // `Omit`ted from `NormalizedPerFileState`, so a delivery cannot carry the
+            // durable source-keyed map at all. `rowHeightProjection` above is the only
+            // height fact that crosses to the webview.
             state: {
                 columnWidths: [],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 0,
                 tabOrientation: null,
@@ -724,6 +797,17 @@ function workbook_snapshot_message(
                 ...identity,
             },
             ...snapshot_extra,
+            // One entry per sheet, defaulting to *this delivery's own* generation, i.e.
+            // "every sheet's mapping moved at this generation". Faithful rather than
+            // convenient: the ordinary reason a delivery's generation has moved at all is
+            // an adoption, and `adopt_source` raises the floor for every sheet, so that is
+            // what the host really sends. It also keeps the interesting case — a generation
+            // that moved because *another* sheet's mapping did — something a test has to
+            // state outright instead of inheriting from a default that guessed.
+            //
+            // After the spread, so an explicit value still wins.
+            mappingGenerations: snapshot_extra.mappingGenerations
+                ?? meta.sheets.map(() => snapshot_extra.generation ?? 1),
         },
     };
 }
@@ -876,7 +960,6 @@ describe('workbook snapshot hydration', () => {
             sourceGeneration: 7,
             state: {
                 columnWidths: [undefined, { 0: 155 }],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
@@ -929,7 +1012,6 @@ describe('workbook snapshot hydration', () => {
             reason: 'fileReload',
             state: {
                 columnWidths: [undefined, { 0: 210 }],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'horizontal',
@@ -962,7 +1044,7 @@ describe('workbook snapshot hydration', () => {
         meta.sheets[0].columnCount = 2;
         const message = workbook_snapshot_message(meta, {
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null, transforms: [],
                 columnVisibility: [{
                     hiddenColumns: [1, 9],
@@ -1083,7 +1165,7 @@ describe('workbook snapshot hydration', () => {
                 csvEditSessionId: 'test-edit-session',
             },
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
                 pendingEdits: authoritative,
                 transforms: [undefined],
@@ -1143,7 +1225,7 @@ describe('workbook snapshot hydration', () => {
                 sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
             },
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
                 transforms: [transform],
                 columnVisibility: [undefined],
@@ -1239,7 +1321,7 @@ describe('workbook snapshot hydration', () => {
         meta.sheets[0].columnCount = 2;
         const message = workbook_snapshot_message(meta, {
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null, transforms: [],
                 columnVisibility: [{
                     hiddenColumns: [1, 8],
@@ -1387,10 +1469,11 @@ describe('Excel first-row header toggle', () => {
     it('requests an authoritative toggle and waits for the result snapshot', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
-            state: { rowHeights: [{ 0: 44 }] },
+            rowHeightProjection: [{ 0: 44 }],
             generation: 4,
             sourceGeneration: 7,
         }));
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{"0":44}');
         post_message.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
@@ -1453,6 +1536,10 @@ describe('Excel first-row header toggle', () => {
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        // The projection is adopted whole from each delivery, so the promotion's own
+        // (empty) one replaces the one above. It is not the webview clearing heights on a
+        // header change: the durable map is source-keyed and survives — this delivery
+        // simply names no display row with a custom height.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
     });
@@ -1770,7 +1857,6 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(initial, {
             state: {
                 columnWidths: [undefined, { 0: 120 }],
-                rowHeights: [undefined, { 2: 40 }],
                 scrollPosition: [undefined, { top: 20, left: 5 }],
                 activeSheetIndex: 0,
                 tabOrientation: 'horizontal',
@@ -1783,9 +1869,12 @@ describe('Excel first-row header toggle', () => {
         const reloaded = make_meta(['People', 'Other']);
         reloaded.sheets[0] = excel_meta(false).sheets[0];
         await dispatch_host_message(refresh_snapshot_message(reloaded, {
+            // Heights reach the grid as the host's display-keyed projection, and *only*
+            // as that: the durable source-keyed map is not on the wire at all, which the
+            // echoed `stateChanged` below is asserted to confirm.
+            rowHeightProjection: [undefined, { 2: 77 }],
             state: {
                 columnWidths: [undefined, { 0: 222 }],
-                rowHeights: [undefined, { 2: 77 }],
                 scrollPosition: [undefined, { top: 300, left: 25 }],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
@@ -1820,15 +1909,75 @@ describe('Excel first-row header toggle', () => {
                     activeSheetIndex: 1,
                     tabOrientation: 'vertical',
                     columnWidths: [{ 2: 222 }, { 0: 222 }],
-                    rowHeights: [undefined, { 2: 77 }],
                     scrollPosition: [undefined, { top: 300, left: 25 }],
                 },
             });
+        // And no height leaf at all in what this panel echoes back. It was never sent
+        // one, so there is nothing for it to carry — the strongest form of "the webview
+        // cannot clobber a host-written height", one step past the missing patch leaf.
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'stateChanged')
+            .at(-1)!.state).not.toHaveProperty('rowHeights');
         await click_button('Other');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
             .toEqual({ 0: 222 });
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
             .toEqual({ 2: 77 });
+    });
+
+    it('keeps custom row heights across a first-row-header promotion', async () => {
+        // The end-to-end shape of the change to `header_changed`. Both halves are named
+        // non-empty on purpose: an assertion that the grid shows `{}` after a promotion
+        // is satisfied just as well by the old clearing as by a delivery that carries no
+        // projection, so it distinguishes nothing. Here source row 2 keeps its height and
+        // simply *moves*, from display row 2 to display row 1, because the promoted header
+        // leaves the display space — which is the whole claim of a source-keyed map.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(false), {
+            state: {
+                columnWidths: [{ 0: 140 }],
+                scrollPosition: [{ top: 30, left: 5 }],
+            },
+            rowHeightProjection: [{ 2: 44 }],
+            generation: 1,
+            sourceGeneration: 1,
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 44 });
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            state: {
+                columnWidths: [{ 0: 140 }],
+                scrollPosition: [{ top: 30, left: 5 }],
+            },
+            // The durable map behind this is unchanged, because a promotion renumbers no
+            // source row; only the display space it projects into moved.
+            rowHeightProjection: [{ 1: 44 }],
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: 'promote',
+                outcome: 'applied',
+            },
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 44 });
+        // And this panel carries no durable copy to erase: the next `stateChanged` it
+        // posts for some other leaf has no height leaf in it, because none was delivered.
+        // The scroll offset beside it *is* cleared, which is the asymmetry: pixels down a
+        // row layout the promotion changed have no key space in which they survive.
+        await act(async () => {
+            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
+        });
+        const echoed = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'stateChanged')
+            .at(-1)!;
+        expect(echoed).toMatchObject({ state: { scrollPosition: [undefined] } });
+        expect(echoed.state).not.toHaveProperty('rowHeights');
     });
 
     it('does not persist a clean reload that has no authoritative state', async () => {
@@ -1837,7 +1986,6 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnWidths: [{ 0: 140 }],
-                rowHeights: [{ 2: 44 }],
                 scrollPosition: [{ top: 30, left: 5 }],
                 activeSheetIndex: 0,
                 tabOrientation: 'horizontal',
@@ -1892,7 +2040,6 @@ describe('Excel first-row header toggle', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: {
-                rowHeights: [{ 0: 44 }],
                 scrollPosition: [{ top: 100, left: 20 }],
             },
             generation: 1,
@@ -1915,7 +2062,6 @@ describe('Excel first-row header toggle', () => {
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
-                rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
@@ -1984,7 +2130,6 @@ describe('Excel first-row header toggle', () => {
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
-                rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
@@ -2560,9 +2705,10 @@ describe('column visibility projection', () => {
 });
 
 describe('row height persistence', () => {
-    it('stores a row resize per sheet and persists it', async () => {
+    it('asks the host to persist a row resize and paints it at once', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
             sourceGeneration: 7,
         }));
         post_message.mockClear();
@@ -2571,24 +2717,506 @@ describe('row height persistence', () => {
             (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
         });
 
-        // Grid receives every height from the single batched resize.
-        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
-            3: 50,
-            5: 50,
-            8: 50,
-        });
+        // The durable write is the host's, so all the webview posts is the request —
+        // display intervals plus the pair of generations that make them meaningful. No
+        // `stateChanged`: heights are not a layout patch leaf any more, and the webview
+        // holds no copy of the durable map to send.
         expect(post_message).toHaveBeenCalledOnce();
-        const last = post_message.mock.calls.at(-1)![0];
-        expect(last.type).toBe('stateChanged');
-        expect(last.sourceGeneration).toBe(7);
-        expect(last.state.rowHeights[0]).toEqual({ 3: 50, 5: 50, 8: 50 });
+        expect(post_message.mock.calls.at(-1)![0]).toEqual({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            rows: [
+                { start: 3, end: 3 },
+                { start: 5, end: 5 },
+                { start: 8, end: 8 },
+            ],
+            height: 50,
+            generation: 4,
+            sourceGeneration: 7,
+        });
+        // Meanwhile the resize is visible immediately, as an overlay over the delivered
+        // projection rather than in it: nothing durable has come back yet.
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({});
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual([{
+                rows: [
+                    { start: 3, end: 3 },
+                    { start: 5, end: 5 },
+                    { start: 8, end: 8 },
+                ],
+                height: 50,
+            }]);
     });
 
-    it('restores saved row heights from initial snapshot state', async () => {
+    it('drops the optimistic overlay once the delivered projection agrees', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+
+        // What the host does with the request: maps the display rows to source rows,
+        // persists them, and delivers the re-projected result at the same generation.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }],
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+        // Dropped rather than left to shadow the projection: kept, it would mask a later
+        // height for those rows for the rest of the generation.
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    /**
+     * A resize the overlay painted, with the delivery that answers it withheld. Every
+     * test below then delivers something *other* than the answer and reads the overlay.
+     */
+    async function pending_resize(): Promise<{ post_message: ReturnType<typeof vi.fn> }> {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+        expect(grid_stub().getAttribute('data-row-height-overlay')).not.toBe('null');
+        return rendered;
+    }
+
+    it('discards the overlay when a delivery moves its own sheet\'s mapping', async () => {
+        await pending_resize();
+
+        // A moved mapping *for this sheet* means a different arrangement of its rows, and
+        // the overlay's keys are display rows read off the old one. Reconciling by value
+        // cannot save it: the projection that arrives is about rows this layer never named,
+        // so it would neither agree with the layer nor make it right — it would just keep
+        // masking whatever row 3 is now.
+        //
+        // `mappingGenerations` says outright that sheet 0 is the sheet that moved, which is
+        // the half of the rule the retention test below must not be allowed to swallow.
+        //
+        // Pinned by one line now, and it used to take two. This was a pair of gates held
+        // jointly — the delivery dropped the overlay and the render site refused any
+        // overlay whose generation was not current, each surviving its own removal because
+        // the other held. Scoping the discard per sheet moved the decision into
+        // `retained_row_height_overlay`, where inverting the comparison fails this test on
+        // its own; the render-site generation gate is what is now unfalsifiable, and says so
+        // at its call site.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            mappingGenerations: [5, 4],
+            rowHeightProjection: [{ 1: 33 }, undefined],
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 33 });
+    });
+
+    it('keeps the overlay when a delivery moves another sheet\'s mapping', async () => {
+        await pending_resize();
+
+        // The case that made `mappingGenerations` necessary. A terminal transform
+        // reconciliation — a background sort on sheet 1 finishing — bumps the core-wide
+        // generation and forces a delivery, while `commit_transform_reconciliation` rewrites
+        // only sheet 1's indices. Sheet 0's display rows have not moved, and the host, which
+        // asks the scoped question through `mapping_generation`, still *accepts* the resize
+        // this layer is waiting on. Discarding here — which the old `previous.generation !==
+        // snapshot.generation` test did, because a snapshot names no sheet — sprang the row
+        // back and then let the height silently reappear when the write was delivered.
+        //
+        // Deliberately not inferred from `sourceGeneration`: it is unchanged here, and it is
+        // equally unchanged when the sheet that moved is sheet 0, so it cannot tell the two
+        // apart. See `retained_row_height_overlay`.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            mappingGenerations: [4, 5],
+            rowHeightProjection: [undefined, { 1: 33 }],
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        // Rebased, not merely retained: the render site compares the overlay's generation
+        // with the current one, so a layer left at 4 would be held in state and painted
+        // nowhere — which is exactly what the assertion above would catch. Proved a second
+        // way by the reconciliation still working at the new generation.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            mappingGenerations: [4, 5],
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }, { 1: 33 }],
+        }));
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+    });
+
+    it('discards the overlay when an adoption moves every sheet\'s mapping', async () => {
+        await pending_resize();
+
+        // Adoption needs no special case, and this is the test of that claim. A physical
+        // refresh or an Excel header promotion replaces the rows themselves, so
+        // `adopt_source` clears the per-sheet map and raises `mapping_generation_floor` to
+        // the generation it installs — every sheet reports having moved, and the uniform
+        // rule discards. Were adoption to leave any sheet's mapping generation behind, the
+        // overlay would survive a source change, which is the one thing no per-sheet fact
+        // can license.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 8,
+            reason: 'fileReload',
+            mappingGenerations: [5, 5],
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    it('discards the overlay when a new document arrives', async () => {
+        await pending_resize();
+
+        // An `initial` presentation is a different document, or the same one reloaded
+        // from scratch. Its generation may well repeat the one the layer was tagged
+        // with — generations restart per source — so the presentation is the only thing
+        // that catches this, and a layer surviving it would paint a height the user set
+        // on a file they are no longer looking at.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    const PENDING_LAYER = [{
+        rows: [
+            { start: 3, end: 3 },
+            { start: 5, end: 5 },
+            { start: 8, end: 8 },
+        ],
+        height: 50,
+    }];
+
+    it('does not paint one sheet\'s pending resize on another sheet', async () => {
+        await pending_resize();
+
+        // A tab switch moves no generation, so nothing about the overlay's own tags
+        // changes — the sheet test has to be applied where it is *read*. Painted on the
+        // other sheet it would show heights at display rows 3, 5 and 8 of a sheet nobody
+        // resized, and the delivery that answers the real resize would not clear them.
+        await click_button('Other');
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+    });
+
+    it('keeps one sheet\'s pending resize across a resize on another sheet', async () => {
+        const { post_message } = await pending_resize();
+
+        // Two sheets with a resize in flight at once. Reachable without a mid-drag tab
+        // switch: the request for Sheet1 is still on its way to the host — or its answer
+        // still on its way back — while the user opens Other and drags a boundary there.
+        // Holding one overlay slot made the second resize *replace* the first, so coming
+        // back to Sheet1 before its delivery landed showed a completed resize snapping back.
+        post_message.mockClear();
+        await click_button('Other');
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            sheetIndex: 1,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+
+        // And the two are answered independently. This delivery agrees with Other's layer
+        // and says nothing about Sheet1's, so exactly one retires — which is also what
+        // stops the per-sheet split from being satisfied by one shared list of layers.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [undefined, { 3: 50, 5: 50, 8: 50 }],
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        await click_button('Other');
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    it('leaves the overlay alone when an install lands on another sheet', async () => {
+        const { post_message } = await pending_resize();
+
+        // The other sheet's stored sort, restored when its tab is opened, so the ack below
+        // is one the app is actually waiting for. Its projection is made to agree with
+        // sheet 0's pending layer *exactly*, which is the only arrangement in which the
+        // per-sheet gate on the install path is visible: value reconciliation would
+        // otherwise read this ack as the answer to sheet 0's resize and drop the layer,
+        // discarding a resize the user is still waiting on.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Other",1,null]',
+                }],
+            },
+        }));
+        await click_button('Other');
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 4, rowHeights: { 3: 50, 5: 50, 8: 50 } },
+        ));
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+    });
+
+    /**
+     * The other sheet's stored sort, restored on opening its tab, so an install ack for
+     * sheet 1 is one the app is actually waiting for. Returns the request to answer.
+     */
+    async function restore_other_sheets_sort(
+        post_message: ReturnType<typeof vi.fn>,
+    ): Promise<Extract<WebviewMessage, { type: 'setTransform' }>> {
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Other",1,null]',
+                }],
+            },
+        }));
+        await click_button('Other');
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(1);
+        return restore;
+    }
+
+    it('rebases the overlay when an install on another sheet moves the generation', async () => {
+        const { post_message } = await pending_resize();
+        const restore = await restore_other_sheets_sort(post_message);
+
+        // An install always bumps the generation, so the sheet gate has to be asked
+        // *before* the generation gate or it is dead code — which it was: sheet 0's layer
+        // was tagged with generation 4 and every install for sheet 1 dropped it. That is
+        // the webview half of scoping resize currency per sheet, and the two halves have to
+        // agree: the host, which asks the same question through `mapping_generation`,
+        // *accepts* sheet 0's in-flight resize across this install, so a webview that
+        // discarded the layer would spring the row back and then have the height silently
+        // reappear on the next delivery.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: {} },
+        ));
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        // Rebased, not merely retained: the render gate compares the overlay's generation
+        // with the current one, so a layer left at 4 would be held in state and painted
+        // nowhere. Proved by the reconciliation still working at the new generation — the
+        // layer retires against a projection delivered at 5, which an un-rebased overlay
+        // could not do either.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }, undefined],
+        }));
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+    });
+
+    it('discards the overlay when an install on its own sheet moves the generation', async () => {
+        const { post_message } = await pending_resize();
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }, undefined],
+            },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // The side the sheet gate must not swallow. This install permuted the very sheet
+        // the layer names, so its display rows now name other source rows and the host
+        // refuses the in-flight resize for exactly that reason. Keeping the layer would
+        // paint the user's height on whatever rows moved into positions 3, 5 and 8.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: { 1: 41 } },
+        ));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 41 });
+    });
+
+    it('keeps the overlay when an install on its own sheet permutes nothing', async () => {
+        const { post_message } = await pending_resize();
+        await act(async () => {
+            (container!.querySelector('.stub-inactive-filter-transform') as HTMLButtonElement)
+                .click();
+        });
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // The other side of the same gate. This install changed the rules — so the view
+        // generation moves, and the ack carries it — but produced no permutation over a
+        // sheet that had none, so display row `r` is still source row `r` and the host
+        // *accepts* the in-flight resize on its old generation. Voiding the layer here
+        // would snap the row back and then silently restore it when that write is
+        // delivered. The host says which happened via `mappingGeneration`; reading
+        // `view.basis.generation` instead is what got this wrong.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, mappingGeneration: 4, permuted: false, rowHeights: {} },
+        ));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+    });
+
+    it('does not paint a resize the host is bound to refuse', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize-over-cap') as HTMLButtonElement)
+                .click();
+        });
+
+        // Posted anyway, because the warning naming the limit is the host's to raise and
+        // the request is what asks for it.
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            rows: [{ start: 0, end: MAX_PERSISTED_ROW_HEIGHTS }],
+        });
+        // But not painted: the host refuses the whole request and delivers nothing, so a
+        // layer for it would have no delivery to reconcile against and would show a
+        // height no file holds until the generation next moved. Springing back as the
+        // drag ends is the truth.
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    it('keeps every other sheet\'s projection across an install', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            rowHeightProjection: [{ 0: 31 }, { 2: 77 }],
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }, undefined],
+            },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // An install carries the projection for the one sheet it permuted. Replacing the
+        // whole array from it would blank every sibling until some unrelated delivery
+        // came along — and an install posts no snapshot, so nothing is guaranteed to.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: { 1: 31 } },
+        ));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 31 });
+        await click_button('Other');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 2: 77 });
+    });
+
+    it('posts a resize against the generation an install moved to', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+        await dispatch_host_message(transform_installed_message(
+            latest_transform_request(post_message),
+            { generation: 9, rowHeights: {} },
+        ));
+        post_message.mockClear();
+
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+
+        // The resize affordance is unconditional under a permutation now, and the request
+        // it posts has to name the *installed* generation: the host refuses anything else,
+        // and the display rows the drag named only mean anything in the arrangement the
+        // install put on screen. Painted at once too, so a permuted view is no different
+        // from a natural one.
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            generation: 9,
+            sourceGeneration: 7,
+            height: 50,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toHaveLength(1);
+    });
+
+    it('renders the delivered projection from an initial snapshot', async () => {
         await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1']), {
-                state: { rowHeights: [{ 1: 44 }] },
+                // The projection is the only height carrier there is: the durable map is
+                // keyed by canonical source row, the webview never renders from it, and
+                // `NormalizedPerFileState` no longer even has a field for it. Display row
+                // 1 here is source row 2 on the host's side of that join.
+                rowHeightProjection: [{ 1: 44 }],
             })
         );
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
@@ -2616,8 +3244,8 @@ describe('merges', () => {
             { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
         ];
         await dispatch_host_message(initial_snapshot_message(meta, {
+            rowHeightProjection: [{ 0: 48 }],
             state: {
-                rowHeights: [{ 0: 48 }],
                 columnVisibility: [{
                     hiddenColumns: [3],
                     schema: '["Sheet1",4,null]',
@@ -5175,7 +5803,8 @@ describe('sorting and filtering', () => {
             },
         }));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // The merges standing unflattened *are* "nothing is applied yet": flattening is
+        // the one thing an installed permutation still changes about the rendered grid.
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
             meta.sheets[0].merges,
@@ -5189,7 +5818,6 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2, rowCount: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(post_message.mock.calls
             .map((call) => call[0])
@@ -5290,7 +5918,6 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2, rowCount: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(document.body.textContent).toContain('Merged cells shown unmerged');
@@ -5311,7 +5938,6 @@ describe('sorting and filtering', () => {
             { generation: 3, rowCount: 3 },
         ));
         expect(document.body.textContent).toContain('✗');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
 
         post_message.mockClear();
@@ -5326,7 +5952,7 @@ describe('sorting and filtering', () => {
             enable_request,
             { generation: 4, rowCount: 2 },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
 
         post_message.mockClear();
         await act(async () => (
@@ -5345,7 +5971,6 @@ describe('sorting and filtering', () => {
             clear_request,
             { generation: 5, rowCount: 3 },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
             meta.sheets[0].merges,
@@ -5702,7 +6327,9 @@ describe('transforms during an edit session', () => {
         const request = latest_transform_request(post_message);
         await acknowledge_transform(request, 2);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The ack landed rather than being dropped by the requestId guard: only an
+        // install moves the generation, and the rules it carried describe a permutation.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
     }
 
     it('keeps transform controls enabled in edit mode and lets a sort through', async () => {
@@ -5721,7 +6348,7 @@ describe('transforms during an edit session', () => {
         // And it lands: the toolbar's own copy of the gate agrees, showing the
         // installed sort's chip live rather than greyed out.
         await acknowledge_transform(request, 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(sort_chip_disabled()).toBeNull();
     });
@@ -5849,7 +6476,6 @@ describe('snapshots arriving during an in-flight transform', () => {
         // the sort installs. Were the requestId discarded above, the webview would
         // sit on generation 1 and the host would refuse every row request after.
         expect(grid_stub().getAttribute('data-generation')).toBe('7');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
     });
 
@@ -5918,16 +6544,17 @@ describe('snapshots arriving during an in-flight transform', () => {
 
         await acknowledge_transform(request, 7);
 
+        // Still on the reload's generation, so the ack never landed. That is the whole
+        // of it: nothing else the install carries could have been adopted either.
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
     });
 });
 
 // The rows a same-basis refresh delivers are the rows already on screen: the host
 // installed nothing and dropped nothing, so an *applied* transform is still applied
 // behind it. Every edit commit during an owned session provokes one of these, and
-// `transformed` reading false while the loader is still permuted is what re-offers
-// the display-keyed row-height affordances — a height written for the wrong row.
+// dropping the record while the loader is still permuted would give the grid a natural
+// row count over permuted rows, and un-flatten merges the permutation has flattened.
 describe('an applied transform across a refresh', () => {
     const STORED_SORT: SheetTransformState = {
         sort: [{ colIndex: 0, direction: 'desc' }],
@@ -5967,8 +6594,17 @@ describe('an applied transform across a refresh', () => {
         schema: '["Sheet1",1,null]',
     };
     // A row height the user set, and a natural count the transformed count can be
-    // told apart from — with make_meta's rowCount of 1 the reset is invisible.
-    const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
+    // told apart from — with make_meta's rowCount of 1 the reset is invisible. The
+    // durable entry is keyed by canonical *source* row 2; what the grid renders is the
+    // host's projection of it, which under the sort below lands at display row 1.
+    //
+    // Which is why the durable map is *not* in `STORED_STATE`: `rowHeights` is `Omit`ted
+    // from `NormalizedPerFileState`, so no delivery can carry it, and a leaf here would
+    // reach nothing while implying the opposite. The heights in this suite arrive the two
+    // ways they really do — an install's `rowHeights` and a snapshot's
+    // `rowHeightProjection`, both display-keyed and both `PROJECTED_HEIGHTS`.
+    const STORED_STATE = { transforms: [STORED_SORT] };
+    const PROJECTED_HEIGHTS = { 1: 44 };
     const FILTERED_ROW_COUNT = 3;
 
     function transform_requests(post_message: ReturnType<typeof vi.fn>) {
@@ -5977,6 +6613,14 @@ describe('an applied transform across a refresh', () => {
             .filter((message) => message.type === 'setTransform');
     }
 
+    /**
+     * A sheet with a merge in it, because merge flattening is what an installed
+     * permutation still *does* to the rendered grid. Nothing else about the view records
+     * below is visible in the shell's own props: heights arrive already projected into
+     * display space and the row count is carried on both arms of the record, so
+     * `data-merges` is the observable that distinguishes a permuted record from a natural
+     * one. One merge is enough — the assertions read its count, not its geometry.
+     */
     function sized_meta(row_count: number): WorkbookMeta {
         const meta = make_meta(['Sheet1'], false);
         return {
@@ -5985,6 +6629,7 @@ describe('an applied transform across a refresh', () => {
                 ...sheet,
                 rowCount: row_count,
                 sourceRowCount: row_count,
+                merges: [{ startRow: 0, startCol: 0, endRow: 1, endCol: 0 }],
             })),
         };
     }
@@ -6004,12 +6649,18 @@ describe('an applied transform across a refresh', () => {
         expect(restore.intent).toBe('restore');
         await dispatch_host_message(transform_installed_message(
             restore,
-            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+            {
+                generation: 2,
+                rowCount: FILTERED_ROW_COUNT,
+                // An install carries the projection for the permutation it installs, and
+                // has to: it bumps the generation and posts no snapshot.
+                rowHeights: PROJECTED_HEIGHTS,
+            },
         ));
         // The snapshot already names a session this panel owns, so it opens in edit
         // mode — the state in which every commit provokes a same-basis refresh.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
         return { post_message };
@@ -6030,17 +6681,20 @@ describe('an applied transform across a refresh', () => {
 
         // Asserted here, before any restore echo: the window this closes is exactly
         // the one between the refresh and the echo. A filtered view must not flash
-        // its natural row count, and the sort must not read as uninstalled.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // its natural row count, and the sort must not read as uninstalled — which on
+        // screen means its merges must not spring back unflattened.
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
     });
 
-    it('does not re-offer row resizing across a same-basis refresh', async () => {
+    it('keeps custom row heights across a same-basis refresh', async () => {
         await editing_with_an_applied_sort();
-        // Heights are suppressed under a transform, which is what unmounts the resize
-        // overlay and disarms hover in the real shell.
-        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+        // Heights are no longer suppressed under a transform. What the grid gets is the
+        // install's own projection — display row 1, from durable source row 2 — so the
+        // resize overlay stays mounted and hover stays armed over permuted rows.
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual(PROJECTED_HEIGHTS);
 
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             generation: 2,
@@ -6048,13 +6702,17 @@ describe('an applied transform across a refresh', () => {
             reason: 'other',
             capabilities: CSV_CAPABILITIES,
             state: STORED_STATE,
+            // The permutation is unchanged, so the host re-projects onto the same display
+            // rows. Named explicitly because the projection is adopted from every
+            // delivery: a refresh that carried none would (correctly) mean no heights.
+            rowHeightProjection: [PROJECTED_HEIGHTS],
         }));
 
-        // The hazard, stated as the grid sees it: were `transformed` to read false
-        // here the overlay would mount over permuted rows and persist a display-keyed
-        // height against the wrong source row — durable corruption, not a flicker.
-        expect(grid_shell_mock.latest_props?.transformed).toBe(true);
-        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+        // Still the permuted record, so the heights below are the projection *of that
+        // permutation* rather than of a natural view that happens to agree.
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual(PROJECTED_HEIGHTS);
     });
 
     it('still asks for a durable transform a sibling panel changed', async () => {
@@ -6115,7 +6773,7 @@ describe('an applied transform across a refresh', () => {
         // A request would be posted synchronously inside the dispatch above, so its
         // absence is already observable here.
         expect(transform_requests(post_message)).toHaveLength(0);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count'))
             .toBe(String(FILTERED_ROW_COUNT));
     });
@@ -6137,7 +6795,7 @@ describe('an applied transform across a refresh', () => {
             restore,
             { generation: 2, rowCount: FILTERED_ROW_COUNT },
         ));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
@@ -6251,8 +6909,9 @@ describe('an applied transform across a refresh', () => {
             transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
         );
 
-        // And the grid agrees with the toolbar again: natural order, natural count.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // And the grid agrees with the toolbar again: natural order, natural count, and
+        // the sheet's merges back the way the file has them.
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
     });
 
@@ -6291,7 +6950,7 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(
             transform_installed_message(restore, { generation: 2, rowCount: 3 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
         post_message.mockClear();
 
@@ -6310,7 +6969,7 @@ describe('an applied transform across a refresh', () => {
             transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
         );
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
     });
 
@@ -6323,11 +6982,15 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             capabilities: CSV_CAPABILITIES,
             state: STORED_STATE,
+            // No permutation left to project through, so the host's projection of durable
+            // source row 2 is display row 2.
+            rowHeightProjection: [{ 2: 44 }],
         }));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
-        // And with nothing applied, the stored height is the user's again.
+        // And the height follows the rows: same durable entry, a display key that moved
+        // with the permutation being dropped.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{"2":44}');
     });
 
@@ -6339,10 +7002,16 @@ describe('an applied transform across a refresh', () => {
      * third: it stands for the fact that an install has landed against these rows,
      * which the restore effect answers by comparing the durable rules against the
      * record's own.
+     *
+     * `merges` is how the *permutation* half is read. `SheetViewRecord.permuted` reaches
+     * the rendered grid through exactly one thing now — merge flattening — so that is
+     * what a test about it asserts; the shell is no longer told whether its rows are
+     * permuted, because nothing in it needs to know (see `GridShellProps.row_count`).
+     * `'0'` is the permuted reading, `'1'` the natural one.
      */
     function view_state(post_message: ReturnType<typeof vi.fn>) {
         return {
-            transformed: grid_stub().getAttribute('data-transformed'),
+            merges: grid_stub().getAttribute('data-merges'),
             row_count: grid_stub().getAttribute('data-row-count'),
             asks_again: transform_requests(post_message).length > 0,
         };
@@ -6366,7 +7035,7 @@ describe('an applied transform across a refresh', () => {
         // together, because they are one value with one basis. Any partial
         // invalidation shows up here as a mismatched field.
         expect(view_state(post_message)).toEqual({
-            transformed: 'true',
+            merges: '0',
             row_count: String(FILTERED_ROW_COUNT),
             asks_again: false,
         });
@@ -6386,7 +7055,7 @@ describe('an applied transform across a refresh', () => {
         // The same three, all the other way — including the ask, which is what makes
         // the stored sort come back rather than being silently forgotten.
         expect(view_state(post_message)).toEqual({
-            transformed: 'false',
+            merges: '1',
             row_count: '5',
             asks_again: true,
         });
@@ -6471,7 +7140,8 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(
             transform_installed_message(uninstall, { generation: 4, rowCount: 5 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-merges')).toBe('1');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
 
         // Differing rules with nothing to reconcile: a sibling retyped a filter it had
         // already switched off, so neither side describes a permutation and the
@@ -6594,7 +7264,10 @@ describe('the transform rollback baseline', () => {
             await dispatch_host_message(
                 transform_installed_message(uninstall, { generation: 3 }),
             );
-            expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+            // The ack landed — only an install moves the generation — and the rules it
+            // carried were rule-free, so the record standing here is the non-permuted
+            // arm. That is the state the rollback below has to read a baseline from.
+            expect(grid_stub().getAttribute('data-generation')).toBe('3');
 
             post_message.mockClear();
             await dispatch_host_message(same_basis(3, [undefined]));
@@ -6622,7 +7295,10 @@ describe('the transform rollback baseline', () => {
         await dispatch_host_message(
             transform_installed_message(restore, { generation: 2 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The ack landed, and the rules it carried are an active sort, so the record
+        // standing here is the permuted arm — the precondition this test contrasts with
+        // 'cancels to no filter at all once a sibling has removed the definition'.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
 
         await start_a_transform(post_message);
         await click_button('Cancel');
@@ -6725,15 +7401,17 @@ describe('refused transforms', () => {
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
         const generation_before = grid_stub().getAttribute('data-generation');
+        const row_count_before = grid_stub().getAttribute('data-row-count');
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
         await refuse_transform(request, { terminal: false });
 
         // Nothing adopted, and now nothing adoptable: the refusal has no generation,
-        // rules or row count on it at all.
+        // rules or row count on it at all. Both of the fields it could have carried are
+        // read back unchanged, rather than only the one.
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe(row_count_before);
         // A refusal cannot reach the fold: only an install can move the generation,
         // and only a moved generation unmounts the grid that owns the overlay.
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
@@ -6766,15 +7444,18 @@ describe('refused transforms', () => {
         ).click());
         const request = latest_transform_request(post_message);
         expect(request.intent).toBe('user');
+        const generation_before = grid_stub().getAttribute('data-generation');
         post_message.mockClear();
 
         await refuse_transform(request, { terminal: false });
 
-        // Visible failure, and that is the whole of it.
+        // Visible failure, and that is the whole of it: the user is told, and the view
+        // they were looking at is the view they are still looking at. Only an install
+        // moves the generation, so an unmoved one is "no view was adopted".
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'showWarning',
         }));
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
 
         // The counterpart of 'keeps a transiently refused transform retriable': there
         // the *stored* transform is asked for again, because the sheet would otherwise
@@ -6785,7 +7466,7 @@ describe('refused transforms', () => {
         post_message.mockClear();
         await settle_a_save();
         expect(transform_requests(post_message)).toEqual([]);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
     });
 
     it('adopts the natural state for a terminal refusal', async () => {
@@ -6793,6 +7474,7 @@ describe('refused transforms', () => {
         post_message.mockClear();
         const request = await refresh_with_stored_sort(post_message);
         const generation_before = grid_stub().getAttribute('data-generation');
+        const row_count_before = grid_stub().getAttribute('data-row-count');
         grid_shell_mock.commit_live_edit.mockClear();
         post_message.mockClear();
 
@@ -6804,7 +7486,7 @@ describe('refused transforms', () => {
         // is already the one it is on. Both are asserted as *unchanged* rather than
         // as echoes that landed.
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe(row_count_before);
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
         // And it warns, even though this is a restore nobody asked for. The transient
         // case above is silent because the effect will ask again; here nothing will,
@@ -6862,7 +7544,7 @@ describe('refused transforms', () => {
         await dispatch_host_message(
             transform_installed_message(install, { generation: 7, rowCount: 4 }),
         );
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
         expect(grid_stub().getAttribute('data-row-count')).toBe('4');
 
         await act(async () => (
@@ -6873,7 +7555,6 @@ describe('refused transforms', () => {
         });
 
         expect(grid_stub().getAttribute('data-generation')).toBe('7');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('4');
     });
 
@@ -6898,8 +7579,10 @@ describe('refused transforms', () => {
         // dirty store, so the cell is still cancellable.
         expect(store_edits()).toEqual({});
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
-        // And the view the webview already had is what it still shows.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // And the view the webview already had is what it still shows: only an install
+        // moves the generation, and this refusal moved nothing.
+        expect(Number(grid_stub().getAttribute('data-generation')))
+            .toBe(generation_before);
 
         // The paired direction, here rather than elsewhere so this test cannot pass by
         // never folding at all: an ack that does move the generation remounts the grid,
@@ -6943,8 +7626,10 @@ describe('refused transforms', () => {
         expect(store_edits()).toEqual({});
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
         // Not vacuous: the install landed, so this is the ack being processed and
-        // choosing not to fold, not the requestId guard dropping it.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // choosing not to fold, not the requestId guard dropping it. The generation is
+        // no evidence here — the whole point of this case is that it did not move — so
+        // the spinner clearing is what says the ack was matched to its request.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
 
         // Paired direction, so this cannot pass by never folding: the same install
         // one generation on does remount, and the overlay has to be folded first.
@@ -7164,7 +7849,9 @@ describe('the Edit button and an installed transform', () => {
             { capabilities: EDITABLE, state: { transforms: [SORT] } },
         ));
         await acknowledge_transform(latest_transform_request(post_message), 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The restore landed and installed an active sort, so what follows is judged
+        // against a permuted view rather than an unsorted one.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         post_message.mockClear();
         return post_message;
     }
@@ -7241,7 +7928,9 @@ describe('stale-view banner', () => {
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
         await acknowledge_transform(latest_transform_request(post_message), 2);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The sort installed — only an install moves the generation — so the banner's
+        // silence below is a choice about a permuted view, not the absence of one.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(banner()).toBeNull();
         return post_message;
     }
@@ -7394,9 +8083,9 @@ describe('stale-view banner', () => {
         expect(banner()?.textContent).not.toContain(BANNER_TEXT);
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
-        // Still the installed view: the record was kept, not replaced by a natural one,
-        // which is what makes the fresh keys about the permutation it describes.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Still the installed view, and the sentence above is itself the evidence:
+        // `hiddenEditedCellKeys` exists only on the record's `permuted` arm, so a record
+        // replaced by a natural one could not have produced that count at all.
         expect_no_call_to_action();
 
         // Withdrawn the same way it arrived. The host is the authority on membership,
@@ -7572,8 +8261,11 @@ describe('stale-view banner', () => {
         await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        // Not vacuous: the record the count came from is still the installed one.
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Not vacuous: the record the count came from is still the installed one. The
+        // refresh above was same-basis and stayed on generation 2, which is the record
+        // written by the install in `edit_mode_sorted_on_column_0` — a dropped record
+        // would have taken the natural view with it and there would be no count to gate.
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(banner()).toBeNull();
         expect_no_call_to_action();
     });
@@ -7736,7 +8428,10 @@ describe('stale-view banner', () => {
         // Deliberately unacknowledged: the record standing here is the snapshot's own,
         // which is the one under test.
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // The fabricated record's row count, which is the constant this test exists to
+        // hold to account: the sheet's own count, because a record built here says no
+        // permutation is in place and therefore shows every row.
+        expect(grid_stub().getAttribute('data-row-count')).toBe('1');
 
         expect(banner()).toBeNull();
         expect_no_call_to_action();
@@ -7817,7 +8512,9 @@ describe('stale-view banner', () => {
         await acknowledge_transform(latest_transform_request(post_message), 3);
         await report_grid_editing(true, true, [], dirty('0:0'));
 
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // The restore echo's own install landed, so the dismissal below is being held
+        // against a live permuted record rather than surviving because nothing arrived.
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
         expect(banner()).toBeNull();
         expect_no_call_to_action();
     });
@@ -7849,7 +8546,9 @@ describe('stale-view banner', () => {
             await acknowledge_transform(latest_transform_request(post_message), 2);
             await report_grid_editing(true, true, [], dirty('0:0'));
             expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-            expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+            // The restore installed the stored sort, so each session opens over a
+            // permuted view — which is what the banner has something to say about.
+            expect(grid_stub().getAttribute('data-generation')).toBe('2');
         };
 
         await restored_session('first-session');
@@ -7909,7 +8608,9 @@ describe('stale-view banner', () => {
             { generation: 2, rowCount: 2, hiddenEditedCellKeys: hidden },
         ));
         await report_grid_editing(true, true, [], edits);
-        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        // Two of the sheet's three rows: the hiding record really installed, which is
+        // what makes the `permuted` arm below the host's word and not a default.
+        expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         return post_message;
     }
 
@@ -8035,10 +8736,15 @@ describe('per-sheet view records', () => {
     };
     const DURABLE = { transforms: [FIRST_SORT, SECOND_SORT] };
 
-    function view(): { sheet: string | null; transformed: string | null; rows: string | null } {
+    /**
+     * Which sheet is on screen and how many rows its record claims. The row count is the
+     * whole discriminant here and is meant to be: the fixture below gives the two sheets
+     * different counts, both different from the natural 5, so a record swapped for
+     * another sheet's or for the natural view shows up as a wrong number.
+     */
+    function view(): { sheet: string | null; rows: string | null } {
         return {
             sheet: grid_stub().getAttribute('data-sheet-index'),
-            transformed: grid_stub().getAttribute('data-transformed'),
             rows: grid_stub().getAttribute('data-row-count'),
         };
     }
@@ -8068,7 +8774,7 @@ describe('per-sheet view records', () => {
             second,
             { generation: 3, rowCount: 4 },
         ));
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         return { post_message };
     }
 
@@ -8079,7 +8785,7 @@ describe('per-sheet view records', () => {
 
         // Each record is the one its own install wrote: the second install bumped
         // the shared generation but moved no row on this sheet.
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
     });
 
     it('keeps a record whose rows an install on another sheet never moved', async () => {
@@ -8099,9 +8805,9 @@ describe('per-sheet view records', () => {
             state: DURABLE,
         }));
 
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
         // And nothing had to be re-asked to get back there: a dropped record shows up
         // as a restore request for rules the host already holds.
         expect(post_message.mock.calls
@@ -8126,7 +8832,7 @@ describe('per-sheet view records', () => {
             second,
             { generation: 2, rowCount: 4 },
         ));
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
 
         // First's compute lands last, on the generation the core reached after both.
         await dispatch_host_message(transform_installed_message(
@@ -8136,8 +8842,8 @@ describe('per-sheet view records', () => {
 
         // The active sheet is Second, and its record must be untouched by an ack
         // addressed to another sheet.
-        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
-        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        expect(view()).toEqual({ sheet: '0', rows: '3' });
     });
 });

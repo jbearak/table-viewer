@@ -99,6 +99,8 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             }],
         },
         hiddenEditedCellKeys: [[]],
+        rowHeightProjection: [undefined],
+        mappingGenerations: [1],
     };
     const diagnostics = overrides.diagnostics ?? { truncationMessage: null };
     const live_material = structuredClone({ core, diagnostics });
@@ -372,6 +374,11 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 // generation. Carried on the projection instead — sampled once, at
                 // replacement — it would do exactly that.
                 hiddenEditedCellKeys: [['4:0']],
+                // Re-sampled for the same reason and with a stronger consequence: a
+                // display-keyed height map paired with another adoption's generation
+                // renders every custom height against the wrong row.
+                rowHeightProjection: [{ 0: 40 }],
+                mappingGenerations: [1],
             },
             diagnostics: { truncationMessage: 'current diagnostics' },
         });
@@ -387,6 +394,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(superseding.sourceGeneration).toBe(4);
         expect(superseding.meta.sheets[0].name).toBe('Locally transformed');
         expect(superseding.hiddenEditedCellKeys).toEqual([['4:0']]);
+        expect(superseding.rowHeightProjection).toEqual([{ 0: 40 }]);
         expect(superseding.truncationMessage).toBe('current diagnostics');
         expect(sample).toHaveBeenCalledTimes(2);
         expect(project).toHaveBeenCalledOnce();

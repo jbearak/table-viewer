@@ -176,6 +176,19 @@ export type ViewBasis = {
  * it, because a message is read once and never retained. Anyone adding a field here
  * should expect the same question of it — and if the answer is "it is not about these
  * rows", the message is where it goes.
+ *
+ * The display-keyed row-height projection PR 4 added is the worked example of that last
+ * sentence, and it is instructive because it looks like it belongs here. It is a fact
+ * about these rows in the sense that its keys are this view's display rows. But it is a
+ * *join* of the permutation with durable intent, and the durable half moves with no
+ * generation bump at all — a `setRowHeights`, a sibling panel's write, an excel-header
+ * plan edit — so a retained record's projection goes stale on an unchanged basis, which
+ * is precisely the failure mode this shape exists to make impossible. What earned
+ * `hiddenEditedCellKeys` its exemption does not transfer: those keys are correctable
+ * because the webview holds a live dirty map to intersect them against, and there is no
+ * live value to correct a height projection with. So it rides the deliveries instead —
+ * `WorkbookSnapshot.rowHeightProjection` and `transformInstalled.rowHeights`, beside the
+ * record exactly as `rules` is.
  */
 export type SheetViewRecord =
     | {
@@ -255,6 +268,43 @@ export type SheetViewRecord =
 
 /** Allocation/persistence guard shared by webview sanitization and host plans. */
 export const MAX_PERSISTED_HIDDEN_ROWS = 1_000_000;
+
+/**
+ * Cap on one sheet's durable custom row heights.
+ *
+ * **This bound is a deliberate behaviour regression, said plainly here because it is the
+ * kind of thing a reader deserves to find at the constant rather than in a bug report.**
+ * Before heights became source-keyed the webview wrote `PerFileState.rowHeights` itself
+ * and nothing counted the entries, so a select-all row resize on a sheet of *any* size
+ * was persisted. From this change on, a select-all resize on a sheet with more than this
+ * many rows is refused outright: nothing is written, no row keeps its new height, and the
+ * user is warned with the limit named (`ROW_HEIGHT_LIMIT_WARNING`, `viewer-controller`).
+ * Sheets at or under the bound are unaffected.
+ *
+ * The refusal is the price of the projection. A row resize commits the user's whole row
+ * selection, which can be select-all, so `setRowHeights` can legitimately name every row
+ * of the sheet. That is intended and supported up to this bound; past it the cost is not
+ * the persisted bytes but the work every later delivery does. The host allocates two
+ * `Uint32Array`s the size of the request in `map_display_rows_to_source`, and then
+ * re-derives the display-keyed projection once per sheet per delivery — an O(overrides)
+ * walk whose `overrides` would be the row count from then on, for the life of the file.
+ * An uncapped map makes every snapshot O(rows), which is the cost this renderer exists
+ * to have stopped paying.
+ *
+ * The nearest relative is `MAX_HIGHLIGHTED_CELLS_PER_FILE` (100_000), not
+ * `MAX_PERSISTED_HIDDEN_ROWS` (1_000_000). Highlights are the other durable, host-owned,
+ * key/value collection built one user gesture at a time, re-counted whole on every
+ * mutation, and refused as a whole with a warning that names the limit — the same shape
+ * in every respect. Hidden rows are the poor comparison: a sorted integer array, consumed
+ * once when a permutation is computed, produced by a gesture whose entire point is to
+ * name many rows at once.
+ *
+ * An order of magnitude below the highlight cap because a height is re-projected on
+ * *every delivery* where a highlight is not, and because ten thousand hand-resized rows
+ * is already far past any real gesture except select-all on a small sheet. Select-all on
+ * a large one is the case this exists to bound, and refusing it is the accepted cost.
+ */
+export const MAX_PERSISTED_ROW_HEIGHTS = 10_000;
 
 export interface SheetColumnVisibilityState {
     /** Canonical visibility stores exactly one side, choosing the smaller list. */
@@ -371,6 +421,63 @@ export interface ScrollPosition {
 
 export interface PerFileState {
     columnWidths?: (Record<number, number> | undefined)[];
+    /**
+     * Per-sheet custom row heights in pixels, keyed by **canonical source row** —
+     * the same key space as `pendingEdits` and `cellHighlights`, and deliberately
+     * so.
+     *
+     * Source-keyed because a durable annotation has to survive everything that
+     * renumbers display rows: a sort, a filter, an explicit row hide, an Excel
+     * first-row-header promotion. A display-keyed map does not merely go stale
+     * under those, it becomes *wrong* — it names other rows — and the previous
+     * design's only defence was to stop honouring the map entirely whenever a
+     * transform was installed, which is why custom heights visibly vanished on
+     * sort and returned on clear. Source keys have no such failure mode: the row a
+     * height belongs to is identified by what it *is* rather than by where it
+     * currently sits, so every permutation is a rendering question — answered by a
+     * sparse display-keyed projection the host recomputes per delivery
+     * (`WorkbookSnapshot.rowHeightProjection`) and per install
+     * (`transformInstalled.rowHeights`) — rather than a storage one.
+     *
+     * The host is the only writer, and the webview is not even a *reader*. This field
+     * is absent from `LayoutStatePatch`, joining `transforms`, `columnVisibility` and
+     * `cellHighlights` as state a `stateChanged` message cannot touch — see
+     * `layout-state-patch.ts` — and it is absent from `NormalizedPerFileState`, so no
+     * delivery carries it either. Neither absence is tidiness. The webview cannot map
+     * display→source for a select-all resize (it has not loaded those rows), so if it
+     * could patch this leaf its only options would be to write display keys or to write
+     * nothing, and the first is the bug above; and a copy it merely *held* would be a
+     * source-keyed map sitting beside the display-keyed projection it renders from,
+     * which is the confusion the re-keying exists to end. Not sending it is also
+     * strictly cheaper on the wire, which matters most exactly where it is largest: a
+     * pre-cap legacy select-all map. Writes arrive as `setRowHeights`, which the host
+     * maps and clamps.
+     *
+     * Existing persisted maps are *migrated*, not reinterpreted, and the
+     * difference from `pendingEdits` is worth stating because the two arguments
+     * look alike and only one of them closes. Both rest on "no key was ever
+     * written under a row permutation", which holds here for a stronger reason
+     * than it does for edits: the suppression that replaced the map with `{}`
+     * under an active transform was introduced by the very commit that added
+     * sorting and filtering, so no released version could write a permuted height
+     * even in principle. But heights are not confined to CSV, and for XLS/XLSX the
+     * *projection* can differ from the source with no permutation in sight: an
+     * active first-row-header promotion removes the header row from the display
+     * space and shifts everything after it up one. Keys written under one of those
+     * promotions are therefore off by one, which no reinterpretation can fix.
+     *
+     * Hence `rowHeightsVersion`. The pass recovers what is recoverable rather than
+     * discarding the user's work wholesale: for a sheet with an active promotion the
+     * inverse of the display space is `source = d < h ? d : d + 1` for header row
+     * `h`, so the keys are *shifted* when `h === 0` and dropped only when `h > 0`,
+     * where a manual header row could have moved while the promotion stayed active
+     * and the old key space is not reliably reconstructible. Sheets with no active
+     * promotion are already canonical and are left alone, CSV among them —
+     * `rowCount === sourceRowCount` there and no promotion exists. See
+     * `plan_excel_candidate_state`, and `migrate_row_heights_for_file` for why the
+     * *other* writer of `excelFirstRowHeaderActive` — `plan_excel_override_state` — has
+     * to discharge the same pass rather than leave it to a later load.
+     */
     rowHeights?: (Record<number, number> | undefined)[];
     scrollPosition?: (ScrollPosition | undefined)[];
     activeSheetIndex?: number;
@@ -413,6 +520,14 @@ export interface PerFileState {
     excelFirstRowHeaderActive?: Record<string, boolean>;
     /** One-time migration marker for row-addressed state created before headers. */
     excelFirstRowHeaderVersion?: 1;
+    /**
+     * One-time migration marker saying `rowHeights` has been reconciled with the
+     * canonical source-row key space it is now documented in. Separate from
+     * `excelFirstRowHeaderVersion` rather than folded into it: that marker is
+     * already `1` in every file this migration needs to run on, so reusing it would
+     * make the pass unreachable exactly where it is needed.
+     */
+    rowHeightsVersion?: 1;
     /** Per-sheet view-only sort/filter descriptors. Computed row permutations
      *  are deliberately never persisted. */
     transforms?: (SheetTransformState | undefined)[];
@@ -534,8 +649,34 @@ export type HostMessage =
      * and persisting the request there would put the unusable rules straight back.
      * Normalized to `undefined` when the set has no entries, because rules with no
      * entries are not a view but the absence of one.
+     *
+     * `rowHeights` is the durable custom heights re-keyed into the display space of the
+     * view just installed — see `PerFileState.rowHeights` for why only the host can
+     * compute that. It sits beside `view` for the same reason `rules` does, and the
+     * reason is worth stating because the projection looks even more like a fact about
+     * these rows than the rules do: a record is *retained* across a same-basis refresh,
+     * and durable heights move with no generation bump, so a projection stored in the
+     * record would be a copy going stale on an unchanged basis. A message is read once
+     * and discarded, so there is no copy to go stale. See the rule on `SheetViewRecord`.
+     *
+     * Required rather than belt-and-braces, and this is the part that is easy to get
+     * wrong: an install bumps the view generation and posts *no snapshot*. The transform
+     * persist runs `update_file_state` → `update_session_state_material` →
+     * `session.update_state_snapshot(...)` with no `deliver` option, and `deliver`
+     * defaults to false. So without this field the webview would render the previous
+     * view's display keys against the permutation just installed until some unrelated
+     * delivery happened to arrive.
      */
-    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined }
+    // `mappingGeneration` is this sheet's `mapping_generation` at the moment of the
+    // install, which is *not* always `view.basis.generation`: an install that changes the
+    // rules without producing a permutation — a filter added but left disabled — moves the
+    // core-wide generation and leaves the mapping generation where it was, because display
+    // row `r` is still source row `r`. The webview needs the same fact the host admits
+    // resizes by, or the two disagree: the host accepts the old-generation write while the
+    // webview, reading the bumped view generation as a mapping change, has already thrown
+    // the optimistic layer away. Same fact `WorkbookSnapshot.mappingGenerations` carries,
+    // delivered on the one message that reports an install.
+    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined; rowHeights: Readonly<Record<number, number>>; mappingGeneration: number }
     /**
      * The host changed nothing. It deliberately carries no `view`, no `state`, no
      * `rowCount` and no `generation`: six review rounds of this feature were each a
@@ -582,6 +723,50 @@ export type WebviewMessage =
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
+    /**
+     * Set one height on every row of a completed resize, named in display space.
+     *
+     * Display intervals rather than source rows because a resize commits the user's
+     * whole row selection, which can be select-all, and the webview cannot map
+     * display→source for rows it has never loaded — the mapping lives behind
+     * `PanelCore.map_display_rows_to_source`. So the request says what the user
+     * dragged, in the coordinates the user was looking at, and the host resolves it
+     * into the canonical source rows `PerFileState.rowHeights` is keyed by.
+     *
+     * `generation` and `sourceGeneration` rather than a `snapshotIdentity`, exactly as
+     * `hideRows` does, and the omission is deliberate rather than an economy. Those two
+     * are what make a display-row interval meaningful — they identify the permutation the
+     * numbers were read off — and they are the *only* thing that does. A snapshot
+     * identity would add a second, stricter currency test whose failures are not about
+     * the rows at all, and the consequence of failing it is no longer what it used to be:
+     * `stateChanged` can be dropped on an identity mismatch harmlessly because
+     * `state_ref` still holds the height and the next debounced persist resends it, but
+     * the webview no longer holds durable heights, so a dropped `setRowHeights` is the
+     * resize gone for good. Narrow the test to what the request actually depends on.
+     *
+     * A stale generation is dropped in silence, with deliberately no refusal message and
+     * deliberately no deferred replay. Replaying a resize once the view has moved would
+     * resize whatever rows now occupy those display positions — the same class of mistake
+     * as replaying a refused sort. And no message is needed to tell the user: the
+     * delivery that moved the generation is exactly what makes the webview's generation
+     * differ from the one it posted, so the optimistic overlay tagged with that
+     * generation is discarded and the row visibly springs back. The user's next drag is
+     * the retry, and it costs one gesture.
+     *
+     * One `height` for the whole request, not one per row: this is the shape a resize
+     * gesture has. Clamped host-side against `MIN_ROW_HEIGHT_PX`, so a webview
+     * arithmetic slip cannot durably store a zero-height row, and bounded by
+     * `MAX_PERSISTED_ROW_HEIGHTS`.
+     *
+     * No `requestId`, unlike every other request above it. The others carry one because
+     * something correlates it: an ack the webview has to match against an in-flight
+     * request (`setTransform`, `hideRows`, `setExcelFirstRowHeader`), or a cancellation
+     * (`cancelFilterHistogram`). A resize is acknowledged only by the delivery of a new
+     * projection, which the webview reconciles by *value* — an overlay layer is dropped
+     * when the delivered heights agree with it — so an id here would be a protocol field
+     * nothing on either side reads.
+     */
+    | { type: 'setRowHeights'; sheetIndex: number; rows: DisplayRowInterval[]; height: number; generation: number; sourceGeneration: number }
     | { type: 'setColumnVisibility'; sheetIndex: number; sheetName: string; state: SheetColumnVisibilityState | undefined; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'applyCellHighlights'; sheetIndex: number; sheetName: string; selection: CellHighlightSelection; mutation: CellHighlightMutation; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'clearAllCellHighlights'; requestId: string; generation: number; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity };

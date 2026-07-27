@@ -65,6 +65,8 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 6,
                 meta: { sheets: [], hasFormatting: false },
                 hiddenEditedCellKeys: [],
+                rowHeightProjection: [],
+                mappingGenerations: [],
             },
             presentation: 'refresh',
             reason: 'retry',
@@ -118,9 +120,16 @@ describe('workbook snapshot builder', () => {
         const state: {
             pendingEdits: Record<string, string>;
             excelFirstRowHeaders: Record<string, 'on' | 'off'>;
+            rowHeights: (Record<number, number> | undefined)[];
         } = {
             pendingEdits: { '0:0': 'Ada' },
             excelFirstRowHeaders: { People: 'on' },
+            // Present in durable state and asserted *absent* from the delivery below.
+            // `NormalizedPerFileState` omits the field: the webview renders from
+            // `rowHeightProjection` and must never be handed the source-keyed map beside
+            // the display-keyed one, which for a pre-cap legacy select-all map would also
+            // be the largest thing on the wire.
+            rowHeights: [{ 2: 44 }],
         };
         const configuration = {
             defaultTabOrientation: 'horizontal' as const,
@@ -136,6 +145,22 @@ describe('workbook snapshot builder', () => {
         // for every delivery, so an issued snapshot sharing the array would let a later
         // sample rewrite what an earlier delivery said was out of sight.
         const hidden_edited_cell_keys = [['2:0']];
+        // Same reason, and the consequence of sharing it is worse: a later sample
+        // rewriting an issued delivery's projection would render heights against a
+        // permutation that delivery never described.
+        //
+        // The *entries* are frozen and the array is not, deliberately: that isolates the
+        // array half of the freeze guard in `build_workbook_snapshot`, which is the half
+        // the `[0] = …` mutation below exercises. The entry half is covered by its own
+        // half-frozen case further down, where the array is frozen and the map is not.
+        const row_height_projection: (Readonly<Record<number, number>> | undefined)[] =
+            [Object.freeze({ 2: 44 })];
+        // And once more for the third permutation-relative value sampled in the same
+        // statement. Numbers, so there is no entry half to freeze — but the array is
+        // resampled on every delivery just like the two above, and an issued snapshot
+        // sharing it would let a later install rewrite the verdict an earlier delivery
+        // gave a webview about whether its display-keyed overlay was still valid.
+        const mapping_generations = [2];
         const commandResult: RetainedSnapshotCommandResult = {
             type: 'excelFirstRowHeader',
             requestId: 'header:1',
@@ -160,6 +185,8 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 3,
                 meta,
                 hiddenEditedCellKeys: hidden_edited_cell_keys,
+                rowHeightProjection: row_height_projection,
+                mappingGenerations: mapping_generations,
             },
             presentation: 'initial',
             reason: 'ready',
@@ -178,6 +205,8 @@ describe('workbook snapshot builder', () => {
         capabilities.csvEditable = true;
         diagnostics.truncationMessage = null;
         hidden_edited_cell_keys[0].push('3:0');
+        row_height_projection[0] = { 9: 99 };
+        mapping_generations[0] = 99;
         (commandResult as { error?: string }).error = 'Changed';
 
         expect(snapshot.meta.sheets[0]).toMatchObject({
@@ -185,9 +214,9 @@ describe('workbook snapshot builder', () => {
             merges: [{ endCol: 1 }],
             columnNames: ['Name', 'Age'],
         });
+        expect(snapshot.state).not.toHaveProperty('rowHeights');
         expect(snapshot.state).toMatchObject({
             columnWidths: [],
-            rowHeights: [],
             scrollPosition: [],
             activeSheetIndex: 0,
             tabOrientation: null,
@@ -201,12 +230,110 @@ describe('workbook snapshot builder', () => {
         expect(snapshot.capabilities.csvEditable).toBe(false);
         expect(snapshot.truncationMessage).toBe('Rows were truncated.');
         expect(snapshot.hiddenEditedCellKeys).toEqual([['2:0']]);
+        expect(snapshot.rowHeightProjection).toEqual([{ 2: 44 }]);
+        expect(snapshot.mappingGenerations).toEqual([2]);
         expect(snapshot.commandResult?.error).toBe('Ambiguous finalization was reconciled.');
         expect(Object.isFrozen(snapshot)).toBe(true);
         expect(Object.isFrozen(snapshot.hiddenEditedCellKeys[0])).toBe(true);
+        expect(Object.isFrozen(snapshot.rowHeightProjection[0])).toBe(true);
+        expect(Object.isFrozen(snapshot.mappingGenerations)).toBe(true);
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
+    });
+
+    it('shares an already-frozen row-height projection instead of copying it', () => {
+        // The other half of the isolation test above, and the reason that one passes an
+        // *unfrozen* array. `ViewerPanelCore` freezes the projection at its source
+        // precisely so the memoized value can be published by reference, and the memo only
+        // pays for itself if the delivery path stops copying it: a pre-cap legacy map can
+        // hold hundreds of thousands of entries, and the walk to clone it would happen on
+        // every scroll-triggered delivery. Identity is the only observable that tells a
+        // share from a copy, so identity is what this asserts.
+        const projection = Object.freeze([Object.freeze({ 2: 44 }), undefined]);
+        const snapshot = build_workbook_snapshot({
+            deliveryId: 3,
+            canonicalFileId: '/book.xlsx',
+            source: 'observed',
+            authority: {
+                fileKey: '/book.xlsx',
+                commitSequence: 1,
+                authorityRevision: 1,
+                physicalRevision: 1,
+                projectionRevision: 0,
+                physicalDigest: 'digest',
+            },
+            state_snapshot: { state: {}, revision: 1 },
+            core: {
+                generation: 1,
+                sourceGeneration: 1,
+                meta: { sheets: [], hasFormatting: false },
+                hiddenEditedCellKeys: [],
+                rowHeightProjection: projection,
+                mappingGenerations: [],
+            },
+            presentation: 'initial',
+            reason: 'ready',
+            configuration: { defaultTabOrientation: 'horizontal', previewMode: false },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' },
+            },
+            diagnostics: { truncationMessage: null },
+        });
+
+        expect(snapshot.rowHeightProjection).toBe(projection);
+        expect(snapshot.rowHeightProjection[0]).toBe(projection[0]);
+        // And the sharing did not cost the snapshot its own freeze.
+        expect(Object.isFrozen(snapshot)).toBe(true);
+    });
+
+    it('still isolates a frozen projection array holding a mutable map', () => {
+        // The half-frozen shape, which is the only one the entry-level part of the guard
+        // can see: a frozen *array* whose entries are not. The core never produces this —
+        // it freezes each map before the array — but the guard is what makes sharing safe
+        // for any caller rather than only for the one that happens to freeze deeply, and
+        // sharing this would let a later mutation rewrite an issued delivery's heights.
+        const mutable_entry: Record<number, number> = { 2: 44 };
+        const projection = Object.freeze([mutable_entry]);
+        const snapshot = build_workbook_snapshot({
+            deliveryId: 4,
+            canonicalFileId: '/book.xlsx',
+            source: 'observed',
+            authority: {
+                fileKey: '/book.xlsx',
+                commitSequence: 1,
+                authorityRevision: 1,
+                physicalRevision: 1,
+                projectionRevision: 0,
+                physicalDigest: 'digest',
+            },
+            state_snapshot: { state: {}, revision: 1 },
+            core: {
+                generation: 1,
+                sourceGeneration: 1,
+                meta: { sheets: [], hasFormatting: false },
+                hiddenEditedCellKeys: [],
+                rowHeightProjection: projection,
+                mappingGenerations: [],
+            },
+            presentation: 'initial',
+            reason: 'ready',
+            configuration: { defaultTabOrientation: 'horizontal', previewMode: false },
+            capabilities: {
+                csvEditable: false,
+                csvEditingSupported: false,
+                csvSaveLifecycle: { revision: 0, state: 'idle' },
+            },
+            diagnostics: { truncationMessage: null },
+        });
+
+        mutable_entry[2] = 99;
+
+        expect(snapshot.rowHeightProjection[0]).not.toBe(mutable_entry);
+        expect(snapshot.rowHeightProjection).toEqual([{ 2: 44 }]);
+        expect(Object.isFrozen(snapshot.rowHeightProjection[0])).toBe(true);
     });
 
     it('restores and freezes canonical highlights for the authority digest', () => {
@@ -248,6 +375,8 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 1,
                 meta: { sheets: [sheet], hasFormatting: false },
                 hiddenEditedCellKeys: [[]],
+                rowHeightProjection: [undefined],
+                mappingGenerations: [1],
             },
             presentation: 'initial',
             reason: 'ready',
