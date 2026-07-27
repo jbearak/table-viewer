@@ -10,6 +10,7 @@ import type {
 } from './data-source/interface';
 import {
     InvalidPersistedTransformError,
+    TransformAdmissionLapsedError,
     ViewerPanelCore,
     adopt_source_into_core,
     clone_filter_entry,
@@ -1780,11 +1781,15 @@ export function attach_viewer(
         if (!committed) {
             // Name the real reason when it is the admission that lapsed: "the source
             // changed" would be a lie, and the phases that refuse here all end on
-            // their own, so the user's next attempt is the one that works.
-            throw new Error(
-                transform_commit_admission_refusal()
-                ?? 'The source changed before this table view could be saved.',
-            );
+            // their own, so the user's next attempt is the one that works. Its own
+            // error type and not just its own message, because `panel-core` has to
+            // answer the two cases differently — transient here, terminal below — and
+            // discriminating on message text is not a discrimination.
+            const refusal = transform_commit_admission_refusal();
+            if (refusal !== undefined) {
+                throw new TransformAdmissionLapsedError(refusal);
+            }
+            throw new Error('The source changed before this table view could be saved.');
         }
     }
 
@@ -3294,6 +3299,7 @@ export function attach_viewer(
             await core?.reject_transform(
                 message,
                 'The active header row cannot be hidden.',
+                'terminal',
             );
             return;
         }
@@ -3303,6 +3309,7 @@ export function attach_viewer(
                 await core?.reject_transform(
                     message,
                     'Use Unhide all to restore rows above the active header.',
+                    'terminal',
                 );
                 return;
             }
@@ -3317,7 +3324,7 @@ export function attach_viewer(
             await core?.reject_transform(
                 message,
                 transform_admission.refusal,
-                true,
+                'transient',
             );
             return;
         }
@@ -4042,8 +4049,17 @@ export function attach_viewer(
                     sourceGeneration: msg.sourceGeneration,
                     intent: 'user',
                 });
+                // Every refusal below is a validation one — preview mode, a stale
+                // generation, an out-of-range sheet, an unmappable row, too many
+                // hidden rows — so none of them is worth asking again. The admission
+                // matrix's transient refusals are reached through
+                // `handle_transform_message`, not here.
                 const reject = async (error: string) => {
-                    await core?.reject_transform(synthesize(installed), error);
+                    await core?.reject_transform(
+                        synthesize(installed),
+                        error,
+                        'terminal',
+                    );
                 };
                 if (profile.previewMode === true) {
                     await reject('Row hiding is unavailable in preview mode.');

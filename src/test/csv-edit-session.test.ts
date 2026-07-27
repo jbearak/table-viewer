@@ -5580,11 +5580,15 @@ describe('CSV edit sessions', () => {
         // is how they would reach the panel that now owns editing.
         expect(versioned.get_state(file_path).transforms?.[0]).toBeUndefined();
         // Refused with the admission's own reason rather than a currency error, so
-        // the sibling's toolbar tells the user something true.
+        // the sibling's toolbar tells the user something true — and transient, because
+        // the phase that refused ends when the owner is done. Calling this terminal
+        // would tell the webview to stop retrying a request the next attempt would
+        // have carried, which is why the lapse travels as its own error type.
         expect(transform_answers(sibling)).toEqual([expect.objectContaining({
             type: 'transformRefused',
             requestId: 'admitted-then-lapsed',
             reason: 'Another panel is editing this file.',
+            terminal: false,
         })]);
 
         // The load-bearing half, and it needs the owner to *touch* durable state to
@@ -5691,6 +5695,7 @@ describe('CSV edit sessions', () => {
         expect(transform_answers(sibling)).toEqual([expect.objectContaining({
             type: 'transformRefused',
             requestId: 'lapsed-inside-cas',
+            terminal: false,
         })]);
         await reopened.__receive({
             type: 'pendingEditsChanged',

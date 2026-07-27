@@ -1567,10 +1567,27 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = '';
                     return next;
                 });
-                host_bridge.postMessage({
-                    type: 'showWarning',
-                    message: `Could not update the table view: ${msg.reason}`,
-                });
+                // Nobody asked for a restore, so a refusal that clears on its own is
+                // not news: the restore effect re-asks once the blocker moves, and in
+                // the ordinary case — a sibling holding the edit session — every panel
+                // showing the file would otherwise pop a warning about something its
+                // user never did and can do nothing about. The latch above already
+                // reduced this from once-per-commit to once-per-blocker-movement, but
+                // unprompted at any rate is still unprompted.
+                //
+                // Terminal is different in kind and keeps its warning: the saved
+                // transform really is being abandoned, nothing will re-ask, and the
+                // view the user gets is not the one their file remembers. Saying so
+                // is the honest thing even though they did not ask.
+                //
+                // `refusal_origin` deliberately read above, before the pending refs
+                // were cleared.
+                if (!(refusal_origin === 'restore' && !msg.terminal)) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: `Could not update the table view: ${msg.reason}`,
+                    });
+                }
                 return;
             }
 
@@ -2135,18 +2152,33 @@ export function App(): React.JSX.Element {
         csv_edit_session_id,
     ]);
 
+    /**
+     * The one place that decides whether this webview will ask the host for a
+     * transform at all. Its own function because four call sites need the same
+     * answer and drifted once already: Cancel checked only the save, and a cancel is
+     * itself a transform request.
+     *
+     * Edit mode is deliberately not here: the host admits a transform from the panel
+     * that owns the session. A save in flight is, because it has already validated
+     * every edit's base against the natural source (see `save_blocks_transform` in
+     * viewer-controller.ts). `edit_session_pending` is a claim mid-flight, which the
+     * host refuses in its `claiming` phase — so a request sent under it is one the
+     * host would refuse anyway, and for Cancel that refusal costs the requestId of
+     * the very request being cancelled. A pending Excel header promotion is
+     * reshaping the rows underneath. Preview mode offers no transform affordances at
+     * all, so the term is inert there, and it is kept so the sets are honestly
+     * identical rather than nearly so.
+     */
+    const transform_request_blocked = useCallback((): boolean => (
+        save_in_flight_ref.current
+        || edit_session_pending
+        || preview_mode
+        || pending_excel_header_ref.current !== null
+    ), [edit_session_pending, preview_mode]);
+
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            // Edit mode is deliberately not a refusal: the host admits a transform
-            // from the panel that owns the session. A save in flight is, because
-            // it has already validated every edit's base against the natural
-            // source (see save_blocks_transform in viewer-controller.ts).
-            if (
-                save_in_flight_ref.current
-                || edit_session_pending
-                || preview_mode
-                || pending_excel_header_ref.current !== null
-            ) return false;
+            if (transform_request_blocked()) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -2176,20 +2208,15 @@ export function App(): React.JSX.Element {
         },
         [
             active_sheet_index,
-            edit_session_pending,
             meta,
-            preview_mode,
             request_transform,
+            transform_request_blocked,
         ],
     );
 
     const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
-        // Same admission set as handle_transform_change; see the comment there.
         if (
-            save_in_flight_ref.current
-            || edit_session_pending
-            || preview_mode
-            || pending_excel_header_ref.current !== null
+            transform_request_blocked()
             || pending_transforms[active_sheet_index]
         ) return;
         const request_id = [
@@ -2221,9 +2248,8 @@ export function App(): React.JSX.Element {
         });
     }, [
         active_sheet_index,
-        edit_session_pending,
         pending_transforms,
-        preview_mode,
+        transform_request_blocked,
     ]);
 
     const handle_unhide_all_rows = useCallback(() => {
@@ -2268,20 +2294,15 @@ export function App(): React.JSX.Element {
             window.clearTimeout(filter_restore_timer_ref.current);
             filter_restore_timer_ref.current = undefined;
         }
-        // Same admission set as handle_transform_change; see the comment there.
         if (
-            save_in_flight_ref.current
-            || edit_session_pending
-            || preview_mode
-            || pending_excel_header_ref.current !== null
+            transform_request_blocked()
             || pending_transforms[active_sheet_index]
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
-        edit_session_pending,
         pending_transforms,
-        preview_mode,
+        transform_request_blocked,
     ]);
 
     const open_grid_filter_editor = useCallback((
@@ -2396,8 +2417,9 @@ export function App(): React.JSX.Element {
         // A cancel the host would refuse must not displace the request it is
         // cancelling: request_transform overwrites the pending requestId, so the
         // original in-flight response would stop matching and the webview would sit
-        // on a stale generation. Same admission set as handle_transform_change.
-        if (save_in_flight_ref.current) return;
+        // on a stale generation. That is why a cancel asks the same question every
+        // other transform request asks — see `transform_request_blocked`.
+        if (transform_request_blocked()) return;
         const previous = transform_rollback_baseline(
             sheet_views[active_sheet_index],
             state_ref.current.transforms?.[active_sheet_index],
@@ -2418,6 +2440,7 @@ export function App(): React.JSX.Element {
         meta,
         request_transform,
         sheet_views,
+        transform_request_blocked,
     ]);
 
     useEffect(() => {

@@ -6740,7 +6740,11 @@ describe('refused transforms', () => {
         // The spinner and its label must not stick.
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
         expect(document.querySelector('.toolbar-progress')).toBeNull();
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+        // Silently, because this is a restore: nobody asked for it, the effect below
+        // asks again by itself, and there is nothing for the user to do meanwhile.
+        // The warning for a refusal the user did provoke is asserted in 'drops a
+        // transiently refused user request instead of queueing it'.
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
             type: 'showWarning',
         }));
 
@@ -6802,6 +6806,10 @@ describe('refused transforms', () => {
         expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        // And it warns, even though this is a restore nobody asked for. The transient
+        // case above is silent because the effect will ask again; here nothing will,
+        // so the saved view is being abandoned and the user is entitled to know that
+        // the sheet they open next will not look the way their file remembers.
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'showWarning',
         }));
@@ -7078,21 +7086,22 @@ describe('a refused restore in a sibling panel', () => {
 
     it('is not repeated while the blocker is unchanged', async () => {
         const { post_message, request } = await restore_refused_by_the_owner();
-        // One ask, one warning: the refusal that has already happened.
+        // One ask, and no warning at all: a transiently refused restore is nothing
+        // the user did and nothing they can act on. The latch is about the *ask*.
         expect(transform_requests(post_message)).toHaveLength(1);
-        expect(warnings(post_message)).toHaveLength(1);
+        expect(warnings(post_message)).toHaveLength(0);
 
         for (let commit = 0; commit < 2; commit += 1) {
             await owner_commits_an_edit(NOT_EDITABLE);
-            // The host would refuse a repeat too, so a repeat costs another warning
-            // here exactly as it does in the real thing.
+            // The host would refuse a repeat too, so answer one the same way it
+            // would, exactly as in the real thing.
             const latest = transform_requests(post_message).at(-1)!;
             if (latest.requestId !== request.requestId) await refuse(latest);
         }
 
-        // Nothing about the refusal changed, so the ask is not repeated and — the
-        // user-visible part — no further global warning is raised.
-        expect(warnings(post_message)).toHaveLength(1);
+        // Nothing about the refusal changed, so the ask is not repeated — and the
+        // user still hears nothing about any of it.
+        expect(warnings(post_message)).toHaveLength(0);
         expect(transform_requests(post_message)).toHaveLength(1);
     });
 

@@ -63,6 +63,30 @@ export class InvalidPersistedTransformError extends Error {
 }
 
 /**
+ * The commit-time admission re-ask refused: the edit phase moved under a transform
+ * that was already in flight. Its own type rather than a message string because the
+ * two ways `onTransformCommit` can fail want opposite answers — every phase that
+ * refuses here ends on its own, so this is transient and the request is worth
+ * asking again, while a genuine persistence failure is terminal. Discriminating on
+ * the type is the same shape `InvalidPersistedTransformError` already uses, and it
+ * is what keeps the catch blocks from having to read message text.
+ */
+export class TransformAdmissionLapsedError extends Error {
+    constructor(readonly refusal: string) {
+        super(refusal);
+        this.name = 'TransformAdmissionLapsedError';
+    }
+}
+
+/**
+ * Whether a refusal clears on its own. Named rather than boolean, and required at
+ * every refusal site: the previous `transient = false` default meant a site that
+ * simply forgot to say became terminal, which is how an admission lapse — a phase
+ * that ends by itself — came to be delivered as "stop asking".
+ */
+export type TransformRefusalDisposition = 'transient' | 'terminal';
+
+/**
  * Gives the host authority layer a chance to durably recover a failed restore.
  * `true` means the invalid candidate was replaced or superseded by a newer winner.
  */
@@ -787,6 +811,7 @@ export class ViewerPanelCore {
             await this.post_transform_refusal(
                 msg,
                 `Sheet index ${msg.sheetIndex} is out of range.`,
+                'terminal',
                 receiver_epoch,
             );
             return;
@@ -795,6 +820,7 @@ export class ViewerPanelCore {
             await this.post_transform_refusal(
                 msg,
                 'The source changed before this table view request arrived.',
+                'terminal',
                 receiver_epoch,
             );
             return;
@@ -806,6 +832,7 @@ export class ViewerPanelCore {
             await this.post_transform_refusal(
                 msg,
                 'The saved table view no longer matches this sheet.',
+                'terminal',
                 receiver_epoch,
             );
             return;
@@ -853,11 +880,16 @@ export class ViewerPanelCore {
                 );
             } catch (error) {
                 if (!source_request_is_current()) return;
-                // Persisting the cancel failed, so nothing changed and nothing will
-                // change by asking again.
+                // Two failures, opposite answers. A lapsed commit admission means an
+                // edit phase moved under this request and will move back, so asking
+                // again is precisely what fixes it. Any other persistence failure
+                // changed nothing and will change nothing by being repeated.
                 await this.post_transform_refusal(
                     msg,
                     error instanceof Error ? error.message : String(error),
+                    error instanceof TransformAdmissionLapsedError
+                        ? 'transient'
+                        : 'terminal',
                     receiver_epoch,
                 );
             } finally {
@@ -962,9 +994,16 @@ export class ViewerPanelCore {
                     receiver_epoch,
                 );
             } else {
+                // As in the equal-state arm above: a lapsed commit admission is a
+                // phase that ends on its own, so the request stays retriable, while a
+                // validation or persistence failure is terminal and repeating it only
+                // fails again.
                 await this.post_transform_refusal(
                     msg,
                     error instanceof Error ? error.message : String(error),
+                    error instanceof TransformAdmissionLapsedError
+                        ? 'transient'
+                        : 'terminal',
                     receiver_epoch,
                 );
             }
@@ -976,20 +1015,21 @@ export class ViewerPanelCore {
     }
 
     /**
-     * `transient` says the refusal will clear on its own and the request is worth
-     * retrying; the default is a terminal validation refusal, which the webview
-     * answers by keeping the view it already has and not asking again.
+     * `'transient'` says the refusal will clear on its own and the request is worth
+     * retrying; `'terminal'` is a validation refusal, which the webview answers by
+     * keeping the view it already has and not asking again. The caller must say
+     * which — see `TransformRefusalDisposition`.
      */
     reject_transform(
         msg: SetTransformMessage,
         error: string,
-        transient = false,
+        disposition: TransformRefusalDisposition,
     ): Promise<boolean> {
         return this.post_transform_refusal(
             msg,
             error,
+            disposition,
             this.receiver_epoch,
-            transient,
         );
     }
 
@@ -997,12 +1037,15 @@ export class ViewerPanelCore {
      * Nothing changed, so nothing about the view is sent. The refusal deliberately
      * cannot describe a state, a generation or a row count — a refusal that could
      * would be adopted as one, which is the bug class this split removes.
+     *
+     * `disposition` sits ahead of `receiver_epoch` so it can be required: the choice
+     * between "ask again" and "give up" is never a sensible default.
      */
     private post_transform_refusal(
         msg: SetTransformMessage,
         reason: string,
+        disposition: TransformRefusalDisposition,
         receiver_epoch = this.receiver_epoch,
-        transient = false,
     ): Promise<boolean> {
         return this.post({
             type: 'transformRefused',
@@ -1010,7 +1053,7 @@ export class ViewerPanelCore {
             requestId: msg.requestId,
             intent: msg.intent,
             reason,
-            terminal: !transient,
+            terminal: disposition === 'terminal',
         }, receiver_epoch);
     }
 

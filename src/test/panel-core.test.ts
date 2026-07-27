@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
     InvalidPersistedTransformError,
+    TransformAdmissionLapsedError,
     ViewerPanelCore,
     adopt_source_into_core,
     transform_states_equal,
@@ -1613,6 +1614,127 @@ describe('ViewerPanelCore', () => {
                 basis: expect.objectContaining({ generation }),
             }),
         }));
+    });
+
+    describe('a commit the host would not make', () => {
+        // Two ways `onTransformCommit` can fail, and they want opposite answers. The
+        // admission the controller re-asks at the commit boundary is an edit-session
+        // phase — a sibling claiming, releasing, or holding the session — and every
+        // one of them ends by itself, so the request is worth asking again. Anything
+        // else that stops the write is a currency or persistence failure that
+        // repeating cannot fix. Before this discrimination existed both arrived as a
+        // plain `Error` and the refusal defaulted to terminal, so a lapse told the
+        // webview to stop retrying and the user's transform was abandoned when the
+        // very next attempt would have succeeded.
+        const SORT: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        };
+
+        function refusal(posted: any[], request_id: string) {
+            return posted.find((message) => (
+                message.type === 'transformRefused'
+                && message.requestId === request_id
+            ));
+        }
+
+        /** Fails only the requests named `failing-…`, so a setup install still lands. */
+        function core_whose_commit_throws(error: Error) {
+            const { panel, posted } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                onTransformCommit: async (message) => {
+                    if (message.requestId.startsWith('failing')) throw error;
+                },
+            });
+            return { core, posted };
+        }
+
+        async function ask(
+            core: ViewerPanelCore,
+            request_id: string,
+            intent: 'user' | 'cancel',
+        ) {
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId: request_id,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent,
+                state: SORT,
+            });
+        }
+
+        it('answers a lapsed commit admission with a transient refusal', async () => {
+            const { core, posted } = core_whose_commit_throws(
+                new TransformAdmissionLapsedError('Another panel is editing this file.'),
+            );
+
+            await ask(core, 'failing-user', 'user');
+
+            expect(refusal(posted, 'failing-user')).toMatchObject({
+                terminal: false,
+                reason: 'Another panel is editing this file.',
+            });
+            // A refusal is not an install: nothing was adopted locally either.
+            expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
+        });
+
+        it('answers a failed durable write with a terminal refusal', async () => {
+            const { core, posted } = core_whose_commit_throws(
+                new Error('The source changed before this table view could be saved.'),
+            );
+
+            await ask(core, 'failing-user', 'user');
+
+            expect(refusal(posted, 'failing-user')).toMatchObject({
+                terminal: true,
+                reason: 'The source changed before this table view could be saved.',
+            });
+            expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
+        });
+
+        /**
+         * The other arm. A Cancel whose rules the core already holds skips
+         * `compute_transform` entirely and still has to commit — durably, so a
+         * close/reopen cannot resurrect the cancelled restore — so it has a second
+         * catch block, and the two must agree because the same lapse reaches either.
+         * (A `restore` never gets here: `persist_transform_commit` returns for it
+         * before any write, so its commit cannot fail at all.)
+         */
+        async function equal_state_cancel(error: Error) {
+            const { core, posted } = core_whose_commit_throws(error);
+            await ask(core, 'install', 'user');
+            posted.length = 0;
+            await ask(core, 'failing-cancel', 'cancel');
+            return { core, posted };
+        }
+
+        it('keeps an equal-state commit retriable when the admission lapsed', async () => {
+            const { core, posted } = await equal_state_cancel(
+                new TransformAdmissionLapsedError(
+                    'Finishing edit-session work; try again in a moment.',
+                ),
+            );
+
+            expect(refusal(posted, 'failing-cancel')).toMatchObject({
+                terminal: false,
+                reason: 'Finishing edit-session work; try again in a moment.',
+            });
+            // The install that preceded it stands; a refused commit changes nothing.
+            expect(core.transform_state(0)).toEqual(SORT);
+        });
+
+        it('abandons an equal-state commit whose durable write failed', async () => {
+            const { posted } = await equal_state_cancel(
+                new Error('The source changed before this table view could be saved.'),
+            );
+
+            expect(refusal(posted, 'failing-cancel')).toMatchObject({
+                terminal: true,
+            });
+        });
     });
 
 });
