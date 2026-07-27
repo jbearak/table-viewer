@@ -717,6 +717,7 @@ describe('the setRowHeights host handler', () => {
         const panel = open_csv_table(store);
         const initial = await ready(panel);
         coordinator = acquire_file_coordinator(file_path);
+        let save: Promise<unknown> | undefined;
         try {
             const deliveries_before = messages_of(panel, 'workbookSnapshot').length;
             // A CSV save takes an authority turn and calls `start_finalization` before
@@ -728,7 +729,7 @@ describe('the setRowHeights host handler', () => {
             const edit_session_id = messages_of(panel, 'editSessionResult')
                 .at(-1)!.editSessionId!;
             park_when_finalizing = true;
-            const save = panel.__receive({
+            save = panel.__receive({
                 type: 'saveCsv',
                 operation: {
                     editSessionId: edit_session_id,
@@ -759,6 +760,10 @@ describe('the setRowHeights host handler', () => {
             expect(state.get_state(file_path).rowHeights?.[0]).toBeUndefined();
         } finally {
             parked?.();
+            // Awaited here as well as in the body: an assertion that throws above skips
+            // the `await save`, and the save would then reject into no one — Vitest
+            // reports that as an unhandled error and it buries the real failure.
+            await save?.catch(() => {});
             coordinator.dispose();
         }
     });
