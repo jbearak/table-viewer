@@ -64,6 +64,30 @@ describe('build_theme_from_vars', () => {
         expect(theme.baseFontStyle).toBe('13px');
         expect(theme_font_size_px({})).toBe(13);
     });
+
+    it('clamps an opaque selection background to the translucent fill alpha', () => {
+        // Dark+ ships #264f78 opaque; Glide's blend() would let it *replace*
+        // the cell background, hiding highlights and edit tints under selection.
+        const theme = build_theme_from_vars((name) =>
+            name === '--vscode-editor-selectionBackground' ? '#264f78' : ''
+        );
+        expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.35)');
+    });
+
+    it('uses a stronger selection fill alpha in high contrast', () => {
+        const theme = build_theme_from_vars(
+            (name) => name === '--vscode-editor-selectionBackground' ? '#264f78' : '',
+            true,
+        );
+        expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.5)');
+    });
+
+    it('falls back to the default selection fill when the variable is unparseable', () => {
+        const theme = build_theme_from_vars((name) =>
+            name === '--vscode-editor-selectionBackground' ? 'color-mix(in srgb, red, blue)' : ''
+        );
+        expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.35)');
+    });
 });
 
 describe('build_edit_tints_from_vars', () => {

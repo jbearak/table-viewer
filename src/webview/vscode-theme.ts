@@ -69,6 +69,21 @@ export function parse_font_size_px(
 const DIRTY_TINT_ALPHA = 0.16;
 const CONFLICT_TINT_ALPHA = 0.22;
 
+/** Alpha the selection fill (`accentLight`) is clamped to, replacing whatever
+ *  alpha `--vscode-editor-selectionBackground` carried. The shipped themes emit
+ *  it as opaque hex, and Glide's `blend()` returns an opaque color unchanged —
+ *  the selection fill would *replace* the cell background instead of tinting
+ *  it, hiding cell highlights and the dirty/conflict tints inside a selection.
+ *  Translucency of the selection fill is an invariant of the grid: any cell
+ *  background (`themeOverride.bgCell`) must stay readable while selected.
+ *  High contrast gets a stronger fill, mirroring highlight-theme.ts. */
+const SELECTION_TINT_ALPHA = 0.35;
+const SELECTION_TINT_ALPHA_HIGH_CONTRAST = 0.5;
+
+/** Fallback when `--vscode-editor-selectionBackground` is unset or unparseable
+ *  (Dark+'s #264f78 at the clamped alpha). */
+export const SELECTION_BG_FALLBACK = 'rgba(38, 79, 120, 0.35)';
+
 /** The historical hard-coded tints, now the fallback for hosts (the VS Code
  *  webview) where the source variables may be unset. Both round-trip through
  *  `tint_from_color` to themselves. */
@@ -156,14 +171,21 @@ export function build_edit_tints_from_vars(get: VarGetter): GridEditTints {
     };
 }
 
-export function build_theme_from_vars(get: VarGetter): Partial<Theme> {
+export function build_theme_from_vars(
+    get: VarGetter,
+    high_contrast = false,
+): Partial<Theme> {
     const v = var_reader(get);
 
     const editor_bg = v('--vscode-editor-background', '#1e1e1e');
     const editor_fg = v('--vscode-editor-foreground', '#d4d4d4');
     const accent = v('--vscode-focusBorder', '#0e639c');
     const accent_fg = v('--vscode-list-activeSelectionForeground', '#ffffff');
-    const accent_light = v('--vscode-editor-selectionBackground', 'rgba(14, 99, 156, 0.25)');
+    const accent_light = tint_from_color(
+        v('--vscode-editor-selectionBackground', SELECTION_BG_FALLBACK),
+        high_contrast ? SELECTION_TINT_ALPHA_HIGH_CONTRAST : SELECTION_TINT_ALPHA,
+        SELECTION_BG_FALLBACK,
+    );
     const header_bg = v('--vscode-editorGroupHeader-tabsBackground', editor_bg);
     const hover_bg = v('--vscode-list-hoverBackground', header_bg);
     const border = v('--vscode-editorWidget-border', v('--vscode-panel-border', '#454545'));
@@ -235,10 +257,11 @@ function read_vscode_grid_theme(
 ): VscodeGridTheme {
     const style = getComputedStyle(root);
     const get: VarGetter = (name) => style.getPropertyValue(name);
+    const high_contrast = is_vscode_high_contrast(body);
     return {
-        theme: build_theme_from_vars(get),
+        theme: build_theme_from_vars(get, high_contrast),
         ...build_edit_tints_from_vars(get),
-        highContrast: is_vscode_high_contrast(body),
+        highContrast: high_contrast,
     };
 }
 
