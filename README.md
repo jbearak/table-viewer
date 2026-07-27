@@ -1,24 +1,22 @@
 # Table Viewer
 
-Fast, full-featured viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files, available as a standalone desktop app and a VS Code extension, with persistent layouts, sorting, filtering, and auto-refresh.
+A fast viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files, built for *reading* tables — reviewing, exploring, and annotating them — rather than authoring spreadsheets. Available as a standalone desktop app and a VS Code extension, with persistent layouts, view-only sorting and filtering, and auto-refresh.
 
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
 ## Why
 
-If you work with scripts that output tables — R, Stata, Python, or anything else — you've probably dealt with the friction of viewing those results. You rerun your script, but your viewer doesn't refresh. Or it does, but you lose your scroll position, your column widths, and the worksheet tab you were looking at. You resize columns again, or you go back to encoding widths in your script — tedious and imprecise.
+When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step. Iterating on a generated workbook means closing the file, reopening it, and finding your place again on every rerun — redoing highlights, column widths, and the rest each time:
 
-Existing solutions were slow, didn't work the way I wanted, or both. I wanted a viewer that:
+- **They're slow to open**, and every time a script re-outputs a file there are extra steps to get back to what you were looking at. Table Viewer opens fast, auto-refreshes when the file changes on disk, and keeps your scroll position, column widths, hidden columns, sorts, filters, and active sheet — across reloads and across sessions.
+- **Sorting, filtering, and hiding modify the worksheet.** When you're reviewing output, the last thing you want is to change it. In Table Viewer these are view-only transforms: the file on disk is never touched, and there's no extra step to turn a range into a sortable/filterable list — every column already is one.
+- **You can't easily control how files open.** Typeface, font size, colors — Table Viewer lets you set all of these in Preferences once, and every sheet you ever open respects them, so files are legible the moment they open.
+- **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full contents in a tooltip on hover.
+- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement without modifying the file.
+- **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
+- **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
 
-- **Auto-refreshes** when the file changes on disk, without losing my place
-- **Remembers layout** — column widths, row heights, hidden columns, scroll position, and active sheet — across reloads and sessions
-- **Lets me explore results** — promote headers, sort and filter rows, and hide irrelevant columns — without changing the underlying file
-- **Lets me toggle formatting** so I can see raw values (`3.14159265358979`) or formatted output (`3.14`) with one click
-- **Lives in VS Code** so it works the same whether I'm local or on a remote host via SSH
-- **Uses VS Code's theme** so it doesn't look out of place
-- **Shows CSV/TSV files two ways** — as a standalone table, or as a synced side-by-side preview alongside the source text
-
-Table Viewer is the result.
+The flip side is that Table Viewer is deliberately *not* a spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting — Excel workbooks are strictly read-only, and CSV/TSV editing is limited to the cells the file already has. That constraint is the point: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
 
 ## Features
 
