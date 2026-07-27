@@ -1032,6 +1032,13 @@ describe('ViewerPanelCore', () => {
 
                 expect(core.generation).toBeGreaterThan(generation_before);
                 expect(core.mapping_generation(0)).toBe(mapping_before);
+                // And the projection the held generation now licenses the memo to reuse is
+                // the right one. Holding the generation is only safe because absent →
+                // absent leaves display↔source as the identity on both sides; if that were
+                // ever untrue the memo would serve a stale projection and nothing else
+                // here would notice.
+                expect(core.snapshot_material().core.rowHeightProjection[0])
+                    .toEqual({ 1: 44 });
             });
 
             it('moves a sheet\'s mapping generation when an install does permute', async () => {
