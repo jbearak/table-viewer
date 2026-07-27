@@ -432,7 +432,15 @@ export class ViewerPanelCore {
 
     /** Clone and freeze all source-owned material needed by a future snapshot. */
     snapshot_material(): ViewerPanelSnapshotMaterial {
-        return deep_clone_and_freeze({
+        // Sampled in the same statement as everything below, which is what the adjacency
+        // arguments on the two fields require; it is only lifted out of the literal so it
+        // can bypass `deep_clone_and_freeze`. It is already deeply frozen at its source
+        // (`compute_row_height_projection`), so sharing it lets no mutable object escape,
+        // and it is the one field where the copy is not free: a pre-cap legacy map can hold
+        // hundreds of thousands of entries and this runs on every delivery. See
+        // `row_height_projection_by_sheet` for the residual per-delivery cost.
+        const rowHeightProjection = this.row_height_projection_by_sheet();
+        const cloned = deep_clone_and_freeze({
             core: {
                 generation: this._generation,
                 sourceGeneration: this._source_generation,
@@ -447,19 +455,22 @@ export class ViewerPanelCore {
                 // projected capabilities instead they would be sampled at a
                 // different moment and could name another permutation's rows.
                 hiddenEditedCellKeys: this.hidden_edited_cell_keys_by_sheet(),
-                // Immediately beside the keys above because it needs the identical
-                // argument and nothing weaker. Both are display-space answers about one
-                // specific permutation, so both are safe only if read in the same instant
-                // as the generation that identifies it. The consequence of getting it
-                // wrong differs, though, and the height projection's is worse: stale
-                // hidden keys over-report unsaved work the user can actually see, while a
-                // projection read against another permutation renders every custom height
-                // on a different row, silently and durably-looking.
-                rowHeightProjection: this.row_height_projection_by_sheet(),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,
             },
+        });
+        return Object.freeze({
+            // Immediately beside the keys above because it needs the identical
+            // argument and nothing weaker. Both are display-space answers about one
+            // specific permutation, so both are safe only if read in the same instant
+            // as the generation that identifies it. The consequence of getting it
+            // wrong differs, though, and the height projection's is worse: stale
+            // hidden keys over-report unsaved work the user can actually see, while a
+            // projection read against another permutation renders every custom height
+            // on a different row, silently and durably-looking.
+            core: Object.freeze({ ...cloned.core, rowHeightProjection }),
+            diagnostics: cloned.diagnostics,
         });
     }
 
@@ -833,10 +844,11 @@ export class ViewerPanelCore {
         // that distinction today.
         //
         // Frozen because the memo below hands the identical object to every reader until
-        // its key changes. A caller that mutated what it got back would be editing the
+        // its key changes, and both readers publish it *by reference*: `snapshot_material`
+        // lifts it out of `deep_clone_and_freeze`, and `transform_installed_ack` posts the
+        // object itself. A caller that mutated what it got back would be editing the
         // cache, and the mutation would then show up on unrelated later deliveries. The
-        // snapshot path clones on the way out and would not have noticed;
-        // `transform_installed_ack` posts the object itself and would.
+        // freeze is what makes sharing it safe rather than merely cheap.
         return projection && Object.freeze(projection);
     }
 
@@ -860,6 +872,16 @@ export class ViewerPanelCore {
      * does nothing about a per-delivery walk over what is already there. Recomputing that
      * on every scroll-triggered delivery is the cost the memo removes; without it the
      * bound is a bound on nothing.
+     *
+     * The memo is only worth having if the delivery path stops copying what it returns, so
+     * it does: `snapshot_material` shares this frozen value by reference, and
+     * `build_workbook_snapshot` passes it through untouched. What remains per delivery for
+     * a pathological pre-cap legacy map is exactly *one* structured clone — the
+     * `postMessage` to the webview, which no host-side change can avoid. That is **below**
+     * the pre-PR baseline rather than merely level with it: before this PR the same map
+     * crossed the bridge as `state.rowHeights` on every delivery, and that field is no
+     * longer sent at all (see `NormalizedPerFileState`). One copy replaces one copy, and
+     * the walk that produced it is now memoized.
      *
      * The key is exactly the pair the answer is a function of. `generation` covers the
      * permutation half — every install and every `adopt_source` bumps it, and those are

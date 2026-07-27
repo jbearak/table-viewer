@@ -11,6 +11,7 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
 import {
+    MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
@@ -2496,6 +2497,52 @@ describe('GridShell stable rows during an edit session', () => {
             [{ start: 0, end: 0 }],
             expected_grown_height,
         );
+    });
+
+    it('caps auto-grow at the ceiling and stops re-posting once it is reached', async () => {
+        // `natural_row_height` is `lines * line_height + padding`, unbounded in the number
+        // of hard newlines a cell holds — so this path, not a malformed message, is the
+        // realistic way to reach an absurd height. It is also the path where an unclamped
+        // height does more than persist a silly number: the comparison guarding this post
+        // is against the *stored* height, which is clamped, so an unclamped `needed` stays
+        // strictly greater forever and re-posts a resize on every single edit commit to
+        // that row — each one a no-op the host now answers with a delivery.
+        //
+        // Both halves in one case because they are one behaviour: the value posted is the
+        // ceiling, and a row already sitting at the ceiling posts nothing at all.
+        const huge = 'x\n'.repeat(5_000);
+        expect(natural_row_height(huge, line_height_for_font(13)))
+            .toBeGreaterThan(MAX_ROW_HEIGHT_PX);
+        const display_to_source = [1, 3, 0, 2];
+
+        const from_default = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [] },
+            { on_row_resize: from_default },
+        ));
+        await act(async () => (grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void
+        )([0, 0], { kind: 'text', data: huge }));
+
+        expect(from_default).toHaveBeenCalledWith(
+            [{ start: 0, end: 0 }],
+            MAX_ROW_HEIGHT_PX,
+        );
+
+        const already_capped = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [] },
+            { on_row_resize: already_capped, row_heights: { 0: MAX_ROW_HEIGHT_PX } },
+        ));
+        await act(async () => (grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void
+        )([0, 0], { kind: 'text', data: huge }));
+
+        expect(already_capped).not.toHaveBeenCalled();
     });
 });
 

@@ -482,7 +482,11 @@ describe('CSV edit sessions', () => {
 
         expect(sheet_meta_count(panel)).toBe(before + 1);
         expect(latest_snapshot(panel).identity.stateRevision).toBe(6);
-        expect(latest_snapshot(panel).state.rowHeights).toEqual([{ 0: 29 }]);
+        // Read through the *projection* rather than `state.rowHeights`, which the wire no
+        // longer carries (see `NormalizedPerFileState`). The marker still says the same
+        // thing — the winning read is the one whose content was delivered — and it now also
+        // pins that the durable-height latch followed that read rather than the failed one.
+        expect(latest_snapshot(panel).rowHeightProjection).toEqual([{ 0: 29 }]);
         vi.useRealTimers();
     });
 
@@ -630,7 +634,11 @@ describe('CSV edit sessions', () => {
         const replay = latest_snapshot(panel);
         expect(replay.identity.stateRevision).toBe(2);
         expect(replay.state.columnWidths).toEqual([{ 0: 166 }]);
-        expect(replay.state.rowHeights).toEqual([{ 0: 41 }]);
+        // The peer's height leaf survived this panel's layout write. Observed through the
+        // projection, because `state.rowHeights` is no longer on the wire (see
+        // `NormalizedPerFileState`) — the durable map is still there, which is what the
+        // projection having an entry proves.
+        expect(replay.rowHeightProjection).toEqual([{ 0: 41 }]);
     });
 
     it('derives initial intent from the exact ACK and preserves unseen peer layout', async () => {

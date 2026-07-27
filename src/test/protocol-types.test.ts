@@ -111,9 +111,11 @@ describe('paginated protocol message shapes', () => {
                 meta,
                 hiddenEditedCellKeys: [[]],
                 rowHeightProjection: [undefined],
+                // No `rowHeights`: `NormalizedPerFileState` omits it, so the durable
+                // source-keyed map has no place on the wire and `rowHeightProjection`
+                // above is the only height fact a delivery carries.
                 state: {
                     columnWidths: [],
-                    rowHeights: [],
                     scrollPosition: [],
                     activeSheetIndex: 0,
                     tabOrientation: null,

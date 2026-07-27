@@ -20,7 +20,7 @@ import {
     type StoredPerFileState,
     type WebviewMessage,
 } from '../types';
-import { MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
+import { MAX_ROW_HEIGHT_PX, MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import {
     acquire_file_coordinator,
@@ -209,6 +209,25 @@ describe('the setRowHeights host handler', () => {
             .toEqual({ 0: MIN_ROW_HEIGHT_PX }));
     });
 
+    it('clamps a height above the ceiling before anything durable is written', async () => {
+        // The floor's counterpart, and not merely for symmetry. Persisted unclamped, a row
+        // taller than any viewport leaves the user no bottom edge on screen to drag it back
+        // by — and the value is reachable without a malformed message, because multiline
+        // auto-grow derives a height from the number of hard newlines in a cell and that is
+        // unbounded. Clamped host-side as well as in the webview, since the host is the
+        // only writer and is what a future webview build would be measured against.
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+
+        await resize(panel, initial, [{ start: 0, end: 0 }], 1e12);
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: MAX_ROW_HEIGHT_PX }));
+        await vi.waitFor(() => expect(latest_projection(panel))
+            .toEqual([{ 0: MAX_ROW_HEIGHT_PX }]));
+    });
+
     it('ignores a stale generation, writing nothing and replaying nothing', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
@@ -346,7 +365,6 @@ describe('the setRowHeights host handler', () => {
         await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
             .toEqual({ 0: 44 }));
         const revision = state.revision(file_path);
-        const deliveries = messages_of(panel, 'workbookSnapshot').length;
 
         // A drag that ends where it started reports its final size like any other.
         await resize(panel, initial, [{ start: 0, end: 0 }], 44);
@@ -354,9 +372,73 @@ describe('the setRowHeights host handler', () => {
 
         await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
             .toEqual({ 0: 44, 1: 55 }));
-        // One revision and one delivery for the second request, none for the no-op.
+        // One revision for the second request, none for the no-op.
         expect(state.revision(file_path)).toBe(revision + 1);
-        expect(messages_of(panel, 'workbookSnapshot').length).toBe(deliveries + 1);
+    });
+
+    it('acknowledges a no-op resize with the freshly read projection', async () => {
+        // A no-op is a *success* that writes nothing, and silence is not an acceptable
+        // answer to it. The webview has already appended an optimistic layer, and a layer
+        // is only dropped by a delivered projection that agrees with it
+        // (`row_height_layers_for_delivery`) — so an unanswered no-op leaves the layer
+        // masking whatever the projection later says, for the rest of the generation.
+        //
+        // Not a hypothetical, because "the height is already durable" is exactly what a
+        // sibling panel's write makes true behind this panel's back: durable heights move
+        // with no generation bump, so this panel can be holding a stale projection while
+        // the user drags a row to precisely the value another panel just persisted.
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+        // Written straight into durable state rather than through this panel, which is
+        // what makes the resize below a no-op *against a projection this panel has never
+        // been delivered* — the sibling-write shape, not a repeat of its own drag.
+        const committed = await state.store.compare_and_set(
+            file_path,
+            state.revision(file_path),
+            { ...state.get_state(file_path), rowHeights: [{ 1: 44 }] },
+        );
+        expect(committed.type).toBe('committed');
+        const revision = state.revision(file_path);
+        const deliveries = messages_of(panel, 'workbookSnapshot').length;
+        expect(latest_projection(panel)).toEqual([undefined]);
+
+        await resize(panel, initial, [{ start: 1, end: 1 }], 44);
+
+        // A delivery, carrying the height the file already held — which is what lets the
+        // webview retire its layer — and no durable write.
+        await vi.waitFor(() => {
+            expect(messages_of(panel, 'workbookSnapshot').length)
+                .toBeGreaterThan(deliveries);
+            expect(latest_projection(panel)).toEqual([{ 1: 44 }]);
+        });
+        expect(state.revision(file_path)).toBe(revision);
+    });
+
+    it('does not acknowledge a refusal, only a no-op success', async () => {
+        // The distinction the no-op acknowledgement must not blur. A write refused on the
+        // accumulated-map bound also returns no committed snapshot, and it must stay
+        // unanswered: nothing was persisted, so no projection could agree with the layer,
+        // and the deliberate residue is that the layer stands until the generation moves
+        // (reasoned out in full at `row_height_layers_for_delivery`). Acknowledging it
+        // would deliver a projection that *disagrees*, which is the one thing the webview
+        // reads as "not yet answered" and would leave the layer in place anyway — while
+        // costing a delivery per refused drag.
+        const seeded: Record<number, number> = {};
+        for (let row = 10; row < 10 + MAX_PERSISTED_ROW_HEIGHTS + 50; row += 1) {
+            seeded[row] = 30;
+        }
+        const state = versioned_state_store({
+            rowHeights: [seeded],
+        } as StoredPerFileState);
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+        const deliveries = messages_of(panel, 'workbookSnapshot').length;
+
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+        await vi.waitFor(() => expect(warnings()).toEqual([ROW_HEIGHT_LIMIT_WARNING]));
+        expect(messages_of(panel, 'workbookSnapshot').length).toBe(deliveries);
     });
 
     it('rejects a malformed interval and a non-finite height', async () => {

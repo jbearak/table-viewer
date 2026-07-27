@@ -120,6 +120,7 @@ import {
 } from './highlight-selection-model';
 import { highlight_rgba } from './highlight-theme';
 import {
+    clamp_row_height,
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
@@ -1707,12 +1708,19 @@ export function GridShell({
             // did so just above, to key the edit) and deliberately does not: one
             // display→source mapper, host-side, is the invariant the design rests on.
             if (text.includes('\n')) {
-                const needed = natural_row_height(
+                // Clamped here, not only in `handle_row_resize`, because this comparison is
+                // the loop guard. `lines * line_height + padding` is unbounded in the
+                // number of hard newlines a cell holds, and the height that gets stored is
+                // clamped — so an unclamped `needed` would stay strictly greater than the
+                // stored height forever and re-post a resize on every single edit commit to
+                // that row, each one a no-op the host now answers with a delivery. Clamping
+                // makes the two sides of the comparison the same quantity.
+                const needed = clamp_row_height(natural_row_height(
                     text,
                     line_height_for_font(font_size_px),
                     undefined,
                     default_row_height,
-                );
+                ));
                 if (needed > resolved_row_height(
                     row_heights,
                     row_height_overlay,

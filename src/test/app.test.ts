@@ -729,9 +729,12 @@ function workbook_snapshot_message(
             // Likewise one entry per sheet, `undefined` by default: that is what the host
             // sends for a sheet with no custom row heights.
             rowHeightProjection: meta.sheets.map(() => undefined),
+            // No `rowHeights` in `state`, and that is not an omission: the field is
+            // `Omit`ted from `NormalizedPerFileState`, so a delivery cannot carry the
+            // durable source-keyed map at all. `rowHeightProjection` above is the only
+            // height fact that crosses to the webview.
             state: {
                 columnWidths: [],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 0,
                 tabOrientation: null,
@@ -919,7 +922,6 @@ describe('workbook snapshot hydration', () => {
             sourceGeneration: 7,
             state: {
                 columnWidths: [undefined, { 0: 155 }],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
@@ -972,7 +974,6 @@ describe('workbook snapshot hydration', () => {
             reason: 'fileReload',
             state: {
                 columnWidths: [undefined, { 0: 210 }],
-                rowHeights: [],
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'horizontal',
@@ -1005,7 +1006,7 @@ describe('workbook snapshot hydration', () => {
         meta.sheets[0].columnCount = 2;
         const message = workbook_snapshot_message(meta, {
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null, transforms: [],
                 columnVisibility: [{
                     hiddenColumns: [1, 9],
@@ -1126,7 +1127,7 @@ describe('workbook snapshot hydration', () => {
                 csvEditSessionId: 'test-edit-session',
             },
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
                 pendingEdits: authoritative,
                 transforms: [undefined],
@@ -1186,7 +1187,7 @@ describe('workbook snapshot hydration', () => {
                 sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
             },
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
                 transforms: [transform],
                 columnVisibility: [undefined],
@@ -1282,7 +1283,7 @@ describe('workbook snapshot hydration', () => {
         meta.sheets[0].columnCount = 2;
         const message = workbook_snapshot_message(meta, {
             state: {
-                columnWidths: [], rowHeights: [], scrollPosition: [],
+                columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null, transforms: [],
                 columnVisibility: [{
                     hiddenColumns: [1, 8],
@@ -1431,7 +1432,6 @@ describe('Excel first-row header toggle', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             rowHeightProjection: [{ 0: 44 }],
-            state: { rowHeights: [{ 0: 44 }] },
             generation: 4,
             sourceGeneration: 7,
         }));
@@ -1819,7 +1819,6 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(initial, {
             state: {
                 columnWidths: [undefined, { 0: 120 }],
-                rowHeights: [undefined, { 2: 40 }],
                 scrollPosition: [undefined, { top: 20, left: 5 }],
                 activeSheetIndex: 0,
                 tabOrientation: 'horizontal',
@@ -1832,12 +1831,12 @@ describe('Excel first-row header toggle', () => {
         const reloaded = make_meta(['People', 'Other']);
         reloaded.sheets[0] = excel_meta(false).sheets[0];
         await dispatch_host_message(refresh_snapshot_message(reloaded, {
-            // Heights reach the grid as the host's display-keyed projection; the durable
-            // map beside it is what a `stateChanged` echoes back, asserted below.
+            // Heights reach the grid as the host's display-keyed projection, and *only*
+            // as that: the durable source-keyed map is not on the wire at all, which the
+            // echoed `stateChanged` below is asserted to confirm.
             rowHeightProjection: [undefined, { 2: 77 }],
             state: {
                 columnWidths: [undefined, { 0: 222 }],
-                rowHeights: [undefined, { 2: 77 }],
                 scrollPosition: [undefined, { top: 300, left: 25 }],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
@@ -1872,10 +1871,16 @@ describe('Excel first-row header toggle', () => {
                     activeSheetIndex: 1,
                     tabOrientation: 'vertical',
                     columnWidths: [{ 2: 222 }, { 0: 222 }],
-                    rowHeights: [undefined, { 2: 77 }],
                     scrollPosition: [undefined, { top: 300, left: 25 }],
                 },
             });
+        // And no height leaf at all in what this panel echoes back. It was never sent
+        // one, so there is nothing for it to carry — the strongest form of "the webview
+        // cannot clobber a host-written height", one step past the missing patch leaf.
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'stateChanged')
+            .at(-1)!.state).not.toHaveProperty('rowHeights');
         await click_button('Other');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
             .toEqual({ 0: 222 });
@@ -1894,7 +1899,6 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(excel_meta(false), {
             state: {
                 columnWidths: [{ 0: 140 }],
-                rowHeights: [{ 2: 44 }],
                 scrollPosition: [{ top: 30, left: 5 }],
             },
             rowHeightProjection: [{ 2: 44 }],
@@ -1907,10 +1911,10 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
             state: {
                 columnWidths: [{ 0: 140 }],
-                // Unchanged, because a promotion renumbers no source row.
-                rowHeights: [{ 2: 44 }],
                 scrollPosition: [{ top: 30, left: 5 }],
             },
+            // The durable map behind this is unchanged, because a promotion renumbers no
+            // source row; only the display space it projects into moved.
             rowHeightProjection: [{ 1: 44 }],
             reason: 'excelHeader',
             commandResult: {
@@ -1923,22 +1927,19 @@ describe('Excel first-row header toggle', () => {
         }));
 
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 44 });
-        // And the durable copy this panel carries is untouched too, so the next
-        // `stateChanged` it posts for some other leaf cannot quietly erase the heights.
+        // And this panel carries no durable copy to erase: the next `stateChanged` it
+        // posts for some other leaf has no height leaf in it, because none was delivered.
         // The scroll offset beside it *is* cleared, which is the asymmetry: pixels down a
         // row layout the promotion changed have no key space in which they survive.
         await act(async () => {
             (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
         });
-        expect(post_message.mock.calls
+        const echoed = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'stateChanged')
-            .at(-1)).toMatchObject({
-                state: {
-                    rowHeights: [{ 2: 44 }],
-                    scrollPosition: [undefined],
-                },
-            });
+            .at(-1)!;
+        expect(echoed).toMatchObject({ state: { scrollPosition: [undefined] } });
+        expect(echoed.state).not.toHaveProperty('rowHeights');
     });
 
     it('does not persist a clean reload that has no authoritative state', async () => {
@@ -1947,7 +1948,6 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
                 columnWidths: [{ 0: 140 }],
-                rowHeights: [{ 2: 44 }],
                 scrollPosition: [{ top: 30, left: 5 }],
                 activeSheetIndex: 0,
                 tabOrientation: 'horizontal',
@@ -2002,7 +2002,6 @@ describe('Excel first-row header toggle', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             state: {
-                rowHeights: [{ 0: 44 }],
                 scrollPosition: [{ top: 100, left: 20 }],
             },
             generation: 1,
@@ -2025,7 +2024,6 @@ describe('Excel first-row header toggle', () => {
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
-                rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
@@ -2094,7 +2092,6 @@ describe('Excel first-row header toggle', () => {
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
-                rowHeights: [undefined],
                 scrollPosition: [undefined],
                 transforms: [undefined],
                 columnVisibility: [undefined],
@@ -2957,10 +2954,11 @@ describe('row height persistence', () => {
         await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1']), {
-                // The projection, not `state.rowHeights`: the durable map is keyed by
-                // canonical source row and the webview never renders from it.
+                // The projection is the only height carrier there is: the durable map is
+                // keyed by canonical source row, the webview never renders from it, and
+                // `NormalizedPerFileState` no longer even has a field for it. Display row
+                // 1 here is source row 2 on the host's side of that join.
                 rowHeightProjection: [{ 1: 44 }],
-                state: { rowHeights: [{ 2: 44 }] },
             })
         );
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({

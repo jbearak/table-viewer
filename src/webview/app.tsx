@@ -1371,11 +1371,11 @@ export function App(): React.JSX.Element {
                             active_sheet_index,
                             sheet_count,
                         );
-                        // `rowHeights` is no longer compared. A correction is a
-                        // `stateChanged` post, and heights are not a patch leaf any more,
-                        // so a difference there could produce nothing but an empty patch
-                        // — and there is no difference to find: this panel does not
-                        // sanitize or clear the delivered map, it only carries it.
+                        // `rowHeights` is not compared, and there is nothing left to
+                        // compare: the field is absent from `NormalizedPerFileState`, so
+                        // no delivery carries the durable map and this panel holds no copy
+                        // of it. Even if one arrived, heights are not a patch leaf any
+                        // more, so a difference could produce nothing but an empty patch.
                         correction_required = JSON.stringify({
                             scrollPosition: authoritative_state.scrollPosition,
                             transforms: authoritative_state.transforms,
@@ -1395,11 +1395,13 @@ export function App(): React.JSX.Element {
                             ...state_ref.current,
                             ...authoritative_state,
                             columnWidths: next_column_widths,
-                            // `rowHeights` rides in on the spread above and is never
-                            // written here or anywhere else: nothing reads this copy, and
-                            // with the patch leaf gone a `stateChanged` post cannot write
-                            // it either. It stays only because the delivered state is
-                            // adopted whole.
+                            // No `rowHeights` anywhere in here, and nothing to strip
+                            // either: the delivered state has no such field
+                            // (`NormalizedPerFileState` omits it), so the spread above
+                            // cannot bring one in and the `stateChanged` this ref feeds
+                            // cannot carry one out. The durable, source-keyed map lives
+                            // only on the host; this panel renders from
+                            // `rowHeightProjection`.
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
@@ -2925,7 +2927,8 @@ export function App(): React.JSX.Element {
      * and mapping display→source needs the permutation plus every source row, which
      * only the host has. It maps, clamps, caps and persists; the answer comes back as a
      * new projection. That also removes the last way this panel could clobber a
-     * host-written height, since `rowHeights` is no longer a `stateChanged` patch leaf.
+     * host-written height: `rowHeights` is no longer a `stateChanged` patch leaf, and the
+     * field is not even delivered, so there is no stale copy here to derive one from.
      */
     const handle_row_resize = useCallback(
         (rows: readonly DisplayRowInterval[], height: number) => {

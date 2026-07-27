@@ -72,6 +72,11 @@ describe('pure Excel header state planning', () => {
             excelFirstRowHeaders: { People: from },
             excelFirstRowHeaderActive: { People: from === 'on' },
             excelFirstRowHeaderVersion: 1,
+            // Post-migration state, which is the regime this case is about: heights are
+            // already canonical, so the toggle has nothing to re-key. The migration-owed
+            // regime is a separate case below — this path is the *second* writer of
+            // `excelFirstRowHeaderActive` and has to discharge the migration too.
+            rowHeightsVersion: 1,
             columnWidths: [{ 0: 120 }],
             rowHeights: [{ 0: 40 }],
             scrollPosition: [{ top: 80, left: 10 }],
@@ -104,6 +109,7 @@ describe('pure Excel header state planning', () => {
         // re-derives, so there is nothing here to invalidate. The scroll offset is a pixel
         // measurement of the layout this toggle changes, so it still goes.
         expect(plan.state.rowHeights).toEqual([{ 0: 40 }]);
+        expect(plan.state.rowHeightsVersion).toBe(1);
         expect(plan.state.scrollPosition).toEqual([undefined]);
         expect(plan.state.columnWidths).toEqual([{ 0: 120 }]);
         const new_schema = transform_schema_for_sheet(plan.newSheet);
@@ -305,6 +311,63 @@ describe('pure Excel header state planning', () => {
 
             expect(plan.changed).toBe(false);
             expect(plan.state).toBe(current);
+        });
+
+        it('is discharged by an explicit override too, not only by a candidate load', () => {
+            // The migration reads `excelFirstRowHeaderActive` to decide which row space the
+            // stored keys are in, and this path is the *second* writer of that fact. Left
+            // to move it without reconciling the heights, it destroys the evidence: a
+            // later `plan_excel_candidate_state` would read the newly-recorded
+            // `false`, conclude the keys were already canonical, and stamp
+            // `rowHeightsVersion` over a still-display-keyed map — every height on the
+            // sheet permanently off by one, with nothing left to detect it.
+            //
+            // Same fixture and same expected shift as the candidate case above, put
+            // through the override planner instead: display 0 and 3 under a row-0
+            // promotion are source 1 and 4.
+            const ds = source();
+            const plan = plan_excel_override_state(
+                previously_promoted([{ 0: 40, 3: 60 }]),
+                ds.planning_input(),
+                0,
+                'People',
+                'off',
+            )!;
+
+            expect(plan.state.rowHeights).toEqual([{ 1: 40, 4: 60 }]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+            // Keyed on the *previous* projection, which this toggle is switching off — the
+            // keys were written under the promotion, so inverting the unpromoted space
+            // (i.e. not shifting) is the wrong answer even though that is what the state
+            // will record a moment from now.
+            expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: false });
+        });
+
+        it('migrates every sheet when an override discharges the marker', () => {
+            // The marker is per *file*. Reconciling only the sheet being toggled and then
+            // stamping would declare every other sheet's display-keyed map canonical
+            // without having touched it — the same permanent off-by-one, on the sheets the
+            // user was not even looking at.
+            const base = source().planning_input();
+            const two_sheets = {
+                ...base,
+                sheets: [base.sheets[0], { ...base.sheets[0], name: 'Other' }],
+            };
+
+            const plan = plan_excel_override_state(
+                {
+                    excelFirstRowHeaderVersion: 1,
+                    excelFirstRowHeaderActive: { People: true, Other: true },
+                    rowHeights: [{ 0: 40 }, { 2: 70 }],
+                },
+                two_sheets,
+                0,
+                'People',
+                'off',
+            )!;
+
+            expect(plan.state.rowHeights).toEqual([{ 1: 40 }, { 3: 70 }]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
         });
     });
 

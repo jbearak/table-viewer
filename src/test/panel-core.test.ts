@@ -911,8 +911,8 @@ describe('ViewerPanelCore', () => {
             // The memo returns the identical object to every reader until its key
             // changes, so a reader that mutated what it got back would be editing the
             // cache and the edit would surface on unrelated later deliveries. The
-            // snapshot path clones on the way out and would never have noticed; the
-            // install ack posts the object itself.
+            // snapshot path publishes the object by reference too now, so both readers
+            // would have noticed; the freeze is what makes sharing it safe at all.
             const { core, sort } = projection_core();
             const installed = await sort('desc');
 
@@ -920,6 +920,28 @@ describe('ViewerPanelCore', () => {
                 (installed.rowHeights as Record<number, number>)[2] = 99;
             }).toThrow(TypeError);
             expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 2: 44 }]);
+        });
+
+        it('publishes the memoized projection by reference, not as a copy', () => {
+            // The memo only pays for itself if the delivery path stops copying what it
+            // returns, and `snapshot_material` used to hand the whole material through
+            // `deep_clone_and_freeze` — so a legacy select-all map was structured-cloned
+            // once per delivery and the memoized walk saved nothing on the path that
+            // matters. Identity is the only observable that separates a share from a copy
+            // (the *values* are equal either way, which is why the assertions above cannot
+            // see this), so identity is what this pins, on both levels of the shape.
+            const { core } = projection_core();
+
+            const first = core.snapshot_material().core.rowHeightProjection;
+            const second = core.snapshot_material().core.rowHeightProjection;
+
+            expect(second).toBe(first);
+            expect(second[0]).toBe(first[0]);
+            // And the rest of the material still keeps its clone-and-freeze contract:
+            // `meta` comes off the source afresh and must be an isolated frozen copy.
+            expect(core.snapshot_material().core.meta)
+                .not.toBe(core.snapshot_material().core.meta);
+            expect(Object.isFrozen(core.snapshot_material().core)).toBe(true);
         });
 
         // No test for "adoption does not serve a stale memo". Adoption bumps

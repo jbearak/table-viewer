@@ -439,14 +439,19 @@ export interface PerFileState {
      * (`WorkbookSnapshot.rowHeightProjection`) and per install
      * (`transformInstalled.rowHeights`) — rather than a storage one.
      *
-     * The host is the only writer. `rowHeights` is deliberately absent from
-     * `LayoutStatePatch`, joining `transforms`, `columnVisibility` and
+     * The host is the only writer, and the webview is not even a *reader*. This field
+     * is absent from `LayoutStatePatch`, joining `transforms`, `columnVisibility` and
      * `cellHighlights` as state a `stateChanged` message cannot touch — see
-     * `layout-state-patch.ts`. That is not tidiness: the webview cannot map
-     * display→source for a select-all resize (it has not loaded those rows), so if
-     * it could patch this leaf its only options would be to write display keys or
-     * to write nothing, and the first is the bug above. Writes arrive as
-     * `setRowHeights`, which the host maps and clamps.
+     * `layout-state-patch.ts` — and it is absent from `NormalizedPerFileState`, so no
+     * delivery carries it either. Neither absence is tidiness. The webview cannot map
+     * display→source for a select-all resize (it has not loaded those rows), so if it
+     * could patch this leaf its only options would be to write display keys or to write
+     * nothing, and the first is the bug above; and a copy it merely *held* would be a
+     * source-keyed map sitting beside the display-keyed projection it renders from,
+     * which is the confusion the re-keying exists to end. Not sending it is also
+     * strictly cheaper on the wire, which matters most exactly where it is largest: a
+     * pre-cap legacy select-all map. Writes arrive as `setRowHeights`, which the host
+     * maps and clamps.
      *
      * Existing persisted maps are *migrated*, not reinterpreted, and the
      * difference from `pendingEdits` is worth stating because the two arguments
@@ -469,7 +474,9 @@ export interface PerFileState {
      * and the old key space is not reliably reconstructible. Sheets with no active
      * promotion are already canonical and are left alone, CSV among them —
      * `rowCount === sourceRowCount` there and no promotion exists. See
-     * `plan_excel_candidate_state`.
+     * `plan_excel_candidate_state`, and `migrate_row_heights_for_file` for why the
+     * *other* writer of `excelFirstRowHeaderActive` — `plan_excel_override_state` — has
+     * to discharge the same pass rather than leave it to a later load.
      */
     rowHeights?: (Record<number, number> | undefined)[];
     scrollPosition?: (ScrollPosition | undefined)[];

@@ -31,10 +31,14 @@ export interface LayoutSheetPatch<T> {
  * (`PerFileState.rowHeights`) and the webview cannot map display→source for a
  * select-all resize, because those rows were never loaded — so the only map it could
  * ever offer here is display-keyed, which is the mis-keying the source-keyed design
- * exists to end. Worse, its copy would be a *stale* display-keyed map on every
- * same-basis refresh, and a leaf patch derived against it would delete the host's
- * entries. Removing the leaf makes that unreachable rather than merely discouraged; the
- * write path is `setRowHeights`, which the host maps and clamps.
+ * exists to end. Removing the leaf makes that unreachable rather than merely discouraged;
+ * the write path is `setRowHeights`, which the host maps and clamps.
+ *
+ * `NormalizedPerFileState` then goes one step further and omits the field outright, so
+ * `basis` and `incoming` below have no `rowHeights` to disagree about in the first place.
+ * The two defences are not redundant: the missing leaf is what stops a patch being
+ * derived, and the missing field is what stops the webview holding the stale map a patch
+ * would have been derived *from*.
  */
 export interface LayoutStatePatch {
     readonly columnWidths: readonly LayoutNumericMapPatch[];

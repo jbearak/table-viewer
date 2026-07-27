@@ -25,6 +25,29 @@ export const BASE_ROW_FONT_SIZE_PX = 13;
 export const MIN_ROW_HEIGHT_PX = 20;
 
 /**
+ * Ceiling for a row height, durable or optimistic.
+ *
+ * A corruption guard rather than a tuning knob, so the value is chosen to be unreachable by
+ * intent and reachable only by accident, and the two ends of that are both concrete.
+ *
+ * *Far above deliberate use.* A 4K display is 2160px tall, so a row at this bound is
+ * already close to twice a full-screen viewport — nothing a user drags a boundary to on
+ * purpose comes near it. The realistic way to reach it is not a malformed message but the
+ * multiline auto-grow path (`natural_row_height`, `lines * line_height + padding`), which
+ * needs roughly 227 hard newlines in one cell to get here; a row showing 227 lines is not
+ * a table row anyone reads, so clamping there loses nothing either.
+ *
+ * *Far below where the arithmetic stops meaning anything.* Glide sums `rowHeight(r)` over
+ * every row to get the total scroll height, so an unbounded height is the one input that
+ * can make that sum absurd. At the bound, a sheet holding the maximum
+ * `MAX_PERSISTED_ROW_HEIGHTS` overrides contributes about 41 million pixels — exact in
+ * double arithmetic and still a scrollbar, where a height of `1e300` is neither.
+ *
+ * A power of two, so it reads as a guard rather than as a measured value somebody tuned.
+ */
+export const MAX_ROW_HEIGHT_PX = 4096;
+
+/**
  * Default row height for a configured font size, keeping the stock 24px at the
  * 13px base so existing files look unchanged. Persisted per-row overrides are
  * unaffected — only rows without one follow the font.
@@ -81,9 +104,22 @@ export function span_height(
     return total;
 }
 
-/** Clamp a height to the allowed minimum. */
+/**
+ * Clamp a height into the allowed range.
+ *
+ * Both ends matter and for different reasons. The floor keeps a row from losing the edge
+ * the user would have to grab to undo the resize; the ceiling keeps a row from growing past
+ * any viewport that could show its bottom edge, which leaves the same boundary unreachable
+ * from the other direction (see {@link MAX_ROW_HEIGHT_PX}).
+ *
+ * One function for both the host and the webview deliberately: the host clamps before it
+ * persists, and the webview clamps the value it paints optimistically, and the overlay is
+ * reconciled against the delivered projection *by value*. Two clamps that disagreed by a
+ * pixel would leave a layer that no delivery can ever agree with, masking the stored height
+ * for the rest of the generation.
+ */
 export function clamp_row_height(height: number): number {
-    return Math.max(MIN_ROW_HEIGHT_PX, height);
+    return Math.min(MAX_ROW_HEIGHT_PX, Math.max(MIN_ROW_HEIGHT_PX, height));
 }
 
 /** Per-line text height used when growing a row to fit multiline content. */

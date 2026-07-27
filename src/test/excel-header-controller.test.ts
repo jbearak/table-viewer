@@ -1009,4 +1009,50 @@ describe('Excel workbook snapshot controller', () => {
         expect(warning).toHaveBeenCalledTimes(1);
         expect(warning).toHaveBeenCalledWith('parse warning');
     });
+
+    it('projects the migrated row heights on the very first view', async () => {
+        // The row-height migration end to end, on the profile and the state shape where it
+        // actually matters: a non-editing Excel panel opening a file whose durable heights
+        // were written by a version that keyed them by *display* row, under a promotion
+        // that was already active. `plan_excel_candidate_state` re-keys them during
+        // `commit_physical_candidate`, so the very first delivery has to project the
+        // *committed* map and not the one the pre-commit read saw.
+        //
+        // The two answers are distinguishable, which is what makes this worth asserting.
+        // Under a row-0 promotion, display d is source d + 1, so the stored `{0:40, 1:60}`
+        // migrates to `{1:40, 2:60}` and projects straight back to `{0:40, 1:60}`. Read
+        // through a stale latch the same stored map would be *taken* for source keys:
+        // source 0 is the promoted header and has no display row at all, source 1 lands at
+        // display 0, and the panel would open showing `{0:60}` — one height silently gone
+        // and the other on the wrong row.
+        //
+        // The path is safe because `project_state_for_panel` observes the commit receipt,
+        // and `PanelSession.create_desired` samples the core *after* that — every delivery
+        // re-reads the projection live rather than using the material captured beside the
+        // adoption. This test is what keeps that ordering from being quietly reversed.
+        const state = mutable_state_store({
+            excelFirstRowHeaderVersion: 1,
+            excelFirstRowHeaderActive: { People: true },
+            rowHeights: [{ 0: 40, 1: 60 }],
+        });
+        const panel = open_excel(
+            '/row-height-migration.xlsx',
+            state.store,
+            excel_profile({ count: 0 }),
+        );
+
+        const initial = await ready(panel);
+
+        // The promotion really is active, auto-detected, and really did take one row out
+        // of the display space — the premise the shift is derived from, asserted rather
+        // than assumed. (`sourceRow` is reported only for an *explicit* `'on'`, so the
+        // row-count gap is what names it here; the migration derives the same fact by
+        // re-projecting the sheet with `'on'`.)
+        expect(initial.meta.sheets[0].excelFirstRowHeader)
+            .toMatchObject({ mode: 'auto', active: true });
+        expect(initial.meta.sheets[0]).toMatchObject({ rowCount: 2, sourceRowCount: 3 });
+        expect(initial.rowHeightProjection).toEqual([{ 0: 40, 1: 60 }]);
+        expect(state.value().rowHeights).toEqual([{ 1: 40, 2: 60 }]);
+        expect(state.value().rowHeightsVersion).toBe(1);
+    });
 });

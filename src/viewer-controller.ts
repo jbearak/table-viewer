@@ -4355,10 +4355,48 @@ export function attach_viewer(
                 // updater's own return value cannot carry the reason — refusing and
                 // writing nothing both surface as `undefined`.
                 let refused_at_bound = false;
+                /**
+                 * Set by the updater when every mapped row already holds the requested
+                 * height. That is a *successful* resize that writes nothing, and it still
+                 * has to be acknowledged, because the webview has already painted an
+                 * optimistic layer for it and only drops a layer once a delivered
+                 * projection agrees with it (`row_height_layers_for_delivery`). Left
+                 * unanswered the layer sits over the projection for the rest of the
+                 * generation, and the case where that matters is not cosmetic: this panel
+                 * can hold a *stale* projection — a sibling's write moves the durable map
+                 * with no generation bump — so "the value is already durable" is exactly
+                 * the request a user makes when they drag a row back to the size another
+                 * panel just set. A later delivery carrying a different height would then
+                 * be masked by the disagreeing layer, hiding authoritative state.
+                 *
+                 * Distinguished from the two refusals rather than lumped with them, and
+                 * neither of those may be acknowledged: over the bound the write was
+                 * rejected and the layer *should* stand until the generation moves (see
+                 * `row_height_layers_for_delivery` on that residue), and a stale
+                 * generation is answered by the delivery that moved it, which is what
+                 * discards the whole overlay. Only a no-op success gets a delivery.
+                 *
+                 * Both flags are reset at the top of each updater run, and that reset is
+                 * unfalsifiable today — said so rather than dressed up as a fix. It is
+                 * there because `update_file_state` re-runs the updater once per losing
+                 * CAS, so a retry could in general reach a different verdict than the run
+                 * before it. It cannot as written: every run that sets either flag returns
+                 * `current` unchanged, which makes `update_file_state` return immediately,
+                 * so only the *last* run can have set anything. Probed by deleting the
+                 * reset, and nothing failed, exactly as that argument predicts. Kept on the
+                 * precedent `may_reserve_claim` and `resize_is_current`'s authority term set
+                 * in this file: the reset is what makes the flags mean "the verdict of the
+                 * write" rather than "the verdict of some attempt at it", and a refusal that
+                 * later did want a retry would otherwise leave a stale warning or a spurious
+                 * acknowledgement behind it.
+                 */
+                let unchanged_at_current_height = false;
                 const committed = await enqueue_layout_write(async () => {
                     if (!resize_is_current()) return undefined;
-                    return update_file_state((current) => {
+                    const written = await update_file_state((current) => {
                         if (!resize_is_current()) return current;
+                        refused_at_bound = false;
+                        unchanged_at_current_height = false;
                         const rowHeights = [...(current.rowHeights ?? [])];
                         const existing = rowHeights[message.sheetIndex];
                         const next = { ...(existing ?? {}) };
@@ -4369,11 +4407,16 @@ export function attach_viewer(
                             changed = true;
                         }
                         // A drag ending on the height the rows already have writes
-                        // nothing, so `update_file_state` returns undefined and no
-                        // delivery follows. Worth being explicit about: a resize reports
-                        // its final size, and reporting an unchanged one is the ordinary
-                        // outcome of a click that moves a pixel and comes back.
-                        if (!changed) return current;
+                        // nothing, so `update_file_state` returns undefined — but it is a
+                        // success, and it is answered below with the freshly read
+                        // projection rather than with silence. See
+                        // `unchanged_at_current_height`. Worth being explicit about: a
+                        // resize reports its final size, and reporting an unchanged one is
+                        // the ordinary outcome of a click that moves a pixel and comes back.
+                        if (!changed) {
+                            unchanged_at_current_height = true;
+                            return current;
+                        }
                         // The accumulated map, not this request: the cap is on what the
                         // file ends up holding, so a hundred small resizes cannot walk
                         // past a bound one large one would have been refused at.
@@ -4410,6 +4453,17 @@ export function attach_viewer(
                         rowHeights[message.sheetIndex] = next;
                         return { ...current, rowHeights };
                     }, undefined, resize_is_current);
+                    if (written || !unchanged_at_current_height) return written;
+                    // The acknowledgement for a no-op success. Read on the same serialized
+                    // tail as the write it stands in for, so the state it answers with
+                    // cannot predate a `persist_layout_state` queued behind it, and read
+                    // rather than reusing the updater's `current` because that is a
+                    // normalized `PerFileState` with no revision — `update_state_snapshot`
+                    // needs the revision to refuse an older read replacing a newer one.
+                    // The read also refreshes the durable-height latch, which is what
+                    // makes the delivered projection the *fresh* one rather than the stale
+                    // one this panel may have been holding.
+                    return resize_is_current() ? await read_file_state(false) : undefined;
                 });
                 if (refused_at_bound) show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
                 if (committed && resize_is_current()) {

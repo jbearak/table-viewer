@@ -79,9 +79,25 @@ export interface WorkbookSnapshotCapabilities {
     readonly csvSaveLifecycle: CsvSaveLifecycle;
 }
 
-export interface NormalizedPerFileState extends PerFileState {
+/**
+ * Durable per-file state with every layout/view leaf the protocol requires filled in.
+ *
+ * `rowHeights` is the one `PerFileState` field this shape deliberately **removes** rather
+ * than completes, and the `Omit` is load-bearing: it is what makes "the webview is not
+ * sent durable heights" a type error to undo instead of a convention. Two readers use
+ * this shape and neither wants the map. `WorkbookSnapshot.state` is what crosses to the
+ * webview, which renders from `rowHeightProjection` and never reads the durable map —
+ * sending it would be a source-keyed map sitting beside a display-keyed one, which is
+ * exactly the confusion this PR exists to end, and for a pre-cap legacy select-all map it
+ * would be hundreds of thousands of entries structured-cloned across the bridge on every
+ * delivery. `derive_layout_state_patch`'s basis/incoming pair is the other, and
+ * `LayoutStatePatch` has no `rowHeights` leaf to derive, so it never looks.
+ *
+ * The durable map itself is unaffected: the host reads and writes it through
+ * `PerFileState` (`normalize_host_state`, `update_file_state`), which keeps the field.
+ */
+export interface NormalizedPerFileState extends Omit<PerFileState, 'rowHeights'> {
     columnWidths: (Record<number, number> | undefined)[];
-    rowHeights: (Record<number, number> | undefined)[];
     scrollPosition: (ScrollPosition | undefined)[];
     activeSheetIndex: number;
     tabOrientation: 'horizontal' | 'vertical' | null;
@@ -218,7 +234,22 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
     const state_snapshot = input.source === 'commitReceipt'
         ? input.receipt.stateSnapshot
         : input.state_snapshot;
-    const snapshot: WorkbookSnapshot = {
+    // Lifted out of the `deep_clone_and_freeze` below and re-attached after it. The core
+    // freezes this value at its source (`compute_row_height_projection` freezes each map,
+    // `row_height_projection_by_sheet` the array) precisely so it can be shared, and
+    // `snapshot_material` already shares it — cloning it here would put the copy the memo
+    // exists to avoid straight back on the delivery path, once for a legacy select-all map
+    // that can hold hundreds of thousands of entries. Guarded rather than assumed: a
+    // caller whose material is not already frozen gets the clone, so no mutable object can
+    // escape into an immutable snapshot. The check is O(sheets) and reads only the two
+    // levels that exist — the leaf values are numbers.
+    const row_height_projection = Object.isFrozen(input.core.rowHeightProjection)
+        && input.core.rowHeightProjection.every(
+            (entry) => entry === undefined || Object.isFrozen(entry),
+        )
+        ? input.core.rowHeightProjection
+        : deep_clone_and_freeze(input.core.rowHeightProjection);
+    const snapshot: Omit<WorkbookSnapshot, 'rowHeightProjection'> = {
         identity: {
             deliveryId: input.deliveryId,
             authority: {
@@ -237,7 +268,6 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         reason: input.reason,
         meta: input.core.meta,
         hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
-        rowHeightProjection: input.core.rowHeightProjection,
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,
@@ -250,7 +280,14 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
             ? {}
             : { commandResult: input.commandResult }),
     };
-    return deep_clone_and_freeze(snapshot);
+    // `rowHeightProjection` is attached after the clone rather than carried through it, for
+    // the reason given where it is sampled above — it is never a member of the object
+    // handed to `structuredClone`. Everything else keeps the clone-and-freeze contract
+    // exactly.
+    return Object.freeze({
+        ...deep_clone_and_freeze(snapshot),
+        rowHeightProjection: row_height_projection,
+    });
 }
 
 /**
@@ -332,11 +369,14 @@ export function complete_normalized_per_file_state(
     stored: StoredPerFileState,
     sheet_names: string[],
 ): NormalizedPerFileState {
-    const normalized = normalize_complete_per_file_state(stored, sheet_names);
+    // Dropped, not completed — see `NormalizedPerFileState`. Destructured away rather than
+    // simply left out of the literal, because the spread below would otherwise carry the
+    // normalizer's copy straight through.
+    const { rowHeights: _drop_row_heights, ...normalized } =
+        normalize_complete_per_file_state(stored, sheet_names);
     return {
         ...normalized,
         columnWidths: normalized.columnWidths ?? [],
-        rowHeights: normalized.rowHeights ?? [],
         scrollPosition: normalized.scrollPosition ?? [],
         activeSheetIndex: normalized.activeSheetIndex ?? 0,
         tabOrientation: normalized.tabOrientation ?? null,

@@ -12,7 +12,6 @@ function normalized(
 ): NormalizedPerFileState {
     return {
         columnWidths: [],
-        rowHeights: [],
         scrollPosition: [],
         activeSheetIndex: 0,
         tabOrientation: null,
@@ -68,8 +67,21 @@ describe('layout state patches', () => {
         // source-keyed entries and write nonsense in their place. Asserted as "no leaf
         // exists" rather than "the leaf is empty", because an empty leaf is one refactor
         // away from a populated one.
-        const basis = normalized({ rowHeights: [{ 0: 20 }, { 5: 60 }] });
-        const incoming = normalized({ rowHeights: [{ 0: 99 }, undefined, { 1: 44 }] });
+        //
+        // The maps are cast in past `NormalizedPerFileState`, which no longer *has* a
+        // `rowHeights` field — the shape is `Omit`ted so the webview cannot be sent durable
+        // heights at all. That makes the type the primary defence and this test the
+        // secondary one: it proves the deriver ignores the property even when a caller
+        // smuggles it in, which is the state a `stateChanged` message from an older webview
+        // build would actually arrive in.
+        const basis = normalized(
+            { rowHeights: [{ 0: 20 }, { 5: 60 }] } as Partial<NormalizedPerFileState>,
+        );
+        const incoming = normalized(
+            {
+                rowHeights: [{ 0: 99 }, undefined, { 1: 44 }],
+            } as Partial<NormalizedPerFileState>,
+        );
 
         const patch = derive_layout_state_patch(basis, incoming);
 

@@ -132,7 +132,16 @@ export function plan_excel_candidate_state(
         };
     }
 
-    const rowHeights = [...(current.rowHeights ?? [])];
+    // Ahead of the per-sheet loop below and independent of its `projection_changed` gate.
+    // The question the migration asks is not "did this load change the projection?" but
+    // "which space are this sheet's stored keys in?", and in the common upgrade — a
+    // promotion active and unchanged — the answer is "the promoted one" while
+    // `projection_changed` is false. Shared with `plan_excel_override_state`, the other
+    // writer of `excelFirstRowHeaderActive`, so the two cannot reach different verdicts
+    // about the same state; see `migrate_row_heights_for_file`.
+    const rowHeights = row_heights_migration
+        ? migrate_row_heights_for_file(current, input)
+        : [...(current.rowHeights ?? [])];
     const scrollPosition = [...(current.scrollPosition ?? [])];
     let transforms = current.transforms;
     let columnVisibility = current.columnVisibility;
@@ -152,28 +161,6 @@ export function plan_excel_candidate_state(
         const matched_planning_sheet = input.sheets[index]?.name === sheet.name
             ? input.sheets[index]
             : undefined;
-        // Ahead of the `projection_changed` gate below, and independent of it. The
-        // question the migration asks is not "did this load change the projection?" but
-        // "which space are this sheet's stored keys in?", and in the common upgrade — a
-        // promotion active and unchanged — the answer is "the promoted one" while
-        // `projection_changed` is false.
-        //
-        // Keyed on the *previous* projection rather than the next, which is the whole
-        // subtlety. The keys were written under whatever was last effective for this
-        // sheet, so a load that is switching the promotion off still has to invert the
-        // promoted space the keys are in — and it needs the header row of *that* space,
-        // which is why the previous projection is re-derived rather than read off `sheet`.
-        if (row_heights_migration) {
-            rowHeights[index] = migrate_display_keyed_row_heights(
-                rowHeights[index],
-                pre_migration_row_height_space(
-                    first_migration,
-                    had_previous,
-                    previous_is_active,
-                    matched_planning_sheet,
-                ),
-            );
-        }
         const projection_changed = first_migration
             ? next_is_active
             : !had_previous
@@ -234,6 +221,55 @@ export function plan_excel_candidate_state(
             rowHeightsVersion: 1,
         },
     };
+}
+
+/**
+ * Run the one-time row-height re-keying over every sheet of a file, for a writer that is
+ * about to move `excelFirstRowHeaderActive` without doing the projection planning
+ * `plan_excel_candidate_state` does.
+ *
+ * It exists because there are **two** writers of `excelFirstRowHeaderActive`, and the
+ * migration keys off exactly that fact: `pre_migration_row_height_space` reads
+ * `previous_active` to decide which row space the stored keys are in. A writer that flips
+ * the recorded projection without discharging the migration destroys the evidence the
+ * migration needs — a later `plan_excel_candidate_state` would see `previous_active` say
+ * "unpromoted", conclude `canonical`, and stamp still-display-keyed heights as canonical,
+ * leaving every height on that sheet permanently off by one. So both writers reconcile the
+ * heights, and both stamp `rowHeightsVersion`.
+ *
+ * Every sheet, not only the one being toggled, and that is the load-bearing part: the
+ * marker is per *file*, so migrating one sheet and stamping would declare the other
+ * sheets' display-keyed maps canonical without ever having touched them.
+ *
+ * Keyed on the state's *previous* recorded projection throughout, for the reason spelled
+ * out at the call site in `plan_excel_candidate_state`: the keys were written under
+ * whatever was last effective, so a write that is switching a promotion off still has to
+ * invert the promoted space the keys are in.
+ */
+function migrate_row_heights_for_file(
+    current: PerFileState,
+    input: ExcelHeaderPlanningInput,
+): (Record<number, number> | undefined)[] {
+    const first_migration = current.excelFirstRowHeaderVersion !== 1;
+    const previous_active = sanitize_excel_header_active(
+        current.excelFirstRowHeaderActive,
+    );
+    const rowHeights = [...(current.rowHeights ?? [])];
+    input.sheets.forEach((planning_sheet, index) => {
+        rowHeights[index] = migrate_display_keyed_row_heights(
+            rowHeights[index],
+            pre_migration_row_height_space(
+                first_migration,
+                Object.prototype.hasOwnProperty.call(
+                    previous_active,
+                    planning_sheet.name,
+                ),
+                first_migration ? false : previous_active[planning_sheet.name],
+                planning_sheet,
+            ),
+        );
+    });
+    return rowHeights;
 }
 
 /** Plan a durable explicit override solely from state plus immutable facts. */
@@ -321,11 +357,23 @@ export function plan_excel_override_state(
     excelFirstRowHeaderActive[sheet_name] = (
         new_sheet.excelFirstRowHeader?.active ?? false
     );
-    // `rowHeights` is untouched: source-keyed heights name the same rows whichever way
-    // this toggle goes, and the display-keyed projection is re-derived from the new
-    // projection on the next delivery. Only `scrollPosition` is genuinely invalidated —
-    // it is a pixel offset into a row layout this override changes. See the same
-    // asymmetry in `plan_excel_candidate_state`.
+    // Once the migration is discharged, `rowHeights` needs nothing from this toggle:
+    // source-keyed heights name the same rows whichever way it goes, and the display-keyed
+    // projection is re-derived from the new projection on the next delivery. That is a
+    // statement about the *post*-migration regime, though, and this function is the second
+    // writer of `excelFirstRowHeaderActive` — the fact the migration reads to decide which
+    // row space the stored keys are in. So while the migration is still owed, it is
+    // discharged here rather than deferred: see `migrate_row_heights_for_file` for what
+    // goes wrong if the two writers disagree. Untouched afterwards, when
+    // `rowHeightsVersion` is already 1.
+    //
+    // `scrollPosition`, by contrast, is genuinely invalidated in every regime — it is a
+    // pixel offset into a row layout this override changes. See the same asymmetry in
+    // `plan_excel_candidate_state`.
+    const row_heights_migration = current.rowHeightsVersion !== 1;
+    const rowHeights = row_heights_migration
+        ? migrate_row_heights_for_file(current, input)
+        : undefined;
     const scrollPosition = [...(current.scrollPosition ?? [])];
     scrollPosition[sheet_index] = undefined;
     if (options?.clearHiddenRows && transforms?.[sheet_index]?.hiddenRows) {
@@ -342,6 +390,8 @@ export function plan_excel_override_state(
             excelFirstRowHeaders,
             excelFirstRowHeaderActive,
             excelFirstRowHeaderVersion: 1,
+            ...(rowHeights === undefined ? {} : { rowHeights }),
+            rowHeightsVersion: 1,
             scrollPosition,
             transforms: migrate_compatible_sheet_schema(
                 transforms,

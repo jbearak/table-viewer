@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     DEFAULT_ROW_HEIGHT_PX,
     MAX_ROW_HEIGHT_LAYERS,
+    MAX_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
     natural_row_height,
@@ -40,6 +41,29 @@ describe('row-heights', () => {
         expect(clamp_row_height(5)).toBe(MIN_ROW_HEIGHT_PX);
         expect(clamp_row_height(MIN_ROW_HEIGHT_PX)).toBe(MIN_ROW_HEIGHT_PX);
         expect(clamp_row_height(100)).toBe(100);
+    });
+
+    it('clamp_row_height enforces the maximum', () => {
+        // The ceiling is not symmetry with the floor: without it a row can be grown past
+        // any viewport that could show its bottom edge, which leaves the boundary needed to
+        // drag it back unreachable — the same dead end the floor exists to prevent, from
+        // the other direction. Reachable by accident rather than only by a malformed
+        // message: `natural_row_height` grows with the number of hard newlines in a cell
+        // and is unbounded, which is why the auto-grow path clamps through here too.
+        expect(clamp_row_height(MAX_ROW_HEIGHT_PX + 1)).toBe(MAX_ROW_HEIGHT_PX);
+        expect(clamp_row_height(MAX_ROW_HEIGHT_PX)).toBe(MAX_ROW_HEIGHT_PX);
+        expect(clamp_row_height(1e300)).toBe(MAX_ROW_HEIGHT_PX);
+        expect(clamp_row_height(MAX_ROW_HEIGHT_PX - 1)).toBe(MAX_ROW_HEIGHT_PX - 1);
+    });
+
+    it('clamps an unbounded multiline natural height into the persistable range', () => {
+        // The realistic route to the ceiling, end to end: a cell with far more hard
+        // newlines than any row can show. `natural_row_height` answers honestly and
+        // unboundedly; the clamp is what stops that answer reaching durable state.
+        const many_lines = 'x\n'.repeat(5_000);
+        expect(natural_row_height(many_lines, 18, 6)).toBeGreaterThan(MAX_ROW_HEIGHT_PX);
+        expect(clamp_row_height(natural_row_height(many_lines, 18, 6)))
+            .toBe(MAX_ROW_HEIGHT_PX);
     });
 
     it('set_row_height returns a new record, clamped, without mutating input', () => {
