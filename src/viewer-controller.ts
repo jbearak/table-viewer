@@ -734,6 +734,17 @@ export function attach_viewer(
      * Also the core's memo key for the projection, which is the second reason it has to
      * be a real durable revision rather than a local counter: see
      * `DurableRowHeightsProvider`.
+     *
+     * The comparison itself is unfalsifiable today, in both directions — a mutation audit
+     * removed the guard entirely and then tightened it from `>=` to `>`, and nothing
+     * failed either way. Recorded rather than trimmed, and the two halves fail differently
+     * if the ordering it assumes ever stops holding. Dropping the guard lets an older read
+     * that resolves late overwrite a newer latch, which regresses the delivered projection
+     * to heights the file no longer has. Tightening it to `>` refuses a *same*-revision
+     * re-read, which is the ordinary case — `read_file_state` is not serialized, so several
+     * callers legitimately observe one revision — and would leave the retention above
+     * comparing against a map it never refreshed. `>=` is the pair of those: never go
+     * backwards, always accept the newest read of the current revision.
      */
     let durable_row_heights_revision = -1;
 
@@ -4437,6 +4448,15 @@ export function attach_viewer(
                     ) return;
                     requested_rows += interval.end - interval.start + 1;
                 }
+                // Only reachable from an empty `rows` array — every interval that gets
+                // past the validation above contributes at least one row. Unfalsifiable
+                // through the webview, which never posts one (`grid-shell` falls back to
+                // the single dragged row and `app` counts before posting), so it is a
+                // guard against a malformed message rather than against a caller. Kept on
+                // that basis: without it the write proceeds to `update_file_state`, finds
+                // nothing to change, and takes the no-op-success path — which delivers,
+                // so a message naming no rows would cost a state read and a snapshot
+                // round-trip per occurrence.
                 if (requested_rows === 0) return;
                 if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
                     show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);

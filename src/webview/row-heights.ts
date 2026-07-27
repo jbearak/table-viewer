@@ -80,7 +80,16 @@ export function line_height_for_font(
 
 export type RowHeightOverrides = Record<number, number>;
 
-/** Override for `row` if present, else `default_height`. */
+/**
+ * Override for `row` if present, else `default_height`.
+ *
+ * `!== undefined` rather than `??`, and the two are indistinguishable here — an
+ * equivalent mutant, kept and labelled. They differ only on `null`, which is reachable in
+ * durable JSON but not in this argument: the only thing ever passed as `overrides` is the
+ * host's projection, and `compute_row_height_projection` skips every non-finite entry and
+ * clamps what survives. The explicit test states which value this treats as absent, so it
+ * stays correct if a caller ever passes something less filtered.
+ */
 export function row_height(
     overrides: RowHeightOverrides,
     row: number,
