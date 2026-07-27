@@ -1056,4 +1056,44 @@ describe('setRowHeights currency across sheets', () => {
             .toEqual({ 1: 55 }));
         expect(warnings()).toEqual([]);
     });
+    it('keeps a layout change the user makes while a resize is in flight', async () => {
+        // The resize's delivery clears the session's acknowledged identity, and
+        // `layout_write_is_current` refuses any `stateChanged` whose identity no longer
+        // matches. A column resize or tab switch made during the drag's round trip is
+        // exactly such a message, already queued behind the height write on the layout
+        // tail. Delivered ahead of it, the delivery invalidated it: the write was refused
+        // and the following snapshot reinstalled the pre-change layout, so the user's
+        // second action disappeared with nothing to notice it by — and unretryable, the
+        // webview having been told it did not happen.
+        //
+        // Both halves are asserted because the failure is silent in one direction only:
+        // the height landing is what makes the lost width look like success.
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+
+        const resizing = resize(panel, initial, [{ start: 0, end: 0 }], 44);
+        const changing = panel.__receive({
+            type: 'stateChanged',
+            sourceGeneration: initial.sourceGeneration,
+            snapshotIdentity: initial.identity,
+            state: { ...initial.state, columnWidths: [{ 0: 177 }] },
+        });
+        await resizing;
+        await changing;
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: 44 }));
+        await vi.waitFor(() => expect(state.get_state(file_path).columnWidths)
+            .toEqual([{ 0: 177 }]));
+        // And the snapshot the webview is left holding carries it too. Persisting the
+        // width while delivering a snapshot built from state read *before* it would put
+        // the pre-change layout back on screen — the same disappearance, one layer up,
+        // and the reason the delivery re-reads on the tail instead of reusing the state
+        // its own write returned.
+        await vi.waitFor(() => expect(
+            messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot.state.columnWidths,
+        ).toEqual([{ 0: 177 }]));
+    });
+
 });

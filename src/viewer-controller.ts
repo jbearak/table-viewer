@@ -4617,10 +4617,34 @@ export function attach_viewer(
                 });
                 if (refused_at_bound) show_owner_warning(ROW_HEIGHT_LIMIT_WARNING);
                 if (committed && resize_is_current()) {
-                    session.update_state_snapshot(
-                        project_state_for_panel(committed),
-                        { deliver: true },
-                    );
+                    // Queued as its own step on the layout tail rather than delivered
+                    // straight from here, and that is a correctness requirement rather
+                    // than tidiness.
+                    //
+                    // Delivering clears the session's acknowledged identity, and
+                    // `layout_write_is_current` refuses any `stateChanged` whose identity
+                    // no longer matches. A layout change the user makes while this resize
+                    // is in flight — a column resize, a tab switch — arrives as exactly
+                    // such a message and is already queued behind the write above. Left
+                    // here, the delivery ran first and invalidated it: the queued write
+                    // was refused and the snapshot then reinstalled the pre-change layout
+                    // in the webview, so the second action vanished with nothing to notice
+                    // it by. Not a refusal the user could retry past, either, since the
+                    // webview had already been told its change did not happen.
+                    //
+                    // On the tail, those writes run first and are acknowledged normally,
+                    // and the delivery that clears the identity is the last thing to
+                    // happen. State is re-read at that point rather than reusing
+                    // `committed`, which by then may predate them.
+                    await enqueue_layout_write(async () => {
+                        if (!resize_is_current()) return;
+                        const fresh = await read_file_state(false);
+                        if (!fresh || !resize_is_current()) return;
+                        session.update_state_snapshot(
+                            project_state_for_panel(fresh),
+                            { deliver: true },
+                        );
+                    });
                 }
                 return;
             }
