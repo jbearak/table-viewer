@@ -6597,7 +6597,13 @@ describe('an applied transform across a refresh', () => {
     // told apart from — with make_meta's rowCount of 1 the reset is invisible. The
     // durable entry is keyed by canonical *source* row 2; what the grid renders is the
     // host's projection of it, which under the sort below lands at display row 1.
-    const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
+    //
+    // Which is why the durable map is *not* in `STORED_STATE`: `rowHeights` is `Omit`ted
+    // from `NormalizedPerFileState`, so no delivery can carry it, and a leaf here would
+    // reach nothing while implying the opposite. The heights in this suite arrive the two
+    // ways they really do — an install's `rowHeights` and a snapshot's
+    // `rowHeightProjection`, both display-keyed and both `PROJECTED_HEIGHTS`.
+    const STORED_STATE = { transforms: [STORED_SORT] };
     const PROJECTED_HEIGHTS = { 1: 44 };
     const FILTERED_ROW_COUNT = 3;
 
