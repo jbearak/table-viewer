@@ -6,7 +6,7 @@ Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose th
 
 ## Why
 
-Most of my time with tables is spent reading them, not making them: reviewing output that I or colleagues generate programmatically (in R, Stata, Python, …), or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets, and for pure reading they add friction at every step:
+When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step. Iterating on a generated workbook means closing the file, reopening it, and finding your place again on every rerun — redoing highlights, column widths, and the rest each time:
 
 - **They're slow to open**, and every time a script re-outputs a file there are extra steps to get back to what you were looking at. Table Viewer opens fast, auto-refreshes when the file changes on disk, and keeps your scroll position, column widths, hidden columns, sorts, filters, and active sheet — across reloads and across sessions.
 - **Sorting, filtering, and hiding modify the worksheet.** When you're reviewing output, the last thing you want is to change it. In Table Viewer these are view-only transforms: the file on disk is never touched, and there's no extra step to turn a range into a sortable/filterable list — every column already is one.
