@@ -666,6 +666,103 @@ describe('the setRowHeights host handler', () => {
         }
     });
 
+    it('answers a resize refused during an authority finalization', async () => {
+        // The refusal above is self-healing by construction: the *source* is being
+        // replaced, so the delivery that adopts it voids the webview's whole overlay
+        // (`retained_row_height_overlay`) and the optimistic layer goes with it.
+        //
+        // This covers the case where that argument is unavailable. A CSV save takes an
+        // authority turn, and `state_write_is_current` is false while that turn is
+        // `finalizing`, so a resize arriving inside the window is refused — correctly, and
+        // not newly: every durable layout write refuses there, which predates this PR.
+        // What is new is the optimistic layer, which is retired only by a delivery that
+        // disagrees with it or by the view generation moving. Neither is guaranteed by the
+        // refusal itself, so "the write is dropped" and "the row keeps a height no file
+        // holds" are separate questions and only the second one is user-visible.
+        //
+        // Reviewed as a suspected stranding, and it is not one: the save path delivers
+        // while the window is open, so the layer is answered without the handler doing
+        // anything. A refusal-delivery branch was written for it and reverted — it added a
+        // seventh delivery to six that already arrive, and no test could distinguish it,
+        // which makes it unfalsifiable code on a hot path rather than a fix. This test is
+        // what records that, so the next reviewer to notice the same window has the
+        // measurement instead of the suspicion.
+        //
+        // Asserted on the delivery rather than the durable store, because the store alone
+        // cannot tell a refusal that answers the webview from one that abandons it.
+        const state = versioned_state_store();
+        let coordinator: FileCoordinatorAttachment | undefined;
+        let park_when_finalizing = false;
+        let parked: (() => void) | undefined;
+        const store: FileStateStore = {
+            ...state.store,
+            async read(path) {
+                // Gated on the phase itself rather than on a guessed revision: the turn
+                // is what this test needs to sit inside, and `state_write_is_current`
+                // going false for the *current* authority is exactly "a turn is
+                // finalizing" — the same predicate the resize handler consults.
+                if (
+                    park_when_finalizing
+                    && coordinator !== undefined
+                    && !coordinator.state_write_is_current(
+                        coordinator.authority().authorityRevision,
+                    )
+                ) {
+                    park_when_finalizing = false;
+                    await new Promise<void>((resume) => { parked = resume; });
+                }
+                return state.store.read(path);
+            },
+        };
+        const panel = open_csv_table(store);
+        const initial = await ready(panel);
+        coordinator = acquire_file_coordinator(file_path);
+        try {
+            const deliveries_before = messages_of(panel, 'workbookSnapshot').length;
+            // A CSV save takes an authority turn and calls `start_finalization` before
+            // awaiting `finalize_authority`, which reads state — so parking that read
+            // holds the turn in `finalizing`, which is the window. The save rewrites the
+            // file, but the source is not replaced until it completes, so while we are
+            // parked the view has not moved and the webview's generations still match.
+            await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+            const edit_session_id = messages_of(panel, 'editSessionResult')
+                .at(-1)!.editSessionId!;
+            park_when_finalizing = true;
+            const save = panel.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: edit_session_id,
+                    saveRequestId: 'save',
+                    edits: { '0:0': 'z' },
+                    dirtyEdits: { '0:0': { value: 'z', base: 'c' } },
+                },
+            });
+            await vi.waitFor(() => expect(parked).toBeDefined());
+
+            await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+            // Refused, as every durable layout write is during finalization. The save's
+            // own write has already put an empty per-sheet slot there; what matters is
+            // that no height was recorded in it.
+            expect(state.get_state(file_path).rowHeights?.[0]).toBeUndefined();
+            // And answered: a delivery the webview can reconcile its layer against,
+            // carrying a projection without the refused height. Without this the layer
+            // has nothing to retire it — the save's own commit updates session state but
+            // does not deliver, and the view generation never moves.
+            const answers = messages_of(panel, 'workbookSnapshot')
+                .slice(deliveries_before);
+            expect(answers.length).toBeGreaterThan(0);
+            expect(answers.at(-1)!.snapshot.rowHeightProjection[0]).toBeUndefined();
+
+            parked!();
+            await save;
+            expect(state.get_state(file_path).rowHeights?.[0]).toBeUndefined();
+        } finally {
+            parked?.();
+            coordinator.dispose();
+        }
+    });
+
     // No test for "ignores a sheet index the workbook does not have". The handler's guard
     // was probed by deleting it, then by deleting the `RangeError` in
     // `map_display_rows_to_source` beside it, then by making the row count tolerate a
