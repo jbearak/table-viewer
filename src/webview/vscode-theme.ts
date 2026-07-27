@@ -80,9 +80,10 @@ const CONFLICT_TINT_ALPHA = 0.22;
 const SELECTION_TINT_ALPHA = 0.35;
 const SELECTION_TINT_ALPHA_HIGH_CONTRAST = 0.5;
 
-/** Fallback when `--vscode-editor-selectionBackground` is unset or unparseable
- *  (Dark+'s #264f78 at the clamped alpha). */
-export const SELECTION_BG_FALLBACK = 'rgba(38, 79, 120, 0.35)';
+/** Fallback channels when `--vscode-editor-selectionBackground` is unset or
+ *  unparseable (Dark+'s selection blue). Re-emitted at the clamped alpha, so
+ *  the fallback path honours the high-contrast strength too. */
+export const SELECTION_BG_FALLBACK_COLOR = '#264f78';
 
 /** The historical hard-coded tints, now the fallback for hosts (the VS Code
  *  webview) where the source variables may be unset. Both round-trip through
@@ -181,10 +182,15 @@ export function build_theme_from_vars(
     const editor_fg = v('--vscode-editor-foreground', '#d4d4d4');
     const accent = v('--vscode-focusBorder', '#0e639c');
     const accent_fg = v('--vscode-list-activeSelectionForeground', '#ffffff');
+    const selection_alpha = high_contrast
+        ? SELECTION_TINT_ALPHA_HIGH_CONTRAST
+        : SELECTION_TINT_ALPHA;
+    const selection_fallback = tint_from_color(
+        SELECTION_BG_FALLBACK_COLOR, selection_alpha, SELECTION_BG_FALLBACK_COLOR);
     const accent_light = tint_from_color(
-        v('--vscode-editor-selectionBackground', SELECTION_BG_FALLBACK),
-        high_contrast ? SELECTION_TINT_ALPHA_HIGH_CONTRAST : SELECTION_TINT_ALPHA,
-        SELECTION_BG_FALLBACK,
+        v('--vscode-editor-selectionBackground', SELECTION_BG_FALLBACK_COLOR),
+        selection_alpha,
+        selection_fallback,
     );
     const header_bg = v('--vscode-editorGroupHeader-tabsBackground', editor_bg);
     const hover_bg = v('--vscode-list-hoverBackground', header_bg);

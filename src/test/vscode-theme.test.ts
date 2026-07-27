@@ -88,6 +88,14 @@ describe('build_theme_from_vars', () => {
         );
         expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.35)');
     });
+
+    it('keeps the high-contrast alpha on the unparseable-variable fallback path', () => {
+        const theme = build_theme_from_vars(
+            (name) => name === '--vscode-editor-selectionBackground' ? 'transparent' : '',
+            true,
+        );
+        expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.5)');
+    });
 });
 
 describe('build_edit_tints_from_vars', () => {
