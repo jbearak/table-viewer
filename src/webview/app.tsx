@@ -1527,10 +1527,12 @@ export function App(): React.JSX.Element {
                     // keys are display rows, and either event means the arrangement they
                     // were read off is gone. Otherwise reconciled by value — a layer the
                     // delivered projection already agrees with has been answered, and
-                    // must be dropped so that a *later* height for those rows is not
-                    // masked by it for the rest of the generation. Value, not a request
-                    // id, because nothing correlates a `setRowHeights` with the delivery
-                    // that answers it and nothing needs to.
+                    // must be dropped — along with every layer older than it, which the
+                    // serialized host write order proves is already dead — so that a
+                    // *later* height for those rows is not masked for the rest of the
+                    // generation. Value, not a request id, because nothing correlates a
+                    // `setRowHeights` with the delivery that answers it and nothing needs
+                    // to. Both arguments in full at `row_height_layers_for_delivery`.
                     set_row_height_overlay((previous) => {
                         if (
                             previous === undefined

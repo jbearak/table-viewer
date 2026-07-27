@@ -218,6 +218,15 @@ function layer_row_count(layer: RowHeightLayer): number {
  * the sheet. Agreement over the whole layer is then "as many projection entries at
  * this height fall inside the intervals as the intervals contain rows", which cannot
  * over-count because projection keys are unique.
+ *
+ * The invariant that actually matters is *cost bounded by the projection, never by the
+ * sheet*, and mutation testing is why that is worth stating separately: a layer-side walk
+ * that returns on the first row the projection does not answer is bounded the same way
+ * (every row it does walk is a distinct projection key), so it survives the select-all read
+ * budget rather than being caught by it. Counting is chosen over walking because it is
+ * bounded without needing that early-exit argument — a shape whose cost is evident beats
+ * one whose cost is a proof. A walk with no early exit *is* O(rows) and the budget does
+ * catch it.
  */
 function projection_agrees_with_layer(
     overrides: RowHeightOverrides,
@@ -267,6 +276,42 @@ export function row_height_layers_with(
  * must still do — a delivery on a *new* permutation says nothing about display rows
  * read off the old one, so the whole overlay is void rather than partly satisfied.
  *
+ * ## Agreement with a layer retires every layer older than it
+ *
+ * The scan runs newest-first and, at the first layer the delivery agrees with, keeps only
+ * what is *newer* than it. It deliberately does not ask the question of each layer
+ * independently, and that is not an optimization — asking independently is a bug once
+ * layers overlap:
+ *
+ * 1. A resize is refused on the accumulated-map bound. Nothing will ever agree with its
+ *    layer (see the residue below), so it stays.
+ * 2. The user resizes an *overlapping* row, and that one is persisted and delivered. An
+ *    independent filter drops the newer, agreed layer and keeps the older refused one.
+ * 3. `resolved_row_height` resolves newest-first, so the surviving older layer is now the
+ *    newest one naming those rows: it paints its refused height *over* the height that was
+ *    just persisted, masking authoritative state for the rest of the generation. The
+ *    reconciliation would have caused exactly the failure it exists to prevent.
+ *
+ * What licenses dropping the older ones is that webview→host resize writes are strictly
+ * ordered. `postMessage` preserves order and the host's `setRowHeights` handler reaches
+ * `enqueue_layout_write` synchronously, before its first await, so requests join the single
+ * serialized layout-write tail in the order they were posted; layers are appended in that
+ * same order, in the same synchronous block that posts. So by the time a write for layer
+ * *N* has been processed, every write older than *N* has been processed too, and each of
+ * those older requests is therefore already dead: either it was persisted (so the delivery
+ * that carries *N* carries it too, unless something later overwrote it — in which case the
+ * newer durable value is precisely what should win) or it was refused (so its intent never
+ * became durable, and it must not keep painting).
+ *
+ * The one gap in that argument, stated rather than papered over: agreement is by value, so
+ * a delivery can agree with layer *N* without *N*'s own write having run — a sibling panel
+ * could persist the same height for the same rows first. Then an older layer still in
+ * flight is dropped early and its rows show the durable height until their own write lands
+ * and delivers. That is a brief flicker in a race that requires another writer to have
+ * chosen the same rows *and* the same height, and it is the same value-based inference the
+ * newest layer has always been reconciled by — not a new class of unsoundness. Masking a
+ * persisted height indefinitely is the worse failure of the two.
+ *
  * ## The one residue this leaves, and why it is left
  *
  * Reconciling by value means a layer is kept until a delivery *agrees* with it, which is
@@ -274,9 +319,10 @@ export function row_height_layers_with(
  * a write the host refused on the accumulated-map bound
  * (`MAX_PERSISTED_ROW_HEIGHTS`). No delivery will ever agree with that layer, because
  * nothing was persisted and the refusal path delivers nothing at all; so it sits over the
- * projection, showing a height no file holds, until the view generation next moves and
- * the whole overlay is discarded. The user does learn what happened — the host warns,
- * naming the limit — but the row they dragged keeps its new size on screen meanwhile.
+ * projection, showing a height no file holds, until the view generation next moves and the
+ * whole overlay is discarded — or until a *newer* layer is answered, which retires it along
+ * with everything else that old (see above). The user does learn what happened — the host
+ * warns, naming the limit — but the row they dragged keeps its new size on screen meanwhile.
  *
  * Three fixes were considered and all three cost more than the residue:
  *
@@ -302,8 +348,14 @@ export function row_height_layers_for_delivery(
     layers: readonly RowHeightLayer[],
     overrides: RowHeightOverrides,
 ): readonly RowHeightLayer[] {
-    const kept = layers.filter(
-        (layer) => !projection_agrees_with_layer(overrides, layer),
-    );
-    return kept.length === layers.length ? layers : kept;
+    // Newest-first, stopping at the first agreement: everything older than an answered
+    // layer is dead by the ordering argument above, so there is nothing to ask about it.
+    // Returning `layers` itself when nothing agreed is load-bearing — App compares by
+    // reference to decide whether the overlay state needs replacing at all.
+    for (let index = layers.length - 1; index >= 0; index -= 1) {
+        if (projection_agrees_with_layer(overrides, layers[index])) {
+            return layers.slice(index + 1);
+        }
+    }
+    return layers;
 }

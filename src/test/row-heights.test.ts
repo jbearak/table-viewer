@@ -244,7 +244,7 @@ describe('the optimistic row-height overlay', () => {
                 .toBe(layers);
         });
 
-        it('drops only the answered layers and returns the same array otherwise', () => {
+        it('drops the answered layer and returns the same array otherwise', () => {
             const answered = layer([{ start: 0, end: 0 }], 40);
             const outstanding = layer([{ start: 5, end: 5 }], 60);
             const layers = [answered, outstanding];
@@ -253,6 +253,82 @@ describe('the optimistic row-height overlay', () => {
             // Identity when nothing was answered: App compares by reference to decide
             // whether the overlay state needs replacing at all.
             expect(row_height_layers_for_delivery(layers, { 4: 40 })).toBe(layers);
+        });
+
+        it('retires an older overlapping layer the delivery cannot agree with', () => {
+            // The failure this rule exists for. The older layer is a resize the host
+            // refused on the accumulated-map bound, so no delivery will ever agree with
+            // it; the newer one overlaps it and *was* persisted. Asking the question of
+            // each layer independently drops the newer, agreed layer and keeps the older
+            // refused one — which `resolved_row_height` then resolves first, painting a
+            // height no file holds over the one just written.
+            const refused = layer([{ start: 0, end: 2 }], 99);
+            const persisted = layer([{ start: 1, end: 1 }], 40);
+            const layers = [refused, persisted];
+            const delivered = { 1: 40 };
+            expect(row_height_layers_for_delivery(layers, delivered)).toEqual([]);
+            // The observable end of it: the delivered height is what the row shows.
+            expect(resolved_row_height(
+                delivered,
+                row_height_layers_for_delivery(layers, delivered),
+                1,
+            )).toBe(40);
+        });
+
+        it('retires older layers that do not overlap the answered one', () => {
+            // Not overlap-only, because the licence is ordering, not geometry: resize
+            // writes are serialized on one host tail in post order, so a delivery that
+            // answers this layer was read after every older request had been processed —
+            // each of those is already either persisted (and carried here) or refused.
+            const older = layer([{ start: 0, end: 0 }], 99);
+            const answered = layer([{ start: 5, end: 5 }], 40);
+            expect(row_height_layers_for_delivery([older, answered], { 5: 40 }))
+                .toEqual([]);
+            // Row 0 falls back to the projection, which does not name it: the default.
+            expect(resolved_row_height(
+                { 5: 40 },
+                row_height_layers_for_delivery([older, answered], { 5: 40 }),
+                0,
+            )).toBe(DEFAULT_ROW_HEIGHT_PX);
+        });
+
+        it('cuts at the newest agreement, not the first one it finds', () => {
+            // Scanning oldest-first satisfies every other assertion here and still leaves
+            // the original bug reachable: it cuts at the *oldest* agreement, so a refused
+            // layer newer than that one survives, and it is then the newest layer naming
+            // its rows. Here the refused layer overlaps a persisted height that an older
+            // delivery already answered.
+            const answered_older = layer([{ start: 0, end: 0 }], 30);
+            const refused = layer([{ start: 0, end: 0 }], 99);
+            const answered_newest = layer([{ start: 7, end: 7 }], 40);
+            const layers = [answered_older, refused, answered_newest];
+            const delivered = { 0: 30, 7: 40 };
+            expect(row_height_layers_for_delivery(layers, delivered)).toEqual([]);
+            expect(resolved_row_height(
+                delivered,
+                row_height_layers_for_delivery(layers, delivered),
+                0,
+            )).toBe(30);
+        });
+
+        it('keeps layers newer than the answered one', () => {
+            // The other half: only what is *older* is dead. A layer posted after the
+            // answered one is still in flight and must keep painting.
+            const answered = layer([{ start: 0, end: 0 }], 40);
+            const newer = layer([{ start: 1, end: 1 }], 60);
+            expect(row_height_layers_for_delivery([answered, newer], { 0: 40 }))
+                .toEqual([newer]);
+        });
+
+        it('retires an older select-all layer without walking its rows', () => {
+            // The scan stops at the newest agreeing layer, so the select-all beneath it is
+            // never inspected at all — and the interval read budget is watching in case a
+            // future rewrite decides to inspect it row by row.
+            const layers = [
+                layer(select_all_rows(10_000_000), 72),
+                layer([{ start: 3, end: 3 }], 40),
+            ];
+            expect(row_height_layers_for_delivery(layers, { 3: 40 })).toEqual([]);
         });
 
         it('never agrees with a select-all layer a sparse projection cannot answer', () => {
