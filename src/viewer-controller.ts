@@ -69,9 +69,13 @@ import {
     type HostMessage,
     type PerFileState,
     type SheetTransformState,
+    type StoredPerFileState,
     type WebviewMessage,
 } from './types';
-import { sanitize_transform_state } from './webview/sheet-state';
+import {
+    normalize_sheet_state_array,
+    sanitize_transform_state,
+} from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 // The host is now the only writer of durable heights, so the floor a resize is clamped
 // against has to be applied here. Imported from the webview module that already owns it
@@ -720,12 +724,16 @@ export function attach_viewer(
      * `observe_durable_state` on the committed snapshot before it returns — so the latch
      * is fresh by the time the `setRowHeights` handler asks for a re-delivery.
      */
-    let durable_row_heights_state: PerFileState['rowHeights'];
+    let durable_row_heights_state: StoredPerFileState['rowHeights'];
     /**
      * Revision of the read `durable_row_heights_state` came from, so an older read
      * finishing late cannot replace a newer one. The pending-edit latch gets this from
      * `file_edit_state.durableTransform.revision`; heights are latched outside that
      * record — see below — so they carry their own.
+     *
+     * Also the core's memo key for the projection, which is the second reason it has to
+     * be a real durable revision rather than a local counter: see
+     * `DurableRowHeightsProvider`.
      */
     let durable_row_heights_revision = -1;
 
@@ -738,9 +746,18 @@ export function attach_viewer(
         // Excel would observe heights exactly never, and the projection every delivery
         // carries would be permanently empty — custom heights would silently stop
         // working on the format that has the most rows to resize.
+        //
+        // Latched *un-normalized*, and normalized in `durable_row_heights` below rather
+        // than here. `PerFileState.rowHeights` is an array indexed by sheet, but a
+        // `LegacyPerFileState` on disk holds the same data keyed by sheet *name*, and
+        // turning one into the other needs the sheet names — which this function has no
+        // reliable access to. It runs on every durable read, including reads that happen
+        // before a source is adopted and reads taken across an adoption, so any sheet
+        // names it reached for could be the wrong workbook's or absent entirely. Deferring
+        // costs nothing: the conversion is O(sheets) and does not touch the height maps.
         if (snapshot.revision >= durable_row_heights_revision) {
             durable_row_heights_revision = snapshot.revision;
-            durable_row_heights_state = state.rowHeights;
+            durable_row_heights_state = (snapshot.state as StoredPerFileState).rowHeights;
         }
         if (
             !file_edit_state
@@ -777,9 +794,34 @@ export function attach_viewer(
      * panel whose heights these might be — every panel on this file shows the same
      * heights, which is the point of persisting them. So there is nothing to narrow and
      * the latch is the answer.
+     *
+     * Normalized here, on the way out, because this is the first point at which the sheet
+     * names are known to be the right ones: the core passes its own source's names, so the
+     * array returned is indexed by the same sheet indices the core is about to project.
+     * The normalization matters and is not cosmetic — a `LegacyPerFileState` keeps this map
+     * keyed by sheet *name*, and handing that through unconverted makes every index lookup
+     * `undefined`, i.e. every height a user persisted under an older version silently
+     * disappears on open. Silently and *durably-looking*: an unchanged state is not
+     * necessarily rewritten, so nothing later restores what the first read failed to see.
+     *
+     * `normalize_sheet_state_array` rather than the whole-state normalizers
+     * (`normalize_host_state`, `complete_normalized_per_file_state`) because this runs on
+     * the core's memo-key path. Those sanitize transforms, column visibility and the whole
+     * pending-edit map, which is work this question does not need. The array conversion is
+     * O(sheets) and shares the height maps by reference rather than copying them, so it is
+     * cheap even for the unbounded legacy maps the memo exists to cope with.
      */
-    function durable_row_heights(): readonly (Record<number, number> | undefined)[] {
-        return durable_row_heights_state ?? [];
+    function durable_row_heights(sheet_names: readonly string[]): {
+        readonly revision: number;
+        readonly heights: readonly (Record<number, number> | undefined)[];
+    } {
+        return {
+            revision: durable_row_heights_revision,
+            heights: normalize_sheet_state_array<Record<number, number>>(
+                durable_row_heights_state,
+                [...sheet_names],
+            ),
+        };
     }
 
     function sync_active_transform_panel(): void {
@@ -4195,13 +4237,31 @@ export function attach_viewer(
              * the generation pair guarding it are `hideRows`'s, because the request names
              * rows in a coordinate space only one specific permutation defines.
              *
-             * Currency is `generation` + `sourceGeneration` and deliberately *not*
-             * `layout_write_is_current`. That predicate also demands a matching
-             * acknowledged snapshot identity, which is affordable for `stateChanged` only
-             * because a dropped one loses nothing — `state_ref` still holds the value and
-             * the next debounced persist resends it. The webview no longer holds durable
-             * heights, so here a drop is the resize gone for good; the test must therefore
-             * be exactly what the request depends on and nothing more.
+             * Currency is the generation pair *plus the authority half* of
+             * `layout_write_is_current`, and deliberately not that predicate whole. The
+             * line between the two is which side of the protocol the fact belongs to.
+             *
+             * The half that is taken — `file_coordinator.state_write_is_current` and
+             * `source_authority.authorityRevision` still equalling the revision read when
+             * the message arrived — is a pair of *host-side* facts about whether this write
+             * still targets the same file revision. Asking them costs nothing and refuses
+             * nothing legitimate, and they are load-bearing because the generation pair
+             * alone does not cover the gap they close: during a physical refresh the file
+             * authority advances before the new source is adopted, and the editable
+             * profile's `read_file_state()` await widens that window, so the old core's
+             * `generation`/`sourceGeneration` can both still match a request that was
+             * mapped through the *old* source. Writing that request lands a height on a row
+             * of the new file revision the user never touched — a silent
+             * mis-attribution, which is worse than losing the resize.
+             *
+             * The half that is *not* taken is `msg.snapshotIdentity` and the acknowledged
+             * identity it is compared against. That is a fact the webview echoes back, and
+             * gating on it means dropping requests because a delivery happened to be in
+             * flight. `stateChanged` can afford that because a dropped one loses nothing —
+             * `state_ref` still holds the value and the next debounced persist resends it.
+             * The webview no longer holds durable heights, so here a drop is the resize
+             * gone for good. Hence the asymmetry: host-side authority facts yes, echoed
+             * snapshot identity no.
              *
              * Serialized through `enqueue_layout_write` so it cannot interleave with
              * `persist_layout_state`. Both write the same durable document through
@@ -4217,15 +4277,39 @@ export function attach_viewer(
              * is what makes the webview's generation differ from the one it posted, so the
              * optimistic overlay tagged with that generation is discarded and the row
              * visibly springs back. The user's next drag is the retry.
+             *
+             * No preview-mode refusal, unlike `hideRows` directly above, and the difference
+             * is not an oversight. `hideRows` is a *view transform*: it changes which rows
+             * the view contains, which is a claim about the document that a read-only
+             * preview has no business making. A row height changes nothing about row
+             * identity or membership — it is layout, in the same class as `columnWidths` and
+             * `scrollPosition`, which preview already persists today because
+             * `persist_layout_state` has no preview guard. Refusing here would have made
+             * this PR the first thing to stop layout persisting in preview, and it would
+             * have done it *silently*: the webview still mounts the resize overlay in
+             * preview and still paints the new height optimistically, so the row would have
+             * looked resized until the next delivery quietly reverted it.
              */
             case 'setRowHeights': {
-                if (profile.previewMode === true) return;
                 const message = structuredClone(msg);
                 const receiver_epoch = session.current_receiver_epoch;
+                const expected_authority = source_authority.authorityRevision;
                 const resize_is_current = () => !disposed
                     && session.current_receiver_epoch === receiver_epoch
                     && message.generation === core?.generation
-                    && message.sourceGeneration === core?.source_generation;
+                    && message.sourceGeneration === core?.source_generation
+                    // `state_write_is_current` is the term that actually catches the
+                    // refresh window; probing found it sufficient on its own, because the
+                    // coordinator's authority advances first and monotonically. The
+                    // `source_authority` comparison beside it is unfalsifiable here for
+                    // that same reason — it is read *from* `source_authority` above, and
+                    // anything that advances that has already advanced the coordinator
+                    // past `expected_authority`. Kept because it is half of the pair every
+                    // other durable write in this file asks (`layout_write_is_current`,
+                    // `setColumnVisibility`), and a predicate that agrees with its
+                    // neighbours is worth more than one term less.
+                    && file_coordinator.state_write_is_current(expected_authority)
+                    && source_authority.authorityRevision === expected_authority;
                 if (!core || !source || !resize_is_current()) return;
                 if (!source.meta().sheets[message.sheetIndex]) return;
                 if (!Number.isFinite(message.height)) return;
@@ -4302,7 +4386,24 @@ export function attach_viewer(
                         // refusal because it never sees the durable map, and without the
                         // warning below the row simply fails to keep its new height with
                         // no explanation anywhere.
-                        if (Object.keys(next).length > MAX_PERSISTED_ROW_HEIGHTS) {
+                        //
+                        // A *growth* check rather than a level check, and that is the
+                        // difference between a bound and a trap. Releases before this bound
+                        // existed could persist a select-all map, so a file on disk may
+                        // already hold far more than the cap; a level check would then
+                        // refuse every resize on that file forever, including one that only
+                        // changes the height of a row the map already names. The user has no
+                        // way out either — the webview never sees the durable map, so
+                        // nothing tells them to delete entries, and there is no UI to delete
+                        // them with. Refusing only writes that push the entry *count* higher
+                        // still stops any over-cap map from being created or grown, which is
+                        // all the bound was ever for. `next` only ever adds keys to
+                        // `existing`, so "grew" and "changed count" are the same question.
+                        const next_count = Object.keys(next).length;
+                        if (
+                            next_count > MAX_PERSISTED_ROW_HEIGHTS
+                            && next_count > Object.keys(existing ?? {}).length
+                        ) {
                             refused_at_bound = true;
                             return current;
                         }

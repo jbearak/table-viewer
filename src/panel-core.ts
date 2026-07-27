@@ -96,6 +96,35 @@ type InvalidRestoreCleanup = (
     receiverEpoch: number,
 ) => Promise<boolean>;
 
+/**
+ * Reads the durable per-sheet custom row heights, keyed by canonical source row, out of
+ * the authority layer for the core to re-key into display space.
+ *
+ * Three things about the shape are deliberate.
+ *
+ * `sheet_names` is asked for rather than assumed because the durable map may still be on
+ * disk in its legacy *name*-keyed form, and only the caller that owns the projection
+ * knows which sheets, in which order, those names have to line up with. The core passes
+ * its own `source.meta()` names, so the array that comes back is indexed by the same
+ * sheet indices the core projects — a controller-side guess could disagree with the
+ * core's source for a delivery during adoption.
+ *
+ * `revision` and `heights` come back from one call because the memo below keys on the
+ * revision and must be certain it names the very read the heights came from. Two getters
+ * could be sampled either side of a durable write and cache a projection under the wrong
+ * revision, which is the one way a memo here becomes a correctness bug rather than a
+ * performance one.
+ *
+ * `revision` is the durable state revision, not a private counter, because that is what
+ * every writer already advances: `setRowHeights`, a sibling panel's write and an
+ * excel-header plan edit all land as a new state revision, and none of them bumps a view
+ * generation.
+ */
+type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
+    readonly revision: number;
+    readonly heights: readonly (Record<number, number> | undefined)[];
+};
+
 type TransformOperationToken = number;
 let next_transform_operation_token = 0;
 
@@ -210,9 +239,17 @@ export class ViewerPanelCore {
     private readonly on_transform_commit?: TransformCommit;
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
     private readonly durable_pending_edit_keys?: () => readonly string[];
-    private readonly durable_row_heights?: () => readonly (
-        Record<number, number> | undefined
-    )[];
+    private readonly durable_row_heights?: DurableRowHeightsProvider;
+    /**
+     * The last computed display-keyed projection, with the two facts it is a function
+     * of. See `row_height_projection_by_sheet` for why both are needed and why a memo
+     * is needed at all.
+     */
+    private row_height_projection_memo?: {
+        readonly generation: number;
+        readonly revision: number;
+        readonly by_sheet: readonly (Readonly<Record<number, number>> | undefined)[];
+    };
 
     constructor(
         private readonly panel: PanelLike,
@@ -239,7 +276,7 @@ export class ViewerPanelCore {
              * projection is empty, which renders as "no row has a custom height" —
              * the correct answer for a file that has none.
              */
-            durableRowHeights?: () => readonly (Record<number, number> | undefined)[];
+            durableRowHeights?: DurableRowHeightsProvider;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -373,6 +410,15 @@ export class ViewerPanelCore {
         this.histogram_operations.clear();
         this.transform_column_cache.clear();
         this.cache.clear();
+        // Unfalsifiable, and said so rather than dressed up as a fix: the `_generation`
+        // bump above already makes the memo's key miss, so no test can tell this line from
+        // its absence — probed by deleting it, and nothing failed. Kept on the precedent
+        // `may_reserve_claim` and `edit_cleanup_blocked` set in `viewer-controller`,
+        // because a new source can also change the *sheet count*, and a cache entry that
+        // outlives the source it was projected against is what a later narrowing of the
+        // memo key would get wrong silently. Dropped beside every other per-source cache
+        // so it is invalidated by the same reflex.
+        this.row_height_projection_memo = undefined;
         return { type: 'adopted' };
     }
 
@@ -428,6 +474,7 @@ export class ViewerPanelCore {
         this.histogram_cache.clear();
         this.transform_column_cache.clear();
         this.cache.clear();
+        this.row_height_projection_memo = undefined;
     }
 
     /** Entry point for webview->host messages the core is responsible for. */
@@ -738,23 +785,10 @@ export class ViewerPanelCore {
     }
 
     /**
-     * The same answer for every sheet, positionally, so a delivery can carry it
-     * without knowing which sheet the user is looking at.
-     *
-     * This is the *additive* half of keeping the notice honest, and it needs a
-     * per-delivery answer rather than a per-install one. Membership changes only at an
-     * install, but the durable map this reads changes on its own — and an edit typed
-     * while a hiding transform was still computing reaches the durable map only
-     * *after* the install that excluded its row, so no install will ever name it. The
-     * webview's intersection against its live dirty map cannot add it back; that
-     * subtracts. Recomputing here, on the delivery `pendingEditsChanged` already
-     * triggers, is what adds it.
-     */
-    /**
-     * The durable custom row heights for a sheet, re-keyed into the display space of
-     * the view this core holds right now. See `SheetViewRecord.rowHeights` for why the
-     * host is the only place this can be computed and why it must travel with the view
-     * it describes.
+     * The durable custom row heights for one sheet, re-keyed into the display space of
+     * the view this core holds right now. See `PerFileState.rowHeights` for why the host
+     * is the only place this can be computed and why it must travel with the view it
+     * describes.
      *
      * Iterates the *overrides*, not the rows, and that is the load-bearing choice: the
      * durable map is sparse and typically holds a handful of entries, while the sheet
@@ -773,10 +807,10 @@ export class ViewerPanelCore {
      * non-canonical numeric key names no source row, and `display_row_for_source`
      * refusing it is the check.
      */
-    private row_height_projection(
+    private compute_row_height_projection(
         sheet_index: number,
-    ): Record<number, number> | undefined {
-        const overrides = this.durable_row_heights?.()[sheet_index];
+        overrides: Record<number, number> | undefined,
+    ): Readonly<Record<number, number>> | undefined {
         if (!overrides) return undefined;
         let projection: Record<number, number> | undefined;
         for (const [key, height] of Object.entries(overrides)) {
@@ -797,7 +831,13 @@ export class ViewerPanelCore {
         // per-sheet-per-delivery structured-clone cost for. It also distinguishes "no
         // heights" from "heights that all fell outside this view", though no reader needs
         // that distinction today.
-        return projection;
+        //
+        // Frozen because the memo below hands the identical object to every reader until
+        // its key changes. A caller that mutated what it got back would be editing the
+        // cache, and the mutation would then show up on unrelated later deliveries. The
+        // snapshot path clones on the way out and would not have noticed;
+        // `transform_installed_ack` posts the object itself and would.
+        return projection && Object.freeze(projection);
     }
 
     /**
@@ -811,13 +851,54 @@ export class ViewerPanelCore {
      * `setRowHeights`, a sibling write, or an excel-header plan edit. Nothing installs on
      * the second kind and nothing delivers on the first, so both carriers exist and each
      * covers what the other cannot.
+     *
+     * Memoized, and the memo is about *pre-existing* data rather than about this
+     * projection being expensive. It is O(overrides), which is a handful of entries for
+     * any map this version could have written — `MAX_PERSISTED_ROW_HEIGHTS` bounds it.
+     * But releases before that bound existed could persist a select-all map, so a file on
+     * disk may already hold millions of entries, and a bound applied only to new writes
+     * does nothing about a per-delivery walk over what is already there. Recomputing that
+     * on every scroll-triggered delivery is the cost the memo removes; without it the
+     * bound is a bound on nothing.
+     *
+     * The key is exactly the pair the answer is a function of. `generation` covers the
+     * permutation half — every install and every `adopt_source` bumps it, and those are
+     * the only things that move a source row to a different display row. The durable state
+     * `revision` covers the height half, since every writer of the map lands as a new
+     * revision and none of them bumps a generation. Neither alone is sufficient, which is
+     * why the earlier "recompute always" was the safe shape to start from.
      */
     private row_height_projection_by_sheet(): readonly (
-        Record<number, number> | undefined
+        Readonly<Record<number, number>> | undefined
     )[] {
-        return this.source.meta().sheets.map((_sheet, sheet_index) => (
-            this.row_height_projection(sheet_index)
-        ));
+        const sheets = this.source.meta().sheets;
+        // No provider means no durable state to read at all (a test core, or a caller
+        // with none), so every projection is empty forever. Keyed at revision -1, which
+        // no real state revision can equal, so this cannot be confused with a real read.
+        const durable = this.durable_row_heights?.(sheets.map((sheet) => sheet.name))
+            ?? { revision: -1, heights: [] };
+        const memo = this.row_height_projection_memo;
+        if (
+            memo
+            && memo.generation === this._generation
+            && memo.revision === durable.revision
+        ) return memo.by_sheet;
+        const by_sheet = Object.freeze(sheets.map((_sheet, sheet_index) => (
+            this.compute_row_height_projection(sheet_index, durable.heights[sheet_index])
+        )));
+        this.row_height_projection_memo = {
+            generation: this._generation,
+            revision: durable.revision,
+            by_sheet,
+        };
+        return by_sheet;
+    }
+
+    /** One sheet's entry of the memoized projection. */
+    private row_height_projection(
+        sheet_index: number,
+    ): Readonly<Record<number, number>> | undefined {
+        return this.row_height_projection_by_sheet()[sheet_index];
     }
 
     /**
@@ -1287,7 +1368,7 @@ export function adopt_source_into_core(
         onTransformCommit?: TransformCommit;
         onInvalidRestore?: InvalidRestoreCleanup;
         durablePendingEditKeys?: () => readonly string[];
-        durableRowHeights?: () => readonly (Record<number, number> | undefined)[];
+        durableRowHeights?: DurableRowHeightsProvider;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

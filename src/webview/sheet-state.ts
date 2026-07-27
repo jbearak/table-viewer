@@ -297,7 +297,18 @@ function normalize_pending_edits(
     return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function normalize_sheet_state_array<T>(
+/**
+ * Index one per-sheet state map by sheet position, converting the legacy
+ * keyed-by-sheet-name shape (`LegacyPerFileState`) on the way.
+ *
+ * Exported because the host needs this one conversion on its own, without the rest of
+ * `normalize_per_file_state`: `viewer-controller`'s durable row-height latch has to hand
+ * the core an index-addressable array on a path where sanitizing transforms and the whole
+ * pending-edit map would be wasted work. Note that it shares the per-sheet values by
+ * reference rather than copying them, which is what makes it cheap enough for that path
+ * even when one of those values is an unbounded pre-migration height map.
+ */
+export function normalize_sheet_state_array<T>(
     value: ((T | undefined)[] | Record<string, T>) | undefined,
     sheet_names: string[]
 ): (T | undefined)[] {

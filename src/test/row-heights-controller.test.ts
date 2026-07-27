@@ -22,6 +22,10 @@ import {
 } from '../types';
 import { MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
+import {
+    acquire_file_coordinator,
+    type FileCoordinatorAttachment,
+} from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -32,6 +36,13 @@ const file_path = '/tmp/row-heights-controller.csv';
 
 /** Header `h`, then data rows `c`, `a`, `b` at source rows 0, 1, 2. */
 const CSV = 'h\nc\na\nb\n';
+
+/**
+ * What the mock filesystem currently holds. Mutable so one test can change the file
+ * *content* under a watcher event, which is what advances the coordinator's file
+ * authority — a same-digest refresh does not.
+ */
+let disk = CSV;
 
 const ROW_HEIGHT_LIMIT_WARNING =
     'Too many resized rows to persist: a sheet may keep at most '
@@ -127,8 +138,9 @@ beforeEach(() => {
     vi.restoreAllMocks();
     vscode_mock.__reset();
     vi.spyOn(vscode_mock.window, 'showWarningMessage');
-    vscode_mock.__setStatImplementation(async () => ({ size: CSV.length, mtime: 1 }));
-    vscode_mock.__setReadFileImplementation(async () => enc.encode(CSV));
+    disk = CSV;
+    vscode_mock.__setStatImplementation(async () => ({ size: disk.length, mtime: 1 }));
+    vscode_mock.__setReadFileImplementation(async () => enc.encode(disk));
 });
 
 describe('the setRowHeights host handler', () => {
@@ -365,22 +377,153 @@ describe('the setRowHeights host handler', () => {
         expect(warnings()).toEqual([]);
     });
 
-    it('writes nothing in preview mode', async () => {
+    it('persists a resize in preview mode, like every other layout field', async () => {
+        // Preview refuses `hideRows` because that is a *view transform*: it changes which
+        // rows the view contains, which is a claim about the document a read-only preview
+        // has no business making. A height changes nothing about row identity — it is
+        // layout, in the same class as `columnWidths` and `scrollPosition`, which preview
+        // has always persisted through `stateChanged`. Refusing here would also have been
+        // silent: preview still mounts the resize overlay and still paints the new height,
+        // so the row would look resized until a later delivery quietly reverted it.
         const state = versioned_state_store();
         const panel = open_csv_table(state.store, {
             ...csv_table_profile(),
             previewMode: true,
         });
         const initial = await ready(panel);
+        expect(initial.configuration.previewMode).toBe(true);
+
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 0: 44 }));
+        await vi.waitFor(() => expect(latest_projection(panel)).toEqual([{ 0: 44 }]));
+    });
+
+    it('projects a legacy height map that is still keyed by sheet name', async () => {
+        // `LegacyPerFileState` keys every per-sheet map by sheet *name*. Latched through
+        // unconverted, the projection's index lookup gets `undefined` and every height the
+        // user persisted under an older version silently disappears on open — and stays
+        // gone, because an unchanged state is not necessarily rewritten, so nothing later
+        // restores what the first read failed to see.
+        const state = versioned_state_store({
+            rowHeights: { Sheet1: { 2: 41 } },
+        } as StoredPerFileState);
+        const panel = open_csv_table(state.store);
+
+        const initial = await ready(panel);
+
+        expect(initial.rowHeightProjection).toEqual([{ 2: 41 }]);
+    });
+
+    it('changes a row already in an over-cap map without refusing it', async () => {
+        // Releases before `MAX_PERSISTED_ROW_HEIGHTS` existed could persist a select-all
+        // height map, so a file on disk may already hold far more than the cap. A check on
+        // the resulting *level* would then refuse every resize on that file forever, with
+        // no way out: the webview never sees the durable map, so nothing tells the user to
+        // delete entries and there is no UI to delete them with. Checking growth still
+        // stops any over-cap map being created or grown, which is all the bound was for.
+        const seeded: Record<number, number> = {};
+        for (let row = 0; row < MAX_PERSISTED_ROW_HEIGHTS + 50; row += 1) seeded[row] = 30;
+        const state = versioned_state_store({
+            rowHeights: [seeded],
+        } as StoredPerFileState);
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+
+        // Display row 0 is source row 0, which the seeded map already names — so the write
+        // changes a value and adds no key.
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0]?.[0])
+            .toBe(44));
+        expect(Object.keys(state.get_state(file_path).rowHeights?.[0] ?? {}))
+            .toHaveLength(MAX_PERSISTED_ROW_HEIGHTS + 50);
+        expect(warnings()).toEqual([]);
+    });
+
+    it('still refuses to grow an over-cap map, and says so', async () => {
+        // The boundary the growth check must not have moved: a row the map does *not*
+        // already name adds a key, and that is the write the bound exists to stop.
+        const seeded: Record<number, number> = {};
+        for (let row = 10; row < 10 + MAX_PERSISTED_ROW_HEIGHTS + 50; row += 1) {
+            seeded[row] = 30;
+        }
+        const state = versioned_state_store({
+            rowHeights: [seeded],
+        } as StoredPerFileState);
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
         const revision = state.revision(file_path);
 
         await resize(panel, initial, [{ start: 0, end: 0 }], 44);
 
-        // Nothing to wait for, so this is asserted after a turn of the microtask queue
-        // that a landing write would have needed anyway.
-        await Promise.resolve();
+        await vi.waitFor(() => expect(warnings()).toEqual([ROW_HEIGHT_LIMIT_WARNING]));
+        expect(state.get_state(file_path).rowHeights?.[0]).toEqual(seeded);
         expect(state.revision(file_path)).toBe(revision);
-        expect(state.get_state(file_path).rowHeights).toBeUndefined();
+    });
+
+    it('refuses a resize whose file authority has moved on, generations notwithstanding', async () => {
+        // The window the generation pair cannot see. During a physical refresh the
+        // coordinator's file authority advances *before* the new source is adopted, and the
+        // editable profile's `read_file_state()` await widens the gap — so the old core's
+        // `generation` and `sourceGeneration` both still match a request that was mapped
+        // through the *old* source. Writing it lands a height on a row of the new file
+        // revision the user never touched: a silent mis-attribution, which is worse than
+        // losing the resize.
+        //
+        // Reproduced by parking the first durable state read taken *after* the authority
+        // advanced — empirically the read inside the adoption path — and posting the resize
+        // while the refresh sits there. The resize's own read is not parked, so the refusal
+        // is the predicate's and not a side effect of the stall.
+        const state = versioned_state_store();
+        let coordinator: FileCoordinatorAttachment | undefined;
+        let park_at_authority: number | undefined;
+        let parked: (() => void) | undefined;
+        const store: FileStateStore = {
+            ...state.store,
+            async read(path) {
+                if (
+                    park_at_authority !== undefined
+                    && coordinator?.authority().authorityRevision === park_at_authority
+                ) {
+                    park_at_authority = undefined;
+                    await new Promise<void>((resume) => { parked = resume; });
+                }
+                return state.store.read(path);
+            },
+        };
+        const panel = open_csv_table(store);
+        const initial = await ready(panel);
+        // Acquired only after `attach_viewer`, so the coordinator entry is the one the
+        // controller built with the fake host's watcher factory. Released in `finally`:
+        // this extra attachment keeps the entry — and its advanced authority — alive, so
+        // leaking it on a failure would break every later test in the file rather than
+        // just this one.
+        coordinator = acquire_file_coordinator(file_path);
+        try {
+            expect(coordinator.authority().authorityRevision).toBe(1);
+
+            park_at_authority = 2;
+            disk = 'h\nc\na\nb\nz\n';
+            const refresh = vscode_mock.__getActiveWatchers()[0].__fireChange();
+            await vi.waitFor(() => expect(parked).toBeDefined());
+            expect(coordinator.authority().authorityRevision).toBe(2);
+            // No delivery yet, so the core has not adopted and the generations the webview
+            // holds — the ones `initial` carries — are still the core's own. That is
+            // precisely what makes the generation pair useless here.
+            expect(messages_of(panel, 'workbookSnapshot')).toHaveLength(1);
+
+            await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+            expect(state.get_state(file_path).rowHeights).toBeUndefined();
+            parked!();
+            await refresh;
+            expect(state.get_state(file_path).rowHeights).toBeUndefined();
+        } finally {
+            parked?.();
+            coordinator.dispose();
+        }
     });
 
     it('ignores a sheet index the workbook does not have', async () => {

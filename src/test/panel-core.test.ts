@@ -815,6 +815,139 @@ describe('ViewerPanelCore', () => {
         });
     });
 
+    /**
+     * The memo over the display-keyed row-height projection.
+     *
+     * Counted through `display_row_for_source`, which the projection calls exactly once
+     * per durable override entry and which nothing else in these cases calls at all —
+     * there is no `durablePendingEditKeys` provider, so the hidden-key scan never enters
+     * its loop. The call count is therefore the number of recomputations, which is the
+     * thing under test: the delivered values are identical with or without the memo, so a
+     * test that only compared values would pass with the memo deleted.
+     */
+    describe('rowHeightProjection memoization', () => {
+        function projection_core(overrides: Record<number, number> = { 2: 44 }) {
+            const { panel, posted } = make_panel();
+            const durable: {
+                revision: number;
+                heights: (Record<number, number> | undefined)[];
+            } = { revision: 1, heights: [overrides] };
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durableRowHeights: () => durable,
+            });
+            const scans = vi.spyOn(core, 'display_row_for_source');
+            const sort = async (requestId: string) => {
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId,
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: {
+                        sort: [{ colIndex: 0, direction: 'desc' }],
+                        filters: [],
+                        schema: '["Sheet1",2,null]',
+                    },
+                });
+                return posted.filter((m) => m.type === 'transformInstalled').at(-1);
+            };
+            return { core, durable, scans, sort };
+        }
+
+        it('recomputes once for a run of deliveries on one generation and revision', () => {
+            const { core, scans } = projection_core();
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 2: 44 }]);
+            const first = scans.mock.calls.length;
+            expect(first).toBeGreaterThan(0);
+
+            // Deliveries are triggered by scrolling, focus and sibling writes among
+            // others, so a run like this is the ordinary case rather than a stress case.
+            // Releases before `MAX_PERSISTED_ROW_HEIGHTS` existed could persist a
+            // select-all map, so "walk the map on every delivery" can be a walk over
+            // millions of entries already on disk — which is why a bound applied only to
+            // new writes does not fix the cost on its own.
+            for (let i = 0; i < 5; i += 1) {
+                expect(core.snapshot_material().core.rowHeightProjection)
+                    .toEqual([{ 2: 44 }]);
+            }
+
+            expect(scans.mock.calls.length).toBe(first);
+        });
+
+        it('recomputes when the durable revision moves with no generation change', () => {
+            // The half a generation key cannot see: a `setRowHeights`, a sibling panel's
+            // write and an excel-header plan edit all land as a new state revision, and
+            // none of them installs a view.
+            const { core, durable, scans } = projection_core();
+            core.snapshot_material();
+            const first = scans.mock.calls.length;
+
+            durable.heights = [{ 3: 55 }];
+            durable.revision = 2;
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 3: 55 }]);
+            expect(scans.mock.calls.length).toBeGreaterThan(first);
+        });
+
+        it('recomputes when an install moves the rows under an unchanged revision', async () => {
+            // The other half, and the one where a wrong answer is silent rather than
+            // merely stale: the durable map has not moved, but source row 4 is at display
+            // row 0 under a descending sort, so a memo keyed on the revision alone would
+            // paint the height on whatever row 4 used to be.
+            const { core, scans, sort } = projection_core({ 4: 44 });
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 4: 44 }]);
+            const first = scans.mock.calls.length;
+
+            const installed = await sort('desc');
+
+            expect(scans.mock.calls.length).toBeGreaterThan(first);
+            expect(installed.rowHeights).toEqual({ 0: 44 });
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 44 }]);
+        });
+
+        it('hands out a projection no reader can mutate', async () => {
+            // The memo returns the identical object to every reader until its key
+            // changes, so a reader that mutated what it got back would be editing the
+            // cache and the edit would surface on unrelated later deliveries. The
+            // snapshot path clones on the way out and would never have noticed; the
+            // install ack posts the object itself.
+            const { core, sort } = projection_core();
+            const installed = await sort('desc');
+
+            expect(() => {
+                (installed.rowHeights as Record<number, number>)[2] = 99;
+            }).toThrow(TypeError);
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 2: 44 }]);
+        });
+
+        // No test for "adoption does not serve a stale memo". Adoption bumps
+        // `_generation`, so the memo key misses whatever else is or is not done beside it,
+        // and the explicit drop in `adopt_source` is unfalsifiable — probed by deleting it,
+        // and nothing failed. A test asserting the behaviour would pass with the drop
+        // reverted, which makes it a test of nothing; `adopt_source`'s comment carries the
+        // argument instead.
+
+        it('asks for the projection indexed against its own source sheets', () => {
+            // The provider is handed sheet names rather than assuming an index array,
+            // because a legacy durable map is keyed by sheet *name* and only the core
+            // knows which sheets, in which order, those names have to line up with.
+            const { panel } = make_panel();
+            const asked: (readonly string[])[] = [];
+            const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 2), {
+                durableRowHeights: (names) => {
+                    asked.push(names);
+                    return { revision: 1, heights: [] };
+                },
+            });
+
+            core.snapshot_material();
+
+            expect(asked).toEqual([['Sheet1', 'Sheet2']]);
+        });
+    });
+
     it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {
         const { panel } = make_panel();
         const source = new TrackingColumnSource();
