@@ -304,12 +304,39 @@ export function resolved_row_height(
     if (layers !== undefined) {
         for (let index = layers.length - 1; index >= 0; index -= 1) {
             const layer = layers[index];
-            for (const interval of layer.rows) {
-                if (row >= interval.start && row <= interval.end) return layer.height;
-            }
+            if (layer_contains_row(layer, row)) return layer.height;
         }
     }
     return row_height(overrides, row, default_height);
+}
+
+/**
+ * Whether `row` falls in one of a layer's intervals, by binary search.
+ *
+ * Linear here is not merely untidy, it misses a frame. The intervals are disjoint and
+ * ascending but there can be many of them: a resize commits the user's whole row
+ * selection, and a *scattered* selection coalesces to one interval per contiguous run, so
+ * the count is bounded only by `MAX_PERSISTED_ROW_HEIGHTS` — the cap the webview checks
+ * before it layers anything. At that bound, with the overlay at `MAX_ROW_HEIGHT_LAYERS`
+ * deep, a linear scan costs about 8ms for a single viewport of rows, and Glide calls this
+ * once per painted row per frame. Half the frame budget, spent deciding that no layer
+ * names the row.
+ *
+ * Ascending and disjoint is what makes the search valid, and it is a real guarantee
+ * rather than a hope: every interval list reaching a layer comes from
+ * `selected_display_row_intervals`, which coalesces and merges before returning.
+ */
+function layer_contains_row(layer: RowHeightLayer, row: number): boolean {
+    let low = 0;
+    let high = layer.rows.length - 1;
+    while (low <= high) {
+        const mid = (low + high) >> 1;
+        const interval = layer.rows[mid];
+        if (row < interval.start) high = mid - 1;
+        else if (row > interval.end) low = mid + 1;
+        else return true;
+    }
+    return false;
 }
 
 /** Total rows an overlay layer names. */
@@ -348,9 +375,11 @@ function projection_agrees_with_layer(
     for (const [key, height] of Object.entries(overrides)) {
         if (height !== layer.height) continue;
         const row = Number(key);
-        if (layer.rows.some(
-            (interval) => row >= interval.start && row <= interval.end,
-        )) matched += 1;
+        // Binary search for the same reason as the render path, though this one is off
+        // the frame path: the walk is over projection entries (bounded by
+        // `MAX_PERSISTED_ROW_HEIGHTS`) and each membership test was linear in the
+        // interval count (bounded the same way), so the product is the cliff.
+        if (layer_contains_row(layer, row)) matched += 1;
     }
     return matched === layer_row_count(layer);
 }

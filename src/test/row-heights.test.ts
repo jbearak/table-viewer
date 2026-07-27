@@ -16,6 +16,7 @@ import {
     span_height,
     type RowHeightLayer,
 } from '../webview/row-heights';
+import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 
 describe('row-heights', () => {
     it('row_height returns the override when present, default otherwise', () => {
@@ -149,6 +150,40 @@ describe('the optimistic row-height overlay', () => {
         }];
     }
 
+    /**
+     * A scattered selection that reports how many of its intervals were *looked at*.
+     *
+     * The sibling of `select_all_rows`, for the other axis of the same claim. That one
+     * pins cost against the sheet's row count with one enormous interval; this one pins
+     * cost against the *interval count* with many small ones, which is the case a
+     * scattered multi-row selection produces — `selected_display_row_intervals` coalesces
+     * one interval per contiguous run, so the count is bounded only by
+     * `MAX_PERSISTED_ROW_HEIGHTS`, the cap the webview checks before layering.
+     *
+     * Counted through an index proxy rather than a getter, because what matters here is
+     * how many *intervals* the search touches, not how often one interval is re-read. A
+     * linear scan touches every one; a binary search touches about log2 of them.
+     */
+    function counted_scattered_rows(count: number): {
+        rows: readonly { start: number; end: number }[];
+        touched: () => number;
+    } {
+        let touched = 0;
+        // Row `2 * i` for each i, so odd rows fall between intervals and a lookup for one
+        // is the worst case: it can stop early at no interval.
+        const backing = Array.from({ length: count }, (_, i) => ({
+            start: i * 2,
+            end: i * 2,
+        }));
+        const rows = new Proxy(backing, {
+            get(target, property, receiver) {
+                if (typeof property === 'string' && /^\d+$/.test(property)) touched += 1;
+                return Reflect.get(target, property, receiver);
+            },
+        });
+        return { rows, touched: () => touched };
+    }
+
     describe('resolved_row_height', () => {
         it('prefers the newest layer that names the row', () => {
             const layers = [layer([{ start: 0, end: 4 }], 40), layer([{ start: 0, end: 0 }], 60)];
@@ -181,6 +216,28 @@ describe('the optimistic row-height overlay', () => {
             // The last row of the sheet: the worst case for anything that scans.
             expect(resolved_row_height({}, select_all, 9_999_999)).toBe(72);
             expect(resolved_row_height({}, select_all, 0)).toBe(72);
+        });
+
+        it('answers a scattered layer without walking its intervals', () => {
+            // The other axis of the same claim, and this one is on the frame path: Glide
+            // calls `rowHeight` once per painted row per frame, so a scan linear in the
+            // interval count costs about 8ms per viewport at the cap — half a frame,
+            // spent deciding that no layer names the row.
+            //
+            // A scattered selection is what produces those intervals: coalescing yields
+            // one per contiguous run, bounded only by `MAX_PERSISTED_ROW_HEIGHTS`. The
+            // budget is generous — log2(10,000) is about 14 per layer, and this asks only
+            // that the answer come from a search rather than a sweep.
+            const scattered = counted_scattered_rows(MAX_PERSISTED_ROW_HEIGHTS);
+            const layers = [layer(scattered.rows, 72)];
+
+            // A row no interval names: the worst case, since a hit can stop early.
+            expect(resolved_row_height({}, layers, 1)).toBe(DEFAULT_ROW_HEIGHT_PX);
+            // And one that is named, to prove the search is answering correctly rather
+            // than cheaply — a stub that touched nothing would satisfy the bound alone.
+            expect(resolved_row_height({}, layers, 19_998)).toBe(72);
+
+            expect(scattered.touched()).toBeLessThan(64);
         });
     });
 
@@ -331,6 +388,30 @@ describe('the optimistic row-height overlay', () => {
                 layer([{ start: 3, end: 3 }], 40),
             ];
             expect(row_height_layers_for_delivery(layers, { 3: 40 })).toEqual([]);
+        });
+
+        it('reconciles a scattered layer without walking its intervals per entry', () => {
+            // Off the frame path, but the cliff here is a *product*: the walk is over
+            // projection entries (bounded by `MAX_PERSISTED_ROW_HEIGHTS`) and each
+            // membership test was linear in the interval count (bounded the same way).
+            // A few hundred entries against a full-cap layer was already millions of
+            // comparisons on a delivery.
+            const scattered = counted_scattered_rows(MAX_PERSISTED_ROW_HEIGHTS);
+            const layers = [layer(scattered.rows, 72)];
+            // 200 delivered entries at the layer's height, all inside it. Nowhere near
+            // covering the layer, so this does not agree and the layer is kept — the
+            // point is what the *decision* cost.
+            const delivered: Record<number, number> = {};
+            for (let i = 0; i < 200; i += 1) delivered[i * 2] = 72;
+
+            expect(row_height_layers_for_delivery(layers, delivered)).toBe(layers);
+
+            // One unavoidable pass over the intervals — `layer_row_count` has to total
+            // them, which is O(intervals) and is not what this is about — plus one search
+            // of ~14 steps per delivered entry. The budget is that sum with room to
+            // spare. A linear membership test would be 200 × 10,000 = two million.
+            expect(scattered.touched())
+                .toBeLessThan(MAX_PERSISTED_ROW_HEIGHTS + 200 * 32);
         });
 
         it('never agrees with a select-all layer a sparse projection cannot answer', () => {
