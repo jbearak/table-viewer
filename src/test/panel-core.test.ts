@@ -996,6 +996,75 @@ describe('ViewerPanelCore', () => {
                 return { core, durable, scans_for, sort };
             }
 
+            it('holds a sheet\'s mapping generation when an install permutes nothing', async () => {
+                // A filter added but left disabled changes the rules — so the core-wide
+                // generation must move, and the ack must carry it — but `compute_transform`
+                // returns no indices and the sheet had none, so display row `r` is still
+                // source row `r`. A resize already in flight against the previous
+                // generation still names exactly the rows it meant, and the host's
+                // admission rule is `msg.generation >= mapping_generation(sheet)`. If this
+                // moved, that resize would be refused and the webview — told its sheet's
+                // mapping had moved — would throw the optimistic layer away with it.
+                const { core } = two_sheet_core();
+                const mapping_before = core.mapping_generation(0);
+                const generation_before = core.generation;
+
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId: 'disabled-filter',
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: {
+                        sort: [],
+                        filters: [{
+                            id: 'f1',
+                            colIndex: 0,
+                            operator: 'contains',
+                            value: 'z',
+                            caseSensitive: false,
+                            enabled: false,
+                        }],
+                        schema: '["Sheet1",3,null]',
+                    },
+                });
+
+                expect(core.generation).toBeGreaterThan(generation_before);
+                expect(core.mapping_generation(0)).toBe(mapping_before);
+            });
+
+            it('moves a sheet\'s mapping generation when an install does permute', async () => {
+                // The other direction, so the test above cannot be satisfied by never
+                // moving the mapping generation at all.
+                const { core, sort } = two_sheet_core();
+                const mapping_before = core.mapping_generation(0);
+
+                await sort(0, 'desc-a');
+
+                expect(core.mapping_generation(0)).toBeGreaterThan(mapping_before);
+            });
+
+            it('moves it back when a permuting view is cleared', async () => {
+                // Present → absent also moves every display row, and is the case a
+                // one-sided check ("next has no indices, so nothing moved") would miss.
+                const { core, sort } = two_sheet_core();
+                await sort(0, 'desc-a');
+                const mapping_after_sort = core.mapping_generation(0);
+
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId: 'clear-a',
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent: 'user',
+                    state: { sort: [], filters: [], schema: '["Sheet1",3,null]' },
+                });
+
+                expect(core.mapping_generation(0)).toBeGreaterThan(mapping_after_sort);
+            });
+
             it('leaves an untouched sheet alone when a sibling installs a view', async () => {
                 // A sort on sheet B bumps the core-wide generation, which is what the
                 // outer memo is keyed on — but sheet A's `mapping_generation` does not

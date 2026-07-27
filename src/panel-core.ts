@@ -829,6 +829,10 @@ export class ViewerPanelCore {
             || this._generation !== prepared.generation
         ) return false;
         for (const change of prepared.changes) {
+            const mapping_moved = mapping_change_moves_rows(
+                this.transform_indices.get(change.sheetIndex),
+                change.indices,
+            );
             if (change.indices) {
                 this.transform_indices.set(change.sheetIndex, change.indices);
             } else {
@@ -844,7 +848,14 @@ export class ViewerPanelCore {
             // several sheets and bumps once per change: a sheet reconciled first must not
             // inherit the generation of a sheet reconciled after it, or its own stale
             // requests would be accepted.
-            this.sheet_mapping_generations.set(change.sheetIndex, this._generation);
+            //
+            // Conditional for the reason given at the other writer of this map, in the
+            // `setTransform` install path: a change that leaves the sheet unpermuted on
+            // both sides moves no display row, and invalidating one would refuse a resize
+            // that is still perfectly current.
+            if (mapping_moved) {
+                this.sheet_mapping_generations.set(change.sheetIndex, this._generation);
+            }
         }
         if (prepared.changes.length > 0) this.cache.clear();
         return true;
@@ -1408,6 +1419,10 @@ export class ViewerPanelCore {
                 || (msg.intent === 'restore' && !receiver_is_current())
             ) return;
 
+            const mapping_moved = mapping_change_moves_rows(
+                this.transform_indices.get(msg.sheetIndex),
+                result.indices,
+            );
             if (result.indices) {
                 this.transform_indices.set(msg.sheetIndex, result.indices);
             } else {
@@ -1420,7 +1435,18 @@ export class ViewerPanelCore {
             // `mapping_generation`. Recorded after the bump so it names the generation the
             // ack below carries, which is the earliest generation a display-keyed request
             // for this sheet may quote from now on.
-            this.sheet_mapping_generations.set(msg.sheetIndex, this._generation);
+            //
+            // Conditional because the core-wide generation and the per-sheet mapping
+            // generation answer different questions. Installing a transform that produces
+            // no permutation over a sheet that had none — a filter added but left disabled,
+            // say — changes the *rules* and so must bump `_generation`, but display row `r`
+            // is still source row `r`. Bumping here too would refuse an in-flight resize
+            // whose display rows are still exactly right, and the webview, told the mapping
+            // moved, would discard the optimistic layer with it: the row springs back and
+            // nothing was ever wrong with it.
+            if (mapping_moved) {
+                this.sheet_mapping_generations.set(msg.sheetIndex, this._generation);
+            }
             this.cache.clear();
             // Built after the mutation above, so the record's basis carries the
             // bumped generation and its rules/rowCount/permuted come from what was
@@ -1600,6 +1626,24 @@ export class ViewerPanelCore {
         ) return Promise.resolve(false);
         return Promise.resolve(this.panel.webview.postMessage(message));
     }
+}
+
+/**
+ * Whether replacing a sheet's permutation with `next` moves any display row.
+ *
+ * The only case answered `false` is absent → absent: with no permutation on either side
+ * display row `r` is source row `r` before and after, so every display-keyed thing —
+ * a queued resize, a row-height overlay — still names the row it meant. Anything else is
+ * reported as moved. Two identical index arrays would also leave rows in place, but they
+ * are not compared: the check would be O(rows) on a path that runs per install, and the
+ * cost of a false "moved" is one discarded overlay while the cost of a false "unmoved" is
+ * a height silently landing on the wrong row.
+ */
+function mapping_change_moves_rows(
+    previous: Uint32Array | undefined,
+    next: Uint32Array | undefined,
+): boolean {
+    return previous !== undefined || next !== undefined;
 }
 
 function clone_transform(state: SheetTransformState): SheetTransformState {
