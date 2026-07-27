@@ -243,6 +243,43 @@ describe('pure Excel header state planning', () => {
             expect(plan.state.rowHeights).toEqual([{ 1: 40 }]);
         });
 
+        it('shifts an auto-promoted sheet whose first source row is hidden', () => {
+            // The auto-detected promotion always takes *projected row 0* out of the display
+            // space, and over a physical XLS/XLSX source that is source row 0 — hiding rows
+            // does not move it, because `active_header_row` reads `manualHeaderRow` only
+            // under an explicit `'on'`. So these keys are recoverable by the ordinary shift.
+            //
+            // What made this worth a test of its own is that the sheet's *manual* candidate
+            // does move: with source row 0 hidden, `manualHeaderSourceRow` is 1. Deriving the
+            // old header row by forcing `'on'` through the projection therefore read 1 here,
+            // concluded "manual promotion, not reconstructible", and dropped the whole map —
+            // permanent loss of heights that a `+1` recovers exactly.
+            const ds = source(undefined, undefined, [[0]]);
+            expect(ds.meta().sheets[0].excelFirstRowHeader)
+                .toMatchObject({ mode: 'auto', active: true });
+            expect(ds.planning_input().sheets[0].manualHeaderSourceRow).toBe(1);
+
+            const plan = plan_excel_candidate_state(
+                {
+                    ...previously_promoted([{ 0: 40, 3: 60 }]),
+                    // How the state gets here: the hidden-row transform is durable, so the
+                    // projection is built with it, but a resize saved before that transform
+                    // installed was written in the un-permuted, header-promoted display
+                    // space.
+                    transforms: [{
+                        sort: [],
+                        filters: [],
+                        hiddenRows: [0],
+                        schema: transform_schema_for_sheet(ds.meta().sheets[0]),
+                    }],
+                },
+                ds.planning_input(),
+            );
+
+            expect(plan.state.rowHeights).toEqual([{ 1: 40, 4: 60 }]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+        });
+
         it('drops the keys when the previous promotion had a manual header row', () => {
             const rows = [
                 [text('Report'), text('')],
@@ -261,6 +298,47 @@ describe('pure Excel header state planning', () => {
             const plan = plan_excel_candidate_state(
                 previously_promoted([{ 0: 40, 1: 60 }], { People: 'on' }),
                 ds.planning_input(),
+            );
+
+            expect(plan.state.rowHeights).toEqual([undefined]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+        });
+
+        it('reads the recorded mode from durable state, not from the live source', () => {
+            // The same manual-header fixture, with the source built *without* the override
+            // the state records. That is the CAS-retry shape: the projection facts come from
+            // whatever the load built its source with, while the state being migrated has
+            // moved on — and it is the state's own heights that are being re-keyed, so it is
+            // the state's own mode that says which space they are in. Taking the mode off the
+            // planning input instead reads "auto" here and shifts a manually-promoted map by
+            // one, which is the silent off-by-one this whole pass is trying to avoid.
+            const rows = [
+                [text('Report'), text('')],
+                [text('Notes'), text('')],
+                [text('Name'), text('Age')],
+                [text('Alice'), number(30)],
+            ];
+            const ds = source(undefined, rows, [[0, 1]]);
+            expect(ds.planning_input().sheets[0].override).toBeUndefined();
+            expect(ds.planning_input().sheets[0].manualHeaderSourceRow).toBe(2);
+
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{ 0: 40, 1: 60 }], { People: 'on' }),
+                ds.planning_input(),
+            );
+
+            expect(plan.state.rowHeights).toEqual([undefined]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+        });
+
+        it('drops the keys when the recorded mode cannot have promoted anything', () => {
+            // `'off'` never promotes, so a state recording it beside an active promotion is
+            // self-contradictory: one of the two facts is wrong and nothing here says which.
+            // Guessing "manual" would shift these keys by one on the strength of a projection
+            // query, which is a silent off-by-one bought with no evidence at all.
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{ 0: 40 }], { People: 'off' }),
+                source('off').planning_input(),
             );
 
             expect(plan.state.rowHeights).toEqual([undefined]);

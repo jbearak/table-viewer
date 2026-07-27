@@ -2897,6 +2897,45 @@ describe('row height persistence', () => {
             .toEqual(PENDING_LAYER);
     });
 
+    it('keeps one sheet\'s pending resize across a resize on another sheet', async () => {
+        const { post_message } = await pending_resize();
+
+        // Two sheets with a resize in flight at once. Reachable without a mid-drag tab
+        // switch: the request for Sheet1 is still on its way to the host — or its answer
+        // still on its way back — while the user opens Other and drags a boundary there.
+        // Holding one overlay slot made the second resize *replace* the first, so coming
+        // back to Sheet1 before its delivery landed showed a completed resize snapping back.
+        post_message.mockClear();
+        await click_button('Other');
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+        expect(post_message.mock.calls.at(-1)![0]).toMatchObject({
+            type: 'setRowHeights',
+            sheetIndex: 1,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+
+        // And the two are answered independently. This delivery agrees with Other's layer
+        // and says nothing about Sheet1's, so exactly one retires — which is also what
+        // stops the per-sheet split from being satisfied by one shared list of layers.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [undefined, { 3: 50, 5: 50, 8: 50 }],
+        }));
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        await click_button('Other');
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
     it('leaves the overlay alone when an install lands on another sheet', async () => {
         const { post_message } = await pending_resize();
 

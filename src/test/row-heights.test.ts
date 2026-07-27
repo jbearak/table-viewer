@@ -5,6 +5,7 @@ import {
     MAX_ROW_HEIGHT_PX,
     MIN_ROW_HEIGHT_PX,
     clamp_row_height,
+    mapped_row_height_overlays,
     natural_row_height,
     resolved_row_height,
     retained_row_height_overlay,
@@ -348,7 +349,6 @@ describe('the optimistic row-height overlay', () => {
      */
     describe('retained_row_height_overlay', () => {
         const overlay = {
-            sheet_index: 0,
             generation: 4,
             layers: [layer([{ start: 3, end: 3 }], 50)],
         };
@@ -392,6 +392,43 @@ describe('the optimistic row-height overlay', () => {
 
         it('has nothing to retain when there is no overlay', () => {
             expect(retained_row_height_overlay(undefined, 5, 4)).toBeUndefined();
+        });
+    });
+
+    describe('mapped_row_height_overlays', () => {
+        const overlay = (generation: number) => ({
+            generation,
+            layers: [layer([{ start: 3, end: 3 }], 50)],
+        });
+
+        it('passes each sheet its own index and keeps every other slot', () => {
+            const first = overlay(4);
+            const third = overlay(6);
+            const seen: number[] = [];
+
+            const next = mapped_row_height_overlays(
+                [first, undefined, third],
+                (entry, sheet_index) => {
+                    seen.push(sheet_index);
+                    return sheet_index === 2 ? undefined : entry;
+                },
+            );
+
+            // The empty slot is skipped rather than handed over as `undefined`, so a caller
+            // cannot invent an overlay for a sheet with no resize in flight.
+            expect(seen).toEqual([0, 2]);
+            expect(next).toEqual([first, undefined, undefined]);
+            // Positional, so the surviving entry stays under its own sheet's index — a
+            // compacting map would slide sheet 2's verdict onto sheet 0.
+            expect(next[0]).toBe(first);
+        });
+
+        it('returns the same array when no verdict changed anything', () => {
+            // Identity, not just equality: this runs on every delivery and every install
+            // ack, and App holds the result in React state, so a fresh array would re-render
+            // the grid on events that changed nothing.
+            const previous = [overlay(4), undefined];
+            expect(mapped_row_height_overlays(previous, (entry) => entry)).toBe(previous);
         });
     });
 });

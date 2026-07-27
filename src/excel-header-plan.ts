@@ -230,12 +230,13 @@ export function plan_excel_candidate_state(
  *
  * It exists because there are **two** writers of `excelFirstRowHeaderActive`, and the
  * migration keys off exactly that fact: `pre_migration_row_height_space` reads
- * `previous_active` to decide which row space the stored keys are in. A writer that flips
- * the recorded projection without discharging the migration destroys the evidence the
- * migration needs — a later `plan_excel_candidate_state` would see `previous_active` say
- * "unpromoted", conclude `canonical`, and stamp still-display-keyed heights as canonical,
- * leaving every height on that sheet permanently off by one. So both writers reconcile the
- * heights, and both stamp `rowHeightsVersion`.
+ * `previous_active` — with `excelFirstRowHeaders` beside it for *which* promotion was
+ * recorded — to decide which row space the stored keys are in. A writer that flips the
+ * recorded projection without discharging the migration destroys the evidence the migration
+ * needs — a later `plan_excel_candidate_state` would see `previous_active` say "unpromoted",
+ * conclude `canonical`, and stamp still-display-keyed heights as canonical, leaving every
+ * height on that sheet permanently off by one. So both writers reconcile the heights, and
+ * both stamp `rowHeightsVersion`.
  *
  * Every sheet, not only the one being toggled, and that is the load-bearing part: the
  * marker is per *file*, so migrating one sheet and stamping would declare the other
@@ -253,6 +254,21 @@ function migrate_row_heights_for_file(
     const first_migration = current.excelFirstRowHeaderVersion !== 1;
     const previous_active = sanitize_excel_header_active(
         current.excelFirstRowHeaderActive,
+    );
+    // The *mode* the stored keys were written under, alongside the *active* flag that says
+    // whether that mode promoted anything. Two durable facts rather than one because the
+    // second cannot be recovered from the projection: see
+    // `pre_migration_row_height_space`.
+    //
+    // Read from `current` rather than from `input.sheets[].override`, and the two are not
+    // interchangeable. The planning input's override is whatever the live source was built
+    // with, which on a CAS retry is the load's own starting point rather than the state
+    // being migrated; `current` is the state whose `rowHeights` are about to be re-keyed,
+    // and the pair (`excelFirstRowHeaders`, `excelFirstRowHeaderActive`) only ever moves
+    // together, host-side, in the two planners here — neither is a `LayoutStatePatch` leaf,
+    // so no webview write can separate them.
+    const previous_overrides = sanitize_excel_header_overrides(
+        current.excelFirstRowHeaders,
     );
     // Built to the workbook's own length rather than copied from `current.rowHeights`,
     // which drops any slot past the last sheet this workbook has — and dropping is the
@@ -285,6 +301,10 @@ function migrate_row_heights_for_file(
                     planning_sheet.name,
                 ),
                 first_migration ? false : previous_active[planning_sheet.name],
+                Object.prototype.hasOwnProperty.call(
+                    previous_overrides,
+                    planning_sheet.name,
+                ) ? previous_overrides[planning_sheet.name] : undefined,
                 planning_sheet,
             ),
         )
@@ -447,12 +467,30 @@ export function plan_excel_override_state(
  *
  * `promoted` is the recorded-active case. Every promotion *transition* cleared the map
  * before this PR, so a map that survived was written under the promotion still recorded
- * as active, and `headerSourceRow` is that promotion's own header row — taken from the
- * previous projection rather than the incoming one, because a load that is switching the
- * promotion off still has to invert the space the keys are in.
+ * as active, and `headerSourceRow` is that promotion's own header row — the previous
+ * projection's, not the incoming one's, because a load that is switching the promotion off
+ * still has to invert the space the keys are in.
  *
- * `unknown` is the honest answer when `excelFirstRowHeaderActive` has no entry for the
- * sheet, or the planning input no longer lines up with it by name. Neither proof is
+ * Which row that was is decided from the recorded *mode*, and deriving it from the
+ * projection instead is the mistake this signature exists to make unwritable. The two
+ * promotions put their header in different places: an auto-detected one always takes
+ * *projected row 0*, which over a physical XLS/XLSX source is source row 0 (the only
+ * sources header authority is ever built over — see `first_non_hidden_source_row`),
+ * while an explicit `'on'` takes the sheet's manual candidate,
+ * `manualHeaderSourceRow`. Asking the projection for "the header row if this were `'on'`"
+ * answers the *manual* question for both, and that answer is wrong for an auto promotion
+ * the moment the manual candidate is not row 0 — which durable `hiddenRows` alone is
+ * enough to arrange, because hiding source row 0 moves the manual candidate to row 1 and
+ * moves the auto promotion not at all. The keys were then dropped as "manual, not
+ * reconstructible" when they were an ordinary `+1` away from correct: permanent loss of
+ * hand-set heights, on the upgrade this whole pass exists to get right.
+ *
+ * `'off'` cannot have been the mode that promoted anything, so a state recording it
+ * *alongside* an active promotion is self-contradictory. The keys are dropped rather than
+ * arbitrated: one of the two facts is wrong and there is nothing here to say which.
+ *
+ * `unknown` is likewise the honest answer when `excelFirstRowHeaderActive` has no entry for
+ * the sheet, or the planning input no longer lines up with it by name. No proof is
  * available, so the keys are dropped rather than guessed at.
  */
 type PreMigrationRowHeightSpace =
@@ -464,11 +502,17 @@ function pre_migration_row_height_space(
     first_migration: boolean,
     had_previous: boolean,
     previous_is_active: boolean,
+    previous_mode: ExcelHeaderOverride | undefined,
     matched_planning_sheet: ExcelHeaderPlanningInput['sheets'][number] | undefined,
 ): PreMigrationRowHeightSpace {
     if (first_migration) return { kind: 'canonical' };
     if (!had_previous || !matched_planning_sheet) return { kind: 'unknown' };
     if (!previous_is_active) return { kind: 'canonical' };
+    if (previous_mode === 'off') return { kind: 'unknown' };
+    // The auto-detected promotion, which is essentially all of it in the field: the header
+    // is projected row 0, so the shift is by one and no projection query is needed to know
+    // that. Querying one would in fact answer a different question; see above.
+    if (previous_mode === undefined) return { kind: 'promoted', headerSourceRow: 0 };
     return {
         kind: 'promoted',
         headerSourceRow: project_excel_header_sheet(matched_planning_sheet, 'on')

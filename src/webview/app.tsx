@@ -84,6 +84,7 @@ import {
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
+    mapped_row_height_overlays,
     retained_row_height_overlay,
     row_height_layers_for_delivery,
     row_height_layers_with,
@@ -119,6 +120,14 @@ type FilterHistogramState = FilterHistogramStatus;
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
+
+/**
+ * No sheet has a resize in flight — the initial value, and the one a new document resets
+ * to. A shared frozen constant so that "nothing pending" is always the *same* array: a
+ * fresh `[]` on every delivery would be a new React state value each time and would
+ * re-render the grid for no change at all.
+ */
+const NO_ROW_HEIGHT_OVERLAYS: readonly (RowHeightOverlay | undefined)[] = Object.freeze([]);
 
 function column_visibility_equal(
     left: SheetColumnVisibilityState | undefined,
@@ -337,16 +346,23 @@ export function App(): React.JSX.Element {
     // select-all resize names every row of the sheet, and expanding that would cost one
     // map entry per row to record a single number (see `RowHeightLayer`).
     //
-    // Tagged with the sheet and the view generation the display rows were read off. What
-    // voids it is not a generation change as such but *this sheet's* mapping moving after
-    // that generation — the host's own test, applied here to the same numbers, so that
-    // the two sides cannot disagree about whether a queued resize is still meaningful.
-    // When it is voided the numbers in it name positions in an arrangement that no longer
-    // exists, and that is also the entire user-visible answer to a resize the host
-    // refuses as stale: the row springs back, with no refusal message and deliberately no
-    // replay, because replaying would resize whatever rows now sit at those positions.
-    // Both the rule and the reasons for it are at `retained_row_height_overlay`.
-    const [row_height_overlay, set_row_height_overlay] = useState<RowHeightOverlay>();
+    // Indexed by sheet, and tagged with the view generation the display rows were read
+    // off. Per sheet because two resizes can be in flight on two sheets at once — the user
+    // drags a boundary, opens another tab and drags there before the first answer arrives —
+    // and a single slot made the second discard the first, so returning to the first sheet
+    // showed a completed resize snapping back until its delivery landed.
+    //
+    // What voids an entry is not a generation change as such but *that sheet's* mapping
+    // moving after the generation it was tagged with — the host's own test, applied here to
+    // the same numbers, so that the two sides cannot disagree about whether a queued resize
+    // is still meaningful. When it is voided the numbers in it name positions in an
+    // arrangement that no longer exists, and that is also the entire user-visible answer to
+    // a resize the host refuses as stale: the row springs back, with no refusal message and
+    // deliberately no replay, because replaying would resize whatever rows now sit at those
+    // positions. Both the rule and the reasons for it are at `retained_row_height_overlay`.
+    const [row_height_overlay, set_row_height_overlay] = useState<
+        readonly (RowHeightOverlay | undefined)[]
+    >(NO_ROW_HEIGHT_OVERLAYS);
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
@@ -1522,14 +1538,17 @@ export function App(): React.JSX.Element {
                         snapshot.meta.sheets.length,
                     );
                     set_row_height_projection(next_row_height_projection);
-                    // And the overlay of resizes this panel has posted but not yet seen
-                    // back. Two independent reasons to void it, and then a reconciliation.
+                    // And the resizes this panel has posted but not yet seen back. Two
+                    // independent reasons to void one, and then a reconciliation, asked of
+                    // *every* sheet's overlay rather than of one: a delivery is a statement
+                    // about the whole workbook, and two sheets can each be waiting on a
+                    // resize at the same time.
                     //
-                    // A new document voids it here rather than through the shared rule: a
-                    // fresh document restarts the host's counters, so every generation
-                    // comparison below would be a coincidence rather than evidence, the
-                    // same reason `presentation === 'refresh'` gates the record retention
-                    // above.
+                    // A new document voids all of them here rather than through the shared
+                    // rule: a fresh document restarts the host's counters, so every
+                    // generation comparison below would be a coincidence rather than
+                    // evidence, the same reason `presentation === 'refresh'` gates the record
+                    // retention above.
                     //
                     // Otherwise the shared rule decides, and this delivery is the reason
                     // `mappingGenerations` is on the wire at all. Asking `previous
@@ -1553,23 +1572,34 @@ export function App(): React.JSX.Element {
                     // the delivery that answers it and nothing needs to. In full at
                     // `row_height_layers_for_delivery`.
                     set_row_height_overlay((previous) => {
-                        if (snapshot.presentation === 'initial') return undefined;
-                        const retained = retained_row_height_overlay(
+                        if (snapshot.presentation === 'initial') {
+                            return NO_ROW_HEIGHT_OVERLAYS;
+                        }
+                        return mapped_row_height_overlays(
                             previous,
-                            snapshot.generation,
-                            previous === undefined
-                                ? undefined
-                                : snapshot.mappingGenerations[previous.sheet_index],
+                            (overlay, sheet_index) => {
+                                const retained = retained_row_height_overlay(
+                                    overlay,
+                                    snapshot.generation,
+                                    snapshot.mappingGenerations[sheet_index],
+                                );
+                                if (retained === undefined) return undefined;
+                                // Each sheet against its own projection. A delivery
+                                // describes every sheet, so unlike the install path there
+                                // is nothing to skip here — but the *pairing* is still the
+                                // whole of it: reconciling one sheet's layers against
+                                // another's projection would retire them on a coincidence
+                                // of row numbers and heights between two sheets.
+                                const layers = row_height_layers_for_delivery(
+                                    retained.layers,
+                                    next_row_height_projection[sheet_index] ?? {},
+                                );
+                                if (layers === retained.layers) return retained;
+                                return layers.length === 0
+                                    ? undefined
+                                    : { ...retained, layers };
+                            },
                         );
-                        if (retained === undefined) return undefined;
-                        const layers = row_height_layers_for_delivery(
-                            retained.layers,
-                            next_row_height_projection[retained.sheet_index] ?? {},
-                        );
-                        if (layers === retained.layers) return retained;
-                        return layers.length === 0
-                            ? undefined
-                            : { ...retained, layers };
                     });
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
@@ -1832,8 +1862,8 @@ export function App(): React.JSX.Element {
                 // for `msg.sheetIndex` and bumps the shared counter, so this sheet's
                 // mapping generation is now exactly the generation the ack carries, and no
                 // other sheet's moved at all — for those, whatever relation held before
-                // still holds, which `previous.generation` expresses without needing to
-                // know the value. Deriving it here rather than adding it to the message
+                // still holds, which the overlay's own `generation` expresses without needing
+                // to know the value. Deriving it here rather than adding it to the message
                 // keeps `transformInstalled` from carrying a per-sheet array it can compute
                 // one entry of and would only ever read one entry of.
                 //
@@ -1855,29 +1885,33 @@ export function App(): React.JSX.Element {
                 // with unit tests either side of the comparison, and inverting it now fails
                 // outright. The render-site generation gate is what became unfalsifiable in
                 // the trade, and is labelled as such where it is read.
-                set_row_height_overlay((previous) => {
-                    const retained = retained_row_height_overlay(
-                        previous,
-                        view.basis.generation,
-                        previous === undefined
-                            ? undefined
-                            : previous.sheet_index === msg.sheetIndex
+                set_row_height_overlay((previous) => mapped_row_height_overlays(
+                    previous,
+                    (overlay, sheet_index) => {
+                        const retained = retained_row_height_overlay(
+                            overlay,
+                            view.basis.generation,
+                            sheet_index === msg.sheetIndex
                                 ? view.basis.generation
-                                : previous.generation,
-                    );
-                    if (retained === undefined) return undefined;
-                    // `msg.rowHeights` describes `msg.sheetIndex` and nothing else, so it
-                    // can only answer an overlay belonging to that sheet. Reconciling
-                    // another sheet's overlay against it would retire layers by a
-                    // coincidence of row numbers and heights between two sheets.
-                    if (retained.sheet_index !== msg.sheetIndex) return retained;
-                    const layers = row_height_layers_for_delivery(
-                        retained.layers,
-                        msg.rowHeights,
-                    );
-                    if (layers === retained.layers) return retained;
-                    return layers.length === 0 ? undefined : { ...retained, layers };
-                });
+                                : overlay.generation,
+                        );
+                        if (retained === undefined) return undefined;
+                        // `msg.rowHeights` describes `msg.sheetIndex` and nothing else, so
+                        // it can only answer an overlay belonging to that sheet.
+                        // Reconciling another sheet's overlay against it would retire
+                        // layers by a coincidence of row numbers and heights between two
+                        // sheets.
+                        if (sheet_index !== msg.sheetIndex) return retained;
+                        const layers = row_height_layers_for_delivery(
+                            retained.layers,
+                            msg.rowHeights,
+                        );
+                        if (layers === retained.layers) return retained;
+                        return layers.length === 0
+                            ? undefined
+                            : { ...retained, layers };
+                    },
+                ));
                 // From the message's own `rules`, which is the rule set the host now
                 // holds, not from the record: the record describes rows, and a view that
                 // installed nothing has no rules on it to read. The message already
@@ -3037,18 +3071,24 @@ export function App(): React.JSX.Element {
             if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
             set_row_height_overlay((previous) => {
                 const layer: RowHeightLayer = { rows, height: clamped };
-                return previous
-                    && previous.sheet_index === active_sheet_index
-                    && previous.generation === generation_ref.current
+                const existing = previous[active_sheet_index];
+                const next = [...previous];
+                // Appended to this sheet's own overlay, and every other sheet's is left
+                // exactly as it was — a resize on one sheet says nothing about a resize in
+                // flight on another. An existing overlay tagged with an older generation is
+                // replaced rather than added to: its display rows named an arrangement this
+                // sheet has left, so there is nothing to accumulate onto.
+                next[active_sheet_index] = existing
+                    && existing.generation === generation_ref.current
                     ? {
-                        ...previous,
-                        layers: row_height_layers_with(previous.layers, layer),
+                        ...existing,
+                        layers: row_height_layers_with(existing.layers, layer),
                     }
                     : {
-                        sheet_index: active_sheet_index,
                         generation: generation_ref.current,
                         layers: [layer],
                     };
+                return next;
             });
         },
         [active_sheet_index]
@@ -3458,13 +3498,15 @@ export function App(): React.JSX.Element {
     // The overlay only ever applies to the sheet and the arrangement it was recorded
     // against.
     //
-    // The *sheet* test has to be here, and only here: a tab switch moves no generation and
-    // touches no overlay state, so nothing written at the two handlers could catch it, and
-    // without this a pending resize on Sheet1 would paint at display rows 3, 5 and 8 of
-    // whatever sheet the user opens next.
+    // The *sheet* part is settled by reading the active sheet's own slot, which is why the
+    // overlays are held per sheet rather than as one record carrying the sheet it belongs
+    // to. A tab switch moves no generation and touches no overlay state, so nothing written
+    // at the two handlers could catch it; painting whatever overlay happened to be in state
+    // would show a pending resize on Sheet1 at display rows 3, 5 and 8 of whatever sheet the
+    // user opens next.
     //
-    // The *generation* test is, as of this change, unfalsifiable, and is kept and labelled
-    // rather than dressed up as load-bearing. Both writers of `generation`
+    // The *generation* test remains unfalsifiable, and is kept and labelled rather than
+    // dressed up as load-bearing. Both writers of `generation`
     // (`workbookSnapshot`, `transformInstalled`) now run `retained_row_height_overlay` in
     // the same handler and therefore the same React batch, and that helper either voids the
     // overlay or rebases it onto the generation being installed — so an overlay whose
@@ -3475,11 +3517,11 @@ export function App(): React.JSX.Element {
     // (`adopt_source`'s memo clear). Previously it was described as *jointly* held with the
     // install path's same-sheet void; that pairing is gone, because the void moved into the
     // shared helper where unit tests kill it directly.
+    const overlay_for_active_sheet = row_height_overlay[active_sheet_index];
     const active_row_height_overlay =
-        row_height_overlay
-        && row_height_overlay.sheet_index === active_sheet_index
-        && row_height_overlay.generation === generation
-            ? row_height_overlay.layers
+        overlay_for_active_sheet
+        && overlay_for_active_sheet.generation === generation
+            ? overlay_for_active_sheet.layers
             : undefined;
 
     const grid = (

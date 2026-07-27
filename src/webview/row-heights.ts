@@ -176,14 +176,46 @@ export interface RowHeightLayer {
  * The resizes this panel has committed but not yet seen answered, for one sheet, tagged
  * with the view generation their display rows were read off.
  *
- * One sheet, not a map of them, because a resize commits the *active* sheet's row
- * selection and the panel shows one sheet at a time: a second sheet's overlay could only
- * be created by switching tabs mid-drag, which is not reachable.
+ * Which sheet is *not* a field here: App holds these per sheet, indexed by sheet, so a
+ * record stored at one index cannot claim to be about another. One overlay per sheet rather
+ * than one overlay is what the panel actually needs — a resize commits the active sheet's
+ * row selection, but nothing makes the request and its answer finish before the user opens
+ * another tab and drags a boundary there, and a single slot let the second resize discard
+ * the first.
  */
 export interface RowHeightOverlay {
-    readonly sheet_index: number;
     readonly generation: number;
     readonly layers: readonly RowHeightLayer[];
+}
+
+/**
+ * Every sheet's overlay put through `next_for`, or the same array back when no sheet's
+ * verdict changed anything.
+ *
+ * The reference-identity guarantee is the reason this is a function rather than a
+ * `.map()`. Both events that reconcile overlays — a delivery and an install ack — arrive
+ * far more often than they change one, and App keeps these in React state: an array
+ * rebuilt on every delivery is a new prop identity on every delivery, which re-renders the
+ * grid for nothing. `undefined` slots are skipped rather than passed through, so a caller
+ * cannot accidentally invent an overlay for a sheet that has none.
+ */
+export function mapped_row_height_overlays(
+    previous: readonly (RowHeightOverlay | undefined)[],
+    next_for: (
+        overlay: RowHeightOverlay,
+        sheet_index: number,
+    ) => RowHeightOverlay | undefined,
+): readonly (RowHeightOverlay | undefined)[] {
+    let next: (RowHeightOverlay | undefined)[] | undefined;
+    for (let sheet_index = 0; sheet_index < previous.length; sheet_index += 1) {
+        const overlay = previous[sheet_index];
+        if (overlay === undefined) continue;
+        const replacement = next_for(overlay, sheet_index);
+        if (replacement === overlay) continue;
+        next ??= [...previous];
+        next[sheet_index] = replacement;
+    }
+    return next ?? previous;
 }
 
 /**
