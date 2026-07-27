@@ -345,6 +345,27 @@ vi.mock('../webview/grid-shell', () => ({
                 },
                 'grid-header-transform'
             ),
+            React.createElement(
+                'button',
+                {
+                    // A filter defined but left switched off: entries, so it installs and
+                    // moves the view generation, but nothing active, so it produces no
+                    // permutation and moves no row.
+                    className: 'stub-inactive-filter-transform',
+                    onClick: () => props.on_transform_change({
+                        sort: [],
+                        filters: [{
+                            id: 'f1',
+                            colIndex: 0,
+                            operator: 'contains',
+                            value: 'z',
+                            caseSensitive: false,
+                            enabled: false,
+                        }],
+                    }),
+                },
+                'grid-inactive-filter-transform'
+            ),
             props.pending_preview_scroll && React.createElement(
                 'button',
                 {
@@ -526,6 +547,7 @@ function transform_installed_message(
         permuted?: boolean;
         hiddenEditedCellKeys?: readonly string[];
         rowHeights?: Readonly<Record<number, number>>;
+        mappingGeneration?: number;
     },
 ): Extract<HostMessage, { type: 'transformInstalled' }> {
     const rules = options.state ?? request.state;
@@ -560,6 +582,11 @@ function transform_installed_message(
         // projection beside the record, and having no custom heights is the ordinary
         // case. A test about heights surviving a permutation names this explicitly.
         rowHeights: options.rowHeights ?? {},
+        // Defaults to the view generation, which is what the host sends for every install
+        // that actually permutes — the overwhelming majority, and what these tests are
+        // about. A test about an install that moves no row passes the older mapping
+        // generation explicitly.
+        mappingGeneration: options.mappingGeneration ?? options.generation,
     };
 }
 
@@ -3059,6 +3086,31 @@ describe('row height persistence', () => {
 
         expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 41 });
+    });
+
+    it('keeps the overlay when an install on its own sheet permutes nothing', async () => {
+        const { post_message } = await pending_resize();
+        await act(async () => {
+            (container!.querySelector('.stub-inactive-filter-transform') as HTMLButtonElement)
+                .click();
+        });
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // The other side of the same gate. This install changed the rules — so the view
+        // generation moves, and the ack carries it — but produced no permutation over a
+        // sheet that had none, so display row `r` is still source row `r` and the host
+        // *accepts* the in-flight resize on its old generation. Voiding the layer here
+        // would snap the row back and then silently restore it when that write is
+        // delivered. The host says which happened via `mappingGeneration`; reading
+        // `view.basis.generation` instead is what got this wrong.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, mappingGeneration: 4, permuted: false, rowHeights: {} },
+        ));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
     });
 
     it('does not paint a resize the host is bound to refuse', async () => {

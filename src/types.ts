@@ -667,7 +667,16 @@ export type HostMessage =
      * view's display keys against the permutation just installed until some unrelated
      * delivery happened to arrive.
      */
-    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined; rowHeights: Readonly<Record<number, number>> }
+    // `mappingGeneration` is this sheet's `mapping_generation` at the moment of the
+    // install, which is *not* always `view.basis.generation`: an install that changes the
+    // rules without producing a permutation — a filter added but left disabled — moves the
+    // core-wide generation and leaves the mapping generation where it was, because display
+    // row `r` is still source row `r`. The webview needs the same fact the host admits
+    // resizes by, or the two disagree: the host accepts the old-generation write while the
+    // webview, reading the bumped view generation as a mapping change, has already thrown
+    // the optimistic layer away. Same fact `WorkbookSnapshot.mappingGenerations` carries,
+    // delivered on the one message that reports an install.
+    | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined; rowHeights: Readonly<Record<number, number>>; mappingGeneration: number }
     /**
      * The host changed nothing. It deliberately carries no `view`, no `state`, no
      * `rowCount` and no `generation`: six review rounds of this feature were each a

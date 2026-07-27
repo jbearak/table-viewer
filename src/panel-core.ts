@@ -1284,6 +1284,7 @@ export class ViewerPanelCore {
             // the sheet's projection, so an always-present map is one branch fewer at the
             // only site that consumes it.
             rowHeights: this.row_height_projection(msg.sheetIndex) ?? {},
+            mappingGeneration: this.mapping_generation(msg.sheetIndex),
         };
     }
 

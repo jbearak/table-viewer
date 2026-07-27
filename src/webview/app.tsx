@@ -1879,11 +1879,21 @@ export function App(): React.JSX.Element {
                 // because the render site paints only an overlay whose generation is the
                 // current one, so an un-rebased overlay silently vanishes on an install for
                 // a sheet the user is not even looking at, while the host has accepted the
-                // write it belonged to. This sheet's own overlay is voided, because an
-                // install always bumps the generation and a new permutation invalidates its
-                // display keys outright; in the (unreachable-by-construction) case of an
-                // install that moved no generation it is instead reconciled by value
-                // against the projection the install carried.
+                // write it belonged to. This sheet's own overlay is voided when the install
+                // moved its rows, because the new permutation invalidates its display keys
+                // outright, and otherwise reconciled by value against the projection the
+                // install carried.
+                //
+                // Which of those it is comes from `msg.mappingGeneration` and deliberately
+                // not from `view.basis.generation`. They differ for an install that changes
+                // the rules without producing a permutation — a filter added but left
+                // disabled — where the core-wide generation moves and this sheet's mapping
+                // does not. Reading the view generation here would void the overlay while
+                // the host, asking the scoped question, *accepts* the old-generation write
+                // it belonged to: the row snaps back and then silently returns when the
+                // write is delivered. The two sides must ask one question, and this is the
+                // same one `WorkbookSnapshot.mappingGenerations` answers on the delivery
+                // path.
                 //
                 // Both verdicts are now pinned directly, which they were not before this
                 // change: the void used to survive its own deletion because the render site
@@ -1899,7 +1909,7 @@ export function App(): React.JSX.Element {
                             overlay,
                             view.basis.generation,
                             sheet_index === msg.sheetIndex
-                                ? view.basis.generation
+                                ? msg.mappingGeneration
                                 : overlay.generation,
                         );
                         if (retained === undefined) return undefined;

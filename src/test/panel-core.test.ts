@@ -993,7 +993,7 @@ describe('ViewerPanelCore', () => {
                     });
                     return posted.filter((m) => m.type === 'transformInstalled').at(-1);
                 };
-                return { core, durable, scans_for, sort };
+                return { core, durable, posted, scans_for, sort };
             }
 
             it('holds a sheet\'s mapping generation when an install permutes nothing', async () => {
@@ -1005,7 +1005,7 @@ describe('ViewerPanelCore', () => {
                 // admission rule is `msg.generation >= mapping_generation(sheet)`. If this
                 // moved, that resize would be refused and the webview — told its sheet's
                 // mapping had moved — would throw the optimistic layer away with it.
-                const { core } = two_sheet_core();
+                const { core, posted } = two_sheet_core();
                 const mapping_before = core.mapping_generation(0);
                 const generation_before = core.generation;
 
@@ -1039,6 +1039,13 @@ describe('ViewerPanelCore', () => {
                 // here would notice.
                 expect(core.snapshot_material().core.rowHeightProjection[0])
                     .toEqual({ 1: 44 });
+                // And the ack tells the webview the same scoped fact, not the bumped view
+                // generation beside it. Without this the two sides disagree: the host goes
+                // on accepting the in-flight resize while the webview, reading the view
+                // generation as a mapping change, has already discarded its layer.
+                const ack = posted.filter((m) => m.type === 'transformInstalled').at(-1);
+                expect(ack.view.basis.generation).toBe(core.generation);
+                expect(ack.mappingGeneration).toBe(mapping_before);
             });
 
             it('moves a sheet\'s mapping generation when an install does permute', async () => {
@@ -1047,9 +1054,13 @@ describe('ViewerPanelCore', () => {
                 const { core, sort } = two_sheet_core();
                 const mapping_before = core.mapping_generation(0);
 
-                await sort(0, 'desc-a');
+                const installed = await sort(0, 'desc-a');
 
                 expect(core.mapping_generation(0)).toBeGreaterThan(mapping_before);
+                // The ack reports the moved value, so the field cannot be satisfied by
+                // sending a constant — the sheet's mapping generation before any install.
+                expect(installed.mappingGeneration).toBe(core.mapping_generation(0));
+                expect(installed.mappingGeneration).toBeGreaterThan(mapping_before);
             });
 
             it('moves it back when a permuting view is cleared', async () => {
