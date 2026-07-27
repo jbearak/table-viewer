@@ -164,6 +164,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                         type="button"
                         className="toolbar-cancel"
                         onClick={on_cancel_transform}
+                        // A cancel is itself a transform request, so it belongs
+                        // behind the same gate: one the host would refuse would only
+                        // displace the request it is trying to cancel.
+                        disabled={props.transform_disabled}
                     >
                         Cancel
                     </button>

@@ -8,6 +8,8 @@ import type {
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
+    SheetViewRecord,
+    TransformIntent,
     WebviewMessage,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
@@ -468,20 +470,67 @@ function latest_transform_request(post_message: ReturnType<typeof vi.fn>) {
     return request!;
 }
 
+/**
+ * The install message the host would post, built the way PanelCore builds it: the
+ * record describes what is installed and takes the arm `permuted` selects, while the
+ * durable rules the webview acknowledges ride the message beside it, normalized to
+ * `undefined` when they carry no entries.
+ */
+function transform_installed_message(
+    request: {
+        sheetIndex: number;
+        requestId: string;
+        intent: TransformIntent;
+        state: SheetTransformState;
+        sourceGeneration: number;
+    },
+    options: {
+        generation: number;
+        rowCount?: number;
+        state?: SheetTransformState;
+        permuted?: boolean;
+        hiddenEditedCellKeys?: readonly string[];
+    },
+): Extract<HostMessage, { type: 'transformInstalled' }> {
+    const rules = options.state ?? request.state;
+    const has_entries = rules.sort.length > 0
+        || rules.filters.length > 0
+        || (rules.hiddenRows?.length ?? 0) > 0;
+    const is_active = rules.sort.length > 0
+        || rules.filters.some((filter) => filter.enabled)
+        || (rules.hiddenRows?.length ?? 0) > 0;
+    const permuted = options.permuted ?? is_active;
+    const basis = {
+        generation: options.generation,
+        sourceGeneration: request.sourceGeneration,
+        schema: rules.schema ?? '["Sheet1",1,null]',
+    };
+    return {
+        type: 'transformInstalled',
+        sheetIndex: request.sheetIndex,
+        requestId: request.requestId,
+        intent: request.intent,
+        view: permuted
+            ? {
+                basis,
+                permuted: true,
+                rules,
+                rowCount: options.rowCount ?? 1,
+                hiddenEditedCellKeys: options.hiddenEditedCellKeys ?? [],
+            }
+            : { basis, permuted: false, rowCount: options.rowCount ?? 1 },
+        rules: has_entries ? rules : undefined,
+    };
+}
+
 async function acknowledge_transform(
     request: Extract<WebviewMessage, { type: 'setTransform' }>,
     generation: number,
+    hiddenEditedCellKeys: readonly string[] = [],
 ) {
-    await dispatch_host_message({
-        type: 'transformApplied',
-        sheetIndex: request.sheetIndex,
-        state: request.state,
-        rowCount: 1,
-        requestId: request.requestId,
-        generation,
-        sourceGeneration: request.sourceGeneration,
-        intent: request.intent,
-    });
+    await dispatch_host_message(
+        transform_installed_message(request, { generation, hiddenEditedCellKeys }),
+    );
 }
 
 async function flush_focus_restore() {
@@ -632,6 +681,11 @@ function workbook_snapshot_message(
             presentation: 'initial',
             reason: 'ready',
             meta,
+            // One entry per sheet, empty by default: a delivery that says nothing is
+            // out of sight is the ordinary case. Tests about a held record's hidden
+            // cells surviving (or not surviving) a refresh must name this explicitly —
+            // a default that guessed would decide the question they are asking.
+            hiddenEditedCellKeys: meta.sheets.map(() => []),
             state: {
                 columnWidths: [],
                 rowHeights: [],
@@ -2879,7 +2933,11 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
         );
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(first_mount_id);
+        // No remount: the grant no longer bumps `load_epoch`. The store assertion
+        // above is what keeps this non-vacuous — the granted projection has to reach
+        // a subscriber of the *surviving* mount, which is the whole point of lifting
+        // edit state above the grid generation.
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
     it('restores a clean owned edit session after receiver recreation', async () => {
@@ -2901,7 +2959,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-initial-edits')).toBe('{}');
     });
 
-    it('clears stale initial edits and remounts when a granted session has none', async () => {
+    it('clears stale initial edits when a granted session has none', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
@@ -2936,7 +2994,11 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
         expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_grant);
+        // Authoritative absence has to reach the live store too, not just the prop:
+        // the stale entry must be gone from what a mounted grid paints from, and
+        // without a remount to wipe it that install is the only thing that can do it.
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(before_grant);
         expect(post_message.mock.calls.filter(([message]) => (
             (message as { type?: string }).type === 'requestEditSession'
         ))).toHaveLength(2);
@@ -4476,6 +4538,10 @@ describe('sorting and filtering', () => {
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        // Specifically the pending window, not edit mode: once the session is
+        // granted the controls come back, because the host admits a transform from
+        // the panel that owns the session.
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
     });
 
     it('drops and persists invalid saved transforms on initial load', async () => {
@@ -4574,11 +4640,9 @@ describe('sorting and filtering', () => {
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: restore.state,
-            rowCount: 1, requestId: restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
         post_message.mockClear();
         const mount_id = grid_stub().getAttribute('data-mount-id');
         const on_transform_change = grid_shell_mock.latest_props?.on_transform_change as
@@ -4605,11 +4669,9 @@ describe('sorting and filtering', () => {
         }));
         const sort_restore = post_message.mock.calls.map((call) => call[0])
             .filter((message) => message.type === 'setTransform').at(-1);
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: sort_restore.state,
-            rowCount: 1, requestId: sort_restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: sort_restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(sort_restore, { generation: 2 }),
+        );
         post_message.mockClear();
         const sort_mount_id = grid_stub().getAttribute('data-mount-id');
         const change_sort = grid_shell_mock.latest_props?.on_transform_change as
@@ -4649,12 +4711,11 @@ describe('sorting and filtering', () => {
             state: { transforms: [invalid] },
         }));
         const restore = latest_transform_request(post_message);
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0,
-            state: { sort: [], filters: [] }, rowCount: 1,
-            requestId: restore.requestId, generation: 1,
-            sourceGeneration: restore.sourceGeneration, intent: 'restore',
-        });
+        // Recovery arrives as an install of the view that stands, not a refusal.
+        await dispatch_host_message(transform_installed_message(restore, {
+            generation: 1,
+            state: { sort: [], filters: [] },
+        }));
         expect(post_message.mock.calls.map((call) => call[0])
             .filter((message) => message.type === 'showWarning')).toHaveLength(0);
 
@@ -4692,11 +4753,9 @@ describe('sorting and filtering', () => {
         expect(request).toBeDefined();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 2,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2 }),
+        );
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
 
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
@@ -4750,11 +4809,9 @@ describe('sorting and filtering', () => {
         expect(restore_old_grid).not.toHaveBeenCalled();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 2,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2 }),
+        );
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
@@ -4771,10 +4828,12 @@ describe('sorting and filtering', () => {
             .find((message) => message.type === 'setTransform');
 
         await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0,
-            state: { sort: [], filters: [] }, rowCount: 1,
-            requestId: request.requestId, generation: 1,
-            sourceGeneration: 1, intent: request.intent, error: 'failed',
+            type: 'transformRefused',
+            sheetIndex: 0,
+            requestId: request.requestId,
+            intent: request.intent,
+            reason: 'failed',
+            terminal: true,
         });
         await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
 
@@ -4846,11 +4905,9 @@ describe('sorting and filtering', () => {
         }));
         const restore = post_message.mock.calls.map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: restore.state,
-            rowCount: 1, requestId: restore.requestId, generation: 2,
-            sourceGeneration: 1, intent: restore.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
         const chip = document.querySelector('.filter-chip-body') as HTMLButtonElement;
         chip.focus();
         await act(async () => chip.click());
@@ -4870,11 +4927,9 @@ describe('sorting and filtering', () => {
         expect(chip.disabled).toBe(false);
         expect(chip.getAttribute('aria-disabled')).toBe('true');
 
-        await dispatch_host_message({
-            type: 'transformApplied', sheetIndex: 0, state: request.state,
-            rowCount: 1, requestId: request.requestId, generation: 3,
-            sourceGeneration: 1, intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 3 }),
+        );
         expect(document.activeElement).toBe(chip);
         expect(chip.getAttribute('aria-disabled')).toBeNull();
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
@@ -5131,16 +5186,9 @@ describe('sorting and filtering', () => {
         expect(request).toBeDefined();
 
         post_message.mockClear();
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: request.state,
-            rowCount: 2,
-            requestId: request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2, rowCount: 2 }),
+        );
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
         expect(post_message.mock.calls
@@ -5176,16 +5224,9 @@ describe('sorting and filtering', () => {
         expect(post_message.mock.calls.map((call) => call[0])
             .some((message) => message.type === 'setTransform')).toBe(false);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: cancel_request.state,
-            rowCount: 1,
-            requestId: cancel_request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: cancel_request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(cancel_request, { generation: 2 }),
+        );
         expect(document.body.textContent).not.toContain('Sort:');
     });
 
@@ -5246,16 +5287,9 @@ describe('sorting and filtering', () => {
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(get_button('Edit').disabled).toBe(true);
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: request.state,
-            rowCount: 2,
-            requestId: request.requestId,
-            generation: 2,
-            sourceGeneration: 1,
-            intent: request.intent,
-        });
+        await dispatch_host_message(
+            transform_installed_message(request, { generation: 2, rowCount: 2 }),
+        );
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
         expect(grid_stub().getAttribute('data-row-count')).toBe('2');
         expect(grid_stub().getAttribute('data-merges')).toBe('0');
@@ -5272,16 +5306,10 @@ describe('sorting and filtering', () => {
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
         expect(disable_request.state.filters[0].enabled).toBe(false);
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: disable_request.state,
-            rowCount: 3,
-            requestId: disable_request.requestId,
-            generation: 3,
-            sourceGeneration: 1,
-            intent: disable_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            disable_request,
+            { generation: 3, rowCount: 3 },
+        ));
         expect(document.body.textContent).toContain('✗');
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
@@ -5294,16 +5322,10 @@ describe('sorting and filtering', () => {
         const enable_request = post_message.mock.calls
             .map((call) => call[0])
             .find((message) => message.type === 'setTransform');
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: enable_request.state,
-            rowCount: 2,
-            requestId: enable_request.requestId,
-            generation: 4,
-            sourceGeneration: 1,
-            intent: enable_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            enable_request,
+            { generation: 4, rowCount: 2 },
+        ));
         expect(grid_stub().getAttribute('data-transformed')).toBe('true');
 
         post_message.mockClear();
@@ -5319,16 +5341,10 @@ describe('sorting and filtering', () => {
             schema: '["Sheet1",1,null]',
         });
 
-        await dispatch_host_message({
-            type: 'transformApplied',
-            sheetIndex: 0,
-            state: clear_request.state,
-            rowCount: 3,
-            requestId: clear_request.requestId,
-            generation: 5,
-            sourceGeneration: 1,
-            intent: clear_request.intent,
-        });
+        await dispatch_host_message(transform_installed_message(
+            clear_request,
+            { generation: 5, rowCount: 3 },
+        ));
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-merges')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-merges-json')!)).toEqual(
@@ -5403,6 +5419,45 @@ describe('edit session store hydration', () => {
         expect(store_edits()).toEqual(pendingEdits);
         expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
         expect(grid_stub().getAttribute('data-generation')).toBe(generation);
+    });
+
+    it('does not fold the open editor for a refresh that remounts nothing', async () => {
+        // The same rule round 4 applied to the transform ack, on the path that
+        // delivers far more of these: the fold exists because a remount destroys the
+        // grid that owns the overlay, so the discriminator is whether this snapshot
+        // actually remounts. GridShell is keyed on the generation, and a same-basis
+        // refresh leaves it exactly where it was — every edit commit during an owned
+        // session provokes one, as does any sibling panel touching durable state. The
+        // user has a cell open and half-typed when it lands; folding would commit that
+        // value into the dirty store, where Escape can no longer take it back.
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half-typed', base: 'base' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+
+        // Nothing remounted, so the overlay is still on screen and still the user's to
+        // confirm or abandon.
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(mount_id);
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        expect(store_edits()).toEqual({});
     });
 
     it('keeps a committed edit across a refresh that bumps the generation', async () => {
@@ -5525,13 +5580,20 @@ describe('edit session store hydration', () => {
         await enter_edit_mode(post_message);
 
         // Bump the generation so the shell's listener is re-registered last.
+        // No requestId, matching the undefined pending id, so the guard admits it:
+        // what this needs is the generation bump, not a particular request.
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformInstalled',
             sheetIndex: 0,
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            rowCount: 1,
-            generation: 5,
-            sourceGeneration: 1,
+            intent: 'user',
+            view: {
+                basis: { generation: 5, sourceGeneration: 1, schema: '["Sheet1",1,null]' },
+                rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+                rowCount: 1,
+                permuted: true,
+                hiddenEditedCellKeys: [],
+            },
+            rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
         });
 
         await dispatch_host_message({ type: 'saveResult', success: true });
@@ -5585,17 +5647,2497 @@ describe('edit session store hydration', () => {
         });
         const mount_id = grid_stub().getAttribute('data-mount-id');
 
+        // No requestId, matching the undefined pending id, so the guard admits it:
+        // what this needs is the generation bump, not a particular request.
         await dispatch_host_message({
-            type: 'transformApplied',
+            type: 'transformInstalled',
             sheetIndex: 0,
-            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            rowCount: 1,
-            generation: 5,
-            sourceGeneration: 1,
+            intent: 'user',
+            view: {
+                basis: { generation: 5, sourceGeneration: 1, schema: '["Sheet1",1,null]' },
+                rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+                rowCount: 1,
+                permuted: true,
+                hiddenEditedCellKeys: [],
+            },
+            rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
         });
 
         expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
         expect(store_edits()).toEqual({ '0:0': { value: 'live', base: 'base' } });
+    });
+});
+
+// Sorting and filtering stay available while the user edits; the displayed order
+// simply does not recompute, which is the feature. What still blocks a transform is
+// a window in which the host would refuse it anyway.
+describe('transforms during an edit session', () => {
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+    };
+
+    async function editable_csv() {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES },
+        ));
+        return rendered;
+    }
+
+    function sort_chip_disabled(): string | null {
+        const chip = document.querySelector('.sort-chip');
+        expect(chip).not.toBeNull();
+        return chip!.getAttribute('aria-disabled');
+    }
+
+    /** Enter edit mode, then install a sort on column 0 from inside it. */
+    async function edit_mode_with_sort(post_message: ReturnType<typeof vi.fn>) {
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        await acknowledge_transform(request, 2);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+    }
+
+    it('keeps transform controls enabled in edit mode and lets a sort through', async () => {
+        const { post_message } = await editable_csv();
+        await enter_edit_mode(post_message);
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        // Not merely offered — the request actually leaves the webview.
+        const request = latest_transform_request(post_message);
+        expect(request.state.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+        // And it lands: the toolbar's own copy of the gate agrees, showing the
+        // installed sort's chip live rather than greyed out.
+        await acknowledge_transform(request, 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(sort_chip_disabled()).toBeNull();
+    });
+
+    it('disables transform controls only while a save is in flight', async () => {
+        const { post_message } = await editable_csv();
+        await edit_mode_with_sort(post_message);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+        expect(sort_chip_disabled()).toBeNull();
+
+        await report_grid_editing(true, true, [], undefined, true);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+        expect(sort_chip_disabled()).toBe('true');
+
+        // The re-enable is the half that stops this passing for the wrong reason:
+        // without it, a permanently disabled control would satisfy the assertion
+        // above just as well.
+        await report_grid_editing(true, true, [], undefined, false);
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(true);
+        expect(sort_chip_disabled()).toBeNull();
+    });
+
+    it('does not reset column visibility when an edit session is granted', async () => {
+        // The grant used to bump `load_epoch`, which feeds `visibility_reset_key`
+        // and closes the popover. An open popover is the observable form of that.
+        const { post_message } = await editable_csv();
+        await open_columns();
+
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'granted-session',
+        });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(document.querySelector(
+            '[role="dialog"][aria-label="Choose visible columns"]',
+        )).not.toBeNull();
+    });
+
+    it('restores a stored transform during an edit session', async () => {
+        // `edit_mode` is no longer a dep of the restore effect, so a refresh that
+        // ships a persisted transform has to reinstall it even mid-session.
+        const { post_message } = await editable_csv();
+        await enter_edit_mode(post_message);
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    ...CSV_CAPABILITIES,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'desc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual([{ colIndex: 0, direction: 'desc' }]);
+    });
+});
+
+// A transform admitted during an owned edit session can be in flight for seconds
+// while the host keeps redelivering the projection — every committed edit provokes
+// one. Those redeliveries change nothing about the rows, so they must not discard
+// the request whose requestId is the only thing the eventual ack can match on.
+describe('snapshots arriving during an in-flight transform', () => {
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+
+    /** Edit mode over an editable CSV with a user-initiated grid sort outstanding. */
+    async function sorting_while_editing() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(true);
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+        return { post_message, request };
+    }
+
+    it('still honours the ack after a same-generation refresh', async () => {
+        const { request } = await sorting_while_editing();
+
+        // What committing an edit provokes: the host writes the pending edits and
+        // re-projects capabilities, so a 'refresh' arrives on the same source and the
+        // same view generation. The transform is still running behind it.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV_CAPABILITIES,
+            },
+        ));
+        expect(grid_stub().getAttribute('data-generation')).toBe('1');
+        // The work is still outstanding, so the progress affordance must not clear.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(true);
+
+        await acknowledge_transform(request, 7);
+
+        // The ack is matched, not dropped: the generation advances to the host's and
+        // the sort installs. Were the requestId discarded above, the webview would
+        // sit on generation 1 and the host would refuse every row request after.
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+    });
+
+    it('loses no edit across commits interleaved with a compute that lands last', async () => {
+        // The whole sequence the feature makes reachable: type and commit, keep
+        // typing while the sort is still computing, then let it land. Each commit
+        // provokes a same-basis refresh, and the landing bumps the generation and
+        // remounts the grid that owns the open overlay — three separate ways an edit
+        // could be dropped, exercised in one order.
+        const { request } = await sorting_while_editing();
+        const store = () => grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        const store_edits = () => JSON.parse(grid_stub().getAttribute('data-store-edits')!);
+
+        await act(async () => {
+            store().commit('test-edit-session', '0:0', { value: 'first', base: 'a' });
+        });
+        // The refresh that commit provokes: same rows, same generation, and the
+        // host's authoritative projection of what it has just written.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV_CAPABILITIES,
+                state: { pendingEdits: { '0:0': { value: 'first', base: 'a' } } },
+            },
+        ));
+        // A second confirmed edit, typed while the compute is still outstanding.
+        await act(async () => {
+            store().commit('test-edit-session', '2:0', { value: 'second', base: 'c' });
+        });
+        // And a third cell still open in the editor when the ack arrives, which only
+        // the fold can carry across the remount.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            store().commit('test-edit-session', '1:0', { value: 'live', base: 'b' });
+        });
+        const mount_id = grid_stub().getAttribute('data-mount-id');
+
+        await acknowledge_transform(request, 7);
+
+        // The remount really happened, so the survival below is not vacuous.
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        // All three, under the source-row keys they were typed against. Display row 0
+        // under this sort is not source row 0, so a display-keyed map would name
+        // different cells here.
+        expect(store_edits()).toEqual({
+            '0:0': { value: 'first', base: 'a' },
+            '1:0': { value: 'live', base: 'b' },
+            '2:0': { value: 'second', base: 'c' },
+        });
+    });
+
+    it('discards the in-flight transform when the source moves', async () => {
+        const { request } = await sorting_while_editing();
+
+        // A reload replaces the rows the transform was being computed over, so the
+        // request is genuinely void and its ack must not be allowed to land.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES },
+        ));
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+
+        await acknowledge_transform(request, 7);
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+    });
+});
+
+// The rows a same-basis refresh delivers are the rows already on screen: the host
+// installed nothing and dropped nothing, so an *applied* transform is still applied
+// behind it. Every edit commit during an owned session provokes one of these, and
+// `transformed` reading false while the loader is still permuted is what re-offers
+// the display-keyed row-height affordances — a height written for the wrong row.
+describe('an applied transform across a refresh', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    // The same sheet sorted the other way, as a sibling panel would leave it.
+    const SIBLING_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+    // Inactive but not empty: `transform_is_active` is false, yet the definition is
+    // still the user's and must survive the uninstall.
+    const DISABLED_FILTER_ONLY: SheetTransformState = {
+        sort: [],
+        filters: [{
+            id: 'f1',
+            colIndex: 0,
+            operator: 'contains',
+            value: 'x',
+            caseSensitive: false,
+            enabled: false,
+        }],
+        schema: '["Sheet1",1,null]',
+    };
+    // The other durable shape `transform_is_active` counts, hidden by a sibling.
+    const STORED_HIDDEN_ROWS: SheetTransformState = {
+        sort: [],
+        filters: [],
+        hiddenRows: [1, 3],
+        schema: '["Sheet1",1,null]',
+    };
+    // A row height the user set, and a natural count the transformed count can be
+    // told apart from — with make_meta's rowCount of 1 the reset is invisible.
+    const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
+    const FILTERED_ROW_COUNT = 3;
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    function sized_meta(row_count: number): WorkbookMeta {
+        const meta = make_meta(['Sheet1'], false);
+        return {
+            ...meta,
+            sheets: meta.sheets.map((sheet) => ({
+                ...sheet,
+                rowCount: row_count,
+                sourceRowCount: row_count,
+            })),
+        };
+    }
+
+    function five_row_meta(): WorkbookMeta {
+        return sized_meta(5);
+    }
+
+    /** An owned edit session over a CSV whose stored sort is installed and applied. */
+    async function editing_with_an_applied_sort() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+        ));
+        // The snapshot already names a session this panel owns, so it opens in edit
+        // mode — the state in which every commit provokes a same-basis refresh.
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+        return { post_message };
+    }
+
+    it('keeps it applied across a same-basis refresh', async () => {
+        await editing_with_an_applied_sort();
+
+        // What committing an edit provokes: pending edits written, capabilities
+        // re-projected, a 'refresh' on the same source and the same view generation.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // Asserted here, before any restore echo: the window this closes is exactly
+        // the one between the refresh and the echo. A filtered view must not flash
+        // its natural row count, and the sort must not read as uninstalled.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+    });
+
+    it('does not re-offer row resizing across a same-basis refresh', async () => {
+        await editing_with_an_applied_sort();
+        // Heights are suppressed under a transform, which is what unmounts the resize
+        // overlay and disarms hover in the real shell.
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The hazard, stated as the grid sees it: were `transformed` to read false
+        // here the overlay would mount over permuted rows and persist a display-keyed
+        // height against the wrong source row — durable corruption, not a flicker.
+        expect(grid_shell_mock.latest_props?.transformed).toBe(true);
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+    });
+
+    it('still asks for a durable transform a sibling panel changed', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+        // Settle first, on the state this panel already has: a refresh that changes
+        // no durable rule asks for nothing at all (see 'does not ask to uninstall
+        // rules that are still active'), so the ask below can only have come from
+        // the sibling's change, not from the refresh itself.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+        expect(transform_requests(post_message)).toHaveLength(0);
+
+        // Durable transform state is shared between panels, and a sibling changing it
+        // arrives here as a refresh on an unchanged row basis and nothing else. So
+        // "preserve the applied transform across a same-basis refresh" must not extend
+        // to treating the source as handled: the ask has to still go out.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [SIBLING_SORT] },
+        }));
+
+        await vi.waitUntil(() => post_message.mock.calls
+            .some((call) => (call[0] as WebviewMessage).type === 'setTransform'));
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(SIBLING_SORT.sort);
+    });
+
+    it('does not ask to uninstall rules that are still active', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // Unchanged durable state, unchanged row basis: round 3's retention holds, so
+        // the durable rules and the installed permutation already agree.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // No ask in either direction. The uninstall is the failure this test was
+        // written for — it would un-sort a view nobody asked to un-sort, which is what
+        // a reconciliation reading "inactive" from anything but the durable rules would
+        // produce — and an install is no better: every edit commit lands one of these
+        // refreshes, and re-asking for the transform already installed spends a host
+        // round-trip per keystroke whose acknowledgement discards this panel's auto-fit
+        // (see 'keeps auto-fit across a commit that changes no durable rule').
+        // A request would be posted synchronously inside the dispatch above, so its
+        // absence is already observable here.
+        expect(transform_requests(post_message)).toHaveLength(0);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count'))
+            .toBe(String(FILTERED_ROW_COUNT));
+    });
+
+    /**
+     * The same owned session with Auto-fit on over the applied sort. Column widths are
+     * part of the fixture because the toggle's snapshot is only observable through
+     * them: deactivating restores the pre-fit widths instead of re-measuring.
+     */
+    async function editing_with_auto_fit_over_a_sort() {
+        grid_shell_mock.auto_fit_result = { 0: 200 };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, columnWidths: [{ 0: 80 }] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+        ));
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        await click_button('Auto-fit Columns');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 200 });
+        post_message.mockClear();
+        return { post_message };
+    }
+
+    it('keeps auto-fit across a commit that changes no durable rule', async () => {
+        const { post_message } = await editing_with_auto_fit_over_a_sort();
+
+        // What committing a cell during an owned session provokes: pending edits
+        // written, capabilities re-projected, a refresh on the same source and view
+        // generation, carrying the fitted widths this panel already persisted.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, columnWidths: [{ 0: 200 }] },
+        }));
+
+        // The host answers whatever it is asked, and that is the whole hazard: an equal
+        // restore intent is short-circuited at the same generation and row count, yet
+        // the acknowledgement alone discards auto-fit. So answer anything asked here
+        // rather than presupposing that nothing was.
+        for (const request of transform_requests(post_message)) {
+            await dispatch_host_message(transform_installed_message(
+                request,
+                { generation: 2, rowCount: FILTERED_ROW_COUNT },
+            ));
+        }
+
+        // Nothing about the rows moved, so nothing justifies dropping the fit.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        // And the snapshot survived with it: deactivating restores the pre-fit widths,
+        // which is only possible while the snapshot is still held.
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 80 });
+        // The assertion that pins the fix rather than its symptom: the commit asked the
+        // host for nothing, so no acknowledgement could have harmed anything at all.
+        expect(transform_requests(post_message)).toHaveLength(0);
+    });
+
+    it('still clears auto-fit when a sibling transform installs', async () => {
+        const { post_message } = await editing_with_auto_fit_over_a_sort();
+
+        // A sibling changed the durable sort, so this reconciliation is real work and
+        // the ask has to go out.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: {
+                ...STORED_STATE,
+                transforms: [SIBLING_SORT],
+                columnWidths: [{ 0: 200 }],
+            },
+        }));
+        const install = latest_transform_request(post_message);
+        expect(install.state.sort).toEqual(SIBLING_SORT.sort);
+        // The refresh itself keeps the fit — the widths it reinstalls are the fitted
+        // ones — so whatever clears it below is the acknowledgement's doing.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 3, rowCount: 4 }),
+        );
+
+        // A different sort re-populates the rows auto-fit sampled, so the measurement
+        // behind the toggle is stale: the toggle goes off and the snapshot with it.
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 200 });
+        // Proof the snapshot went too: one click measures afresh instead of restoring
+        // the pre-fit 80.
+        grid_shell_mock.auto_fit_result = { 0: 300 };
+        await click_button('Auto-fit Columns');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+            .toEqual({ 0: 300 });
+    });
+
+    it('uninstalls it when a sibling clears the durable sort', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A sibling panel cleared the shared sort. That never un-installs *our*
+        // permutation, and it arrives as a same-basis refresh — the one shape that
+        // deliberately keeps `applied_transforms`. Without an uninstall the rows stay
+        // sorted behind a toolbar that shows no rules.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [undefined] },
+        }));
+
+        // The ask itself, not merely a state change: only the host can un-permute the
+        // loader, so nothing is fixed unless the empty view is actually requested.
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual([]);
+        expect(uninstall.state.hiddenRows ?? []).toEqual([]);
+
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
+        );
+
+        // And the grid agrees with the toolbar again: natural order, natural count.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+    });
+
+    it('keeps a disabled filter while uninstalling the sort around it', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A sibling dropped the sort and switched its filter off. The rules are now
+        // inactive, so the permutation has to go — but the filter definition is still
+        // the user's, one click from being re-enabled. Asking with a bare empty state
+        // would make the host record "no transform" and delete it.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms: [DISABLED_FILTER_ONLY] },
+        }));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual(DISABLED_FILTER_ONLY.filters);
+    });
+
+    it('uninstalls hidden rows a sibling unhid', async () => {
+        // Hidden rows travel the same durable path but are a different shape, so the
+        // empty view has to clear them too rather than only sorts and filters.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: { transforms: [STORED_HIDDEN_ROWS] },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.state.hiddenRows).toEqual(STORED_HIDDEN_ROWS.hiddenRows);
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2, rowCount: 3 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { transforms: [undefined] },
+        }));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.hiddenRows ?? []).toEqual([]);
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 3, rowCount: 5 }),
+        );
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+    });
+
+    it('drops it when the refresh changes the row basis', async () => {
+        await editing_with_an_applied_sort();
+
+        // A reload: the host drops permutations because matching schema does not
+        // imply matching values, so the applied transform and the transformed count
+        // both have to revert until a fresh restore lands.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+        // And with nothing applied, the stored height is the user's again.
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{"2":44}');
+    });
+
+    /**
+     * Everything a snapshot can invalidate about the installed view, read together.
+     * Three separately-stored atoms used to hold these, and three review findings on
+     * this PR were a snapshot moving some and not the others; asserted as one object
+     * so no future change can move one of them past this test. `asks_again` is the
+     * third: it stands for the fact that an install has landed against these rows,
+     * which the restore effect answers by comparing the durable rules against the
+     * record's own.
+     */
+    function view_state(post_message: ReturnType<typeof vi.fn>) {
+        return {
+            transformed: grid_stub().getAttribute('data-transformed'),
+            row_count: grid_stub().getAttribute('data-row-count'),
+            asks_again: transform_requests(post_message).length > 0,
+        };
+    }
+
+    it('keeps every part of the record across a same-basis refresh', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // What committing an edit provokes: same source, same view generation, the
+        // rows already on screen.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            generation: 2,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The permutation, the row count and the landed install stand or fall
+        // together, because they are one value with one basis. Any partial
+        // invalidation shows up here as a mismatched field.
+        expect(view_state(post_message)).toEqual({
+            transformed: 'true',
+            row_count: String(FILTERED_ROW_COUNT),
+            asks_again: false,
+        });
+    });
+
+    it('drops every part of the record when the basis changes', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        post_message.mockClear();
+
+        // A reload. The host re-read the rows and installed no permutation over them,
+        // so nothing the record said is true any more.
+        await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+            state: STORED_STATE,
+        }));
+
+        // The same three, all the other way — including the ask, which is what makes
+        // the stored sort come back rather than being silently forgotten.
+        expect(view_state(post_message)).toEqual({
+            transformed: 'false',
+            row_count: '5',
+            asks_again: true,
+        });
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('does not carry a record into a newly loaded document', async () => {
+        // The basis is built from the host's own counters, and a new document restarts
+        // them: an 'initial' snapshot can arrive on the very generation and source
+        // generation the outgoing file's record was computed against, over a sheet of
+        // the same name and shape. Equal numbers are a coincidence there rather than
+        // evidence about the rows, so identity of the basis alone cannot be what
+        // retains a record — the second file would be shown the first one's row count.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(five_row_meta(), {
+            capabilities: CSV_CAPABILITIES,
+        }));
+        expect(grid_stub().getAttribute('data-row-count')).toBe('5');
+
+        await dispatch_host_message(initial_snapshot_message(sized_meta(9), {
+            capabilities: CSV_CAPABILITIES,
+        }));
+
+        expect(grid_stub().getAttribute('data-row-count')).toBe('9');
+    });
+
+    // One comparison — the durable rules against the record's — decides both
+    // directions and the two ways of doing nothing. Walked in one test from one
+    // fixture, because the failure the shape prevents is a reader adding a case to
+    // the install side and not to the uninstall side.
+    it('reconciles in either direction from the same comparison', async () => {
+        const { post_message } = await editing_with_an_applied_sort();
+        // The same disabled filter, retyped. The last phase below needs durable rules
+        // that differ from the installed ones without either describing a
+        // permutation, and an edited value is the way to get there on this fixture:
+        // the sheet has one column, and `sanitize_transform_state` keeps only one
+        // filter per column, so a *second* disabled filter would be dropped before
+        // the comparison ever saw it.
+        const retyped_disabled_filter: SheetTransformState = {
+            ...DISABLED_FILTER_ONLY,
+            filters: DISABLED_FILTER_ONLY.filters.map((filter) => ({
+                ...filter,
+                value: 'z',
+            })),
+        };
+        const same_basis = (
+            generation: number,
+            transforms: (SheetTransformState | undefined)[],
+        ) => refresh_snapshot_message(five_row_meta(), {
+            generation,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: CSV_CAPABILITIES,
+            state: { ...STORED_STATE, transforms },
+        });
+
+        // Agreeing: neither direction.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(2, [STORED_SORT]));
+        expect(transform_requests(post_message)).toHaveLength(0);
+
+        // Durable rules active and differing — a sibling re-sorted — so install them.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(2, [SIBLING_SORT]));
+        expect(transform_requests(post_message)).toHaveLength(1);
+        const install = latest_transform_request(post_message);
+        expect(install.state.sort).toEqual(SIBLING_SORT.sort);
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 3, rowCount: 4 }),
+        );
+
+        // Durable rules inactive while a permutation is still installed, so ask for
+        // the rule-free view — carrying the disabled definition, which is still the
+        // user's. Only the host can un-permute the loader, so nothing else can fix it.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(3, [DISABLED_FILTER_ONLY]));
+        expect(transform_requests(post_message)).toHaveLength(1);
+        const uninstall = latest_transform_request(post_message);
+        expect(uninstall.state.sort).toEqual([]);
+        expect(uninstall.state.filters).toEqual(DISABLED_FILTER_ONLY.filters);
+        await dispatch_host_message(
+            transform_installed_message(uninstall, { generation: 4, rowCount: 5 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // Differing rules with nothing to reconcile: a sibling retyped a filter it had
+        // already switched off, so neither side describes a permutation and the
+        // toolbar reads the definition from durable state anyway. Asking would bump
+        // the generation, remount the grid and fold whatever is being typed, all for a
+        // view identical to the one on screen.
+        post_message.mockClear();
+        await dispatch_host_message(same_basis(4, [retyped_disabled_filter]));
+        expect(transform_requests(post_message)).toHaveLength(0);
+    });
+});
+
+// Cancel rolls a *pending* request back to the view that was already on screen. It is
+// not a "re-apply now" affordance — the design has none — so which view that is
+// depends on what is installed, and when nothing is permuted the answer is the durable
+// intent, read live. See `transform_rollback_baseline`.
+describe('the transform rollback baseline', () => {
+    const SCHEMA = '["Sheet1",1,null]';
+    /**
+     * Inactive but not empty. The sheet has one column and
+     * `sanitize_transform_state` keeps one filter per column, so a *changed* definition
+     * has to be the same filter retyped rather than a second one added.
+     */
+    const disabled_only = (value: string): SheetTransformState => ({
+        sort: [],
+        filters: [{
+            id: 'f1',
+            colIndex: 0,
+            operator: 'contains',
+            value,
+            caseSensitive: false,
+            enabled: false,
+        }],
+        schema: SCHEMA,
+    });
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: SCHEMA,
+    };
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    /** A sibling panel's durable state, arriving the only way it can: same rows. */
+    const same_basis = (
+        generation: number,
+        transforms: (SheetTransformState | undefined)[],
+    ) => refresh_snapshot_message(make_meta(['Sheet1']), {
+        generation,
+        sourceGeneration: 1,
+        reason: 'other',
+        state: { transforms },
+    });
+
+    /** Something to cancel: a sort the grid asked for and no ack for it. */
+    async function start_a_transform(post_message: ReturnType<typeof vi.fn>) {
+        post_message.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        expect(transform_requests(post_message)).toHaveLength(1);
+        post_message.mockClear();
+    }
+
+    it('cancels to the disabled filter a sibling left, not the one it replaced',
+        async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(
+                initial_snapshot_message(make_meta(['Sheet1']), {
+                    state: { transforms: [disabled_only('old')] },
+                }),
+            );
+            // Inactive rules install nothing, so this panel holds the natural view and
+            // there is no record of any rules for a rollback to read.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await dispatch_host_message(same_basis(1, [disabled_only('new')]));
+            // The heart of it: changing a *disabled* filter moves no row, so there is
+            // nothing to install and no generation to bump. This silence is exactly why
+            // nothing can refresh a copy of the durable rules held on the record — the
+            // rollback baseline has to come from durable state itself.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await start_a_transform(post_message);
+            await click_button('Cancel');
+
+            // Cancel persists what it sends, so reading a stale copy would not merely
+            // roll back wrongly — it would resurrect a definition the sibling replaced,
+            // overwriting the sibling's update in shared durable state.
+            expect(latest_transform_request(post_message).state.filters)
+                .toEqual(disabled_only('new').filters);
+        });
+
+    it('cancels to no filter at all once a sibling has removed the definition',
+        async () => {
+            // The same staleness one shape over: rules the host *acknowledged* while
+            // installing nothing. `permuted` is false, so they are no more a description
+            // of these rows than the natural view's would be, and the retention holds
+            // them just as indefinitely.
+            const { post_message } = await render_app();
+            await dispatch_host_message(
+                initial_snapshot_message(make_meta(['Sheet1']), {
+                    state: { transforms: [STORED_SORT] },
+                }),
+            );
+            const restore = latest_transform_request(post_message);
+            await dispatch_host_message(
+                transform_installed_message(restore, { generation: 2 }),
+            );
+            // A sibling switches the sort off and leaves a filter disabled: the
+            // permutation goes, and the ack carries the definition onto the record.
+            await dispatch_host_message(same_basis(2, [disabled_only('old')]));
+            await vi.waitUntil(() => transform_requests(post_message).length > 0);
+            const uninstall = latest_transform_request(post_message);
+            expect(uninstall.state.filters).toEqual(disabled_only('old').filters);
+            await dispatch_host_message(
+                transform_installed_message(uninstall, { generation: 3 }),
+            );
+            expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+            post_message.mockClear();
+            await dispatch_host_message(same_basis(3, [undefined]));
+            // Nothing to reconcile again — neither side permutes anything — so the
+            // record keeps the definition the sibling has just deleted.
+            expect(transform_requests(post_message)).toHaveLength(0);
+
+            await start_a_transform(post_message);
+            await click_button('Cancel');
+
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.state.filters).toEqual([]);
+            expect(cancel.state.sort).toEqual([]);
+        });
+
+    it('cancels to the installed rules while a permutation is in place', async () => {
+        // The other side of the rule: a permuted record's rules *are* basis-derived —
+        // they are the set the host built the permutation from — so they, and not
+        // durable state's notion of inactivity, are what Cancel puts back.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            state: { transforms: [STORED_SORT] },
+        }));
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message(
+            transform_installed_message(restore, { generation: 2 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        await start_a_transform(post_message);
+        await click_button('Cancel');
+
+        const cancel = latest_transform_request(post_message);
+        expect(cancel.state.sort).toEqual(STORED_SORT.sort);
+        expect(cancel.intent).toBe('cancel');
+    });
+});
+
+// A refusal always means the host changed nothing, and `transformRefused` carries
+// nothing about the view for that reason — there is no state, generation or row count
+// on the message to adopt by accident. `terminal` says only whether the reason will
+// clear on its own, which decides whether the webview stops asking (terminal
+// validation) or keeps its own copy and retries (the admission matrix).
+//
+// The first guarantee below is enforced by the compiler, not by any test: six review
+// rounds of this feature were each a consumer adopting a refusal's echo of the host's
+// unchanged view, so the fields are gone from the arm rather than merely
+// unread. `Extract` of them from the refusal's keys must be `never`, or this alias
+// resolves to `never` and the assignment stops compiling.
+type _RefusalCarriesNoView = Extract<
+    keyof Extract<HostMessage, { type: 'transformRefused' }>,
+    'view' | 'state' | 'rowCount' | 'generation' | 'sourceGeneration'
+> extends never ? true : never;
+const _refusal_carries_no_view: _RefusalCarriesNoView = true;
+void _refusal_carries_no_view;
+
+describe('refused transforms', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    const CSV_CAPABILITIES = {
+        csvEditable: true,
+        csvEditingSupported: true,
+        csvEditSessionId: 'test-edit-session',
+    };
+
+    /** Edit mode over an editable CSV whose persisted state carries STORED_SORT. */
+    async function refresh_with_stored_sort(
+        post_message: ReturnType<typeof vi.fn>,
+    ) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES, state: { transforms: [STORED_SORT] } },
+        ));
+        return latest_transform_request(post_message);
+    }
+
+    async function editing_csv() {
+        const rendered = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(rendered.post_message);
+        return rendered;
+    }
+
+    /**
+     * The whole refusal, exhaustively. There is no `state`, `rowCount` or
+     * `generation` to pass: the arm does not have them, which is a type-level
+     * guarantee that no handler can adopt one.
+     */
+    async function refuse_transform(
+        request: Extract<WebviewMessage, { type: 'setTransform' }>,
+        options: { terminal: boolean },
+    ) {
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: request.sheetIndex,
+            requestId: request.requestId,
+            intent: request.intent,
+            reason: 'A save is in progress.',
+            terminal: options.terminal,
+        });
+    }
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    function store_edits() {
+        return JSON.parse(grid_stub().getAttribute('data-store-edits')!);
+    }
+
+    /** Move the save in and back out of flight, the one dep the restore effect
+     *  gained, so a retriable source gets its second chance. */
+    async function settle_a_save() {
+        await report_grid_editing(true, true, [], undefined, true);
+        await report_grid_editing(true, true, [], undefined, false);
+    }
+
+    it('keeps a transiently refused transform retriable', async () => {
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = grid_stub().getAttribute('data-generation');
+        grid_shell_mock.commit_live_edit.mockClear();
+        post_message.mockClear();
+
+        await refuse_transform(request, { terminal: false });
+
+        // Nothing adopted, and now nothing adoptable: the refusal has no generation,
+        // rules or row count on it at all.
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        // A refusal cannot reach the fold: only an install can move the generation,
+        // and only a moved generation unmounts the grid that owns the overlay.
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // The spinner and its label must not stick.
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        expect(document.querySelector('.toolbar-progress')).toBeNull();
+        // Silently, because this is a restore: nobody asked for it, the effect below
+        // asks again by itself, and there is nothing for the user to do meanwhile.
+        // The warning for a refusal the user did provoke is asserted in 'drops a
+        // transiently refused user request instead of queueing it'.
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+
+        // The webview still holds the saved transform and has not marked the source
+        // handled, so the effect asks again once the refusing condition settles.
+        post_message.mockClear();
+        await settle_a_save();
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('drops a transiently refused user request instead of queueing it', async () => {
+        const { post_message } = await editing_csv();
+        // No stored transform anywhere, so anything asked for later could only be a
+        // replay of what the user just did.
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        expect(request.intent).toBe('user');
+        post_message.mockClear();
+
+        await refuse_transform(request, { terminal: false });
+
+        // Visible failure, and that is the whole of it.
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // The counterpart of 'keeps a transiently refused transform retriable': there
+        // the *stored* transform is asked for again, because the sheet would otherwise
+        // sit unsorted for the session. A request the user made has no such standing.
+        // Replaying it once the refusing condition lifts would reorder rows under
+        // someone mid-edit who has moved on — the deferred "Resort" this design
+        // forbids — so it must stay dropped.
+        post_message.mockClear();
+        await settle_a_save();
+        expect(transform_requests(post_message)).toEqual([]);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+    });
+
+    it('adopts the natural state for a terminal refusal', async () => {
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = grid_stub().getAttribute('data-generation');
+        grid_shell_mock.commit_live_edit.mockClear();
+        post_message.mockClear();
+
+        await refuse_transform(request, { terminal: true });
+
+        // "Adopts the natural state" needs nothing from the wire, which is why the
+        // refusal can carry nothing: the stored sort never installed, so the natural
+        // view is already what this webview shows, and the generation the host holds
+        // is already the one it is on. Both are asserted as *unchanged* rather than
+        // as echoes that landed.
+        expect(grid_stub().getAttribute('data-generation')).toBe(generation_before);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        // And it warns, even though this is a restore nobody asked for. The transient
+        // case above is silent because the effect will ask again; here nothing will,
+        // so the saved view is being abandoned and the user is entitled to know that
+        // the sheet they open next will not look the way their file remembers.
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+
+        // The load-bearing half, and the whole of what `terminal` buys: the source
+        // counts as handled, which is how a saved transform the sheet can no longer
+        // support stays dropped instead of being asked for — with its global warning —
+        // every time a blocker moves.
+        post_message.mockClear();
+        await settle_a_save();
+        expect(transform_requests(post_message)).toEqual([]);
+    });
+
+    it('asks again for a terminally refused transform once the source reloads', async () => {
+        // The other half of `terminal`, and the half that keeps it from being a
+        // one-way door. "Stop asking" is bookkeeping about a request the host refused
+        // over *these* rows: a reload replaces them, and a sheet that could not support
+        // the saved sort a moment ago — wrong columns, a promoted header row — may well
+        // support it now. Latching past that would drop the user's sort for the rest of
+        // the session, with nothing to show they still have one.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        await refuse_transform(request, { terminal: true });
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 3,
+                sourceGeneration: 3,
+                capabilities: CSV_CAPABILITIES,
+                state: { transforms: [STORED_SORT] },
+            },
+        ));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('keeps the applied view and its row count across a terminal refusal', async () => {
+        // The counterpart of the test above, where there *is* something to lose. A
+        // refusal has no state, generation or rowCount field to adopt — the type
+        // guarantees it — so an installed sort survives one by construction rather
+        // than because the handler remembered not to overwrite it.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const install = await refresh_with_stored_sort(post_message);
+        await dispatch_host_message(
+            transform_installed_message(install, { generation: 7, rowCount: 4 }),
+        );
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('4');
+
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await refuse_transform(latest_transform_request(post_message), {
+            terminal: true,
+        });
+
+        expect(grid_stub().getAttribute('data-generation')).toBe('7');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(grid_stub().getAttribute('data-row-count')).toBe('4');
+    });
+
+    it('does not fold the live editor for a terminal refusal', async () => {
+        // Nothing installed, so nothing remounts. Editing is permitted while a
+        // transform computes, so the user can be mid-cell when the refusal arrives —
+        // and folding then puts a half-typed value in the dirty store, where Escape
+        // can no longer take it back.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = Number(grid_stub().getAttribute('data-generation'));
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half', base: 'base' });
+        });
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await refuse_transform(request, { terminal: true });
+
+        // Stated as the user experiences it: the partial value never reached the
+        // dirty store, so the cell is still cancellable.
+        expect(store_edits()).toEqual({});
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // And the view the webview already had is what it still shows.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        // The paired direction, here rather than elsewhere so this test cannot pass by
+        // never folding at all: an ack that does move the generation remounts the grid,
+        // and the overlay has to be folded ahead of that or the value is lost. Cleared
+        // first so the count below is attributable to this ack and cannot be satisfied
+        // by a fold that already happened above.
+        grid_shell_mock.commit_live_edit.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(
+            latest_transform_request(post_message),
+            generation_before + 1,
+        );
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(store_edits()).toEqual({ '0:0': { value: 'half', base: 'base' } });
+    });
+
+    it('does not fold the live editor for an install that moves no generation', async () => {
+        // The other half of the fold condition, and the one the split does *not*
+        // make structural. Reaching `transformInstalled` is necessary but not
+        // sufficient: the host answers a restore or cancel whose rules it already
+        // holds with a no-op ack, which is a truthful install on an unmoved
+        // generation. Nothing remounts, so folding puts a half-typed value in the
+        // dirty store where Escape can no longer take it back — the same harm the
+        // refusal case does, arriving on the arm that can fold.
+        const { post_message } = await editing_csv();
+        post_message.mockClear();
+        const request = await refresh_with_stored_sort(post_message);
+        const generation_before = Number(grid_stub().getAttribute('data-generation'));
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('test-edit-session', '0:0', { value: 'half', base: 'base' });
+        });
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await dispatch_host_message(transform_installed_message(request, {
+            generation: generation_before,
+        }));
+
+        expect(store_edits()).toEqual({});
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        // Not vacuous: the install landed, so this is the ack being processed and
+        // choosing not to fold, not the requestId guard dropping it.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+
+        // Paired direction, so this cannot pass by never folding: the same install
+        // one generation on does remount, and the overlay has to be folded first.
+        grid_shell_mock.commit_live_edit.mockClear();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(
+            latest_transform_request(post_message),
+            generation_before + 1,
+        );
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+        expect(store_edits()).toEqual({ '0:0': { value: 'half', base: 'base' } });
+    });
+
+    it('holds the stored transform back until a save settles', async () => {
+        const { post_message } = await editing_csv();
+        await report_grid_editing(true, true, [], undefined, true);
+        post_message.mockClear();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: CSV_CAPABILITIES, state: { transforms: [STORED_SORT] } },
+        ));
+        // The host would refuse this one, and a refusal changes no other dep of the
+        // restore effect, so asking now is asking never.
+        expect(transform_requests(post_message)).toEqual([]);
+
+        await report_grid_editing(true, true, [], undefined, false);
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('blocks Cancel while a save is in flight', async () => {
+        const { post_message } = await editing_csv();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        latest_transform_request(post_message);
+        expect(get_button('Cancel').disabled).toBe(false);
+
+        // Second layer, because the button is only the affordance and it lags by a
+        // render: the save starts and the click lands before React has repainted the
+        // toolbar, which is the actual race. A cancel the host would refuse must not
+        // displace the request it is cancelling, whose requestId it would overwrite.
+        post_message.mockClear();
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'dirty', base: 'base' } },
+                conflicted: [],
+            });
+            get_button('Cancel').click();
+        });
+        expect(transform_requests(post_message)).toEqual([]);
+        // And once React catches up the affordance agrees.
+        expect(get_button('Cancel').disabled).toBe(true);
+
+        // The other half: nothing here permanently disables cancelling.
+        await report_grid_editing(true, true, [], undefined, false);
+        expect(get_button('Cancel').disabled).toBe(false);
+        post_message.mockClear();
+        await click_button('Cancel');
+        expect(transform_requests(post_message)).toHaveLength(1);
+    });
+});
+
+// The panel that is *not* editing. Its persisted sort is refused for as long as
+// another panel owns the session, and every edit that owner commits redelivers a
+// same-basis snapshot here. Asking again each time buys nothing and costs a global
+// VS Code warning per keystroke-batch. Latching the ask is safe precisely because
+// this request is restore-origin in a panel with no editor to disturb.
+describe('a refused restore in a sibling panel', () => {
+    const STORED_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+    // What the host projects to a panel while another one holds the session.
+    const NOT_EDITABLE = { csvEditable: false, csvEditingSupported: true };
+    const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+
+    function transform_requests(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform');
+    }
+
+    function warnings(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning');
+    }
+
+    /** The owner commits an edit: same source, same view generation, new state. */
+    async function owner_commits_an_edit(
+        capabilities: { csvEditable: boolean; csvEditingSupported: boolean },
+    ) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities,
+                state: { transforms: [STORED_SORT] },
+            },
+        ));
+    }
+
+    async function refuse(
+        request: Extract<WebviewMessage, { type: 'setTransform' }>,
+    ) {
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: request.sheetIndex,
+            requestId: request.requestId,
+            intent: request.intent,
+            reason: 'Another editor is holding this file.',
+            terminal: false,
+        });
+    }
+
+    async function restore_refused_by_the_owner() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: NOT_EDITABLE, state: { transforms: [STORED_SORT] } },
+        ));
+        const request = latest_transform_request(post_message);
+        expect(request.intent).toBe('restore');
+        await refuse(request);
+        return { post_message, request };
+    }
+
+    it('is not repeated while the blocker is unchanged', async () => {
+        const { post_message, request } = await restore_refused_by_the_owner();
+        // One ask, and no warning at all: a transiently refused restore is nothing
+        // the user did and nothing they can act on. The latch is about the *ask*.
+        expect(transform_requests(post_message)).toHaveLength(1);
+        expect(warnings(post_message)).toHaveLength(0);
+
+        for (let commit = 0; commit < 2; commit += 1) {
+            await owner_commits_an_edit(NOT_EDITABLE);
+            // The host would refuse a repeat too, so answer one the same way it
+            // would, exactly as in the real thing.
+            const latest = transform_requests(post_message).at(-1)!;
+            if (latest.requestId !== request.requestId) await refuse(latest);
+        }
+
+        // Nothing about the refusal changed, so the ask is not repeated — and the
+        // user still hears nothing about any of it.
+        expect(warnings(post_message)).toHaveLength(0);
+        expect(transform_requests(post_message)).toHaveLength(1);
+    });
+
+    it('is asked again once the owner releases the session', async () => {
+        const { post_message, request } = await restore_refused_by_the_owner();
+        await owner_commits_an_edit(NOT_EDITABLE);
+        // Leave nothing in flight, so what the release has to overcome is the latch
+        // and not the pending-request guard that sits above it.
+        const latest = transform_requests(post_message).at(-1)!;
+        if (latest.requestId !== request.requestId) await refuse(latest);
+        post_message.mockClear();
+
+        // Release: the host projects this panel editable again, which is the only
+        // observable this webview has for "the refusing condition cleared".
+        await owner_commits_an_edit(EDITABLE);
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+
+    it('is asked again when the source reloads under the same blocker', async () => {
+        const { post_message } = await restore_refused_by_the_owner();
+        post_message.mockClear();
+
+        // A reload, with the owner still holding the session. The host dropped the
+        // permutation over rows that no longer exist, so the earlier refusal has
+        // nothing to say about this one and the latch must not suppress it.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: NOT_EDITABLE, state: { transforms: [STORED_SORT] } },
+        ));
+
+        await vi.waitUntil(() => transform_requests(post_message).length > 0);
+        expect(latest_transform_request(post_message).state.sort)
+            .toEqual(STORED_SORT.sort);
+    });
+});
+
+describe('the Edit button and an installed transform', () => {
+    const EDITABLE = { csvEditable: true, csvEditingSupported: true };
+    // Descending, so the grid stub's ascending shortcut is a real change and
+    // actually leaves a request in flight.
+    const SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Sheet1",1,null]',
+    };
+
+    function warnings(post_message: ReturnType<typeof vi.fn>) {
+        return post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'showWarning');
+    }
+
+    async function sorted_sheet_not_yet_editing() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: EDITABLE, state: { transforms: [SORT] } },
+        ));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        post_message.mockClear();
+        return post_message;
+    }
+
+    it('leaves Edit enabled while a sort is installed', async () => {
+        // An *installed* transform is just a view. Edits are source-keyed and the
+        // permutation never recomputes mid-session, so there is nothing to clear.
+        const post_message = await sorted_sheet_not_yet_editing();
+        expect(get_button('Edit').disabled).toBe(false);
+        expect(warnings(post_message)).toEqual([]);
+    });
+
+    it('requests a session from a sorted sheet instead of warning', async () => {
+        const post_message = await sorted_sheet_not_yet_editing();
+
+        await click_button('Edit');
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+            requestId: expect.any(String),
+        }));
+        expect(warnings(post_message)).toEqual([]);
+    });
+
+    it('disables Edit while transform work is in flight', async () => {
+        // The half that still blocks: work in flight is file-level concurrency and
+        // the host refuses an edit claim during it, so the button must agree.
+        const post_message = await sorted_sheet_not_yet_editing();
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        // Deliberately unacknowledged: the request is in flight.
+        expect(latest_transform_request(post_message)).toBeDefined();
+
+        expect(get_button('Edit').disabled).toBe(true);
+        // The retired copy: nothing in this build tells the user to clear sorting
+        // before editing, in a tooltip or anywhere else.
+        expect(document.body.textContent ?? '').not.toContain('Clear sorting');
+    });
+});
+
+describe('stale-view banner', () => {
+    const BANNER_TEXT = 'Sorting and filters don\'t update while you\'re editing.';
+    // A future contributor must not be able to reintroduce a "Resort"/"Refresh"
+    // action here. Rows staying put is the feature, so there is nothing to apply.
+    const CTA = /re-?sort|re-?filter|refresh|apply|update/i;
+
+    function banner(): HTMLElement | null {
+        return document.querySelector('.stale-view-banner');
+    }
+
+    function expect_no_call_to_action() {
+        const present = banner();
+        if (present) {
+            const labels = Array.from(present.querySelectorAll('button'))
+                .map((button) => button.textContent ?? '');
+            expect(labels).toEqual(['Dismiss']);
+        }
+        // Nowhere on the page, so a CTA cannot sneak in beside the banner either.
+        const offenders = Array.from(document.querySelectorAll('button'))
+            .map((button) => button.textContent ?? '')
+            .filter((label) => CTA.test(label));
+        expect(offenders).toEqual([]);
+    }
+
+    async function edit_mode_sorted_on_column_0() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        return post_message;
+    }
+
+    const dirty = (...keys: string[]) => Object.fromEntries(
+        keys.map((key) => [key, { value: `dirty-${key}`, base: 'base' }]),
+    );
+
+    /**
+     * Re-answer with the same rules on the same generation and a new set of hidden
+     * cells — the no-op-ack shape, and the smallest change that isolates them: an
+     * unmoved generation remounts nothing and the rules half of the signature is
+     * untouched, so only the keys can be doing the work.
+     *
+     * `hiddenRows` deliberately not named on the rules here: hiding is what puts
+     * these keys out of sight in the real host, but the rules half must stay fixed
+     * for these tests to be about the keys, and the record is the host's word either
+     * way.
+     */
+    async function reinstall_with_hidden_cells(hidden: readonly string[]) {
+        await dispatch_host_message({
+            type: 'transformInstalled',
+            sheetIndex: 0,
+            intent: 'restore',
+            view: {
+                basis: { generation: 2, sourceGeneration: 1, schema: '["Sheet1",1,null]' },
+                rules: {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    // The schema the restore effect matches on: without it the record
+                    // disagrees with durable state and the effect asks for a fresh
+                    // transform, whose pending requestId would then swallow the next
+                    // install here.
+                    schema: '["Sheet1",1,null]',
+                },
+                rowCount: 1,
+                permuted: true,
+                hiddenEditedCellKeys: hidden,
+            },
+            rules: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,null]',
+            },
+        });
+    }
+
+    it('names hidden edited cells with no edit in a column the order reads', async () => {
+        // The count is an independent reason to speak, and this is why it has to be:
+        // hidden-ness is a property of the *row*, so the edited column has nothing to
+        // do with it. Here no dirty cell is in the sorted column — the column test
+        // alone says nothing — and there is still unsaved work the user cannot see.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        expect(banner()).toBeNull();
+
+        await reinstall_with_hidden_cells(['0:1']);
+
+        // And the hidden sentence stands alone. No edit here can change where the sort
+        // puts a row, so there is no order disagreeing with any value and the first
+        // sentence would be saying something about nothing.
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        // Informational, like the sentence before it: no exit, no affordance.
+        expect_no_call_to_action();
+    });
+
+    it('pluralizes the hidden-cell sentence as one phrase', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
+
+        expect(banner()?.textContent)
+            .toContain('2 edited cells are in rows this view doesn\'t show.');
+        // Noun and verb agree, as in the conflict banner: never "2 edited cell is".
+        expect(banner()?.textContent).not.toContain('edited cell is');
+        expect_no_call_to_action();
+    });
+
+    it('names only the hidden cells the dirty map still holds', async () => {
+        // The count is a function of two things — which rows the view contains and
+        // which cells are edited — and only the first is the host's to observe. The
+        // second moves with every discard, and none of them install a transform, so a
+        // number sent from the host would sit here claiming forever that work the user
+        // has already thrown away is out of sight. Narrowing to the live map is what
+        // makes the sentence answerable at all times rather than only just after an
+        // install.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
+        expect(banner()?.textContent)
+            .toContain('2 edited cells are in rows this view doesn\'t show.');
+
+        // The discard: one of the two hidden edits leaves the map. No install follows
+        // — the view did not change, only the work in it.
+        await report_grid_editing(true, true, [], dirty('1:1'));
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain('2 edited cells');
+        expect_no_call_to_action();
+    });
+
+    /**
+     * The refresh a `pendingEditsChanged` produces: same generation, same source
+     * generation, same schema — so the record stands — carrying the host's fresh answer
+     * about which edited rows the permutation it already holds does not show.
+     */
+    async function same_basis_refresh(hidden: readonly string[]) {
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 2,
+                sourceGeneration: 1,
+                hiddenEditedCellKeys: [hidden],
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+    }
+
+    it('names a hidden cell only a refresh could have told it about', async () => {
+        // The additive direction, which the live intersection cannot reach: an edit
+        // typed while a hiding transform was still computing is in no durable map when
+        // the install reads one, so the install's record omits it and no later install
+        // is ever asked. Here the install says nothing is hidden, the dirty map never
+        // changes, and the only new information is the host's re-answer on the refresh
+        // the durable write triggers.
+        await edit_mode_sorted_on_column_0();
+        // Column 1, which the installed sort does not read, so the column half of the
+        // signature is silent throughout and only the hidden cells can speak.
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        expect(banner()).toBeNull();
+
+        await same_basis_refresh(['0:1']);
+
+        // Hidden cells alone again: the sorted column holds no unsaved edit.
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        // Still the installed view: the record was kept, not replaced by a natural one,
+        // which is what makes the fresh keys about the permutation it describes.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect_no_call_to_action();
+
+        // Withdrawn the same way it arrived. The host is the authority on membership,
+        // so a refresh naming nothing is news too — taking the fresh answer only when
+        // it is non-empty would leave the claim standing forever.
+        await same_basis_refresh([]);
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('reads consistently beside the shrink conflict banner over the same row', async () => {
+        // The two notices can stand together, and they are about the same vanished row:
+        // this one says unsaved work is in a row the view does not show, the conflict
+        // banner says the save was cancelled because that row is gone. Checked rather
+        // than assumed, because they are the same fact at two moments — before Save this
+        // is the only notice there is, and after a rejection the conflict banner adds
+        // what the stale-view notice deliberately never says: which row, and that
+        // something was cancelled.
+        //
+        // No contradiction to fix: "this view doesn't show" was chosen over "hides"
+        // precisely so it stays true of a removed row, and the counts differ by design
+        // and by unit — cells out of sight here, rows lost there, each stated in its own
+        // sentence with its own noun.
+        await edit_mode_sorted_on_column_0();
+        const removed = { '7:1': { value: 'orphan', base: 'gone' } };
+        await report_grid_editing(true, true, [], removed);
+        await same_basis_refresh(['7:1']);
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 901,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-shrunk',
+                    edits: { '7:1': 'orphan' },
+                    dirtyEdits: removed,
+                },
+            },
+            rejection: { reason: 'rowsRemoved', keys: ['7:1'] },
+        });
+        await report_grid_editing(true, true, [], removed);
+
+        // Both up, neither restated as the other, and only the conflict banner offers a
+        // way out — the stale-view notice is still informational.
+        expect(container!.querySelector('.conflict-banner')?.textContent)
+            .toContain('1 edited row no longer exists');
+        expect(container!.querySelector('.conflict-banner')?.textContent)
+            .toContain('Affected row: 8');
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain('cancelled');
+        expect_no_call_to_action();
+    });
+
+    it('does not claim a refreshed key the dirty map never held', async () => {
+        // The paired direction, so the fresh answer cannot pass by naming everything:
+        // the host reads the *durable* map, which can name an entry the user has
+        // already discarded, and the intersection still has to run over what a refresh
+        // brings in exactly as it does over what an install brings in.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+
+        await same_basis_refresh(['2:1']);
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('drops the claim entirely when the last hidden edit is discarded', async () => {
+        // The end of the same road, and the shape codex named: with nothing else to
+        // say, the whole notice goes rather than standing there over an empty claim.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()).not.toBeNull();
+
+        await report_grid_editing(false, false, [], {});
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('says nothing about hidden cells when the count is zero', async () => {
+        // The pre-existing reason on its own: an edit in a sorted column, nothing
+        // hidden. The sentence must not appear with a count of 0 in it.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect(banner()?.textContent).not.toContain('doesn\'t show');
+        expect(banner()?.textContent).not.toContain('edited cell');
+        expect_no_call_to_action();
+    });
+
+    it('reappears after Dismiss when the hidden-cell count changes', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()).not.toBeNull();
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // Same rules, same generation, same dirty map — a different set of cells out
+        // of sight, which the acknowledgement did not cover.
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
+
+        expect(banner()?.textContent)
+            .toContain('2 edited cells are in rows this view doesn\'t show.');
+        expect_no_call_to_action();
+    });
+
+    it('keeps a dismissal that the same hidden cells re-assert', async () => {
+        // The other direction: folding the keys in must not make every echo of the
+        // same view a new fact, or Dismiss would never stick under a hiding filter.
+        // Including an echo that names them in another order, which is all
+        // `Object.keys` on the host's durable map promises.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1', '1:1'));
+        await reinstall_with_hidden_cells(['0:1', '1:1']);
+        await click_button('Dismiss');
+
+        await reinstall_with_hidden_cells(['1:1', '0:1']);
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('goes silent when edit mode ends with the dirty map still reported', async () => {
+        // Probing for holes rather than only mutating the new code found this one: the
+        // `edit_mode` term on the signature was holding up the whole notice and no test
+        // was holding it to account — deleting it failed nothing across the suite.
+        //
+        // Reachable without a discard: the file becoming uneditable (a truncating
+        // reload, a sibling taking the session) leaves edit mode through
+        // `leave_edit_mode`, which releases the session but keeps the dirty map, so
+        // GridShell goes on reporting the same edits. The statement is about editing;
+        // outside it the order recomputes as normal and there is nothing to say.
+        //
+        // Same-basis refresh deliberately — a moved basis would replace the record
+        // with a natural view and the hidden half would fall silent for that reason
+        // instead, which is what makes this pin the gate rather than the record.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()).not.toBeNull();
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                generation: 2,
+                sourceGeneration: 1,
+                // Re-asserted, not dropped: a same-basis refresh now hands the record
+                // a fresh answer, and letting this default to empty would silence the
+                // notice through the record and leave the `edit_mode` gate untested
+                // again — the exact hole this test was written to hold.
+                hiddenEditedCellKeys: [['0:1']],
+                capabilities: { csvEditable: false, csvEditingSupported: true },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                },
+            },
+        ));
+        await report_grid_editing(true, true, [], dirty('0:0', '0:1'));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        // Not vacuous: the record the count came from is still the installed one.
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('re-shows the notice when a different dirty row is the hidden one', async () => {
+        // Hide the first of two dirty rows, dismiss, unhide it, hide the second. The
+        // count, the dirty map, the sorts and the enabled filters are all identical
+        // across the two hiding views, so nothing but the *identity* of what is out of
+        // sight distinguishes them — and different unsaved work has disappeared, which
+        // the user has not been told. `hiddenRows` is deliberately not in the rules
+        // half of the signature; making the keys the acknowledged fact is what closes
+        // this without anyone having to remember to serialize another rule field.
+        //
+        // Driven the way the app drives it: durable rules arrive on a snapshot (a
+        // sibling panel's hide, or the user's own restored on reload), the restore
+        // effect asks the host for them, and the host answers with the record.
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 3,
+                sourceRowCount: 3,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const schema = '["Sheet1",2,null]';
+        // Both edits are in column 1, which no rule reads, so the column half of the
+        // signature says nothing throughout and only the hidden cells can speak.
+        const edits = dirty('1:1', '2:1');
+        const hiding = (rows: number[]): SheetTransformState => (
+            { sort: [], filters: [], hiddenRows: rows, schema }
+        );
+        const { post_message } = await render_app();
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            // One session throughout: a new session id would expire the dismissal for
+            // an unrelated reason and make this pass without the keys.
+            csvEditSessionId: 'hidden-row-identity',
+        };
+        // Each step delivers the durable rules, lets the restore effect ask, and
+        // answers with the record the host would build for them.
+        const install_durable = async (
+            snapshot: Extract<HostMessage, { type: 'workbookSnapshot' }>,
+            rules: SheetTransformState | undefined,
+            installed_generation: number,
+            hidden: readonly string[],
+        ) => {
+            await dispatch_host_message(snapshot);
+            if (rules) {
+                await dispatch_host_message(transform_installed_message(
+                    latest_transform_request(post_message),
+                    {
+                        generation: installed_generation,
+                        rowCount: 2,
+                        hiddenEditedCellKeys: hidden,
+                    },
+                ));
+            }
+            // Last, because an install that moves the generation remounts the grid and
+            // the stub reports a fresh (empty) status on mount, exactly as the real
+            // shell does. The dirty map the user is holding is what this reports.
+            await report_grid_editing(true, true, [], edits);
+        };
+        const durable = (rules: SheetTransformState | undefined) => ({
+            capabilities,
+            state: { transforms: [rules], pendingEdits: edits },
+        });
+
+        await install_durable(
+            initial_snapshot_message(meta, durable(hiding([1]))),
+            hiding([1]),
+            2,
+            ['1:1'],
+        );
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // Unhidden: every row is back, so the notice has nothing left to say and goes
+        // on its own. Nothing here clears the acknowledgement — a signature of
+        // `undefined` is silence, not a dismissal expiring.
+        await install_durable(
+            refresh_snapshot_message(meta, {
+                generation: 3,
+                sourceGeneration: 3,
+                ...durable(undefined),
+            }),
+            undefined,
+            0,
+            [],
+        );
+        expect(banner()).toBeNull();
+
+        await install_durable(
+            refresh_snapshot_message(meta, {
+                generation: 4,
+                sourceGeneration: 4,
+                ...durable(hiding([2])),
+            }),
+            hiding([2]),
+            5,
+            ['2:1'],
+        );
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect_no_call_to_action();
+    });
+
+    it('claims nothing hidden for the natural view a snapshot describes', async () => {
+        // Probing for holes rather than only mutating the new code found this one: the
+        // snapshot handler *fabricates* a record when the basis moves, and its count is
+        // a constant nobody was holding to account. Setting it to any other number
+        // failed no test, and the copy would then name cells over rows the host has
+        // just re-read and not filtered yet.
+        //
+        // Inactive-but-non-empty durable rules are the shape that reaches the banner:
+        // they are kept on the record (a disabled filter is still a definition), and
+        // they read no column, so the fabricated count would be the only thing
+        // speaking.
+        //
+        // The delivery deliberately *does* name a hidden cell, which is the second
+        // probe: now that a same-basis refresh takes the host's fresh keys, letting this
+        // branch take them too fails nothing unless the snapshot carries some — and it
+        // must not take them, because the record being built here says no permutation is
+        // in place, so the keys would name cells as out of sight of a view claiming to
+        // show every row.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                hiddenEditedCellKeys: [['0:0']],
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'natural-view-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [],
+                        filters: [{
+                            id: 'off',
+                            colIndex: 0,
+                            operator: 'contains',
+                            value: 'x',
+                            caseSensitive: false,
+                            enabled: false,
+                        }],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                    pendingEdits: dirty('0:0'),
+                },
+            },
+        ));
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        // Deliberately unacknowledged: the record standing here is the snapshot's own,
+        // which is the one under test.
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-transformed')).toBe('false');
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('appears when an edit lands in a sorted column', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('disappears when that edit is reverted', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        expect(banner()).not.toBeNull();
+
+        // Derived from the *current* dirty map, not latched: the last relevant edit
+        // leaving takes the banner with it, with nothing to clear explicitly.
+        await report_grid_editing(false, false, [], {});
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('stays away for an edit in a column the order does not read', async () => {
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('reappears after Dismiss when a second edit lands in the sorted column', async () => {
+        const post_message = await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        post_message.mockClear();
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+        // Dismiss acknowledges; it must not touch the view.
+        expect(post_message.mock.calls
+            .map((call) => (call[0] as WebviewMessage).type)
+            .filter((type) => type === 'setTransform')).toEqual([]);
+
+        // A dismissal covers the edits it was pressed over, not later ones.
+        await report_grid_editing(true, true, [], dirty('0:0', '1:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('survives an identical same-session hydration', async () => {
+        const post_message = await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // The host echo after pendingEditsChanged: same session, same dirty map,
+        // same installed order. A delayed echo of what the user is already looking
+        // at must not resurrect the banner they just dismissed.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: {
+                    transforms: [{
+                        sort: [{ colIndex: 0, direction: 'asc' }],
+                        filters: [],
+                        schema: '["Sheet1",1,null]',
+                    }],
+                    pendingEdits: dirty('0:0'),
+                },
+            },
+        ));
+        await acknowledge_transform(latest_transform_request(post_message), 3);
+        await report_grid_editing(true, true, [], dirty('0:0'));
+
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('expires with the session it was pressed in', async () => {
+        // Restored-session route rather than a re-grant: entering edit mode refuses
+        // while a sort is installed, so a *second* session that already has both can
+        // only arrive with a document load.
+        const { post_message } = await render_app();
+        const restored_session = async (session_id: string) => {
+            await dispatch_host_message(initial_snapshot_message(
+                make_meta(['Sheet1'], false),
+                {
+                    capabilities: {
+                        csvEditable: true,
+                        csvEditingSupported: true,
+                        csvEditSessionId: session_id,
+                    },
+                    state: {
+                        transforms: [{
+                            sort: [{ colIndex: 0, direction: 'asc' }],
+                            filters: [],
+                            schema: '["Sheet1",1,null]',
+                        }],
+                        pendingEdits: dirty('0:0'),
+                    },
+                },
+            ));
+            await acknowledge_transform(latest_transform_request(post_message), 2);
+            await report_grid_editing(true, true, [], dirty('0:0'));
+            expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+            expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        };
+
+        await restored_session('first-session');
+        expect(banner()).not.toBeNull();
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        await restored_session('second-session');
+
+        // A different session's map is not the one that was acknowledged, even when
+        // the cells happen to coincide.
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    /**
+     * A view permuted by `hiddenRows` alone: rows are dropped, nothing is sorted and no
+     * filter is enabled, so the installed order reads no column at all. Restored the way
+     * the app restores one — durable rules on a snapshot, the restore effect's request,
+     * the host's record in answer — because the record has to be the host's word for the
+     * `permuted` arm to be the real one.
+     */
+    async function edit_mode_hiding_row_1(
+        hidden: readonly string[],
+        edits: Record<string, { value: string; base: string }>,
+    ) {
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: 3,
+                sourceRowCount: 3,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'hiding-only-session',
+            },
+            state: {
+                transforms: [{
+                    sort: [],
+                    filters: [],
+                    hiddenRows: [1],
+                    schema: '["Sheet1",2,null]',
+                }],
+                pendingEdits: edits,
+            },
+        }));
+        await dispatch_host_message(transform_installed_message(
+            latest_transform_request(post_message),
+            { generation: 2, rowCount: 2, hiddenEditedCellKeys: hidden },
+        ));
+        await report_grid_editing(true, true, [], edits);
+        expect(grid_stub().getAttribute('data-transformed')).toBe('true');
+        return post_message;
+    }
+
+    it('says nothing about sorting for a view that only hides rows', async () => {
+        // The sentence was unconditional and was simply false here: this view drops a
+        // row and orders nothing, so there is no sort and no enabled filter for the
+        // statement to be about. The hidden sentence has to carry the notice alone, and
+        // read as a complete statement doing it.
+        await edit_mode_hiding_row_1(['1:1'], dirty('1:1'));
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        expect(banner()?.textContent).not.toContain('Sorting');
+        expect(banner()?.textContent).not.toContain('filters');
+        expect_no_call_to_action();
+    });
+
+    it('says nothing at all when a hiding-only view hides no edit', async () => {
+        // The other half of the same gate: with the first sentence conditional, a view
+        // that reads no column and hides no unsaved work has nothing to say. Before the
+        // change this rendered the sorting sentence over a view with no sort in it.
+        await edit_mode_hiding_row_1([], dirty('0:0', '0:1'));
+
+        expect(banner()).toBeNull();
+        expect_no_call_to_action();
+    });
+
+    it('says both when the order is stale and a cell is out of sight', async () => {
+        // Two independent facts, two sentences, one notice — and still nothing to press.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0', '1:1'));
+
+        await reinstall_with_hidden_cells(['1:1']);
+
+        expect(banner()?.textContent).toContain(
+            'Sorting and filters don\'t update while you\'re editing.'
+            + ' 1 edited cell is in a row this view doesn\'t show.',
+        );
+        expect_no_call_to_action();
+    });
+
+    it('does not let a dismissed hidden cell silence a later stale order', async () => {
+        // The two reasons occupy their own fields of the signature, so an
+        // acknowledgement of one is not an acknowledgement of the other. Dismissed while
+        // only the hidden half was speaking; the order half then starts.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:1'));
+        await reinstall_with_hidden_cells(['0:1']);
+        expect(banner()?.textContent).not.toContain(BANNER_TEXT);
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // A second edit, this one in the sorted column. Same rules, same generation,
+        // same hidden cell — a reason the dismissal never covered.
+        await report_grid_editing(true, true, [], dirty('0:1', '0:0'));
+
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('does not let a dismissed stale order silence a later hidden cell', async () => {
+        // And the other direction, which is the one a single summed signature would
+        // break: the count of things said would be unchanged.
+        await edit_mode_sorted_on_column_0();
+        await report_grid_editing(true, true, [], dirty('0:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect(banner()?.textContent).not.toContain('doesn\'t show');
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+
+        // The same edit, now in a row the view has stopped showing.
+        await reinstall_with_hidden_cells(['0:0']);
+
+        expect(banner()?.textContent)
+            .toContain('1 edited cell is in a row this view doesn\'t show.');
+        expect_no_call_to_action();
+    });
+});
+
+// The invariant `SheetViewRecord` now carries as a shape, enforced by the compiler and
+// by no test: a record the webview retained across a same-basis refresh must have no
+// `rules` and no `hiddenEditedCellKeys` on it unless it describes a permutation, because
+// neither is a fact about the rows a non-permuted view contains and basis equality is
+// evidence about nothing else. Three review rounds of this PR were each a reader taking
+// one of those fields off a record that had gone stale in exactly that way, and the last
+// of them shipped a paragraph naming which reader was entitled to read what. `Extract` of
+// the fields from the non-permuted arm's keys must be `never`, or this alias resolves to
+// `never` and the assignment stops compiling.
+type _NonPermutedViewDescribesNoRows = Extract<
+    keyof Extract<SheetViewRecord, { permuted: false }>,
+    'rules' | 'hiddenEditedCellKeys'
+> extends never ? true : never;
+const _non_permuted_view_describes_no_rows: _NonPermutedViewDescribesNoRows = true;
+void _non_permuted_view_describes_no_rows;
+
+// One `SheetViewRecord` per sheet, one generation for the whole core: an install
+// bumps the core's counter, so every *other* sheet's record is left quoting a
+// generation the core has moved past even though its own rows never moved. What a
+// long compute plus a sheet switch reaches, and what the next refresh then decides.
+describe('per-sheet view records', () => {
+    function two_sheet_meta(row_count = 5): WorkbookMeta {
+        const meta = make_meta(['First', 'Second'], false);
+        return {
+            ...meta,
+            sheets: meta.sheets.map((sheet) => ({
+                ...sheet,
+                rowCount: row_count,
+                sourceRowCount: row_count,
+            })),
+        };
+    }
+
+    const FIRST_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+        schema: '["First",1,null]',
+    };
+    const SECOND_SORT: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'desc' }],
+        filters: [],
+        schema: '["Second",1,null]',
+    };
+    const DURABLE = { transforms: [FIRST_SORT, SECOND_SORT] };
+
+    function view(): { sheet: string | null; transformed: string | null; rows: string | null } {
+        return {
+            sheet: grid_stub().getAttribute('data-sheet-index'),
+            transformed: grid_stub().getAttribute('data-transformed'),
+            rows: grid_stub().getAttribute('data-row-count'),
+        };
+    }
+
+    /**
+     * Both sheets permuted, each by its own install, so the two records carry
+     * different generations — 2 for First, 3 for Second — while the core's counter
+     * ends at 3. Row counts differ from each other and from the natural 5, so a
+     * record swapped for another sheet's or for the natural view is distinguishable
+     * from a record that stood.
+     */
+    async function both_sheets_installed() {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(two_sheet_meta(), {
+            state: DURABLE,
+        }));
+        const first = latest_transform_request(post_message);
+        expect(first.sheetIndex).toBe(0);
+        await dispatch_host_message(transform_installed_message(
+            first,
+            { generation: 2, rowCount: 3 },
+        ));
+        await click_button('Second');
+        const second = latest_transform_request(post_message);
+        expect(second.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            second,
+            { generation: 3, rowCount: 4 },
+        ));
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        return { post_message };
+    }
+
+    it('does not disturb another sheet\'s record when an install lands', async () => {
+        await both_sheets_installed();
+
+        await click_button('First');
+
+        // Each record is the one its own install wrote: the second install bumped
+        // the shared generation but moved no row on this sheet.
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+    });
+
+    it('keeps a record whose rows an install on another sheet never moved', async () => {
+        const { post_message } = await both_sheets_installed();
+        post_message.mockClear();
+
+        // The refresh every capability re-projection delivers, on the core's current
+        // generation. First's record was written at generation 2 and Second's install
+        // moved the counter to 3 without touching First's rows, so a basis comparison
+        // that reads the generation alone calls First's record stale and replaces it
+        // with the natural view — while the host's loader is still permuting those
+        // rows and still reporting three of them.
+        await dispatch_host_message(refresh_snapshot_message(two_sheet_meta(), {
+            generation: 3,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: DURABLE,
+        }));
+
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        await click_button('First');
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
+        // And nothing had to be re-asked to get back there: a dropped record shows up
+        // as a restore request for rules the host already holds.
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform')).toEqual([]);
+    });
+
+    it('lands a compute for the sheet the user has since left without corrupting either record', async () => {
+        // The sequence: a slow install is in flight on First, the user switches to
+        // Second, and the ack then arrives for a sheet that is no longer active.
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(two_sheet_meta(), {
+            state: DURABLE,
+        }));
+        const first = latest_transform_request(post_message);
+        expect(first.sheetIndex).toBe(0);
+
+        await click_button('Second');
+        const second = latest_transform_request(post_message);
+        expect(second.sheetIndex).toBe(1);
+        await dispatch_host_message(transform_installed_message(
+            second,
+            { generation: 2, rowCount: 4 },
+        ));
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+
+        // First's compute lands last, on the generation the core reached after both.
+        await dispatch_host_message(transform_installed_message(
+            first,
+            { generation: 3, rowCount: 3 },
+        ));
+
+        // The active sheet is Second, and its record must be untouched by an ack
+        // addressed to another sheet.
+        expect(view()).toEqual({ sheet: '1', transformed: 'true', rows: '4' });
+        await click_button('First');
+        expect(view()).toEqual({ sheet: '0', transformed: 'true', rows: '3' });
     });
 });

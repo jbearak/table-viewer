@@ -25,7 +25,9 @@ import {
     type SheetTransformState,
     type FilterEntry,
     type SheetColumnVisibilityState,
+    type SheetViewRecord,
     type TransformIntent,
+    type ViewBasis,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -38,6 +40,8 @@ import {
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import {
+    order_relevant_dirty_keys,
+    stale_view_signature,
     transform_progress_label,
     upsert_filter,
     type FilterHistogramReady,
@@ -148,6 +152,89 @@ function sheet_widths_equal(
     ));
 }
 
+/**
+ * Whether two row bases describe the same rows. The whole point of keeping the
+ * basis inside `SheetViewRecord` is that this is the *only* question a snapshot has
+ * to ask about an installed view: same rows, keep the record; different rows,
+ * replace it. There is no way to answer it for the rules and not for the row count.
+ */
+function view_bases_equal(left: ViewBasis, right: ViewBasis): boolean {
+    return left.generation === right.generation
+        && left.sourceGeneration === right.sourceGeneration
+        && left.schema === right.schema;
+}
+
+/**
+ * A held record carrying the delivery's fresh hidden edited cells.
+ *
+ * Exactly one field of `SheetViewRecord` is edit-derived; `rules`, `rowCount` and
+ * `basis` are all row-derived, and a same-basis refresh is by definition news about
+ * neither the rows nor the rules. Taking only this one field is therefore not partial
+ * invalidation of the record — it is the only field a delivery that moved no row can
+ * have a newer answer for. What licenses taking it is the same basis equality that
+ * licenses keeping the rest: the host samples these keys and the generation together,
+ * so a generation still equal to the record's is proof these keys were computed
+ * against the very permutation that record describes.
+ *
+ * A non-permuted record has no such field, and passes through: with no permutation
+ * there is no row the view fails to show, and the host's answer for such a sheet is
+ * empty for exactly that reason, so there is nothing here to take. Structural rather
+ * than checked — the arm has no `hiddenEditedCellKeys` to write.
+ *
+ * Deliberately unconditional on the permuted arm rather than returning `held`
+ * unchanged when the keys match. Probed rather than assumed: preserving the object's
+ * identity fails no test, and it cannot — `set_sheet_views` rebuilds the array on
+ * every applied snapshot regardless, and every consumer reads the record by value, the
+ * restore effect included. A guard nothing can hold to account is worse than the
+ * allocation it saves.
+ */
+function view_record_with_hidden_keys(
+    held: SheetViewRecord,
+    fresh: readonly string[],
+): SheetViewRecord {
+    if (!held.permuted) return held;
+    return { ...held, hiddenEditedCellKeys: fresh };
+}
+
+/**
+ * The view a Cancel rolls a pending transform request back to.
+ *
+ * Cancel is not an "apply now" affordance — it puts back the view that was already on
+ * screen. When the held record is `permuted` that view is the host's permutation, and
+ * the record's rules are its only description; they are basis-derived, so the record
+ * is the right place to read them, and a sibling cannot move the durable rules out
+ * from under an installed permutation without the restore reconciliation seeing it.
+ *
+ * When nothing is permuted there is no installed view to describe, so the baseline is
+ * the durable intent — read live, at click time. A record's rules could not serve, and
+ * the non-permuted arm no longer has any: a sibling that replaces or removes a
+ * *disabled* filter definition moves no row, so nothing installs, no generation moves,
+ * and the same-basis retention would go on holding definitions the sibling deleted.
+ * Cancel persists what it sends, so reading that copy would silently resurrect them
+ * over the sibling's update. `state_ref.current.transforms` is the same value that copy
+ * came from, sanitized against the delivered schema by the snapshot handler before it
+ * was stored, and it is what `handle_transform_change` already compares a new request
+ * against.
+ *
+ * Wholly-inactive durable rules pass through as they are rather than being flattened
+ * to empty: a filter the user merely switched off is a definition the host holds and
+ * the toolbar shows, and sending empty would durably delete it. Rules with an active
+ * part are a different case — they describe a view that is *not* on screen, a saved
+ * transform still being restored — so cancelling that restore means going without it,
+ * which is the empty state.
+ */
+function transform_rollback_baseline(
+    installed: SheetViewRecord | undefined,
+    durable: SheetTransformState | undefined,
+    schema: string | undefined,
+): SheetTransformState {
+    if (installed?.permuted) return installed.rules;
+    if (durable && transform_has_entries(durable) && !transform_is_active(durable)) {
+        return durable;
+    }
+    return { sort: [], filters: [], schema };
+}
+
 export function transforms_semantically_equal(
     left: SheetTransformState | undefined,
     right: SheetTransformState | undefined,
@@ -248,10 +335,22 @@ export function App(): React.JSX.Element {
     const [transforms, set_transforms] = useState<
         (SheetTransformState | undefined)[]
     >([]);
-    const [applied_transforms, set_applied_transforms] = useState<
-        (SheetTransformState | undefined)[]
+    // Per sheet, the view the host has installed: its rules, its post-filter row
+    // count, whether the order is permuted — and the row basis all three were
+    // computed against, which is what makes this one value rather than three.
+    //
+    // Three separately-stored atoms held this before (`applied_transforms`,
+    // `effective_row_counts`, and a boolean recording that some install had landed),
+    // and three review findings on this PR were the same mistake: a snapshot
+    // invalidating some of them and not the others, so `transform_active` disagreed
+    // with the row count the loader was using, or a reset path was forgotten.
+    // Carrying the basis inside the record makes partial invalidation unwritable —
+    // an incoming snapshot either matches the basis, and the record stands whole, or
+    // it does not, and the record is replaced whole by the natural view that
+    // snapshot describes.
+    const [sheet_views, set_sheet_views] = useState<
+        (SheetViewRecord | undefined)[]
     >([]);
-    const [effective_row_counts, set_effective_row_counts] = useState<number[]>([]);
     const [pending_transforms, set_pending_transforms] = useState<boolean[]>([]);
     const [pending_transform_labels, set_pending_transform_labels] = useState<string[]>([]);
     const [pending_excel_header, set_pending_excel_header] = useState<string | null>(null);
@@ -305,6 +404,13 @@ export function App(): React.JSX.Element {
     // if a *different* set of cells later conflicts.
     const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
         useState<string | null>(null);
+    // Stale-view signature the user acknowledged ("Dismiss"). Purely informational:
+    // the banner it silences states that the displayed order does not recompute
+    // mid-edit, which is intended, so acknowledging it must not touch the view. It
+    // reappears once a *different* set of order-relevant edits — or a different
+    // installed sort or filter — makes that statement a new fact.
+    const [acknowledged_stale_signature, set_acknowledged_stale_signature] =
+        useState<string | undefined>(undefined);
     // Keys the *host* refused a save over, from a saveResult's `rejection`. These
     // exist because the webview cannot derive them: is_entry_conflicted is
     // residency-gated, so an edit on a filtered-out row, an evicted page, or a row
@@ -373,6 +479,13 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    // Mirrors editing_status.save_in_flight for the transform request paths. A ref
+    // rather than the state value in their dep arrays: the grid reports editing
+    // status on every commit, so depending on it would rebuild these callbacks —
+    // and with them GridShell's props — on each keystroke. Written synchronously
+    // in handle_editing_change, so a request always reads the latest report and
+    // there is no closure to go stale.
+    const save_in_flight_ref = useRef(false);
     const pending_excel_header_unhide_ref = useRef(false);
     const pending_excel_header_promote_ref = useRef(false);
     const pending_edit_request_ref = useRef<string | null>(null);
@@ -400,7 +513,25 @@ export function App(): React.JSX.Element {
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
     const pending_transform_origins_ref = useRef<(TransformOrigin | undefined)[]>([]);
-    const transform_applied_for_source_ref = useRef<boolean[]>([]);
+    // Request-dedup bookkeeping, both of these, and deliberately *not* part of
+    // `sheet_views`: they record what has already been asked of the host, which is a
+    // different fact from what the host installed, and folding them into the view
+    // record would make a refusal — which changes no view — look like one.
+    //
+    // Per sheet, the `restore_blocker_epoch` in force when the restore effect last
+    // asked the host to reconcile to the persisted transform — installing it, or
+    // uninstalling one the durable rules no longer describe — cleared once either
+    // lands. Only of what has already been asked and refused, so the ask is not
+    // repeated verbatim; `sheet_views` remains the only answer to what is installed.
+    const restore_request_blockers_ref = useRef<(number | undefined)[]>([]);
+    // Per sheet, whether the restore was refused for a reason that will never clear
+    // (out-of-range sheet, stale source generation, schema mismatch, a failed
+    // compute). The blocker stamp above suppresses only a *verbatim* repeat under
+    // unchanged conditions, so without this a saved transform this sheet can no
+    // longer support would be asked for — with its global warning — every time a
+    // blocker moved. Cleared by every applied snapshot, which is the point at which
+    // the sheet may well be able to support it again.
+    const restore_abandoned_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
@@ -567,7 +698,29 @@ export function App(): React.JSX.Element {
     ) => {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
+        // Read the outgoing stamp before install overwrites it.
+        const previous_identity = edit_session_ref.current!.identity();
         edit_session_ref.current!.install({ session_id }, edits);
+        // An acknowledgement is about a specific set of dirty cells, so it expires
+        // when the *session* it belonged to does — not on every crossing of this
+        // boundary. Crossing it is not by itself evidence of a new dirty map: the
+        // host echo after pendingEditsChanged and failed-save hydration both
+        // re-install the identical map for the same session, and resetting there
+        // resurrected a banner the user had just dismissed as soon as a delayed
+        // echo landed.
+        //
+        // Keying on the session id still covers every path that genuinely replaces
+        // the map: a successful save plus reload, a discard and a re-grant either
+        // change the session id or install an empty map — and an empty dirty map
+        // makes the signature `undefined`, which hides the banner on its own with
+        // no acknowledgement to expire. A never-stamped store counts as a change;
+        // the reset is a no-op there.
+        if (
+            previous_identity === null
+            || previous_identity.session_id !== session_id
+        ) {
+            set_acknowledged_stale_signature(undefined);
+        }
         // Deliberately does NOT clear the host's save verdict. Crossing this
         // boundary is not evidence that the judged map is gone: the refresh branch
         // installs on a snapshot for our *own* session, and what it installs is
@@ -876,7 +1029,28 @@ export function App(): React.JSX.Element {
                     // false and therefore nothing installs. Only on the applied
                     // branch — a duplicate or stale snapshot must not touch edit
                     // state at all.
-                    editing_ref.current?.commit_live_edit();
+                    //
+                    // And only when this snapshot actually remounts, which is the same
+                    // discriminator round 4 established for the transform ack: the
+                    // fold exists because the remount destroys the grid that owns the
+                    // overlay, so a snapshot that remounts nothing has nothing to
+                    // rescue and folding for it commits a value the user never
+                    // confirmed, past the point where Escape could take it back. The
+                    // predicate is GridShell's remount key: `generation` (still the
+                    // previous one here), `load_epoch` — which only an 'initial'
+                    // snapshot bumps — and the active sheet, which a refresh can move
+                    // only by clamping to a shrunken sheet list. A same-basis refresh
+                    // is the common case by far, since every edit commit during an
+                    // owned session and every sibling touch of durable state delivers
+                    // one.
+                    const remounts_the_grid =
+                        snapshot.presentation === 'initial'
+                        || snapshot.generation !== generation_ref.current
+                        || clamp_sheet_index(
+                            active_sheet_index,
+                            snapshot.meta.sheets.length,
+                        ) !== active_sheet_index;
+                    if (remounts_the_grid) editing_ref.current?.commit_live_edit();
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets = new Map(
                         (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
@@ -985,17 +1159,20 @@ export function App(): React.JSX.Element {
                         pending_save_dialog_ref.current = null;
                     }
                     set_source_epoch((n) => n + 1);
-                    // Auto-fit measures the loaded rows, so anything that changes
-                    // the measured population invalidates it: a new source, a new
-                    // view generation (durable transform reconciliation bumps the
-                    // generation without the source, and reports it only here), or
-                    // a changed header row. A same-generation capability refresh —
-                    // entering edit mode redelivers the projection — must not.
-                    if (
+                    // What the rows *are* changes with a new source, a new view
+                    // generation (durable transform reconciliation bumps the
+                    // generation without the source, and reports it only here), or a
+                    // changed header row — and with nothing else. A same-generation
+                    // capability refresh, which entering edit mode and every
+                    // edit-store notification during an owned session redeliver,
+                    // leaves the rows exactly where they were.
+                    const row_basis_changed =
                         source_changed
                         || view_generation_changed
-                        || header_changed.size > 0
-                    ) {
+                        || header_changed.size > 0;
+                    // Auto-fit measures the loaded rows, so a changed row basis
+                    // invalidates the measurement.
+                    if (row_basis_changed) {
                         auto_fit_active_ref.current = [];
                         auto_fit_snapshot_ref.current = [];
                         set_auto_fit_active([]);
@@ -1026,12 +1203,33 @@ export function App(): React.JSX.Element {
                             set_auto_fit_snapshot(next_snapshot);
                         }
                     }
-                    set_pending_transforms([]);
-                    set_pending_transform_labels([]);
-                    pending_transform_request_ids_ref.current = [];
-                    pending_transform_states_ref.current = [];
-                    pending_transform_origins_ref.current = [];
-                    transform_applied_for_source_ref.current = [];
+                    // An in-flight transform is only invalidated by a snapshot that
+                    // changes the rows it is being computed over; on the same row
+                    // basis it is still going to answer, and its requestId is the
+                    // only thing the install/refusal guards can match on. Dropping
+                    // the id here would make the host's ack fail that guard and be
+                    // discarded, leaving this webview on a generation the host has
+                    // already left behind — every row request it sends afterwards is
+                    // then refused. That is reachable now that a transform may be in
+                    // flight during an owned edit session, where committing an edit
+                    // makes the host redeliver the projection at the same generation.
+                    if (row_basis_changed) {
+                        set_pending_transforms([]);
+                        set_pending_transform_labels([]);
+                        pending_transform_request_ids_ref.current = [];
+                        pending_transform_states_ref.current = [];
+                        pending_transform_origins_ref.current = [];
+                        // Different rows mean the earlier refusal was about a basis
+                        // that no longer exists, and the permutation the host dropped
+                        // has to be asked for again regardless of what is blocking.
+                        restore_request_blockers_ref.current = [];
+                    }
+                    // Deliberately NOT gated on row_basis_changed, unlike the
+                    // in-flight bookkeeping above and the view records below: a sheet
+                    // that could not support its saved transform a moment ago may be
+                    // able to now — different columns, a different header row — and
+                    // this snapshot is the only place that news arrives.
+                    restore_abandoned_ref.current = [];
 
                     let correction_required = false;
                     if (snapshot.presentation === 'initial') {
@@ -1055,12 +1253,6 @@ export function App(): React.JSX.Element {
                         set_column_visibility(normalized.columnVisibility);
                         set_row_heights(normalized.rowHeights);
                         set_transforms(normalized.transforms);
-                        set_applied_transforms(normalized.transforms.map((state) => (
-                            state && !transform_is_active(state) ? state : undefined
-                        )));
-                        set_effective_row_counts(
-                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
-                        );
                         const tab_orient = normalized.tabOrientation;
                         set_vertical_tabs(
                             tab_orient !== null
@@ -1153,14 +1345,8 @@ export function App(): React.JSX.Element {
                         });
                         set_column_widths(next_column_widths);
                         set_row_heights(next_row_heights);
-                        set_effective_row_counts(
-                            snapshot.meta.sheets.map((sheet) => sheet.rowCount),
-                        );
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
-                        set_applied_transforms(next_transforms.map((state) => (
-                            state && !transform_is_active(state) ? state : undefined
-                        )));
                         set_active_sheet_index(next_active_sheet_index);
                         state_ref.current = {
                             ...state_ref.current,
@@ -1177,6 +1363,99 @@ export function App(): React.JSX.Element {
                                 : {}),
                         };
                     }
+                    // The whole of this snapshot's effect on what view is installed,
+                    // as one decision per sheet. The basis is derived the way the host
+                    // derives it in `PanelCore.installed_view`, and a record whose
+                    // basis matches describes rows this snapshot did not move: it
+                    // stands, entirely. A record whose basis differs describes rows
+                    // that no longer exist, so it is replaced, entirely, by the
+                    // natural view this snapshot does describe.
+                    //
+                    // Both halves are load-bearing, and splitting them is what three
+                    // of this PR's findings were. Keeping a stale record would make
+                    // `transform_active` read true over rows the host has re-read.
+                    // Dropping a live one would make it read false while the loader is
+                    // still permuted, which un-suppresses the display-keyed row-height
+                    // affordances (the resize overlay, hover-arming, multiline
+                    // auto-grow) and lets a height be persisted for the wrong row —
+                    // durable corruption, not a flicker. Every edit commit during an
+                    // owned session redelivers a same-basis refresh, so that second
+                    // case is the common one.
+                    //
+                    // `header_changed` is not consulted: an Excel promotion reaches
+                    // the view only through adopt_source, which bumps both
+                    // generations, and it names the promoted row in the schema too — so
+                    // the basis has already caught it. Its other use in the refresh
+                    // branch above, clearing that sheet's stored heights and scroll
+                    // offset, is a different concern.
+                    //
+                    // A retained record deliberately does NOT take its rules from
+                    // this snapshot's durable state. The two are different facts: a
+                    // sibling panel can change the durable rules with no generation
+                    // movement at all, and a same-basis refresh is exactly how that
+                    // arrives. The record saying what *we* still hold is what lets the
+                    // restore effect see the difference and reconcile it.
+                    //
+                    // Sound only because a retained record's rules are read as a
+                    // *description of these rows* and never as the user's current
+                    // intent: keeping them is licensed by the basis, which is evidence
+                    // about the permutation they describe and about nothing else. The
+                    // one reader that wanted intent — Cancel's rollback baseline —
+                    // reads durable state live for exactly this reason.
+                    //
+                    // Its hidden edited cells are the one exception, and the exception
+                    // is not about durable *rules* at all — it is the host's live
+                    // answer about the permutation this record already describes, and
+                    // the only field of the record a delivery that moved no row can
+                    // have news about. See `view_record_with_hidden_keys`.
+                    set_sheet_views((previous) => snapshot.meta.sheets.map(
+                        (sheet, index) => {
+                            const basis = {
+                                generation: snapshot.generation,
+                                sourceGeneration: snapshot.sourceGeneration,
+                                schema: transform_schema_for_sheet(sheet),
+                            };
+                            const held = previous[index];
+                            if (
+                                // A new document restarts from the host's own
+                                // counters, so equal generations here are a
+                                // coincidence rather than evidence about the rows.
+                                snapshot.presentation === 'refresh'
+                                && held
+                                && view_bases_equal(held.basis, basis)
+                            ) {
+                                return view_record_with_hidden_keys(
+                                    held,
+                                    snapshot.hiddenEditedCellKeys[index] ?? [],
+                                );
+                            }
+                            // The natural view: the host installs no permutation for a
+                            // basis it has just read (matching schema does not imply
+                            // matching values), so an active transform has to be
+                            // re-requested and until it lands the rows are the
+                            // metadata's own.
+                            //
+                            // Which is why this is the `permuted: false` arm and there
+                            // is nothing else to fill in. No rules — not even the
+                            // durable definitions a filter the user switched off leaves
+                            // behind — because this branch asserts that nothing is
+                            // installed, and a record naming them anyway would be
+                            // holding a copy of durable intent that basis equality never
+                            // licensed keeping. Cancel used to read that copy as its
+                            // rollback baseline; it now reads the intent live, which is
+                            // the only way to see a sibling that replaced or removed a
+                            // disabled definition without moving a row.
+                            //
+                            // And no hidden edited cells, which used to be a fabricated
+                            // `[]` here: a view containing every row hides no edit, and
+                            // adopting `snapshot.hiddenEditedCellKeys` instead — which
+                            // the delivery does carry, about whatever permutation the
+                            // host holds — would have made the record self-contradictory.
+                            // Both mistakes are now unwritable rather than commented
+                            // against; see the rule on `SheetViewRecord`.
+                            return { basis, permuted: false, rowCount: sheet.rowCount };
+                        },
+                    ));
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
                     set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
@@ -1209,27 +1488,144 @@ export function App(): React.JSX.Element {
                 queue_preview_scroll(msg.row);
             }
 
-            if (msg.type === 'transformApplied') {
+            if (msg.type === 'transformRefused') {
                 if (
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
                 ) {
                     return;
                 }
+                // A refusal means the host changed nothing, and this arm of
+                // HostMessage carries nothing about the view for that reason: there
+                // is no generation, state or row count here to adopt by accident.
+                // All this path does is clear the in-flight UI, restore focus, and
+                // warn.
+                //
+                // It cannot commit_live_edit() either, and now cannot be made to by
+                // mistake: the fold in the install handler exists only because a
+                // generation bump unmounts the grid that owns the overlay, and no
+                // generation bump can arrive on this arm.
+                //
+                // The stamp the restore effect left in restore_request_blockers_ref
+                // is deliberately not cleared, so the same doomed request is not
+                // resent — with its global warning — on every same-basis refresh, and
+                // every edit commit during an owned session produces one of those.
+                // Only restore requests are stamped, so this latch cannot reach a
+                // user-initiated one.
+                //
+                // A user-initiated request has no durable copy anywhere, and clearing
+                // pending_transform_states_ref below therefore drops it outright.
+                // That is the intended outcome, not an oversight to be fixed with a
+                // queue: a sort or filter replayed seconds later — when a sibling's
+                // session releases or a save finishes — would move rows under a user
+                // who is mid-edit and has moved on, which is the one thing this whole
+                // design exists to prevent, and it would amount to the deferred
+                // "Resort/Refilter" action the design forbids. A refused user request
+                // fails visibly (the warning below names the reason) and stays failed;
+                // the user asks again if they still want it.
+                const refusal_origin =
+                    pending_transform_origins_ref.current[msg.sheetIndex];
+                pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_states_ref.current[msg.sheetIndex] = undefined;
+                pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                if (msg.terminal) {
+                    // Retrying validation only fails again, so stop asking. This is
+                    // what keeps a saved transform the sheet can no longer support
+                    // from being re-requested — with its warning — once per snapshot.
+                    // Leaving the flag false is conversely what lets the restore
+                    // effect ask again after a refusal that clears on its own.
+                    //
+                    // Bookkeeping about the *request*, which is why it is not in
+                    // `sheet_views`: nothing was installed, so there is no view here
+                    // to record. The record still says what it always said.
+                    restore_abandoned_ref.current[msg.sheetIndex] = true;
+                }
+                // Focus still has to come back. Our own unchanged generation is
+                // precisely what the focus effect's
+                // `grid_focus_restore.generation !== generation` check wants — and
+                // reading it locally rather than from the message is now the only
+                // option, which is the point.
+                if (refusal_origin === 'grid') {
+                    set_grid_focus_restore({
+                        sheet_index: msg.sheetIndex,
+                        generation: generation_ref.current,
+                        document_epoch: document_epoch_ref.current,
+                    });
+                } else if (refusal_origin === 'toolbar') {
+                    set_toolbar_focus_restore({
+                        sheet_index: msg.sheetIndex,
+                        document_epoch: document_epoch_ref.current,
+                    });
+                }
+                set_pending_transforms((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = false;
+                    return next;
+                });
+                set_pending_transform_labels((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = '';
+                    return next;
+                });
+                // Nobody asked for a restore, so a refusal that clears on its own is
+                // not news: the restore effect re-asks once the blocker moves, and in
+                // the ordinary case — a sibling holding the edit session — every panel
+                // showing the file would otherwise pop a warning about something its
+                // user never did and can do nothing about. The latch above already
+                // reduced this from once-per-commit to once-per-blocker-movement, but
+                // unprompted at any rate is still unprompted.
+                //
+                // Terminal is different in kind and keeps its warning: the saved
+                // transform really is being abandoned, nothing will re-ask, and the
+                // view the user gets is not the one their file remembers. Saying so
+                // is the honest thing even though they did not ask.
+                //
+                // `refusal_origin` deliberately read above, before the pending refs
+                // were cleared.
+                if (!(refusal_origin === 'restore' && !msg.terminal)) {
+                    host_bridge.postMessage({
+                        type: 'showWarning',
+                        message: `Could not update the table view: ${msg.reason}`,
+                    });
+                }
+                return;
+            }
+
+            if (msg.type === 'transformInstalled') {
+                if (
+                    pending_transform_request_ids_ref.current[msg.sheetIndex]
+                    !== msg.requestId
+                ) {
+                    return;
+                }
+                const view = msg.view;
                 // Fold the open overlay into the store before the generation bump
-                // below unmounts the grid that owns it. Doable here rather than at
-                // dispatch time because GridShell is still mounted and Glide's
-                // .gdg-clip-region overlay is still in the DOM, so read_live_edit
-                // resolves; React batches set_generation and flushes only after
-                // this handler returns. It works at all only because the store's
-                // write is synchronous — the subscription plays no part.
-                // Placed after the requestId guard so a stale or duplicated ack
-                // doesn't fold for no reason. This path installs nothing, which is
-                // exactly where the fold earns its keep; where an authoritative
-                // install does follow, the install runs after the fold and still
-                // wins, preserving "the grant/refresh owns the complete
-                // pending-edit projection, including authoritative absence".
-                editing_ref.current?.commit_live_edit();
+                // below unmounts the grid that owns it — and only when that bump is
+                // real. Arriving here is necessary but not sufficient: this is the
+                // only message that *can* move the generation, so a refusal can no
+                // longer reach the fold at all, but the host also answers a restore
+                // or cancel whose rules it already holds with a no-op ack, and that
+                // install leaves the generation exactly where it was. Nothing
+                // remounts, so folding for it would commit an edit the user never
+                // confirmed and put a half-typed value in the dirty store where
+                // Escape can no longer take it back. That is reachable now that a
+                // transform may be computing while the user types, so the comparison
+                // stays — against the installed view's own basis, which is the
+                // generation the record was computed on.
+                //
+                // Doable here rather than at dispatch time because GridShell is
+                // still mounted and Glide's .gdg-clip-region overlay is still in
+                // the DOM, so read_live_edit resolves; React batches set_generation
+                // and flushes only after this handler returns. It works at all only
+                // because the store's write is synchronous — the subscription plays
+                // no part. Placed after the requestId guard so a stale or duplicated
+                // ack doesn't fold for no reason. Where an authoritative install of
+                // pending edits follows, it runs after the fold and still wins,
+                // preserving "the grant/refresh owns the complete pending-edit
+                // projection, including authoritative absence".
+                if (view.basis.generation !== generation_ref.current) {
+                    editing_ref.current?.commit_live_edit();
+                }
                 const origin = pending_transform_origins_ref.current[msg.sheetIndex];
                 pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
                 pending_transform_states_ref.current[msg.sheetIndex] = undefined;
@@ -1237,7 +1633,7 @@ export function App(): React.JSX.Element {
                 if (origin === 'grid') {
                     set_grid_focus_restore({
                         sheet_index: msg.sheetIndex,
-                        generation: msg.generation,
+                        generation: view.basis.generation,
                         document_epoch: document_epoch_ref.current,
                     });
                 } else if (origin === 'toolbar') {
@@ -1256,32 +1652,55 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = '';
                     return next;
                 });
-                set_generation(msg.generation);
-                generation_ref.current = msg.generation;
-                transform_applied_for_source_ref.current[msg.sheetIndex] = true;
-                set_effective_row_counts((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = msg.rowCount;
+                set_generation(view.basis.generation);
+                generation_ref.current = view.basis.generation;
+                // Something installed, so whatever was refusing has cleared: the next
+                // restore is free to ask again.
+                restore_request_blockers_ref.current[msg.sheetIndex] = undefined;
+                // The record arrives whole and is stored whole — the host built it
+                // from its own state after the mutation, so there is nothing here to
+                // recombine and no way to store the rules without the row count and
+                // the basis they were computed with.
+                //
+                // Every *other* sheet's record is rebased onto the same generation,
+                // because the generation is the core's and the indices are per sheet:
+                // `handle_set_transform` writes `transform_indices` for its own sheet
+                // and bumps one shared counter, so an install on this sheet moved no
+                // row anywhere else. Left un-rebased, those records quote a generation
+                // the core has passed, and the next refresh — which any capability
+                // re-projection delivers — reads their basis as stale and replaces a
+                // live permutation with the natural view. That is the same failure the
+                // same-basis retention exists to prevent, one sheet over:
+                // `transform_active` false and a natural row count over rows the
+                // loader is still permuting. Only same-source records are rebased; a
+                // different `sourceGeneration` is genuinely other rows, and the
+                // snapshot handler's replacement is right for those.
+                set_sheet_views((prev) => {
+                    const next = prev.map((held, index) => (
+                        index !== msg.sheetIndex
+                        && held
+                        && held.basis.sourceGeneration === view.basis.sourceGeneration
+                            ? { ...held, basis: { ...held.basis, generation: view.basis.generation } }
+                            : held
+                    ));
+                    next[msg.sheetIndex] = view;
                     return next;
                 });
+                // From the message's own `rules`, which is the rule set the host now
+                // holds, not from the record: the record describes rows, and a view that
+                // installed nothing has no rules on it to read. The message already
+                // normalizes an entry-less set to `undefined`, so the durable copy takes
+                // it verbatim. Reading a message is safe where reading a record is not —
+                // nothing retains a message, so there is no copy here to go stale.
                 const next_transforms = [
                     ...(state_ref.current.transforms ?? transforms),
                 ];
-                next_transforms[msg.sheetIndex] = transform_has_entries(msg.state)
-                    ? msg.state
-                    : undefined;
+                next_transforms[msg.sheetIndex] = msg.rules;
                 state_ref.current = {
                     ...state_ref.current,
                     transforms: next_transforms,
                 };
                 set_transforms(next_transforms);
-                set_applied_transforms((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = transform_has_entries(msg.state)
-                        ? msg.state
-                        : undefined;
-                    return next;
-                });
                 // A transform changes the population sampled by auto-fit. Keep
                 // current widths, but discard the toggle/snapshot so restoring
                 // cannot apply a stale pre-transform measurement.
@@ -1295,12 +1714,6 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = undefined;
                     return next;
                 });
-                if (msg.error) {
-                    host_bridge.postMessage({
-                        type: 'showWarning',
-                        message: `Could not update the table view: ${msg.error}`,
-                    });
-                }
             }
         };
 
@@ -1415,13 +1828,55 @@ export function App(): React.JSX.Element {
     // Recompute persisted transforms against each freshly loaded source. The
     // host intentionally drops permutations on reload because matching schema
     // does not imply matching values.
+    //
+    // Not gated on edit_mode: the host admits a transform from the panel holding
+    // the session, so re-requesting the stored transform during an owned session
+    // is legitimate — and skipping it would leave the user's own saved sort
+    // silently uninstalled for the rest of the session. Preview keeps its gate
+    // (natural source order is a trust boundary there) and so does a pending
+    // Excel header change, which is about to reshape the rows itself.
+    //
+    // A save in flight is a gate rather than a plain skip: the host refuses a
+    // transform during a save, and a refusal changes none of this effect's other
+    // deps, so without the boolean in the dep list a refresh mid-save would leave
+    // the stored transform uninstalled forever. Depending on the boolean and not
+    // on `editing_status` is deliberate — the grid reports editing status on every
+    // commit, so the object would re-run this on every keystroke.
+    const save_in_flight = editing_status?.save_in_flight === true;
+    // Counts observed movements of the conditions under which the host refuses a
+    // transform and which this webview can actually see: another panel owning the
+    // edit session projects `csvEditable: false` here and true again once it
+    // releases, and a save of our own is reported through editing status. A count
+    // rather than the values themselves, because what matters is that a blocker
+    // *moved* — a save goes in and back out of flight, leaving the boolean where it
+    // started, and the restore has to be retried on the way out. Stamped on each
+    // restore request and compared on the next run: see
+    // `restore_request_blockers_ref`.
+    const [restore_blocker_epoch, set_restore_blocker_epoch] = useState(0);
     useEffect(() => {
-        if (!meta || preview_mode || edit_mode || pending_excel_header !== null) return;
+        set_restore_blocker_epoch((n) => n + 1);
+    }, [csv_editable, save_in_flight]);
+    useEffect(() => {
+        if (!meta || preview_mode || pending_excel_header !== null) return;
+        if (save_in_flight) return;
         const sheet = meta.sheets[active_sheet_index];
         if (!sheet) return;
         if (
-            transform_applied_for_source_ref.current[active_sheet_index]
+            restore_abandoned_ref.current[active_sheet_index]
             || pending_transform_request_ids_ref.current[active_sheet_index]
+        ) {
+            return;
+        }
+        // A restore already asked under exactly these conditions and nothing
+        // installed, so asking again would only repeat the refusal — and its global
+        // warning — once per edit commit, because every commit during an owned
+        // session redelivers a snapshot and so bumps `source_epoch`. The stamp is
+        // dropped when a transform does install, when the row basis changes, and
+        // whenever a blocking condition moves, so the restore still lands once the
+        // blocker clears.
+        if (
+            restore_request_blockers_ref.current[active_sheet_index]
+            === restore_blocker_epoch
         ) {
             return;
         }
@@ -1431,17 +1886,79 @@ export function App(): React.JSX.Element {
             transform_schema_for_sheet(sheet),
             sheet.sourceRowCount,
         );
-        if (state && transform_is_active(state)) {
-            request_transform(active_sheet_index, state, 'restore', 'restore');
-        }
+        const installed = sheet_views[active_sheet_index];
+        // One comparison, both directions, one request. An install branch with no
+        // else was how a sibling's cleared sort came to leave the rows permuted
+        // under a toolbar showing no rules: only the host can un-permute the loader,
+        // so a reconciliation that can only ever add rules has no way back. What
+        // reconciling means is decided by the data below rather than by which branch
+        // the reader happens to be in.
+        //
+        // Nothing to reconcile when the durable rules already describe the view we
+        // hold. Every edit commit during an owned session redelivers a same-basis
+        // refresh and so bumps `source_epoch`, so without this the effect would fire
+        // a restore request per keystroke-commit. The host short-circuits an equal
+        // restore intent at the same generation, but that no-op ack is still a
+        // `transformInstalled`, and the install handler discards
+        // `auto_fit_active`/`auto_fit_snapshot` — correctly, since a real transform
+        // changes the population auto-fit sampled — so the Auto-fit toggle would
+        // switch itself off on every commit. Skipping the pointless round-trip
+        // removes that and any other side effect a no-op ack could carry.
+        //
+        // Compared against the rules of a *permutation* only. A non-permuted record has
+        // none, and that is the point rather than a gap to fill from durable state: the
+        // question here is whether the durable rules already describe the view we hold,
+        // and a view holding no permutation is described by no rules at all. The
+        // inactive-both case that used to reach this comparison through a retained
+        // record's stale copy now falls through to the guard below, which answers it
+        // from the same two facts and without the copy.
+        if (
+            transforms_semantically_equal(
+                state,
+                installed?.permuted ? installed.rules : undefined,
+            )
+        ) return;
+        // Differing rules the host has nothing to do about, and the one case that is
+        // not a reconciliation: neither side describes a permutation, so the rules
+        // differ only in definitions nobody is applying — a filter a sibling added
+        // and left switched off, say. The toolbar already reads those from durable
+        // state. Asking the host to "install" them would bump the generation, remount
+        // the grid and fold whatever the user was typing, all for a view identical to
+        // the one on screen.
+        if (!transform_is_active(state) && !installed?.permuted) return;
+        // Sending the sanitized durable state — rather than the active half of it, or
+        // a bare EMPTY_TRANSFORM — is what carries both directions. When it is active
+        // this installs it. When it is not, it is the rule-free view, and sending it
+        // as-is keeps disabled filter definitions the user may re-enable; only when
+        // there is nothing durable left at all is the empty state sent, stamped with
+        // this sheet's schema the way handle_transform_change does.
+        //
+        // Deliberately not gated on edit mode. `admit_transform_for_phase` refuses a
+        // sibling's transform while we own the session, so the durable rules cannot
+        // go inactive from a sibling mid-session; a gate here would instead create a
+        // state that never reconciles, since leaving edit mode moves no dep of this
+        // effect.
+        restore_request_blockers_ref.current[active_sheet_index] =
+            restore_blocker_epoch;
+        request_transform(
+            active_sheet_index,
+            state ?? {
+                ...EMPTY_TRANSFORM,
+                schema: transform_schema_for_sheet(sheet),
+            },
+            'restore',
+            'restore',
+        );
     }, [
         source_epoch,
         meta,
         preview_mode,
-        edit_mode,
         pending_excel_header,
         active_sheet_index,
+        sheet_views,
         request_transform,
+        save_in_flight,
+        restore_blocker_epoch,
     ]);
 
     const handle_sheet_select = useCallback(
@@ -1585,13 +2102,14 @@ export function App(): React.JSX.Element {
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
             if (edit_session_pending) return;
-            if (
-                transform_is_active(transforms[active_sheet_index])
-                || pending_transforms[active_sheet_index]
-            ) {
+            // Only work in flight, and only because the host refuses it: warning
+            // locally saves a round-trip whose answer is already known. An
+            // *installed* sort, filter, or hidden-row rule is no longer a reason
+            // to warn — editing under one is supported and moves no rows.
+            if (pending_transforms[active_sheet_index]) {
                 host_bridge.postMessage({
                     type: 'showWarning',
-                    message: 'Clear sorting, filters, and hidden rows before entering edit mode.',
+                    message: 'Wait for sorting and filtering to finish before entering edit mode.',
                 });
                 return;
             }
@@ -1628,21 +2146,39 @@ export function App(): React.JSX.Element {
     }, [
         edit_mode,
         leave_edit_mode,
-        transforms,
         pending_transforms,
         edit_session_pending,
         active_sheet_index,
         csv_edit_session_id,
     ]);
 
+    /**
+     * The one place that decides whether this webview will ask the host for a
+     * transform at all. Its own function because four call sites need the same
+     * answer and drifted once already: Cancel checked only the save, and a cancel is
+     * itself a transform request.
+     *
+     * Edit mode is deliberately not here: the host admits a transform from the panel
+     * that owns the session. A save in flight is, because it has already validated
+     * every edit's base against the natural source (see `save_blocks_transform` in
+     * viewer-controller.ts). `edit_session_pending` is a claim mid-flight, which the
+     * host refuses in its `claiming` phase — so a request sent under it is one the
+     * host would refuse anyway, and for Cancel that refusal costs the requestId of
+     * the very request being cancelled. A pending Excel header promotion is
+     * reshaping the rows underneath. Preview mode offers no transform affordances at
+     * all, so the term is inert there, and it is kept so the sets are honestly
+     * identical rather than nearly so.
+     */
+    const transform_request_blocked = useCallback((): boolean => (
+        save_in_flight_ref.current
+        || edit_session_pending
+        || preview_mode
+        || pending_excel_header_ref.current !== null
+    ), [edit_session_pending, preview_mode]);
+
     const handle_transform_change = useCallback(
         (next_state: SheetTransformState, origin: TransformOrigin): boolean => {
-            if (
-                edit_mode
-                || edit_session_pending
-                || preview_mode
-                || pending_excel_header_ref.current !== null
-            ) return false;
+            if (transform_request_blocked()) return false;
             const schema = meta?.sheets[active_sheet_index]
                 ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
                 : undefined;
@@ -1672,20 +2208,15 @@ export function App(): React.JSX.Element {
         },
         [
             active_sheet_index,
-            edit_mode,
-            edit_session_pending,
             meta,
-            preview_mode,
             request_transform,
+            transform_request_blocked,
         ],
     );
 
     const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
         if (
-            edit_mode
-            || edit_session_pending
-            || preview_mode
-            || pending_excel_header_ref.current !== null
+            transform_request_blocked()
             || pending_transforms[active_sheet_index]
         ) return;
         const request_id = [
@@ -1717,10 +2248,8 @@ export function App(): React.JSX.Element {
         });
     }, [
         active_sheet_index,
-        edit_mode,
-        edit_session_pending,
         pending_transforms,
-        preview_mode,
+        transform_request_blocked,
     ]);
 
     const handle_unhide_all_rows = useCallback(() => {
@@ -1766,19 +2295,14 @@ export function App(): React.JSX.Element {
             filter_restore_timer_ref.current = undefined;
         }
         if (
-            edit_mode
-            || edit_session_pending
-            || preview_mode
-            || pending_excel_header_ref.current !== null
+            transform_request_blocked()
             || pending_transforms[active_sheet_index]
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
-        edit_mode,
-        edit_session_pending,
         pending_transforms,
-        preview_mode,
+        transform_request_blocked,
     ]);
 
     const open_grid_filter_editor = useCallback((
@@ -1890,14 +2414,19 @@ export function App(): React.JSX.Element {
     ]);
 
     const handle_cancel_transform = useCallback(() => {
-        const previous = applied_transforms[active_sheet_index]
-            ?? {
-                sort: [],
-                filters: [],
-                schema: meta?.sheets[active_sheet_index]
-                    ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
-                    : undefined,
-            };
+        // A cancel the host would refuse must not displace the request it is
+        // cancelling: request_transform overwrites the pending requestId, so the
+        // original in-flight response would stop matching and the webview would sit
+        // on a stale generation. That is why a cancel asks the same question every
+        // other transform request asks — see `transform_request_blocked`.
+        if (transform_request_blocked()) return;
+        const previous = transform_rollback_baseline(
+            sheet_views[active_sheet_index],
+            state_ref.current.transforms?.[active_sheet_index],
+            meta?.sheets[active_sheet_index]
+                ? transform_schema_for_sheet(meta.sheets[active_sheet_index])
+                : undefined,
+        );
         const pending_state = pending_transform_states_ref.current[active_sheet_index];
         const current = pending_state
             ?? state_ref.current.transforms?.[active_sheet_index];
@@ -1908,9 +2437,10 @@ export function App(): React.JSX.Element {
         request_transform(active_sheet_index, previous, 'cancel');
     }, [
         active_sheet_index,
-        applied_transforms,
         meta,
         request_transform,
+        sheet_views,
+        transform_request_blocked,
     ]);
 
     useEffect(() => {
@@ -1932,8 +2462,16 @@ export function App(): React.JSX.Element {
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
+                    //
+                    // The boundary is `install_edit_session` plus the `adopt_session`
+                    // layout effect, not a remount. Since #104 the dirty map lives in
+                    // App's own store; `use_editing` reads it through
+                    // useSyncExternalStore rather than a useState initializer, and
+                    // `install` force-notifies, so a changed map — including an empty
+                    // one — installs into the mounted grid. Bumping load_epoch here
+                    // would also reset column visibility, and entering edit mode is
+                    // not a data reload.
                     install_edit_session(msg.pendingEdits, msg.editSessionId);
-                    set_load_epoch((n) => n + 1);
                     set_edit_mode(true);
                 } else {
                     pending_exit_ref.current = false;
@@ -2060,6 +2598,7 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = Object.keys(status.edits).length > 0
             ? status.edits
             : undefined;
+        save_in_flight_ref.current = status.save_in_flight;
         set_editing_status(status);
     }, []);
 
@@ -2446,10 +2985,23 @@ export function App(): React.JSX.Element {
     const has_multiple_sheets = meta.sheets.length > 1;
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
     const current_transform = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
-    const visible_transform =
-        edit_mode || preview_mode ? EMPTY_TRANSFORM : current_transform;
-    const applied_transform = applied_transforms[active_sheet_index];
-    const transform_active = transform_is_active(applied_transform);
+    // Synchronized preview panes are shown their rows in natural source order.
+    // This is preview's own rule and has nothing to do with editing: the host
+    // treats it as a trust boundary because `visibleRowChanged` indexes the
+    // source-line map by display row, so a permutation would scroll the text
+    // editor to the wrong line (see the guard above `handle_transform_message`
+    // and the `hideRows` preview reject in viewer-controller.ts).
+    //
+    // Edit mode, separately, no longer suppresses anything: an installed sort or
+    // filter stays visible while the user edits, and deliberately does not
+    // recompute, so rows keep their positions mid-edit.
+    const visible_transform = preview_mode ? EMPTY_TRANSFORM : current_transform;
+    const installed_view = sheet_views[active_sheet_index];
+    // What the loader is actually doing, straight from the record rather than
+    // re-derived from the rules: the host set it from whether it holds an index
+    // permutation for this sheet, which is the thing the display-keyed row-height
+    // affordances have to be suppressed against.
+    const transform_active = installed_view?.permuted ?? false;
     const any_transform_pending = pending_transforms.some(Boolean);
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
@@ -2480,8 +3032,7 @@ export function App(): React.JSX.Element {
             ? 'Making row header…'
             : 'Updating column names…'
         : 'Wait for sorting and filtering to finish.';
-    const effective_row_count =
-        effective_row_counts[active_sheet_index] ?? current_sheet.rowCount;
+    const effective_row_count = installed_view?.rowCount ?? current_sheet.rowCount;
     const visibility_reset_key = [
         load_epoch,
         active_sheet_index,
@@ -2489,6 +3040,111 @@ export function App(): React.JSX.Element {
     ].join(':');
     const no_visible_columns =
         current_column_projection.visible_to_source.length === 0;
+
+    /**
+     * The one reason set that hides or disables transform affordances, shared by
+     * the grid's header sections and the toolbar so the two can never disagree.
+     * Edit mode is deliberately absent — sorting and filtering stay available
+     * while editing. What remains are the windows in which the host would refuse
+     * the request anyway (a save in flight, a claim mid-flight) or in which the
+     * displayed order is not the user's to change (preview, an Excel header
+     * change reshaping the rows underneath).
+     */
+    const transform_ui_blocked =
+        editing_status?.save_in_flight === true
+        || edit_session_pending
+        || preview_mode
+        || excel_header_pending;
+
+    // Stale-view banner: derived from the rules actually *installed* in the grid, not
+    // the requested ones, because the statement is about the order the user is
+    // looking at. Only meaningful in edit mode — outside it the order recomputes as
+    // normal.
+    //
+    // The hidden cells ride the same record, so they need no state of their own and
+    // cannot disagree with the rules they were computed against. No `edit_mode` term
+    // of their own either: the signature below carries the only one there should be,
+    // and the message is rendered only when the banner is. Probed rather than assumed
+    // — a second copy of that gate here fails no test, which makes it a guard nothing
+    // could hold to account. The one below is now pinned: see "goes silent when edit
+    // mode ends with the dirty map still reported", which deleting it fails.
+    //
+    // Narrowed to keys the dirty map still holds, which is the *subtracting* half of
+    // keeping this current. The host answers membership, which only an install can
+    // change; the number of hidden cells depends on the edit set too, and that moves
+    // with every `pendingEditsChanged`, discard and save — none of which install
+    // anything, so a count from the host would go on claiming a discarded edit is out
+    // of sight forever. An entry that left the dirty map is not out of sight, it is
+    // gone, so subtracting it here is exact and needs no message from the host.
+    //
+    // The adding half is not here and cannot be: it needs view membership, which never
+    // reaches the webview. An edit typed while a hiding transform computed is missing
+    // from the install's own answer for good, so the host re-answers on every delivery
+    // and the snapshot handler takes the fresh keys onto the record it keeps — see
+    // `view_record_with_hidden_keys`. This intersection then subtracts from *that*.
+    //
+    // Membership in the map, not identity of the entry — deliberately unlike
+    // `live_rejected_keys` above, which compares value and base because a re-typed
+    // cell has never been judged. Here the question is only whether unsaved work is
+    // still sitting in a row the user cannot see, and a hidden row's cell cannot be
+    // re-typed to begin with.
+    //
+    // Silent until GridShell's first status report lands, since `live_edits` is that
+    // report. The column half already waits on the same map, so the notice speaks as
+    // one fact over one dirty map rather than half of it arriving early.
+    // Only a permutation has rules and hidden rows to speak about. A non-permuted
+    // record carries neither, structurally, so both halves below fall silent on it
+    // without a guard of their own — which is right: the host applied nothing, so
+    // there is no installed order to be stale and no row it fails to show.
+    const installed_rules = installed_view?.permuted
+        ? installed_view.rules
+        : undefined;
+    const hidden_edited_cell_keys = (installed_view?.permuted
+        ? installed_view.hiddenEditedCellKeys
+        : []).filter((key) => live_edits?.[key] !== undefined);
+    const hidden_edited_cells = hidden_edited_cell_keys.length;
+    const dirty_keys = Object.keys(live_edits ?? {});
+    // The first sentence's own reason, from the same list the signature folds in.
+    const order_relevant_edits = order_relevant_dirty_keys(
+        installed_rules,
+        dirty_keys,
+    );
+    const stale_view_current_signature = edit_mode
+        ? stale_view_signature(
+            installed_rules,
+            dirty_keys,
+            hidden_edited_cell_keys,
+        )
+        : undefined;
+    const show_stale_view_banner = stale_view_current_signature !== undefined
+        && stale_view_current_signature !== acknowledged_stale_signature;
+    // One notice, two independent facts, one sentence each — and each sentence
+    // rendered only when its own fact holds, so either can stand alone. The first was
+    // unconditional and was false of a view permuted by `hiddenRows` alone: nothing
+    // was sorted and nothing was filtered, so there was no order not updating. It now
+    // speaks only when an unsaved edit sits in a column the installed order actually
+    // reads, which is the only case in which the displayed order can disagree with the
+    // values.
+    //
+    // Both are statements, not prompts: they say what the view is doing and where the
+    // unsaved work is, and nothing about doing anything with either. Noun and verb in
+    // the second are pluralized as one phrase, as in conflict_banner_message, so
+    // "1 edited cells are" cannot be written.
+    //
+    // "doesn't show" rather than "hides" because the host names every edited row the
+    // view does not contain, and one of those is a row an external shrink removed —
+    // not hidden, gone. The weaker verb is true of both, and both are the same fact
+    // for the user: unsaved work they cannot see.
+    const stale_view_message = [
+        ...(order_relevant_edits.length > 0
+            ? ['Sorting and filters don\'t update while you\'re editing.']
+            : []),
+        ...(hidden_edited_cells > 0
+            ? [hidden_edited_cells === 1
+                ? '1 edited cell is in a row this view doesn\'t show.'
+                : `${hidden_edited_cells} edited cells are in rows this view doesn't show.`]
+            : []),
+    ].join(' ');
 
     // Conflict banner: a stable signature of the conflicted cell set, so dismissing
     // it ("Keep All") sticks until a *different* set of cells drifts.
@@ -2581,12 +3237,7 @@ export function App(): React.JSX.Element {
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
             transform_state={visible_transform}
-            transform_sections={
-                !edit_mode
-                && !edit_session_pending
-                && !preview_mode
-                && !excel_header_pending
-            }
+            transform_sections={!transform_ui_blocked}
             transform_pending={transform_pending}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -2608,12 +3259,7 @@ export function App(): React.JSX.Element {
             <Toolbar
                 ref={toolbar_focus_ref}
                 transform={visible_transform}
-                transform_disabled={
-                    edit_mode
-                    || edit_session_pending
-                    || preview_mode
-                    || excel_header_pending
-                }
+                transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 hidden_rows={{
@@ -2687,11 +3333,16 @@ export function App(): React.JSX.Element {
                 is_dirty={editing_status?.is_dirty ?? false}
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
+                // `transform_active` is deliberately absent: an *installed* sort,
+                // filter, or row-hiding rule no longer disables Edit. Edits are
+                // source-keyed (#110) and an installed permutation never
+                // recomputes during a session, so entering edit mode under one
+                // moves no rows. `transform_pending` — work in flight — still
+                // disables, matching the host's own transient refusal.
                 edit_disabled={
                     editing_status?.save_in_flight === true
                     || (!edit_mode && (
                         edit_session_pending
-                        || transform_active
                         || transform_pending
                     ))
                 }
@@ -2700,9 +3351,8 @@ export function App(): React.JSX.Element {
                         ? 'Saving changes.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'
-                        : transform_pending
-                        ? 'Wait for sorting and filtering to finish.'
-                        : 'Clear sorting, filters, and hidden rows before editing.'
+                        // Transform work in flight is the only disabler left.
+                        : 'Wait for sorting and filtering to finish.'
                 }
             />
             {filter_editor && (
@@ -2725,6 +3375,31 @@ export function App(): React.JSX.Element {
             )}
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
+            )}
+            {show_stale_view_banner && (
+                // Informational only. Deliberately no "Resort"/"Refilter"/"Refresh"
+                // action: rows staying where the user left them is the feature, so
+                // there is nothing to fix and nothing to apply. Dismiss records the
+                // acknowledgement and touches nothing else. Rendered outside the
+                // content area holding the grid so it never joins GridShell's
+                // remount key.
+                //
+                // A polite live region: it appears in response to typing rather than
+                // to an explicit action, so without role="status" a screen-reader
+                // user gets no signal it is there. Announced once, without taking
+                // focus from the cell being edited.
+                <div className="stale-view-banner" role="status">
+                    {stale_view_message}
+                    <div className="stale-view-banner-actions">
+                        <button
+                            onClick={() => set_acknowledged_stale_signature(
+                                stale_view_current_signature,
+                            )}
+                        >
+                            Dismiss
+                        </button>
+                    </div>
+                </div>
             )}
             {show_conflict_banner && (
                 <div className="conflict-banner">

@@ -97,6 +97,27 @@ export interface WorkbookSnapshot {
     readonly presentation: 'initial' | 'refresh';
     readonly reason: WorkbookSnapshotReason;
     readonly meta: WorkbookMeta;
+    /**
+     * Which durable pending-edit cells the host's installed view of each sheet does
+     * not show, positionally matching `meta.sheets`.
+     *
+     * Every delivery carries this, not only `transformInstalled`, because the set has
+     * two halves that move at different times. Membership moves only at an install,
+     * and the record the webview holds is refreshed then. The *edits* move on their
+     * own, and one of those moves cannot be reconstructed from anything the webview
+     * has: an edit typed while a hiding transform was computing reaches the durable
+     * map only after the install that excluded its row, so the install's own answer
+     * omits it permanently. Narrowing the held keys to the live dirty map subtracts;
+     * only a fresh answer from the host can add, and `pendingEditsChanged` already
+     * triggers a same-basis refresh for the capabilities it re-projects.
+     *
+     * A snapshot field rather than a capability because `create_desired` samples the
+     * core live for every delivery while capabilities are sampled only when something
+     * re-projects them — so this arrives with the generation it agrees with, and can
+     * never name a permutation other than the one the same delivery's generation
+     * identifies.
+     */
+    readonly hiddenEditedCellKeys: readonly (readonly string[])[];
     readonly state: NormalizedPerFileState;
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
@@ -108,6 +129,16 @@ export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = Workbo
     readonly generation: number;
     readonly sourceGeneration: number;
     readonly meta: Meta;
+    /**
+     * `SheetViewRecord.hiddenEditedCellKeys` for the view this core holds right now,
+     * one entry per sheet, positionally matching `meta.sheets`.
+     *
+     * Sampled with the generation beside it, which is what makes it usable: the
+     * webview keeps a held record when the generation still matches, and a matching
+     * generation means the permutation these keys were computed against is the one
+     * that record describes. See `WorkbookSnapshot.hiddenEditedCellKeys`.
+     */
+    readonly hiddenEditedCellKeys: readonly (readonly string[])[];
 }
 
 export interface WorkbookSnapshotDiagnostics {
@@ -169,6 +200,7 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         presentation: input.presentation,
         reason: input.reason,
         meta: input.core.meta,
+        hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,

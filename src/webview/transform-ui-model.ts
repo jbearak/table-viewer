@@ -7,7 +7,7 @@ import type {
     SortKey,
     TransformIntent,
 } from '../types';
-import { is_range_filter_operator } from '../types';
+import { is_range_filter_operator, transform_read_columns } from '../types';
 
 export { is_range_filter_operator };
 
@@ -301,6 +301,124 @@ export function transform_progress_label(
     if (has_sort && has_filter) return 'Applying sort & filters…';
     if (has_sort) return 'Sorting…';
     return 'Filtering…';
+}
+
+/**
+ * The dirty cells that sit in a column the installed order reads — sorted, so the same
+ * set is the same list.
+ *
+ * Its own function because two callers need the same answer and must not be able to
+ * disagree: this is both the first half of `stale_view_signature` and the condition on
+ * the notice's *first sentence*. That sentence says sorting and filters do not
+ * recompute mid-edit, and a view permuted by `hiddenRows` alone has neither — the
+ * sentence was rendered unconditionally beside the hidden-cell one and was simply false
+ * there. Deriving the sentence from the same list the signature folds in is what keeps
+ * "what the notice says" and "what a dismissal acknowledges" the one fact.
+ */
+export function order_relevant_dirty_keys(
+    state: SheetTransformState | undefined,
+    dirty_keys: readonly string[],
+): readonly string[] {
+    if (!state) return [];
+    const columns = transform_read_columns(state);
+    if (columns.size === 0) return [];
+    return dirty_keys
+        .filter((key) => {
+            const separator = key.indexOf(':');
+            if (separator < 0) return false;
+            const text = key.slice(separator + 1);
+            const column = Number(text);
+            // Number('') is 0, so an empty tail would otherwise read as column 0.
+            return text.length > 0
+                && Number.isInteger(column)
+                && columns.has(column);
+        })
+        .sort();
+}
+
+/**
+ * Signature of everything the stale-view notice is currently saying, or undefined
+ * when it has nothing to say.
+ *
+ * There are two independent reasons to say something, and either alone is enough:
+ *
+ *  - A dirty cell sits in a column the installed order reads. An installed sort or
+ *    filter deliberately does not recompute during a live edit session — rows stay
+ *    where the user left them, which is the feature — so the displayed order can
+ *    disagree with the current values, and that is worth saying.
+ *  - The installed view does not show rows holding unsaved edits
+ *    (`hidden_edited_cell_keys`). This one cannot be reduced to the first:
+ *    hidden-ness is a property of the *row*, so an edit in a column no rule reads is
+ *    hidden just the same, and the reopen case — durable edits plus a durable filter
+ *    whose saved values exclude their rows — is exactly that shape. Gating it behind
+ *    the column test would silence the notice in the case it exists for.
+ *
+ * Both reasons are folded in, which is what makes a dismissal specific to the one that
+ * was speaking: the notice renders a sentence per reason and either can stand alone, so
+ * acknowledging a hidden-cell notice must leave a later stale-order notice free to
+ * appear and the other way round. Each half is pinned in both directions — dropping
+ * either from the result fails tests. They occupy their own `|`-delimited fields for
+ * legibility rather than for discrimination: the caller only ever passes hidden keys the
+ * dirty map still holds, so `affected` and `hidden` are both subsets of the dirty map
+ * and merging them into one sorted list was probed and fails nothing. The separation is
+ * kept because a reader can see which reason a signature is about.
+ *
+ * The column half is derived from the *current* dirty map rather than latched, so
+ * reverting or discarding the last relevant edit clears it for free. The
+ * transform's own signature is folded in so changing the installed sort is a new
+ * fact rather than a previously acknowledged one.
+ *
+ * The hidden half is *not* computable here, which is why it is a parameter: view
+ * membership never reaches the webview. `transformInstalled` carries basis, rules,
+ * row count and `permuted` — no index list — and display-to-source identity
+ * arrives only per fetched page, as `rowData.sourceRows`, behind RowLoader's page
+ * LRU, so a webview-side answer would move with the scrollbar. Recomputing
+ * membership instead of observing it is worse still: it needs every filtered
+ * column's *saved* value for every dirty row, non-resident ones included, plus the
+ * host's filter compiler. The host has both halves — see
+ * `SheetViewRecord.hiddenEditedCellKeys` — so it sends the keys, on the install and
+ * again on every delivery after it, the caller intersects them with the live dirty
+ * map, and this reads the result.
+ *
+ * Keys and not a count, here as on the wire, because this signature is the identity
+ * of *what the notice is saying* and a count cannot express that. Two views can hide
+ * one edited cell each and be entirely different news; a dismissal of the first must
+ * not silence the second. Folding the keys in also makes the rules half below
+ * complete without `state.hiddenRows`: hiding a different row changes which keys are
+ * out of sight, so the change arrives through the keys rather than needing a rule
+ * field someone must remember to serialize. When hiding a row changes no key, the
+ * notice says the same two things it already said and the dismissal correctly holds.
+ * (`transform_read_columns` excludes `hiddenRows` for an unrelated reason — it
+ * answers whether an *edit* can change membership, which hiding by row identity
+ * cannot. Neither exclusion licenses the other; see its doc.)
+ *
+ * @param dirty_keys `"sourceRow:sourceColumn"` keys, as PR 2 rekeyed them.
+ * @param hidden_edited_cell_keys the installed view's
+ *   `hiddenEditedCellKeys` already narrowed to entries the dirty map still holds.
+ */
+export function stale_view_signature(
+    state: SheetTransformState | undefined,
+    dirty_keys: readonly string[],
+    hidden_edited_cell_keys: readonly string[],
+): string | undefined {
+    // No installed rules is no view to be stale about, and nothing can be hidden by
+    // one either — so this also makes the rules serialization below total.
+    if (!state) return undefined;
+    const affected = order_relevant_dirty_keys(state, dirty_keys);
+    if (affected.length === 0 && hidden_edited_cell_keys.length === 0) {
+        return undefined;
+    }
+    // The transform half changes whenever the installed rules do — including a
+    // filter's operator or value, not just which columns it names — so an
+    // acknowledgement cannot carry over to a different view.
+    const rules = JSON.stringify([
+        state.sort,
+        state.filters.filter((entry) => entry.enabled),
+    ]);
+    // Sorted, because the host's key order follows `Object.keys` on the durable map
+    // and an echo of the same view must be the same signature.
+    const hidden = [...hidden_edited_cell_keys].sort();
+    return `${rules}|${affected.join(',')}|${hidden.join(',')}`;
 }
 
 export type TransformShortcut =

@@ -64,6 +64,7 @@ describe('workbook snapshot builder', () => {
                 generation: 7,
                 sourceGeneration: 6,
                 meta: { sheets: [], hasFormatting: false },
+                hiddenEditedCellKeys: [],
             },
             presentation: 'refresh',
             reason: 'retry',
@@ -131,6 +132,10 @@ describe('workbook snapshot builder', () => {
             csvSaveLifecycle: { revision: 0, state: 'idle' as const },
         };
         const diagnostics = { truncationMessage: 'Rows were truncated.' as string | null };
+        // Per sheet, and mutated below with everything else: the core re-samples these
+        // for every delivery, so an issued snapshot sharing the array would let a later
+        // sample rewrite what an earlier delivery said was out of sight.
+        const hidden_edited_cell_keys = [['2:0']];
         const commandResult: RetainedSnapshotCommandResult = {
             type: 'excelFirstRowHeader',
             requestId: 'header:1',
@@ -150,7 +155,12 @@ describe('workbook snapshot builder', () => {
                 physicalDigest: 'digest',
             },
             state_snapshot: { state, revision: 9 },
-            core: { generation: 4, sourceGeneration: 3, meta },
+            core: {
+                generation: 4,
+                sourceGeneration: 3,
+                meta,
+                hiddenEditedCellKeys: hidden_edited_cell_keys,
+            },
             presentation: 'initial',
             reason: 'ready',
             configuration,
@@ -167,6 +177,7 @@ describe('workbook snapshot builder', () => {
         configuration.previewMode = true;
         capabilities.csvEditable = true;
         diagnostics.truncationMessage = null;
+        hidden_edited_cell_keys[0].push('3:0');
         (commandResult as { error?: string }).error = 'Changed';
 
         expect(snapshot.meta.sheets[0]).toMatchObject({
@@ -189,8 +200,10 @@ describe('workbook snapshot builder', () => {
         expect(snapshot.configuration.previewMode).toBe(false);
         expect(snapshot.capabilities.csvEditable).toBe(false);
         expect(snapshot.truncationMessage).toBe('Rows were truncated.');
+        expect(snapshot.hiddenEditedCellKeys).toEqual([['2:0']]);
         expect(snapshot.commandResult?.error).toBe('Ambiguous finalization was reconciled.');
         expect(Object.isFrozen(snapshot)).toBe(true);
+        expect(Object.isFrozen(snapshot.hiddenEditedCellKeys[0])).toBe(true);
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
@@ -234,6 +247,7 @@ describe('workbook snapshot builder', () => {
                 generation: 1,
                 sourceGeneration: 1,
                 meta: { sheets: [sheet], hasFormatting: false },
+                hiddenEditedCellKeys: [[]],
             },
             presentation: 'initial',
             reason: 'ready',

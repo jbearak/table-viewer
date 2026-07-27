@@ -8,6 +8,13 @@ import type {
     GridFocusHandle,
     GridShellProps,
 } from '../webview/grid-shell';
+import { matches_filter } from '../table-transform';
+import type { FilterEntry, SheetTransformState } from '../types';
+import {
+    default_row_height_for_font,
+    line_height_for_font,
+    natural_row_height,
+} from '../webview/row-heights';
 
 // Array-backed CompactSelection stand-in with just enough surface for the
 // selection models (add/remove/hasIndex/equals) used by drag sweeps.
@@ -1235,6 +1242,109 @@ describe('GridShell column projection', () => {
         expect(menu_button_labels()).not.toContain('Use row as header');
     });
 
+    // Hiding rows is a transform like any other, so edit mode no longer withholds
+    // it: the host admits it from the panel that owns the session. Preview keeps its
+    // refusal, because natural source order is a trust boundary there.
+    async function open_row_marker_menu(overrides: Partial<GridShellProps>) {
+        await render_grid(props({
+            row_count: 4,
+            sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+            transform_sections: true,
+            ...overrides,
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+    }
+
+    it('offers hiding rows from the row-marker menu in edit mode', async () => {
+        await open_row_marker_menu({ edit_mode: true, csv_editable: true });
+        expect(menu_button_labels()).toContain('Hide row');
+    });
+
+    it('refuses hiding rows from the row-marker menu in preview mode', async () => {
+        await open_row_marker_menu({ preview_mode: true });
+        expect(menu_button_labels()).not.toContain('Hide row');
+    });
+
+    it('offers hiding rows from the cell menu in edit mode but not in preview', async () => {
+        const select_row_2 = async () => {
+            const on_selection_change = grid_mock.props!.onGridSelectionChange as
+                (selection: unknown) => void;
+            await act(async () => on_selection_change({
+                columns: compact([]),
+                rows: compact([2]),
+            }));
+        };
+        // Hide row lives in the cell menu's Hide submenu, so the submenu has to be
+        // opened before its labels are readable.
+        const open_cell_hide_submenu = async () => {
+            const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+                (cell: [number, number], event: Record<string, unknown>) => void;
+            await act(async () => on_cell_context_menu([0, 2], {
+                preventDefault: vi.fn(),
+                bounds: { x: 0, y: 72, width: 100, height: 24 },
+                localEventX: 10,
+                localEventY: 10,
+            }));
+            const hide = Array.from(document.querySelectorAll('button'))
+                .find((button) => button.textContent === 'Hide›');
+            if (hide) await act(async () => hide.click());
+        };
+
+        await render_grid(props({
+            row_count: 4,
+            sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+            transform_sections: true,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        await select_row_2();
+        await open_cell_hide_submenu();
+        expect(menu_button_labels()).toContain('Hide row');
+
+        act(() => root!.unmount());
+        root = null;
+        container?.remove();
+        document.body.innerHTML = '';
+        await render_grid(props({
+            row_count: 4,
+            sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+            transform_sections: true,
+            preview_mode: true,
+        }));
+        await select_row_2();
+        await open_cell_hide_submenu();
+        expect(menu_button_labels()).not.toContain('Hide row');
+    });
+
+    it('omits row promotion under an edit-mode sort', async () => {
+        // `transform_state` is no longer emptied in edit mode, so this restriction —
+        // promoting a row hides the rows above it, which only means anything in
+        // natural order — now actually sees the sort a user installed while editing.
+        const base = props();
+        await open_row_marker_menu({
+            sheet_meta: {
+                ...base.sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 4,
+                excelFirstRowHeader: {
+                    mode: 'off', detected: false, active: false, available: true,
+                },
+            },
+            transform_state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            can_promote_row_to_header: true,
+            edit_mode: true,
+            csv_editable: true,
+        });
+        expect(menu_button_labels()).not.toContain('Use row as header');
+    });
+
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {
         const on_hide_rows = vi.fn();
         await render_grid(props({
@@ -2157,6 +2267,224 @@ describe('GridShell source-row edit identity', () => {
             }));
         });
         expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+    });
+});
+
+/**
+ * Rows must never move mid-edit. A sort or filter now survives edit mode, and it
+ * deliberately does not recompute while the session is live: the user keeps typing
+ * into the cell they clicked, exactly as a spreadsheet behaves. These are the
+ * user-facing guarantees of the admission change, so they are pinned here rather
+ * than left implied by the absence of re-sorting code.
+ */
+describe('GridShell stable rows during an edit session', () => {
+    // Column 0 values by *source* row. Distinct per row, so the value a display row
+    // paints identifies which source row that display row is showing — which is how
+    // the display→source mapping below is observed rather than asserted against the
+    // harness knob that produces it.
+    const SOURCE_VALUES = ['q', 'a', 'z', 'm'];
+
+    function install_permutation(display_to_source: readonly number[]) {
+        // Non-identity on purpose: with display === source, a grid that silently
+        // re-sorted and one that did not are indistinguishable, so an identity
+        // mapping would make everything below pass trivially.
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_to_source[display_row]
+        );
+        grid_mock.get_row.mockImplementation(((display_row?: number) => {
+            const source_row = display_to_source[display_row ?? 0];
+            if (source_row === undefined) return undefined;
+            const value = SOURCE_VALUES[source_row]!;
+            return [
+                { raw: value, formatted: value, bold: false, italic: false },
+                { raw: `b${source_row}`, formatted: `b${source_row}`, bold: false, italic: false },
+                { raw: `c${source_row}`, formatted: `c${source_row}`, bold: false, italic: false },
+            ];
+        }) as never);
+    }
+
+    function stable_props(
+        display_to_source: readonly number[],
+        transform_state: SheetTransformState,
+        overrides: Partial<GridShellProps> = {},
+    ): GridShellProps {
+        return props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: display_to_source.length,
+                sourceRowCount: SOURCE_VALUES.length,
+            },
+            row_count: display_to_source.length,
+            // All three columns visible, so display column 0 is source column 0 and
+            // the sorted/filtered column is the one being edited.
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+            transformed: true,
+            transform_state,
+            transform_sections: true,
+            edit_mode: true,
+            csv_editable: true,
+            ...overrides,
+        });
+    }
+
+    /** What every display row paints in column 0 — the observable display order. */
+    function displayed_column_0(row_count: number): string[] {
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data: string };
+        return Array.from(
+            { length: row_count },
+            (_, display_row) => get_cell_content([0, display_row]).data,
+        );
+    }
+
+    function posted_transforms() {
+        return grid_mock.post_message.mock.calls
+            .map(([message]) => message as { type?: string })
+            .filter((message) => message?.type === 'setTransform');
+    }
+
+    it('committing an edit to a sorted column does not change any row\'s display position', async () => {
+        // Ascending on column 0 over ['q','a','z','m'] puts the sources in this
+        // order — no display row keeps its source row, so nothing here can pass by
+        // the two row spaces happening to coincide.
+        const display_to_source = [1, 3, 0, 2];
+        install_permutation(display_to_source);
+        const on_transform_change = vi.fn();
+        const statuses: { edits: Record<string, { value: string; base: string }> }[] = [];
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            {
+                on_transform_change,
+                on_editing_change: (status) => { statuses.push(status as never); },
+            },
+        ));
+        const rows_before = grid_mock.props!.rows;
+        const before = displayed_column_0(display_to_source.length);
+        expect(before).toEqual(['a', 'm', 'q', 'z']);
+
+        // 'zzz' sorts after every other value, so a view that recomputed would move
+        // this row from display 0 to display 3.
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'zzz' }));
+        await vi.waitUntil(() => statuses.some(
+            (status) => status.edits['1:0']?.value === 'zzz',
+        ));
+
+        // Positively applied, and readable where the user left it: without this the
+        // test would also pass if the edit had simply been dropped.
+        expect(statuses.at(-1)!.edits['1:0']!.value).toBe('zzz');
+        const after = displayed_column_0(display_to_source.length);
+        expect(after[0]).toBe('zzz');
+        // Every other display row still shows the same source row's value, so the
+        // whole display→source mapping is unchanged.
+        expect(after.slice(1)).toEqual(before.slice(1));
+        expect(grid_mock.props!.rows).toBe(rows_before);
+        // The mechanized form of the product rule: nothing asks the host to re-sort.
+        expect(on_transform_change).not.toHaveBeenCalled();
+        expect(posted_transforms()).toEqual([]);
+    });
+
+    it('an edited row that fails an enabled filter stays visible until save', async () => {
+        const filter: FilterEntry = {
+            id: 'filter-1',
+            colIndex: 0,
+            operator: 'notEquals',
+            value: 'q',
+            caseSensitive: false,
+            enabled: true,
+        };
+        // Anti-vacuity first: if the filter accepted the new value too, everything
+        // below would hold for reasons having nothing to do with stable rows.
+        const cell = (raw: string) => ({
+            raw, formatted: raw, bold: false, italic: false,
+        });
+        expect(matches_filter(cell('a'), filter)).toBe(true);
+        expect(matches_filter(cell('q'), filter)).toBe(false);
+
+        // Source 0 ('q') is filtered out, so the surviving display rows are 1, 2, 3.
+        const display_to_source = [1, 2, 3];
+        install_permutation(display_to_source);
+        const on_transform_change = vi.fn();
+        const statuses: { edits: Record<string, { value: string; base: string }> }[] = [];
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [filter] },
+            {
+                on_transform_change,
+                on_editing_change: (status) => { statuses.push(status as never); },
+            },
+        ));
+        const rows_before = grid_mock.props!.rows;
+        const before = displayed_column_0(display_to_source.length);
+        expect(before).toEqual(['a', 'z', 'm']);
+
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'q' }));
+        await vi.waitUntil(() => statuses.some(
+            (status) => status.edits['1:0']?.value === 'q',
+        ));
+
+        expect(statuses.at(-1)!.edits['1:0']!.value).toBe('q');
+        // Still there, still where it was, showing the value that no longer matches.
+        // It leaves the view on the next save + reload, not before.
+        expect(grid_mock.props!.rows).toBe(rows_before);
+        const after = displayed_column_0(display_to_source.length);
+        expect(after).toEqual(['q', 'z', 'm']);
+        expect(on_transform_change).not.toHaveBeenCalled();
+        expect(posted_transforms()).toEqual([]);
+    });
+
+    // Row heights are still keyed by *display* row (PR 4 moves them to source
+    // keys), so the multiline auto-grow write is gated on `transformed` — the one
+    // place transforms and edit mode now coexist. Asserted as a pair: alone, the
+    // first test would also pass if auto-grow were broken outright.
+    const MULTILINE = 'one\ntwo\nthree';
+    const expected_grown_height = natural_row_height(
+        MULTILINE,
+        line_height_for_font(13),
+        undefined,
+        default_row_height_for_font(13),
+    );
+
+    async function commit_multiline(transformed: boolean, on_row_resize: () => void) {
+        const display_to_source = [1, 3, 0, 2];
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            transformed
+                ? { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] }
+                : { sort: [], filters: [] },
+            { transformed, on_row_resize },
+        ));
+        grid_mock.update_cells.mockClear();
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: MULTILINE }));
+    }
+
+    it('does not write a row height for a multiline edit while transformed', async () => {
+        const on_row_resize = vi.fn();
+        await commit_multiline(true, on_row_resize);
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+        // Fell through to the single-cell repaint rather than returning early: the
+        // edit still has to be painted, there is just no height change to spread
+        // across the row.
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [0, 0] }]);
+    });
+
+    it('grows the row for a multiline edit when not transformed', async () => {
+        const on_row_resize = vi.fn();
+        await commit_multiline(false, on_row_resize);
+
+        expect(on_row_resize).toHaveBeenCalledWith([0], expected_grown_height);
     });
 });
 

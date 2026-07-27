@@ -14,6 +14,7 @@ import {
     transformed_window,
 } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
+import { transform_read_columns } from '../types';
 import type {
     CachedTransformColumn,
     TransformColumnCache,
@@ -101,6 +102,44 @@ function cancel_at_checkpoint(checkpoint: number): () => boolean {
     // target checkpoint returns true on its first (pre-yield) check.
     return () => ++checks >= checkpoint * 2 - 1;
 }
+
+// The membership rule `needed_columns` delegates to. It lives in types.ts because
+// the webview needs the same answer to decide whether an edit landed in a column
+// the displayed order depends on; covered here, next to the host's use of it.
+describe('transform_read_columns', () => {
+    it('reads nothing without a sort or an enabled filter', () => {
+        expect(transform_read_columns(undefined)).toEqual(new Set());
+        expect(transform_read_columns({ sort: [], filters: [] })).toEqual(new Set());
+    });
+
+    it('reads every sorted column', () => {
+        expect(transform_read_columns({
+            sort: [{ colIndex: 2, direction: 'asc' }],
+            filters: [],
+        })).toEqual(new Set([2]));
+    });
+
+    it('reads an enabled filter\'s column but not a disabled one\'s', () => {
+        expect(transform_read_columns({
+            sort: [],
+            filters: [{ ...filter('equals', 'a', 3), enabled: false }],
+        })).toEqual(new Set());
+        expect(transform_read_columns({
+            sort: [],
+            filters: [filter('equals', 'a', 3)],
+        })).toEqual(new Set([3]));
+    });
+
+    it('reads no column for hidden rows', () => {
+        // Hiding is by row identity, not by value, so no edit can change whether a
+        // row is hidden — a hidden-rows-only transform therefore reads nothing.
+        expect(transform_read_columns({
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 4],
+        })).toEqual(new Set());
+    });
+});
 
 describe('table transforms', () => {
     it('sorts numeric values stably and keeps missing values last in both directions', () => {

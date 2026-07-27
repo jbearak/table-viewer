@@ -109,6 +109,7 @@ describe('paginated protocol message shapes', () => {
                 presentation: 'refresh',
                 reason: 'excelHeader',
                 meta,
+                hiddenEditedCellKeys: [[]],
                 state: {
                     columnWidths: [],
                     rowHeights: [],

@@ -10,6 +10,7 @@ import type {
 } from './data-source/interface';
 import {
     InvalidPersistedTransformError,
+    TransformAdmissionLapsedError,
     ViewerPanelCore,
     adopt_source_into_core,
     clone_filter_entry,
@@ -550,22 +551,105 @@ export function attach_viewer(
         return phase.type === 'cleanupPending' || phase.type === 'uncertain';
     }
 
-    function transform_blocks_editing(): boolean {
-        return !!file_edit_state && (
-            file_edit_state.transformOperations.size > 0
-            || file_edit_state.activeTransformPanels.size > 0
-            || file_edit_state.durableTransform.active
-        );
+    /**
+     * A save in flight refuses transform work regardless of edit phase: the save
+     * validated every edit's base against the natural source and is about to
+     * write those bytes, so a permutation landing in between would be persisted
+     * against a basis the save never saw.
+     *
+     * Both halves are checked because they answer different questions and no
+     * single site owns both. `active_save_operation` is the host's own
+     * preparing → accepted → writing reference, and outlives the terminal
+     * lifecycle transition: after a successful write the lifecycle already reads
+     * 'succeeded' while the operation stays live until `begin_edit_cleanup`
+     * clears it. `save_lifecycle.state === 'active'` is the window the webview
+     * has been told about, and is what a future path clearing the operation
+     * before posting its terminal lifecycle would still expose. Today they
+     * overlap almost exactly; the redundancy is deliberate, because a false
+     * refusal is a momentary no-op while a false admit corrupts durable state.
+     */
+    function save_blocks_transform(): boolean {
+        return active_save_operation !== undefined
+            || save_lifecycle.state === 'active';
     }
 
-    function editing_available_for_panel(): boolean {
+    /**
+     * Transform work is mid-flight across state I/O somewhere on this file:
+     * `compute_transform` yields at cancellation checkpoints and publishes the
+     * resulting rules through the shared state store, so anything that crosses
+     * state I/O concurrently races the operation that is about to replace the row
+     * basis. Genuine file-level concurrency.
+     *
+     * This is a *fact*, not a policy. It used to be consulted through one shared
+     * predicate by four editing-side sites that turned out to be asking four
+     * different questions — the conflation review round 6 spent three findings on
+     * — so each site now names its own: `may_begin_editing`,
+     * `may_retain_capability`, `may_reserve_claim` and `may_rehydrate_session`.
+     * Two of those answers coincide today, one adds an owner escape, and one does
+     * not consult this fact at all. Anything that reads this predicate directly is
+     * therefore stating that concurrency is the whole of its question — which is
+     * true of `handle_save`, the mirror of `save_blocks_transform()`.
+     *
+     * Deliberately *not* included: `activeTransformPanels` and
+     * `durableTransform.active`, i.e. a transform that is merely **installed**.
+     * That used to block editing because the dirty map was keyed by display row,
+     * so typing under a permutation wrote the wrong source row. #110 made edits
+     * source-keyed and retired that hazard: an installed sort or filter is now
+     * just a view, and editing under one is safe precisely because the
+     * permutation never recomputes during a live session — rows stay put.
+     *
+     * The mirror of this predicate is `save_blocks_transform()`: transforms
+     * refuse during a save, saves and edit claims refuse during transform work.
+     * Both directions read the same in-flight set, `transformOperations`.
+     */
+    function transform_work_in_flight(): boolean {
+        return !!file_edit_state && file_edit_state.transformOperations.size > 0;
+    }
+
+    /**
+     * May a panel holding no session *start* one?
+     *
+     * No while transform work is in flight. Starting a session is a new,
+     * user-initiated request, and the operation in flight is about to publish a
+     * different row basis through the same state store the grant reads and writes;
+     * admitting across that hands the user an editor over rows being renumbered
+     * underneath it. A transform merely *installed* is not a reason — edits are
+     * source-keyed and an installed permutation never recomputes during a live
+     * session, so entering edit mode under a sort moves nothing.
+     *
+     * The refusal is transient by construction, and the request is *dropped* rather
+     * than queued: replaying an edit-mode entry a moment later would open an editor
+     * over a view the user has since moved on from.
+     */
+    function may_begin_editing(): boolean {
+        return !transform_work_in_flight();
+    }
+
+    /**
+     * May this panel be told it still has the edit capability — `csvEditable`?
+     *
+     * The owner: yes, unconditionally. Rows deliberately stay put mid-edit, so a
+     * sort the user installs in the very panel they are editing must not revoke the
+     * capability and eject them from edit mode. This is exactly why the answer
+     * cannot be `may_begin_editing()`: an existing session's capability has to
+     * survive the same condition that refuses a fresh start.
+     *
+     * A non-owner: only from a free phase with no work in flight. `csvEditable` is
+     * also the one signal a sibling's webview watches to retry a transform restore
+     * that was refused while the owner held the session, so it has to go true again
+     * the moment the session is released — holding it false for the lifetime of an
+     * *installed* sort would strand that sibling's grid under a toolbar showing
+     * rules it never received.
+     */
+    function may_retain_capability(): boolean {
         const phase = edit_phase();
-        return !transform_blocks_editing() && (
-            phase.type === 'free'
-            || (phase.type === 'owned' && phase.token === edit_session_token)
-        );
+        if (phase.type === 'owned' && phase.token === edit_session_token) return true;
+        return !transform_work_in_flight() && phase.type === 'free';
     }
 
+    // Teardown safety, not editing availability: `activeTransformPanels` is a
+    // live registration on this shared record, so deleting the record while one
+    // is present would drop it. Editing no longer consults it.
     function shared_edit_state_is_unused(): boolean {
         return !!file_edit_state
             && file_edit_state.attachments === 0
@@ -581,7 +665,23 @@ export function attach_viewer(
         if (shared_edit_state_is_unused()) csv_edit_file_states.delete(file_key);
     }
 
-    function observe_durable_transform(snapshot: Readonly<FileStateSnapshot>): void {
+    /**
+     * The durable pending edits this panel last observed. Latched rather than read,
+     * because `installed_view` builds its record synchronously and an install must
+     * not gain a state read it did not need before.
+     *
+     * Staleness here is bounded rather than benign, and the distinction matters: this
+     * can lag the live dirty map by the webview's persistence debounce, and an edit
+     * typed *while a hiding transform computed* really is one of the hidden ones even
+     * though it was on screen when it was typed. What makes the lag harmless is that
+     * the answer is recomputed on every delivery rather than only at an install, and
+     * the durable write that ends the lag triggers one — see
+     * `PanelCore.snapshot_material` and `WorkbookSnapshot.hiddenEditedCellKeys`.
+     */
+    let durable_pending_edits: PerFileState['pendingEdits'];
+
+    /** Latched facts about durable state, refreshed on every read of it. */
+    function observe_durable_state(snapshot: Readonly<FileStateSnapshot>): void {
         if (
             !file_edit_state
             || snapshot.revision < file_edit_state.durableTransform.revision
@@ -591,6 +691,22 @@ export function attach_viewer(
             revision: snapshot.revision,
             active: state.transforms?.some(transform_is_active) ?? false,
         };
+        durable_pending_edits = state.pendingEdits;
+    }
+
+    /**
+     * Keys of the durable pending edits the *current* session owns, which is what
+     * `hiddenEditedCellKeys` is drawn from. Scoped through
+     * `pending_edits_for_current_session` so a retired save's or another session's
+     * tombstoned entries — durably present but not this session's to show — cannot
+     * be counted as work the user is holding.
+     *
+     * No sheet qualification, because there is none to give: `pendingEdits` is
+     * file-scoped, and CSV — the one editable format — has exactly one sheet.
+     */
+    function durable_pending_edit_keys(): readonly string[] {
+        const scoped = pending_edits_for_current_session(durable_pending_edits);
+        return scoped ? Object.keys(scoped) : [];
     }
 
     function sync_active_transform_panel(): void {
@@ -602,12 +718,75 @@ export function attach_viewer(
         }
     }
 
-    function begin_transform_admission(): symbol | undefined {
-        if (!file_edit_state) return Symbol(file_key);
-        if (file_edit_state.phase.type !== 'free') return undefined;
+    type TransformAdmission =
+        | { readonly operation: symbol }
+        | { readonly refusal: string };
+
+    /**
+     * Which edit phases admit transform work, and why the rest do not. The
+     * trailing `never` assignment is what makes adding a phase to
+     * `CsvEditFilePhase` a compile error here rather than a silent admit: this
+     * project does not set `noImplicitReturns`, so a bare `switch` with no
+     * `default` would let a new phase fall through and return `undefined` —
+     * which means "admit". The unreachable branch still refuses, so even a
+     * compile run that someone forces through cannot admit under an unknown
+     * phase.
+     *
+     * `owned` admits only the panel holding the session. A sibling's sort would
+     * recompute the permutation and publish it to durable state, moving the
+     * owner's rows out from under them mid-edit — the exact thing stable-rows
+     * editing exists to prevent. The owner's own request is different in kind:
+     * the user, in the panel they are editing, changing their own view. Rows do
+     * not move for edits already made, because an installed transform never
+     * recomputes during a live session.
+     */
+    function admit_transform_for_phase(phase: CsvEditFilePhase): string | undefined {
+        switch (phase.type) {
+            case 'free':
+                return undefined;
+            case 'owned':
+                // The owning panel only; see above.
+                return phase.token === edit_session_token
+                    ? undefined
+                    : 'Another panel is editing this file.';
+            case 'claiming':
+                // A claim is mid-flight across state I/O. Admitting here lets a
+                // transform overtake the very reservation `reserve_edit_claim`
+                // exists to serialize.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'releasing':
+                // `release_edit_session` is still awaiting `pending_edit_writes`;
+                // durable pending edits may yet be written.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'cleanupPending':
+                // A post-write state clear is in flight and
+                // `clearedStateRevision` is not yet recorded, so a transform
+                // write would race the CAS clear.
+                return 'Finishing edit-session work; try again in a moment.';
+            case 'uncertain':
+                // Durable pending-edit state may or may not exist. Never admit
+                // under unknown durable state.
+                return 'Finishing edit-session work; try again in a moment.';
+        }
+        const exhaustive: never = phase;
+        console.error('Unhandled CSV edit phase in transform admission', exhaustive);
+        return 'Finishing edit-session work; try again in a moment.';
+    }
+
+    function begin_transform_admission(): TransformAdmission {
+        // No shared edit state means no edit session can exist for this file, so
+        // there is nothing to serialize against.
+        if (!file_edit_state) return { operation: Symbol(file_key) };
+        if (save_blocks_transform()) {
+            return {
+                refusal: 'Wait for the save to finish before sorting, filtering, or hiding rows.',
+            };
+        }
+        const refusal = admit_transform_for_phase(file_edit_state.phase);
+        if (refusal !== undefined) return { refusal };
         const operation = Symbol(file_key);
         file_edit_state.transformOperations.add(operation);
-        return operation;
+        return { operation };
     }
 
     function finish_transform_admission(operation: symbol): void {
@@ -615,6 +794,43 @@ export function attach_viewer(
         sync_active_transform_panel();
         file_edit_state.transformOperations.delete(operation);
         delete_shared_edit_state_if_unused();
+    }
+
+    /**
+     * The admission question, asked again at the commit boundary. Admission at
+     * entry is not enough, because the phase can change under an operation that is
+     * already in flight: `may_rehydrate_session()` answers yes unconditionally — a
+     * reopened panel holding durable pending edits gets its session back, because
+     * refusing to represent existing user work is data loss — so the phase can go
+     * from `free` to `owned` by *another* panel while a transform computes.
+     * Persisting then would put new rules into durable state, the reopened owner's
+     * restore effect would install them, and the rows would move under a live edit
+     * session: exactly what admitting transforms only from the owning panel exists
+     * to prevent.
+     *
+     * The currency guard cannot see this. Receiver epoch, source authority and
+     * generation say nothing about the edit phase, so a transform whose panel and
+     * source never moved is perfectly "current" while its admission has lapsed.
+     * Round 6's finding 13 had the same shape — a gate that knew only one direction
+     * of a race — and asking one predicate at both ends of the operation is what
+     * stops that recurring: `admit_transform_for_phase` cannot drift from itself.
+     *
+     * What the requesting panel gives up is a view preference. Declining the write
+     * makes the commit fail, and `panel-core` answers a failed commit with a refusal
+     * rather than an install — so the requester keeps the view it already had and
+     * nothing about it diverges from durable state. Better than persisting, and
+     * better than installing locally: the user re-asks for the sort once the other
+     * panel is done. That is the right trade — a view preference asked for twice is
+     * recoverable, rows moving under an editor is not.
+     *
+     * Silent when there is no shared edit record, exactly as
+     * `begin_transform_admission` is: no record means no session can exist on this
+     * file — a non-editing profile never builds one — so there is nothing to
+     * serialize against.
+     */
+    function transform_commit_admission_refusal(): string | undefined {
+        if (!file_edit_state) return undefined;
+        return admit_transform_for_phase(file_edit_state.phase);
     }
 
     function projected_save_lifecycle(): CsvSaveLifecycle {
@@ -704,8 +920,38 @@ export function attach_viewer(
         session.recapture_current_projection({ deliver });
     }
 
+    /**
+     * May a claim be reserved ahead of the state I/O a grant needs?
+     *
+     * No while transform work is in flight. The reservation exists precisely to
+     * serialize against work that crosses state I/O — it pins the phase across
+     * `read_file_state()` so a sibling transform cannot overtake it — so taking one
+     * while such work is *already* in flight would be entering that race from the
+     * losing side, with a transform poised to publish a new basis under the read
+     * the reservation is protecting.
+     *
+     * The same answer as `may_begin_editing()` today, and deliberately its own
+     * function rather than a call to it: that one is about a user's request, this
+     * one about a window across I/O, and they are not required to agree forever. A
+     * reservation refused here is simply not taken; nothing is held for a retry.
+     *
+     * It also cannot currently *observe* a refusal, and that is worth knowing before
+     * anyone tries to test it: `reserve_edit_claim` has one caller, which evaluates
+     * `may_begin_editing()` synchronously a few statements earlier with no await
+     * between, so this can only differ from that answer once some future caller —
+     * or an await inserted into that gap — makes the two evaluations separable in
+     * time. Kept for the same reason `save_blocks_transform()` keeps its overlapping
+     * halves: a false refusal here is a momentary no-op, while a reservation taken
+     * into an in-flight window is a race over durable state.
+     */
+    function may_reserve_claim(): boolean {
+        return !transform_work_in_flight();
+    }
+
     function reserve_edit_claim(): symbol | undefined {
-        if (!file_edit_state || transform_blocks_editing()) return undefined;
+        // Every phase check below is unchanged — those are the claim serialization,
+        // not the transform-shaped question this site asks.
+        if (!file_edit_state || !may_reserve_claim()) return undefined;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned' && phase.token === edit_session_token) {
             return undefined;
@@ -732,11 +978,50 @@ export function attach_viewer(
         delete_shared_edit_state_if_unused();
     }
 
+    /**
+     * May a reopened panel reclaim a session that exists only in durable state?
+     *
+     * Yes, whenever durable `pendingEdits` exist — which is why this function
+     * consults nothing at all. A reopened panel holding durable edits is not
+     * *starting* anything: the session already exists in durable state, and the
+     * only live question is whether the running system can represent it. Refusing
+     * to represent existing user work is data loss, not policy. That is round 6's
+     * worst finding — the reclaim was refused on a transform, so
+     * `project_state_for_panel` stripped the edits and the viewer opened looking
+     * clean over work the user could neither see nor recover.
+     *
+     * Why "yes" is safe here when `may_begin_editing()` says no to the same
+     * condition. Computed row permutations are deliberately never persisted (see
+     * the `transforms` field in types.ts: "Computed row permutations are
+     * deliberately never persisted"), so a close leaves only the *rules* behind.
+     * The permutation the user was looking at is gone by construction, which means
+     * the "rows must not move under an editor" guarantee cannot bind across a
+     * close/reopen — there is no prior order left to preserve, so recomputation
+     * here is not something we are in a position to decline. What the user gets
+     * back is an order over *saved* values with their dirty overlay drawn on top:
+     * the same stale-view semantics the banner already explains for a live session,
+     * and safe to key edits into because edits are source-keyed and therefore valid
+     * under any permutation.
+     *
+     * This answer stops at the transform-shaped question. The phase checks in
+     * `try_claim_edit_session` are untouched and still decide the rest: a session
+     * another panel owns, is releasing, or is cleaning up after is not ours to
+     * take, and no amount of durable work makes it ours.
+     */
+    function may_rehydrate_session(): boolean {
+        return true;
+    }
+
     function try_claim_edit_session(
         notify = true,
         claim?: symbol,
     ): boolean {
-        if (!file_edit_state || transform_blocks_editing()) return false;
+        // The transform-shaped question at this site is `may_rehydrate_session()`,
+        // and its answer is unconditional — see there for why declining would be
+        // data loss. Both callers that need a concurrency refusal already have one:
+        // `requestEditSession` re-evaluates `may_begin_editing()` after its read,
+        // and `reserve_edit_claim` asked `may_reserve_claim()` before it.
+        if (!file_edit_state || !may_rehydrate_session()) return false;
         const phase = file_edit_state.phase;
         if (phase.type === 'owned') {
             if (phase.token !== edit_session_token) return false;
@@ -880,7 +1165,7 @@ export function attach_viewer(
             ? { type: 'free' }
             : { type: 'uncertain', operation };
         if (success && cleared_snapshot !== undefined) {
-            observe_durable_transform(cleared_snapshot);
+            observe_durable_state(cleared_snapshot);
             file_edit_state.clearedStateRevision = Math.max(
                 file_edit_state.clearedStateRevision ?? -1,
                 cleared_snapshot.revision,
@@ -985,24 +1270,56 @@ export function attach_viewer(
         return cleanup;
     }
 
-    /** Project durable state for this panel without mutating shared authority. */
+    /**
+     * Project durable state for this panel without mutating shared authority.
+     *
+     * Being a *projection* is the point, and the one way it can quietly stop being
+     * one is by dropping `pendingEdits`. Round 6's worst finding arrived through
+     * exactly that shape: a reclaim refused upstream, and this function discarding
+     * durable user work as an incidental fallthrough — the viewer opened looking
+     * clean over edits the user could not see. The claim relaxation fixed that
+     * cause; this structure is so the next one cannot hide. The discard is a named
+     * branch with a stated reason, and there is only ever one legitimate reason:
+     * the session those edits belong to is not this panel's to represent.
+     */
     function project_state_for_panel(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): FileStateSnapshot {
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         const state = snapshot.state as PerFileState;
         if (!state.pendingEdits) {
             return { revision: snapshot.revision, state };
         }
+        // `edit_cleanup_blocked()` below is defence in depth and honestly cannot be
+        // observed on its own: `begin_edit_cleanup` clears `active_edit_session_id`,
+        // so `owns_edit_session()` is already false under both cleanup phases, and
+        // `try_claim_edit_session` already refuses any phase that is not `free`.
+        // Probing for a mutation that isolates it found none — every way of letting
+        // the claim through those phases breaks the cleanup-recovery machinery
+        // wholesale. Kept on the precedent `may_reserve_claim` sets rather than
+        // removed, because the term states the projection's own reason for
+        // withholding instead of borrowing the claim's.
+        //
+        // Not live work: a read older than a clear this panel already completed
+        // still carries edits the clear removed.
         const predates_completed_clear = file_edit_state?.clearedStateRevision !== undefined
             && snapshot.revision <= file_edit_state.clearedStateRevision;
-        if (
-            !predates_completed_clear
+        // `may_rehydrate_session()` is asked here by name, not left implicit inside
+        // the claim, because this is the site where its answer decides whether
+        // durable user work reaches the panel at all.
+        const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
             && profile.editing
-            && (owns_edit_session() || (allow_claim && try_claim_edit_session(false)))
-        ) {
+            && (
+                owns_edit_session()
+                || (
+                    allow_claim
+                    && may_rehydrate_session()
+                    && try_claim_edit_session(false)
+                )
+            );
+        if (represents_session) {
             const pending_edits = pending_edits_for_current_session(state.pendingEdits);
             if (pending_edits === state.pendingEdits) {
                 return { revision: snapshot.revision, state };
@@ -1016,6 +1333,27 @@ export function attach_viewer(
             const { pendingEdits: _drop, ...rest } = state;
             return { revision: snapshot.revision, state: rest };
         }
+        // The session belongs to another panel: it owns the phase, is releasing it,
+        // or is clearing state behind it, so these edits are its work to show and
+        // not ours to duplicate. (Or this panel was not asked to claim, or cannot
+        // edit at all, or the snapshot predates a completed clear.)
+        //
+        // Everything else is silent loss of unsaved user work, so assert rather than
+        // hope: reaching here from a free phase with a claim permitted means
+        // `try_claim_edit_session` refused a session nobody holds, which
+        // `may_rehydrate_session()` is written to make impossible.
+        if (
+            allow_claim
+            && profile.editing
+            && !!file_edit_state
+            && !predates_completed_clear
+            && edit_phase().type === 'free'
+        ) {
+            console.error(
+                'Dropped durable CSV pending edits with no panel holding the session',
+                file_key,
+            );
+        }
         const { pendingEdits: _drop, ...rest } = state;
         return { revision: snapshot.revision, state: rest };
     }
@@ -1024,7 +1362,7 @@ export function attach_viewer(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
     ): boolean {
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         return session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
     }
 
@@ -1039,7 +1377,7 @@ export function attach_viewer(
     async function read_file_state(touch = true): Promise<FileStateSnapshot> {
         await file_coordinator.state_ready();
         const snapshot = await state_store.read(state_path);
-        observe_durable_transform(snapshot);
+        observe_durable_state(snapshot);
         if (touch) await state_store.touch(state_path);
         return snapshot;
     }
@@ -1062,7 +1400,7 @@ export function attach_viewer(
                 validate,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
@@ -1210,7 +1548,7 @@ export function attach_viewer(
                 is_current,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed && is_current()) update_session_state_material(result.snapshot);
                 return { type: 'committed', snapshot: result.snapshot };
             }
@@ -1340,13 +1678,13 @@ export function attach_viewer(
                 is_current,
             );
             if (result.type === 'committed') {
-                observe_durable_transform(result.snapshot);
+                observe_durable_state(result.snapshot);
                 if (!disposed && is_current()) {
                     update_session_state_material(result.snapshot, false);
                 }
                 return 'committed';
             }
-            observe_durable_transform(result.snapshot);
+            observe_durable_state(result.snapshot);
             if (!disposed && is_current() && core === cleanup_core) {
                 update_session_state_material(result.snapshot, false);
             }
@@ -1388,9 +1726,36 @@ export function attach_viewer(
         if (message.intent === 'restore') return;
         const authority = transform_authorities.get(message);
         if (!authority || authority.receiverEpoch !== receiver_epoch) return;
+        // Currency *and* admission. The admission term is folded in here rather than
+        // written out in the mutator so that all three places this closure is consulted
+        // get it: the pre-read check, the mutator below, and the `validate` the CAS
+        // itself calls. See `transform_commit_admission_refusal` for why re-asking is
+        // the fix; the mutator alone is not enough, because the phase can flip between
+        // the mutator running and the CAS being reached.
+        //
+        // Be precise about what the `validate` evaluation does and does not close, since
+        // an earlier version of this comment claimed it closed the CAS window outright.
+        // It does not: `compare_and_set` in state.ts calls `validate` and *then* awaits
+        // the medium's durable write, so this closure's last evaluation is still before
+        // the bytes land. Nothing here can observe a phase that flips inside that gap.
+        //
+        // What closes the gap is the store, not another check. Every operation
+        // `create_authority_store` exposes runs on one queue per medium and the durable
+        // write happens inside the queued operation, so no panel can read durable state
+        // while this write is in flight; and every free → owned transition is
+        // synchronously downstream of such a read (`read_file_state` →
+        // `project_state_for_panel` → `try_claim_edit_session`, no await in between —
+        // the paths that are *not*, `requestEditSession` and `reserve_edit_claim`,
+        // refuse on `transform_work_in_flight()` instead). So the phase flips either
+        // before `validate`, where this closure refuses, or after the write landed,
+        // where the session simply begins over rules that were already durable. That is
+        // a dependency on the store's serialization, and it is pinned by
+        // 'rehydrates over a transform whose durable write is still in flight, never
+        // under it' rather than left to be rediscovered.
         const transform_is_current_before_commit = () =>
             authority.receiverEpoch === receiver_epoch
-            && transform_authority_is_current(message, authority);
+            && transform_authority_is_current(message, authority)
+            && transform_commit_admission_refusal() === undefined;
         transform_commit_barriers.add(authority);
         const committed = await update_file_state((current) => {
             const sheet = source?.meta().sheets[message.sheetIndex];
@@ -1414,6 +1779,16 @@ export function attach_viewer(
             return { ...current, transforms };
         }, undefined, transform_is_current_before_commit);
         if (!committed) {
+            // Name the real reason when it is the admission that lapsed: "the source
+            // changed" would be a lie, and the phases that refuse here all end on
+            // their own, so the user's next attempt is the one that works. Its own
+            // error type and not just its own message, because `panel-core` has to
+            // answer the two cases differently — transient here, terminal below — and
+            // discriminating on message text is not a discrimination.
+            const refusal = transform_commit_admission_refusal();
+            if (refusal !== undefined) {
+                throw new TransformAdmissionLapsedError(refusal);
+            }
             throw new Error('The source changed before this table view could be saved.');
         }
     }
@@ -1738,6 +2113,7 @@ export function attach_viewer(
                 {
                     onTransformCommit: persist_transform_commit,
                     onInvalidRestore: cleanup_invalid_restore,
+                    durablePendingEditKeys: durable_pending_edit_keys,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -1763,7 +2139,7 @@ export function attach_viewer(
                             capabilities: {
                                 csvEditingSupported: profile.editing,
                                 csvEditable: profile.editing
-                                    && editing_available_for_panel()
+                                    && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
                                 ...(owns_edit_session() && active_edit_session_id
@@ -1911,7 +2287,7 @@ export function attach_viewer(
                                     capabilities: {
                                         csvEditingSupported: profile.editing,
                                         csvEditable: profile.editing
-                                            && editing_available_for_panel()
+                                            && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
@@ -2520,8 +2896,20 @@ export function attach_viewer(
         const expected_digest = session.acknowledged_physical_digest();
         const src = source;
         const expected_authority = source_authority.authorityRevision;
+        // `transform_work_in_flight()` is the other half of the exclusion
+        // `save_blocks_transform()` states: transforms refuse during a save, and
+        // saves refuse during transform work. Same in-flight set on both sides.
+        // Without it the owner could start a slow sort and save immediately;
+        // `compute_transform` yields at its cancellation checkpoints, so the save
+        // would refresh and replace the source first, cancelling the transform,
+        // and the webview would clear its request on the row-basis change with no
+        // ack — the requested sort silently lost. Refusing rather than waiting
+        // matches this gate's existing shape: the save reports a failed lifecycle
+        // the webview already knows how to restore from, and transform work is
+        // short, so a retry costs the user one keystroke.
         if (
             edit_cleanup_blocked()
+            || transform_work_in_flight()
             || !profile.editing
             || !src
             || !!src.truncationMessage
@@ -2534,7 +2922,9 @@ export function attach_viewer(
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
             show_owner_warning(
-                'The table view is still refreshing. Please try saving again.',
+                transform_work_in_flight()
+                    ? 'Wait for sorting and filtering to finish, then save again.'
+                    : 'The table view is still refreshing. Please try saving again.',
             );
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
             return;
@@ -2909,6 +3299,7 @@ export function attach_viewer(
             await core?.reject_transform(
                 message,
                 'The active header row cannot be hidden.',
+                'terminal',
             );
             return;
         }
@@ -2918,17 +3309,22 @@ export function attach_viewer(
                 await core?.reject_transform(
                     message,
                     'Use Unhide all to restore rows above the active header.',
+                    'terminal',
                 );
                 return;
             }
         }
-        const transform_admission = profile.editing
+        const transform_admission: TransformAdmission = profile.editing
             ? begin_transform_admission()
-            : Symbol(file_key);
-        if (!transform_admission) {
+            : { operation: Symbol(file_key) };
+        if ('refusal' in transform_admission) {
+            // Transient: the admission matrix refuses on an edit-session phase or a
+            // save in flight, both of which end on their own. The webview keeps its
+            // requested transform and retries instead of adopting the unchanged echo.
             await core?.reject_transform(
                 message,
-                'Exit edit mode before sorting, filtering, or hiding rows.',
+                transform_admission.refusal,
+                'transient',
             );
             return;
         }
@@ -2968,7 +3364,7 @@ export function attach_viewer(
             transform_commit_barriers.delete(transform_authority);
             transform_authority.resolveCompletion();
             if (profile.editing) {
-                finish_transform_admission(transform_admission);
+                finish_transform_admission(transform_admission.operation);
             }
         }
     }
@@ -3034,13 +3430,15 @@ export function attach_viewer(
                             || ready_core.source_generation !== ready_source_generation
                         ) continue;
 
-                        const transform_admission = profile.editing
+                        const transform_admission: TransformAdmission = profile.editing
                             ? begin_transform_admission()
-                            : Symbol(file_key);
-                        if (!transform_admission) {
-                            // Edit ownership intentionally keeps the installed view
-                            // natural, but ready must still cross a serialized revision
-                            // barrier before publishing its state material.
+                            : { operation: Symbol(file_key) };
+                        if ('refusal' in transform_admission) {
+                            // Every still-refusing phase reaches here — a sibling's
+                            // session, a claim, a release, cleanup, or uncertainty —
+                            // and keeps the installed view natural. Ready must still
+                            // cross a serialized revision barrier before publishing
+                            // its state material.
                             const confirmed = await read_state_for_ready_epoch(
                                 begun.receiverEpoch,
                             );
@@ -3174,7 +3572,7 @@ export function attach_viewer(
                             break;
                         } finally {
                             if (profile.editing) {
-                                finish_transform_admission(transform_admission);
+                                finish_transform_admission(transform_admission.operation);
                             }
                         }
                         if (!reconciled) continue;
@@ -3549,7 +3947,7 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_blocks_editing();
+                    && may_begin_editing();
                 const denied_by_owner = can_edit
                     && ((phase.type === 'owned' && phase.token !== edit_session_token)
                         || phase.type === 'claiming');
@@ -3590,7 +3988,9 @@ export function attach_viewer(
                     && active_save_operation === undefined
                     && !!source
                     && !source.truncationMessage
-                    && !transform_blocks_editing();
+                    // Re-asked after the state read, because the window this
+                    // question is about is exactly the one the read just crossed.
+                    && may_begin_editing();
                 const owner_still_available = already_owned
                     ? phase.type === 'owned' && phase.token === edit_session_token
                     : phase.type === 'claiming' && phase.claim === claim;
@@ -3599,10 +3999,14 @@ export function attach_viewer(
                     && try_claim_edit_session(true, claim);
                 if (!granted) cancel_edit_claim(claim);
                 if (edit_state) update_session_state_material(edit_state);
+                // The reason half of the same question `can_edit` asked: an installed
+                // sort or filter is not a denial, because editing under one is
+                // supported and the rows stay exactly where they are. Only work in
+                // flight refuses, and it refuses transiently.
                 const denied_by_transform = profile.editing
                     && !!source
                     && !source.truncationMessage
-                    && transform_blocks_editing();
+                    && !may_begin_editing();
                 const pendingEdits = granted
                     ? pending_edits_for_current_session(
                         (edit_state?.state as PerFileState | undefined)?.pendingEdits,
@@ -3627,7 +4031,7 @@ export function attach_viewer(
                         'This file is already being edited in another Table Viewer tab.');
                 } else if (denied_by_transform) {
                     show_owner_warning(
-                        'Clear sorting, filters, and hidden rows before entering edit mode.');
+                        'Wait for sorting and filtering to finish before entering edit mode.');
                 }
                 return;
             }
@@ -3645,8 +4049,17 @@ export function attach_viewer(
                     sourceGeneration: msg.sourceGeneration,
                     intent: 'user',
                 });
+                // Every refusal below is a validation one — preview mode, a stale
+                // generation, an out-of-range sheet, an unmappable row, too many
+                // hidden rows — so none of them is worth asking again. The admission
+                // matrix's transient refusals are reached through
+                // `handle_transform_message`, not here.
                 const reject = async (error: string) => {
-                    await core?.reject_transform(synthesize(installed), error);
+                    await core?.reject_transform(
+                        synthesize(installed),
+                        error,
+                        'terminal',
+                    );
                 };
                 if (profile.previewMode === true) {
                     await reject('Row hiding is unavailable in preview mode.');
@@ -3785,8 +4198,30 @@ export function attach_viewer(
                         if (
                             file_edit_state
                             && tombstone
-                            && tombstone.editSessionId === edit_session_id
-                            && supersedes(tombstone)
+                            && (
+                                // The echo hazard is same-session only, and asking
+                                // `supersedes` outside that session was silent loss of
+                                // unsaved work. A later session starts from a
+                                // projection with the tombstoned entries already
+                                // stripped, and neither `resolve_csv_save_hydration`
+                                // nor the grant path will hand it a failed operation it
+                                // does not own — so it has nothing to echo, and a post
+                                // that happens to carry the failed operation's exact
+                                // values was typed. Left asking `supersedes`, retyping
+                                // the value the failed save had — "Save failed, close
+                                // the tab, reopen, type it again" — put the user's own
+                                // work back inside a strip that then took it out of the
+                                // grid on the next projection.
+                                //
+                                // Dropping the tombstone here also discharges the
+                                // cleanup obligation honestly rather than abandoning
+                                // it: a post *replaces* the durable map, so nothing the
+                                // failed save persisted and the user did not post is
+                                // still there for `ensure_failed_save_cleanup` to
+                                // remove.
+                                tombstone.editSessionId !== edit_session_id
+                                || supersedes(tombstone)
+                            )
                         ) {
                             file_edit_state.failedSaveTombstone = undefined;
                         }

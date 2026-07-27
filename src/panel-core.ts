@@ -1,8 +1,9 @@
-import type { DataSource } from './data-source/interface';
+import type { DataSource, SheetMeta } from './data-source/interface';
 import {
     projected_row_for_source,
     read_source_row_indices,
 } from './data-source/interface';
+import { parse_cell_highlight_key } from './cell-highlights';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram, type ColumnHistogram } from './histograms';
 import {
@@ -26,6 +27,7 @@ import {
     type FilterEntry,
     type HostMessage,
     type SheetTransformState,
+    type SheetViewRecord,
     type WebviewMessage,
 } from './types';
 
@@ -59,6 +61,30 @@ export class InvalidPersistedTransformError extends Error {
         this.name = 'InvalidPersistedTransformError';
     }
 }
+
+/**
+ * The commit-time admission re-ask refused: the edit phase moved under a transform
+ * that was already in flight. Its own type rather than a message string because the
+ * two ways `onTransformCommit` can fail want opposite answers — every phase that
+ * refuses here ends on its own, so this is transient and the request is worth
+ * asking again, while a genuine persistence failure is terminal. Discriminating on
+ * the type is the same shape `InvalidPersistedTransformError` already uses, and it
+ * is what keeps the catch blocks from having to read message text.
+ */
+export class TransformAdmissionLapsedError extends Error {
+    constructor(readonly refusal: string) {
+        super(refusal);
+        this.name = 'TransformAdmissionLapsedError';
+    }
+}
+
+/**
+ * Whether a refusal clears on its own. Named rather than boolean, and required at
+ * every refusal site: the previous `transient = false` default meant a site that
+ * simply forgot to say became terminal, which is how an admission lapse — a phase
+ * that ends by itself — came to be delivered as "stop asking".
+ */
+export type TransformRefusalDisposition = 'transient' | 'terminal';
 
 /**
  * Gives the host authority layer a chance to durably recover a failed restore.
@@ -183,6 +209,7 @@ export class ViewerPanelCore {
     private disposed = false;
     private readonly on_transform_commit?: TransformCommit;
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
+    private readonly durable_pending_edit_keys?: () => readonly string[];
 
     constructor(
         private readonly panel: PanelLike,
@@ -192,6 +219,14 @@ export class ViewerPanelCore {
             maxCachedTransformCells?: number;
             onTransformCommit?: TransformCommit;
             onInvalidRestore?: InvalidRestoreCleanup;
+            /**
+             * Canonical `"sourceRow:sourceColumn"` keys of the durable pending edits
+             * the current edit session owns. The core owns view membership and the
+             * authority layer owns the dirty map, so `hiddenEditedCellKeys` needs
+             * both; absent (Excel, or any caller with no edit sessions) it is always
+             * empty.
+             */
+            durablePendingEditKeys?: () => readonly string[];
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -200,6 +235,7 @@ export class ViewerPanelCore {
         );
         this.on_transform_commit = opts?.onTransformCommit;
         this.on_invalid_restore = opts?.onInvalidRestore;
+        this.durable_pending_edit_keys = opts?.durablePendingEditKeys;
     }
 
     get generation(): number {
@@ -341,6 +377,16 @@ export class ViewerPanelCore {
                 generation: this._generation,
                 sourceGeneration: this._source_generation,
                 meta: this.source.meta(),
+                // Sampled here, beside the generation, and that adjacency is the
+                // whole point: PanelSession builds every delivery from one
+                // `snapshot_material()` call, so the keys and the generation the
+                // webview tests its held record against were read at the same
+                // instant. A generation still equal to the record's is proof the
+                // permutation has not moved, so it is proof these keys were computed
+                // against the very view that record describes. Carried on the
+                // projected capabilities instead they would be sampled at a
+                // different moment and could name another permutation's rows.
+                hiddenEditedCellKeys: this.hidden_edited_cell_keys_by_sheet(),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,
@@ -572,30 +618,209 @@ export class ViewerPanelCore {
             && this.commit_transform_reconciliation(prepared);
     }
 
+    /**
+     * Which of the session's durable pending-edit cells sit in rows this view does
+     * not contain — see `SheetViewRecord.hiddenEditedCellKeys` for why this is the
+     * only place membership is answerable, and why the answer is keys rather than a
+     * count the webview would have no way to correct.
+     *
+     * Two independent ways a key's row can be absent, and only one of them is about
+     * the rules. An enabled filter or an explicit `hiddenRows` drops rows from the
+     * permutation, which `indices.length < sheet.rowCount` detects for free. But a
+     * key can also name a row the *source* no longer has — an external shrink, the
+     * `rowsRemoved` case — and that is true of a permutation that dropped nothing at
+     * all, a bare sort included. There used to be a short-circuit here for "no rule
+     * excludes rows" and for "the filter matched everything", and both were wrong for
+     * exactly that second reason: a filter can match every surviving row while an
+     * edited row it was never asked about has vanished from the file. Deliberately
+     * covered rather than left to the save-time conflict banner, because that banner
+     * only speaks once the user presses Save, and this notice exists to say what is
+     * out of sight *before* then — which is also why the copy says the view does not
+     * *show* the row rather than that it hides it.
+     *
+     * So the scan is skipped only when there are no keys to scan. What the length test
+     * still buys is the *cost*: when the permutation kept every row, membership in the
+     * view reduces to membership in the projection, and `projected_row_for_source`
+     * answers that per key without materializing the O(rows) inverse that
+     * `display_row_for_source` would. When rows really were dropped there is no
+     * shortcut, and `display_row_for_source` reuses the inverse cached beside the
+     * indices it inverts: the install that produced those indices has just
+     * invalidated the old inverse, so the first lookup costs O(rows) at a moment that
+     * was already O(rows), and every lookup after it is O(1).
+     *
+     * Deliberately reads the *durable* map rather than the live one, which can lag it
+     * by the webview's persistence debounce. Over-reporting from that lag — an entry
+     * the user has already discarded but whose removal has not been persisted yet — is
+     * removed by the webview's intersection against its live dirty map.
+     * Under-reporting from it is not benign and is not tolerated either: an edit typed
+     * *while* a hiding transform computed was in no durable map when the install read
+     * one, and the install then excluded its row, so the "just typed, hence visible"
+     * argument does not hold across an install. That direction is answered by
+     * recomputing this on every delivery — see `snapshot_material` — rather than only
+     * at an install.
+     */
+    private hidden_edited_cell_keys(
+        sheet_index: number,
+        sheet: SheetMeta,
+        indices: Uint32Array | undefined,
+    ): readonly string[] {
+        if (!indices || !this.durable_pending_edit_keys) return [];
+        const keys = this.durable_pending_edit_keys();
+        if (keys.length === 0) return [];
+        // Whether the permutation itself left rows out. `rules` is not consulted:
+        // whatever an enabled filter or a `hiddenRows` list asked for, what a row's
+        // presence actually turns on is whether the indices kept it, and a rule that
+        // excluded nothing is indistinguishable from no rule at all.
+        const drops_rows = indices.length !== sheet.rowCount;
+        const hidden: string[] = [];
+        // Several cells in one row ask the same question, and the answer is per row.
+        const row_is_present = new Map<number, boolean>();
+        for (const key of keys) {
+            // Pending edits and cell highlights share one canonical key format, so
+            // this is the same parse, refusing the same malformed keys.
+            const parsed = parse_cell_highlight_key(key);
+            if (!parsed) continue;
+            let present = row_is_present.get(parsed.sourceRow);
+            if (present === undefined) {
+                present = drops_rows
+                    ? this.display_row_for_source(sheet_index, parsed.sourceRow)
+                        !== undefined
+                    // Every kept row is somewhere in the view, so all that is left to
+                    // ask is whether the source still projects the row at all — the
+                    // cheap half of what `display_row_for_source` does, without the
+                    // Int32Array(rows) inverse it would build to answer the other half.
+                    //
+                    // Cost only, and deliberately so: the two branches must agree
+                    // wherever both are defined, and when the permutation kept every
+                    // row they do, which is why no test can tell them apart. Probed
+                    // both ways: forcing `drops_rows` true fails nothing, forcing it
+                    // false fails every filter and hidden-row case in the suite. So the
+                    // equivalence is real, and the cheap arm buys an allocation this
+                    // question never needed.
+                    : projected_row_for_source(
+                        this.source,
+                        sheet_index,
+                        parsed.sourceRow,
+                    ) !== undefined;
+                row_is_present.set(parsed.sourceRow, present);
+            }
+            // The key as given rather than rebuilt from the parse. The two coincide
+            // today — the parse accepts only canonical keys, so there is nothing to
+            // normalize — but the webview matches these against its own dirty map by
+            // string, and rebuilding would put that agreement at the mercy of a
+            // future relaxation of the parse.
+            if (!present) hidden.push(key);
+        }
+        return hidden;
+    }
+
+    /**
+     * The same answer for every sheet, positionally, so a delivery can carry it
+     * without knowing which sheet the user is looking at.
+     *
+     * This is the *additive* half of keeping the notice honest, and it needs a
+     * per-delivery answer rather than a per-install one. Membership changes only at an
+     * install, but the durable map this reads changes on its own — and an edit typed
+     * while a hiding transform was still computing reaches the durable map only
+     * *after* the install that excluded its row, so no install will ever name it. The
+     * webview's intersection against its live dirty map cannot add it back; that
+     * subtracts. Recomputing here, on the delivery `pendingEditsChanged` already
+     * triggers, is what adds it.
+     */
+    private hidden_edited_cell_keys_by_sheet(): readonly (readonly string[])[] {
+        return this.source.meta().sheets.map((sheet, sheet_index) => (
+            this.hidden_edited_cell_keys(
+                sheet_index,
+                sheet,
+                this.transform_indices.get(sheet_index),
+            )
+        ));
+    }
+
+    /**
+     * Describe the view this core holds for a sheet *right now*. Every install
+     * acknowledgement is built from this after the mutation, so the record and the
+     * core cannot disagree about what was installed.
+     *
+     * Which arm of `SheetViewRecord` is decided by whether an index permutation is
+     * held, and that is the whole reason the two row-describing fields are unwritable
+     * on the other one: with no permutation there are no rules describing these rows
+     * and no row the view fails to show, so there is nothing here to fabricate and
+     * nothing a retaining webview can later misread. See the type's doc.
+     */
+    private installed_view(sheet_index: number, sheet: SheetMeta): SheetViewRecord {
+        const basis = {
+            generation: this._generation,
+            sourceGeneration: this._source_generation,
+            schema: transform_schema_for_sheet(sheet),
+        };
+        const indices = this.transform_indices.get(sheet_index);
+        if (!indices) return { basis, permuted: false, rowCount: sheet.rowCount };
+        return {
+            basis,
+            permuted: true,
+            // The fallback is unreachable rather than defensive: indices and state are
+            // written in the same statement pair, and indices are only ever written for
+            // a state `compute_transform` found active. EMPTY_TRANSFORM rather than a
+            // cast so the unreachable case stays a value the readers can handle.
+            rules: clone_transform(
+                this.transform_states.get(sheet_index) ?? EMPTY_TRANSFORM,
+            ),
+            rowCount: indices.length,
+            // Every install arm builds its record here, including the two no-op
+            // equal-state acks, so none of them can answer this with a stale set.
+            hiddenEditedCellKeys: this.hidden_edited_cell_keys(
+                sheet_index,
+                sheet,
+                indices,
+            ),
+        };
+    }
+
+    /**
+     * The install acknowledgement for a sheet, in one place so the view and the rules
+     * beside it are read from this core in the same tick and cannot disagree.
+     *
+     * The rules ride the message rather than the record because they are the host's
+     * durable intent for the sheet, not a fact about the rows the view contains — see
+     * `HostMessage`'s `transformInstalled` arm.
+     */
+    private transform_installed_ack(
+        msg: SetTransformMessage,
+        sheet: SheetMeta,
+    ): Extract<HostMessage, { type: 'transformInstalled' }> {
+        const rules = this.transform_states.get(msg.sheetIndex);
+        return {
+            type: 'transformInstalled',
+            sheetIndex: msg.sheetIndex,
+            requestId: msg.requestId,
+            intent: msg.intent,
+            view: this.installed_view(msg.sheetIndex, sheet),
+            rules: transform_has_entries(rules)
+                ? clone_transform(rules!)
+                : undefined,
+        };
+    }
+
     private async handle_set_transform(
         msg: SetTransformMessage,
     ): Promise<void> {
         const receiver_epoch = this.receiver_epoch;
         const sheet = this.source.meta().sheets[msg.sheetIndex];
         if (!sheet) {
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: this.transform_states.get(msg.sheetIndex) ?? EMPTY_TRANSFORM,
-                rowCount: 0,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-                error: `Sheet index ${msg.sheetIndex} is out of range.`,
-            }, receiver_epoch);
+            await this.post_transform_refusal(
+                msg,
+                `Sheet index ${msg.sheetIndex} is out of range.`,
+                'terminal',
+                receiver_epoch,
+            );
             return;
         }
         if (msg.sourceGeneration !== this._source_generation) {
-            await this.post_transform_error(
+            await this.post_transform_refusal(
                 msg,
-                sheet.rowCount,
                 'The source changed before this table view request arrived.',
+                'terminal',
                 receiver_epoch,
             );
             return;
@@ -604,10 +829,10 @@ export class ViewerPanelCore {
             transform_has_entries(msg.state)
             && msg.state.schema !== transform_schema_for_sheet(sheet)
         ) {
-            await this.post_transform_error(
+            await this.post_transform_refusal(
                 msg,
-                sheet.rowCount,
                 'The saved table view no longer matches this sheet.',
+                'terminal',
                 receiver_epoch,
             );
             return;
@@ -619,17 +844,12 @@ export class ViewerPanelCore {
             && installed_state
             && transform_states_equal(installed_state, msg.state)
         ) {
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: clone_transform(installed_state),
-                rowCount: this.transform_indices.get(msg.sheetIndex)?.length
-                    ?? sheet.rowCount,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-            }, receiver_epoch);
+            // A no-op ack, and truthfully an install: the view the record describes
+            // is the one already in place, on an unmoved generation.
+            await this.post(
+                this.transform_installed_ack(msg, sheet),
+                receiver_epoch,
+            );
             return;
         }
         if (
@@ -654,29 +874,24 @@ export class ViewerPanelCore {
                     receiver_epoch,
                 );
                 if (!source_request_is_current()) return;
-                await this.post({
-                    type: 'transformApplied',
-                    sheetIndex: msg.sheetIndex,
-                    state: clone_transform(installed_state),
-                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
-                    requestId: msg.requestId,
-                    generation: this._generation,
-                    sourceGeneration: this._source_generation,
-                    intent: msg.intent,
-                }, receiver_epoch);
+                await this.post(
+                    this.transform_installed_ack(msg, sheet),
+                    receiver_epoch,
+                );
             } catch (error) {
                 if (!source_request_is_current()) return;
-                await this.post({
-                    type: 'transformApplied',
-                    sheetIndex: msg.sheetIndex,
-                    state: clone_transform(installed_state),
-                    rowCount: this.transform_indices.get(msg.sheetIndex)?.length ?? sheet.rowCount,
-                    requestId: msg.requestId,
-                    generation: this._generation,
-                    sourceGeneration: this._source_generation,
-                    intent: msg.intent,
-                    error: error instanceof Error ? error.message : String(error),
-                }, receiver_epoch);
+                // Two failures, opposite answers. A lapsed commit admission means an
+                // edit phase moved under this request and will move back, so asking
+                // again is precisely what fixes it. Any other persistence failure
+                // changed nothing and will change nothing by being repeated.
+                await this.post_transform_refusal(
+                    msg,
+                    error instanceof Error ? error.message : String(error),
+                    error instanceof TransformAdmissionLapsedError
+                        ? 'transient'
+                        : 'terminal',
+                    receiver_epoch,
+                );
             } finally {
                 if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                     this.transforms_in_flight.delete(msg.sheetIndex);
@@ -728,16 +943,13 @@ export class ViewerPanelCore {
             this.transform_states.set(msg.sheetIndex, clone_transform(msg.state));
             this._generation += 1;
             this.cache.clear();
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: clone_transform(msg.state),
-                rowCount: result.rowCount,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-            }, receiver_epoch);
+            // Built after the mutation above, so the record's basis carries the
+            // bumped generation and its rules/rowCount/permuted come from what was
+            // actually installed rather than from what was asked for.
+            await this.post(
+                this.transform_installed_ack(msg, sheet),
+                receiver_epoch,
+            );
         } catch (error) {
             if (
                 !source_request_is_current()
@@ -747,8 +959,6 @@ export class ViewerPanelCore {
             }
             const previous = this.transform_states.get(msg.sheetIndex)
                 ?? EMPTY_TRANSFORM;
-            const previous_count = this.transform_indices.get(msg.sheetIndex)?.length
-                ?? sheet.rowCount;
             const persisted_error = error instanceof InvalidNumericFilterOperandError
                 ? new InvalidPersistedTransformError(
                     msg.sheetIndex,
@@ -774,19 +984,29 @@ export class ViewerPanelCore {
                 !source_request_is_current()
                 || (msg.intent === 'restore' && !receiver_is_current())
             ) return;
-            await this.post({
-                type: 'transformApplied',
-                sheetIndex: msg.sheetIndex,
-                state: clone_transform(previous),
-                rowCount: previous_count,
-                requestId: msg.requestId,
-                generation: this._generation,
-                sourceGeneration: this._source_generation,
-                intent: msg.intent,
-                ...(recovered
-                    ? {}
-                    : { error: error instanceof Error ? error.message : String(error) }),
-            }, receiver_epoch);
+            if (recovered) {
+                // The controller dropped the invalid saved transform durably, so
+                // there is nothing left to warn about: the view that stands is the
+                // one already installed, and saying so as an install is what stops
+                // the restore effect asking for the dropped rules again.
+                await this.post(
+                    this.transform_installed_ack(msg, sheet),
+                    receiver_epoch,
+                );
+            } else {
+                // As in the equal-state arm above: a lapsed commit admission is a
+                // phase that ends on its own, so the request stays retriable, while a
+                // validation or persistence failure is terminal and repeating it only
+                // fails again.
+                await this.post_transform_refusal(
+                    msg,
+                    error instanceof Error ? error.message : String(error),
+                    error instanceof TransformAdmissionLapsedError
+                        ? 'transient'
+                        : 'terminal',
+                    receiver_epoch,
+                );
+            }
         } finally {
             if (this.transform_operations.get(msg.sheetIndex) === operation_token) {
                 this.transforms_in_flight.delete(msg.sheetIndex);
@@ -794,34 +1014,46 @@ export class ViewerPanelCore {
         }
     }
 
+    /**
+     * `'transient'` says the refusal will clear on its own and the request is worth
+     * retrying; `'terminal'` is a validation refusal, which the webview answers by
+     * keeping the view it already has and not asking again. The caller must say
+     * which — see `TransformRefusalDisposition`.
+     */
     reject_transform(
         msg: SetTransformMessage,
         error: string,
+        disposition: TransformRefusalDisposition,
     ): Promise<boolean> {
-        const natural_count =
-            this.source.meta().sheets[msg.sheetIndex]?.rowCount ?? 0;
-        return this.post_transform_error(msg, natural_count, error);
+        return this.post_transform_refusal(
+            msg,
+            error,
+            disposition,
+            this.receiver_epoch,
+        );
     }
 
-    private post_transform_error(
+    /**
+     * Nothing changed, so nothing about the view is sent. The refusal deliberately
+     * cannot describe a state, a generation or a row count — a refusal that could
+     * would be adopted as one, which is the bug class this split removes.
+     *
+     * `disposition` sits ahead of `receiver_epoch` so it can be required: the choice
+     * between "ask again" and "give up" is never a sensible default.
+     */
+    private post_transform_refusal(
         msg: SetTransformMessage,
-        natural_row_count: number,
-        error: string,
+        reason: string,
+        disposition: TransformRefusalDisposition,
         receiver_epoch = this.receiver_epoch,
     ): Promise<boolean> {
-        const previous = this.transform_states.get(msg.sheetIndex)
-            ?? EMPTY_TRANSFORM;
         return this.post({
-            type: 'transformApplied',
+            type: 'transformRefused',
             sheetIndex: msg.sheetIndex,
-            state: clone_transform(previous),
-            rowCount: this.transform_indices.get(msg.sheetIndex)?.length
-                ?? natural_row_count,
             requestId: msg.requestId,
-            generation: this._generation,
-            sourceGeneration: this._source_generation,
             intent: msg.intent,
-            error,
+            reason,
+            terminal: disposition === 'terminal',
         }, receiver_epoch);
     }
 
@@ -928,6 +1160,7 @@ export function adopt_source_into_core(
     opts?: {
         onTransformCommit?: TransformCommit;
         onInvalidRestore?: InvalidRestoreCleanup;
+        durablePendingEditKeys?: () => readonly string[];
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

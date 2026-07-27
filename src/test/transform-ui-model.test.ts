@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from 'vitest';
-import type { FilterEntry, FilterOperator } from '../types';
+import type { FilterEntry, FilterOperator, SheetTransformState } from '../types';
 import {
     append_sort,
     filter_column_kind_from_histogram,
@@ -15,6 +15,8 @@ import {
     operator_supports_case_sensitive,
     remove_sort,
     replace_sort,
+    order_relevant_dirty_keys,
+    stale_view_signature,
     transform_progress_label,
     transform_shortcut,
     upsert_filter,
@@ -236,5 +238,197 @@ describe('transform UI model', () => {
         Object.defineProperty(editable, 'isContentEditable', { value: true });
         expect(is_editable_target(editable)).toBe(true);
         expect(is_editable_target(document.createElement('button'))).toBe(false);
+    });
+});
+
+describe('stale_view_signature', () => {
+    const enabled_filter = (colIndex: number, value = '5'): FilterEntry => ({
+        ...entry('equals', value),
+        id: `filter-${colIndex}-${value}`,
+        colIndex,
+        enabled: true,
+    });
+    const sort_on_2: SheetTransformState = {
+        sort: [{ colIndex: 2, direction: 'asc' }],
+        filters: [],
+    };
+
+    it('says nothing without an installed transform', () => {
+        expect(stale_view_signature(undefined, ['5:2'], [])).toBeUndefined();
+        expect(stale_view_signature({ sort: [], filters: [] }, ['5:2'], []))
+            .toBeUndefined();
+    });
+
+    it('is defined for a dirty cell in a sorted column', () => {
+        expect(stale_view_signature(sort_on_2, ['5:2'], [])).toBeDefined();
+    });
+
+    it('says nothing for a dirty cell in a column the order does not read', () => {
+        expect(stale_view_signature(sort_on_2, ['5:3'], [])).toBeUndefined();
+    });
+
+    it('says nothing for a disabled filter on the dirty column', () => {
+        expect(stale_view_signature(
+            { sort: [], filters: [{ ...enabled_filter(2), enabled: false }] },
+            ['5:2'],
+            [],
+        )).toBeUndefined();
+        // Same state, filter enabled: the column is now read, so it does speak.
+        expect(stale_view_signature(
+            { sort: [], filters: [enabled_filter(2)] },
+            ['5:2'],
+            [],
+        )).toBeDefined();
+    });
+
+    it('changes when the installed rules change for the same dirty cells', () => {
+        // Folding the rules in is what stops an acknowledgement of one view being
+        // honoured against a different one.
+        const ascending = stale_view_signature(sort_on_2, ['5:2'], []);
+        const descending = stale_view_signature(
+            { sort: [{ colIndex: 2, direction: 'desc' }], filters: [] },
+            ['5:2'],
+            [],
+        );
+        expect(descending).not.toBe(ascending);
+        // Including a filter's operand, not just which column it names.
+        expect(stale_view_signature({ sort: [], filters: [enabled_filter(2, '5')] }, ['5:2'], []))
+            .not.toBe(
+                stale_view_signature({ sort: [], filters: [enabled_filter(2, '6')] }, ['5:2'], []),
+            );
+    });
+
+    it('ignores malformed keys', () => {
+        // `Number('')` is 0, so a key with no column tail must not be read as a
+        // dirty cell in column 0.
+        expect(stale_view_signature(
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            ['5:', ':', 'nonsense', '5'],
+            [],
+        )).toBeUndefined();
+    });
+
+    it('does not depend on the order dirty keys arrive in', () => {
+        expect(stale_view_signature(sort_on_2, ['5:2', '1:2'], []))
+            .toBe(stale_view_signature(sort_on_2, ['1:2', '5:2'], []));
+    });
+
+    it('speaks for a hidden edited cell in a column no rule reads', () => {
+        // Hidden-ness is a property of the row, so the column test cannot stand in
+        // for it: this is the reopen shape — a filter on column 2 excluding a row
+        // whose only unsaved edit is in column 3.
+        const filtered: SheetTransformState = {
+            sort: [],
+            filters: [enabled_filter(2)],
+        };
+        expect(stale_view_signature(filtered, ['5:3'], [])).toBeUndefined();
+        expect(stale_view_signature(filtered, ['5:3'], ['5:3'])).toBeDefined();
+    });
+
+    it('speaks for hidden rows alone, which read no column at all', () => {
+        // `hiddenRows` contributes no read columns by construction
+        // (`transform_read_columns`), so without the hidden cells folded in this view
+        // could never say anything, however many edits it is keeping out of sight.
+        const hidden_only: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [5],
+        };
+        expect(stale_view_signature(hidden_only, ['5:3'], [])).toBeUndefined();
+        expect(stale_view_signature(hidden_only, ['5:3'], ['5:3'])).toBeDefined();
+    });
+
+    it('changes when only the number of hidden cells changes', () => {
+        // What makes a dismissal expire when the number the user acknowledged does.
+        expect(stale_view_signature(sort_on_2, ['5:2'], ['5:2']))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], ['5:2', '5:3']));
+        expect(stale_view_signature(sort_on_2, ['5:2'], []))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2'], ['5:2']));
+    });
+
+    it('changes when different cells are hidden and the count does not move', () => {
+        // Why the parameter is keys and not a count. Hide one dirty row, dismiss,
+        // unhide it and hide a *different* dirty row: same count, same dirty map, and —
+        // because `hiddenRows` is deliberately not in the rules serialization — the
+        // same rules half. Only the keys distinguish the two, and they must, because
+        // it is different unsaved work that has gone out of sight.
+        const hiding = (row: number): SheetTransformState => ({
+            sort: [],
+            filters: [],
+            hiddenRows: [row],
+        });
+        const dirty = ['5:0', '7:0'];
+        expect(stale_view_signature(hiding(5), dirty, ['5:0']))
+            .not.toBe(stale_view_signature(hiding(7), dirty, ['7:0']));
+    });
+
+    it('is unchanged by an echo of the same hidden cells in another order', () => {
+        // The other direction, and what keeps Dismiss sticking under a hiding filter:
+        // the host's key order follows `Object.keys` on the durable map, which is not
+        // a promise about anything.
+        expect(stale_view_signature(sort_on_2, ['5:2'], ['9:1', '3:4']))
+            .toBe(stale_view_signature(sort_on_2, ['5:2'], ['3:4', '9:1']));
+    });
+
+    it('changes when another dirty cell lands in a read column', () => {
+        // Probing for holes found this one: the hidden half was pinned in both
+        // directions here and the *order* half was pinned nowhere in this file — dropping
+        // `affected` from the signature entirely failed only two app-level tests.
+        // Both halves have to be folded in, because either alone is enough to make the
+        // notice speak and a dismissal covers only what it was pressed over.
+        expect(stale_view_signature(sort_on_2, ['5:2'], []))
+            .not.toBe(stale_view_signature(sort_on_2, ['5:2', '7:2'], []));
+    });
+});
+
+describe('order_relevant_dirty_keys', () => {
+    const sorted_on_0: SheetTransformState = {
+        sort: [{ colIndex: 0, direction: 'asc' }],
+        filters: [],
+    };
+    const enabled_filter = (colIndex: number): FilterEntry => ({
+        ...entry('equals', '5'),
+        id: `filter-${colIndex}`,
+        colIndex,
+        enabled: true,
+    });
+
+    it('names the dirty cells in a sorted column and no others', () => {
+        expect(order_relevant_dirty_keys(sorted_on_0, ['5:0', '5:1'])).toEqual(['5:0']);
+    });
+
+    it('names none for a view that only hides rows', () => {
+        // The condition on the notice's first sentence, which claims that sorting and
+        // filters do not update mid-edit. A view permuted by `hiddenRows` alone has
+        // neither, so there is no such claim to make however many rows it drops.
+        expect(order_relevant_dirty_keys(
+            { sort: [], filters: [], hiddenRows: [5] },
+            ['5:0', '5:1'],
+        )).toEqual([]);
+    });
+
+    it('names none for a disabled filter on the dirty column', () => {
+        expect(order_relevant_dirty_keys(
+            {
+                sort: [],
+                filters: [{ ...enabled_filter(0), enabled: false }],
+            },
+            ['5:0'],
+        )).toEqual([]);
+        expect(order_relevant_dirty_keys(
+            { sort: [], filters: [enabled_filter(0)] },
+            ['5:0'],
+        )).toEqual(['5:0']);
+    });
+
+    it('names none without an installed transform', () => {
+        expect(order_relevant_dirty_keys(undefined, ['5:0'])).toEqual([]);
+    });
+
+    it('does not read a malformed key as column 0', () => {
+        // `Number('')` is 0, which would make every tail-less key an edit in the first
+        // sorted column.
+        expect(order_relevant_dirty_keys(sorted_on_0, ['5:', ':', 'nonsense', '5']))
+            .toEqual([]);
     });
 });

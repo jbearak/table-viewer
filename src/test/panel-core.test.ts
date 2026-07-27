@@ -1,12 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
     InvalidPersistedTransformError,
+    TransformAdmissionLapsedError,
     ViewerPanelCore,
     adopt_source_into_core,
     transform_states_equal,
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
-import type { WebviewMessage } from '../types';
+import type {
+    HostMessage,
+    SheetTransformState,
+    SheetViewRecord,
+    WebviewMessage,
+} from '../types';
 
 class StubSource implements DataSource {
     read_rows_calls = 0;
@@ -108,6 +114,13 @@ function make_panel() {
     return { panel: { webview: { postMessage } }, posted, postMessage };
 }
 
+/** Every answer to a setTransform, whichever arm it arrived on. */
+function transform_answers(posted: any[]): any[] {
+    return posted.filter((message) => (
+        message.type === 'transformInstalled' || message.type === 'transformRefused'
+    ));
+}
+
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
     const promise = new Promise<T>((done) => { resolve = done; });
@@ -178,6 +191,10 @@ describe('ViewerPanelCore', () => {
                     hasFormatting: false,
                     sheets: [expect.objectContaining({ rowCount: 4 })],
                 },
+                // Per sheet, and empty with no permutation installed and no dirty-map
+                // provider wired — but present, because every delivery is built from
+                // this and the webview reads it positionally.
+                hiddenEditedCellKeys: [[]],
             },
             diagnostics: { truncationMessage: 'Showing 4 rows' },
         });
@@ -467,10 +484,21 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) => message.type === 'transformApplied');
+        const applied = posted.find((message) => message.type === 'transformInstalled');
         expect(applied).toMatchObject({
             requestId: 'sort-1',
-            rowCount: 5,
+            view: {
+                rowCount: 5,
+                permuted: true,
+                // The basis is what a stored record will later be checked against, so
+                // its schema has to be this sheet's fingerprint — the same string
+                // SheetTransformState.schema is matched on.
+                basis: {
+                    generation: old_generation + 1,
+                    sourceGeneration: core.source_generation,
+                    schema: '["Sheet1",2,null]',
+                },
+            },
         });
         expect(core.generation).toBe(old_generation + 1);
 
@@ -485,6 +513,302 @@ describe('ViewerPanelCore', () => {
         const page = posted.find((message) => message.type === 'rowData');
         expect(page.rows.map((row: RenderedCell[]) => row[0].raw))
             .toEqual(['4', '3', '2']);
+    });
+
+    it('reports a permutation for every shape of active rule and none for an inactive one', async () => {
+        // `permuted` is the webview's only answer to "are the rows on screen the source
+        // rows", and it decides whether the display-keyed row-height affordances are
+        // suppressed. It has to follow *activity*, not the presence of rules: hiding
+        // rows and filtering permute without sorting anything, and a filter switched
+        // off leaves rules the host still holds over rows it has not touched.
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        const install = async (requestId: string, state: SheetTransformState) => {
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user',
+                state,
+            });
+            const message = posted.filter(
+                (candidate) => candidate.type === 'transformInstalled',
+            ).at(-1);
+            expect(message.requestId).toBe(requestId);
+            return message as Extract<HostMessage, { type: 'transformInstalled' }>;
+        };
+
+        const hidden = (await install('hidden', {
+            sort: [],
+            filters: [],
+            hiddenRows: [1, 3],
+            schema: '["Sheet1",2,null]',
+        })).view;
+        expect(hidden.permuted).toBe(true);
+        expect(hidden.rowCount).toBe(3);
+        // The permuted arm's rules are the set the permutation was built from, and this
+        // is the only place the *record's* copy is checked at all: emptying it failed a
+        // single test elsewhere in the suite, because every webview test fabricates its
+        // own record. Cancel's rollback baseline reads exactly this.
+        if (!hidden.permuted) throw new Error('expected a permuted view');
+        expect(hidden.rules.hiddenRows).toEqual([1, 3]);
+
+        const disabled = await install('disabled', {
+            sort: [],
+            filters: [{
+                id: 'filter-1',
+                colIndex: 0,
+                operator: 'contains',
+                value: '1',
+                caseSensitive: false,
+                enabled: false,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+        expect(disabled.view.permuted).toBe(false);
+        expect(disabled.view.rowCount).toBe(5);
+        // The definition survives — on the message, which is where the host's durable
+        // rules live now that the record carries rules only for a view it permuted.
+        expect(disabled.rules?.filters).toHaveLength(1);
+
+        // Probing for holes found this one: the ack normalizes a rule set with no
+        // entries to `undefined`, and nothing held that to account — the assertion that
+        // looked like it did reaches the path with no state stored at all. The webview
+        // copies these rules straight into durable state, so an entry-less object here
+        // is persisted where "no transform" belongs.
+        const cleared = await install('cleared', {
+            sort: [],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        });
+        expect(cleared.view.permuted).toBe(false);
+        expect(cleared.rules).toBeUndefined();
+    });
+
+    describe('hiddenEditedCellKeys', () => {
+        // StubSource's column 0 is the row index as text, so `equals '2'` keeps
+        // exactly source row 2 and drops the other four.
+        const keeps_only_row_2 = (id = 'filter-1'): SheetTransformState => ({
+            sort: [],
+            filters: [{
+                id,
+                colIndex: 0,
+                operator: 'equals',
+                value: '2',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+
+        function counting_core(keys: readonly string[]) {
+            const { panel, posted } = make_panel();
+            const durablePendingEditKeys = vi.fn(() => keys);
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                durablePendingEditKeys,
+            });
+            const install = async (
+                requestId: string,
+                state: SheetTransformState,
+                intent: 'user' | 'restore' | 'cancel' = 'user',
+            ) => {
+                await core.handle_message({
+                    type: 'setTransform',
+                    sheetIndex: 0,
+                    requestId,
+                    generation: core.generation,
+                    sourceGeneration: core.source_generation,
+                    intent,
+                    state,
+                });
+                const message = posted.filter(
+                    (candidate) => candidate.type === 'transformInstalled',
+                ).at(-1);
+                expect(message.requestId).toBe(requestId);
+                // Every rule set installed in here is active, so the ack is the
+                // permuted arm — the only arm with hidden keys to report. Narrowed by
+                // the discriminant rather than cast: if one of these stopped permuting,
+                // the assertion below would say so instead of the field vanishing.
+                const view = message.view as SheetViewRecord;
+                if (!view.permuted) throw new Error('expected a permuted view');
+                return view;
+            };
+            return { core, install, durablePendingEditKeys };
+        }
+
+        it('names the cells a filter excludes and not one in a surviving row', async () => {
+            const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
+
+            const view = await install('filter', keeps_only_row_2());
+
+            expect(view.rowCount).toBe(1);
+            // Row 2 survives, so its edit is visible and unnamed; rows 0 and 4 do
+            // not, and row 0 contributes both of its cells.
+            expect([...view.hiddenEditedCellKeys].sort())
+                .toEqual(['0:0', '0:1', '4:0']);
+        });
+
+        it('counts several cells in one hidden row as several cells', async () => {
+            // In cells, not rows: three pieces of unsaved work are out of sight, and
+            // saying "1" would understate what the user is holding. The conflict
+            // banner counts *rows* for removed rows because there the cell no longer
+            // exists; here it does.
+            const { install } = counting_core(['0:0', '0:1', '4:0']);
+
+            expect([...(await install('filter', keeps_only_row_2()))
+                .hiddenEditedCellKeys].sort())
+                .toEqual(['0:0', '0:1', '4:0']);
+        });
+
+        it('counts the cells explicitly hidden rows exclude', async () => {
+            // The other exclusion mechanism, and the one that reads no column at all,
+            // so nothing about the *columns* edited can be standing in for this.
+            const { install } = counting_core(['1:0', '3:0', '3:1', '0:0']);
+
+            const view = await install('hidden', {
+                sort: [],
+                filters: [],
+                hiddenRows: [1, 3],
+                schema: '["Sheet1",2,null]',
+            });
+
+            expect(view.rowCount).toBe(3);
+            expect([...view.hiddenEditedCellKeys].sort())
+                .toEqual(['1:0', '3:0', '3:1']);
+        });
+
+        const sort_only = (): SheetTransformState => ({
+            sort: [{ colIndex: 0, direction: 'desc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        });
+
+        const matches_every_row = (): SheetTransformState => ({
+            sort: [],
+            filters: [{
+                id: 'filter-wide',
+                colIndex: 0,
+                operator: 'isNotEmpty',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["Sheet1",2,null]',
+        });
+
+        it('reports none for a sort, whose rows are all still there', async () => {
+            // A sort permutes without dropping, so every row it was given is somewhere
+            // in the view.
+            const { install } = counting_core(['0:0', '4:0']);
+
+            const view = await install('sort', sort_only());
+
+            expect(view.permuted).toBe(true);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
+        });
+
+        it('reports none for a filter that excluded nothing', async () => {
+            const { install } = counting_core(['0:0']);
+
+            const view = await install('wide', matches_every_row());
+
+            expect(view.rowCount).toBe(5);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
+        });
+
+        it('names a vanished row under a filter that excluded nothing', async () => {
+            // The all-rows-match case, which used to return before inspecting a single
+            // key. An enabled filter can match every row the file still has while an
+            // edited row an external shrink removed is genuinely absent from the view —
+            // and if that edit is in a column no rule reads, nothing else raises the
+            // notice, so the user is never told the work is out of sight. StubSource(5)
+            // has no row 9, which is what the shrink leaves behind.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            const view = await install('wide', matches_every_row());
+
+            expect(view.rowCount).toBe(5);
+            expect(view.hiddenEditedCellKeys).toEqual(['9:0']);
+        });
+
+        it('names a vanished row under a bare sort', async () => {
+            // Same defect behind the other short-circuit: "no rule excludes rows" was
+            // read as "no row can be missing", and a sort is exactly the view where the
+            // permutation drops nothing and the *source* has still lost the row.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            const view = await install('sort', sort_only());
+
+            expect(view.hiddenEditedCellKeys).toEqual(['9:0']);
+        });
+
+        it('reports none when the session holds no pending edits', async () => {
+            const { install } = counting_core([]);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual([]);
+        });
+
+        it('carries the count on both no-op equal-state acks', async () => {
+            // These two short-circuit before any compute, so they could easily answer
+            // with a default. They are `transformInstalled` messages describing the
+            // view in place, and that view hides the same cells.
+            const { install } = counting_core(['0:0', '0:1', '2:0', '4:0']);
+            const installed = keeps_only_row_2();
+            const hidden = ['0:0', '0:1', '4:0'];
+            expect([...(await install('user', installed)).hiddenEditedCellKeys].sort())
+                .toEqual(hidden);
+
+            expect([...(await install('restore', installed, 'restore'))
+                .hiddenEditedCellKeys].sort()).toEqual(hidden);
+            expect([...(await install('cancel', installed, 'cancel'))
+                .hiddenEditedCellKeys].sort()).toEqual(hidden);
+        });
+
+        it('counts an edit whose row the source no longer has', async () => {
+            // Reachable after an external shrink: adopt_source drops the permutation,
+            // then the restore recomputes it over fewer rows while the durable edits
+            // still name the old ones. Counted deliberately — the row is certainly not
+            // in the view, and the user is certainly holding work they cannot see,
+            // which is why the copy says the view does not *show* the row rather than
+            // that it hides it.
+            const { install } = counting_core(['9:0', '2:0']);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual(['9:0']);
+        });
+
+        it('ignores keys that name no cell', async () => {
+            const { install } = counting_core(['0:', ':', 'nonsense', '4', '4:0']);
+
+            expect((await install('filter', keeps_only_row_2())).hiddenEditedCellKeys)
+                .toEqual(['4:0']);
+        });
+
+        it('reports none with no provider wired at all', async () => {
+            // Excel and every other non-editing caller: no dirty map exists, so the
+            // record still has to be truthful rather than absent.
+            const { panel, posted } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5));
+
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId: 'no-provider',
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user',
+                state: keeps_only_row_2(),
+            });
+
+            const view = (posted.find(
+                (message) => message.type === 'transformInstalled',
+            ).view) as SheetViewRecord;
+            if (!view.permuted) throw new Error('expected a permuted view');
+            expect(view.rowCount).toBe(1);
+            expect(view.hiddenEditedCellKeys).toEqual([]);
+        });
     });
 
     it('reuses extracted columns across transform changes and reads only newly needed columns', async () => {
@@ -723,10 +1047,13 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) => message.type === 'transformApplied');
-        expect(applied.requestId).toBe('bad');
-        expect(applied.error).toContain('column index 99 out of range');
-        expect(applied.state).toEqual({ sort: [], filters: [] });
+        const refused = posted.find((message) => message.type === 'transformRefused');
+        expect(refused.requestId).toBe('bad');
+        expect(refused.reason).toContain('column index 99 out of range');
+        expect(refused.terminal).toBe(true);
+        // The refusal carries nothing about the view, so the rollback is asserted
+        // against the core itself: nothing installed and the generation held.
+        expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(generation);
     });
 
@@ -761,8 +1088,10 @@ describe('ViewerPanelCore', () => {
             retainedState: { sort: [], filters: [] },
             operandError: { filterId: 'bad', operand: 'value' },
         });
-        expect(posted.find((message) => message.type === 'transformApplied'))
-            .not.toHaveProperty('error');
+        // A recovered invalid restore is answered as an install of the view that
+        // stands, not as a refusal: there is nothing left to warn about.
+        expect(transform_answers(posted).map((message) => message.type))
+            .toEqual(['transformInstalled']);
 
         await core.handle_message({
             type: 'setTransform', sheetIndex: 0, requestId: 'user',
@@ -771,7 +1100,7 @@ describe('ViewerPanelCore', () => {
         });
         expect(failures).toHaveLength(1);
         expect(posted.find((message) =>
-            message.type === 'transformApplied' && message.requestId === 'user')?.error)
+            message.type === 'transformRefused' && message.requestId === 'user')?.reason)
             .toContain('finite numbers');
     });
 
@@ -801,9 +1130,11 @@ describe('ViewerPanelCore', () => {
         });
 
         const rejected = posted.find((message) =>
-            message.type === 'transformApplied' && message.requestId === 'invalid-user');
-        expect(rejected).toMatchObject({ state: valid });
-        expect(rejected?.error).toContain('finite numbers');
+            message.type === 'transformRefused' && message.requestId === 'invalid-user');
+        expect(rejected?.reason).toContain('finite numbers');
+        // The valid view is preserved in the core, which is now the only place a
+        // refusal lets anyone look for it.
+        expect(core.transform_state(0)).toEqual(valid);
         expect(core.generation).toBe(installed_generation);
     });
 
@@ -835,10 +1166,10 @@ describe('ViewerPanelCore', () => {
 
         expect(cleanup).toHaveBeenCalledOnce();
         const failed = posted.find((message) =>
-            message.type === 'transformApplied'
+            message.type === 'transformRefused'
             && message.requestId === 'failed-restore-cleanup');
-        expect(failed).toMatchObject({ state: valid });
-        expect(failed?.error).toContain('finite numbers');
+        expect(failed?.reason).toContain('finite numbers');
+        expect(core.transform_state(0)).toEqual(valid);
     });
 
     it('does not request invalid-restore cleanup after receiver cancellation', async () => {
@@ -862,7 +1193,7 @@ describe('ViewerPanelCore', () => {
         await restore;
 
         expect(cleanup).not.toHaveBeenCalled();
-        expect(posted.some((message) => message.type === 'transformApplied')).toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('rejects a stale transform request after the source generation changes', async () => {
@@ -886,10 +1217,10 @@ describe('ViewerPanelCore', () => {
             },
         });
 
-        const applied = posted.find((message) =>
-            message.type === 'transformApplied');
-        expect(applied.error).toContain('source changed');
-        expect(applied.state).toEqual({ sort: [], filters: [] });
+        const refused = posted.find((message) =>
+            message.type === 'transformRefused');
+        expect(refused.reason).toContain('source changed');
+        expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
         expect(core.generation).toBe(stale_generation + 1);
     });
 
@@ -940,8 +1271,7 @@ describe('ViewerPanelCore', () => {
         release_persist.resolve();
         await restore;
 
-        expect(posted.filter((message) =>
-            message.type === 'transformApplied').map((message) => message.requestId))
+        expect(transform_answers(posted).map((message) => message.requestId))
             .toEqual(['cancel']);
         expect(core.generation).toBe(2);
     });
@@ -973,8 +1303,7 @@ describe('ViewerPanelCore', () => {
         core.dispose();
         release_persist.resolve();
         await work;
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('cancels receiver-owned transform compute synchronously on a new epoch', async () => {
@@ -1001,8 +1330,7 @@ describe('ViewerPanelCore', () => {
 
         expect(core.generation).toBe(1);
         expect(core.has_transform_work).toBe(false);
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
     });
 
     it('installs a committed transform after receiver turnover without delivering its terminal', async () => {
@@ -1045,8 +1373,7 @@ describe('ViewerPanelCore', () => {
         await old_work;
 
         expect(core.generation).toBe(installed_generation + 1);
-        expect(posted.some((message) => message.type === 'transformApplied'))
-            .toBe(false);
+        expect(transform_answers(posted)).toEqual([]);
         await core.handle_message({
             type: 'requestRows', sheetIndex: 0, startRow: 0, count: 2,
             requestId: 'committed', generation: installed_generation + 1,
@@ -1121,9 +1448,10 @@ describe('ViewerPanelCore', () => {
         });
 
         expect(posted).toContainEqual(expect.objectContaining({
-            type: 'transformApplied',
+            type: 'transformRefused',
             requestId: 'source-abort',
-            error: 'source aborted unexpectedly',
+            reason: 'source aborted unexpectedly',
+            terminal: true,
         }));
         expect(core.has_transform_work).toBe(false);
     });
@@ -1243,9 +1571,8 @@ describe('ViewerPanelCore', () => {
 
         expect(previous.closed).toBe(true);
         expect(previous.read_rows_calls).toBe(1);
-        expect(posted.some((message) =>
-            message.type === 'transformApplied'
-            && message.requestId === 'old-source')).toBe(false);
+        expect(transform_answers(posted).some((message) =>
+            message.requestId === 'old-source')).toBe(false);
     });
 
     it('fast-paths Cancel when the complete rollback state is already installed', async () => {
@@ -1276,10 +1603,138 @@ describe('ViewerPanelCore', () => {
         expect(source.read_rows_calls).toBe(reads);
         expect(core.generation).toBe(generation);
         expect(commits).toContain('cancel-fast');
+        // A no-op ack is an install of the view already in place: truthful by
+        // definition, and on an unmoved generation, which is what tells the webview
+        // not to fold an open editor for it.
         expect(posted).toContainEqual(expect.objectContaining({
-            type: 'transformApplied', requestId: 'cancel-fast', rowCount: 5,
-            generation,
+            type: 'transformInstalled',
+            requestId: 'cancel-fast',
+            view: expect.objectContaining({
+                rowCount: 5,
+                basis: expect.objectContaining({ generation }),
+            }),
         }));
+    });
+
+    describe('a commit the host would not make', () => {
+        // Two ways `onTransformCommit` can fail, and they want opposite answers. The
+        // admission the controller re-asks at the commit boundary is an edit-session
+        // phase — a sibling claiming, releasing, or holding the session — and every
+        // one of them ends by itself, so the request is worth asking again. Anything
+        // else that stops the write is a currency or persistence failure that
+        // repeating cannot fix. Before this discrimination existed both arrived as a
+        // plain `Error` and the refusal defaulted to terminal, so a lapse told the
+        // webview to stop retrying and the user's transform was abandoned when the
+        // very next attempt would have succeeded.
+        const SORT: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["Sheet1",2,null]',
+        };
+
+        function refusal(posted: any[], request_id: string) {
+            return posted.find((message) => (
+                message.type === 'transformRefused'
+                && message.requestId === request_id
+            ));
+        }
+
+        /** Fails only the requests named `failing-…`, so a setup install still lands. */
+        function core_whose_commit_throws(error: Error) {
+            const { panel, posted } = make_panel();
+            const core = new ViewerPanelCore(panel, new StubSource(5), {
+                onTransformCommit: async (message) => {
+                    if (message.requestId.startsWith('failing')) throw error;
+                },
+            });
+            return { core, posted };
+        }
+
+        async function ask(
+            core: ViewerPanelCore,
+            request_id: string,
+            intent: 'user' | 'cancel',
+        ) {
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId: request_id,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent,
+                state: SORT,
+            });
+        }
+
+        it('answers a lapsed commit admission with a transient refusal', async () => {
+            const { core, posted } = core_whose_commit_throws(
+                new TransformAdmissionLapsedError('Another panel is editing this file.'),
+            );
+
+            await ask(core, 'failing-user', 'user');
+
+            expect(refusal(posted, 'failing-user')).toMatchObject({
+                terminal: false,
+                reason: 'Another panel is editing this file.',
+            });
+            // A refusal is not an install: nothing was adopted locally either.
+            expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
+        });
+
+        it('answers a failed durable write with a terminal refusal', async () => {
+            const { core, posted } = core_whose_commit_throws(
+                new Error('The source changed before this table view could be saved.'),
+            );
+
+            await ask(core, 'failing-user', 'user');
+
+            expect(refusal(posted, 'failing-user')).toMatchObject({
+                terminal: true,
+                reason: 'The source changed before this table view could be saved.',
+            });
+            expect(core.transform_state(0)).toEqual({ sort: [], filters: [] });
+        });
+
+        /**
+         * The other arm. A Cancel whose rules the core already holds skips
+         * `compute_transform` entirely and still has to commit — durably, so a
+         * close/reopen cannot resurrect the cancelled restore — so it has a second
+         * catch block, and the two must agree because the same lapse reaches either.
+         * (A `restore` never gets here: `persist_transform_commit` returns for it
+         * before any write, so its commit cannot fail at all.)
+         */
+        async function equal_state_cancel(error: Error) {
+            const { core, posted } = core_whose_commit_throws(error);
+            await ask(core, 'install', 'user');
+            posted.length = 0;
+            await ask(core, 'failing-cancel', 'cancel');
+            return { core, posted };
+        }
+
+        it('keeps an equal-state commit retriable when the admission lapsed', async () => {
+            const { core, posted } = await equal_state_cancel(
+                new TransformAdmissionLapsedError(
+                    'Finishing edit-session work; try again in a moment.',
+                ),
+            );
+
+            expect(refusal(posted, 'failing-cancel')).toMatchObject({
+                terminal: false,
+                reason: 'Finishing edit-session work; try again in a moment.',
+            });
+            // The install that preceded it stands; a refused commit changes nothing.
+            expect(core.transform_state(0)).toEqual(SORT);
+        });
+
+        it('abandons an equal-state commit whose durable write failed', async () => {
+            const { posted } = await equal_state_cancel(
+                new Error('The source changed before this table view could be saved.'),
+            );
+
+            expect(refusal(posted, 'failing-cancel')).toMatchObject({
+                terminal: true,
+            });
+        });
     });
 
 });
