@@ -7,6 +7,7 @@ import {
     transform_states_equal,
 } from '../panel-core';
 import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
+import { MAX_ROW_HEIGHT_PX, MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type {
     HostMessage,
     SheetTransformState,
@@ -1161,6 +1162,39 @@ describe('ViewerPanelCore', () => {
             });
 
             expect(core.snapshot_material().core.rowHeightProjection).toEqual([{ 0: 40 }]);
+        });
+
+        it('clamps a durable height the bound was never applied to', () => {
+            // Unlike the two above this is not a key with no row — it is a real row with
+            // an out-of-range height, so dropping it would lose a height the user set.
+            // Every *write* path clamps, but the durable map is not something this
+            // version wrote: releases before the bound existed persisted whatever
+            // arithmetic produced, and a state file is editable besides.
+            //
+            // The floor is the half that is not merely cosmetic. A row at zero or a
+            // negative height renders with no edge to grab, and there is no UI that
+            // deletes a height entry — so without this the file puts the row beyond the
+            // user's reach permanently. The ceiling keeps Glide's total-scroll-height
+            // sum, which adds `rowHeight(r)` over every row, from being dominated by one
+            // absurd entry.
+            //
+            // Values are asserted exactly rather than by range: the webview reconciles
+            // its optimistic overlay against this projection *by value*, so the number
+            // here has to be the same number `clamp_row_height` produces on the write
+            // side, not merely one inside the bounds.
+            const { core } = core_with({
+                0: -50,
+                1: 0,
+                2: 1e9,
+                3: 44,
+            });
+
+            expect(core.snapshot_material().core.rowHeightProjection).toEqual([{
+                0: MIN_ROW_HEIGHT_PX,
+                1: MIN_ROW_HEIGHT_PX,
+                2: MAX_ROW_HEIGHT_PX,
+                3: 44,
+            }]);
         });
     });
 

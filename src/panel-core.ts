@@ -4,6 +4,7 @@ import {
     read_source_row_indices,
 } from './data-source/interface';
 import { parse_cell_highlight_key } from './cell-highlights';
+import { clamp_row_height } from './webview/row-heights';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram, type ColumnHistogram } from './histograms';
 import {
@@ -998,7 +999,32 @@ export class ViewerPanelCore {
             const display_row = this.display_row_for_source(sheet_index, source_row);
             if (display_row === undefined) continue;
             projection ??= {};
-            projection[display_row] = height;
+            // Clamped on the way out, not merely on the way in. Every *write* path
+            // clamps already (`setRowHeights` before it persists, the webview before it
+            // paints optimistically), so nothing this version can persist needs this —
+            // but the durable map is not something this version wrote. Releases before
+            // the bound existed persisted whatever arithmetic produced, and a state file
+            // is editable on disk besides, so a map already there can hold a negative, a
+            // zero, or a value large enough to make Glide's total-scroll-height sum
+            // meaningless.
+            //
+            // The webview cannot defend itself here: it renders the projection through
+            // `resolved_row_height`, which returns an override verbatim, and it has no
+            // clamp on that path by design — the optimistic overlay is reconciled against
+            // the projection *by value*, so a webview-side clamp would silently disagree
+            // with the height the host holds and leave a layer no delivery can ever
+            // retire. Clamping at the single point that produces the projection keeps one
+            // authority for the value, which is the same reason `clamp_row_height` is one
+            // function shared by both sides.
+            //
+            // Worth being concrete about the floor: a row persisted at zero or a negative
+            // height renders with no grabbable edge, so the user cannot drag it back and
+            // has no UI that would let them delete the entry — an unrecoverable state
+            // reachable from a file, which is exactly what `MIN_ROW_HEIGHT_PX` exists to
+            // prevent. The durable entry is deliberately left alone rather than rewritten:
+            // this is a read path, a silent durable write from a read is its own hazard,
+            // and the next resize of that row persists a clamped value anyway.
+            projection[display_row] = clamp_row_height(height);
         }
         // `undefined` rather than `{}` when nothing projected, which is the answer for
         // every sheet nobody has resized — the common case, and one worth not paying
