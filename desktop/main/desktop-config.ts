@@ -19,6 +19,7 @@ import {
     sanitize_new_window_size_mode,
     type NewWindowSizeMode,
 } from './window-geometry';
+import { MONO_FONT, font_family_with_fallback } from './theme-palette';
 
 export const SETTINGS_FILE_NAME = 'settings.v1.json';
 
@@ -183,7 +184,10 @@ export class DesktopConfigStore {
     /** The shared `ConfigPort` view over this store. */
     config_port(): ConfigPort {
         return {
-            font_family: () => this.settings().fontFamily.trim() || null,
+            font_family: () => {
+                const family = this.settings().fontFamily.trim();
+                return family ? font_family_with_fallback(family, MONO_FONT) : null;
+            },
             font_size: () => this.settings().fontSize,
             max_file_size_mib: () => this.settings().maxFileSizeMiB,
             csv_max_rows: () => this.settings().csvMaxRows,

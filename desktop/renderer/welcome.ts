@@ -5,6 +5,7 @@
 import type { WelcomeApi } from '../preload/welcome-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
+import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
 
 const welcome_api = (window as unknown as { welcomeApi: WelcomeApi }).welcomeApi;
 
@@ -22,9 +23,10 @@ function apply_theme(payload: ThemePayload): void {
 /** The font preference styles the whole app, so this window follows it too. */
 function apply_settings(settings: DesktopSettings): void {
     const root = document.documentElement;
-    const family = settings.fontFamily.trim();
-    if (family) root.style.setProperty('--welcome-font-family', family);
-    else root.style.removeProperty('--welcome-font-family');
+    root.style.setProperty(
+        '--welcome-font-family',
+        font_family_with_fallback(settings.fontFamily, SYSTEM_FONT),
+    );
     root.style.setProperty('--welcome-font-size', `${settings.fontSize}px`);
 }
 

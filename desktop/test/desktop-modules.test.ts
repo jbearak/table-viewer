@@ -53,6 +53,11 @@ import {
 } from '../main/viewer-html';
 import { node_file_system_port } from '../main/desktop-host-ports';
 import type { HostMessage, WebviewMessage } from '../../src/types';
+import {
+    MONO_FONT,
+    SYSTEM_FONT,
+    font_family_with_fallback,
+} from '../main/theme-palette';
 
 describe('desktop-config', () => {
     let dir: string;
@@ -184,9 +189,22 @@ describe('desktop-config', () => {
         store.update({ fontFamily: 'Monaco' });
         expect(listener).toHaveBeenCalledTimes(2);
 
-        expect(port.font_family()).toBe('Monaco');
+        expect(port.font_family()).toBe(`Monaco, ${MONO_FONT}`);
         store.update({ fontFamily: '   ' });
         expect(port.font_family()).toBeNull();
+    });
+});
+
+describe('desktop font fallback', () => {
+    it('puts the same default stack after an unavailable configured family', () => {
+        expect(font_family_with_fallback('', SYSTEM_FONT)).toBe(SYSTEM_FONT);
+        expect(font_family_with_fallback('Nonexistent Zzz Face', SYSTEM_FONT))
+            .toBe(`Nonexistent Zzz Face, ${SYSTEM_FONT}`);
+    });
+
+    it('preserves a configured fallback list before the app default', () => {
+        expect(font_family_with_fallback('Hack, monospace', SYSTEM_FONT))
+            .toBe(`Hack, monospace, ${SYSTEM_FONT}`);
     });
 });
 

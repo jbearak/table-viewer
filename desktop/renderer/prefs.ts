@@ -14,6 +14,7 @@ import {
     MIN_WINDOW_WIDTH,
     sanitize_new_window_size_mode,
 } from '../main/window-geometry';
+import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -78,9 +79,10 @@ function populate_color_themes(payload: ThemePayload): void {
 /** The font settings style the whole app, so this window follows them too. */
 function apply_fonts(settings: DesktopSettings): void {
     const root = document.documentElement;
-    const family = settings.fontFamily.trim();
-    if (family) root.style.setProperty('--prefs-font-family', family);
-    else root.style.removeProperty('--prefs-font-family');
+    root.style.setProperty(
+        '--prefs-font-family',
+        font_family_with_fallback(settings.fontFamily, SYSTEM_FONT),
+    );
     root.style.setProperty('--prefs-font-size', `${settings.fontSize}px`);
 }
 
