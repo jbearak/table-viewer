@@ -1,3 +1,225 @@
-Warning: truncated output (original token count: 101410)
-Total output lines: 11550
-
+{
+  "name": "table-viewer",
+  "displayName": "Table Viewer",
+  "description": "Fast viewer for Excel, CSV and TSV",
+  "version": "0.7.0",
+  "publisher": "jbearak",
+  "icon": "media/icon-128.png",
+  "license": "GPL-3.0",
+  "author": "Jonathan Marc Bearak",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jbearak/table-viewer.git"
+  },
+  "engines": {
+    "node": ">=24",
+    "vscode": "^1.114.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "csv",
+        "extensions": [
+          ".csv",
+          ".CSV"
+        ],
+        "aliases": [
+          "CSV"
+        ]
+      },
+      {
+        "id": "tsv",
+        "extensions": [
+          ".tsv",
+          ".TSV"
+        ],
+        "aliases": [
+          "TSV"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "tableViewer.showCsvPreviewToSide",
+        "title": "Table Viewer: Open Preview to the Side",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "tableViewer.showCsvPreview",
+        "title": "Table Viewer: Open Preview"
+      },
+      {
+        "command": "tableViewer.openCsvTable",
+        "title": "Table Viewer: Open as Table",
+        "icon": "$(table)"
+      },
+      {
+        "command": "tableViewer.openAsText",
+        "title": "Table Viewer: Open in Text Editor",
+        "icon": "$(go-to-file)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "tableViewer.showCsvPreviewToSide",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor",
+          "group": "navigation",
+          "alt": "tableViewer.showCsvPreview"
+        },
+        {
+          "command": "tableViewer.openCsvTable",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor && activeCustomEditorId != tableViewer.excelViewer",
+          "group": "navigation"
+        },
+        {
+          "command": "tableViewer.openAsText",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor",
+          "group": "navigation"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "tableViewer.excelViewer",
+        "displayName": "Table Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.XLSX"
+          },
+          {
+            "filenamePattern": "*.xls"
+          },
+          {
+            "filenamePattern": "*.XLS"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "tableViewer.editor",
+        "displayName": "Table Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.CSV"
+          },
+          {
+            "filenamePattern": "*.tsv"
+          },
+          {
+            "filenamePattern": "*.TSV"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "Table Viewer",
+      "properties": {
+        "tableViewer.fontFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Font family used in table views. Leave empty to use the editor font (editor.fontFamily)."
+        },
+        "tableViewer.fontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Font size in pixels used in table views. Set to 0 to follow the editor font size (editor.fontSize)."
+        },
+        "tableViewer.tabOrientation": {
+          "type": "string",
+          "enum": [
+            "horizontal",
+            "vertical"
+          ],
+          "default": "horizontal",
+          "description": "Default worksheet tab orientation. Can be overridden per file."
+        },
+        "tableViewer.maxStoredFiles": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 1,
+          "scope": "application",
+          "description": "Maximum number of files whose layout settings (column widths, row heights, scroll positions) are remembered. When the limit is reached, the least recently used entries are removed first."
+        },
+        "tableViewer.csvMaxRows": {
+          "type": "integer",
+          "default": 1000000,
+          "minimum": 1,
+          "description": "Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner."
+        },
+        "tableViewer.maxFileSizeMiB": {
+          "type": "number",
+          "default": 256,
+          "minimum": 1,
+          "description": "Maximum file size in MiB for all file types (xlsx, xls, csv, tsv)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "compile:integration": "tsc -p tsconfig.integration.json",
+    "typecheck": "tsc -p . --noEmit",
+    "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit",
+    "typecheck:all": "npm run typecheck && npm run typecheck:desktop && npm run typecheck:integration",
+    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run compile:integration",
+    "test:integration": "vscode-test",
+    "vscode:prepublish": "npm run bundle && npm run bundle:webview",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs --target=es2022 --minify",
+    "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
+    "bundle:desktop": "node desktop/build.mjs",
+    "typecheck:desktop": "tsc -p desktop",
+    "desktop:dev": "npm run desktop:prepackage && electron dist/desktop/main.js",
+    "desktop:prepackage": "npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs",
+    "desktop:package": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac -c.mac.identity=null -c.dmg.sign=false",
+    "desktop:package:dir": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac --dir -c.mac.identity=null",
+    "desktop:package:release": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --mac --arm64",
+    "desktop:package:win": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --win --x64 --arm64",
+    "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@glideapps/glide-data-grid": "6.0.3",
+    "cfb": "^1.2.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ssf": "^0.11.2"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.8",
+    "serialize-javascript": "7.0.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.19.17",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/vscode": "^1.110.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.2",
+    "electron": "^39.8.5",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
+    "jsdom": "^29.0.1",
+    "mocha": "^11.7.6",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.2"
+  }
+}
