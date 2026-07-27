@@ -1,10 +1,19 @@
 /**
  * Pure variable-row-height helpers (Phase D). Heights live in a sparse
- * `Record<number, number>` keyed by row index — the same shape persisted in
- * `PerFileState.rowHeights` — so the renderer, the row-resize overlay, and the
- * state store all share one representation. Rows without an override use the
+ * `Record<number, number>` keyed by row index. Rows without an override use the
  * default. No DOM, no Glide imports: fully unit-testable.
+ *
+ * The record the renderer reads is *display*-keyed: it is the host's projection of
+ * the durable, canonical-source-keyed `PerFileState.rowHeights` into the display
+ * space of the view currently installed (`WorkbookSnapshot.rowHeightProjection`,
+ * `transformInstalled.rowHeights`). The webview never holds the durable map and
+ * never writes it — see `PerFileState.rowHeights` and the `setRowHeights` message.
+ * Rendering therefore needs the optimistic-overlay machinery at the bottom of this
+ * file: a committed resize is visible immediately, before the durable write and its
+ * re-delivery have round-tripped.
  */
+
+import type { DisplayRowInterval } from '../types';
 
 /** Default row height; matches Glide's Phase C constant. */
 export const DEFAULT_ROW_HEIGHT_PX = 24;
@@ -106,4 +115,128 @@ export function set_row_height(
     height: number,
 ): RowHeightOverrides {
     return { ...overrides, [row]: clamp_row_height(height) };
+}
+
+/**
+ * One committed resize, awaiting the host's answer: the display rows it named and
+ * the height it set them to.
+ *
+ * Held as *intervals* rather than an expanded `Record<number, number>`, and that is
+ * the whole point of the shape. A resize commits the user's entire row selection,
+ * which can be select-all: expanding that into entries is O(rows) in time and memory
+ * on every commit, on a sheet that may have millions of them, to describe a single
+ * number. The intervals are what the request itself carries
+ * (`setRowHeights.rows`), so this is also the same value, not a second encoding of
+ * it. The cost moves to the read — resolving one row scans the layers — which is
+ * bounded by the number of *in-flight* resizes rather than by the sheet.
+ */
+export interface RowHeightLayer {
+    /** Inclusive display-row intervals, disjoint and ascending. */
+    readonly rows: readonly Readonly<DisplayRowInterval>[];
+    readonly height: number;
+}
+
+/**
+ * Height for `row`: the newest overlay layer that names it, else the delivered
+ * projection, else the default.
+ *
+ * Layers are display-keyed, like the projection they sit over, so no mapping is
+ * needed here — which is the reason the optimistic value is recorded in display space
+ * even though what gets persisted is source-keyed. The webview cannot map
+ * display→source for a select-all resize anyway (those rows were never loaded), and
+ * a display-keyed overlay is only ever valid for one permutation: see
+ * `row_height_layers_for_delivery` for how that is enforced.
+ */
+export function resolved_row_height(
+    overrides: RowHeightOverrides,
+    layers: readonly RowHeightLayer[] | undefined,
+    row: number,
+    default_height = DEFAULT_ROW_HEIGHT_PX,
+): number {
+    if (layers !== undefined) {
+        for (let index = layers.length - 1; index >= 0; index -= 1) {
+            const layer = layers[index];
+            for (const interval of layer.rows) {
+                if (row >= interval.start && row <= interval.end) return layer.height;
+            }
+        }
+    }
+    return row_height(overrides, row, default_height);
+}
+
+/** Total rows an overlay layer names. */
+function layer_row_count(layer: RowHeightLayer): number {
+    let total = 0;
+    for (const interval of layer.rows) total += interval.end - interval.start + 1;
+    return total;
+}
+
+/**
+ * Whether a delivered projection already says what this layer says, in which case
+ * the layer is redundant and must be dropped — left in place it would keep masking
+ * that row for the rest of the generation, so a *later* height for the same row (a
+ * sibling panel's write, a plan edit) would never become visible.
+ *
+ * Counted from the projection's side, never the layer's: the projection is sparse
+ * and bounded by `MAX_PERSISTED_ROW_HEIGHTS`, while the layer can name every row of
+ * the sheet. Agreement over the whole layer is then "as many projection entries at
+ * this height fall inside the intervals as the intervals contain rows", which cannot
+ * over-count because projection keys are unique.
+ */
+function projection_agrees_with_layer(
+    overrides: RowHeightOverrides,
+    layer: RowHeightLayer,
+): boolean {
+    let matched = 0;
+    for (const [key, height] of Object.entries(overrides)) {
+        if (height !== layer.height) continue;
+        const row = Number(key);
+        if (layer.rows.some(
+            (interval) => row >= interval.start && row <= interval.end,
+        )) matched += 1;
+    }
+    return matched === layer_row_count(layer);
+}
+
+/**
+ * How many unanswered resizes an overlay keeps. Reached only when the host is
+ * refusing writes (over the persisted-heights cap) or a delivery is yet to arrive for
+ * several drags running; the ordinary depth is one. Dropping the *oldest* layer on
+ * overflow is the conservative direction: a layer only ever hides the delivered
+ * projection, so dropping one reveals what is actually persisted.
+ */
+export const MAX_ROW_HEIGHT_LAYERS = 8;
+
+/** Add a committed resize to a layer list, newest last. */
+export function row_height_layers_with(
+    layers: readonly RowHeightLayer[],
+    layer: RowHeightLayer,
+): readonly RowHeightLayer[] {
+    const next = [...layers, layer];
+    return next.length > MAX_ROW_HEIGHT_LAYERS
+        ? next.slice(next.length - MAX_ROW_HEIGHT_LAYERS)
+        : next;
+}
+
+/**
+ * The layers still worth keeping once `overrides` has been delivered for the sheet
+ * they belong to: those the delivery does not already agree with.
+ *
+ * This is the *value*-based reconciliation that replaces a request id. Nothing
+ * correlates a `setRowHeights` with the delivery that answers it, and nothing needs
+ * to: a projection that already names these rows at this height has answered,
+ * whichever write produced it.
+ *
+ * Not a substitute for discarding the overlay on a generation change, which callers
+ * must still do — a delivery on a *new* permutation says nothing about display rows
+ * read off the old one, so the whole overlay is void rather than partly satisfied.
+ */
+export function row_height_layers_for_delivery(
+    layers: readonly RowHeightLayer[],
+    overrides: RowHeightOverrides,
+): readonly RowHeightLayer[] {
+    const kept = layers.filter(
+        (layer) => !projection_agrees_with_layer(overrides, layer),
+    );
+    return kept.length === layers.length ? layers : kept;
 }

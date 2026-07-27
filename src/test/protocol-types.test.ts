@@ -110,6 +110,7 @@ describe('paginated protocol message shapes', () => {
                 reason: 'excelHeader',
                 meta,
                 hiddenEditedCellKeys: [[]],
+                rowHeightProjection: [undefined],
                 state: {
                     columnWidths: [],
                     rowHeights: [],

@@ -65,6 +65,7 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 6,
                 meta: { sheets: [], hasFormatting: false },
                 hiddenEditedCellKeys: [],
+                rowHeightProjection: [],
             },
             presentation: 'refresh',
             reason: 'retry',
@@ -136,6 +137,10 @@ describe('workbook snapshot builder', () => {
         // for every delivery, so an issued snapshot sharing the array would let a later
         // sample rewrite what an earlier delivery said was out of sight.
         const hidden_edited_cell_keys = [['2:0']];
+        // Same reason, and the consequence of sharing it is worse: a later sample
+        // rewriting an issued delivery's projection would render heights against a
+        // permutation that delivery never described.
+        const row_height_projection: (Record<number, number> | undefined)[] = [{ 2: 44 }];
         const commandResult: RetainedSnapshotCommandResult = {
             type: 'excelFirstRowHeader',
             requestId: 'header:1',
@@ -160,6 +165,7 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 3,
                 meta,
                 hiddenEditedCellKeys: hidden_edited_cell_keys,
+                rowHeightProjection: row_height_projection,
             },
             presentation: 'initial',
             reason: 'ready',
@@ -178,6 +184,7 @@ describe('workbook snapshot builder', () => {
         capabilities.csvEditable = true;
         diagnostics.truncationMessage = null;
         hidden_edited_cell_keys[0].push('3:0');
+        row_height_projection[0] = { 9: 99 };
         (commandResult as { error?: string }).error = 'Changed';
 
         expect(snapshot.meta.sheets[0]).toMatchObject({
@@ -201,9 +208,11 @@ describe('workbook snapshot builder', () => {
         expect(snapshot.capabilities.csvEditable).toBe(false);
         expect(snapshot.truncationMessage).toBe('Rows were truncated.');
         expect(snapshot.hiddenEditedCellKeys).toEqual([['2:0']]);
+        expect(snapshot.rowHeightProjection).toEqual([{ 2: 44 }]);
         expect(snapshot.commandResult?.error).toBe('Ambiguous finalization was reconciled.');
         expect(Object.isFrozen(snapshot)).toBe(true);
         expect(Object.isFrozen(snapshot.hiddenEditedCellKeys[0])).toBe(true);
+        expect(Object.isFrozen(snapshot.rowHeightProjection[0])).toBe(true);
         expect(Object.isFrozen(snapshot.meta.sheets[0].merges)).toBe(true);
         expect(Object.isFrozen(snapshot.state.pendingEdits)).toBe(true);
         expect(Object.isFrozen(snapshot.commandResult)).toBe(true);
@@ -248,6 +257,7 @@ describe('workbook snapshot builder', () => {
                 sourceGeneration: 1,
                 meta: { sheets: [sheet], hasFormatting: false },
                 hiddenEditedCellKeys: [[]],
+                rowHeightProjection: [undefined],
             },
             presentation: 'initial',
             reason: 'ready',

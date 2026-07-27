@@ -210,6 +210,9 @@ export class ViewerPanelCore {
     private readonly on_transform_commit?: TransformCommit;
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
     private readonly durable_pending_edit_keys?: () => readonly string[];
+    private readonly durable_row_heights?: () => readonly (
+        Record<number, number> | undefined
+    )[];
 
     constructor(
         private readonly panel: PanelLike,
@@ -227,6 +230,16 @@ export class ViewerPanelCore {
              * empty.
              */
             durablePendingEditKeys?: () => readonly string[];
+            /**
+             * The durable per-sheet custom row heights, keyed by canonical source row.
+             * Same division of labour as `durablePendingEditKeys` and the same reason
+             * for the injection: the core owns the projection and the permutation, the
+             * authority layer owns durable state, and `rowHeights` needs both. Absent
+             * (a test core, or any caller with no durable state to read) every
+             * projection is empty, which renders as "no row has a custom height" —
+             * the correct answer for a file that has none.
+             */
+            durableRowHeights?: () => readonly (Record<number, number> | undefined)[];
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -236,6 +249,7 @@ export class ViewerPanelCore {
         this.on_transform_commit = opts?.onTransformCommit;
         this.on_invalid_restore = opts?.onInvalidRestore;
         this.durable_pending_edit_keys = opts?.durablePendingEditKeys;
+        this.durable_row_heights = opts?.durableRowHeights;
     }
 
     get generation(): number {
@@ -387,6 +401,15 @@ export class ViewerPanelCore {
                 // projected capabilities instead they would be sampled at a
                 // different moment and could name another permutation's rows.
                 hiddenEditedCellKeys: this.hidden_edited_cell_keys_by_sheet(),
+                // Immediately beside the keys above because it needs the identical
+                // argument and nothing weaker. Both are display-space answers about one
+                // specific permutation, so both are safe only if read in the same instant
+                // as the generation that identifies it. The consequence of getting it
+                // wrong differs, though, and the height projection's is worse: stale
+                // hidden keys over-report unsaved work the user can actually see, while a
+                // projection read against another permutation renders every custom height
+                // on a different row, silently and durably-looking.
+                rowHeightProjection: this.row_height_projection_by_sheet(),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,
@@ -727,6 +750,89 @@ export class ViewerPanelCore {
      * subtracts. Recomputing here, on the delivery `pendingEditsChanged` already
      * triggers, is what adds it.
      */
+    /**
+     * The durable custom row heights for a sheet, re-keyed into the display space of
+     * the view this core holds right now. See `SheetViewRecord.rowHeights` for why the
+     * host is the only place this can be computed and why it must travel with the view
+     * it describes.
+     *
+     * Iterates the *overrides*, not the rows, and that is the load-bearing choice: the
+     * durable map is sparse and typically holds a handful of entries, while the sheet
+     * can hold millions of rows. So the cost is O(overrides) lookups, each O(1) against
+     * the inverse index `display_row_for_source` caches beside the permutation it
+     * inverts — never O(rows). Walking rows instead would make every delivery on a
+     * large sheet linear in the row count for a map that is usually empty.
+     *
+     * A source row with no display row is dropped rather than recorded anywhere: it has
+     * been filtered out, explicitly hidden, or consumed as an Excel promoted header,
+     * and there is no display number that would name it. Nothing is lost — the durable
+     * map keeps the entry under its source row and the next view containing that row
+     * projects it again. This is the whole reason durable heights are source-keyed.
+     *
+     * Malformed keys are skipped in the same spirit as the pending-edit scan: a
+     * non-canonical numeric key names no source row, and `display_row_for_source`
+     * refusing it is the check.
+     */
+    private row_height_projection(
+        sheet_index: number,
+    ): Record<number, number> | undefined {
+        const overrides = this.durable_row_heights?.()[sheet_index];
+        if (!overrides) return undefined;
+        let projection: Record<number, number> | undefined;
+        for (const [key, height] of Object.entries(overrides)) {
+            const source_row = Number(key);
+            // `String(source_row) === key` rejects '01', '1.0', '1e0' and ' 1' — the
+            // same canonicality test `layout-state-patch.ts` applies to these maps,
+            // kept in step so a key the patcher would never have written cannot be
+            // honoured here either.
+            if (!Number.isSafeInteger(source_row) || String(source_row) !== key) continue;
+            if (!Number.isFinite(height)) continue;
+            const display_row = this.display_row_for_source(sheet_index, source_row);
+            if (display_row === undefined) continue;
+            projection ??= {};
+            projection[display_row] = height;
+        }
+        // `undefined` rather than `{}` when nothing projected, which is the answer for
+        // every sheet nobody has resized — the common case, and one worth not paying
+        // per-sheet-per-delivery structured-clone cost for. It also distinguishes "no
+        // heights" from "heights that all fell outside this view", though no reader needs
+        // that distinction today.
+        return projection;
+    }
+
+    /**
+     * The same answer for every sheet, positionally, so a delivery can carry it without
+     * knowing which sheet the user is looking at — see
+     * `WorkbookSnapshot.rowHeightProjection`.
+     *
+     * Per delivery rather than per install, and unlike `hiddenEditedCellKeys` that is not
+     * about a lag in observing durable state but about there being no single event to
+     * hang it on: the permutation half moves at an install, the durable half moves on a
+     * `setRowHeights`, a sibling write, or an excel-header plan edit. Nothing installs on
+     * the second kind and nothing delivers on the first, so both carriers exist and each
+     * covers what the other cannot.
+     */
+    private row_height_projection_by_sheet(): readonly (
+        Record<number, number> | undefined
+    )[] {
+        return this.source.meta().sheets.map((_sheet, sheet_index) => (
+            this.row_height_projection(sheet_index)
+        ));
+    }
+
+    /**
+     * The same answer for every sheet, positionally, so a delivery can carry it
+     * without knowing which sheet the user is looking at.
+     *
+     * This is the *additive* half of keeping the notice honest, and it needs a
+     * per-delivery answer rather than a per-install one. Membership changes only at an
+     * install, but the durable map this reads changes on its own — and an edit typed
+     * while a hiding transform was still computing reaches the durable map only
+     * *after* the install that excluded its row, so no install will ever name it. The
+     * webview's intersection against its live dirty map cannot add it back; that
+     * subtracts. Recomputing here, on the delivery `pendingEditsChanged` already
+     * triggers, is what adds it.
+     */
     private hidden_edited_cell_keys_by_sheet(): readonly (readonly string[])[] {
         return this.source.meta().sheets.map((sheet, sheet_index) => (
             this.hidden_edited_cell_keys(
@@ -747,6 +853,12 @@ export class ViewerPanelCore {
      * on the other one: with no permutation there are no rules describing these rows
      * and no row the view fails to show, so there is nothing here to fabricate and
      * nothing a retaining webview can later misread. See the type's doc.
+     *
+     * Deliberately carries no row-height projection. It would be a fact about these rows
+     * by its keys, but it is a join with durable state that moves on its own, so a
+     * retained record would hold a copy going stale on an unchanged basis — the field
+     * class the record's shape exists to exclude. It rides `transformInstalled` beside
+     * this record instead, exactly as `rules` does.
      */
     private installed_view(sheet_index: number, sheet: SheetMeta): SheetViewRecord {
         const basis = {
@@ -783,7 +895,14 @@ export class ViewerPanelCore {
      *
      * The rules ride the message rather than the record because they are the host's
      * durable intent for the sheet, not a fact about the rows the view contains — see
-     * `HostMessage`'s `transformInstalled` arm.
+     * `HostMessage`'s `transformInstalled` arm. `rowHeights` rides it for a related but
+     * distinct reason: it *is* keyed in this view's display space, but it is a join with
+     * durable state that moves independently, so a record retained across a same-basis
+     * refresh would hold a projection that has since gone stale. A message is read once.
+     *
+     * Both are read from this core in the same tick as the view, which is what makes the
+     * three of them consistent: the display keys in `rowHeights` are the display keys of
+     * the permutation `view` describes, because there was no await between reading them.
      */
     private transform_installed_ack(
         msg: SetTransformMessage,
@@ -799,6 +918,13 @@ export class ViewerPanelCore {
             rules: transform_has_entries(rules)
                 ? clone_transform(rules!)
                 : undefined,
+            // `{}` rather than `undefined` when nothing projects, unlike the snapshot
+            // field. A snapshot's per-sheet array is one entry per sheet on every
+            // delivery, so "absent" is worth distinguishing there; this is one value on
+            // one message about one sheet, and the reader has to install *something* as
+            // the sheet's projection, so an always-present map is one branch fewer at the
+            // only site that consumes it.
+            rowHeights: this.row_height_projection(msg.sheetIndex) ?? {},
         };
     }
 
@@ -1161,6 +1287,7 @@ export function adopt_source_into_core(
         onTransformCommit?: TransformCommit;
         onInvalidRestore?: InvalidRestoreCleanup;
         durablePendingEditKeys?: () => readonly string[];
+        durableRowHeights?: () => readonly (Record<number, number> | undefined)[];
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

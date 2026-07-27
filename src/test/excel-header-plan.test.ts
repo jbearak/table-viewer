@@ -99,7 +99,11 @@ describe('pure Excel header state planning', () => {
         expect(ds.meta().sheets[0]).toBe(old_sheet);
         expect(plan.state.excelFirstRowHeaders).toEqual({ People: to });
         expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: to === 'on' });
-        expect(plan.state.rowHeights).toEqual([undefined]);
+        // Heights survive the toggle now that they are keyed by canonical source row:
+        // promoting or demoting a header renumbers only the display space the projection
+        // re-derives, so there is nothing here to invalidate. The scroll offset is a pixel
+        // measurement of the layout this toggle changes, so it still goes.
+        expect(plan.state.rowHeights).toEqual([{ 0: 40 }]);
         expect(plan.state.scrollPosition).toEqual([undefined]);
         expect(plan.state.columnWidths).toEqual([{ 0: 120 }]);
         const new_schema = transform_schema_for_sheet(plan.newSheet);
@@ -132,7 +136,13 @@ describe('pure Excel header state planning', () => {
         expect(plan.changed).toBe(true);
         expect(plan.state.excelFirstRowHeaderVersion).toBe(1);
         expect(plan.state.excelFirstRowHeaderActive).toEqual({ People: true });
-        expect(plan.state.rowHeights).toEqual([undefined]);
+        // Preserved, not shifted, and not dropped. State with no
+        // `excelFirstRowHeaderVersion` has never been read by a header-aware version, so
+        // no promotion was ever effective for it and its height keys are already canonical
+        // — the promotion this load is applying came after them. Shifting here would be
+        // the migration corrupting exactly the data it exists to rescue.
+        expect(plan.state.rowHeights).toEqual([{ 1: 50 }]);
+        expect(plan.state.rowHeightsVersion).toBe(1);
         expect(plan.state.scrollPosition).toEqual([undefined]);
         expect(plan.state.columnWidths).toEqual([{ 0: 99 }]);
         const projected_schema = transform_schema_for_sheet(ds.meta().sheets[0]);
@@ -157,7 +167,11 @@ describe('pure Excel header state planning', () => {
         expect(plan.changed).toBe(true);
         expect(plan.state.transforms?.[0]?.schema).toBe(next_schema);
         expect(plan.state.columnVisibility?.[0]?.schema).toBe(next_schema);
-        expect(plan.state.rowHeights).toEqual([undefined]);
+        // The recorded projection for this sheet was *unpromoted*, so its height keys were
+        // written in the source space and are already canonical. The detector turning the
+        // promotion on renumbers the display space, which the delivered projection
+        // re-derives; it does not renumber the stored keys.
+        expect(plan.state.rowHeights).toEqual([{ 0: 31 }]);
         expect(plan.state.scrollPosition).toEqual([undefined]);
     });
 

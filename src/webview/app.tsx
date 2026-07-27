@@ -8,6 +8,7 @@ import React, {
 } from 'react';
 import {
     EMPTY_TRANSFORM,
+    MAX_PERSISTED_ROW_HEIGHTS,
     is_range_filter_operator,
     transform_has_entries,
     transform_is_active,
@@ -81,6 +82,12 @@ import {
     type EditSessionStore,
 } from './edit-session-store';
 import { column_letter } from './grid-model';
+import {
+    clamp_row_height,
+    row_height_layers_for_delivery,
+    row_height_layers_with,
+    type RowHeightLayer,
+} from './row-heights';
 import {
     create_column_projection,
     hide_all_columns,
@@ -304,9 +311,42 @@ export function App(): React.JSX.Element {
     const [column_visibility, set_column_visibility] = useState<
         (SheetColumnVisibilityState | undefined)[]
     >([]);
-    const [row_heights, set_row_heights] = useState<
-        (Record<number, number> | undefined)[]
+    // Per sheet, the host's *display*-keyed projection of the durable row heights —
+    // never the durable map itself, which is keyed by canonical source row and which
+    // this webview neither holds nor writes (see `PerFileState.rowHeights`). Only the
+    // host can join the two, because only the host knows the permutation and holds every
+    // source row; a resize can commit rows this webview has never loaded.
+    //
+    // It arrives on the two carriers that are each sampled beside the generation they
+    // describe: `WorkbookSnapshot.rowHeightProjection` on every delivery, and
+    // `transformInstalled.rowHeights` on an install, which posts no snapshot. It is
+    // deliberately not on `SheetViewRecord`: a record is retained across a same-basis
+    // refresh, and the durable heights move with no basis change at all (a sibling
+    // panel's write, an excel-header plan edit), so a retained projection would go stale
+    // invisibly. Held here instead, replaced whole by every delivery.
+    const [row_height_projection, set_row_height_projection] = useState<
+        (Readonly<Record<number, number>> | undefined)[]
     >([]);
+    // Resizes this panel has committed and posted but not yet seen come back.
+    //
+    // Display-keyed, like the projection it renders over, so no display→source mapping
+    // is needed to show one — which the webview could not do anyway for a select-all.
+    // Held as intervals + one height per commit rather than expanded entries: a
+    // select-all resize names every row of the sheet, and expanding that would cost one
+    // map entry per row to record a single number (see `RowHeightLayer`).
+    //
+    // Tagged with the sheet and the view generation the display rows were read off. A
+    // generation change voids the whole overlay rather than any part of it: the numbers
+    // in it name positions in an arrangement that no longer exists. That is also the
+    // entire user-visible answer to a resize the host refuses as stale — the delivery
+    // that moved the generation drops the overlay and the row springs back, with no
+    // refusal message and deliberately no replay, because replaying would resize
+    // whatever rows now sit at those positions.
+    const [row_height_overlay, set_row_height_overlay] = useState<{
+        readonly sheet_index: number;
+        readonly generation: number;
+        readonly layers: readonly RowHeightLayer[];
+    }>();
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
@@ -1251,7 +1291,6 @@ export function App(): React.JSX.Element {
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
                         set_column_visibility(normalized.columnVisibility);
-                        set_row_heights(normalized.rowHeights);
                         set_transforms(normalized.transforms);
                         const tab_orient = normalized.tabOrientation;
                         set_vertical_tabs(
@@ -1300,12 +1339,14 @@ export function App(): React.JSX.Element {
                             authoritative_state.columnWidths,
                             sheet_count,
                         );
-                        const next_row_heights = trim_sheet_state_array(
-                            authoritative_state.rowHeights,
-                            sheet_count,
-                        ).map((value, index) => (
-                            header_changed.has(index) ? undefined : value
-                        ));
+                        // No `rowHeights` clearing beside the scroll clearing below any
+                        // more, and the asymmetry is the point. A scroll offset is in
+                        // pixels down a particular arrangement of rows, so a promotion
+                        // that removes a row genuinely invalidates it. Heights are keyed
+                        // by canonical source row, which a promotion does not renumber:
+                        // the promoted row simply stops having a display row, and
+                        // `display_row_for_source` accounts for the one-row shift in
+                        // every projection the host sends afterwards.
                         const next_scroll_position = trim_sheet_state_array(
                             authoritative_state.scrollPosition,
                             sheet_count,
@@ -1330,21 +1371,23 @@ export function App(): React.JSX.Element {
                             active_sheet_index,
                             sheet_count,
                         );
+                        // `rowHeights` is no longer compared. A correction is a
+                        // `stateChanged` post, and heights are not a patch leaf any more,
+                        // so a difference there could produce nothing but an empty patch
+                        // — and there is no difference to find: this panel does not
+                        // sanitize or clear the delivered map, it only carries it.
                         correction_required = JSON.stringify({
-                            rowHeights: authoritative_state.rowHeights,
                             scrollPosition: authoritative_state.scrollPosition,
                             transforms: authoritative_state.transforms,
                             columnVisibility: authoritative_state.columnVisibility,
                             cellHighlights: snapshot.state.cellHighlights,
                         }) !== JSON.stringify({
-                            rowHeights: next_row_heights,
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
                             cellHighlights: authoritative_state.cellHighlights,
                         });
                         set_column_widths(next_column_widths);
-                        set_row_heights(next_row_heights);
                         set_transforms(next_transforms);
                         set_column_visibility(next_column_visibility);
                         set_active_sheet_index(next_active_sheet_index);
@@ -1352,7 +1395,11 @@ export function App(): React.JSX.Element {
                             ...state_ref.current,
                             ...authoritative_state,
                             columnWidths: next_column_widths,
-                            rowHeights: next_row_heights,
+                            // `rowHeights` rides in on the spread above and is never
+                            // written here or anywhere else: nothing reads this copy, and
+                            // with the patch leaf gone a `stateChanged` post cannot write
+                            // it either. It stays only because the delivered state is
+                            // adopted whole.
                             scrollPosition: next_scroll_position,
                             transforms: next_transforms,
                             columnVisibility: next_column_visibility,
@@ -1456,6 +1503,47 @@ export function App(): React.JSX.Element {
                             return { basis, permuted: false, rowCount: sheet.rowCount };
                         },
                     ));
+                    // The height projection, adopted whole from every delivery and from
+                    // both branches — the opposite treatment to the view records above,
+                    // and for the opposite reason. A record is retained on a matching
+                    // basis because it is a statement about rows that this snapshot did
+                    // not move. The projection is a *join* of that permutation with
+                    // durable intent, and the durable side moves with no basis change at
+                    // all: a sibling panel's write, another `setRowHeights`, an
+                    // excel-header plan edit. A retained projection would therefore go
+                    // stale invisibly, so there is nothing to retain — the host samples
+                    // it live and synchronously for every delivery, in the same instant
+                    // as `snapshot.generation`, and the two can never name different
+                    // permutations.
+                    const next_row_height_projection = trim_sheet_state_array(
+                        [...snapshot.rowHeightProjection],
+                        snapshot.meta.sheets.length,
+                    );
+                    set_row_height_projection(next_row_height_projection);
+                    // And the overlay of resizes this panel has posted but not yet seen
+                    // back. Void outright on a new document or a moved generation: its
+                    // keys are display rows, and either event means the arrangement they
+                    // were read off is gone. Otherwise reconciled by value — a layer the
+                    // delivered projection already agrees with has been answered, and
+                    // must be dropped so that a *later* height for those rows is not
+                    // masked by it for the rest of the generation. Value, not a request
+                    // id, because nothing correlates a `setRowHeights` with the delivery
+                    // that answers it and nothing needs to.
+                    set_row_height_overlay((previous) => {
+                        if (
+                            previous === undefined
+                            || snapshot.presentation === 'initial'
+                            || previous.generation !== snapshot.generation
+                        ) return undefined;
+                        const layers = row_height_layers_for_delivery(
+                            previous.layers,
+                            next_row_height_projection[previous.sheet_index] ?? {},
+                        );
+                        if (layers === previous.layers) return previous;
+                        return layers.length === 0
+                            ? undefined
+                            : { ...previous, layers };
+                    });
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
                     set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
@@ -1685,6 +1773,44 @@ export function App(): React.JSX.Element {
                     ));
                     next[msg.sheetIndex] = view;
                     return next;
+                });
+                // The height projection for the sheet that just installed, re-keyed by
+                // the host into the display space of the permutation it installed. This
+                // carrier is required rather than redundant: an install bumps the
+                // generation and posts no snapshot at all — the transform persist runs
+                // `update_file_state` → `update_session_state_material` →
+                // `update_state_snapshot` with `deliver` defaulting false — so without it
+                // the sheet would render heights keyed to the arrangement it has just
+                // left, until some unrelated delivery came along.
+                //
+                // Every *other* sheet keeps the projection it has, which is the same
+                // argument as the record rebase above and needs the same care to state:
+                // the generation is the whole core's, but `handle_set_transform` writes
+                // `transform_indices` for one sheet only, so no display row moved
+                // anywhere else and the display keys those projections use still name the
+                // rows they named. (What they can be is stale about *durable* heights a
+                // sibling wrote — but so can `columnWidths`, for the same reason, and
+                // layout state has no cross-panel fan-out to fix either. They correct
+                // themselves on the next delivery.)
+                set_row_height_projection((prev) => {
+                    const next = [...prev];
+                    next[msg.sheetIndex] = msg.rowHeights;
+                    return next;
+                });
+                // The overlay, on the same rules as a delivery: void if this install moved
+                // the generation, since a new permutation invalidates display keys
+                // outright; otherwise reconciled by value against the projection that
+                // came with it.
+                set_row_height_overlay((previous) => {
+                    if (previous === undefined) return undefined;
+                    if (previous.generation !== view.basis.generation) return undefined;
+                    if (previous.sheet_index !== msg.sheetIndex) return previous;
+                    const layers = row_height_layers_for_delivery(
+                        previous.layers,
+                        msg.rowHeights,
+                    );
+                    if (layers === previous.layers) return previous;
+                    return layers.length === 0 ? undefined : { ...previous, layers };
                 });
                 // From the message's own `rules`, which is the rule set the host now
                 // holds, not from the record: the record describes rows, and a view that
@@ -2790,22 +2916,69 @@ export function App(): React.JSX.Element {
         [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
     );
 
+    /**
+     * A completed resize: paint it at once, and ask the host to persist it.
+     *
+     * Nothing durable is written here, and nothing is written into `state_ref` either.
+     * The rows arrive as *display* intervals — a resize commits the user's whole row
+     * selection, which can be select-all, so most of them may never have been loaded —
+     * and mapping display→source needs the permutation plus every source row, which
+     * only the host has. It maps, clamps, caps and persists; the answer comes back as a
+     * new projection. That also removes the last way this panel could clobber a
+     * host-written height, since `rowHeights` is no longer a `stateChanged` patch leaf.
+     */
     const handle_row_resize = useCallback(
-        (rows: readonly number[], height: number) => {
-            set_row_heights((prev) => {
-                const next = [...prev];
-                const sheet_heights = { ...(next[active_sheet_index] ?? {}) };
-                for (const row of rows) sheet_heights[row] = height;
-                next[active_sheet_index] = sheet_heights;
-                state_ref.current = {
-                    ...state_ref.current,
-                    rowHeights: [...next],
-                };
-                persist_immediate();
-                return next;
+        (rows: readonly DisplayRowInterval[], height: number) => {
+            if (!Number.isFinite(height)) return;
+            let requested_rows = 0;
+            for (const interval of rows) {
+                requested_rows += interval.end - interval.start + 1;
+            }
+            if (requested_rows === 0) return;
+            // Clamped here as well as host-side, and not merely for symmetry: the overlay
+            // is reconciled against the delivered projection by *value*, so an
+            // unclamped optimistic height would never match the clamped height the host
+            // stores, and the layer would sit there masking it. The drag itself already
+            // clamps (`row-resize-model`), so this is the case that should not arise
+            // rather than one that does.
+            const clamped = clamp_row_height(height);
+            host_bridge.postMessage({
+                type: 'setRowHeights',
+                sheetIndex: active_sheet_index,
+                rows: rows.map((interval) => ({
+                    start: interval.start,
+                    end: interval.end,
+                })),
+                height: clamped,
+                generation: generation_ref.current,
+                sourceGeneration: source_generation_ref.current,
+            });
+            // Posted either way, but painted optimistically only when the host can
+            // actually keep it. Over the cap the host refuses the whole request and warns
+            // the owner, delivering nothing — so an overlay layer for it would have no
+            // delivery to reconcile against and would show a height nothing persisted
+            // until the generation next moved. Better to let the row spring back as the
+            // drag ends, which is the truth. (The same cap applied to the *accumulated*
+            // map is a refusal this panel cannot predict, since it never sees the durable
+            // map; that one does leave a stale layer behind.)
+            if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) return;
+            set_row_height_overlay((previous) => {
+                const layer: RowHeightLayer = { rows, height: clamped };
+                return previous
+                    && previous.sheet_index === active_sheet_index
+                    && previous.generation === generation_ref.current
+                    ? {
+                        ...previous,
+                        layers: row_height_layers_with(previous.layers, layer),
+                    }
+                    : {
+                        sheet_index: active_sheet_index,
+                        generation: generation_ref.current,
+                        layers: [layer],
+                    };
             });
         },
-        [active_sheet_index, persist_immediate]
+        [active_sheet_index]
     );
 
     const handle_toggle_auto_fit = useCallback(() => {
@@ -3203,6 +3376,17 @@ export function App(): React.JSX.Element {
                 conflicted_keys.length === 1 ? '' : 's'
             } may be affected — highlighted cells show conflicts.`;
 
+    // The overlay only ever applies to the sheet and the arrangement it was recorded
+    // against. Both tests are checked here rather than only where the overlay is
+    // written, so a tab switch (which moves no generation) cannot paint one sheet's
+    // pending resize onto another's rows.
+    const active_row_height_overlay =
+        row_height_overlay
+        && row_height_overlay.sheet_index === active_sheet_index
+        && row_height_overlay.generation === generation
+            ? row_height_overlay.layers
+            : undefined;
+
     const grid = (
         <GridShell
             key={`${active_sheet_index}:${load_epoch}:${generation}`}
@@ -3215,7 +3399,13 @@ export function App(): React.JSX.Element {
             column_projection={current_column_projection}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
-            row_heights={transform_active ? {} : (row_heights[active_sheet_index] ?? {})}
+            // The host's display-keyed projection for this sheet — never `{}` under a
+            // permutation, which is what the old `transform_active ? {} : …` did to keep a
+            // display-keyed durable map from naming the wrong rows. The projection is
+            // computed against the installed permutation, so it is correct in exactly the
+            // case the suppression existed for.
+            row_heights={row_height_projection[active_sheet_index] ?? {}}
+            row_height_overlay={active_row_height_overlay}
             on_row_resize={handle_row_resize}
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}

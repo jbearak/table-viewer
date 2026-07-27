@@ -81,7 +81,48 @@ export function plan_excel_candidate_state(
     );
     const next_active = effective_excel_header_map(sheets);
     const first_migration = current.excelFirstRowHeaderVersion !== 1;
-    if (!first_migration && excel_header_maps_equal(previous_active, next_active)) {
+    /**
+     * The one-time reconciliation of `PerFileState.rowHeights` with the canonical
+     * source-row key space it is now documented in.
+     *
+     * Every pre-migration height key is a *display* row. Display and source rows are the
+     * same numbers except where the projection differs from the source, and for heights
+     * there is exactly one such case: an active first-row-header promotion, which removes
+     * the header row from the display space and shifts everything after it up by one. A
+     * permutation would be another, but no released version could have written a permuted
+     * height — the suppression that replaced the map with `{}` under an active transform
+     * shipped in the same commit that added sorting and filtering. So the sheets needing
+     * repair are exactly those with an active promotion, and every other sheet's keys are
+     * already canonical and are left alone. CSV among them: `rowCount === sourceRowCount`
+     * there and no promotion exists, which is why CSV never calls this function and never
+     * needs to.
+     *
+     * For the promoted sheets the keys are *recoverable* rather than lost, and recovering
+     * them is worth the care because the alternative discards work the user did by hand.
+     * Every promotion *transition* already cleared the map — the projection-changed branch
+     * below did, and `plan_excel_override_state` did unconditionally — so a surviving
+     * durable map was written in the display space of the promotion last recorded as
+     * active for that sheet. Inverting that space is `source = d < h ? d : d + 1` for
+     * header row `h`, which for `h === 0` is a shift by one.
+     *
+     * Per sheet, and decided from what durable state can actually prove about that sheet
+     * rather than from what this load is doing — `pre_migration_row_height_space` is where
+     * the three cases and their proofs live. The one worth flagging here is that
+     * `first_migration` means *canonical*, not promoted: state with no
+     * `excelFirstRowHeaderVersion` predates the header feature, so its keys were written
+     * before any promotion existed and shifting them would break heights this pass exists
+     * to preserve.
+     *
+     * Lives here rather than in a dedicated migration because this function already runs
+     * on every Excel load with the projection facts in hand, and heights only ever need
+     * repair on a format that reaches it.
+     */
+    const row_heights_migration = current.rowHeightsVersion !== 1;
+    if (
+        !first_migration
+        && !row_heights_migration
+        && excel_header_maps_equal(previous_active, next_active)
+    ) {
         return {
             state: current,
             changed: false,
@@ -108,6 +149,31 @@ export function plan_excel_candidate_state(
             : had_previous
             ? previous_active[sheet.name]
             : false;
+        const matched_planning_sheet = input.sheets[index]?.name === sheet.name
+            ? input.sheets[index]
+            : undefined;
+        // Ahead of the `projection_changed` gate below, and independent of it. The
+        // question the migration asks is not "did this load change the projection?" but
+        // "which space are this sheet's stored keys in?", and in the common upgrade — a
+        // promotion active and unchanged — the answer is "the promoted one" while
+        // `projection_changed` is false.
+        //
+        // Keyed on the *previous* projection rather than the next, which is the whole
+        // subtlety. The keys were written under whatever was last effective for this
+        // sheet, so a load that is switching the promotion off still has to invert the
+        // promoted space the keys are in — and it needs the header row of *that* space,
+        // which is why the previous projection is re-derived rather than read off `sheet`.
+        if (row_heights_migration) {
+            rowHeights[index] = migrate_display_keyed_row_heights(
+                rowHeights[index],
+                pre_migration_row_height_space(
+                    first_migration,
+                    had_previous,
+                    previous_is_active,
+                    matched_planning_sheet,
+                ),
+            );
+        }
         const projection_changed = first_migration
             ? next_is_active
             : !had_previous
@@ -115,12 +181,20 @@ export function plan_excel_candidate_state(
             : previous_is_active !== next_is_active;
         if (!projection_changed) return;
 
-        rowHeights[index] = undefined;
+        // `rowHeights` is deliberately *not* cleared here any more. Heights are keyed by
+        // canonical source row, so a promotion coming or going renumbers only the display
+        // space the projection re-derives, and the stored keys still name the same rows.
+        // Clearing them was the old design's only defence against a display-keyed map,
+        // and it cost the user every custom height each time they toggled a header.
+        //
+        // `scrollPosition` still goes, and the asymmetry is real rather than an
+        // oversight: a scroll offset is a pixel measurement of a specific row layout, so
+        // there is no key space in which it survives the layout changing. It is genuinely
+        // invalidated; heights are not.
         scrollPosition[index] = undefined;
-        const planning_sheet = input.sheets[index];
-        if (!planning_sheet || planning_sheet.name !== sheet.name) return;
+        if (!matched_planning_sheet) return;
         const previous = project_excel_header_sheet(
-            planning_sheet,
+            matched_planning_sheet,
             previous_is_active ? 'on' : 'off',
         );
         transforms = migrate_compatible_sheet_schema(
@@ -157,6 +231,7 @@ export function plan_excel_candidate_state(
             cellHighlights,
             excelFirstRowHeaderActive: next_active,
             excelFirstRowHeaderVersion: 1,
+            rowHeightsVersion: 1,
         },
     };
 }
@@ -246,9 +321,12 @@ export function plan_excel_override_state(
     excelFirstRowHeaderActive[sheet_name] = (
         new_sheet.excelFirstRowHeader?.active ?? false
     );
-    const rowHeights = [...(current.rowHeights ?? [])];
+    // `rowHeights` is untouched: source-keyed heights name the same rows whichever way
+    // this toggle goes, and the display-keyed projection is re-derived from the new
+    // projection on the next delivery. Only `scrollPosition` is genuinely invalidated —
+    // it is a pixel offset into a row layout this override changes. See the same
+    // asymmetry in `plan_excel_candidate_state`.
     const scrollPosition = [...(current.scrollPosition ?? [])];
-    rowHeights[sheet_index] = undefined;
     scrollPosition[sheet_index] = undefined;
     if (options?.clearHiddenRows && transforms?.[sheet_index]?.hiddenRows) {
         transforms = [...transforms];
@@ -264,7 +342,6 @@ export function plan_excel_override_state(
             excelFirstRowHeaders,
             excelFirstRowHeaderActive,
             excelFirstRowHeaderVersion: 1,
-            rowHeights,
             scrollPosition,
             transforms: migrate_compatible_sheet_schema(
                 transforms,
@@ -286,6 +363,88 @@ export function plan_excel_override_state(
             ),
         },
     };
+}
+
+/**
+ * Which row space one sheet's pre-migration `rowHeights` keys are in.
+ *
+ * `canonical` is a *proof*, not a default, and there are two of them. The stronger one is
+ * `first_migration`: no `excelFirstRowHeaderVersion` means this state has never been read
+ * by a header-aware version, so no promotion can ever have been effective for it and the
+ * display space it was written in was the source space. (This is also why the pass must
+ * not shift there — the promotion this very load is about to apply came after the keys,
+ * not before them.) The weaker one is a recorded `previous_active` of `false`: the last
+ * effective projection for this sheet was unpromoted, so the same equality held.
+ *
+ * `promoted` is the recorded-active case. Every promotion *transition* cleared the map
+ * before this PR, so a map that survived was written under the promotion still recorded
+ * as active, and `headerSourceRow` is that promotion's own header row — taken from the
+ * previous projection rather than the incoming one, because a load that is switching the
+ * promotion off still has to invert the space the keys are in.
+ *
+ * `unknown` is the honest answer when `excelFirstRowHeaderActive` has no entry for the
+ * sheet, or the planning input no longer lines up with it by name. Neither proof is
+ * available, so the keys are dropped rather than guessed at.
+ */
+type PreMigrationRowHeightSpace =
+    | { readonly kind: 'canonical' }
+    | { readonly kind: 'promoted'; readonly headerSourceRow: number | undefined }
+    | { readonly kind: 'unknown' };
+
+function pre_migration_row_height_space(
+    first_migration: boolean,
+    had_previous: boolean,
+    previous_is_active: boolean,
+    matched_planning_sheet: ExcelHeaderPlanningInput['sheets'][number] | undefined,
+): PreMigrationRowHeightSpace {
+    if (first_migration) return { kind: 'canonical' };
+    if (!had_previous || !matched_planning_sheet) return { kind: 'unknown' };
+    if (!previous_is_active) return { kind: 'canonical' };
+    return {
+        kind: 'promoted',
+        headerSourceRow: project_excel_header_sheet(matched_planning_sheet, 'on')
+            .excelFirstRowHeader?.sourceRow,
+    };
+}
+
+/**
+ * Re-key one sheet's pre-migration display-keyed heights into canonical source rows, drop
+ * them when the old key space cannot be inverted, or leave them alone when they are
+ * already canonical. See `pre_migration_row_height_space` and the argument at
+ * `row_heights_migration` in `plan_excel_candidate_state`.
+ *
+ * The shift is `source = display + 1`, and it is applied only for `headerSourceRow === 0`
+ * — the auto-detected promotion, where the header took source row 0 out of the display
+ * space and everything after it moved up one. A manual header row is dropped instead, not
+ * because the arithmetic differs but because `h` is not trustworthy there: the recorded
+ * projection is a boolean, so a manual header row that moved while the promotion stayed
+ * active leaves no trace, and a wrong shift is silently wrong heights indistinguishable
+ * from right ones.
+ *
+ * Non-canonical keys are dropped rather than coerced, matching the numeric-key test the
+ * layout patcher applies to the same maps: a key no writer could have produced names no
+ * row, and guessing which row it meant is how an off-by-one becomes permanent.
+ */
+function migrate_display_keyed_row_heights(
+    stored: Record<number, number> | undefined,
+    space: PreMigrationRowHeightSpace,
+): Record<number, number> | undefined {
+    if (!stored) return undefined;
+    if (space.kind === 'canonical') return stored;
+    if (space.kind === 'unknown' || space.headerSourceRow !== 0) return undefined;
+    let migrated: Record<number, number> | undefined;
+    for (const [key, height] of Object.entries(stored)) {
+        const display_row = Number(key);
+        if (
+            !Number.isSafeInteger(display_row)
+            || display_row < 0
+            || String(display_row) !== key
+            || !Number.isFinite(height)
+        ) continue;
+        migrated ??= {};
+        migrated[display_row + 1] = height;
+    }
+    return migrated;
 }
 
 function hidden_rows_before_header(

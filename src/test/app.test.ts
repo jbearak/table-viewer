@@ -64,7 +64,14 @@ vi.mock('../webview/grid-shell', () => ({
             source_to_visible: (number | undefined)[];
         };
         column_widths: Record<number, number>;
+        // The host's display-keyed projection, and the resizes App has committed but
+        // not yet seen delivered back. Reported separately because that is how the real
+        // shell reads them: the projection is authoritative, the overlay sits over it.
         row_heights: Record<number, number>;
+        row_height_overlay?: readonly {
+            rows: readonly { start: number; end: number }[];
+            height: number;
+        }[];
         merges: { startRow: number }[];
         edit_mode?: boolean;
         edit_session_id?: string;
@@ -99,7 +106,10 @@ vi.mock('../webview/grid-shell', () => ({
             } | null;
         };
         on_column_resize: (col: number, width: number) => void;
-        on_row_resize: (rows: readonly number[], height: number) => void;
+        on_row_resize: (
+            rows: readonly { start: number; end: number }[],
+            height: number,
+        ) => void;
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
@@ -268,6 +278,9 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-source-to-visible': JSON.stringify(props.column_projection.source_to_visible),
                 'data-col-widths': JSON.stringify(props.column_widths),
                 'data-row-heights': JSON.stringify(props.row_heights),
+                'data-row-height-overlay': JSON.stringify(
+                    props.row_height_overlay ?? null,
+                ),
                 'data-pending-preview-scroll': JSON.stringify(props.pending_preview_scroll ?? null),
                 'data-merges': String(props.merges?.length ?? 0),
                 'data-merges-json': JSON.stringify(props.merges ?? []),
@@ -284,7 +297,16 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-row-resize',
-                    onClick: () => props.on_row_resize([3, 5, 8], 50),
+                    // Display-row intervals, the way the real shell coalesces a row
+                    // selection before handing it up: rows 3, 5 and 8 as three of them.
+                    onClick: () => props.on_row_resize(
+                        [
+                            { start: 3, end: 3 },
+                            { start: 5, end: 5 },
+                            { start: 8, end: 8 },
+                        ],
+                        50,
+                    ),
                 },
                 'row-resize'
             ),
@@ -490,6 +512,7 @@ function transform_installed_message(
         state?: SheetTransformState;
         permuted?: boolean;
         hiddenEditedCellKeys?: readonly string[];
+        rowHeights?: Readonly<Record<number, number>>;
     },
 ): Extract<HostMessage, { type: 'transformInstalled' }> {
     const rules = options.state ?? request.state;
@@ -520,6 +543,10 @@ function transform_installed_message(
             }
             : { basis, permuted: false, rowCount: options.rowCount ?? 1 },
         rules: has_entries ? rules : undefined,
+        // Empty by default: an install carries the sheet's display-keyed height
+        // projection beside the record, and having no custom heights is the ordinary
+        // case. A test about heights surviving a permutation names this explicitly.
+        rowHeights: options.rowHeights ?? {},
     };
 }
 
@@ -686,6 +713,9 @@ function workbook_snapshot_message(
             // cells surviving (or not surviving) a refresh must name this explicitly —
             // a default that guessed would decide the question they are asking.
             hiddenEditedCellKeys: meta.sheets.map(() => []),
+            // Likewise one entry per sheet, `undefined` by default: that is what the host
+            // sends for a sheet with no custom row heights.
+            rowHeightProjection: meta.sheets.map(() => undefined),
             state: {
                 columnWidths: [],
                 rowHeights: [],
@@ -1387,10 +1417,12 @@ describe('Excel first-row header toggle', () => {
     it('requests an authoritative toggle and waits for the result snapshot', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            rowHeightProjection: [{ 0: 44 }],
             state: { rowHeights: [{ 0: 44 }] },
             generation: 4,
             sourceGeneration: 7,
         }));
+        expect(grid_stub().getAttribute('data-row-heights')).toBe('{"0":44}');
         post_message.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
@@ -1453,6 +1485,10 @@ describe('Excel first-row header toggle', () => {
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
+        // The projection is adopted whole from each delivery, so the promotion's own
+        // (empty) one replaces the one above. It is not the webview clearing heights on a
+        // header change: the durable map is source-keyed and survives — this delivery
+        // simply names no display row with a custom height.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
     });
@@ -1783,6 +1819,9 @@ describe('Excel first-row header toggle', () => {
         const reloaded = make_meta(['People', 'Other']);
         reloaded.sheets[0] = excel_meta(false).sheets[0];
         await dispatch_host_message(refresh_snapshot_message(reloaded, {
+            // Heights reach the grid as the host's display-keyed projection; the durable
+            // map beside it is what a `stateChanged` echoes back, asserted below.
+            rowHeightProjection: [undefined, { 2: 77 }],
             state: {
                 columnWidths: [undefined, { 0: 222 }],
                 rowHeights: [undefined, { 2: 77 }],
@@ -2560,9 +2599,10 @@ describe('column visibility projection', () => {
 });
 
 describe('row height persistence', () => {
-    it('stores a row resize per sheet and persists it', async () => {
+    it('asks the host to persist a row resize and paints it at once', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
             sourceGeneration: 7,
         }));
         post_message.mockClear();
@@ -2571,24 +2611,72 @@ describe('row height persistence', () => {
             (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
         });
 
-        // Grid receives every height from the single batched resize.
-        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
-            3: 50,
-            5: 50,
-            8: 50,
-        });
+        // The durable write is the host's, so all the webview posts is the request —
+        // display intervals plus the pair of generations that make them meaningful. No
+        // `stateChanged`: heights are not a layout patch leaf any more, and the webview
+        // holds no copy of the durable map to send.
         expect(post_message).toHaveBeenCalledOnce();
-        const last = post_message.mock.calls.at(-1)![0];
-        expect(last.type).toBe('stateChanged');
-        expect(last.sourceGeneration).toBe(7);
-        expect(last.state.rowHeights[0]).toEqual({ 3: 50, 5: 50, 8: 50 });
+        expect(post_message.mock.calls.at(-1)![0]).toEqual({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            rows: [
+                { start: 3, end: 3 },
+                { start: 5, end: 5 },
+                { start: 8, end: 8 },
+            ],
+            height: 50,
+            generation: 4,
+            sourceGeneration: 7,
+        });
+        // Meanwhile the resize is visible immediately, as an overlay over the delivered
+        // projection rather than in it: nothing durable has come back yet.
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({});
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual([{
+                rows: [
+                    { start: 3, end: 3 },
+                    { start: 5, end: 5 },
+                    { start: 8, end: 8 },
+                ],
+                height: 50,
+            }]);
     });
 
-    it('restores saved row heights from initial snapshot state', async () => {
+    it('drops the optimistic overlay once the delivered projection agrees', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        await act(async () => {
+            (container!.querySelector('.stub-row-resize') as HTMLButtonElement).click();
+        });
+
+        // What the host does with the request: maps the display rows to source rows,
+        // persists them, and delivers the re-projected result at the same generation.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }],
+        }));
+
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+        // Dropped rather than left to shadow the projection: kept, it would mask a later
+        // height for those rows for the rest of the generation.
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+    });
+
+    it('renders the delivered projection from an initial snapshot', async () => {
         await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1']), {
-                state: { rowHeights: [{ 1: 44 }] },
+                // The projection, not `state.rowHeights`: the durable map is keyed by
+                // canonical source row and the webview never renders from it.
+                rowHeightProjection: [{ 1: 44 }],
+                state: { rowHeights: [{ 2: 44 }] },
             })
         );
         expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({
@@ -2616,8 +2704,8 @@ describe('merges', () => {
             { startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
         ];
         await dispatch_host_message(initial_snapshot_message(meta, {
+            rowHeightProjection: [{ 0: 48 }],
             state: {
-                rowHeights: [{ 0: 48 }],
                 columnVisibility: [{
                     hiddenColumns: [3],
                     schema: '["Sheet1",4,null]',
@@ -5926,8 +6014,8 @@ describe('snapshots arriving during an in-flight transform', () => {
 // The rows a same-basis refresh delivers are the rows already on screen: the host
 // installed nothing and dropped nothing, so an *applied* transform is still applied
 // behind it. Every edit commit during an owned session provokes one of these, and
-// `transformed` reading false while the loader is still permuted is what re-offers
-// the display-keyed row-height affordances — a height written for the wrong row.
+// `transformed` reading false while the loader is still permuted would give the grid a
+// natural row count over permuted rows.
 describe('an applied transform across a refresh', () => {
     const STORED_SORT: SheetTransformState = {
         sort: [{ colIndex: 0, direction: 'desc' }],
@@ -5967,8 +6055,11 @@ describe('an applied transform across a refresh', () => {
         schema: '["Sheet1",1,null]',
     };
     // A row height the user set, and a natural count the transformed count can be
-    // told apart from — with make_meta's rowCount of 1 the reset is invisible.
+    // told apart from — with make_meta's rowCount of 1 the reset is invisible. The
+    // durable entry is keyed by canonical *source* row 2; what the grid renders is the
+    // host's projection of it, which under the sort below lands at display row 1.
     const STORED_STATE = { transforms: [STORED_SORT], rowHeights: [{ 2: 44 }] };
+    const PROJECTED_HEIGHTS = { 1: 44 };
     const FILTERED_ROW_COUNT = 3;
 
     function transform_requests(post_message: ReturnType<typeof vi.fn>) {
@@ -6004,7 +6095,13 @@ describe('an applied transform across a refresh', () => {
         expect(restore.intent).toBe('restore');
         await dispatch_host_message(transform_installed_message(
             restore,
-            { generation: 2, rowCount: FILTERED_ROW_COUNT },
+            {
+                generation: 2,
+                rowCount: FILTERED_ROW_COUNT,
+                // An install carries the projection for the permutation it installs, and
+                // has to: it bumps the generation and posts no snapshot.
+                rowHeights: PROJECTED_HEIGHTS,
+            },
         ));
         // The snapshot already names a session this panel owns, so it opens in edit
         // mode — the state in which every commit provokes a same-basis refresh.
@@ -6036,11 +6133,13 @@ describe('an applied transform across a refresh', () => {
             .toBe(String(FILTERED_ROW_COUNT));
     });
 
-    it('does not re-offer row resizing across a same-basis refresh', async () => {
+    it('keeps custom row heights across a same-basis refresh', async () => {
         await editing_with_an_applied_sort();
-        // Heights are suppressed under a transform, which is what unmounts the resize
-        // overlay and disarms hover in the real shell.
-        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+        // Heights are no longer suppressed under a transform. What the grid gets is the
+        // install's own projection — display row 1, from durable source row 2 — so the
+        // resize overlay stays mounted and hover stays armed over permuted rows.
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual(PROJECTED_HEIGHTS);
 
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             generation: 2,
@@ -6048,13 +6147,15 @@ describe('an applied transform across a refresh', () => {
             reason: 'other',
             capabilities: CSV_CAPABILITIES,
             state: STORED_STATE,
+            // The permutation is unchanged, so the host re-projects onto the same display
+            // rows. Named explicitly because the projection is adopted from every
+            // delivery: a refresh that carried none would (correctly) mean no heights.
+            rowHeightProjection: [PROJECTED_HEIGHTS],
         }));
 
-        // The hazard, stated as the grid sees it: were `transformed` to read false
-        // here the overlay would mount over permuted rows and persist a display-keyed
-        // height against the wrong source row — durable corruption, not a flicker.
         expect(grid_shell_mock.latest_props?.transformed).toBe(true);
-        expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual(PROJECTED_HEIGHTS);
     });
 
     it('still asks for a durable transform a sibling panel changed', async () => {
@@ -6323,11 +6424,15 @@ describe('an applied transform across a refresh', () => {
         await dispatch_host_message(refresh_snapshot_message(five_row_meta(), {
             capabilities: CSV_CAPABILITIES,
             state: STORED_STATE,
+            // No permutation left to project through, so the host's projection of durable
+            // source row 2 is display row 2.
+            rowHeightProjection: [{ 2: 44 }],
         }));
 
         expect(grid_stub().getAttribute('data-transformed')).toBe('false');
         expect(grid_stub().getAttribute('data-row-count')).toBe('5');
-        // And with nothing applied, the stored height is the user's again.
+        // And the height follows the rows: same durable entry, a display key that moved
+        // with the permutation being dropped.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{"2":44}');
     });
 

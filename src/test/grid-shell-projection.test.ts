@@ -2441,10 +2441,11 @@ describe('GridShell stable rows during an edit session', () => {
         expect(posted_transforms()).toEqual([]);
     });
 
-    // Row heights are still keyed by *display* row (PR 4 moves them to source
-    // keys), so the multiline auto-grow write is gated on `transformed` — the one
-    // place transforms and edit mode now coexist. Asserted as a pair: alone, the
-    // first test would also pass if auto-grow were broken outright.
+    // Multiline auto-grow used to be gated on `transformed`, because the height it
+    // wrote was keyed by the display row it measured and that named another source row
+    // under a permutation. The write is now a display *interval* the host maps through
+    // the permutation it installed, so the gate is gone — asserted as a pair, permuted
+    // and not, since a permuted view is the one place transforms and edit mode coexist.
     const MULTILINE = 'one\ntwo\nthree';
     const expected_grown_height = natural_row_height(
         MULTILINE,
@@ -2469,22 +2470,27 @@ describe('GridShell stable rows during an edit session', () => {
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: MULTILINE }));
     }
 
-    it('does not write a row height for a multiline edit while transformed', async () => {
+    it('grows the row for a multiline edit while transformed', async () => {
         const on_row_resize = vi.fn();
         await commit_multiline(true, on_row_resize);
 
-        expect(on_row_resize).not.toHaveBeenCalled();
-        // Fell through to the single-cell repaint rather than returning early: the
-        // edit still has to be painted, there is just no height change to spread
-        // across the row.
-        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [0, 0] }]);
+        // The display row it was measured at, as a one-row interval. This site knows the
+        // source row too (it resolved one to key the edit) and deliberately does not use
+        // it: the host is the only display→source mapper.
+        expect(on_row_resize).toHaveBeenCalledWith(
+            [{ start: 0, end: 0 }],
+            expected_grown_height,
+        );
     });
 
     it('grows the row for a multiline edit when not transformed', async () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);
 
-        expect(on_row_resize).toHaveBeenCalledWith([0], expected_grown_height);
+        expect(on_row_resize).toHaveBeenCalledWith(
+            [{ start: 0, end: 0 }],
+            expected_grown_height,
+        );
     });
 });
 
@@ -2536,7 +2542,11 @@ describe('GridShell row resizing', () => {
         expect(grid_mock.overlay_repaint).toHaveBeenCalled();
         act(() => on_resize_end(3, 52));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([1, 3, 4], 52);
+        // Coalesced into display-row intervals: 1 alone, then 3–4.
+        expect(on_row_resize).toHaveBeenCalledWith(
+            [{ start: 1, end: 1 }, { start: 3, end: 4 }],
+            52,
+        );
     });
 
     it('previews all selected rows when dragging the first selected row', async () => {
@@ -2608,7 +2618,7 @@ describe('GridShell row resizing', () => {
         expect(on_row_resize).not.toHaveBeenCalled();
         act(() => on_resize_end(2, 48));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize).toHaveBeenCalledWith([2], 48);
+        expect(on_row_resize).toHaveBeenCalledWith([{ start: 2, end: 2 }], 48);
         expect(grid_mock.update_cells).not.toHaveBeenCalled();
     });
 
@@ -2651,7 +2661,10 @@ describe('GridShell row resizing', () => {
         ]);
         act(() => on_resize_end(0, 60));
         expect(on_row_resize).toHaveBeenCalledOnce();
-        expect(on_row_resize.mock.calls[0][0]).toHaveLength(10_000);
+        // Ten thousand contiguous selected rows leave as one interval, not ten thousand
+        // row numbers: the request that crosses to the host is the size of the gesture,
+        // not of the selection.
+        expect(on_row_resize.mock.calls[0][0]).toEqual([{ start: 0, end: 9_999 }]);
     });
 
     it('repaints merge geometry after committed row heights render', async () => {

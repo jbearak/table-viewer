@@ -123,7 +123,8 @@ import {
     default_row_height_for_font,
     line_height_for_font,
     natural_row_height,
-    row_height,
+    resolved_row_height,
+    type RowHeightLayer,
     type RowHeightOverrides,
 } from './row-heights';
 
@@ -239,17 +240,48 @@ export interface GridShellProps {
     generation: number;
     /** Effective displayed row count (may be filtered). */
     row_count?: number;
-    /** True while display rows are a view-only permutation of source rows. */
+    /**
+     * True while display rows are a view-only permutation of source rows.
+     *
+     * Nothing in this shell reads it any more, and that is worth stating rather than
+     * leaving to be discovered. Its three readers were all row-height suppressions —
+     * the resize overlay's mount, hover-arming, multiline auto-grow — and all three are
+     * gone now that durable heights are keyed by canonical source row and reach the
+     * webview already projected into display space. The flattening it also used to be
+     * cited for is decided in App, which simply passes `merges` empty.
+     *
+     * Kept, deliberately, as the one place a mounted shell states whether its rows are
+     * permuted: it is the fact every removed guard was reaching for, and the fact a
+     * future one would reach for again. Remove it only with something to say about why
+     * a shell no longer needs to know.
+     */
     transformed?: boolean;
     show_formatting: boolean;
     column_projection: ColumnProjection;
     /** Persisted widths keyed by canonical source column. */
     column_widths: Record<number, number>;
     on_column_resize: (col: number, width: number) => void;
+    /**
+     * Heights keyed by *display* row: the host's projection of the durable
+     * source-keyed map into the coordinate space of the view currently installed. So
+     * it is safe to read at a display row under any permutation, which is what makes
+     * the row-resize affordances below unconditional.
+     */
     row_heights: RowHeightOverrides;
-    // Wired by the row-resize overlay (D-wire-3); accepted now so App's contract
-    // is stable while the overlay lands.
-    on_row_resize: (rows: readonly number[], height: number) => void;
+    /**
+     * Resizes committed here but not yet reflected in `row_heights`, newest last.
+     * App owns their lifetime (they are void once the view generation moves); this
+     * shell only reads them, over `row_heights`, via `resolved_row_height`.
+     */
+    row_height_overlay?: readonly RowHeightLayer[];
+    /**
+     * A completed resize, as the inclusive display-row intervals it named. Intervals
+     * rather than an expanded row list because the committed rows are the user's whole
+     * row selection, which can be select-all; and display rows rather than source rows
+     * because the host is the only party that can map them — for a select-all those
+     * rows were never loaded here. See the `setRowHeights` message.
+     */
+    on_row_resize: (rows: readonly DisplayRowInterval[], height: number) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
     // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
@@ -335,12 +367,12 @@ export function GridShell({
     sheet_index,
     generation,
     row_count = sheet_meta.rowCount,
-    transformed = false,
     show_formatting,
     column_projection,
     column_widths,
     on_column_resize,
     row_heights,
+    row_height_overlay,
     on_row_resize,
     merges,
     preview_mode = false,
@@ -1665,23 +1697,31 @@ export function GridShell({
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
-            // TODO(PR 4): row heights are still keyed by *display* row, so this is
-            // gated on `transformed` — matching hover-arming and the resize overlay
-            // — rather than writing a display-keyed height against a permuted view.
-            // Now that transforms and edit mode coexist this is reachable, and
-            // skipping the whole block (not just the on_row_resize call) falls
-            // through to the single-cell updateCells below, which is the correct
-            // paint when no height changed. PR 4 makes heights source-keyed and
-            // removes the guard.
-            if (text.includes('\n') && !transformed) {
+            //
+            // No longer gated on `transformed`. It used to be, because a height was
+            // persisted under the display row it was measured at, which under a
+            // permutation named some other source row — durable corruption, so the
+            // whole affordance was suppressed rather than risked. Now the height goes
+            // up as a display interval and the host maps it through the permutation it
+            // installed, so a permuted view is no different from an unpermuted one; and
+            // `row_heights` is itself display-keyed, so the comparison below is a
+            // like-for-like read at this row. This site *could* resolve `source_row` (it
+            // did so just above, to key the edit) and deliberately does not: one
+            // display→source mapper, host-side, is the invariant the design rests on.
+            if (text.includes('\n')) {
                 const needed = natural_row_height(
                     text,
                     line_height_for_font(font_size_px),
                     undefined,
                     default_row_height,
                 );
-                if (needed > row_height(row_heights, row, default_row_height)) {
-                    on_row_resize([row], needed);
+                if (needed > resolved_row_height(
+                    row_heights,
+                    row_height_overlay,
+                    row,
+                    default_row_height,
+                )) {
+                    on_row_resize([{ start: row, end: row }], needed);
                     const cells: { cell: Item }[] = [];
                     for (let display_column = 0; display_column < display_column_count; display_column++) {
                         cells.push({ cell: [display_column, row] });
@@ -1698,12 +1738,12 @@ export function GridShell({
             default_row_height,
             font_size_px,
             row_heights,
+            row_height_overlay,
             on_row_resize,
             display_column_count,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
-            transformed,
         ],
     );
 
@@ -1774,9 +1814,14 @@ export function GridShell({
                     || row_resize_preview.preview_rows?.hasIndex(row)
                 )
             ) return row_resize_preview.height;
-            return row_height(row_heights, row, default_row_height);
+            return resolved_row_height(
+                row_heights,
+                row_height_overlay,
+                row,
+                default_row_height,
+            );
         },
-        [default_row_height, row_heights, row_resize_preview],
+        [default_row_height, row_heights, row_height_overlay, row_resize_preview],
     );
 
     // Repaint merge geometry after live-preview and committed-height renders.
@@ -1784,7 +1829,7 @@ export function GridShell({
     // applied the new rowHeight callback, leaving vertical/2D bounds one tick old.
     useEffect(() => {
         overlay_ref.current?.repaint();
-    }, [row_heights, row_resize_preview]);
+    }, [row_heights, row_height_overlay, row_resize_preview]);
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
@@ -1840,10 +1885,10 @@ export function GridShell({
                     args.bounds,
                 );
             }
-            if (transformed) {
-                row_resize_ref.current?.set_target(null);
-                return;
-            }
+            // No `transformed` bail here any more. Arming the strip was suppressed
+            // under a permutation only because the resize it leads to used to persist a
+            // display-keyed height; the resize now names display intervals the host
+            // maps, so there is nothing left for a permutation to mis-key.
             if (args.kind !== 'cell') {
                 row_resize_ref.current?.set_target(null);
                 return;
@@ -1861,8 +1906,9 @@ export function GridShell({
                     ? {
                           row: hit.row,
                           boundary_y: hit.boundary_y,
-                          height: row_height(
+                          height: resolved_row_height(
                               row_heights,
+                              row_height_overlay,
                               hit.row,
                               default_row_height,
                           ),
@@ -1875,9 +1921,9 @@ export function GridShell({
             display_column_count,
             hide_cell_tooltip,
             row_heights,
+            row_height_overlay,
             row_markers,
             schedule_cell_tooltip,
-            transformed,
         ],
     );
 
@@ -1939,11 +1985,26 @@ export function GridShell({
         row_resize_preview_ref.current = null;
         set_row_resize_preview(null);
         if (!preview || preview.row !== row || height === preview.start_height) return;
-        on_row_resize(
-            preview.commit_rows ? [...preview.commit_rows] : [row],
-            height,
-        );
-    }, [on_row_resize]);
+        // Handed up as intervals, never as the expanded row list this used to pass.
+        // `commit_rows` is the user's whole row selection and can be select-all, so the
+        // expansion produced one number per row of the sheet purely to say "all of
+        // them" — and the message would then have carried a copy of it across the
+        // bridge. Coalescing is `selected_display_row_intervals`', reused rather than
+        // rewritten; it is also the clamp against `row_count`.
+        //
+        // It still walks the selection once (`CompactSelection.toArray` — the class
+        // keeps its ranges in a *private* field, so nothing typed can read them), which
+        // is the cost the old code paid too. The saving that matters is downstream: what
+        // crosses to the host, and what the host counts against
+        // `MAX_PERSISTED_ROW_HEIGHTS` before allocating anything.
+        const selected = preview.commit_rows
+            ? selected_display_row_intervals(
+                { columns: CompactSelection.empty(), rows: preview.commit_rows },
+                row_count,
+            )
+            : null;
+        on_row_resize(selected ?? [{ start: row, end: row }], height);
+    }, [on_row_resize, row_count]);
 
     // Armed by a header mousedown (Glide selects the column and reports it via
     // onGridSelectionChange before any drag movement); consumed by hover events
@@ -2855,14 +2916,21 @@ export function GridShell({
                 version={version}
                 highlight_version={highlight_version}
             />
-            {!transformed && (
-                <RowResizeOverlay
-                    ref={row_resize_ref}
-                    on_resize_start={handle_row_resize_start}
-                    on_resize={handle_row_resize_drag}
-                    on_resize_end={handle_row_resize_end}
-                />
-            )}
+            {/*
+              * Mounted unconditionally. It used to be withheld under a permutation,
+              * because the height a drag committed was persisted at the display row it
+              * was dragged on and that named the wrong source row — so the affordance
+              * was removed rather than allowed to corrupt durable state. The drag now
+              * reports display intervals and the host maps them through the very
+              * permutation the user was looking at, which makes a permuted view an
+              * ordinary case.
+              */}
+            <RowResizeOverlay
+                ref={row_resize_ref}
+                on_resize_start={handle_row_resize_start}
+                on_resize={handle_row_resize_drag}
+                on_resize_end={handle_row_resize_end}
+            />
             {cell_tooltip && (
                 <div
                     ref={cell_tooltip_el_ref}

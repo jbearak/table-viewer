@@ -21,9 +21,23 @@ export interface LayoutSheetPatch<T> {
     readonly change: LayoutValueChange<T>;
 }
 
+/**
+ * The layout leaves a `stateChanged` message may write.
+ *
+ * `rowHeights` is deliberately not among them, alongside `transforms`,
+ * `columnVisibility` and `cellHighlights`: all four are host-owned, and a patch leaf is
+ * exactly the mechanism by which a webview could overwrite one. For heights that is not
+ * a hypothetical. Durable heights are keyed by canonical source row
+ * (`PerFileState.rowHeights`) and the webview cannot map display→source for a
+ * select-all resize, because those rows were never loaded — so the only map it could
+ * ever offer here is display-keyed, which is the mis-keying the source-keyed design
+ * exists to end. Worse, its copy would be a *stale* display-keyed map on every
+ * same-basis refresh, and a leaf patch derived against it would delete the host's
+ * entries. Removing the leaf makes that unreachable rather than merely discouraged; the
+ * write path is `setRowHeights`, which the host maps and clamps.
+ */
 export interface LayoutStatePatch {
     readonly columnWidths: readonly LayoutNumericMapPatch[];
-    readonly rowHeights: readonly LayoutNumericMapPatch[];
     readonly scrollPosition: readonly LayoutSheetPatch<ScrollPosition>[];
     readonly activeSheetIndex?: LayoutValueChange<number>;
     readonly tabOrientation?: LayoutValueChange<'horizontal' | 'vertical' | null>;
@@ -116,10 +130,6 @@ export function derive_layout_state_patch(
             basis.columnWidths,
             incoming.columnWidths,
         ),
-        rowHeights: derive_numeric_map_patches(
-            basis.rowHeights,
-            incoming.rowHeights,
-        ),
         scrollPosition: derive_scroll_patches(
             basis.scrollPosition,
             incoming.scrollPosition,
@@ -148,7 +158,6 @@ export function layout_state_patch_is_empty(
     patch: Readonly<LayoutStatePatch>,
 ): boolean {
     return patch.columnWidths.length === 0
-        && patch.rowHeights.length === 0
         && patch.scrollPosition.length === 0
         && patch.activeSheetIndex === undefined
         && patch.tabOrientation === undefined;
@@ -220,13 +229,6 @@ export function apply_layout_state_patch(
     );
     if (column_widths !== current.columnWidths) {
         result = { ...result, columnWidths: column_widths };
-    }
-    const row_heights = apply_numeric_map_patches(
-        current.rowHeights,
-        patch.rowHeights,
-    );
-    if (row_heights !== current.rowHeights) {
-        result = { ...result, rowHeights: row_heights };
     }
     const scroll_position = apply_scroll_patches(
         current.scrollPosition,

@@ -56,6 +56,7 @@ import { SourceCandidate } from './source-candidate';
 import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
+    MAX_PERSISTED_ROW_HEIGHTS,
     sanitize_excel_header_overrides,
     sheet_name_from_transform_schema,
     transform_has_entries,
@@ -72,6 +73,13 @@ import {
 } from './types';
 import { sanitize_transform_state } from './webview/sheet-state';
 import { sanitize_column_visibility_state } from './webview/column-projection';
+// The host is now the only writer of durable heights, so the floor a resize is clamped
+// against has to be applied here. Imported from the webview module that already owns it
+// rather than restated: two copies of a minimum are two numbers that can drift, and the
+// module is pure arithmetic with no DOM or Glide imports — the same reason
+// `sanitize_transform_state` and `sanitize_column_visibility_state` above already cross
+// this boundary.
+import { clamp_row_height } from './webview/row-heights';
 import {
     cell_highlight_states_equal,
     rebase_cell_highlight_digest,
@@ -680,13 +688,44 @@ export function attach_viewer(
      */
     let durable_pending_edits: PerFileState['pendingEdits'];
 
+    /**
+     * The durable custom row heights this panel last observed, latched for the same
+     * reason as `durable_pending_edits`: `installed_view` builds its record
+     * synchronously, on paths (an install, a snapshot delivery) that must not acquire a
+     * state read they did not need before.
+     *
+     * Staleness here is bounded by the write that ends it, and the bound is tighter than
+     * the pending-edit one because there is no debounce in the way: the host is the only
+     * writer of heights, every write goes through `update_file_state`, and that calls
+     * `observe_durable_state` on the committed snapshot before it returns — so the latch
+     * is fresh by the time the `setRowHeights` handler asks for a re-delivery.
+     */
+    let durable_row_heights_state: PerFileState['rowHeights'];
+    /**
+     * Revision of the read `durable_row_heights_state` came from, so an older read
+     * finishing late cannot replace a newer one. The pending-edit latch gets this from
+     * `file_edit_state.durableTransform.revision`; heights are latched outside that
+     * record — see below — so they carry their own.
+     */
+    let durable_row_heights_revision = -1;
+
     /** Latched facts about durable state, refreshed on every read of it. */
     function observe_durable_state(snapshot: Readonly<FileStateSnapshot>): void {
+        const state = snapshot.state as PerFileState;
+        // Ahead of the edit-state guard below, deliberately. `file_edit_state` exists
+        // only for editable files, i.e. CSV, and only once something has asked to edit
+        // one; row heights are a property of every format. Latched after that guard,
+        // Excel would observe heights exactly never, and the projection every delivery
+        // carries would be permanently empty — custom heights would silently stop
+        // working on the format that has the most rows to resize.
+        if (snapshot.revision >= durable_row_heights_revision) {
+            durable_row_heights_revision = snapshot.revision;
+            durable_row_heights_state = state.rowHeights;
+        }
         if (
             !file_edit_state
             || snapshot.revision < file_edit_state.durableTransform.revision
         ) return;
-        const state = snapshot.state as PerFileState;
         file_edit_state.durableTransform = {
             revision: snapshot.revision,
             active: state.transforms?.some(transform_is_active) ?? false,
@@ -707,6 +746,20 @@ export function attach_viewer(
     function durable_pending_edit_keys(): readonly string[] {
         const scoped = pending_edits_for_current_session(durable_pending_edits);
         return scoped ? Object.keys(scoped) : [];
+    }
+
+    /**
+     * The durable per-sheet custom row heights, keyed by canonical source row, for the
+     * core's display-keyed projection to re-key.
+     *
+     * Unscoped and unfiltered, unlike `durable_pending_edit_keys`. Heights are not
+     * session-owned work: there is no claim over them, no tombstoning, and no other
+     * panel whose heights these might be — every panel on this file shows the same
+     * heights, which is the point of persisting them. So there is nothing to narrow and
+     * the latch is the answer.
+     */
+    function durable_row_heights(): readonly (Record<number, number> | undefined)[] {
+        return durable_row_heights_state ?? [];
     }
 
     function sync_active_transform_panel(): void {
@@ -1426,9 +1479,15 @@ export function attach_viewer(
             && same_snapshot_identity(message.snapshotIdentity, acknowledged_identity);
     }
 
-    function enqueue_layout_write(operation: () => Promise<void>): Promise<void> {
+    /**
+     * Serialize one durable layout write behind every earlier one. Generic in the
+     * operation's result so a caller that needs the committed snapshot back — the
+     * `setRowHeights` handler, which has to deliver explicitly afterwards — can be on the
+     * same tail as `persist_layout_state`, which needs nothing back.
+     */
+    function enqueue_layout_write<T>(operation: () => Promise<T>): Promise<T> {
         const write = layout_write_tail.catch(() => {}).then(operation);
-        layout_write_tail = write.catch(() => {});
+        layout_write_tail = write.then(() => {}, () => {});
         return write;
     }
 
@@ -2114,6 +2173,7 @@ export function attach_viewer(
                     onTransformCommit: persist_transform_commit,
                     onInvalidRestore: cleanup_invalid_restore,
                     durablePendingEditKeys: durable_pending_edit_keys,
+                    durableRowHeights: durable_row_heights,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -4102,6 +4162,125 @@ export function attach_viewer(
                     hiddenRows: hidden_rows,
                     schema: transform_schema_for_sheet(sheet),
                 }));
+                return;
+            }
+            /**
+             * Durably record one height for every row of a completed resize.
+             *
+             * The write is `setColumnVisibility`'s shape — a currency predicate re-asked
+             * across every await, `update_file_state`, then an *explicit* delivery,
+             * because `update_file_state`'s own `update_session_state_material` does not
+             * deliver and the display-keyed projection the webview renders from is
+             * recomputed only when something is delivered. The display→source mapping and
+             * the generation pair guarding it are `hideRows`'s, because the request names
+             * rows in a coordinate space only one specific permutation defines.
+             *
+             * Currency is `generation` + `sourceGeneration` and deliberately *not*
+             * `layout_write_is_current`. That predicate also demands a matching
+             * acknowledged snapshot identity, which is affordable for `stateChanged` only
+             * because a dropped one loses nothing — `state_ref` still holds the value and
+             * the next debounced persist resends it. The webview no longer holds durable
+             * heights, so here a drop is the resize gone for good; the test must therefore
+             * be exactly what the request depends on and nothing more.
+             *
+             * Serialized through `enqueue_layout_write` so it cannot interleave with
+             * `persist_layout_state`. Both write the same durable document through
+             * read-modify-write CAS loops, and while `rowHeights` is no longer a layout
+             * patch leaf, the two still touch peer leaves of one object; running them on
+             * one tail is how `columnWidths` and `scrollPosition` already avoid trading
+             * CAS retries with each other.
+             *
+             * The stale-generation rejections are silent, and that is a decision. There is
+             * no refusal message and deliberately no deferred replay — replaying a resize
+             * against a moved view resizes whatever rows now sit at those display
+             * positions. Nor is a message needed: the delivery that moved the generation
+             * is what makes the webview's generation differ from the one it posted, so the
+             * optimistic overlay tagged with that generation is discarded and the row
+             * visibly springs back. The user's next drag is the retry.
+             */
+            case 'setRowHeights': {
+                if (profile.previewMode === true) return;
+                const message = structuredClone(msg);
+                const receiver_epoch = session.current_receiver_epoch;
+                const resize_is_current = () => !disposed
+                    && session.current_receiver_epoch === receiver_epoch
+                    && message.generation === core?.generation
+                    && message.sourceGeneration === core?.source_generation;
+                if (!core || !source || !resize_is_current()) return;
+                if (!source.meta().sheets[message.sheetIndex]) return;
+                if (!Number.isFinite(message.height)) return;
+                // Clamped before anything durable is touched, so no arithmetic slip in
+                // the webview can persist a zero- or negative-height row — a row the
+                // user would then have no visible edge left to drag back.
+                const height = clamp_row_height(message.height);
+                // Counted from the intervals *before* mapping, which is the only place it
+                // can usefully be counted: `map_display_rows_to_source` allocates two
+                // `Uint32Array`s the size of the request, so a select-all on a
+                // ten-million-row sheet has already cost 80MB by the time a post-mapping
+                // check could look at it.
+                let requested_rows = 0;
+                for (const interval of message.rows) {
+                    if (
+                        !Number.isInteger(interval.start)
+                        || !Number.isInteger(interval.end)
+                        || interval.end < interval.start
+                    ) return;
+                    requested_rows += interval.end - interval.start + 1;
+                }
+                if (requested_rows === 0) return;
+                if (requested_rows > MAX_PERSISTED_ROW_HEIGHTS) {
+                    show_owner_warning('Too many resized rows to persist.');
+                    return;
+                }
+                let mapped: Uint32Array;
+                try {
+                    mapped = core.map_display_rows_to_source(
+                        message.sheetIndex,
+                        message.rows,
+                    );
+                } catch {
+                    // `map_display_rows_to_source` throws for an interval outside the
+                    // installed view. On a current generation that is a malformed request
+                    // rather than a stale one, and there is nothing to write either way.
+                    return;
+                }
+                const committed = await enqueue_layout_write(async () => {
+                    if (!resize_is_current()) return undefined;
+                    return update_file_state((current) => {
+                        if (!resize_is_current()) return current;
+                        const rowHeights = [...(current.rowHeights ?? [])];
+                        const existing = rowHeights[message.sheetIndex];
+                        const next = { ...(existing ?? {}) };
+                        let changed = false;
+                        for (const source_row of mapped) {
+                            if (next[source_row] === height) continue;
+                            next[source_row] = height;
+                            changed = true;
+                        }
+                        // A drag ending on the height the rows already have writes
+                        // nothing, so `update_file_state` returns undefined and no
+                        // delivery follows. Worth being explicit about: a resize reports
+                        // its final size, and reporting an unchanged one is the ordinary
+                        // outcome of a click that moves a pixel and comes back.
+                        if (!changed) return current;
+                        // The accumulated map, not this request: the cap is on what the
+                        // file ends up holding, so a hundred small resizes cannot walk
+                        // past a bound one large one would have been refused at.
+                        // All-or-nothing rather than partial, because a sheet resized up
+                        // to an arbitrary row and default below it reads as corruption.
+                        if (Object.keys(next).length > MAX_PERSISTED_ROW_HEIGHTS) {
+                            return current;
+                        }
+                        rowHeights[message.sheetIndex] = next;
+                        return { ...current, rowHeights };
+                    }, undefined, resize_is_current);
+                });
+                if (committed && resize_is_current()) {
+                    session.update_state_snapshot(
+                        project_state_for_panel(committed),
+                        { deliver: true },
+                    );
+                }
                 return;
             }
             case 'setTransform': {

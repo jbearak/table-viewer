@@ -26,15 +26,16 @@ function normalized(
 describe('layout state patches', () => {
     it('derives only changed layout leaves in deterministic sheet and key order', () => {
         const basis = normalized({
-            columnWidths: [{ 10: 110, 2: 102 }, { 0: 90 }],
-            rowHeights: [{ 4: 24 }],
+            // Sheet 2's map is identical in both, which is the canary `rowHeights`
+            // carried before the leaf was removed: a map that did not change must
+            // produce no entry at all, not an empty one.
+            columnWidths: [{ 10: 110, 2: 102 }, { 0: 90 }, { 4: 24 }],
             scrollPosition: [{ top: 1, left: 2 }],
             pendingEdits: { '0:0': 'draft' },
             excelFirstRowHeaders: { Sheet1: 'on' },
         });
         const incoming = normalized({
-            columnWidths: [{ 10: 210, 2: 102 }, { 0: 90, 3: 93 }],
-            rowHeights: [{ 4: 24 }],
+            columnWidths: [{ 10: 210, 2: 102 }, { 0: 90, 3: 93 }, { 4: 24 }],
             scrollPosition: [{ top: 5, left: 6 }],
             activeSheetIndex: 1,
             tabOrientation: 'vertical',
@@ -49,7 +50,6 @@ describe('layout state patches', () => {
                 { sheetIndex: 0, entries: [{ key: 10, change: { type: 'set', value: 210 } }] },
                 { sheetIndex: 1, entries: [{ key: 3, change: { type: 'set', value: 93 } }] },
             ],
-            rowHeights: [],
             scrollPosition: [{
                 sheetIndex: 0,
                 change: { type: 'set', value: { top: 5, left: 6 } },
@@ -61,14 +61,32 @@ describe('layout state patches', () => {
         expect(Object.isFrozen(patch.columnWidths[0].entries[0])).toBe(true);
     });
 
+    it('never patches row heights, however far the panel copy has drifted', () => {
+        // Heights are host-owned: the only writer is `setRowHeights`, so a `stateChanged`
+        // must not be able to touch them. The panel's copy is display-keyed and goes stale
+        // the moment a sort installs, so a patch derived from it would delete the host's
+        // source-keyed entries and write nonsense in their place. Asserted as "no leaf
+        // exists" rather than "the leaf is empty", because an empty leaf is one refactor
+        // away from a populated one.
+        const basis = normalized({ rowHeights: [{ 0: 20 }, { 5: 60 }] });
+        const incoming = normalized({ rowHeights: [{ 0: 99 }, undefined, { 1: 44 }] });
+
+        const patch = derive_layout_state_patch(basis, incoming);
+
+        expect('rowHeights' in patch).toBe(false);
+        expect(layout_state_patch_is_empty(patch)).toBe(true);
+        const latest: PerFileState = { rowHeights: [{ 0: 20 }, { 5: 60 }] };
+        expect(apply_layout_state_patch(latest, patch)).toBe(latest);
+    });
+
     it('merges disjoint sheet and numeric-map changes into the latest durable state', () => {
         const basis = normalized({
             columnWidths: [{ 0: 100 }, { 0: 200 }],
-            rowHeights: [{ 0: 20 }],
         });
         const incoming = normalized({
-            columnWidths: [{ 0: 125 }, { 0: 200 }],
-            rowHeights: [{ 0: 20, 2: 32 }],
+            // Key 2 is a pure addition beside the change to key 0 — the other half of
+            // what the removed `rowHeights` leaf used to cover here.
+            columnWidths: [{ 0: 125, 2: 32 }, { 0: 200 }],
         });
         const patch = derive_layout_state_patch(basis, incoming);
         const latest: PerFileState = {
@@ -88,13 +106,11 @@ describe('layout state patches', () => {
         const merged = apply_layout_state_patch(latest, patch);
 
         expect(merged.columnWidths).toEqual([
-            { 0: 125, 1: 150 },
+            { 0: 125, 1: 150, 2: 32 },
             { 0: 240 },
         ]);
-        expect(merged.rowHeights).toEqual([
-            { 0: 20, 2: 32 },
-            { 1: 41 },
-        ]);
+        // Untouched by the patch, and the trailing sheet the panel never saw survives.
+        expect(merged.rowHeights).toBe(latest.rowHeights);
         expect(merged.pendingEdits).toEqual({ '0:0': 'peer' });
         expect(merged.excelFirstRowHeaders).toEqual({ Sheet1: 'off' });
         expect(merged.cellHighlights).toBe(latest.cellHighlights);
@@ -103,20 +119,20 @@ describe('layout state patches', () => {
     it('deletes only basis-known keys and preserves concurrent additions', () => {
         const basis = normalized({
             columnWidths: [{ 0: 100, 1: 110 }],
-            rowHeights: [{ 0: 20 }],
         });
         const incoming = normalized({
             columnWidths: [{ 1: 110 }],
-            rowHeights: [],
         });
         const patch = derive_layout_state_patch(basis, incoming);
+        // Row heights the panel would have deleted stand: same shape as the columnWidths
+        // case below, and the whole point of the leaf being gone.
         const merged = apply_layout_state_patch({
             columnWidths: [{ 0: 100, 1: 110, 2: 120 }],
             rowHeights: [{ 0: 20, 1: 30 }],
         }, patch);
 
         expect(merged.columnWidths).toEqual([{ 1: 110, 2: 120 }]);
-        expect(merged.rowHeights).toEqual([{ 1: 30 }]);
+        expect(merged.rowHeights).toEqual([{ 0: 20, 1: 30 }]);
     });
 
     it('collapses emptied maps to undefined without truncating unrelated sheets', () => {

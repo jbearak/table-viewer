@@ -195,6 +195,10 @@ describe('ViewerPanelCore', () => {
                 // provider wired — but present, because every delivery is built from
                 // this and the webview reads it positionally.
                 hiddenEditedCellKeys: [[]],
+                // Also per sheet, but `undefined` rather than `{}` with no durable-height
+                // provider wired: the projection says "this sheet has no custom heights",
+                // which is what an unwired core and an unresized sheet both mean.
+                rowHeightProjection: [undefined],
             },
             diagnostics: { truncationMessage: 'Showing 4 rows' },
         });

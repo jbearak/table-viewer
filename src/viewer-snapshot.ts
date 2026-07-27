@@ -118,6 +118,36 @@ export interface WorkbookSnapshot {
      * identifies.
      */
     readonly hiddenEditedCellKeys: readonly (readonly string[])[];
+    /**
+     * The durable custom row heights re-keyed into the display space of the view the
+     * host holds for each sheet, positionally matching `meta.sheets`. Sparse — an absent
+     * key is the default height — and `undefined` for a sheet with no custom heights at
+     * all, which is the overwhelmingly common case and so worth not sending as `{}`.
+     *
+     * This is what the webview renders from. It cannot compute it: durable heights are
+     * keyed by canonical source row (`PerFileState.rowHeights`) and the permutation plus
+     * the source→projected mapping that invert one into the other live only on the host.
+     *
+     * Sampled beside `hiddenEditedCellKeys` for the identical reason, and the argument
+     * transfers verbatim because both values are meaningless except against one specific
+     * permutation. `create_desired` samples the core live and synchronously for every
+     * delivery, so this and `generation` above are read in the same instant and cannot
+     * name different permutations — whereas a value carried on the projected
+     * capabilities is sampled only when something re-projects them, and could describe a
+     * permutation two installs old. Applied to the wrong permutation a display-keyed
+     * height map is not stale but *wrong*: every height renders against a different row,
+     * which is the exact bug source-keyed durable heights exist to end.
+     *
+     * Every delivery, and not only the ones that moved a row, because both halves of
+     * this join move independently. The permutation moves at an install; the durable
+     * heights move on a `setRowHeights`, a sibling panel's write, or an excel-header plan
+     * edit, none of which install anything or bump a generation. So there is no event
+     * that can be relied on to be the last word, and the answer is simply recomputed
+     * whenever anything is delivered. The install case is the one gap a delivery does not
+     * cover — an install posts no snapshot — and `transformInstalled.rowHeights` covers
+     * it.
+     */
+    readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
     readonly state: NormalizedPerFileState;
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
@@ -139,6 +169,12 @@ export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = Workbo
      * that record describes. See `WorkbookSnapshot.hiddenEditedCellKeys`.
      */
     readonly hiddenEditedCellKeys: readonly (readonly string[])[];
+    /**
+     * The display-keyed row-height projection for the view this core holds right now,
+     * one entry per sheet. Sampled in the same statement as the generation and the keys
+     * above, for the same reason. See `WorkbookSnapshot.rowHeightProjection`.
+     */
+    readonly rowHeightProjection: readonly (Readonly<Record<number, number>> | undefined)[];
 }
 
 export interface WorkbookSnapshotDiagnostics {
@@ -201,6 +237,7 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         reason: input.reason,
         meta: input.core.meta,
         hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
+        rowHeightProjection: input.core.rowHeightProjection,
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,
@@ -276,6 +313,16 @@ export function normalize_complete_per_file_state(
         && stored.excelFirstRowHeaderVersion === 1
     ) {
         normalized.excelFirstRowHeaderVersion = 1;
+    }
+    // Same shape and the same reason as the marker above: a migration marker is only
+    // ever exactly `1`, so anything else on disk — a truncated write, a hand edit, a
+    // future version's `2` read by this one — must normalize to "not migrated" and let
+    // the pass run again rather than be trusted as "already done". Carried through here
+    // rather than in `normalize_per_file_state` because, like the Excel markers, it is
+    // host-owned: no webview state ever names it, so the webview's normalizer has no
+    // business preserving it.
+    if ('rowHeightsVersion' in stored && stored.rowHeightsVersion === 1) {
+        normalized.rowHeightsVersion = 1;
     }
     return normalized;
 }
