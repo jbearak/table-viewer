@@ -65,6 +65,14 @@ export interface SemanticPalette {
 // can reach them without importing theme.ts, which imports it back.
 export const SYSTEM_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Ubuntu', 'Droid Sans', sans-serif";
 export const MONO_FONT = "Menlo, Monaco, 'Courier New', monospace";
+
+/** Keep an unavailable configured face on the same fallback as an empty
+ * preference. CSS otherwise falls all the way back to its initial serif face
+ * when a non-empty family name cannot be resolved. */
+export function font_family_with_fallback(configured: string, fallback: string): string {
+    const family = configured.trim();
+    return family ? `${family}, ${fallback}` : fallback;
+}
 /** Fallback only: the configured desktop font size is injected ahead of this
  *  by the viewer page bootstrap (--table-viewer-font-size). */
 export const BASE_FONT_SIZE = '13px';

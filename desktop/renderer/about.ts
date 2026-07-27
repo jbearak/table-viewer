@@ -5,6 +5,7 @@
 import type { AboutApi } from '../preload/about-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
+import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
 
 const about_api = (window as unknown as { aboutApi: AboutApi }).aboutApi;
 
@@ -26,9 +27,10 @@ function apply_theme(payload: ThemePayload): void {
 /** The font preference styles the whole app, so this window follows it too. */
 function apply_fonts(settings: DesktopSettings): void {
     const root = document.documentElement;
-    const family = settings.fontFamily.trim();
-    if (family) root.style.setProperty('--about-font-family', family);
-    else root.style.removeProperty('--about-font-family');
+    root.style.setProperty(
+        '--about-font-family',
+        font_family_with_fallback(settings.fontFamily, SYSTEM_FONT),
+    );
     root.style.setProperty('--about-font-size', `${settings.fontSize}px`);
 }
 
