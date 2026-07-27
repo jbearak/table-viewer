@@ -4276,7 +4276,11 @@ export function attach_viewer(
              * positions. Nor is a message needed: the delivery that moved the generation
              * is what makes the webview's generation differ from the one it posted, so the
              * optimistic overlay tagged with that generation is discarded and the row
-             * visibly springs back. The user's next drag is the retry.
+             * visibly springs back. The user's next drag is the retry. "Stale" is scoped to
+             * the sheet the request names, not to the core-wide generation — see
+             * `mapping_generation` in the predicate below — and the webview's overlay
+             * lifecycle is scoped the same way, so the two halves agree about which
+             * requests die.
              *
              * No preview-mode refusal, unlike `hideRows` directly above, and the difference
              * is not an oversight. `hideRows` is a *view transform*: it changes which rows
@@ -4296,8 +4300,36 @@ export function attach_viewer(
                 const expected_authority = source_authority.authorityRevision;
                 const resize_is_current = () => !disposed
                     && session.current_receiver_epoch === receiver_epoch
-                    && message.generation === core?.generation
-                    && message.sourceGeneration === core?.source_generation
+                    // A *range* on the generation rather than equality, and the only
+                    // predicate in this file that asks it that way. The generation is
+                    // core-wide but a permutation is per sheet, so equality refuses
+                    // requests that were always safe: a saved transform restoring on a
+                    // background sheet, or a long sort the user started before switching
+                    // tabs, bumps the shared generation and silently springs back a resize
+                    // on the sheet they are actually looking at — whose display->source
+                    // mapping never moved. `core.mapping_generation` is the fact that
+                    // tells the two apart, and it is host-side, so this needs nothing new
+                    // on the wire: the webview keeps posting the one global generation it
+                    // holds.
+                    //
+                    // Both bounds are load-bearing. The lower one is the real refusal — a
+                    // generation older than *this sheet's* mapping generation names
+                    // display rows in an arrangement this sheet has left, and honouring it
+                    // would resize whatever rows now sit at those positions, which is also
+                    // why a refusal is dropped rather than replayed. The upper one refuses
+                    // a generation the core has never issued; unreachable from an honest
+                    // webview, but it is the term that keeps "at least the sheet's
+                    // mapping" from degenerating into "any number at all" for a sheet that
+                    // has never been permuted, whose mapping generation is the floor.
+                    //
+                    // This only ever *accepts* a request that was already safe. Nothing is
+                    // queued and nothing is retried: every request that gets through is
+                    // executed against a mapping provably identical to the one the webview
+                    // composed it against.
+                    && core !== undefined
+                    && message.generation >= core.mapping_generation(message.sheetIndex)
+                    && message.generation <= core.generation
+                    && message.sourceGeneration === core.source_generation
                     // `state_write_is_current` is the term that actually catches the
                     // refresh window; probing found it sufficient on its own, because the
                     // coordinator's authority advances first and monotonically. The

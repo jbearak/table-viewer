@@ -254,10 +254,30 @@ function migrate_row_heights_for_file(
     const previous_active = sanitize_excel_header_active(
         current.excelFirstRowHeaderActive,
     );
-    const rowHeights = [...(current.rowHeights ?? [])];
-    input.sheets.forEach((planning_sheet, index) => {
-        rowHeights[index] = migrate_display_keyed_row_heights(
-            rowHeights[index],
+    // Built to the workbook's own length rather than copied from `current.rowHeights`,
+    // which drops any slot past the last sheet this workbook has — and dropping is the
+    // honest answer here rather than the lazy one.
+    //
+    // The marker this migration stamps is per *file*, so keeping such a slot would
+    // declare a still-display-keyed map canonical; if that sheet ever came back, every
+    // height on it would be off by one, permanently and with nothing to notice it by.
+    // Migrating it instead is not available: the shift needs that sheet's projection facts
+    // (`headerSourceRow`, via `project_excel_header_sheet` inside
+    // `pre_migration_row_height_space`) and a sheet the workbook does not have supplies
+    // none — there is literally nothing to invert the old key space with. So the choice is
+    // between a silent off-by-one and losing hand-set heights for a sheet that is not in
+    // the file, and the visible loss is the smaller harm.
+    //
+    // Worth naming the case this does change behaviour for: a sheet absent only
+    // *temporarily* — an external write that removes it, a later one that puts it back —
+    // loses its custom heights, where before this it kept them (mis-keyed). Accepted, and
+    // not a new exposure: durable per-sheet state here is positional, a workbook that lost
+    // a sheet has already renumbered every slot after it, and this file already drops
+    // trailing state on that same reasoning (`scrollPosition`, and the
+    // `excelFirstRowHeaderVersion` migration).
+    return input.sheets.map((planning_sheet, index) => (
+        migrate_display_keyed_row_heights(
+            current.rowHeights?.[index],
             pre_migration_row_height_space(
                 first_migration,
                 Object.prototype.hasOwnProperty.call(
@@ -267,9 +287,8 @@ function migrate_row_heights_for_file(
                 first_migration ? false : previous_active[planning_sheet.name],
                 planning_sheet,
             ),
-        );
-    });
-    return rowHeights;
+        )
+    ));
 }
 
 /** Plan a durable explicit override solely from state plus immutable facts. */

@@ -16,10 +16,17 @@ import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-
 import type { FileStateStore } from '../state';
 import {
     MAX_PERSISTED_ROW_HEIGHTS,
+    transform_schema_for_sheet,
     type HostMessage,
     type StoredPerFileState,
     type WebviewMessage,
 } from '../types';
+import type {
+    DataSource,
+    RenderedCell,
+    RowWindow,
+    WorkbookMeta,
+} from '../data-source/interface';
 import { MAX_ROW_HEIGHT_PX, MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import {
@@ -95,9 +102,20 @@ async function resize(
     rows: Array<{ start: number; end: number }>,
     height: number,
 ): Promise<void> {
+    await resize_sheet(panel, basis, 0, rows, height);
+}
+
+/** `resize`, for the multi-sheet fixture where the sheet index is the point. */
+async function resize_sheet(
+    panel: ReturnType<typeof open_csv_table>,
+    basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'>,
+    sheetIndex: number,
+    rows: Array<{ start: number; end: number }>,
+    height: number,
+): Promise<void> {
     await panel.__receive({
         type: 'setRowHeights',
-        sheetIndex: 0,
+        sheetIndex,
         rows,
         height,
         generation: basis.generation,
@@ -228,7 +246,36 @@ describe('the setRowHeights host handler', () => {
             .toEqual([{ 0: MAX_ROW_HEIGHT_PX }]));
     });
 
-    it('ignores a stale generation, writing nothing and replaying nothing', async () => {
+    it('refuses a generation older than this sheet\'s own mapping generation', async () => {
+        // The refusal that survives scoping currency per sheet, and the direction that
+        // matters: a display row from before *this* sheet was permuted names a different
+        // source row now, so honouring the request would resize whatever row has since
+        // moved into that position. Nothing is replayed either — a replay would do exactly
+        // that damage one beat later.
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+        const sorted = await install_ascending_sort(panel, initial);
+        const revision = state.revision(file_path);
+
+        // Display row 0 pre-sort is source row 0 (`c`); post-sort it is source row 1
+        // (`a`). The two answers differ, which is what makes the refusal observable.
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+        // A current request proves the stale one wrote nothing rather than merely not
+        // having arrived yet, and that nothing was queued behind it.
+        await resize(panel, sorted.view.basis, [{ start: 0, end: 0 }], 55);
+
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 1: 55 }));
+        expect(state.revision(file_path)).toBe(revision + 1);
+        expect(warnings()).toEqual([]);
+    });
+
+    it('ignores a generation the core has never issued, writing nothing', async () => {
+        // The upper bound of the accepted range. Unreachable from an honest webview — it
+        // only ever posts a generation the host gave it — but it is what keeps "at least
+        // this sheet's mapping generation" from degenerating into "any number at all" on a
+        // sheet that has never been permuted, whose mapping generation is the floor.
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
@@ -628,4 +675,162 @@ describe('the setRowHeights host handler', () => {
     // test asserting that it does not would pass with every implementation. The guard
     // stays as the cheapest of the three refusals; `map_display_rows_to_source`'s own
     // range test is where the behaviour is covered.
+});
+
+/**
+ * A workbook with two sheets, which is the only shape in which the question can be asked
+ * at all: the generation is core-wide but a permutation is per sheet, so telling "the view
+ * moved" from "this sheet's view moved" needs a second sheet to move instead. CSV is
+ * always one sheet, hence a bare multi-sheet `DataSource` behind a minimal profile rather
+ * than `csv_table_profile`.
+ */
+class TwoSheetSource implements DataSource {
+    private readonly rows: Record<number, string[]> = {
+        0: ['c', 'a', 'b'],
+        1: ['q', 'p', 'r'],
+    };
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [0, 1].map((sheet) => ({
+                name: `Sheet${sheet + 1}`,
+                rowCount: this.rows[sheet].length,
+                sourceRowCount: this.rows[sheet].length,
+                columnCount: 1,
+                merges: [],
+                hasFormatting: false,
+            })),
+        };
+    }
+
+    read_rows(sheet: number, start: number, count: number): RowWindow {
+        const values = this.rows[sheet] ?? [];
+        const clamped = Math.max(0, Math.min(start, values.length));
+        const rows: (RenderedCell | null)[][] = values
+            .slice(clamped, clamped + count)
+            .map((raw) => [{ raw, formatted: raw, bold: false, italic: false }]);
+        return { startRow: clamped, rows };
+    }
+
+    close(): void {}
+}
+
+function open_two_sheet_workbook(store: FileStateStore) {
+    const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+    const controller = attach_viewer(
+        panel as unknown as Parameters<typeof attach_viewer>[0],
+        vscode_mock.Uri.file(file_path) as unknown as vscode.Uri,
+        with_in_memory_authority_transactions(store),
+        { editing: false, async build_source() { return new TwoSheetSource(); } },
+        fake_viewer_host,
+    );
+    panel.onDidDispose(() => controller.dispose());
+    return panel;
+}
+
+/** Sort one sheet ascending on its only column, and return the ack it installed. */
+async function sort_sheet_ascending(
+    panel: ReturnType<typeof open_two_sheet_workbook>,
+    basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration' | 'meta'>,
+    sheetIndex: number,
+): Promise<Extract<HostMessage, { type: 'transformInstalled' }>> {
+    const requestId = `sort-${sheetIndex}-${basis.generation}`;
+    await panel.__receive({
+        type: 'setTransform',
+        sheetIndex,
+        requestId,
+        generation: basis.generation,
+        sourceGeneration: basis.sourceGeneration,
+        intent: 'user',
+        state: {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: transform_schema_for_sheet(basis.meta.sheets[sheetIndex]),
+        },
+    } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
+    const acks = () => messages_of(panel, 'transformInstalled')
+        .filter((message) => message.requestId === requestId);
+    await vi.waitFor(() => expect(acks()).toHaveLength(1));
+    return acks()[0];
+}
+
+describe('setRowHeights currency across sheets', () => {
+    it('accepts a resize for a sheet whose mapping never moved, though the generation has', async () => {
+        // The bug this pins: `generation` is one counter for the whole core, so a transform
+        // finishing on *another* sheet — a saved transform restoring on a background sheet,
+        // or a long sort the user kicked off before switching tabs — used to reject a resize
+        // on the sheet in front of them, whose display→source mapping had not moved a row.
+        // The user saw the row silently spring back, with no message and nothing to retry
+        // but the drag.
+        const state = versioned_state_store();
+        const panel = open_two_sheet_workbook(state.store);
+        const initial = await ready(panel);
+        expect(initial.meta.sheets).toHaveLength(2);
+
+        // Sheet 0 is permuted first, so the accepted request below has to be mapped through
+        // a real permutation rather than through the identity — otherwise the test would
+        // pass on a handler that ignored the mapping entirely.
+        const sheet_0_sorted = await sort_sheet_ascending(panel, initial, 0);
+        const sheet_0_basis = sheet_0_sorted.view.basis;
+        // Then sheet 1 moves, bumping the shared generation past what a webview looking at
+        // sheet 0 holds. Sheet 0's own arrangement is untouched.
+        const sheet_1_sorted = await sort_sheet_ascending(
+            panel,
+            { ...initial, generation: sheet_0_basis.generation },
+            1,
+        );
+        expect(sheet_1_sorted.view.basis.generation)
+            .toBeGreaterThan(sheet_0_basis.generation);
+
+        await resize(panel, sheet_0_basis, [{ start: 0, end: 1 }], 44);
+
+        // Accepted, and mapped through sheet 0's ascending sort: display rows 0 and 1 are
+        // `a` and `b`, source rows 1 and 2. A handler that had refused writes nothing; one
+        // that accepted but ignored the permutation would write {0, 1}.
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0])
+            .toEqual({ 1: 44, 2: 44 }));
+        expect(warnings()).toEqual([]);
+    });
+
+    it('refuses a resize for the sheet that moved, in the same run of generations', async () => {
+        // The other half, on the same fixture, because scoping currency per sheet is only
+        // worth anything if it still refuses what it always refused. Same two installs,
+        // same stale generation — the request just names the sheet that was permuted after
+        // it, and that one must die.
+        const state = versioned_state_store();
+        const panel = open_two_sheet_workbook(state.store);
+        const initial = await ready(panel);
+
+        const sheet_0_sorted = await sort_sheet_ascending(panel, initial, 0);
+        const sheet_0_basis = sheet_0_sorted.view.basis;
+        const sheet_1_sorted = await sort_sheet_ascending(
+            panel,
+            { ...initial, generation: sheet_0_basis.generation },
+            1,
+        );
+
+        // `sheet_0_basis.generation` predates sheet 1's install, so for sheet 1 it names an
+        // arrangement that no longer exists. Deliberately naming a *different* display row
+        // from the request below: judged against the wrong sheet's mapping generation this
+        // would be accepted, and it has to leave a key behind that the surviving state can
+        // be distinguished by. (Display row 2 of the sorted sheet 1 is `r`, source row 2.)
+        await resize_sheet(panel, sheet_0_basis, 1, [{ start: 2, end: 2 }], 44);
+        // A current request for the same sheet proves the refused one wrote nothing and was
+        // not queued: display rows 0 and 1 of the sorted sheet 1 are `p` and `q`, source
+        // rows 1 and 0.
+        await resize_sheet(
+            panel,
+            sheet_1_sorted.view.basis,
+            1,
+            [{ start: 0, end: 1 }],
+            55,
+        );
+
+        // Exactly these two keys: an accepted stale request would have added source row 2.
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[1])
+            .toEqual({ 0: 55, 1: 55 }));
+        expect(state.get_state(file_path).rowHeights?.[0]).toBeUndefined();
+        expect(warnings()).toEqual([]);
+    });
 });

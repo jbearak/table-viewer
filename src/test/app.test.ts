@@ -2855,6 +2855,97 @@ describe('row height persistence', () => {
             .toEqual(PENDING_LAYER);
     });
 
+    /**
+     * The other sheet's stored sort, restored on opening its tab, so an install ack for
+     * sheet 1 is one the app is actually waiting for. Returns the request to answer.
+     */
+    async function restore_other_sheets_sort(
+        post_message: ReturnType<typeof vi.fn>,
+    ): Promise<Extract<WebviewMessage, { type: 'setTransform' }>> {
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [undefined, {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Other",1,null]',
+                }],
+            },
+        }));
+        await click_button('Other');
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(1);
+        return restore;
+    }
+
+    it('rebases the overlay when an install on another sheet moves the generation', async () => {
+        const { post_message } = await pending_resize();
+        const restore = await restore_other_sheets_sort(post_message);
+
+        // An install always bumps the generation, so the sheet gate has to be asked
+        // *before* the generation gate or it is dead code — which it was: sheet 0's layer
+        // was tagged with generation 4 and every install for sheet 1 dropped it. That is
+        // the webview half of scoping resize currency per sheet, and the two halves have to
+        // agree: the host, which asks the same question through `mapping_generation`,
+        // *accepts* sheet 0's in-flight resize across this install, so a webview that
+        // discarded the layer would spring the row back and then have the height silently
+        // reappear on the next delivery.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: {} },
+        ));
+
+        await click_button('Sheet1');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-height-overlay')!))
+            .toEqual(PENDING_LAYER);
+        // Rebased, not merely retained: the render gate compares the overlay's generation
+        // with the current one, so a layer left at 4 would be held in state and painted
+        // nowhere. Proved by the reconciliation still working at the new generation — the
+        // layer retires against a projection delivered at 5, which an un-rebased overlay
+        // could not do either.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 5,
+            sourceGeneration: 7,
+            reason: 'other',
+            rowHeightProjection: [{ 3: 50, 5: 50, 8: 50 }, undefined],
+        }));
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!))
+            .toEqual({ 3: 50, 5: 50, 8: 50 });
+    });
+
+    it('discards the overlay when an install on its own sheet moves the generation', async () => {
+        const { post_message } = await pending_resize();
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1', 'Other']), {
+            generation: 4,
+            sourceGeneration: 7,
+            reason: 'other',
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }, undefined],
+            },
+        }));
+        const restore = latest_transform_request(post_message);
+        expect(restore.sheetIndex).toBe(0);
+
+        // The side the sheet gate must not swallow. This install permuted the very sheet
+        // the layer names, so its display rows now name other source rows and the host
+        // refuses the in-flight resize for exactly that reason. Keeping the layer would
+        // paint the user's height on whatever rows moved into positions 3, 5 and 8.
+        await dispatch_host_message(transform_installed_message(
+            restore,
+            { generation: 5, rowHeights: { 1: 41 } },
+        ));
+
+        expect(grid_stub().getAttribute('data-row-height-overlay')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-row-heights')!)).toEqual({ 1: 41 });
+    });
+
     it('does not paint a resize the host is bound to refuse', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {

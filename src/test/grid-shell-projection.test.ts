@@ -2499,6 +2499,98 @@ describe('GridShell stable rows during an edit session', () => {
         );
     });
 
+    /**
+     * An open Glide overlay editor holding `value`, portalled where the shell reads it.
+     *
+     * A `textarea`, not an `input`, and that is not incidental: `HTMLInputElement.value`
+     * strips newlines, so a single-line element cannot express the only value auto-grow
+     * reacts to — the multiline case would silently arrive as `onetwothree` and the test
+     * would pass against an implementation that never grew anything. Glide's overlay is a
+     * textarea for a multiline editor anyway, and the shell's selector accepts both.
+     */
+    function open_overlay_editor(value: string): () => void {
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const editor = document.createElement('textarea');
+        editor.value = value;
+        clip.appendChild(editor);
+        document.body.appendChild(clip);
+        return () => clip.remove();
+    }
+
+    /**
+     * Mount permuted with an editor open on display row 1 — not row 0, so a handler that
+     * read a source row (3 here) or defaulted to the first row would name a visibly wrong
+     * interval — then fold it the way App does.
+     */
+    async function fold_open_editor(value: string): Promise<ReturnType<typeof vi.fn>> {
+        const display_to_source = [1, 3, 0, 2];
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_row_resize = vi.fn();
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            { on_row_resize, editing_ref },
+        ));
+        await act(async () => {
+            (grid_mock.props!.onGridSelectionChange as (selection: unknown) => void)({
+                columns: {},
+                rows: {},
+                current: {
+                    cell: [0, 1],
+                    range: { x: 0, y: 1, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+        const close = open_overlay_editor(value);
+        try {
+            await act(async () => editing_ref.current?.commit_live_edit());
+        } finally {
+            close();
+        }
+        return on_row_resize;
+    }
+
+    it('grows the row when a forced commit folds an open multiline editor', async () => {
+        // The commit path that is *not* Glide's. App folds an open editor through
+        // `commit_live_edit` whenever something is about to remount or re-project the grid
+        // — a transform completing, a column-visibility change — and that path wrote through
+        // `commit_edit` directly, so it skipped auto-grow entirely: the text survived, the
+        // row kept its old height, and it clipped what the user had just typed with nothing
+        // to explain why. Newly reachable precisely because auto-grow stopped being gated
+        // on an unpermuted view, which is what makes it this change's to fix.
+        //
+        // Whether the *host* keeps the height depends on why the fold happened, and that is
+        // deliberately not the shell's business: a fold for a column-visibility change or an
+        // install on another sheet is accepted (`mapping_generation` in `viewer-controller`),
+        // one for an install on this sheet is refused like any other resize naming an
+        // arrangement that has moved. The shell's job is to ask.
+        const on_row_resize = await fold_open_editor(MULTILINE);
+
+        expect(on_row_resize).toHaveBeenCalledWith(
+            [{ start: 1, end: 1 }],
+            expected_grown_height,
+        );
+    });
+
+    it('leaves the row alone when a forced commit folds a single-line editor', async () => {
+        // The negative half, so the test above pins "grows for hard line breaks" rather
+        // than "posts a resize on every fold" — which would cost a durable write and a
+        // delivery on every column-visibility change made with an editor open.
+        //
+        // Held *jointly* by the two guards in `auto_grow_row_for_text`, and probing says so:
+        // the newline test survives its own deletion because `natural_row_height` floors at
+        // the default, so a one-line value measures exactly the default and the height
+        // comparison refuses it; the comparison survives its deletion because the newline
+        // test refuses it first. This fails only when both are gone. What is pinned is the
+        // behaviour, therefore, not either line.
+        const on_row_resize = await fold_open_editor('one line only');
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+    });
+
     it('caps auto-grow at the ceiling and stops re-posting once it is reached', async () => {
         // `natural_row_height` is `lines * line_height + padding`, unbounded in the number
         // of hard newlines a cell holds — so this path, not a malformed message, is the

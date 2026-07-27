@@ -1801,14 +1801,42 @@ export function App(): React.JSX.Element {
                     next[msg.sheetIndex] = msg.rowHeights;
                     return next;
                 });
-                // The overlay, on the same rules as a delivery: void if this install moved
-                // the generation, since a new permutation invalidates display keys
-                // outright; otherwise reconciled by value against the projection that
-                // came with it.
+                // The overlay. An overlay belongs to exactly one sheet, so the sheet
+                // comparison comes *first* and decides which of two different questions
+                // gets asked — it used to come second, behind the generation check, which
+                // made it dead code and cost another sheet's overlay on every install.
+                //
+                // Another sheet's overlay is *rebased*, on the identical argument to the
+                // record rebase above and with the identical consequence for getting it
+                // wrong: `handle_set_transform` writes `transform_indices` for its own
+                // sheet only, so no display row moved on any other sheet and the display
+                // keys in that overlay still name the rows they named. Left un-rebased it
+                // would fail the render gate (which requires `generation === generation`),
+                // so the optimistic height would vanish on an install for a sheet the user
+                // is not even looking at — and the host, which scopes the same question per
+                // sheet via `mapping_generation`, has meanwhile *accepted* the write. The
+                // two halves have to agree or the row springs back and then silently
+                // reappears on the next delivery.
+                //
+                // This sheet's own overlay is voided if the install moved the generation,
+                // because a new permutation invalidates its display keys outright;
+                // otherwise it is reconciled by value against the projection that came
+                // with the install. That void is held *jointly* with the render-site
+                // generation test, exactly as the delivery path's is: probing found it
+                // survives its own deletion, because the render site refuses an overlay
+                // whose generation is not the current one, and only removing both paints a
+                // stale layer. Kept for the same reason as there — the void is what stops
+                // layers accumulating across generations, while the render gate is needed
+                // anyway for the *sheet* test, which a tab switch (moving no generation)
+                // can only be caught by.
                 set_row_height_overlay((previous) => {
                     if (previous === undefined) return undefined;
+                    if (previous.sheet_index !== msg.sheetIndex) {
+                        return previous.generation === view.basis.generation
+                            ? previous
+                            : { ...previous, generation: view.basis.generation };
+                    }
                     if (previous.generation !== view.basis.generation) return undefined;
-                    if (previous.sheet_index !== msg.sheetIndex) return previous;
                     const layers = row_height_layers_for_delivery(
                         previous.layers,
                         msg.rowHeights,

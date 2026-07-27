@@ -1710,6 +1710,97 @@ describe('ViewerPanelCore', () => {
         expect(core.has_active_transform).toBe(true);
     });
 
+    it('records a mapping generation per sheet, not one for the whole core', async () => {
+        // `generation` is core-wide, but `transform_indices` is written per sheet, so an
+        // install on one sheet moves the counter without moving a display row anywhere
+        // else. `mapping_generation` is what lets a display-keyed request be judged against
+        // the arrangement of the sheet it actually names — without it, a resize on the sheet
+        // the user is looking at dies because a background sheet finished a sort.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([1, 1, 1]);
+
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 1,
+            requestId: 'sort-sheet-1',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet2",3,null]',
+            },
+        });
+
+        expect(core.generation).toBe(2);
+        // Only sheet 1 moved. The other two are still answerable at the generation a
+        // webview held before this install, which is the whole point.
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([1, 2, 1]);
+    });
+
+    it('gives each reconciled sheet its own generation, not the last one bumped', async () => {
+        // A reconciliation can carry changes for several sheets and bumps the generation
+        // once per change. Recorded after the loop, or from one shared value, the sheet
+        // reconciled *first* would inherit the generation of the sheet reconciled after it
+        // — and would then refuse a request quoting its own install, the very arrangement
+        // it still has.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        core.begin_receiver_epoch(1);
+        const desc = (name: string) => ({
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: `["${name}",3,null]`,
+        });
+        const prepared = await core.prepare_transform_reconciliation(
+            [desc('Sheet1'), undefined, desc('Sheet3')],
+            () => false,
+        );
+
+        expect(core.commit_transform_reconciliation(prepared!)).toBe(true);
+
+        expect(core.generation).toBe(3);
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([2, 1, 3]);
+    });
+
+    it('raises every sheet\'s mapping generation on source adoption', async () => {
+        // Adoption replaces the rows themselves, so it invalidates every sheet at once and
+        // no per-sheet exemption may survive it. Carried as a floor rather than an entry
+        // per sheet because a new source can have a different sheet *count* — there is no
+        // set of indices to enumerate, and a leftover entry would license a display-keyed
+        // request against rows that are gone.
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new TrackingColumnSource(5, 3));
+        await core.handle_message({
+            type: 'setTransform',
+            sheetIndex: 1,
+            requestId: 'sort-sheet-1',
+            generation: core.generation,
+            sourceGeneration: core.source_generation,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'desc' }],
+                filters: [],
+                schema: '["Sheet2",3,null]',
+            },
+        });
+        expect(core.mapping_generation(0)).toBe(1);
+
+        core.adopt_source(new TrackingColumnSource(5, 3));
+
+        expect(core.generation).toBe(3);
+        expect([0, 1, 2].map((sheet) => core.mapping_generation(sheet)))
+            .toEqual([3, 3, 3]);
+        // Including a sheet index the new source does not have, which a per-sheet map
+        // could not have answered at all.
+        expect(core.mapping_generation(7)).toBe(3);
+    });
+
     it('rejects a prepared reconciliation after source adoption', async () => {
         const { panel } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource(5));

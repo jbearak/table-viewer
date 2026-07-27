@@ -369,6 +369,39 @@ describe('pure Excel header state planning', () => {
             expect(plan.state.rowHeights).toEqual([{ 1: 40 }, { 3: 70 }]);
             expect(plan.state.rowHeightsVersion).toBe(1);
         });
+
+        it('drops trailing slots for sheets the workbook no longer has', () => {
+            // The other end of "the marker is per file". A slot past the last sheet belongs
+            // to a sheet this workbook does not have, so there are no projection facts to
+            // invert its keys with — and copying it through while stamping
+            // `rowHeightsVersion: 1` would declare a still-display-keyed map canonical, so
+            // if that sheet ever came back every height on it would be off by one for good.
+            // Dropped instead: a visible loss of hand-set heights for a sheet that is not
+            // in the file beats a silent mis-attribution to rows in one that is.
+            const plan = plan_excel_candidate_state(
+                previously_promoted([{ 0: 40 }, { 2: 70 }, { 5: 90 }]),
+                source().planning_input(),
+            );
+
+            // Sheet 0 shifted; slots 1 and 2, which name nothing this one-sheet workbook
+            // has, are gone rather than carried forward unmigrated.
+            expect(plan.state.rowHeights).toEqual([{ 1: 40 }]);
+            expect(plan.state.rowHeightsVersion).toBe(1);
+        });
+
+        it('keeps trailing slots on a state the migration does not touch', () => {
+            // The truncation belongs to the migration and to nothing else, which is what
+            // keeps it from being a drive-by change of behaviour: an already-marked state
+            // takes the non-migrating branch and keeps every slot it had, exactly as this
+            // file's other per-sheet state does.
+            const plan = plan_excel_candidate_state({
+                ...previously_promoted([{ 1: 40 }, { 2: 70 }], { People: 'off' }),
+                rowHeightsVersion: 1,
+            }, source('off').planning_input());
+
+            expect(plan.changed).toBe(true);
+            expect(plan.state.rowHeights).toEqual([{ 1: 40 }, { 2: 70 }]);
+        });
     });
 
     it("treats absent authoritative state as auto when the DTO captured 'off'", () => {

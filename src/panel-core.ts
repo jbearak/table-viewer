@@ -227,6 +227,19 @@ export class ViewerPanelCore {
     private readonly transform_indices = new Map<number, Uint32Array>();
     /** Projected source-row -> display-row, built lazily for transformed views. */
     private readonly inverse_transform_indices = new Map<number, Int32Array>();
+    /**
+     * Per sheet, the value `_generation` took when *that sheet's* display->source
+     * mapping last moved. See `mapping_generation` for why this exists at all; the
+     * pair of them is written by every writer of `transform_indices` that names a
+     * sheet, so that the two maps can never disagree about when a sheet moved.
+     */
+    private readonly sheet_mapping_generations = new Map<number, number>();
+    /**
+     * The floor `mapping_generation` reports for a sheet that has never had a
+     * mapping installed — reset by `adopt_source`, which invalidates every sheet's
+     * mapping at once and therefore cannot be recorded per sheet.
+     */
+    private mapping_generation_floor = 1;
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
@@ -310,6 +323,36 @@ export class ViewerPanelCore {
         return clone_transform(
             this.transform_states.get(sheet_index) ?? EMPTY_TRANSFORM,
         );
+    }
+
+    /**
+     * The core generation at which this sheet's display->source mapping last moved.
+     *
+     * `generation` is core-wide but a permutation is per sheet: `handle_set_transform`
+     * and `commit_transform_reconciliation` write `transform_indices` for one sheet and
+     * bump one shared counter, so an install on sheet B moves the generation without
+     * moving a single display row on sheet A. Anything validating a *display-keyed*
+     * request against the bare generation therefore refuses requests that were always
+     * safe — a saved transform restoring on a background sheet, or a long sort the user
+     * started before switching tabs, silently kills a resize on the sheet they are
+     * looking at, whose mapping never moved. This is the fact that lets such a request
+     * be accepted rather than queued: `msg.generation >= mapping_generation(sheet)`
+     * means "posted no earlier than the arrangement this sheet still has", which is
+     * exactly what a display row naming the intended source row requires.
+     *
+     * Deliberately *not* exposed on the wire. The webview keeps posting the one global
+     * generation it holds, because the whole point is that the host knows something the
+     * webview does not; a per-sheet generation in the protocol would have to be
+     * delivered, retained and rebased in the webview, which is the class of stale
+     * copy `SheetViewRecord` exists to prevent.
+     *
+     * Not a substitute for the `sourceGeneration` term beside it. Adoption replaces the
+     * rows themselves, so it invalidates every sheet at once and no per-sheet fact can
+     * license anything across it; `adopt_source` moves the floor for that reason.
+     */
+    mapping_generation(sheet_index: number): number {
+        return this.sheet_mapping_generations.get(sheet_index)
+            ?? this.mapping_generation_floor;
     }
 
     /** Map inclusive installed display-row intervals to canonical source rows. */
@@ -403,6 +446,14 @@ export class ViewerPanelCore {
         this._source_generation += 1;
         this.transform_indices.clear();
         this.inverse_transform_indices.clear();
+        // Every sheet's mapping moved, so no sheet keeps a per-sheet exemption and the
+        // floor rises to the generation this adoption just installed. Written as a floor
+        // rather than as an entry per sheet because a new source can have a different
+        // sheet *count*, so there is no set of indices to enumerate — and a leftover
+        // entry for a sheet this source does not have would license a display-keyed
+        // request against rows that no longer exist.
+        this.sheet_mapping_generations.clear();
+        this.mapping_generation_floor = this._generation;
         this.transform_states.clear();
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
@@ -479,6 +530,13 @@ export class ViewerPanelCore {
         if (this.disposed) return;
         this.disposed = true;
         this.cancel_pending();
+        // The fourth writer of `transform_indices`, and the one that deliberately leaves
+        // `sheet_mapping_generations` alone. Clearing it here would *lower* every sheet
+        // back to the floor, which is the weaker answer, not the stronger one; and it buys
+        // nothing, because every predicate that reads a mapping generation is guarded by
+        // `disposed` first — `handle_message` returns immediately and the controller's
+        // `resize_is_current` opens with `!disposed`. Held as a Map of small numbers, so
+        // there is no memory here for the other clears' reason to apply to.
         this.transform_indices.clear();
         this.inverse_transform_indices.clear();
         this.transform_states.clear();
@@ -681,6 +739,14 @@ export class ViewerPanelCore {
             this.inverse_transform_indices.delete(change.sheetIndex);
             this.transform_states.set(change.sheetIndex, clone_transform(change.state));
             this._generation += 1;
+            // Recorded after the bump, so the sheet's mapping generation is the one a
+            // webview told about this reconciliation would hold — a request quoting it is
+            // current for this sheet, and one quoting anything earlier is not. Inside the
+            // loop rather than after it because a reconciliation can carry changes for
+            // several sheets and bumps once per change: a sheet reconciled first must not
+            // inherit the generation of a sheet reconciled after it, or its own stale
+            // requests would be accepted.
+            this.sheet_mapping_generations.set(change.sheetIndex, this._generation);
         }
         if (prepared.changes.length > 0) this.cache.clear();
         return true;
@@ -1171,6 +1237,11 @@ export class ViewerPanelCore {
             this.inverse_transform_indices.delete(msg.sheetIndex);
             this.transform_states.set(msg.sheetIndex, clone_transform(msg.state));
             this._generation += 1;
+            // This sheet's mapping moved and no other sheet's did; see
+            // `mapping_generation`. Recorded after the bump so it names the generation the
+            // ack below carries, which is the earliest generation a display-keyed request
+            // for this sheet may quote from now on.
+            this.sheet_mapping_generations.set(msg.sheetIndex, this._generation);
             this.cache.clear();
             // Built after the mutation above, so the record's basis carries the
             // bumped generation and its rules/rowCount/permuted come from what was

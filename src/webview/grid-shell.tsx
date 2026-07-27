@@ -1191,6 +1191,72 @@ export function GridShell({
         store,
     ]);
 
+    /**
+     * Grow a row to fit hard line breaks (Shift+Alt+Enter) in the text just committed to
+     * it, and report whether it asked for a growth. Only ever grows: a row the user sized
+     * larger by hand is left alone.
+     *
+     * Shared by *every* path that commits a cell value, which is the point of it being a
+     * function rather than a branch inside `on_cell_edited`. There are two such paths and
+     * only one of them is Glide's: App also folds an open multiline editor through
+     * `commit_live_edit` when something is about to remount or re-project the grid — a
+     * transform completing, a column-visibility change. That fold used to reach
+     * `commit_edit` directly, so the text survived and the height did not, and the row
+     * clipped its own content with nothing to explain why. It became reachable exactly
+     * when this affordance stopped being gated on an unpermuted view, so the two belong to
+     * the same change.
+     *
+     * Takes a *display* row deliberately, and resolves no source row even where the caller
+     * has one to hand: `on_row_resize` speaks display intervals and the host owns the one
+     * display→source mapper. The auto-grow comment in `on_cell_edited` has the full
+     * version of that argument.
+     */
+    const auto_grow_row_for_text = useCallback((
+        display_row: number,
+        text: string,
+    ): boolean => {
+        // A fast path, and said so rather than dressed up as the gate: probed by deleting
+        // it, and nothing failed, because `natural_row_height` floors at the default so an
+        // ordinary one-line value measures *exactly* the default and the comparison below
+        // refuses it anyway. The pair is what makes "a single-line commit resizes nothing"
+        // true, and that claim is pinned by removing both. Kept because it is the cheaper
+        // of the two and because it says what this affordance is for: hard line breaks, not
+        // text length.
+        if (!text.includes('\n')) return false;
+        // Clamped because this comparison is the loop guard. `lines * line_height +
+        // padding` is unbounded in the number of hard newlines a cell holds, and the
+        // height that gets stored is clamped — so an unclamped `needed` would stay
+        // strictly greater than the stored height forever and re-post a resize on every
+        // single edit commit to that row, each one a no-op the host now answers with a
+        // delivery. Clamping makes the two sides of the comparison the same quantity.
+        const needed = clamp_row_height(natural_row_height(
+            text,
+            line_height_for_font(font_size_px),
+            undefined,
+            default_row_height,
+        ));
+        // `<=`, so a row already at the needed height posts nothing. That is not a
+        // micro-optimization: `natural_row_height` floors at the default, so an ordinary
+        // one-line value measures *exactly* the default and a `<` here would post a resize
+        // for every edit commit — which is a durable write and a delivery each time. It is
+        // also the second half of the guard against the unbounded case above, where the
+        // clamped `needed` and the stored height meet at the ceiling.
+        if (needed <= resolved_row_height(
+            row_heights,
+            row_height_overlay,
+            display_row,
+            default_row_height,
+        )) return false;
+        on_row_resize([{ start: display_row, end: display_row }], needed);
+        return true;
+    }, [
+        default_row_height,
+        font_size_px,
+        on_row_resize,
+        row_heights,
+        row_height_overlay,
+    ]);
+
     const commit_live_edit = useCallback((): void => {
         if (save_in_flight_ref.current) return;
         const live = read_live_edit();
@@ -1200,8 +1266,31 @@ export function GridShell({
         const [source_row, source_column] = live.key.split(':').map(Number);
         if (!Number.isInteger(source_row) || !Number.isInteger(source_column)) return;
         commit_edit(source_row, source_column, live.value);
+        // The display row for the same cell, read from the same selection `read_live_edit`
+        // derived `live.key` from and in the same synchronous block — so the two name one
+        // cell in the two spaces, with no mapping and no chance of drift.
+        //
+        // Whether the resize this posts is honoured depends on why the fold happened, and
+        // that is the honest state of it rather than a gap. A fold for a column-visibility
+        // change, or for a transform installing on *another* sheet, leaves this sheet's
+        // mapping alone, so the host accepts it (`mapping_generation`, in
+        // `viewer-controller`) and the height lands. A fold for a transform installing on
+        // *this* sheet is refused, and must be: the display row here belongs to the
+        // arrangement being left, and the reason resizes are never replayed is that
+        // replaying one resizes whatever rows have moved into those positions. The text is
+        // committed either way. No repaint, unlike `on_cell_edited`: every caller of this
+        // is about to remount or re-project the grid, which repaints everything.
+        const display_row = grid_selection_ref.current.current?.cell[1];
+        if (display_row !== undefined) {
+            auto_grow_row_for_text(display_row, live.value);
+        }
         set_live_uncommitted(false);
-    }, [commit_edit, read_live_edit, save_in_flight_ref]);
+    }, [
+        auto_grow_row_for_text,
+        commit_edit,
+        read_live_edit,
+        save_in_flight_ref,
+    ]);
 
     const has_uncommitted_changes = useCallback((): boolean => {
         if (store.size() > 0) return true;
@@ -1695,6 +1784,8 @@ export function GridShell({
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
+            // The measurement and the resize live in `auto_grow_row_for_text` because
+            // this is not the only path that commits a value — see there.
             //
             // No longer gated on a `transformed` prop — which no longer exists, having had
             // no readers left once this was its last one. It used to be, because a height was
@@ -1707,45 +1798,20 @@ export function GridShell({
             // like-for-like read at this row. This site *could* resolve `source_row` (it
             // did so just above, to key the edit) and deliberately does not: one
             // display→source mapper, host-side, is the invariant the design rests on.
-            if (text.includes('\n')) {
-                // Clamped here, not only in `handle_row_resize`, because this comparison is
-                // the loop guard. `lines * line_height + padding` is unbounded in the
-                // number of hard newlines a cell holds, and the height that gets stored is
-                // clamped — so an unclamped `needed` would stay strictly greater than the
-                // stored height forever and re-post a resize on every single edit commit to
-                // that row, each one a no-op the host now answers with a delivery. Clamping
-                // makes the two sides of the comparison the same quantity.
-                const needed = clamp_row_height(natural_row_height(
-                    text,
-                    line_height_for_font(font_size_px),
-                    undefined,
-                    default_row_height,
-                ));
-                if (needed > resolved_row_height(
-                    row_heights,
-                    row_height_overlay,
-                    row,
-                    default_row_height,
-                )) {
-                    on_row_resize([{ start: row, end: row }], needed);
-                    const cells: { cell: Item }[] = [];
-                    for (let display_column = 0; display_column < display_column_count; display_column++) {
-                        cells.push({ cell: [display_column, row] });
-                    }
-                    grid_ref.current?.updateCells(cells);
-                    overlay_ref.current?.repaint();
-                    return;
+            if (auto_grow_row_for_text(row, text)) {
+                const cells: { cell: Item }[] = [];
+                for (let display_column = 0; display_column < display_column_count; display_column++) {
+                    cells.push({ cell: [display_column, row] });
                 }
+                grid_ref.current?.updateCells(cells);
+                overlay_ref.current?.repaint();
+                return;
             }
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
         [
+            auto_grow_row_for_text,
             commit_edit,
-            default_row_height,
-            font_size_px,
-            row_heights,
-            row_height_overlay,
-            on_row_resize,
             display_column_count,
             source_column_for_display,
             commit_source_row,
