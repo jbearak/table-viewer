@@ -25,7 +25,10 @@ const node_common = {
     platform: 'node',
     format: 'cjs',
     target: 'es2022',
-    external: ['electron'],
+    // Built-in SQLite must remain a runtime import. Bundling a shim would hide
+    // whether the embedded Node runtime actually supplies the API and could make
+    // packaged builds depend on node_modules.
+    external: ['electron', 'node:sqlite'],
     sourcemap: true,
     outdir: out_dir,
     logLevel: 'info',
@@ -40,6 +43,14 @@ await build({
     ...node_common,
     entryPoints: [join(desktop_dir, 'main', 'main.ts')],
     define: { __APP_VERSION__: JSON.stringify(version) },
+});
+
+// Runtime-only probe bundle. Keep it outside dist/desktop so electron-builder
+// cannot accidentally ship test code with the standalone application.
+await build({
+    ...node_common,
+    entryPoints: [join(desktop_dir, 'electron-sqlite-runtime-probe.mjs')],
+    outdir: join(repo_dir, 'dist', 'runtime-probes'),
 });
 
 // Preload scripts (need Node/electron require at runtime → cjs, not browser).

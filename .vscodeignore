@@ -1,9 +1,14 @@
 src/**
 node_modules/**
+out/**
 tsconfig.json
+tsconfig.integration.json
+.vscode-test.mjs
 desktop/**
 dist/desktop/**
 dist/desktop-packages/**
+dist/runtime-probes/**
+.node-version
 .gitignore
 .superpowers/**
 docs/**

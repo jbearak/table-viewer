@@ -1,12 +1,11 @@
 import { defineConfig } from '@vscode/test-cli';
 
-// Runs the compiled integration tests (src/test-integration → out/) inside a
-// real VS Code Extension Host. The extension under test is loaded from this
-// folder (package.json `main` → dist/extension.js), so `npm run bundle` must
-// run first — wired via the `pretest:integration` script.
-export default defineConfig({
+// Run the compiled integration suite in both embedded runtimes that bound the
+// shared node:sqlite API: the product floor and the current stable release at
+// implementation time. The extension under test is loaded from this folder
+// (package.json `main` → dist/extension.js), so pretest:integration bundles it.
+const shared = {
     files: 'out/test-integration/**/*.test.js',
-    version: 'stable',
     // A clean, empty workspace; tests open fixtures by absolute URI.
     launchArgs: ['--disable-extensions'],
     mocha: {
@@ -14,4 +13,17 @@ export default defineConfig({
         // VS Code download + Electron startup + large-file perf smoke need headroom.
         timeout: 120000,
     },
-});
+};
+
+export default defineConfig([
+    {
+        ...shared,
+        label: 'minimum',
+        version: '1.127.0',
+    },
+    {
+        ...shared,
+        label: 'current',
+        version: '1.131.0',
+    },
+]);
