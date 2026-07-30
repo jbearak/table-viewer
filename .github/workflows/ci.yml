@@ -52,7 +52,10 @@ jobs:
         run: npm run probe:sqlite:bundles
 
       - name: Electron SQLite runtime probe
-        run: xvfb-run -a npm run probe:sqlite:electron
+        # GitHub-hosted runners cannot configure Electron's root-owned SUID helper.
+        # The probe opens no windows or untrusted content; disable Chromium's sandbox
+        # only for this isolated runtime-capability check.
+        run: npm run bundle:desktop && xvfb-run -a ./node_modules/.bin/electron --no-sandbox dist/runtime-probes/electron-sqlite-runtime-probe.js
 
       # The VS Code Extension Host is a GUI app; Linux runners are headless,
       # so launch it under a virtual framebuffer.
