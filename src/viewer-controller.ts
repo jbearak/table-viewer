@@ -32,6 +32,7 @@ import { validate_dirty_bases } from './csv-base-validation';
 import type {
     AuthorityFileStateStore,
     FileStateSnapshot,
+    FileStateWriteBasis,
 } from './state';
 import { compare_authority, same_authority } from './authority-order';
 import {
@@ -1452,7 +1453,7 @@ export function attach_viewer(
                     if (pending_edits) return { ...current, pendingEdits: pending_edits };
                     const { pendingEdits: _drop, ...rest } = current;
                     return rest;
-                });
+                }, undefined, undefined, null);
                 if (file_edit_state?.failedSaveTombstone === operation) {
                     file_edit_state.failedSaveTombstone = undefined;
                 }
@@ -1549,10 +1550,7 @@ export function attach_viewer(
             && !predates_completed_clear
             && edit_phase().type === 'free'
         ) {
-            console.error(
-                'Dropped durable CSV pending edits with no panel holding the session',
-                file_key,
-            );
+            console.error('Dropped durable CSV pending edits with no panel holding the session');
         }
         const { pendingEdits: _drop, ...rest } = state;
         return { revision: snapshot.revision, state: rest };
@@ -1586,6 +1584,9 @@ export function attach_viewer(
         updater: (current: PerFileState) => PerFileState,
         sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
         validate?: () => boolean,
+        write_basis: FileStateWriteBasis | null = {
+            expectedAuthorityRevision: source_authority.authorityRevision,
+        },
     ): Promise<FileStateSnapshot | undefined> {
         let snapshot = await read_file_state(false);
         for (;;) {
@@ -1598,12 +1599,27 @@ export function attach_viewer(
                 snapshot.revision,
                 next,
                 validate,
+                write_basis ?? undefined,
             );
             if (result.type === 'committed') {
                 observe_durable_state(result.snapshot);
                 if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
+            file_coordinator.observe_state_authority(result.authority);
+            if (write_basis && (
+                result.authority.authorityRevision !== write_basis.expectedAuthorityRevision
+                || (
+                    write_basis.expectedPhysicalRevision !== undefined
+                    && result.authority.physicalRevision
+                        !== write_basis.expectedPhysicalRevision
+                )
+                || (
+                    write_basis.expectedProjectionRevision !== undefined
+                    && result.authority.projectionRevision
+                        !== write_basis.expectedProjectionRevision
+                )
+            )) return undefined;
             if (validate && !validate()) return undefined;
             snapshot = result.snapshot;
         }
@@ -1643,6 +1659,11 @@ export function attach_viewer(
         expected_authority: number,
     ): Promise<void> {
         if (!layout_write_is_current(message, expected_authority) || !source) return;
+        const write_basis: FileStateWriteBasis = {
+            expectedAuthorityRevision: expected_authority,
+            expectedPhysicalRevision: source_authority.physicalRevision,
+            expectedProjectionRevision: source_authority.projectionRevision,
+        };
         const sheet_names = source.meta().sheets.map((sheet) => sheet.name);
         if (
             !layout_basis
@@ -1706,7 +1727,7 @@ export function attach_viewer(
                 }
                 : current;
             return apply_layout_state_patch(host_state, patch);
-        }, sheet_names, () => layout_write_is_current(message, expected_authority));
+        }, sheet_names, () => layout_write_is_current(message, expected_authority), write_basis);
         if (
             reconciled
             && layout_basis === basis
@@ -1735,6 +1756,7 @@ export function attach_viewer(
             return (phase.type === 'owned' || phase.type === 'releasing')
                 && phase.token === edit_session_token;
         };
+        const expected_authority_revision = source_authority.authorityRevision;
         let snapshot = await read_file_state(false);
         for (;;) {
             if (!is_current()) return { type: 'aborted' };
@@ -1752,13 +1774,18 @@ export function attach_viewer(
                 snapshot.revision,
                 next,
                 is_current,
+                { expectedAuthorityRevision: expected_authority_revision },
             );
             if (result.type === 'committed') {
                 observe_durable_state(result.snapshot);
                 if (!disposed && is_current()) update_session_state_material(result.snapshot);
                 return { type: 'committed', snapshot: result.snapshot };
             }
-            if (!is_current()) return { type: 'aborted' };
+            file_coordinator.observe_state_authority(result.authority);
+            if (
+                result.authority.authorityRevision !== expected_authority_revision
+                || !is_current()
+            ) return { type: 'aborted' };
             snapshot = result.snapshot;
         }
     }
@@ -1839,6 +1866,11 @@ export function attach_viewer(
         error: InvalidPersistedTransformError,
         is_current: () => boolean,
     ): Promise<InvalidTransformCleanupResult> {
+        const write_basis: FileStateWriteBasis = {
+            expectedAuthorityRevision: source_authority.authorityRevision,
+            expectedPhysicalRevision: source_authority.physicalRevision,
+            expectedProjectionRevision: source_authority.projectionRevision,
+        };
         for (let attempt = 0; attempt < READY_STATE_REBASE_COUNT; attempt += 1) {
             if (!is_current()) return 'failed';
             const cleanup_core = core;
@@ -1882,6 +1914,7 @@ export function attach_viewer(
                 snapshot.revision,
                 { ...current, transforms },
                 is_current,
+                write_basis,
             );
             if (result.type === 'committed') {
                 observe_durable_state(result.snapshot);
@@ -1890,7 +1923,14 @@ export function attach_viewer(
                 }
                 return 'committed';
             }
+            file_coordinator.observe_state_authority(result.authority);
             observe_durable_state(result.snapshot);
+            if (
+                result.authority.authorityRevision !== write_basis.expectedAuthorityRevision
+                || result.authority.physicalRevision !== write_basis.expectedPhysicalRevision
+                || result.authority.projectionRevision
+                    !== write_basis.expectedProjectionRevision
+            ) return 'failed';
             if (!disposed && is_current() && core === cleanup_core) {
                 update_session_state_material(result.snapshot, false);
             }
@@ -1962,6 +2002,11 @@ export function attach_viewer(
             authority.receiverEpoch === receiver_epoch
             && transform_authority_is_current(message, authority)
             && transform_commit_admission_refusal() === undefined;
+        const write_basis: FileStateWriteBasis = {
+            expectedAuthorityRevision: authority.authorityRevision,
+            expectedPhysicalRevision: source_authority.physicalRevision,
+            expectedProjectionRevision: source_authority.projectionRevision,
+        };
         transform_commit_barriers.add(authority);
         const committed = await update_file_state((current) => {
             const sheet = source?.meta().sheets[message.sheetIndex];
@@ -1983,7 +2028,7 @@ export function attach_viewer(
                 }
                 : undefined;
             return { ...current, transforms };
-        }, undefined, transform_is_current_before_commit);
+        }, undefined, transform_is_current_before_commit, write_basis);
         if (!committed) {
             // Name the real reason when it is the admission that lapsed: "the source
             // changed" would be a lie, and the phases that refuse here all end on
@@ -2595,7 +2640,7 @@ export function attach_viewer(
             if (!current.pendingEdits) return current;
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
-        });
+        }, undefined, undefined, null);
         return committed ?? refresh_session_state_material(false);
     }
 
@@ -2830,7 +2875,15 @@ export function attach_viewer(
             const expected_authority = file_coordinator.authority().authorityRevision;
             candidate = await build_source();
             if (!await built_source_is_current(request.seq, candidate)) {
-                schedule_local_refresh_retry(request, force, reason, initial);
+                if (
+                    !schedule_local_refresh_retry(request, force, reason, initial)
+                    && load_is_current(request.seq)
+                ) {
+                    report_refresh_failure(
+                        new Error('The file changed while it was being refreshed.'),
+                        initial,
+                    );
+                }
                 return false;
             }
             if (
@@ -2847,14 +2900,30 @@ export function attach_viewer(
                     reset_reload_retry();
                     return true;
                 }
-                schedule_local_refresh_retry(request, force, reason, initial);
+                if (
+                    !schedule_local_refresh_retry(request, force, reason, initial)
+                    && load_is_current(request.seq)
+                ) {
+                    report_refresh_failure(
+                        new Error('The file authority changed while it was refreshed.'),
+                        initial,
+                    );
+                }
                 return false;
             }
             const committed = await commit_physical_candidate(
                 candidate, request.seq, expected_authority, true,
             );
             if (committed.type !== 'committed') {
-                schedule_local_refresh_retry(request, force, reason, initial);
+                if (
+                    !schedule_local_refresh_retry(request, force, reason, initial)
+                    && load_is_current(request.seq)
+                ) {
+                    report_refresh_failure(
+                        new Error('The file authority changed while it was refreshed.'),
+                        initial,
+                    );
+                }
                 return false;
             }
             const adopted = adopt_committed_candidate(
@@ -3382,7 +3451,10 @@ export function attach_viewer(
                     return current;
                 }
                 return { ...current, cellHighlights: highlights };
-            }, undefined, rebase_is_current);
+            }, undefined, rebase_is_current, {
+                expectedAuthorityRevision: expected_authority,
+                expectedPhysicalRevision: source_authority.physicalRevision,
+            });
             if (!rebased && rebase_was_noop && rebase_is_current()) {
                 const current = await read_file_state(false);
                 rebased = rebase_is_current() ? current : undefined;
@@ -3980,6 +4052,7 @@ export function attach_viewer(
                 const command_source = source;
                 const expected_authority = source_authority.authorityRevision;
                 const expected_physical_revision = source_authority.physicalRevision;
+                const expected_projection_revision = source_authority.projectionRevision;
                 const expected_physical_digest = source_authority.physicalDigest;
                 const command_is_current = () => {
                     const acknowledged = session.acknowledged_identity();
@@ -3999,6 +4072,11 @@ export function attach_viewer(
                             === expected_physical_revision
                         && source_authority.authorityRevision === expected_authority
                         && source_authority.physicalRevision === expected_physical_revision
+                        && (
+                            message.type === 'clearAllCellHighlights'
+                            || source_authority.projectionRevision
+                                === expected_projection_revision
+                        )
                         && source_authority.physicalDigest === expected_physical_digest
                         && file_coordinator.state_write_is_current(expected_authority);
                 };
@@ -4063,6 +4141,7 @@ export function attach_viewer(
                 const result = message.type === 'applyCellHighlights'
                     ? await file_coordinator.apply_cell_highlights({
                         ...common,
+                        expectedProjectionRevision: expected_projection_revision,
                         sheetIndex: message.sheetIndex,
                         sheetName: message.sheetName,
                         selection: message.selection,
@@ -4082,6 +4161,8 @@ export function attach_viewer(
                 const message = structuredClone(msg);
                 const receiver_epoch = session.current_receiver_epoch;
                 const expected_authority = source_authority.authorityRevision;
+                const expected_physical_revision = source_authority.physicalRevision;
+                const expected_projection_revision = source_authority.projectionRevision;
                 const visibility_is_current = () => {
                     const acknowledged = session.acknowledged_identity();
                     return !disposed
@@ -4104,7 +4185,11 @@ export function attach_viewer(
                         transform_schema_for_sheet(sheet),
                     );
                     return { ...current, columnVisibility };
-                }, undefined, visibility_is_current);
+                }, undefined, visibility_is_current, {
+                    expectedAuthorityRevision: expected_authority,
+                    expectedPhysicalRevision: expected_physical_revision,
+                    expectedProjectionRevision: expected_projection_revision,
+                });
                 if (committed && visibility_is_current()) {
                     session.update_state_snapshot(
                         project_state_for_panel(committed),
@@ -4383,6 +4468,8 @@ export function attach_viewer(
                 const message = structuredClone(msg);
                 const receiver_epoch = session.current_receiver_epoch;
                 const expected_authority = source_authority.authorityRevision;
+                const expected_physical_revision = source_authority.physicalRevision;
+                const expected_projection_revision = source_authority.projectionRevision;
                 const resize_is_current = () => !disposed
                     && session.current_receiver_epoch === receiver_epoch
                     // A *range* on the generation rather than equality, and the only
@@ -4602,7 +4689,11 @@ export function attach_viewer(
                         }
                         rowHeights[message.sheetIndex] = next;
                         return { ...current, rowHeights };
-                    }, undefined, resize_is_current);
+                    }, undefined, resize_is_current, {
+                        expectedAuthorityRevision: expected_authority,
+                        expectedPhysicalRevision: expected_physical_revision,
+                        expectedProjectionRevision: expected_projection_revision,
+                    });
                     if (written || !unchanged_at_current_height) return written;
                     // The acknowledgement for a no-op success. Read on the same serialized
                     // tail as the write it stands in for, so the state it answers with

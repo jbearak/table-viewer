@@ -18,7 +18,11 @@ import type {
 } from '../file-refresh-watcher';
 import type { FinalizationReconciliation } from '../finalization-reconciliation';
 import type { ExcelHeaderPlanningInput } from '../data-source/excel-header-source';
-import type { AuthorityFileStateStore, FileStateStore } from '../state';
+import type {
+    AuthorityFileStateStore,
+    DurableFileAuthority,
+    FileStateStore,
+} from '../state';
 import type { StoredPerFileState } from '../types';
 import {
     finalize_authority,
@@ -27,6 +31,15 @@ import {
     stage_authority,
     with_in_memory_authority_transactions,
 } from '../state-authority';
+
+function empty_authority(): DurableFileAuthority {
+    return {
+        commitSequence: 0,
+        authorityRevision: 0,
+        physicalRevision: 0,
+        projectionRevision: 0,
+    };
+}
 
 function mapped_state_store(initial: Record<string, StoredPerFileState> = {}) {
     const values = new Map<string, { state: StoredPerFileState; revision: number }>();
@@ -50,16 +63,14 @@ function mapped_state_store(initial: Record<string, StoredPerFileState> = {}) {
         async compare_and_set(path, expected, state, validate) {
             const current = values.get(path);
             const revision = current?.revision ?? 0;
-            const validation = validate?.();
-            if (
-                revision !== expected
-                || (validation !== undefined && validation !== true)
-            ) {
+            const valid = validate === undefined || validate() === true;
+            if (revision !== expected || !valid) {
                 return {
                     type: 'conflict',
                     snapshot: current
                         ? { state: structuredClone(current.state), revision }
                         : { state: {}, revision: 0 },
+                    authority: empty_authority(),
                 };
             }
             const committed = { state: structuredClone(state), revision: next_revision++ };
@@ -68,6 +79,7 @@ function mapped_state_store(initial: Record<string, StoredPerFileState> = {}) {
             return {
                 type: 'committed',
                 snapshot: { state: structuredClone(state), revision: committed.revision },
+                authority: empty_authority(),
             };
         },
         async canonicalize_path(canonical, canonical_key) {
@@ -1049,6 +1061,49 @@ describe('file coordinator Task 10 invariants', () => {
         second.dispose();
     });
 
+    it('enforces the exact-once fallback CAS validator contract', async () => {
+        const base = mapped_state_store();
+        const compare_and_set = vi.spyOn(base.backing, 'compare_and_set');
+
+        await expect(base.store.compare_and_set(
+            '/guarded', 0, { activeSheetIndex: 1 },
+        )).resolves.toMatchObject({ type: 'committed' });
+        const literal_true = vi.fn(() => true);
+        await expect(base.store.compare_and_set(
+            '/guarded', 1, { activeSheetIndex: 2 }, literal_true,
+        )).resolves.toMatchObject({ type: 'committed' });
+        expect(literal_true).toHaveBeenCalledOnce();
+
+        const implicit_pass = vi.fn(() => undefined);
+        await expect(base.store.compare_and_set(
+            '/guarded', 2, { activeSheetIndex: 3 }, implicit_pass,
+        )).resolves.toMatchObject({ type: 'committed' });
+        expect(implicit_pass).toHaveBeenCalledOnce();
+
+        for (const value of [false, null, 0, 'true', Promise.resolve(true), { then() {} }]) {
+            const validate = vi.fn(() => value as never);
+            await expect(base.store.compare_and_set(
+                '/guarded', 3, { activeSheetIndex: 4 }, validate,
+            )).resolves.toMatchObject({ type: 'conflict' });
+            expect(validate).toHaveBeenCalledOnce();
+        }
+
+        const thrown = new Error('validator failed');
+        const validate_throw = vi.fn(() => { throw thrown; });
+        await expect(base.store.compare_and_set(
+            '/guarded',
+            -1,
+            { activeSheetIndex: 4 },
+            validate_throw,
+            {
+                expectedAuthorityRevision: 99,
+                editOwner: { editSessionId: 'unsupported', ownershipGeneration: 1 },
+            },
+        )).rejects.toBe(thrown);
+        expect(validate_throw).toHaveBeenCalledOnce();
+        expect(compare_and_set).toHaveBeenCalledTimes(3);
+    });
+
     it('scopes fallback authority by backing store and path', async () => {
         const make_store = (): FileStateStore => {
             let snapshot = { state: {} as StoredPerFileState, revision: 0 };
@@ -1056,10 +1111,18 @@ describe('file coordinator Task 10 invariants', () => {
                 async read() { return structuredClone(snapshot); },
                 async compare_and_set(_path, expected, state) {
                     if (snapshot.revision !== expected) {
-                        return { type: 'conflict', snapshot: structuredClone(snapshot) };
+                        return {
+                            type: 'conflict',
+                            snapshot: structuredClone(snapshot),
+                            authority: empty_authority(),
+                        };
                     }
                     snapshot = { state: structuredClone(state), revision: expected + 1 };
-                    return { type: 'committed', snapshot: structuredClone(snapshot) };
+                    return {
+                        type: 'committed',
+                        snapshot: structuredClone(snapshot),
+                        authority: empty_authority(),
+                    };
                 },
                 async copy_entry_if_absent() {
                     return {
@@ -2793,7 +2856,11 @@ describe('file coordinator identity', () => {
                         cellHighlights: undefined,
                     }, validate);
                     if (peer.type !== 'committed') throw new Error('peer write failed');
-                    return { type: 'conflict', snapshot: peer.snapshot };
+                    return {
+                        type: 'conflict',
+                        snapshot: peer.snapshot,
+                        authority: peer.authority,
+                    };
                 }
                 return mapped.store.compare_and_set(file_path, expected, state, validate);
             },
@@ -2982,7 +3049,11 @@ describe('file coordinator identity', () => {
                         },
                     }, validate);
                     if (peer.type !== 'committed') throw new Error('peer write failed');
-                    return { type: 'conflict', snapshot: peer.snapshot };
+                    return {
+                        type: 'conflict',
+                        snapshot: peer.snapshot,
+                        authority: peer.authority,
+                    };
                 }
                 return mapped.store.compare_and_set(file_path, expected, next, validate);
             },
@@ -3101,7 +3172,11 @@ describe('file coordinator identity', () => {
             ...mapped.store,
             async compare_and_set(file_path) {
                 compare_calls += 1;
-                return { type: 'conflict', snapshot: await mapped.store.read(file_path) };
+                return {
+                    type: 'conflict',
+                    snapshot: await mapped.store.read(file_path),
+                    authority: await mapped.store.read_authority(file_path),
+                };
             },
         };
         const subscriber = vi.fn();

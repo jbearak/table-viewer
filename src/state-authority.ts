@@ -301,6 +301,36 @@ export function with_in_memory_authority_transactions(
     };
     const wrapped: AuthorityFileStateStore = {
         ...store,
+        compare_and_set: (path, expected, state, validate, basis) => enqueue(async () => {
+            const current = await store.read(path);
+            const authority = structuredClone(entry(store, path).authority);
+            // Match the durable store's literal, exact-once validator contract. An
+            // unsupported ownership/recovery fence cannot be represented by this
+            // fallback authority, so refuse it rather than silently weakening it.
+            const validator_result = validate?.();
+            const valid = validator_result === undefined || validator_result === true;
+            const supported_basis = basis?.editOwner === undefined
+                && basis?.recoveryRecordId === undefined;
+            const basis_matches = !basis || (
+                supported_basis
+                && authority.authorityRevision === basis.expectedAuthorityRevision
+                && (
+                    basis.expectedPhysicalRevision === undefined
+                    || authority.physicalRevision === basis.expectedPhysicalRevision
+                )
+                && (
+                    basis.expectedProjectionRevision === undefined
+                    || authority.projectionRevision === basis.expectedProjectionRevision
+                )
+            );
+            if (
+                current.revision !== expected
+                || !basis_matches
+                || !valid
+            ) return { type: 'conflict', snapshot: current, authority };
+            const result = await store.compare_and_set(path, expected, state);
+            return { ...result, authority };
+        }),
         read_authority: (path) => enqueue(() => read_authority(store, path)),
         stage_authority_transaction: (path, input) => enqueue(
             () => stage_authority(store, path, input),
@@ -347,8 +377,8 @@ export function with_in_memory_authority_transactions(
                 await destination_lease?.release().catch(() => {});
                 throw error;
             } finally {
-                await source_lease?.release().catch((error) => {
-                    console.error('Failed to release provider migration source lease', error);
+                await source_lease?.release().catch(() => {
+                    console.error('Failed to release provider migration source lease');
                 });
             }
         }),

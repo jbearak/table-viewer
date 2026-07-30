@@ -8,7 +8,11 @@ import type {
     RowWindow,
     WorkbookMeta,
 } from '../data-source/interface';
-import type { AuthorityFileStateStore, FileStateStore } from '../state';
+import type {
+    AuthorityFileStateStore,
+    DurableFileAuthority,
+    FileStateStore,
+} from '../state';
 import type { HostMessage, PerFileState } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import * as vscode_mock from './mocks/vscode';
@@ -74,6 +78,13 @@ function number(raw: number): RenderedCell {
     };
 }
 
+const empty_authority: DurableFileAuthority = {
+    commitSequence: 0,
+    authorityRevision: 0,
+    physicalRevision: 0,
+    projectionRevision: 0,
+};
+
 // These fixtures only ever hold the current state shape (migration of the
 // legacy shape is covered in state.test.ts), so they are typed `PerFileState`
 // rather than the `StoredPerFileState` union the store *reads* — assertions can
@@ -85,11 +96,13 @@ function mutable_state_store(initial: PerFileState = {}) {
         async read() {
             return { state: structuredClone(state), revision };
         },
-        async compare_and_set(_path, expected, next) {
-            if (expected !== revision) {
+        async compare_and_set(_path, expected, next, validate) {
+            const valid = validate === undefined || validate() === true;
+            if (expected !== revision || !valid) {
                 return {
                     type: 'conflict',
                     snapshot: { state: structuredClone(state), revision },
+                    authority: structuredClone(empty_authority),
                 };
             }
             state = structuredClone(next);
@@ -97,6 +110,7 @@ function mutable_state_store(initial: PerFileState = {}) {
             return {
                 type: 'committed',
                 snapshot: { state: structuredClone(state), revision },
+                authority: structuredClone(empty_authority),
             };
         },
         async touch() {},

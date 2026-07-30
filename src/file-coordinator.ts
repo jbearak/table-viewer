@@ -149,6 +149,7 @@ export interface CellHighlightAuthorityCommandBase {
     readonly originToken: symbol;
     readonly expectedAuthorityRevision: number;
     readonly expectedPhysicalRevision: number;
+    readonly expectedProjectionRevision?: number;
     readonly expectedPhysicalDigest: string;
     readonly meta: WorkbookMeta;
     readonly stateStore: AuthorityFileStateStore;
@@ -542,16 +543,27 @@ function register_store(
             identity.kind === 'file'
             && identity.uri.fsPath !== entry.statePath
         ) {
-            const [stable, alias] = await Promise.all([
+            const [stable, alias, stable_authority] = await Promise.all([
                 store.read(entry.statePath),
                 store.read(identity.uri.fsPath),
+                read_authority(store, entry.statePath),
             ]);
             if (Object.keys(stable.state).length === 0 && Object.keys(alias.state).length > 0) {
-                await store.compare_and_set(
+                const copied = await store.compare_and_set(
                     entry.statePath,
                     stable.revision,
                     alias.state as PerFileState,
+                    undefined,
+                    {
+                        expectedAuthorityRevision: stable_authority.authorityRevision,
+                        expectedPhysicalRevision: stable_authority.physicalRevision,
+                        expectedProjectionRevision: stable_authority.projectionRevision,
+                    },
                 );
+                const installed = install_authority(entry, copied.authority);
+                if (installed.type === 'invalid') {
+                    throw new Error('The persisted file authority diverged during alias migration.');
+                }
             }
         }
         const observed = await read_authority(store, entry.statePath);
@@ -718,6 +730,7 @@ export interface FileCoordinatorAttachment {
     begin_physical(expectedAuthorityRevision: number, digest: string): AuthorityOperationStart<'physical'>;
     operation_is_current(token: AuthorityOperationToken): boolean;
     state_write_is_current(authorityRevision: number): boolean;
+    observe_state_authority(authority: DurableFileAuthority): FileAuthoritySnapshot;
     request_commit_turn(token: AuthorityOperationToken): Promise<AuthorityCommitTurnResult>;
     start_finalization(turn: AuthorityCommitTurn): void;
     finalize_authority_commit<Kind extends AuthorityTransactionKind>(
@@ -779,6 +792,10 @@ export function acquire_file_coordinator(
                 return command.isCurrent()
                     && current.authorityRevision === command.expectedAuthorityRevision
                     && current.physicalRevision === command.expectedPhysicalRevision
+                    && (
+                        command.expectedProjectionRevision === undefined
+                        || current.projectionRevision === command.expectedProjectionRevision
+                    )
                     && current.physicalDigest === command.expectedPhysicalDigest
                     && entry.activeTurn?.phase !== 'finalizing';
             };
@@ -832,8 +849,14 @@ export function acquire_file_coordinator(
                         state_snapshot.revision,
                         next,
                         basis_is_current,
+                        {
+                            expectedAuthorityRevision: command.expectedAuthorityRevision,
+                            expectedPhysicalRevision: command.expectedPhysicalRevision,
+                            expectedProjectionRevision: command.expectedProjectionRevision,
+                        },
                     );
                     if (result.type === 'conflict') {
+                        attachment.observe_state_authority(result.authority);
                         state_snapshot = result.snapshot;
                         continue;
                     }
@@ -910,6 +933,14 @@ export function acquire_file_coordinator(
         state_write_is_current(authorityRevision) {
             return entry.authority.authorityRevision === authorityRevision
                 && entry.activeTurn?.phase !== 'finalizing';
+        },
+
+        observe_state_authority(authority) {
+            const installed = install_authority(entry, authority);
+            if (installed.type === 'invalid') {
+                throw new Error('The observed state authority diverged from the installed authority.');
+            }
+            return installed.current;
         },
 
         request_commit_turn(token) {

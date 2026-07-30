@@ -571,6 +571,194 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
+function is_plain_record(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function is_non_negative_integer(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function is_finite_number(value: unknown): value is number {
+    return typeof value === 'number' && Number.isFinite(value);
+}
+
+function invalid_leaf(name: string): never {
+    throw new TypeError(`Persisted file state ${name} is invalid.`);
+}
+
+function validate_number_record(value: unknown, name: string): void {
+    if (!is_plain_record(value)) invalid_leaf(name);
+    for (const [key, entry] of Object.entries(value)) {
+        if (!/^\d+$/.test(key) || !is_finite_number(entry)) invalid_leaf(name);
+    }
+}
+
+function validate_number_record_collection(value: unknown, name: string): void {
+    if (Array.isArray(value)) {
+        for (const entry of value) {
+            if (entry !== null && entry !== undefined) validate_number_record(entry, name);
+        }
+        return;
+    }
+    if (is_plain_record(value)) {
+        for (const entry of Object.values(value)) validate_number_record(entry, name);
+        return;
+    }
+    invalid_leaf(name);
+}
+
+function validate_scroll_position(value: unknown, name: string): void {
+    if (
+        !is_plain_record(value)
+        || !is_finite_number(value.top)
+        || !is_finite_number(value.left)
+    ) invalid_leaf(name);
+}
+
+function validate_scroll_positions(value: unknown): void {
+    if (Array.isArray(value)) {
+        for (const entry of value) {
+            if (entry !== null && entry !== undefined) validate_scroll_position(entry, 'scrollPosition');
+        }
+        return;
+    }
+    if (is_plain_record(value)) {
+        for (const entry of Object.values(value)) validate_scroll_position(entry, 'scrollPosition');
+        return;
+    }
+    invalid_leaf('scrollPosition');
+}
+
+function validate_integer_array(value: unknown, name: string): void {
+    if (!Array.isArray(value) || value.some((entry) => !is_non_negative_integer(entry))) {
+        invalid_leaf(name);
+    }
+}
+
+const FILTER_OPERATORS = new Set<unknown>([
+    'contains', 'notContains', 'equals', 'notEquals', 'startsWith', 'endsWith',
+    'greaterThan', 'greaterThanOrEqual', 'lessThan', 'lessThanOrEqual', 'between',
+    'notBetween', 'isEmpty', 'isNotEmpty', 'isOneOf',
+]);
+
+function validate_transforms(value: unknown): void {
+    if (!Array.isArray(value)) invalid_leaf('transforms');
+    for (const transform of value) {
+        if (transform === null || transform === undefined) continue;
+        if (!is_plain_record(transform) || !Array.isArray(transform.sort) || !Array.isArray(transform.filters)) {
+            invalid_leaf('transforms');
+        }
+        for (const sort of transform.sort) {
+            if (!is_plain_record(sort) || !is_non_negative_integer(sort.colIndex)
+                || (sort.direction !== 'asc' && sort.direction !== 'desc')) invalid_leaf('transforms');
+        }
+        for (const filter of transform.filters) {
+            if (!is_plain_record(filter) || typeof filter.id !== 'string'
+                || !is_non_negative_integer(filter.colIndex) || !FILTER_OPERATORS.has(filter.operator)
+                || typeof filter.caseSensitive !== 'boolean' || typeof filter.enabled !== 'boolean'
+                || (filter.value !== undefined && typeof filter.value !== 'string')
+                || (filter.secondValue !== undefined && typeof filter.secondValue !== 'string')
+                || (filter.excludedValues !== undefined && (!Array.isArray(filter.excludedValues)
+                    || filter.excludedValues.some((entry) => entry !== null && typeof entry !== 'string')))) {
+                invalid_leaf('transforms');
+            }
+        }
+        if (transform.hiddenRows !== undefined) validate_integer_array(transform.hiddenRows, 'transforms');
+        if (transform.schema !== undefined && typeof transform.schema !== 'string') invalid_leaf('transforms');
+    }
+}
+
+function validate_column_visibility(value: unknown): void {
+    if (!Array.isArray(value)) invalid_leaf('columnVisibility');
+    for (const visibility of value) {
+        if (visibility === null || visibility === undefined) continue;
+        if (!is_plain_record(visibility)) invalid_leaf('columnVisibility');
+        if (visibility.hiddenColumns !== undefined) {
+            validate_integer_array(visibility.hiddenColumns, 'columnVisibility');
+        }
+        if (visibility.visibleColumns !== undefined) {
+            validate_integer_array(visibility.visibleColumns, 'columnVisibility');
+        }
+        if (visibility.schema !== undefined && typeof visibility.schema !== 'string') {
+            invalid_leaf('columnVisibility');
+        }
+    }
+}
+
+function is_canonical_cell_key(value: string): boolean {
+    const match = /^(0|[1-9]\d*):(0|[1-9]\d*)$/.exec(value);
+    return match !== null
+        && Number.isSafeInteger(Number(match[1]))
+        && Number.isSafeInteger(Number(match[2]));
+}
+
+function validate_cell_highlights(value: unknown): void {
+    if (!is_plain_record(value) || typeof value.sourceDigest !== 'string' || !Array.isArray(value.sheets)) {
+        invalid_leaf('cellHighlights');
+    }
+    for (const sheet of value.sheets) {
+        if (sheet === null || sheet === undefined) continue;
+        if (!is_plain_record(sheet) || typeof sheet.schema !== 'string' || !is_plain_record(sheet.cells)) {
+            invalid_leaf('cellHighlights');
+        }
+        for (const [key, color] of Object.entries(sheet.cells)) {
+            if (!is_canonical_cell_key(key)
+                || !(CELL_HIGHLIGHT_COLORS as readonly unknown[]).includes(color)) {
+                invalid_leaf('cellHighlights');
+            }
+        }
+    }
+}
+
+/** Validate known leaves while preserving unknown top-level leaves verbatim. */
+export function decode_stored_per_file_state(value: unknown): StoredPerFileState {
+    if (!is_plain_record(value)) throw new TypeError('Persisted file state must be an object.');
+    const state = structuredClone(value);
+    if (state.columnWidths !== undefined) validate_number_record_collection(state.columnWidths, 'columnWidths');
+    if (state.rowHeights !== undefined) validate_number_record_collection(state.rowHeights, 'rowHeights');
+    if (state.scrollPosition !== undefined) validate_scroll_positions(state.scrollPosition);
+    if (state.transforms !== undefined) validate_transforms(state.transforms);
+    if (state.columnVisibility !== undefined) validate_column_visibility(state.columnVisibility);
+    if (state.cellHighlights !== undefined) validate_cell_highlights(state.cellHighlights);
+
+    if (state.activeSheetIndex !== undefined && !is_non_negative_integer(state.activeSheetIndex)) {
+        invalid_leaf('activeSheetIndex');
+    }
+    if (state.activeSheet !== undefined && typeof state.activeSheet !== 'string') invalid_leaf('activeSheet');
+    if (state.tabOrientation !== undefined && state.tabOrientation !== null
+        && state.tabOrientation !== 'horizontal' && state.tabOrientation !== 'vertical') {
+        invalid_leaf('tabOrientation');
+    }
+    for (const marker of ['excelFirstRowHeaderVersion', 'rowHeightsVersion'] as const) {
+        if (state[marker] !== undefined && state[marker] !== 1) invalid_leaf(marker);
+    }
+    if (state.excelFirstRowHeaders !== undefined) {
+        if (!is_plain_record(state.excelFirstRowHeaders)
+            || Object.values(state.excelFirstRowHeaders).some((entry) => entry !== 'on' && entry !== 'off')) {
+            invalid_leaf('excelFirstRowHeaders');
+        }
+    }
+    if (state.excelFirstRowHeaderActive !== undefined) {
+        if (!is_plain_record(state.excelFirstRowHeaderActive)
+            || Object.values(state.excelFirstRowHeaderActive).some((entry) => typeof entry !== 'boolean')) {
+            invalid_leaf('excelFirstRowHeaderActive');
+        }
+    }
+    if (state.pendingEdits !== undefined) {
+        if (!is_plain_record(state.pendingEdits)) invalid_leaf('pendingEdits');
+        for (const [key, entry] of Object.entries(state.pendingEdits)) {
+            if (!is_canonical_cell_key(key)) invalid_leaf('pendingEdits');
+            if (typeof entry === 'string') continue;
+            if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
+                invalid_leaf('pendingEdits');
+            }
+        }
+        if (Object.keys(state.pendingEdits).length === 0) delete state.pendingEdits;
+    }
+    return state as unknown as StoredPerFileState;
+}
+
 /** Exact conflict-preserving entry durably owned by the CSV edit session. */
 export interface CsvDirtyEntry {
     readonly value: string;

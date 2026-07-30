@@ -1,4 +1,5 @@
 import type {
+    DurableFileAuthority,
     FileStateCompareAndSetResult,
     FileStateSnapshot,
     FileStateStore,
@@ -6,6 +7,12 @@ import type {
 import type { PerFileState, StoredPerFileState } from '../../types';
 
 export function versioned_state_store(initial: StoredPerFileState = {}) {
+    const authority: DurableFileAuthority = {
+        commitSequence: 0,
+        authorityRevision: 0,
+        physicalRevision: 0,
+        projectionRevision: 0,
+    };
     const states = new Map<string, StoredPerFileState>();
     const revisions = new Map<string, number>();
     const copies = new Map<string, {
@@ -29,10 +36,25 @@ export function versioned_state_store(initial: StoredPerFileState = {}) {
             expected_revision,
             state,
             validate,
+            basis,
         ): Promise<FileStateCompareAndSetResult> {
             const current = snapshot(file_path);
-            if (current.revision !== expected_revision || (validate && !validate())) {
-                return { type: 'conflict', snapshot: current };
+            const valid = validate === undefined || validate() === true;
+            const basis_matches = !basis || (
+                basis.editOwner === undefined
+                && basis.recoveryRecordId === undefined
+                && basis.expectedAuthorityRevision === authority.authorityRevision
+                && (
+                    basis.expectedPhysicalRevision === undefined
+                    || basis.expectedPhysicalRevision === authority.physicalRevision
+                )
+                && (
+                    basis.expectedProjectionRevision === undefined
+                    || basis.expectedProjectionRevision === authority.projectionRevision
+                )
+            );
+            if (current.revision !== expected_revision || !valid || !basis_matches) {
+                return { type: 'conflict', snapshot: current, authority: structuredClone(authority) };
             }
             const revision = expected_revision + 1;
             states.set(file_path, structuredClone(state));
@@ -41,6 +63,7 @@ export function versioned_state_store(initial: StoredPerFileState = {}) {
             return {
                 type: 'committed',
                 snapshot: { state: structuredClone(state), revision },
+                authority: structuredClone(authority),
             };
         },
         async copy_entry_if_absent(source_path, destination_path, copy_id) {
