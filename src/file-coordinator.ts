@@ -564,6 +564,9 @@ function register_store(
                 if (installed.type === 'invalid') {
                     throw new Error('The persisted file authority diverged during alias migration.');
                 }
+                if (copied.type !== 'committed') {
+                    throw new Error('Alias state migration conflicted with persisted file state.');
+                }
             }
         }
         const observed = await read_authority(store, entry.statePath);

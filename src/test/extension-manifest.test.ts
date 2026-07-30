@@ -56,6 +56,7 @@ describe('extension runtime manifest', () => {
     it('excludes build and integration-only artifacts from the VSIX', () => {
         expect(vscodeignore).toEqual(expect.arrayContaining([
             'out/**',
+            'dist/runtime-probes/**',
             '.vscode-test.mjs',
             'tsconfig.integration.json',
         ]));

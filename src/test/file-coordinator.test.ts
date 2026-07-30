@@ -2602,6 +2602,58 @@ describe('file coordinator identity', () => {
         reopened.dispose();
     });
 
+    it('rejects an uncommitted alias migration and retries from installed authority', async () => {
+        const upper = 'C:\\Data\\Conflicted.xlsx';
+        const stable = canonical_file_key(upper, 'win32');
+        const base = mapped_state_store({ [upper]: { activeSheetIndex: 8 } });
+        const backing: FileStateStore = {
+            read: base.backing.read,
+            compare_and_set: base.backing.compare_and_set,
+            touch: base.backing.touch,
+        };
+        const wrapped = with_in_memory_authority_transactions(backing);
+        const conflict_authority: DurableFileAuthority = {
+            commitSequence: 1,
+            authorityRevision: 1,
+            physicalRevision: 0,
+            projectionRevision: 0,
+        };
+        let observed_authority = empty_authority();
+        let attempts = 0;
+        const store: AuthorityFileStateStore = {
+            ...wrapped,
+            async read_authority() {
+                return structuredClone(observed_authority);
+            },
+            async compare_and_set(path, expected, state) {
+                attempts += 1;
+                if (attempts === 1) {
+                    observed_authority = structuredClone(conflict_authority);
+                    return {
+                        type: 'conflict',
+                        snapshot: await backing.read(path),
+                        authority: structuredClone(conflict_authority),
+                    };
+                }
+                const committed = await backing.compare_and_set(path, expected, state);
+                return { ...committed, authority: structuredClone(observed_authority) };
+            },
+        };
+        const coordinator = acquire_file_coordinator(upper, store, 'win32');
+
+        await expect(coordinator.state_ready()).rejects.toThrow(
+            'Alias state migration conflicted with persisted file state.',
+        );
+        expect(base.value(stable)).toBeUndefined();
+        expect(base.value(upper)).toEqual({ activeSheetIndex: 8 });
+        expect(coordinator.authority()).toMatchObject(conflict_authority);
+
+        await expect(coordinator.state_ready()).resolves.toBeUndefined();
+        expect(attempts).toBe(2);
+        expect(base.value(stable)).toEqual({ activeSheetIndex: 8 });
+        coordinator.dispose();
+    });
+
     it('discovers an uppercase Windows legacy key on lowercase first reopen', async () => {
         const upper = 'C:\\Data\\Legacy.xlsx';
         const lower = 'c:\\data\\legacy.xlsx';

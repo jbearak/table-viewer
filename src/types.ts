@@ -51,22 +51,13 @@ export interface SortKey {
     direction: SortDirection;
 }
 
-export type FilterOperator =
-    | 'contains'
-    | 'notContains'
-    | 'equals'
-    | 'notEquals'
-    | 'startsWith'
-    | 'endsWith'
-    | 'greaterThan'
-    | 'greaterThanOrEqual'
-    | 'lessThan'
-    | 'lessThanOrEqual'
-    | 'between'
-    | 'notBetween'
-    | 'isEmpty'
-    | 'isNotEmpty'
-    | 'isOneOf';
+const FILTER_OPERATORS = [
+    'contains', 'notContains', 'equals', 'notEquals', 'startsWith', 'endsWith',
+    'greaterThan', 'greaterThanOrEqual', 'lessThan', 'lessThanOrEqual', 'between',
+    'notBetween', 'isEmpty', 'isNotEmpty', 'isOneOf',
+] as const;
+
+export type FilterOperator = typeof FILTER_OPERATORS[number];
 
 export type RangeFilterOperator = 'between' | 'notBetween';
 
@@ -636,11 +627,7 @@ function validate_integer_array(value: unknown, name: string): void {
     }
 }
 
-const FILTER_OPERATORS = new Set<unknown>([
-    'contains', 'notContains', 'equals', 'notEquals', 'startsWith', 'endsWith',
-    'greaterThan', 'greaterThanOrEqual', 'lessThan', 'lessThanOrEqual', 'between',
-    'notBetween', 'isEmpty', 'isNotEmpty', 'isOneOf',
-]);
+const FILTER_OPERATOR_SET = new Set<unknown>(FILTER_OPERATORS);
 
 function validate_transforms(value: unknown): void {
     if (!Array.isArray(value)) invalid_leaf('transforms');
@@ -655,7 +642,7 @@ function validate_transforms(value: unknown): void {
         }
         for (const filter of transform.filters) {
             if (!is_plain_record(filter) || typeof filter.id !== 'string'
-                || !is_non_negative_integer(filter.colIndex) || !FILTER_OPERATORS.has(filter.operator)
+                || !is_non_negative_integer(filter.colIndex) || !FILTER_OPERATOR_SET.has(filter.operator)
                 || typeof filter.caseSensitive !== 'boolean' || typeof filter.enabled !== 'boolean'
                 || (filter.value !== undefined && typeof filter.value !== 'string')
                 || (filter.secondValue !== undefined && typeof filter.secondValue !== 'string')

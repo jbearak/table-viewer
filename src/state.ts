@@ -1180,7 +1180,7 @@ function copy_in_transaction(
         ) return { type: 'recoveryRequired' };
     }
 
-    const cleaned = cleanup_stale_stages(tx, capturedAt);
+    cleanup_stale_stages(tx, capturedAt);
     const source = tx.read_entry(sourcePath);
     if (!source) throw new Error('Copy source disappeared inside its transaction.');
     const sourceSnapshot = snapshot_from_complete(source, metadata.absenceRevision);
@@ -1213,8 +1213,8 @@ function copy_in_transaction(
         })),
     };
     write_complete(tx, copied);
-    const evicted = evict_entries(tx, runtime, max, new Set([sourcePath, destinationPath]));
-    if (cleaned || evicted || copied) tx.set_updated_at(capturedAt);
+    evict_entries(tx, runtime, max, new Set([sourcePath, destinationPath]));
+    tx.set_updated_at(capturedAt);
     return {
         type: 'copied',
         source: sourceSnapshot,
