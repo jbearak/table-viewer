@@ -29,7 +29,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
-          node-version: '24'
+          node-version: '26.5.1'
           cache: npm
 
       - name: Install dependencies
@@ -44,6 +44,18 @@ jobs:
 
       - name: Unit tests (vitest)
         run: npm test
+
+      - name: Host Node SQLite runtime probe
+        run: npm run probe:sqlite:host
+
+      - name: Server bundle SQLite externalization probe
+        run: npm run probe:sqlite:bundles
+
+      - name: Electron SQLite runtime probe
+        # GitHub-hosted runners cannot configure Electron's root-owned SUID helper.
+        # The probe opens no windows or untrusted content; disable Chromium's sandbox
+        # only for this isolated runtime-capability check.
+        run: npm run bundle:desktop && xvfb-run -a ./node_modules/.bin/electron --no-sandbox dist/runtime-probes/electron-sqlite-runtime-probe.js
 
       # The VS Code Extension Host is a GUI app; Linux runners are headless,
       # so launch it under a virtual framebuffer.

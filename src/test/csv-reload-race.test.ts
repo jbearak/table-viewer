@@ -1031,6 +1031,69 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
+    it('reports initial-load failure after stale verification exhausts local retries', async () => {
+        vi.useFakeTimers();
+        let mtime = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        open_csv_table(uri('/tmp/stale-initial-retry.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+
+        await panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(200);
+
+        expect(initial_snapshots(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(4);
+        expect(error_spy).toHaveBeenCalledOnce();
+        expect(error_spy).toHaveBeenCalledWith(
+            'The file changed while it was being refreshed.',
+        );
+        vi.useRealTimers();
+    });
+
+    it('reports initial-load failure after authority conflicts exhaust local retries', async () => {
+        vi.useFakeTimers();
+        const base = state_store();
+        let conflicts = 0;
+        const store: AuthorityFileStateStore = {
+            ...base,
+            async stage_authority_transaction(path, input) {
+                conflicts += 1;
+                const external_id = `external-${conflicts}`;
+                await base.stage_authority_transaction(path, {
+                    id: external_id,
+                    kind: 'physical',
+                    ordinal: 1_000 + conflicts,
+                    expectedStateRevision: input.expectedStateRevision,
+                    expectedCommitSequence: input.expectedCommitSequence,
+                    physicalDigest: `external-${conflicts}`,
+                });
+                await base.finalize_authority_transaction(path, external_id);
+                return base.stage_authority_transaction(path, input);
+            },
+        };
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        open_csv_table(uri('/tmp/authority-initial-retry.csv'), store);
+        const panel = vscode_mock.__getPanels()[0];
+
+        await panel.__receive({ type: 'ready' });
+        await vi.advanceTimersByTimeAsync(200);
+
+        expect(conflicts).toBe(4);
+        expect(initial_snapshots(panel)).toHaveLength(0);
+        expect(close_spy).toHaveBeenCalledTimes(4);
+        expect(error_spy).toHaveBeenCalledOnce();
+        expect(error_spy).toHaveBeenCalledWith(
+            'The file authority changed while it was refreshed.',
+        );
+        vi.useRealTimers();
+    });
+
     it('shares one retry budget across locked and unstable reload failures', async () => {
         vi.useFakeTimers();
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: 1 }));
@@ -1778,11 +1841,12 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'requestEditSession' });
 
         await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
-        await flush_promises();
 
         expect(panel.__messages.filter((message: any) => message?.type === 'saveResult'))
             .toEqual([]);
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        await vi.waitFor(() => {
+            expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        });
     });
 
     it('releases a disposed owner when writeFile rejects', async () => {

@@ -1,11 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ExtensionContext } from 'vscode';
 import { compare_authority } from '../authority-order';
-import { create_file_state_store } from '../state';
+import {
+    create_file_state_store,
+    create_keyed_authority_store,
+    create_memento_keyed_file_state_persistence,
+    supports_coordinated_file_state,
+    type KeyedFileStatePersistence,
+    type KeyedStateReadTransaction,
+    type KeyedStateWriteTransaction,
+} from '../state';
+import { file_state_store_contract } from './file-state-store-contract';
 
 function context_with(initial: unknown) {
     let stored: unknown = initial;
+    let failNextWrite = false;
     const update = vi.fn(async (_key: string, value: unknown) => {
+        if (failNextWrite) {
+            failNextWrite = false;
+            throw new Error('injected write failure');
+        }
         stored = structuredClone(value);
     });
     const context = {
@@ -14,10 +28,95 @@ function context_with(initial: unknown) {
             update,
         },
     } as unknown as ExtensionContext;
-    return { context, value: () => stored as any, update };
+    return {
+        context,
+        value: () => stored as any,
+        set: (value: unknown) => { stored = structuredClone(value); },
+        failNextWrite: () => { failNextWrite = true; },
+        update,
+    };
 }
 
+function instrument_payload_io(persistence: KeyedFileStatePersistence) {
+    const counts = { reads: 0, writes: 0 };
+    const readTx = (tx: KeyedStateReadTransaction): KeyedStateReadTransaction => ({
+        ...tx,
+        read_entry(path) {
+            counts.reads += 1;
+            return tx.read_entry(path);
+        },
+    });
+    const writeTx = (tx: KeyedStateWriteTransaction): KeyedStateWriteTransaction => ({
+        ...tx,
+        read_entry(path) {
+            counts.reads += 1;
+            return tx.read_entry(path);
+        },
+        write_entry(value) {
+            counts.writes += 1;
+            tx.write_entry(value);
+        },
+    });
+    const wrapped: KeyedFileStatePersistence = {
+        ...persistence,
+        read_transaction: (body) => persistence.read_transaction((tx) => body(readTx(tx))),
+        write_transaction: (kind, body) => persistence.write_transaction(
+            kind,
+            (tx) => body(writeTx(tx)),
+        ),
+    };
+    return { counts, wrapped, reset: () => { counts.reads = 0; counts.writes = 0; } };
+}
+
+file_state_store_contract('Memento compatibility backend', () => {
+    const backing = context_with({});
+    return {
+        create: (max = 10_000) => create_file_state_store(backing.context, () => max),
+        createIndependent: (max = 10_000) => create_file_state_store(backing.context, () => max),
+        seedEnvelope: (envelope) => backing.set(envelope),
+        persistedValue: () => backing.value(),
+        failNextWrite: async () => {
+            backing.failNextWrite();
+            return async () => {};
+        },
+    };
+});
+
 describe('FileStateStore versioned state', () => {
+    it('requires the complete coordinated file-state surface', () => {
+        const base = create_file_state_store(context_with({}).context);
+        const coordinated = {
+            ...base,
+            acquire_edit_session: vi.fn(),
+            release_edit_session: vi.fn(),
+            reserve_physical_write: vi.fn(),
+            execute_reserved_physical_write: vi.fn(),
+            reconcile_reserved_physical_write: vi.fn(),
+        };
+        expect(supports_coordinated_file_state(coordinated)).toBe(true);
+
+        for (const method of [
+            'read',
+            'compare_and_set',
+            'touch',
+            'read_authority',
+            'stage_authority_transaction',
+            'finalize_authority_transaction',
+            'inspect_authority_transaction',
+            'discard_authority_transaction',
+            'cleanup_authority_transactions',
+            'acquire_edit_session',
+            'release_edit_session',
+            'reserve_physical_write',
+            'execute_reserved_physical_write',
+            'reconcile_reserved_physical_write',
+        ] as const) {
+            const incomplete = { ...coordinated } as Record<string, unknown>;
+            delete incomplete[method];
+            expect(supports_coordinated_file_state(incomplete as never)).toBe(false);
+        }
+    });
+
     it('commits an exact revision and rejects a stale compare-and-set', async () => {
         const backing = context_with({});
         const store = create_file_state_store(backing.context);
@@ -66,6 +165,363 @@ describe('FileStateStore versioned state', () => {
         );
         expect(async_fence.type).toBe('conflict');
         expect((await store.read('/a')).state).toEqual({});
+    });
+
+    it('invokes CAS validation exactly once before every stale guard', async () => {
+        const store = create_file_state_store(context_with({}).context);
+        await store.stage_authority_transaction('/a', {
+            id: 'physical', kind: 'physical', ordinal: 1,
+            expectedStateRevision: 0, expectedCommitSequence: 0,
+            physicalDigest: 'digest',
+        });
+        const finalized = await store.finalize_authority_transaction('/a', 'physical');
+        if (finalized.type !== 'finalized') throw new Error('authority setup failed');
+
+        const stale_revision_validator = vi.fn(() => true);
+        await expect(store.compare_and_set(
+            '/a',
+            -1,
+            { activeSheetIndex: 1 },
+            stale_revision_validator,
+            { expectedAuthorityRevision: finalized.authority.authorityRevision },
+        )).resolves.toMatchObject({ type: 'conflict', authority: finalized.authority });
+        expect(stale_revision_validator).toHaveBeenCalledOnce();
+
+        const stale_authority_validator = vi.fn(() => true);
+        await expect(store.compare_and_set(
+            '/a',
+            finalized.snapshot.revision,
+            { activeSheetIndex: 2 },
+            stale_authority_validator,
+            { expectedAuthorityRevision: 0 },
+        )).resolves.toMatchObject({ type: 'conflict', authority: finalized.authority });
+        expect(stale_authority_validator).toHaveBeenCalledOnce();
+
+        const stale_component_validator = vi.fn(() => true);
+        await expect(store.compare_and_set(
+            '/a',
+            finalized.snapshot.revision,
+            { activeSheetIndex: 3 },
+            stale_component_validator,
+            {
+                expectedAuthorityRevision: finalized.authority.authorityRevision,
+                expectedPhysicalRevision: 0,
+                expectedProjectionRevision: finalized.authority.projectionRevision,
+            },
+        )).resolves.toMatchObject({ type: 'conflict', authority: finalized.authority });
+        expect(stale_component_validator).toHaveBeenCalledOnce();
+    });
+
+    it('gives validator throws precedence and conflicts every non-pass value', async () => {
+        const store = create_file_state_store(context_with({}).context);
+        const thrown = new Error('validator failed');
+        await expect(store.compare_and_set(
+            '/a',
+            -1,
+            { activeSheetIndex: 1 },
+            () => { throw thrown; },
+            { expectedAuthorityRevision: 99 },
+        )).rejects.toBe(thrown);
+
+        for (const value of [false, null, 0, 'true', Promise.resolve(true), { then() {} }]) {
+            const validator = vi.fn(() => value as never);
+            await expect(store.compare_and_set(
+                '/a',
+                0,
+                { activeSheetIndex: 2 },
+                validator,
+            )).resolves.toMatchObject({ type: 'conflict' });
+            expect(validator).toHaveBeenCalledOnce();
+        }
+        expect((await store.read('/a')).state).toEqual({});
+    });
+
+    it('returns the current snapshot and authority on every CAS outcome', async () => {
+        const store = create_file_state_store(context_with({}).context);
+        const committed = await store.compare_and_set('/a', 0, { activeSheetIndex: 1 });
+        expect(committed).toEqual({
+            type: 'committed',
+            snapshot: { state: { activeSheetIndex: 1 }, revision: 1 },
+            authority: {
+                commitSequence: 0,
+                authorityRevision: 0,
+                physicalRevision: 0,
+                projectionRevision: 0,
+            },
+        });
+        await store.stage_authority_transaction('/a', {
+            id: 'projection', kind: 'projection', ordinal: 1,
+            expectedStateRevision: 1, expectedCommitSequence: 0,
+        });
+        const finalized = await store.finalize_authority_transaction('/a', 'projection');
+        if (finalized.type !== 'finalized') throw new Error('authority setup failed');
+        await expect(store.compare_and_set('/a', 0, { activeSheetIndex: 2 }))
+            .resolves.toEqual({
+                type: 'conflict',
+                snapshot: finalized.snapshot,
+                authority: finalized.authority,
+            });
+    });
+
+    it('shares one explicit runtime queue and close drains independently queued work', async () => {
+        const backing = context_with({});
+        const base = create_memento_keyed_file_state_persistence(backing.context);
+        const peer = create_memento_keyed_file_state_persistence(backing.context);
+        expect(peer.runtime_key).toBe(base.runtime_key);
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+        let firstWrite = true;
+        const held: KeyedFileStatePersistence = {
+            ...base,
+            async write_transaction(kind, body) {
+                if (firstWrite) {
+                    firstWrite = false;
+                    markFirstEntered();
+                    await firstGate;
+                }
+                return base.write_transaction(kind, body);
+            },
+        };
+        let secondTransactionBegan = false;
+        const observed: KeyedFileStatePersistence = {
+            ...peer,
+            write_transaction(kind, body) {
+                secondTransactionBegan = true;
+                return peer.write_transaction(kind, body);
+            },
+        };
+        const first = create_keyed_authority_store(held);
+        const second = create_keyed_authority_store(observed);
+
+        const firstWritePromise = first.compare_and_set('/first', 0, { activeSheetIndex: 1 });
+        await firstEntered;
+        const secondWritePromise = second.compare_and_set('/second', 0, { activeSheetIndex: 2 });
+        let closeResolved = false;
+        const closePromise = base.close().then(() => { closeResolved = true; });
+        const postCloseRead = second.read('/rejected');
+        expect(secondTransactionBegan).toBe(false);
+        expect(closeResolved).toBe(false);
+        await expect(postCloseRead).rejects.toThrow('File-state persistence is closed.');
+
+        releaseFirst();
+        await Promise.all([firstWritePromise, secondWritePromise, closePromise]);
+        expect(secondTransactionBegan).toBe(true);
+        expect(closeResolved).toBe(true);
+        await expect(first.compare_and_set('/late', 0, { activeSheetIndex: 3 }))
+            .rejects.toThrow('File-state persistence is closed.');
+    });
+
+    it('avoids entry payload I/O for touch and stage-only mutations', async () => {
+        const backing = context_with({});
+        const measured = instrument_payload_io(
+            create_memento_keyed_file_state_persistence(backing.context),
+        );
+        const store = create_keyed_authority_store(measured.wrapped);
+        await store.compare_and_set('/large', 0, {
+            activeSheetIndex: 1,
+            futureCompatibleLeaf: { payload: 'x'.repeat(100_000) },
+        } as any);
+
+        measured.reset();
+        await store.touch('/large');
+        expect(measured.counts).toEqual({ reads: 0, writes: 0 });
+
+        measured.reset();
+        await store.stage_authority_transaction('/large', {
+            id: 'stage', kind: 'projection', ordinal: 1,
+            expectedStateRevision: 1, expectedCommitSequence: 0,
+        });
+        expect(measured.counts).toEqual({ reads: 0, writes: 0 });
+
+        measured.reset();
+        await store.discard_authority_transaction('/large', 'stage');
+        expect(measured.counts).toEqual({ reads: 0, writes: 0 });
+
+        await store.stage_authority_transaction('/large', {
+            id: 'stale', kind: 'projection', ordinal: 2,
+            expectedStateRevision: 1, expectedCommitSequence: 0,
+        });
+        measured.reset();
+        await store.cleanup_authority_transactions('/large', Date.now() + 25 * 60 * 60 * 1000);
+        expect(measured.counts).toEqual({ reads: 0, writes: 0 });
+        expect((await store.read('/large')).state).toMatchObject({ activeSheetIndex: 1 });
+    });
+
+    it('rejects thenable keyed transaction callbacks without committing mutations', async () => {
+        const backing = context_with({});
+        const persistence = create_memento_keyed_file_state_persistence(backing.context);
+        await expect(persistence.read_transaction(
+            (() => Promise.resolve('async')) as never,
+        )).rejects.toThrow('transaction callbacks must be synchronous');
+        await expect(persistence.write_transaction('compareAndSet', (tx) => {
+            tx.set_updated_at(123);
+            return { then() {} } as never;
+        })).rejects.toThrow('transaction callbacks must be synchronous');
+        expect(backing.update).not.toHaveBeenCalled();
+        expect(backing.value()).toEqual({});
+        await persistence.close();
+    });
+
+    it('round-trips complete entries through the keyed Memento transaction port', async () => {
+        const backing = context_with({});
+        const persistence = create_memento_keyed_file_state_persistence(backing.context);
+        const written = await persistence.write_transaction('compareAndSet', (tx) => {
+            const revision = tx.allocate_revision();
+            tx.set_updated_at(123);
+            tx.write_entry({
+                entry: {
+                    path: '/keyed',
+                    stateRevision: revision,
+                    stateJson: JSON.stringify({ activeSheetIndex: 3 }),
+                    hasPendingEdits: false,
+                    authority: {
+                        commitSequence: 2,
+                        authorityRevision: 1,
+                        physicalRevision: 1,
+                        projectionRevision: 0,
+                        physicalDigest: 'digest',
+                    },
+                    recencyOrder: 1n,
+                    updatedAtMs: 123,
+                    recoveryEntryId: '/keyed',
+                },
+                stages: [{
+                    id: 'stage', kind: 'projection', ordinal: 3,
+                    expectedStateRevision: revision,
+                    expectedCommitSequence: 2,
+                    createdAt: 100,
+                }],
+            });
+            return revision;
+        });
+        expect(written).toBe(1);
+        expect(backing.value()).toEqual({
+            format: 'tableViewer.fileState.v1',
+            nextRevision: 2,
+            absenceRevision: 0,
+            updatedAt: 123,
+            entries: {
+                '/keyed': {
+                    revision: 1,
+                    state: { activeSheetIndex: 3 },
+                    authority: {
+                        commitSequence: 2,
+                        authorityRevision: 1,
+                        physicalRevision: 1,
+                        projectionRevision: 0,
+                        physicalDigest: 'digest',
+                    },
+                    stages: {
+                        stage: {
+                            id: 'stage', kind: 'projection', ordinal: 3,
+                            expectedStateRevision: 1,
+                            expectedCommitSequence: 2,
+                            createdAt: 100,
+                        },
+                    },
+                    updatedAt: 123,
+                },
+            },
+        });
+        await expect(persistence.read_transaction((tx) => tx.read_entry('/keyed')))
+            .resolves.toMatchObject({
+                entry: {
+                    path: '/keyed',
+                    stateRevision: 1,
+                    stateJson: JSON.stringify({ activeSheetIndex: 3 }),
+                    hasPendingEdits: false,
+                    recencyOrder: 1n,
+                },
+                stages: [{ id: 'stage', createdAt: 100 }],
+            });
+        await persistence.close();
+    });
+
+    it('derives pending-edit metadata and protects pending rows from retention', async () => {
+        const backing = context_with({});
+        const store = create_file_state_store(backing.context, () => 1);
+        await store.compare_and_set('/pending', 0, {
+            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+        });
+        const keyed = create_memento_keyed_file_state_persistence(backing.context);
+        await expect(keyed.read_transaction((tx) => tx.read_entry_metadata('/pending')))
+            .resolves.toMatchObject({ hasPendingEdits: true });
+
+        await store.compare_and_set('/ordinary-a', 0, { activeSheetIndex: 1 });
+        await store.compare_and_set('/ordinary-b', 0, { activeSheetIndex: 2 });
+        expect(backing.value().entries['/pending']).toBeDefined();
+        expect(backing.value().entries['/ordinary-a']).toBeUndefined();
+        await expect(keyed.read_transaction((tx) => tx.read_entry_metadata('/ordinary-b')))
+            .resolves.toMatchObject({ hasPendingEdits: false });
+
+        const copied = await store.copy_entry_if_absent!(
+            '/pending',
+            '/pending-copy',
+            'pending-copy',
+        );
+        expect(copied.type).toBe('copied');
+        await expect(keyed.read_transaction((tx) => tx.read_entry_metadata('/pending-copy')))
+            .resolves.toMatchObject({ hasPendingEdits: true });
+
+        const copy_snapshot = await store.read('/pending-copy');
+        const authority = await store.read_authority('/pending-copy');
+        await store.stage_authority_transaction('/pending-copy', {
+            id: 'clear-pending', kind: 'projection', ordinal: 1,
+            expectedStateRevision: copy_snapshot.revision,
+            expectedCommitSequence: authority.commitSequence,
+            nextState: { activeSheetIndex: 4 },
+        });
+        await store.finalize_authority_transaction('/pending-copy', 'clear-pending');
+        await expect(keyed.read_transaction((tx) => tx.read_entry_metadata('/pending-copy')))
+            .resolves.toMatchObject({ hasPendingEdits: false });
+        await keyed.close();
+    });
+
+    it('repairs imported pending-edit metadata during canonicalization', async () => {
+        const alias = 'C:\\Data\\Pending.csv';
+        const canonical = 'c:\\data\\pending.csv';
+        const backing = context_with({
+            format: 'tableViewer.fileState.v1',
+            nextRevision: 2,
+            absenceRevision: 0,
+            entries: {
+                [alias]: {
+                    revision: 1,
+                    state: { pendingEdits: { '0:0': 'value' } },
+                    hasPendingEdits: false,
+                },
+            },
+        });
+        const store = create_file_state_store(backing.context);
+        await store.canonicalize_path!(canonical, (path) => path.toLowerCase());
+        const keyed = create_memento_keyed_file_state_persistence(backing.context);
+        await expect(keyed.read_transaction((tx) => tx.read_entry_metadata(canonical)))
+            .resolves.toMatchObject({ hasPendingEdits: true });
+        await keyed.close();
+    });
+
+    it('clears copy provenance when absent-target canonicalization allocates a revision', async () => {
+        const backing = context_with({});
+        const base = create_memento_keyed_file_state_persistence(backing.context);
+        const persistence: KeyedFileStatePersistence = {
+            ...base,
+            canonicalization_revision_policy: 'allocate-revision-when-target-absent',
+        };
+        const store = create_keyed_authority_store(persistence);
+        const source = '/source';
+        const alias = 'C:\\Data\\copied.csv';
+        const canonical = 'c:\\data\\copied.csv';
+        await store.compare_and_set(source, 0, { activeSheetIndex: 3 });
+        await store.copy_entry_if_absent!(source, alias, 'copy-id');
+        const aliasRevision = (await store.read(alias)).revision;
+
+        await store.canonicalize_path!(canonical, (path) => path.toLowerCase());
+        expect((await store.read(canonical)).revision).not.toBe(aliasRevision);
+        await expect(store.copy_entry_if_absent!(source, canonical, 'copy-id'))
+            .resolves.toMatchObject({ type: 'destinationExists' });
+        expect(backing.value().entries[canonical].copyProvenance).toBeUndefined();
     });
 
     it('leaves no staged state when the single durable update fails', async () => {

@@ -97,6 +97,82 @@ describe('shared state store recency timestamps', () => {
         expect(backing.value().entries['/source'].updatedAt).toBe(1_000_000);
     });
 
+    it('never regresses store or entry timestamps when the clock moves backward', async () => {
+        const backing = memory_medium();
+        const store = create_authority_store(backing.medium);
+        vi.setSystemTime(2_000_000);
+        await store.compare_and_set('/a', 0, { activeSheetIndex: 1 });
+
+        vi.setSystemTime(1_000_000);
+        await store.compare_and_set('/a', 1, { activeSheetIndex: 2 });
+        await store.touch('/a');
+
+        expect(backing.value().updatedAt).toBe(2_000_000);
+        expect(backing.value().entries['/a'].updatedAt).toBe(2_000_000);
+        expect(backing.value().entries['/a'].touchedAt).toBe(1_000_000);
+
+        vi.setSystemTime(500_000);
+        await store.touch('/a');
+        expect(backing.value().entries['/a'].touchedAt).toBe(1_000_000);
+        expect(backing.value().updatedAt).toBe(2_000_000);
+    });
+
+    it('does not stamp conflicts or missing-discard no-ops', async () => {
+        const backing = memory_medium();
+        const store = create_authority_store(backing.medium);
+        await store.compare_and_set('/a', 0, { activeSheetIndex: 1 });
+        const writes_before = structuredClone(backing.value());
+
+        vi.setSystemTime(4_000_000);
+        await store.compare_and_set('/a', 0, { activeSheetIndex: 2 });
+        await store.discard_authority_transaction('/a', 'missing');
+
+        expect(backing.value()).toEqual(writes_before);
+    });
+
+    it('uses one captured timestamp per queued copy and preserves inherited touch time', async () => {
+        const backing = memory_medium();
+        const store = create_authority_store(backing.medium);
+        vi.setSystemTime(2_000_000);
+        await store.compare_and_set('/source', 0, { activeSheetIndex: 1 });
+        vi.setSystemTime(3_000_000);
+        await store.touch('/source');
+
+        vi.setSystemTime(1_000_000);
+        await store.copy_entry_if_absent!('/source', '/destination', 'copy');
+
+        expect(backing.value().entries['/destination'].updatedAt).toBe(1_000_000);
+        expect(backing.value().entries['/destination'].touchedAt).toBe(3_000_000);
+        expect(backing.value().updatedAt).toBe(3_000_000);
+    });
+
+    it('updates the store timestamp for stage, discard, and stale cleanup mutations', async () => {
+        const backing = memory_medium();
+        const store = create_authority_store(backing.medium);
+        vi.setSystemTime(2_000_000);
+        await store.stage_authority_transaction('/a', {
+            id: 'discarded', kind: 'physical', ordinal: 1,
+            expectedStateRevision: 0, expectedCommitSequence: 0,
+        });
+        expect(backing.value().updatedAt).toBe(2_000_000);
+
+        vi.setSystemTime(3_000_000);
+        await store.discard_authority_transaction('/a', 'discarded');
+        expect(backing.value().updatedAt).toBe(3_000_000);
+
+        vi.setSystemTime(4_000_000);
+        await store.stage_authority_transaction('/a', {
+            id: 'stale', kind: 'physical', ordinal: 2,
+            expectedStateRevision: 0, expectedCommitSequence: 0,
+        });
+        await store.cleanup_authority_transactions(
+            '/ignored',
+            4_000_000 + 24 * 60 * 60 * 1000 + 1,
+        );
+        expect(backing.value().updatedAt)
+            .toBe(4_000_000 + 24 * 60 * 60 * 1000 + 1);
+    });
+
     it('reads old envelopes without timestamps and fills them in on the next write', async () => {
         const backing = memory_medium({
             format: 'tableViewer.fileState.v1',

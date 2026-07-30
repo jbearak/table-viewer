@@ -7,6 +7,7 @@ import {
     json_state_file_path,
     JSON_STATE_FILE_NAME,
 } from '../json-file-state-store';
+import { file_state_store_contract } from './file-state-store-contract';
 
 let temp_dir: string;
 let counter = 0;
@@ -29,7 +30,52 @@ afterEach(async () => {
     await fs.promises.rm(temp_dir, { recursive: true, force: true });
 });
 
+file_state_store_contract('JSON compatibility backend', () => {
+    const blob_path = fresh_blob_path();
+    return {
+        create: (max = 10_000) => create_json_file_state_store(blob_path, () => max),
+        createIndependent: (max = 10_000) => create_json_file_state_store(blob_path, () => max),
+        async seedEnvelope(envelope) {
+            await fs.promises.mkdir(path.dirname(blob_path), { recursive: true });
+            await fs.promises.writeFile(blob_path, JSON.stringify(envelope), 'utf8');
+        },
+        persistedValue: () => read_blob(blob_path),
+        async failNextWrite() {
+            const directory = path.dirname(blob_path);
+            const serialized = await fs.promises.readFile(blob_path, 'utf8');
+            await fs.promises.rm(directory, { recursive: true, force: true });
+            await fs.promises.writeFile(directory, 'not a directory', 'utf8');
+            return async () => {
+                await fs.promises.rm(directory, { force: true });
+                await fs.promises.mkdir(directory, { recursive: true });
+                await fs.promises.writeFile(blob_path, serialized, 'utf8');
+            };
+        },
+    };
+});
+
 describe('JSON file state store backend', () => {
+    it('leaves legacy JSON bytes exactly unchanged after reads', async () => {
+        const blob_path = fresh_blob_path();
+        const bytes = `{
+  "/legacy" : {
+    "futureCompatibleLeaf" : { "z" : 1, "a" : 2 },
+    "activeSheet" : "Sheet1",
+    "columnWidths" : { "Sheet1" : { "0" : 120 } },
+    "rowHeights" : { "Sheet1" : { "1" : 24 } },
+    "scrollPosition" : { "Sheet1" : { "top" : 2, "left" : 3 } }
+  }
+}\n`;
+        await fs.promises.mkdir(path.dirname(blob_path), { recursive: true });
+        await fs.promises.writeFile(blob_path, bytes, 'utf8');
+        const store = create_json_file_state_store(blob_path);
+
+        await store.read('/legacy');
+        await store.read_authority('/legacy');
+
+        expect(await fs.promises.readFile(blob_path, 'utf8')).toBe(bytes);
+    });
+
     it('derives the stable userData layout path', () => {
         expect(json_state_file_path('/data')).toBe(
             path.join('/data', 'state', 'tableViewer.fileState.v1.json'),
@@ -65,6 +111,11 @@ describe('JSON file state store backend', () => {
                 },
             },
         });
+        expect(Object.keys(envelope.entries['/a']).sort()).toEqual([
+            'revision',
+            'state',
+            'updatedAt',
+        ]);
         expect(fs.readdirSync(path.dirname(blob_path))).toEqual([JSON_STATE_FILE_NAME]);
     });
 
