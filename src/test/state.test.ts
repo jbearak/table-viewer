@@ -74,7 +74,7 @@ file_state_store_contract('Memento compatibility backend', () => {
         create: (max = 10_000) => create_file_state_store(backing.context, () => max),
         createIndependent: (max = 10_000) => create_file_state_store(backing.context, () => max),
         seedEnvelope: (envelope) => backing.set(envelope),
-        persistedValue: () => backing.value(),
+        inspect: () => backing.value(),
         failNextWrite: async () => {
             backing.failNextWrite();
             return async () => {};
@@ -437,6 +437,143 @@ describe('FileStateStore versioned state', () => {
                 stages: [{ id: 'stage', createdAt: 100 }],
             });
         await persistence.close();
+    });
+
+    it('stages transaction-owned lease changes until persistence succeeds', async () => {
+        const backing = context_with({});
+        const persistence = create_memento_keyed_file_state_persistence(backing.context);
+
+        backing.failNextWrite();
+        await expect(persistence.write_transaction('lease', (tx) => {
+            tx.insert_lease('exact-lease', '/alias');
+            expect(tx.entry_is_leased('/alias')).toBe(true);
+            tx.set_updated_at(1);
+        })).rejects.toThrow('injected write failure');
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+            .resolves.toBe(false);
+
+        await persistence.write_transaction('lease', (tx) => {
+            tx.insert_lease('exact-lease', '/alias');
+            tx.set_updated_at(2);
+        });
+        backing.failNextWrite();
+        await expect(persistence.write_transaction('canonicalize', (tx) => {
+            tx.move_leases(['/alias'], '/canonical');
+            expect(tx.entry_is_leased('/alias')).toBe(false);
+            expect(tx.entry_is_leased('/canonical')).toBe(true);
+            tx.set_updated_at(3);
+        })).rejects.toThrow('injected write failure');
+        await expect(persistence.read_transaction((tx) => ({
+            alias: tx.entry_is_leased('/alias'),
+            canonical: tx.entry_is_leased('/canonical'),
+        }))).resolves.toEqual({ alias: true, canonical: false });
+
+        backing.failNextWrite();
+        await expect(persistence.write_transaction('releaseLease', (tx) => {
+            expect(tx.delete_lease('different-lease')).toBe(false);
+            expect(tx.delete_lease('exact-lease')).toBe(true);
+            expect(tx.entry_is_leased('/alias')).toBe(false);
+            tx.set_updated_at(4);
+        })).rejects.toThrow('injected write failure');
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+            .resolves.toBe(true);
+
+        await persistence.write_transaction('releaseLease', (tx) => {
+            expect(tx.delete_lease('exact-lease')).toBe(true);
+        });
+        await persistence.write_transaction('releaseLease', (tx) => {
+            expect(tx.delete_lease('exact-lease')).toBe(false);
+        });
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+            .resolves.toBe(false);
+        await persistence.close();
+    });
+
+    it('passes one exact random lease id through backend insertion and release', async () => {
+        const backing = context_with({});
+        const base = create_memento_keyed_file_state_persistence(backing.context);
+        const events: Array<{
+            kind: string;
+            operation: 'insert' | 'move' | 'delete';
+            leaseId?: string;
+            path?: string;
+            sourcePaths?: readonly string[];
+        }> = [];
+        const persistence: KeyedFileStatePersistence = {
+            ...base,
+            write_transaction: (kind, body) => base.write_transaction(kind, (tx) => body({
+                ...tx,
+                insert_lease(leaseId, path) {
+                    tx.insert_lease(leaseId, path);
+                    expect(tx.entry_is_leased(path)).toBe(true);
+                    events.push({ kind, operation: 'insert', leaseId, path });
+                },
+                move_leases(sourcePaths, destinationPath) {
+                    tx.move_leases(sourcePaths, destinationPath);
+                    events.push({
+                        kind,
+                        operation: 'move',
+                        sourcePaths: [...sourcePaths],
+                        path: destinationPath,
+                    });
+                },
+                delete_lease(leaseId) {
+                    events.push({ kind, operation: 'delete', leaseId });
+                    return tx.delete_lease(leaseId);
+                },
+            })),
+        };
+        const store = create_keyed_authority_store(persistence, () => 1);
+        const alias = 'C:\\Data\\leased.csv';
+        const canonical = 'c:\\data\\leased.csv';
+        await store.compare_and_set(alias, 0, { activeSheetIndex: 1 });
+
+        const lease = await store.lease_entry!(alias, (path) => path.toLowerCase());
+        const insertion = events.find((event) => event.operation === 'insert');
+        expect(insertion).toMatchObject({ kind: 'lease', path: alias });
+        expect(insertion?.leaseId).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        );
+
+        await store.canonicalize_path!(canonical, (path) => path.toLowerCase());
+        expect(events).toContainEqual({
+            kind: 'canonicalize',
+            operation: 'move',
+            sourcePaths: [alias],
+            path: canonical,
+        });
+        await lease.release();
+        expect(events.at(-1)).toEqual({
+            kind: 'releaseLease',
+            operation: 'delete',
+            leaseId: insertion?.leaseId,
+        });
+        await base.close();
+    });
+
+    it('uses transaction-visible backend leases for retention protection', async () => {
+        const backing = context_with({});
+        const base = create_memento_keyed_file_state_persistence(backing.context);
+        const persistence: KeyedFileStatePersistence = {
+            ...base,
+            read_transaction: (body) => base.read_transaction((tx) => body({
+                ...tx,
+                entry_is_leased: (path) => path === '/backend-owned' || tx.entry_is_leased(path),
+            })),
+            write_transaction: (kind, body) => base.write_transaction(kind, (tx) => body({
+                ...tx,
+                entry_is_leased: (path) => path === '/backend-owned' || tx.entry_is_leased(path),
+            })),
+        };
+        const store = create_keyed_authority_store(persistence, () => 1);
+        await store.compare_and_set('/backend-owned', 0, { activeSheetIndex: 1 });
+        await store.compare_and_set('/ordinary', 0, { activeSheetIndex: 2 });
+        await store.compare_and_set('/newest', 0, { activeSheetIndex: 3 });
+
+        expect((await store.read('/backend-owned')).state).toEqual({ activeSheetIndex: 1 });
+        expect((await store.read('/ordinary')).state).toEqual({});
+        expect((await store.read('/newest')).state).toEqual({ activeSheetIndex: 3 });
+        await base.close();
     });
 
     it('derives pending-edit metadata and protects pending rows from retention', async () => {
