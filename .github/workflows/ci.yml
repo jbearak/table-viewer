@@ -61,3 +61,42 @@ jobs:
       # so launch it under a virtual framebuffer.
       - name: Integration tests (VS Code Extension Host)
         run: xvfb-run -a npm run test:integration
+
+  windows-sqlite:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck:all
+
+      - name: Unit tests excluding unsupported Windows SQLite backend
+        run: npm test -- --exclude "src/test/sqlite-*.test.ts"
+
+      - name: SQLite Windows public-open fail-closed test
+        run: npm run test:sqlite:windows-fail-closed
+
+      - name: Host Node SQLite runtime probe
+        run: npm run probe:sqlite:host
+
+      - name: Server bundle SQLite externalization probe
+        run: npm run probe:sqlite:bundles
+
+      - name: Electron SQLite runtime probe
+        shell: pwsh
+        run: |
+          npm run bundle:desktop
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\electron-sqlite-runtime-probe.js

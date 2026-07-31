@@ -175,6 +175,9 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:sqlite:multiprocess": "vitest run src/test/sqlite-multiprocess.test.ts",
+    "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts",
+    "test:sqlite:windows-fail-closed": "vitest run src/test/sqlite-open-recovery.test.ts -t \"fails public open on Windows at unsupported directory durability without creating database evidence\"",
     "compile:integration": "tsc -p tsconfig.integration.json",
     "typecheck": "tsc -p . --noEmit",
     "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit",

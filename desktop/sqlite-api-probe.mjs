@@ -1,4 +1,18 @@
+import {
+    closeSync,
+    existsSync,
+    fsyncSync,
+    linkSync,
+    mkdtempSync,
+    openSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 
 function invariant(condition, message) {
     if (!condition) throw new Error(`node:sqlite runtime probe failed: ${message}`);
@@ -52,6 +66,90 @@ export function run_sqlite_api_probe(runtime) {
         invariant(typeof sqlite_version === 'string' && sqlite_version.length > 0,
             'sqlite_version() returned no version');
 
+        const json = database.prepare(`SELECT json_valid(?) AS valid,
+            json_type(?) AS type`).get('{"value":1}', '{"value":1}');
+        invariant(json?.valid === 1 && json?.type === 'object',
+            'SQLite JSON functions are unavailable');
+
+        database.exec('PRAGMA query_only = ON');
+        let query_only_error;
+        try {
+            insert.run(8, 'query-only-write');
+        } catch (error) {
+            query_only_error = error;
+        } finally {
+            database.exec('PRAGMA query_only = OFF');
+        }
+        invariant(query_only_error instanceof Error, 'query_only did not reject a write');
+        invariant(insert.run(9, 'query-only-restored').changes === 1,
+            'query_only could not be restored for the writer connection');
+
+        const probe_directory = mkdtempSync(join(tmpdir(), 'table-viewer-sqlite-probe-'));
+        let directory_fsync;
+        try {
+            const existing_path = join(probe_directory, 'existing.sqlite3');
+            new DatabaseSync(existing_path).close();
+            const existing_uri = pathToFileURL(existing_path);
+            existing_uri.searchParams.set('mode', 'rw');
+            new DatabaseSync(existing_uri).close();
+
+            const missing_path = join(probe_directory, 'missing.sqlite3');
+            const missing_uri = pathToFileURL(missing_path);
+            missing_uri.searchParams.set('mode', 'rw');
+            let missing_error;
+            try {
+                new DatabaseSync(missing_uri).close();
+            } catch (error) {
+                missing_error = error;
+            }
+            invariant(missing_error instanceof Error,
+                'URI mode=rw unexpectedly created a missing database');
+            invariant(!existsSync(missing_path),
+                'URI mode=rw left a missing database behind');
+
+            const link_source = join(probe_directory, 'link-source');
+            const link_target = join(probe_directory, 'link-target');
+            writeFileSync(link_source, 'source', { mode: 0o600 });
+            writeFileSync(link_target, 'target', { mode: 0o600 });
+            let link_error;
+            try {
+                linkSync(link_source, link_target);
+            } catch (error) {
+                link_error = error;
+            }
+            invariant(link_error instanceof Error && link_error.code === 'EEXIST',
+                'hard-link installation did not fail closed on an existing target');
+            invariant(readFileSync(link_target, 'utf8') === 'target',
+                'hard-link no-clobber changed the existing target');
+
+            let directory_error;
+            try {
+                const directory = openSync(probe_directory, 'r');
+                try {
+                    fsyncSync(directory);
+                } finally {
+                    closeSync(directory);
+                }
+            } catch (error) {
+                directory_error = error;
+            }
+            if (process.platform === 'win32') {
+                // Production deliberately refuses Windows directory durability until
+                // Node exposes a proven primitive. A native success here is not enough
+                // to weaken that fail-closed policy.
+                directory_fsync = 'fail-closed';
+            } else {
+                invariant(directory_error === undefined,
+                    `directory fsync failed: ${directory_error?.code ?? 'unknown'}`);
+                directory_fsync = 'supported';
+            }
+        } finally {
+            rmSync(probe_directory, { recursive: true, force: true });
+        }
+
+        invariant(directory_fsync === 'supported' || directory_fsync === 'fail-closed',
+            'directory durability capability was not resolved');
+
         let representative_error;
         try {
             insert.run(8, 'alpha');
@@ -72,6 +170,13 @@ export function run_sqlite_api_probe(runtime) {
             node: process.versions.node,
             electron: process.versions.electron ?? null,
             sqlite: sqlite_version,
+            capabilities: {
+                jsonFunctions: true,
+                uriReadWriteNonCreating: true,
+                queryOnly: true,
+                hardLinkNoClobber: true,
+                directoryFsync: directory_fsync,
+            },
             error: {
                 code: representative_error.code,
                 errcode: representative_error.errcode,
