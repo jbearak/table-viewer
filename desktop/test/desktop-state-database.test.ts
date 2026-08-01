@@ -4,7 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SqliteOpenRecoveryEvent } from '../../src/sqlite-open-recovery';
-import { sqlite_file_state_protocol_error } from '../../src/sqlite-file-state-errors';
+import {
+    SqliteFileStateError,
+    sqlite_file_state_protocol_error,
+} from '../../src/sqlite-file-state-errors';
 import { classify_state_recovery_failure } from '../main/state-recovery-dialog';
 import {
     DESKTOP_STATE_DATABASE_ID,
@@ -538,6 +541,62 @@ describe('desktop state database', () => {
         expect(generations).toHaveLength(1);
         expect(fs.readdirSync(path.join(quarantine_root, generations[0])))
             .toEqual(['not-a-uuid.reader']);
+    });
+
+    it('leaks no path when the readers directory is not a directory', async () => {
+        // The quarantine runs ahead of the backend's own sanitizing layer, so an
+        // errno escaping it raw would put an absolute path into `.path` and into
+        // `.message` — which is exactly what every other failure in this module is
+        // careful never to do. Reachable without hand-editing: a sync client or a
+        // restore can leave a plain file on a directory's name.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const readers = path.join(gate_directory(), 'readers');
+        fs.rmSync(readers, { recursive: true, force: true });
+        fs.writeFileSync(readers, 'not a directory', { mode: 0o600 });
+
+        const failure = await preserve_desktop_state_database(
+            userDataDir,
+            { allProcessesClosed: true },
+        ).then(() => undefined, (error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(SqliteFileStateError);
+        const categorized = failure as SqliteFileStateError;
+        expect(categorized.category).toBe('recovery');
+        expect((categorized as unknown as { path?: string }).path).toBeUndefined();
+        for (const secret of [userDataDir, os.tmpdir(), 'file-state.sqlite3', 'readers']) {
+            expect(categorized.message).not.toContain(secret);
+            expect(JSON.stringify(categorized.metadata)).not.toContain(secret);
+        }
+    });
+
+    it('moves nothing when the readers directory is a symlink out of the gate', async () => {
+        // `existsSync` follows symlinks, so resolving the readers directory that
+        // way would send every rename to wherever the link points — mutating files
+        // outside the gate tree, and doing it before the backend's own
+        // managed-directory check could object. Nothing here is ours to move.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const elsewhere = path.join(userDataDir, 'elsewhere');
+        fs.mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+        const decoy = path.join(elsewhere, 'not-a-uuid.reader');
+        fs.writeFileSync(decoy, 'outside the gate', { mode: 0o600 });
+        const readers = path.join(gate_directory(), 'readers');
+        fs.rmSync(readers, { recursive: true, force: true });
+        fs.symlinkSync(elsewhere, readers);
+
+        await expect(preserve_desktop_state_database(
+            userDataDir,
+            { allProcessesClosed: true },
+        )).rejects.toBeInstanceOf(SqliteFileStateError);
+
+        // The decoy never moved, and no quarantine tree was created for it.
+        expect(fs.readFileSync(decoy, 'utf8')).toBe('outside the gate');
+        expect(fs.existsSync(path.join(gate_directory(), 'quarantined-readers'))).toBe(false);
     });
 
     it('reports a non-file on a basename member as its own condition, not a resumed move', async () => {

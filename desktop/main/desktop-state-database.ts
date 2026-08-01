@@ -351,6 +351,22 @@ function desktop_state_gate_directory(database_path: string): string {
  * are evidence about how the directory got into this state, and nothing in this
  * module is allowed to destroy evidence.
  */
+/**
+ * Reduce any filesystem failure from the quarantine to a category.
+ *
+ * Load-bearing, not defensive tidiness: a raw `NodeJS.ErrnoException` carries
+ * the absolute path in `.path` *and* embeds it in `.message`, and this function
+ * runs before the backend's own sanitizing layer would have caught it — so
+ * without this an `ENOTDIR`/`EACCES` here would put a real filesystem path into
+ * whatever the caller logs or shows. `SqliteFileStateError` already carries
+ * nothing but a category and a sanitized operation name.
+ */
+function quarantine_failure(error: unknown) {
+    return categorize_sqlite_file_state_error(error, {
+        operation: 'reader-token-quarantine',
+    });
+}
+
 function quarantine_unparseable_reader_tokens(
     database_path: string,
     confirmation: { readonly allProcessesClosed: true },
@@ -360,7 +376,25 @@ function quarantine_unparseable_reader_tokens(
         throw new Error('Quarantining reader tokens requires all processes closed.');
     }
     const readers_directory = path.join(desktop_state_gate_directory(database_path), 'readers');
-    if (!fs.existsSync(readers_directory)) return;
+    // `lstatSync`, not `existsSync`: the latter follows symlinks, so a `readers`
+    // symlink would send every rename below outside the gate tree — moving files
+    // this function has no business touching, and doing it *before* the backend's
+    // own managed-directory check could object. A non-directory or a link is left
+    // exactly as found for the recovery dialog to surface; this function's job is
+    // to clear entries *inside* our own readers directory, and if that directory
+    // is not ours then nothing here is either.
+    let readers: fs.Stats;
+    try {
+        readers = fs.lstatSync(readers_directory);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return;
+        throw quarantine_failure(error);
+    }
+    if (!readers.isDirectory()) {
+        throw sqlite_file_state_recovery_error({
+            operation: 'reader-token-quarantine-directory',
+        });
+    }
     // Duplicated rather than imported from the shared backend: this is the shape
     // the backend *rejects*, so the predicate that decides what to quarantine has
     // to keep matching that rejection even if a future token name gains a
@@ -368,36 +402,43 @@ function quarantine_unparseable_reader_tokens(
     // pattern accepts.
     const uuid_pattern
         = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const unparseable = fs.readdirSync(readers_directory, { withFileTypes: true })
-        .filter((entry) => entry.name.endsWith('.reader'))
-        .filter((entry) => !entry.isFile()
-            || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
-        .map((entry) => entry.name);
-    if (unparseable.length === 0) return;
-    const quarantine_directory = path.join(
-        desktop_state_gate_directory(database_path),
-        READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
-        randomUUID(),
-    );
-    fs.mkdirSync(quarantine_directory, { recursive: true, mode: 0o700 });
-    // Durability in the same order the shared backend uses: the new directory
-    // entry is flushed before anything is moved into it, so a crash mid-quarantine
-    // cannot leave a member with no directory to have landed in.
-    const flush = (directory: string): void => {
-        assert_sqlite_directory_durability_supported(
-            directory,
-            options.fsyncDirectory ?? fs.fsyncSync,
+    // Every filesystem call below is inside this try for the reason
+    // `quarantine_failure` documents: an unsanitized errno escaping here would
+    // carry an absolute path out of the module.
+    try {
+        const unparseable = fs.readdirSync(readers_directory, { withFileTypes: true })
+            .filter((entry) => entry.name.endsWith('.reader'))
+            .filter((entry) => !entry.isFile()
+                || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
+            .map((entry) => entry.name);
+        if (unparseable.length === 0) return;
+        const quarantine_directory = path.join(
+            desktop_state_gate_directory(database_path),
+            READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
+            randomUUID(),
         );
-    };
-    flush(path.dirname(quarantine_directory));
-    for (const name of unparseable) {
-        fs.renameSync(
-            path.join(readers_directory, name),
-            path.join(quarantine_directory, name),
-        );
+        fs.mkdirSync(quarantine_directory, { recursive: true, mode: 0o700 });
+        // Durability in the same order the shared backend uses: the new directory
+        // entry is flushed before anything is moved into it, so a crash
+        // mid-quarantine cannot leave a member with no directory to have landed in.
+        const flush = (directory: string): void => {
+            assert_sqlite_directory_durability_supported(
+                directory,
+                options.fsyncDirectory ?? fs.fsyncSync,
+            );
+        };
+        flush(path.dirname(quarantine_directory));
+        for (const name of unparseable) {
+            fs.renameSync(
+                path.join(readers_directory, name),
+                path.join(quarantine_directory, name),
+            );
+        }
+        flush(quarantine_directory);
+        flush(readers_directory);
+    } catch (error) {
+        throw quarantine_failure(error);
     }
-    flush(quarantine_directory);
-    flush(readers_directory);
 }
 
 /**
