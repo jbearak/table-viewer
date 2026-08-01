@@ -3,6 +3,8 @@
 // other shells (e.g. a future desktop app) can provide their own without the
 // shared code importing `vscode`.
 import type { FileRefreshWatcherFactory } from './file-refresh-watcher';
+import type { PreparedPhysicalInstallBundle } from './prepared-physical-install';
+import type { HostPhysicalResourceLock } from './physical-resource-lock';
 import type { ResourceUriLike } from './resource-identity';
 
 /** Minimal disposable, structurally compatible with vscode.Disposable. */
@@ -45,12 +47,42 @@ export interface ConfigPort {
     on_font_change(listener: () => void): Disposable;
 }
 
+export type PhysicalEditViewOnlyReason =
+    | 'non-file'
+    | 'remote-host'
+    | 'shared-mount'
+    | 'wsl'
+    | 'unverifiable-filesystem'
+    | 'unsupported-platform'
+    | 'conditional-install-unsupported';
+
+export type PhysicalEditAvailability =
+    | { readonly type: 'available' }
+    | { readonly type: 'viewOnly'; readonly reason: PhysicalEditViewOnlyReason };
+
+/** Host-owned physical coordination; unsupported resources stay view-only. */
+export interface PhysicalCoordinationPort {
+    availability(resource: ResourceUriLike): PhysicalEditAvailability;
+    acquire(resource: ResourceUriLike): Promise<
+        | { readonly type: 'acquired'; readonly lock: HostPhysicalResourceLock }
+        | { readonly type: 'busy' }
+        | { readonly type: 'viewOnly'; readonly reason: PhysicalEditViewOnlyReason }
+    >;
+    prepare(
+        resource: ResourceUriLike,
+        expectedOriginal: Uint8Array,
+        intended: Uint8Array,
+        lock: HostPhysicalResourceLock,
+    ): Promise<PreparedPhysicalInstallBundle>;
+}
+
 /** Everything host-specific the shared controller needs, injected at attach. */
 export interface ViewerHost {
     readonly fs: FileSystemPort;
     readonly ui: HostUiPort;
     readonly config: ConfigPort;
     readonly refreshWatcherFactory: FileRefreshWatcherFactory;
+    readonly physicalCoordination?: PhysicalCoordinationPort;
 }
 
 /** ',' for .csv (and anything else), '\t' for .tsv — chosen by extension. */

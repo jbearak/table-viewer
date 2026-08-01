@@ -24,7 +24,7 @@ import {
     json_state_file_path,
 } from '../../src/json-file-state-store';
 import { DesktopConfigStore, settings_file_path, type DesktopSettings } from './desktop-config';
-import { ViewerWindowManager } from './viewer-windows';
+import { create_app_quit_coordinator, ViewerWindowManager } from './viewer-windows';
 import {
     resolve_theme_id,
     theme_payload,
@@ -100,6 +100,15 @@ let about_window: BrowserWindow | undefined;
 const welcome_windows = new Set<BrowserWindow>();
 /** Files requested before the app was ready (macOS `open-file` fires early). */
 const pending_open_paths: string[] = [];
+
+// Electron's first app.quit() is synchronous, while viewer close is fenced by
+// renderer and state-backend acknowledgements. Resume quit after those windows
+// close; the allow-quit guard admits the second before-quit event on macOS too.
+const coordinate_app_quit = create_app_quit_coordinator(
+    () => viewer_windows?.has_windows() ?? false,
+    () => viewer_windows?.close_all() ?? Promise.resolve(true),
+    () => app.quit(),
+);
 
 // The viewer page and the shared webview bundle are served from a privileged
 // custom scheme so the CSP model matches VS Code's webview loader (no file://).
@@ -301,6 +310,20 @@ function route_edit_command(
     else contents.selectAll();
 }
 
+/** Viewer reloads must use the same state-backend fence as close. */
+function route_reload(
+    ignore_cache: boolean,
+    window: Electron.BaseWindow | undefined,
+): void {
+    const target = (window as BrowserWindow | undefined) ?? BrowserWindow.getFocusedWindow();
+    if (!target) return;
+    if (viewer_windows?.reload(target, ignore_cache)) return;
+    const contents = target.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    if (ignore_cache) contents.reloadIgnoringCache();
+    else contents.reload();
+}
+
 function build_menu(): void {
     const is_mac = process.platform === 'darwin';
     const template: Electron.MenuItemConstructorOptions[] = [
@@ -389,8 +412,16 @@ function build_menu(): void {
         {
             label: 'View',
             submenu: [
-                { role: 'reload' },
-                { role: 'forceReload' },
+                {
+                    label: 'Reload',
+                    accelerator: 'CmdOrCtrl+R',
+                    click: (_item, window) => route_reload(false, window),
+                },
+                {
+                    label: 'Force Reload',
+                    accelerator: 'CmdOrCtrl+Shift+R',
+                    click: (_item, window) => route_reload(true, window),
+                },
                 { role: 'toggleDevTools' },
                 { type: 'separator' },
                 // Deliberately not the zoom roles, which ignore the clamped
@@ -586,6 +617,8 @@ const got_lock = app.requestSingleInstanceLock();
 if (!got_lock) {
     app.quit();
 } else {
+    app.on('before-quit', coordinate_app_quit);
+
     app.on('second-instance', (_event, argv, working_directory) => {
         const files = file_args(argv.slice(1), working_directory);
         // A second launch with no file behaves like File → New Window.

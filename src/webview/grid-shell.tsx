@@ -145,7 +145,7 @@ const PREVIEW_RESTORE_SETTLE_MS = 32;
 
 import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
-import { host_bridge } from './host-bridge';
+import { host_bridge, pending_edit_durability } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
 import '@glideapps/glide-data-grid/dist/index.css';
 
@@ -190,6 +190,8 @@ export interface EditingHandle {
      * overloading it would leave the blocking entry in place.
      */
     discard_keys(keys: readonly string[]): void;
+    /** Fence every renderer-side mutation before a host close/reload flush. */
+    stop_edit_admission(): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
     commit_live_edit(): void;
     /** True when there are committed edits or an open editor with changes. */
@@ -595,6 +597,19 @@ export function GridShell({
         restored_save_operation,
     );
     const save_in_flight_ref = useRef(restored_save_operation !== undefined);
+    const close_barrier_ref = useRef(false);
+    const [close_barrier_active, set_close_barrier_active] = useState(false);
+    const close_barrier_session_ref = useRef(edit_session_id);
+    if (close_barrier_session_ref.current !== edit_session_id) {
+        // A close/release fence belongs to one edit session. A later grant can reuse
+        // this mounted GridShell, so reopen the synchronous mutation boundary during
+        // render rather than leaving the new session permanently read-only.
+        close_barrier_session_ref.current = edit_session_id;
+        close_barrier_ref.current = false;
+    }
+    useEffect(() => {
+        set_close_barrier_active(false);
+    }, [edit_session_id]);
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against the loader's per-render callback identities; `version` in
@@ -661,7 +676,10 @@ export function GridShell({
     const [save_in_flight, set_save_in_flight] = useState(
         restored_save_operation !== undefined,
     );
-    const editable_cells = edit_mode && csv_editable && !save_in_flight;
+    const editable_cells = edit_mode
+        && csv_editable
+        && !save_in_flight
+        && !close_barrier_active;
 
     useEffect(() => {
         if (
@@ -764,32 +782,64 @@ export function GridShell({
     // survive into the next edit session. Keying on the session id as well as the
     // payload keeps a freshly granted session from being stranded with a map the
     // host recorded under the previous one.
-    const last_posted_ref = useRef<{ session: string; payload: string } | null>(null);
+    const [pending_edit_status, set_pending_edit_status] = useState(() => (
+        edit_session_id
+            ? pending_edit_durability.snapshot(edit_session_id)
+            : { highestProducedSequence: 0, highestAcknowledgedSequence: 0 }
+    ));
 
-    // Persist the dirty map to the host so edits survive a webview reload. Posting
-    // null clears the stored state. Runs on the initial render too: a restored map
-    // simply round-trips back (harmless), and an empty map posts null (already so).
-    //
-    // The deps carry `save_in_flight` (the state) rather than `save_in_flight_ref`,
-    // whose identity never changes and so could never fire this effect. The swap is
-    // housekeeping, not a behaviour change: while the ref is true every mutation
-    // path is already guarded, so `dirty_cells` cannot change under a save, and the
-    // settle's `replace_dirty` changes `dirty_cells`, which is in the deps already.
-    // The guard still reads the ref because it is current within the flush —
-    // `request_save` sets it synchronously, ahead of any render.
+    const post_pending_edits = useCallback((
+        edits: Record<string, DirtyEntry> | null,
+        force = false,
+    ): number => {
+        if (!edit_session_id) return 0;
+        if (close_barrier_ref.current) {
+            return pending_edit_durability.snapshot(edit_session_id)
+                .highestProducedSequence;
+        }
+        return pending_edit_durability.publish(edit_session_id, edits, force);
+    }, [edit_session_id]);
+
+    const post_pending_edits_with_live_value = useCallback((value: string) => {
+        if (
+            !edit_mode
+            || !edit_session_id
+            || close_barrier_ref.current
+            || save_in_flight_ref.current
+        ) return;
+        const live = read_live_edit_ref.current();
+        if (!live) return;
+        const edits = Object.fromEntries(store.snapshot()) as Record<string, DirtyEntry>;
+        if (value === live.original) delete edits[live.key];
+        else edits[live.key] = { value, base: live.original };
+        post_pending_edits(Object.keys(edits).length > 0 ? edits : null);
+    }, [edit_mode, edit_session_id, post_pending_edits, save_in_flight_ref, store]);
+
+    useEffect(() => {
+        if (!edit_session_id) {
+            set_pending_edit_status({
+                highestProducedSequence: 0,
+                highestAcknowledgedSequence: 0,
+            });
+            return;
+        }
+        return pending_edit_durability.subscribe(
+            edit_session_id,
+            set_pending_edit_status,
+        );
+    }, [edit_session_id]);
+
+    const highest_produced_sequence = pending_edit_status.highestProducedSequence;
+    const highest_acknowledged_sequence = pending_edit_status.highestAcknowledgedSequence;
+
+    // Persist a complete dirty map under a renderer-monotonic sequence. The host
+    // acknowledges only after the corresponding state-store write resolves.
     useEffect(() => {
         if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
-        const edits = dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null;
-        const payload = JSON.stringify(edits);
-        const last = last_posted_ref.current;
-        if (last && last.session === edit_session_id && last.payload === payload) return;
-        last_posted_ref.current = { session: edit_session_id, payload };
-        host_bridge.postMessage({
-            type: 'pendingEditsChanged',
-            editSessionId: edit_session_id,
-            edits,
-        });
-    }, [dirty_cells, edit_mode, edit_session_id, save_in_flight]);
+        post_pending_edits(
+            dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
+        );
+    }, [dirty_cells, edit_mode, edit_session_id, post_pending_edits, save_in_flight]);
 
     // Mirror read imperatively by the save handle (which must stay stable so the
     // ref App holds doesn't churn): the current selection. The dirty map needs no
@@ -1136,7 +1186,9 @@ export function GridShell({
     // Collect committed dirty edits + any in-progress editor and post saveCsv.
     // Returns false (no message sent) when there is nothing to save.
     const request_save = useCallback((): boolean => {
-        if (save_in_flight_ref.current || !edit_session_id) return false;
+        if (close_barrier_ref.current || save_in_flight_ref.current || !edit_session_id) {
+            return false;
+        }
         const live = read_live_edit();
         const edits = collect_save_edits(store.snapshot(), live);
         if (Object.keys(edits).length === 0) return false;
@@ -1313,15 +1365,15 @@ export function GridShell({
     }, [editable_cells, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
-        if (save_in_flight_ref.current) return;
+        if (close_barrier_ref.current || save_in_flight_ref.current) return;
         clear_dirty();
     }, [clear_dirty, save_in_flight_ref]);
     const guarded_discard_conflicted = useCallback(() => {
-        if (save_in_flight_ref.current) return;
+        if (close_barrier_ref.current || save_in_flight_ref.current) return;
         discard_conflicted();
     }, [discard_conflicted, save_in_flight_ref]);
     const guarded_discard_keys = useCallback((keys: readonly string[]) => {
-        if (save_in_flight_ref.current) return;
+        if (close_barrier_ref.current || save_in_flight_ref.current) return;
         if (keys.length === 0) return;
         // Host-named keys are already source-keyed, so they go straight into the
         // source-keyed store with no conversion — the payoff for having moved
@@ -1337,6 +1389,10 @@ export function GridShell({
             clear_dirty: guarded_clear_dirty,
             discard_conflicted: guarded_discard_conflicted,
             discard_keys: guarded_discard_keys,
+            stop_edit_admission() {
+                close_barrier_ref.current = true;
+                set_close_barrier_active(true);
+            },
             commit_live_edit,
             has_uncommitted_changes,
         };
@@ -1761,7 +1817,7 @@ export function GridShell({
     // with the cell location, which we fold into the dirty map.
     const on_cell_edited = useCallback(
         (cell: Item, new_value: EditableGridCell) => {
-            if (save_in_flight_ref.current) return;
+            if (close_barrier_ref.current || save_in_flight_ref.current) return;
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return;
@@ -1847,18 +1903,48 @@ export function GridShell({
                 };
             }, []);
             const handle_change = (next: GridCell) => {
-                if (save_in_flight_ref.current) return;
+                if (save_in_flight_ref.current || close_barrier_ref.current) return;
                 props.onChange(next);
+                const value = next.kind === GridCellKind.Text ? next.data ?? '' : '';
+                // Publish the overlay value early, not merely the last committed
+                // dirty map. This narrows the loss window when VS Code closes a panel
+                // before a request/response flush can run; host receipt and persistence
+                // are still established only by the acknowledgement protocol.
+                post_pending_edits_with_live_value(value);
                 refresh_live_uncommitted();
             };
-            return <CsvCellEditor {...props} onChange={handle_change} />;
+            const handle_finished: CsvCellEditorProps['onFinishedEditing'] = (
+                next,
+                movement,
+            ) => {
+                props.onFinishedEditing(next, movement);
+                if (next !== undefined) return;
+                // Escape retracts the speculative overlay projection after Glide
+                // has closed it. Ordinary commits are published by the dirty-store
+                // effect; a document unload does not unmount React effects and
+                // therefore leaves the latest per-keystroke projection intact.
+                queueMicrotask(() => {
+                    const edits = Object.fromEntries(store.snapshot());
+                    post_pending_edits(Object.keys(edits).length > 0 ? edits : null);
+                });
+            };
+            return (
+                <CsvCellEditor
+                    {...props}
+                    onChange={handle_change}
+                    onFinishedEditing={handle_finished}
+                />
+            );
         }
         return TrackingCsvCellEditor;
     }, [
         capture_open_overlay_row,
+        post_pending_edits,
+        post_pending_edits_with_live_value,
         refresh_live_uncommitted,
         release_open_overlay_row,
         save_in_flight_ref,
+        store,
     ]);
 
     // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
@@ -2931,9 +3017,39 @@ export function GridShell({
         });
     }
 
+    const durability_status = edit_mode
+        && highest_produced_sequence > 0
+        && (dirty_cells.size > 0
+            || highest_acknowledged_sequence < highest_produced_sequence)
+        ? (highest_acknowledged_sequence >= highest_produced_sequence
+            ? 'Edits stored in this state session'
+            : 'Storing edits…')
+        : undefined;
+
     if (!has_visible_columns) {
         return (
             <div ref={grid_root_ref} className="grid-shell-root">
+                {durability_status && (
+                    <div
+                        className="pending-edit-durability"
+                        role="status"
+                        aria-live="polite"
+                        style={{
+                            position: 'absolute',
+                            right: 8,
+                            bottom: 8,
+                            zIndex: 20,
+                            padding: '4px 8px',
+                            borderRadius: 4,
+                            background: 'var(--vscode-editorWidget-background)',
+                            color: 'var(--vscode-editorWidget-foreground)',
+                            boxShadow: '0 1px 4px var(--vscode-widget-shadow)',
+                            fontSize: 12,
+                        }}
+                    >
+                        {durability_status}
+                    </div>
+                )}
                 <div className="all-columns-hidden" role="status">
                     {sheet_meta.columnCount === 0
                         ? 'This sheet contains no columns.'
@@ -2949,6 +3065,27 @@ export function GridShell({
             className="grid-shell-root"
             onPointerDownCapture={row_markers.on_pointer_down_capture}
         >
+            {durability_status && (
+                <div
+                        className="pending-edit-durability"
+                        role="status"
+                        aria-live="polite"
+                        style={{
+                            position: 'absolute',
+                            right: 8,
+                            bottom: 8,
+                            zIndex: 20,
+                            padding: '4px 8px',
+                            borderRadius: 4,
+                            background: 'var(--vscode-editorWidget-background)',
+                            color: 'var(--vscode-editorWidget-foreground)',
+                            boxShadow: '0 1px 4px var(--vscode-widget-shadow)',
+                            fontSize: 12,
+                        }}
+                    >
+                    {durability_status}
+                </div>
+            )}
             <DataEditor
                 ref={grid_ref}
                 className="glide-grid"

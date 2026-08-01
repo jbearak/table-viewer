@@ -19,6 +19,11 @@ import {
     sqlite_file_state_schema_error,
 } from './sqlite-file-state-errors';
 import { decode_stored_per_file_state, type StoredPerFileState } from './types';
+import {
+    decode_prepared_install_lifecycle,
+    SQLITE_PREPARED_INSTALL_STATE_KEY,
+} from './sqlite-file-state-repository';
+import type { PersistedPreparedInstallLifecycleRecord } from './state';
 
 type SqliteRow = Record<string, unknown>;
 
@@ -250,13 +255,32 @@ function validate_integer_storage(database: DatabaseSync): void {
     }
 }
 
-function state_from_json(value: unknown): StoredPerFileState {
+function decode_state_json(value: unknown): {
+    readonly state: StoredPerFileState;
+    readonly lifecycle?: PersistedPreparedInstallLifecycleRecord;
+} {
     if (typeof value !== 'string') throw sqlite_file_state_malformed_error();
     try {
-        return decode_stored_per_file_state(JSON.parse(value));
+        const parsed = JSON.parse(value);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw sqlite_file_state_malformed_error();
+        }
+        const logical = { ...(parsed as Record<string, unknown>) };
+        const lifecycle = decode_prepared_install_lifecycle(
+            logical[SQLITE_PREPARED_INSTALL_STATE_KEY],
+        );
+        delete logical[SQLITE_PREPARED_INSTALL_STATE_KEY];
+        return {
+            state: decode_stored_per_file_state(logical),
+            ...(lifecycle === undefined ? {} : { lifecycle }),
+        };
     } catch {
         throw sqlite_file_state_malformed_error();
     }
+}
+
+function state_from_json(value: unknown): StoredPerFileState {
+    return decode_state_json(value).state;
 }
 
 function has_pending_edits(state: StoredPerFileState): boolean {
@@ -421,7 +445,12 @@ function validate_coordination(
     const ownerships = new Set<number>();
     for (const edit of editRows) {
         const ownership = safe_number(edit.ownership_generation) as number;
-        if (ownerships.has(ownership) || !pending.has(text(edit.entry_path))
+        if (text(edit.entry_path).length === 0
+            || text(edit.physical_resource_lock_key).length === 0
+            || text(edit.host_lock_id).length === 0
+            || text(edit.edit_session_id).length === 0
+            || text(edit.owner_writer_session_id).length === 0
+            || ownerships.has(ownership) || !pending.has(text(edit.entry_path))
             || (safe_number(edit.last_confirmed_at_ms) as number)
                 < (safe_number(edit.acquired_at_ms) as number)) {
             throw sqlite_file_state_malformed_error({ rowCount: editRows.length });
@@ -430,7 +459,7 @@ function validate_coordination(
     }
 
     const reservations = rows(database, `SELECT
-        r.*, e.state_revision, e.authority_commit_sequence, e.authority_revision,
+        r.*, e.state_json, e.state_revision, e.authority_commit_sequence, e.authority_revision,
         e.physical_revision, e.projection_revision, e.physical_digest AS current_physical_digest,
         s.kind AS stage_kind, s.expected_state_revision AS stage_state_revision,
         s.expected_commit_sequence AS stage_commit_sequence,
@@ -443,6 +472,7 @@ function validate_coordination(
         throw sqlite_file_state_foreign_key_error({ rowCount: reservations.length });
     }
     for (const reservation of reservations) {
+        const lifecycle = decode_state_json(reservation.state_json).lifecycle;
         const exactNumbers = [
             ['expected_state_revision', 'state_revision'],
             ['expected_commit_sequence', 'authority_commit_sequence'],
@@ -455,12 +485,34 @@ function validate_coordination(
         if (exactNumbers.some(([left, right]) => safe_number(reservation[left]) !== safe_number(reservation[right]))) {
             throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
         }
-        if (nullable_text(reservation.expected_physical_digest)
-            !== nullable_text(reservation.current_physical_digest)
+        if (!lifecycle || lifecycle.phase !== 'reserved'
+            || lifecycle.reservationId !== text(reservation.reservation_id)
+            || lifecycle.saveOperationId !== text(reservation.save_operation_id)
+            || lifecycle.stageId !== text(reservation.stage_id)
+            || lifecycle.preparedInstallId !== text(reservation.prepared_install_id)
+            || lifecycle.hostLockId !== text(reservation.host_lock_id)
+            || lifecycle.physicalResourceLockKey
+                !== text(reservation.physical_resource_lock_key)
+            || lifecycle.expectedPhysicalDigest !== text(reservation.expected_physical_digest)
+            || lifecycle.intendedPhysicalDigest !== text(reservation.intended_physical_digest)
+            || lifecycle.recoveryRecordId !== nullable_text(reservation.recovery_record_id)
+            || text(reservation.reservation_id).length === 0
+            || text(reservation.save_operation_id).length === 0
+            || text(reservation.entry_path).length === 0
+            || text(reservation.physical_resource_lock_key).length === 0
+            || text(reservation.host_lock_id).length === 0
+            || text(reservation.edit_session_id).length === 0
+            || text(reservation.stage_id).length === 0
+            || text(reservation.prepared_install_id).length === 0
+            || nullable_text(reservation.expected_physical_digest) === undefined
+            || nullable_text(reservation.expected_physical_digest)?.length === 0
+            || nullable_text(reservation.expected_physical_digest)
+                !== nullable_text(reservation.current_physical_digest)
+            || text(reservation.intended_physical_digest).length === 0
             || text(reservation.stage_kind) !== 'physical'
             || nullable_text(reservation.stage_physical_digest)
-            !== text(reservation.intended_physical_digest)
-            || (safe_number(reservation.reserved_generation) as number) > generation) {
+                !== text(reservation.intended_physical_digest)
+            || (safe_number(reservation.reserved_generation) as number) !== generation) {
             throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
         }
         if (requiresPendingEditRecovery
@@ -470,6 +522,24 @@ function validate_coordination(
             if (!has_pending_edits(next) && reservation.recovery_record_id === null) {
                 throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
             }
+        }
+    }
+
+    const lifecycleIds = new Set<string>();
+    for (const entry of rows(database, 'SELECT path, state_json FROM entries')) {
+        const lifecycle = decode_state_json(entry.state_json).lifecycle;
+        if (!lifecycle) continue;
+        if (lifecycleIds.has(lifecycle.reservationId)) {
+            throw sqlite_file_state_malformed_error();
+        }
+        lifecycleIds.add(lifecycle.reservationId);
+        const reservation = reservations.find((candidate) => (
+            text(candidate.entry_path) === text(entry.path)
+        ));
+        if ((lifecycle.phase === 'reserved') !== (reservation !== undefined)
+            || (reservation !== undefined
+                && text(reservation.reservation_id) !== lifecycle.reservationId)) {
+            throw sqlite_file_state_malformed_error();
         }
     }
 }

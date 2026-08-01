@@ -3,8 +3,24 @@
 
 /** Webview → host viewer protocol messages (WebviewMessage payloads). */
 export const CHANNEL_WEBVIEW_MESSAGE = 'tableViewer:webviewMessage';
-/** Host → webview viewer protocol messages (HostMessage payloads). */
+/** Host → viewer preload protocol messages. State-backend acknowledgements carry
+ * a desktop receipt request so main waits for renderer delivery, not merely send(). */
 export const CHANNEL_HOST_MESSAGE = 'tableViewer:hostMessage';
+/** Viewer preload → main confirmation that an acknowledgement reached the page. */
+export const CHANNEL_HOST_MESSAGE_RECEIPT = 'tableViewer:hostMessageReceipt';
+
+export interface PendingEditAcknowledgementReceipt {
+    receiptId: string;
+    rendererGeneration: number;
+    editSessionId: string;
+    sequence: number;
+}
+
+export interface DesktopHostMessageEnvelope {
+    rendererGeneration: number;
+    message: unknown;
+    receipt?: PendingEditAcknowledgementReceipt;
+}
 /** Sync request from the viewer preload for the initial theme payload. */
 export const CHANNEL_GET_THEME = 'tableViewer:getTheme';
 /** Main → viewer: OS appearance changed (ThemePayload). */

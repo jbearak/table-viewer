@@ -14,18 +14,32 @@ import {
     nativeTheme,
     screen,
 } from 'electron';
-import { attach_viewer, profile_for } from '../../src/viewer-controller';
+import {
+    attach_viewer,
+    profile_for,
+    type ViewerController,
+} from '../../src/viewer-controller';
 import type { AuthorityFileStateStore } from '../../src/state';
-import type { Disposable, ViewerHost } from '../../src/host-ports';
+import type { ViewerHost } from '../../src/host-ports';
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
-import { create_viewer_panel, type DesktopViewerPanel } from './viewer-panel';
+import {
+    create_viewer_panel,
+    type DesktopViewerPanel,
+    type ViewerPanelDeadlineScheduler,
+} from './viewer-panel';
 import { dirty_from_host_message, dirty_from_webview_message } from './dirty-state';
 import { resolve_theme_id, window_background_color, type ThemePayload } from './theme';
-import { CHANNEL_HOST_MESSAGE, CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
+import {
+    CHANNEL_HOST_MESSAGE,
+    CHANNEL_HOST_MESSAGE_RECEIPT,
+    CHANNEL_WEBVIEW_MESSAGE,
+    type DesktopHostMessageEnvelope,
+    type PendingEditAcknowledgementReceipt,
+} from '../shared/ipc';
 import { viewer_url } from './viewer-html';
 import {
     MIN_WINDOW_HEIGHT,
@@ -38,9 +52,19 @@ interface ViewerWindow {
     readonly fileKey: string;
     readonly window: BrowserWindow;
     readonly panel: DesktopViewerPanel;
-    readonly controller: Disposable;
+    readonly controller: ViewerController;
+    /** One serialized flush/drain barrier shared by reload, close, and app quit. */
+    lifecycle?: {
+        promise: Promise<boolean>;
+        intent: 'reload' | 'close';
+        ignoreCache: boolean;
+    };
+    /** Set only after the renderer acknowledgement and controller drain succeed. */
+    allowClose: boolean;
     /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
     readonly stop_watching_dirty: () => void;
+    /** Drops renderer navigation/process/transport lifecycle watchers. */
+    readonly stop_watching_renderer: () => void;
     /** Persists a resize still inside its settle window, and cancels it.
      *  A no-op when nothing is pending. */
     readonly flush_size: () => void;
@@ -63,6 +87,44 @@ const RESIZE_SETTLE_MS = 250;
  *  closed window's zoom level is not inherited by the next one. */
 let next_window_id = 1;
 
+/**
+ * Coordinate Electron's synchronous before-quit event with asynchronous viewer
+ * close fences. The resumed app.quit() call is admitted exactly once after all
+ * viewer windows have closed; a failed fence leaves quitting retryable.
+ */
+export function create_app_quit_coordinator(
+    has_viewer_windows: () => boolean,
+    close_viewer_windows: () => Promise<boolean>,
+    resume_quit: () => void,
+): (event: { preventDefault(): void }) => void {
+    let allow_quit = false;
+    let quit_barrier: Promise<void> | undefined;
+
+    return (event) => {
+        if (allow_quit) return;
+        if (!has_viewer_windows()) {
+            allow_quit = true;
+            return;
+        }
+
+        event.preventDefault();
+        if (quit_barrier) return;
+        quit_barrier = close_viewer_windows()
+            .then((closed) => {
+                if (!closed) return;
+                allow_quit = true;
+                resume_quit();
+            })
+            // before-quit cannot await this barrier. Consume a failed close fence
+            // here so it cannot surface as an unhandled main-process rejection;
+            // finally clears the claim so the next quit request can retry it.
+            .catch(() => {})
+            .finally(() => {
+                quit_barrier = undefined;
+            });
+    };
+}
+
 export class ViewerWindowManager {
     /** Open windows in the order they were created (the last one is cascaded
      *  from when the next window opens). */
@@ -77,6 +139,7 @@ export class ViewerWindowManager {
         private readonly state_store: AuthorityFileStateStore,
         private readonly config_store: DesktopConfigStore,
         private readonly viewer_preload_path: string,
+        private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
     ) {}
 
     /**
@@ -115,8 +178,8 @@ export class ViewerWindowManager {
         const web_contents = window.webContents;
         if (process.platform === 'darwin') window.setRepresentedFilename(file_path);
 
-        // Unsaved CSV edits are durable (the controller persists them per file), so
-        // this only makes them visible: macOS puts a dot in an edited document's
+        // Unsaved CSV edits accepted by the current state backend are tracked per file;
+        // this indicator only makes them visible: macOS puts a dot in an edited document's
         // close button, and other platforms get a marked title.
         let dirty = false;
         const apply_window_state = () => {
@@ -139,13 +202,86 @@ export class ViewerWindowManager {
 
         // Per-window transport: host messages go out over this window's
         // webContents; webview messages come back on the shared channel,
-        // filtered by sender.
+        // filtered by sender. Renderer loss is a first-class transport event so
+        // a close already waiting for a flush or acknowledgement cannot hang.
+        const renderer_generation_listeners = new Set<(error: Error) => void>();
+        const renderer_loss_listeners = new Set<(error: Error, retryable: boolean) => void>();
+        const renderer_responsive_listeners = new Set<() => void>();
+        const acknowledgement_receipt_listeners = new Set<(
+            receipt: PendingEditAcknowledgementReceipt,
+        ) => void>();
+        const report_renderer_generation_change = () => {
+            const error = new Error('Viewer renderer was replaced by a successful navigation.');
+            for (const listener of [...renderer_generation_listeners]) listener(error);
+        };
+        const report_renderer_loss = (error: Error, retryable = false) => {
+            for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
+        };
+        const on_main_frame_navigated = () => report_renderer_generation_change();
+        const on_failed_load = (
+            _event: Electron.Event,
+            error_code: number,
+            error_description: string,
+            validated_url: string,
+            is_main_frame: boolean,
+        ) => {
+            if (!is_main_frame) return;
+            report_renderer_loss(new Error(
+                `Viewer navigation failed (${error_code} ${error_description}): ${validated_url}`,
+            ));
+        };
+        const on_render_process_gone = (
+            _event: Electron.Event,
+            details: Electron.RenderProcessGoneDetails,
+        ) => report_renderer_loss(new Error(
+            `Viewer renderer terminated (${details.reason}, exit ${details.exitCode}).`,
+        ));
+        const on_transport_destroyed = () => report_renderer_loss(
+            new Error('Viewer renderer transport was destroyed.'),
+        );
+        const on_unresponsive = () => report_renderer_loss(
+            new Error('Viewer renderer became unresponsive.'),
+            true,
+        );
+        const on_responsive = () => {
+            for (const listener of [...renderer_responsive_listeners]) listener();
+        };
+        const acknowledgement_receipt_watcher = (
+            event: Electron.IpcMainEvent,
+            receipt: PendingEditAcknowledgementReceipt,
+        ) => {
+            if (event.sender !== web_contents) return;
+            for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
+        };
+        web_contents.on('did-navigate', on_main_frame_navigated);
+        web_contents.on('did-fail-load', on_failed_load);
+        web_contents.on('render-process-gone', on_render_process_gone);
+        web_contents.on('destroyed', on_transport_destroyed);
+        window.on('unresponsive', on_unresponsive);
+        window.on('responsive', on_responsive);
+        ipcMain.on(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+
         const panel = create_viewer_panel({
-            send: (message: HostMessage) => {
-                if (web_contents.isDestroyed()) return false;
+            send: (message: HostMessage, rendererGeneration, receipt) => {
+                if (web_contents.isDestroyed()) {
+                    report_renderer_loss(new Error('Viewer renderer transport was destroyed.'));
+                    return false;
+                }
                 set_dirty(dirty_from_host_message(message));
-                web_contents.send(CHANNEL_HOST_MESSAGE, message);
-                return true;
+                try {
+                    const envelope: DesktopHostMessageEnvelope = {
+                        rendererGeneration,
+                        message,
+                        receipt,
+                    };
+                    web_contents.send(CHANNEL_HOST_MESSAGE, envelope);
+                    return true;
+                } catch (error) {
+                    report_renderer_loss(error instanceof Error
+                        ? error
+                        : new Error('Viewer renderer transport failed.'));
+                    return false;
+                }
             },
             on_message: (listener: (message: WebviewMessage) => void) => {
                 const handler = (
@@ -158,7 +294,23 @@ export class ViewerWindowManager {
                 ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, handler);
                 return () => ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, handler);
             },
-        });
+            on_renderer_generation_changed: (listener) => {
+                renderer_generation_listeners.add(listener);
+                return () => renderer_generation_listeners.delete(listener);
+            },
+            on_renderer_unavailable: (listener) => {
+                renderer_loss_listeners.add(listener);
+                return () => renderer_loss_listeners.delete(listener);
+            },
+            on_renderer_responsive: (listener) => {
+                renderer_responsive_listeners.add(listener);
+                return () => renderer_responsive_listeners.delete(listener);
+            },
+            on_pending_edit_ack_receipt: (listener) => {
+                acknowledgement_receipt_listeners.add(listener);
+                return () => acknowledgement_receipt_listeners.delete(listener);
+            },
+        }, this.viewer_panel_deadline_scheduler);
 
         // Watched independently of the panel's own subscriptions, which belong to
         // the controller and may come and go.
@@ -171,11 +323,17 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
+        // PR3 ships the coordination protocol but not a proven desktop
+        // conditional-install primitive or SQLite authority cutover. Keep the
+        // unreleased desktop editor view-only rather than falling back to the
+        // legacy unconditional physical write path.
+        const profile = profile_for(file_path, this.config_store.config_port());
+        profile.editing = false;
         const controller = attach_viewer(
             panel,
             file_path,
             this.state_store,
-            profile_for(file_path, this.config_store.config_port()),
+            profile,
             this.viewer_host(window),
         );
 
@@ -199,8 +357,22 @@ export class ViewerWindowManager {
             window,
             panel,
             controller,
+            allowClose: false,
             stop_watching_dirty: () =>
                 ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
+            stop_watching_renderer: () => {
+                web_contents.removeListener('did-navigate', on_main_frame_navigated);
+                web_contents.removeListener('did-fail-load', on_failed_load);
+                web_contents.removeListener('render-process-gone', on_render_process_gone);
+                web_contents.removeListener('destroyed', on_transport_destroyed);
+                window.removeListener('unresponsive', on_unresponsive);
+                window.removeListener('responsive', on_responsive);
+                ipcMain.removeListener(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+                renderer_generation_listeners.clear();
+                renderer_loss_listeners.clear();
+                renderer_responsive_listeners.clear();
+                acknowledgement_receipt_listeners.clear();
+            },
             flush_size: () => {
                 if (!pending) return;
                 cancel_settle();
@@ -240,7 +412,12 @@ export class ViewerWindowManager {
         // a size the user chose, and recording it would overwrite the size they
         // did choose in some other window. 'closed' is where the controller and
         // its subscriptions go away.
-        window.on('close', () => entry.flush_size());
+        window.on('close', (event) => {
+            entry.flush_size();
+            if (entry.allowClose) return;
+            event.preventDefault();
+            void this.close_entry(entry);
+        });
         window.once('closed', () => this.teardown(entry));
         // Closing the window mid-load aborts the navigation, which rejects; an
         // unhandled rejection in the main process is fatal, so swallow it.
@@ -253,6 +430,25 @@ export class ViewerWindowManager {
     /** Whether any file is open, i.e. the app has a document window on screen. */
     has_windows(): boolean {
         return this.windows.length > 0;
+    }
+
+    /** Close every viewer through the same renderer/backend fence as native close. */
+    async close_all(): Promise<boolean> {
+        const entries = this.windows.filter((entry) => !entry.window.isDestroyed());
+        const closed = await Promise.all(entries.map((entry) => this.close_entry(entry)));
+        return closed.every(Boolean);
+    }
+
+    /**
+     * Route a menu reload through flush → drain → acknowledgement → drain.
+     * Returns false for non-viewer windows so main.ts can use native reload there.
+     */
+    reload(window: BrowserWindow, ignore_cache: boolean): boolean {
+        const entry = this.windows.find((candidate) => candidate.window === window);
+        if (!entry) return false;
+        if (entry.lifecycle || window.isDestroyed()) return true;
+        this.start_lifecycle(entry, 'reload', ignore_cache);
+        return true;
     }
 
     /**
@@ -281,6 +477,77 @@ export class ViewerWindowManager {
                 entry.window.setBackgroundColor(window_background_color(payload.themeId));
             }
         }
+    }
+
+    private async fence_renderer(entry: ViewerWindow): Promise<void> {
+        const flush = await entry.panel.flush_pending_edits();
+        await entry.controller.drain();
+        await entry.panel.wait_for_pending_edit_ack(
+            flush.rendererGeneration,
+            flush.editSessionId,
+            flush.sequence,
+        );
+        // Acknowledgement delivery is downstream of persistence, but other admitted
+        // controller work may have joined while the renderer was flushing.
+        await entry.controller.drain();
+    }
+
+    private start_lifecycle(
+        entry: ViewerWindow,
+        intent: 'reload' | 'close',
+        ignore_cache = false,
+    ): Promise<boolean> {
+        const lifecycle = {
+            intent,
+            ignoreCache: ignore_cache,
+            promise: Promise.resolve(false),
+        } satisfies NonNullable<ViewerWindow['lifecycle']>;
+        entry.lifecycle = lifecycle;
+        lifecycle.promise = this.fence_renderer(entry)
+            .then(() => {
+                if (entry.window.isDestroyed()) return true;
+                if (lifecycle.intent === 'close') {
+                    entry.allowClose = true;
+                    entry.window.close();
+                    return entry.window.isDestroyed();
+                }
+                if (lifecycle.ignoreCache) entry.window.webContents.reloadIgnoringCache();
+                else entry.window.webContents.reload();
+                return true;
+            })
+            .catch(() => {
+                if (!entry.window.isDestroyed()) {
+                    const closing = lifecycle.intent === 'close';
+                    void dialog.showMessageBox(entry.window, {
+                        type: 'error',
+                        message: closing
+                            ? 'Table Viewer could not safely close this window.'
+                            : 'Table Viewer could not safely reload this window.',
+                        detail: closing
+                            ? 'The latest edits have not been acknowledged by the current state backend. The window will remain open so you can retry.'
+                            : 'The current state backend has not acknowledged the latest edits. The window was not reloaded so you can retry.',
+                        buttons: ['OK'],
+                        noLink: true,
+                    });
+                }
+                return false;
+            })
+            .finally(() => {
+                if (entry.lifecycle === lifecycle) entry.lifecycle = undefined;
+            });
+        return lifecycle.promise;
+    }
+
+    private close_entry(entry: ViewerWindow): Promise<boolean> {
+        if (entry.window.isDestroyed()) return Promise.resolve(true);
+        if (entry.lifecycle) {
+            // A native close or application quit claims a pending reload's single
+            // fence. Its flush continues, but completion closes instead of
+            // navigating, so there is never a second concurrent renderer flush.
+            entry.lifecycle.intent = 'close';
+            return entry.lifecycle.promise;
+        }
+        return this.start_lifecycle(entry, 'close');
     }
 
     private bounds_for_new_window() {
@@ -384,6 +651,7 @@ export class ViewerWindowManager {
         const index = this.windows.indexOf(entry);
         if (index >= 0) this.windows.splice(index, 1);
         entry.stop_watching_dirty();
+        entry.stop_watching_renderer();
         try {
             entry.controller.dispose();
         } catch {

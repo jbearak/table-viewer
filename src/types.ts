@@ -802,6 +802,10 @@ export type HostMessage =
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
     | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
+    /** The current state backend accepted a pending-edit full map through this sequence. */
+    | { type: 'pendingEditsAcknowledged'; editSessionId: string; sequence: number }
+    /** Stop accepting edits and report the highest full-map sequence produced. */
+    | { type: 'requestPendingEditsFlush'; requestId: string }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
     /**
@@ -889,7 +893,11 @@ export type WebviewMessage =
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperation }
     | { type: 'showSaveDialog'; editSessionId: string; requestId: string }
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string }
+    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number }
+    /** Renderer close/reload barrier response; zero means no map was produced. */
+    | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
+    /** The renderer could not establish the requested close/reload barrier. */
+    | { type: 'pendingEditsFlushFailed'; requestId: string }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }

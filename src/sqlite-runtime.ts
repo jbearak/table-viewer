@@ -102,8 +102,14 @@ export interface SqliteRuntimeHandle {
     readonly runtime_key: object;
     readonly canonical_path: string;
     readonly writer_session_id: string;
+    readonly coordination_generation: number;
     read_transaction<T>(body: (tx: SqliteReadTransactionContext) => T): Promise<T>;
     write_transaction<T>(kind: string, body: (tx: SqliteWriteTransactionContext) => T): Promise<T>;
+    /** Dedicated executor for reservation-bound host I/O; generic callbacks remain synchronous. */
+    async_write_transaction<T>(
+        kind: string,
+        body: (tx: SqliteWriteTransactionContext) => Promise<T>,
+    ): Promise<T>;
     close(): Promise<void>;
 }
 
@@ -807,6 +813,89 @@ function write_transaction<T>(
     });
 }
 
+function async_write_transaction<T>(
+    runtime: RuntimeState,
+    kind: string,
+    body: (tx: SqliteWriteTransactionContext) => Promise<T>,
+): Promise<T> {
+    assert_nonempty(kind, 'transaction kind');
+    return enqueue(runtime, async () => {
+        const database = runtime.opened?.database;
+        if (!database) throw runtime.fault ?? new Error('SQLite runtime connection is unavailable.');
+        try {
+            emit(runtime, 'before-write-begin');
+            let changesBefore: number;
+            try {
+                database.exec('BEGIN IMMEDIATE');
+                emit(runtime, 'after-write-begin');
+                assert_runtime_fences(runtime, database);
+                assert_connection_policy(database, 0);
+                changesBefore = total_changes(database);
+            } catch (error) {
+                try { database.exec('ROLLBACK'); } catch { /* Preserve begin failure. */ }
+                throw safe_error(error, 'write-begin');
+            }
+            const context = context_for(database, true);
+            let result: T;
+            try {
+                emit(runtime, 'before-callback');
+                result = await body(context);
+                assert_runtime_fences(runtime, database);
+                assert_connection_policy(database, 0);
+                emit(runtime, 'after-callback');
+                if (total_changes(database) !== changesBefore) context.mark_changed();
+            } catch (error) {
+                try { database.exec('ROLLBACK'); } catch { /* Preserve callback failure. */ }
+                throw error;
+            }
+            if (!context.changed) {
+                try {
+                    database.exec('COMMIT');
+                    return result;
+                } catch (error) {
+                    try { database.exec('ROLLBACK'); } catch { /* Preserve commit failure. */ }
+                    throw safe_error(error, 'write-commit');
+                }
+            }
+            const previous = runtime.marker;
+            const expected: SessionMarker = {
+                sequence: previous.sequence + 1,
+                operationId: runtime.options.randomId(),
+                operationKind: kind,
+            };
+            sqlite_safe_integer(expected.sequence, 'writer committed sequence', 1, Number.MAX_SAFE_INTEGER - 1);
+            assert_nonempty(expected.operationId as string, 'operationId');
+            update_session_marker(runtime, database, expected, runtime.options.now());
+            let commitInvoked = false;
+            try {
+                const commit = (): void => {
+                    if (commitInvoked) throw new Error('SQLite transaction outcome was invoked more than once.');
+                    commitInvoked = true;
+                    database.exec('COMMIT');
+                };
+                const rollback = (): void => {
+                    if (commitInvoked) throw new Error('SQLite transaction outcome was invoked more than once.');
+                    commitInvoked = true;
+                    database.exec('ROLLBACK');
+                };
+                if (runtime.options.hooks?.commit) runtime.options.hooks.commit(commit, rollback);
+                else commit();
+                if (!commitInvoked) throw new Error('SQLite COMMIT hook did not invoke COMMIT.');
+                runtime.marker = expected;
+                return result;
+            } catch (error) {
+                if (!commitInvoked) {
+                    try { database.exec('ROLLBACK'); } catch { /* Preserve commit failure. */ }
+                    throw safe_error(error, 'write-commit');
+                }
+                return reconcile_ambiguous_commit(runtime, previous, expected, result, error);
+            }
+        } finally {
+            if (runtime.opened?.database === database) restore_connection_policy(runtime, database);
+        }
+    });
+}
+
 async function cleanup_final_reference(runtime: RuntimeState): Promise<void> {
     const database = runtime.opened?.database;
     if (!database || runtime.fault) return;
@@ -904,6 +993,7 @@ export async function open_sqlite_runtime(
         runtime_key: runtime.runtimeKey,
         canonical_path: canonicalPath,
         writer_session_id: runtime.writerSessionId,
+        coordination_generation: runtime.generation,
         read_transaction(body) {
             try {
                 assertHandleOpen();
@@ -916,6 +1006,14 @@ export async function open_sqlite_runtime(
             try {
                 assertHandleOpen();
                 return write_transaction(runtime, kind, body);
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        },
+        async_write_transaction(kind, body) {
+            try {
+                assertHandleOpen();
+                return async_write_transaction(runtime, kind, body);
             } catch (error) {
                 return Promise.reject(error);
             }

@@ -65,6 +65,10 @@
         "command": "tableViewer.openAsText",
         "title": "Table Viewer: Open in Text Editor",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "tableViewer.setupPhysicalEditProtocol",
+        "title": "Table Viewer: Arm Physical Edit Protocol"
       }
     ],
     "menus": {

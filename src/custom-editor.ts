@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
-import { attach_viewer, profile_for } from './viewer-controller';
+import { attach_viewer, profile_for, type ViewerController } from './viewer-controller';
 import type { AuthorityFileStateStore } from './state';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
+import { native_physical_edit_eligibility } from './physical-resource-lock';
 
 const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
@@ -15,10 +16,65 @@ class TableViewerDocument implements vscode.CustomDocument {
 export class TableViewerEditorProvider
     implements vscode.CustomReadonlyEditorProvider<TableViewerDocument> {
 
+    readonly #controllers = new Set<ViewerController>();
+    readonly #panels = new Map<ViewerController, vscode.WebviewPanel>();
+    readonly #drains = new Set<Promise<void>>();
+    #close_barrier: Promise<void> | undefined;
+    #close_barrier_settled = false;
+    #edit_admission_open = true;
+
     constructor(
         private readonly extension_uri: vscode.Uri,
         private readonly state_store: AuthorityFileStateStore,
+        private readonly view_only: () => boolean,
     ) {}
+
+    #dispose_controller(controller: ViewerController): void {
+        if (!this.#controllers.delete(controller)) return;
+        this.#panels.delete(controller);
+        controller.dispose();
+        const drain = controller.drain();
+        this.#drains.add(drain);
+        void drain.finally(() => this.#drains.delete(drain)).catch(() => {});
+    }
+
+    stop_edit_admission(): void {
+        this.#edit_admission_open = false;
+        for (const controller of this.#controllers) controller.stop_edit_admission();
+    }
+
+    dispose_viewers(): void {
+        this.stop_edit_admission();
+        if (this.#close_barrier && !this.#close_barrier_settled) return;
+        this.#close_barrier_settled = false;
+        const attempt = (async () => {
+            const controllers = [...this.#controllers];
+            // Keep every panel and transport alive until its renderer has folded its
+            // live overlay and the controller has observed the exact durable
+            // acknowledgement. A failed/timed-out panel remains open, fenced, and is
+            // included in the next attempt instead of poisoning a permanent barrier.
+            const results = await Promise.allSettled(controllers.map(async (controller) => {
+                await controller.flush_pending_edits();
+                this.#panels.get(controller)?.dispose();
+            }));
+            const failures = results
+                .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+                .map((result) => result.reason);
+            if (failures.length > 0) {
+                throw new AggregateError(failures, 'One or more viewers did not flush pending edits.');
+            }
+        })();
+        this.#close_barrier = attempt;
+        void attempt.finally(() => {
+            if (this.#close_barrier === attempt) this.#close_barrier_settled = true;
+        }).catch(() => {});
+    }
+
+    async drain_viewers(): Promise<void> {
+        const close_barrier = this.#close_barrier;
+        await close_barrier;
+        while (this.#drains.size > 0) await Promise.allSettled([...this.#drains]);
+    }
 
     async openCustomDocument(uri: vscode.Uri): Promise<TableViewerDocument> {
         return new TableViewerDocument(uri);
@@ -37,30 +93,67 @@ export class TableViewerEditorProvider
         webview_panel.webview.html = build_vscode_webview_html(
             webview_panel.webview, this.extension_uri, generate_nonce());
 
+        const profile = profile_for(document.uri.fsPath, vscode_viewer_host.config);
+        const edit_eligibility = native_physical_edit_eligibility({
+            scheme: document.uri.scheme,
+            filePath: document.uri.fsPath,
+            remoteHost: Boolean(vscode.env.remoteName),
+        });
+        // Before the activation marker is armed, eligible native-local CSV files
+        // continue through the established Memento editing path. Physical lock
+        // availability belongs to the later SQLite cutover; requiring it here would
+        // disable legacy editing in the preparation release. The marker is the cold
+        // boundary: once armed, this Memento host stays view-only until cutover.
+        profile.editing = profile.editing
+            && edit_eligibility.eligible
+            && this.#edit_admission_open
+            && !this.view_only();
         const controller = attach_viewer(
             webview_panel,
             document.uri,
             this.state_store,
-            profile_for(document.uri.fsPath, vscode_viewer_host.config),
+            profile,
             vscode_viewer_host,
         );
-        webview_panel.onDidDispose(() => controller.dispose());
+        this.#controllers.add(controller);
+        this.#panels.set(controller, webview_panel);
+        webview_panel.onDidDispose(() => this.#dispose_controller(controller));
     }
+}
+
+export interface TableViewerRegistration extends vscode.Disposable {
+    drain(): Promise<void>;
 }
 
 export function register_table_viewer(
     context: vscode.ExtensionContext,
     state_store: AuthorityFileStateStore,
-): void {
-    const provider = new TableViewerEditorProvider(context.extensionUri, state_store);
+    view_only: () => boolean = () => false,
+): TableViewerRegistration {
+    const provider = new TableViewerEditorProvider(context.extensionUri, state_store, view_only);
     // Both editors deliberately allow multiple tabs per document. The CSV/TSV
     // editor could have set this to false to dodge the cross-tab pending-edits
     // race (#22), but we keep multi-viewer support and serialize editing with
     // an exclusive edit-session lock (see viewer-controller) instead.
-    const excel_options = { supportsMultipleEditorsPerDocument: true };
-    const table_options = { supportsMultipleEditorsPerDocument: true };
-    context.subscriptions.push(
+    const excel_options = {
+        supportsMultipleEditorsPerDocument: true,
+        webviewOptions: { retainContextWhenHidden: true },
+    };
+    const table_options = {
+        supportsMultipleEditorsPerDocument: true,
+        webviewOptions: { retainContextWhenHidden: true },
+    };
+    const registrations = [
         vscode.window.registerCustomEditorProvider(EXCEL_VIEW_TYPE, provider, excel_options),
         vscode.window.registerCustomEditorProvider(TABLE_VIEW_TYPE, provider, table_options),
-    );
+    ];
+    const registration: TableViewerRegistration = {
+        dispose() {
+            provider.dispose_viewers();
+            for (const disposable of registrations) disposable.dispose();
+        },
+        drain: () => provider.drain_viewers(),
+    };
+    context.subscriptions.push(registration);
+    return registration;
 }

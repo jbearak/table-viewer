@@ -1,8 +1,14 @@
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { categorize_sqlite_file_state_error } from '../../sqlite-file-state-errors';
-import { open_sqlite_file_state_store } from '../../sqlite-file-state-persistence';
+import {
+    open_sqlite_file_state_store,
+    reopen_reserved_physical_write,
+} from '../../sqlite-file-state-persistence';
+import { PhysicalResourceLockManager } from '../../physical-resource-lock';
+import { prepare_physical_install, type PlatformConditionalInstaller } from '../../prepared-physical-install';
 import {
     acquire_sqlite_exclusive_recovery_gate,
     acquire_sqlite_shared_reader_gate,
@@ -18,7 +24,12 @@ import {
     type SqliteOpenRecoveryEvent,
     type SqliteSharedReaderGate,
 } from '../../sqlite-open-recovery';
-import type { AuthorityFileStateStore, FileStateLease } from '../../state';
+import type {
+    CoordinatedAuthorityFileStateStore,
+    CoordinatedKeyedFileStatePersistence,
+    DurableEditSession,
+    FileStateLease,
+} from '../../state';
 import type { SqliteRuntimeEvent, SqliteRuntimeHooks } from '../../sqlite-runtime';
 
 interface WorkerOptions {
@@ -42,7 +53,8 @@ const options = JSON.parse(process.env.TABLE_VIEWER_SQLITE_WORKER_OPTIONS ?? '{}
 const leases = new Map<string, FileStateLease>();
 const runtimeEvents: SqliteRuntimeEvent[] = [];
 const barriers = new Map<string, () => void>();
-let store: AuthorityFileStateStore | undefined;
+let store: CoordinatedAuthorityFileStateStore | undefined;
+let persistence: CoordinatedKeyedFileStatePersistence | undefined;
 let closeStore: (() => Promise<void>) | undefined;
 let rawDatabase: DatabaseSync | undefined;
 let recoveryGate: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate | undefined;
@@ -53,6 +65,10 @@ let reconciliationReadySent = false;
 function send(message: unknown): void {
     if (!process.send) throw new Error('SQLite worker IPC is unavailable.');
     process.send(message);
+}
+
+function sha256(bytes: Uint8Array): string {
+    return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
 async function crossBarrier(barrierId: string, name: string, occurrence?: number): Promise<void> {
@@ -168,10 +184,11 @@ async function initialize(): Promise<void> {
         timeoutMs: 5_000,
     }, () => options.maxStoredFiles ?? 10_000);
     store = opened.store;
+    persistence = opened.persistence;
     closeStore = opened.close;
 }
 
-function requireStore(): AuthorityFileStateStore {
+function requireStore(): CoordinatedAuthorityFileStateStore {
     if (!store) throw new Error('This worker was not opened in store mode.');
     return store;
 }
@@ -187,6 +204,187 @@ async function handle(command: string, payload: any): Promise<unknown> {
             return requireStore().read(payload.path);
         case 'readAuthority':
             return requireStore().read_authority(payload.path);
+        case 'acquireEdit':
+            return requireStore().acquire_edit_session(
+                payload.path,
+                canonicalKey(payload.keyKind),
+                {
+                    hostLockId: payload.hostLockId,
+                    physicalResourceLockKey: payload.physicalResourceLockKey,
+                    verify: async () => true,
+                    release: async () => undefined,
+                },
+            );
+        case 'releaseEdit':
+            await requireStore().release_edit_session(
+                payload.path,
+                payload.session as DurableEditSession,
+            );
+            return null;
+        case 'reserveWrite':
+            return requireStore().reserve_physical_write(
+                payload.path,
+                payload.session as DurableEditSession,
+                payload.request,
+            );
+        case 'prepareRestartReservation': {
+            const targetPath = payload.targetPath as string;
+            const expected = Buffer.from(payload.expected as string, 'utf8');
+            const intended = Buffer.from(payload.intended as string, 'utf8');
+            fs.writeFileSync(targetPath, expected);
+            const manager = new PhysicalResourceLockManager({ lockRoot: payload.lockRoot });
+            const hostLock = await manager.acquire(targetPath);
+            if (!hostLock) throw new Error('Could not acquire restart reservation lock.');
+            const initial = await requireStore().compare_and_set(targetPath, 0, {
+                activeSheetIndex: 5,
+                pendingEdits: { '0:0': 'restart-process' },
+            });
+            if (initial.type !== 'committed') throw new Error('Could not seed restart state.');
+            await requireStore().stage_authority_transaction(targetPath, {
+                id: 'process-restart-original',
+                kind: 'physical',
+                ordinal: 1,
+                expectedStateRevision: initial.snapshot.revision,
+                expectedCommitSequence: 0,
+                physicalDigest: sha256(expected),
+            });
+            const installed = await requireStore().finalize_authority_transaction(
+                targetPath,
+                'process-restart-original',
+            );
+            if (installed.type !== 'finalized') throw new Error('Could not seed restart authority.');
+            const acquired = await requireStore().acquire_edit_session(
+                targetPath,
+                (value) => value,
+                hostLock,
+            );
+            if (acquired.type !== 'acquired') throw new Error('Could not acquire restart edit session.');
+            const bundle = await prepare_physical_install({
+                targetPath,
+                expectedOriginal: expected,
+                intended,
+                hostLock,
+            });
+            await requireStore().stage_authority_transaction(targetPath, {
+                id: 'process-restart-save',
+                kind: 'physical',
+                ordinal: 2,
+                expectedStateRevision: initial.snapshot.revision,
+                expectedCommitSequence: installed.authority.commitSequence,
+                nextState: { activeSheetIndex: 5 },
+                physicalDigest: bundle.intendedPhysicalDigest,
+            });
+            const reserved = await requireStore().reserve_physical_write(targetPath, acquired.session, {
+                saveOperationId: 'process-restart-operation',
+                stageId: 'process-restart-save',
+                expectedStateRevision: initial.snapshot.revision,
+                expectedAuthority: installed.authority,
+                preparedInstall: bundle,
+            });
+            if (reserved.type !== 'reserved') throw new Error('Could not reserve restart write.');
+            const installer: PlatformConditionalInstaller = {
+                platformEnforced: true,
+                async acquire(acquiredTargetPath, expectedPhysicalDigest, contract) {
+                    if (sha256(fs.readFileSync(acquiredTargetPath)) !== expectedPhysicalDigest) {
+                        return { type: 'conflict' };
+                    }
+                    return {
+                        type: 'acquired',
+                        fence: {
+                            async install() {
+                                fs.renameSync(contract.source.path, acquiredTargetPath);
+                                const targetDescriptor = fs.openSync(acquiredTargetPath, 'r');
+                                try { fs.fsyncSync(targetDescriptor); } finally { fs.closeSync(targetDescriptor); }
+                                const parentDescriptor = fs.openSync(
+                                    path.dirname(acquiredTargetPath),
+                                    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
+                                );
+                                try { fs.fsyncSync(parentDescriptor); } finally { fs.closeSync(parentDescriptor); }
+                                return { displacedPhysicalDigest: expectedPhysicalDigest };
+                            },
+                            async verifyInstalledDurable() {
+                                return sha256(fs.readFileSync(acquiredTargetPath))
+                                    === contract.source.physicalDigest;
+                            },
+                            async release() {},
+                        },
+                    };
+                },
+            };
+            const io = bundle.createReservedIo(installer);
+            if (!await io.verifyHostLock() || !await io.verifyPreparedBundle()
+                || await io.inspectTarget() !== 'expected'
+                || await io.acquireConditionalInstallFence('expected') !== 'acquired') {
+                throw new Error('Could not acquire actual restart installer.');
+            }
+            const installedByPlatform = await io.installPreparedBundle();
+            if (installedByPlatform.displacedPhysicalDigest !== bundle.expectedPhysicalDigest
+                || !await io.verifyInstalledDurable()
+                || await io.inspectTarget() !== 'intended') {
+                throw new Error('Actual restart installer did not durably install the bundle.');
+            }
+            await io.releaseConditionalInstallFence();
+            return { reservationId: reserved.reservation.reservationId };
+        }
+        case 'reconcileRestartReservation': {
+            if (!persistence) throw new Error('SQLite persistence is unavailable.');
+            const targetPath = payload.targetPath as string;
+            const installer: PlatformConditionalInstaller = {
+                platformEnforced: true,
+                async acquire(acquiredTargetPath) {
+                    return {
+                        type: 'acquired',
+                        fence: {
+                            async install() { throw new Error('Restart reconciliation must not reinstall.'); },
+                            async verifyInstalledDurable(bundle) {
+                                return sha256(fs.readFileSync(acquiredTargetPath))
+                                    === bundle.intendedPhysicalDigest;
+                            },
+                            async release() {},
+                        },
+                    };
+                },
+            };
+            const reopened = await reopen_reserved_physical_write(persistence, {
+                targetPath,
+                lockManager: new PhysicalResourceLockManager({ lockRoot: payload.lockRoot }),
+                installer,
+            });
+            if (reopened.type !== 'reopened') return reopened;
+            const result = await requireStore().reconcile_reserved_physical_write(
+                targetPath,
+                reopened.reservation.reservationId,
+                reopened.io,
+            );
+            if (result.type === 'finalized') {
+                const discovered = await persistence.discover_prepared_install_cleanups();
+                if (!discovered.some((record) => (
+                    record.reservationId === reopened.reservation.reservationId
+                ))) throw new Error('Restart cleanup record was not durably discoverable.');
+                await reopened.cleanupPreparedInstall();
+                const cleanup = await persistence.resume_prepared_install_cleanup(
+                    reopened.reservation.reservationId,
+                );
+                if (cleanup.type !== 'observed' || cleanup.physicalState !== 'pending') {
+                    throw new Error('Restart cleanup evidence was not durably pending.');
+                }
+                if (await persistence.complete_prepared_install_cleanup(cleanup)) {
+                    throw new Error('Pending restart cleanup record was cleared prematurely.');
+                }
+                const retained = await persistence.discover_prepared_install_cleanups();
+                if (retained.length !== 1
+                    || retained[0].reservationId !== reopened.reservation.reservationId) {
+                    throw new Error('Restart cleanup evidence was not retained for retry.');
+                }
+                await reopened.releaseHostLock();
+                return {
+                    ...result,
+                    cleanupPhysicalState: cleanup.physicalState,
+                    cleanupRecordRetained: true,
+                };
+            }
+            return result;
+        }
         case 'cas':
             if (typeof payload.barrierId === 'string') {
                 await crossBarrier(payload.barrierId, payload.barrierName ?? 'before-cas');

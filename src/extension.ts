@@ -1,45 +1,98 @@
 import * as vscode from 'vscode';
 import { register_table_viewer, TABLE_VIEW_TYPE } from './custom-editor';
 import { show_csv_preview, dispose_csv_preview } from './csv-preview';
-import { create_file_state_store, DEFAULT_MAX_STORED_FILES } from './state';
+import {
+    create_physical_edit_activation_boundary,
+    PhysicalEditProtocolMarker,
+    run_physical_edit_protocol_setup,
+    type PhysicalEditActivationBoundary,
+} from './physical-edit-activation';
+
+let active_boundary: PhysicalEditActivationBoundary | undefined;
+let active_disposables: vscode.Disposable[] = [];
+let drain_active_viewers: (() => Promise<void>) | undefined;
 
 function active_custom_tab_uri(): vscode.Uri | undefined {
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
     return input instanceof vscode.TabInputCustom ? input.uri : undefined;
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-    const get_max_stored = () =>
-        Math.max(1, vscode.workspace.getConfiguration('tableViewer')
-            .get<number>('maxStoredFiles', DEFAULT_MAX_STORED_FILES)!);
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    const marker = new PhysicalEditProtocolMarker();
+    const boundary = await create_physical_edit_activation_boundary(context, marker);
+    active_boundary = boundary;
 
-    const state_store = create_file_state_store(context, get_max_stored);
-    register_table_viewer(context, state_store);
+    const viewer_registration = register_table_viewer(
+        context,
+        boundary.store,
+        () => boundary.viewOnly,
+    );
+    if (boundary.markerStatus === 'invalid') {
+        await vscode.window.showErrorMessage(
+            'Table Viewer could not verify the physical-edit protocol marker. Files remain available in view-only mode. Close and update every Table Viewer product, then repair or remove the unreadable or tampered coordination marker before arming the protocol again.',
+        );
+    }
+    drain_active_viewers = () => viewer_registration.drain();
+    let viewers_stopped = false;
+    const stop_viewers = async () => {
+        if (!viewers_stopped) {
+            viewers_stopped = true;
+            dispose_csv_preview();
+        }
+        // Re-invocation retries panels whose renderer did not answer a previous
+        // bounded flush. Registrations are idempotent; failed panels stay open and
+        // view-only until a later attempt succeeds.
+        viewer_registration.dispose();
+        await viewer_registration.drain();
+    };
 
-    context.subscriptions.push(
+    const disposables = [
+        viewer_registration,
+        vscode.commands.registerCommand('tableViewer.setupPhysicalEditProtocol', async () => {
+            await run_physical_edit_protocol_setup(marker, boundary, stop_viewers);
+        }),
         vscode.commands.registerCommand('tableViewer.showCsvPreviewToSide', (uri?: vscode.Uri) => {
             const target = uri ?? vscode.window.activeTextEditor?.document.uri;
             if (!target) return;
-            show_csv_preview(target, context.extensionUri, state_store, vscode.ViewColumn.Beside);
+            show_csv_preview(target, context.extensionUri, boundary.store, vscode.ViewColumn.Beside);
         }),
         vscode.commands.registerCommand('tableViewer.showCsvPreview', (uri?: vscode.Uri) => {
             const target = uri ?? vscode.window.activeTextEditor?.document.uri;
             if (!target) return;
-            show_csv_preview(target, context.extensionUri, state_store, vscode.ViewColumn.Active);
+            show_csv_preview(target, context.extensionUri, boundary.store, vscode.ViewColumn.Active);
         }),
         vscode.commands.registerCommand('tableViewer.openCsvTable', (uri?: vscode.Uri) => {
             const target = uri ?? vscode.window.activeTextEditor?.document.uri;
             if (!target) return;
-            vscode.commands.executeCommand('vscode.openWith', target, TABLE_VIEW_TYPE);
+            void vscode.commands.executeCommand('vscode.openWith', target, TABLE_VIEW_TYPE);
         }),
         vscode.commands.registerCommand('tableViewer.openAsText', (uri?: vscode.Uri) => {
             const target = uri ?? active_custom_tab_uri();
             if (!target) return;
-            vscode.commands.executeCommand('vscode.openWith', target, 'default');
+            void vscode.commands.executeCommand('vscode.openWith', target, 'default');
         }),
-    );
-
-    context.subscriptions.push({ dispose() { dispose_csv_preview(); } });
+        { dispose: dispose_csv_preview },
+    ];
+    active_disposables = disposables;
+    context.subscriptions.push(...disposables);
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+    const disposables = active_disposables;
+    active_disposables = [];
+    for (const disposable of disposables) {
+        try {
+            disposable.dispose();
+        } catch {
+            // Continue teardown; a later drain still gets its bounded chance to settle.
+        }
+    }
+    const drain_viewers = drain_active_viewers;
+    drain_active_viewers = undefined;
+    const boundary = active_boundary;
+    active_boundary = undefined;
+    await Promise.allSettled([
+        drain_viewers?.() ?? Promise.resolve(),
+        boundary?.drain() ?? Promise.resolve(),
+    ]);
+}

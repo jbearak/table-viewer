@@ -14,6 +14,7 @@ import {
     type SqliteVscodeFileStateIdentity,
 } from '../sqlite-file-state-schema';
 import { validate_sqlite_file_state_database } from '../sqlite-file-state-validation';
+import { SQLITE_PREPARED_INSTALL_STATE_KEY } from '../sqlite-file-state-repository';
 
 let tempDirectory: string;
 let databases: DatabaseSync[];
@@ -222,7 +223,23 @@ describe('SQLite file-state structural validation', () => {
         const database = createDatabase();
         insertEntry(database, {
             pendingEdits: { '0:0': { value: 'changed', base: 'original' } },
+            [SQLITE_PREPARED_INSTALL_STATE_KEY]: {
+                version: 1,
+                phase: 'reserved',
+                reservationId: 'reservation',
+                saveOperationId: 'save-operation',
+                stageId: 'save-stage',
+                preparedInstallId: 'prepared-install',
+                hostLockId: 'host-lock',
+                previousPhysicalResourceLockKey: 'previous-resource-lock',
+                physicalResourceLockKey: 'resource-lock',
+                expectedPhysicalDigest: 'expected-digest',
+                intendedPhysicalDigest: 'intended-digest',
+                recoveryRecordId: 'clear-record',
+                recordedAtMs: 10,
+            },
         }, { hasPending: true, recoveryRecordId: 'snapshot-record' });
+        database.exec("UPDATE entries SET physical_digest = 'expected-digest'");
         database.prepare(`INSERT INTO edit_sessions (
             entry_path, physical_resource_lock_key, host_lock_id, edit_session_id,
             owner_writer_session_id, ownership_generation, acquired_at_ms, last_confirmed_at_ms
@@ -244,13 +261,59 @@ describe('SQLite file-state structural validation', () => {
             acquired_at_ms
         ) VALUES ('reservation', 'save-operation', 'file:///entry.csv', 'resource-lock',
             'host-lock', 'edit-session', 1, 1, 'save-stage', 'prepared-install',
-            1, 0, 0, 0, 0, NULL, 'intended-digest', 'clear-record', 10)`).run();
+            1, 0, 0, 0, 0, 'expected-digest', 'intended-digest', 'clear-record', 10)`).run();
 
         expect(() => validate_sqlite_file_state_database(database, {
             identity: desktopIdentity,
         })).not.toThrow();
 
         database.exec('UPDATE file_write_reservations SET expected_authority_revision = 1');
+        expectValidationCategory(database, 'malformed-state');
+    });
+
+    it('accepts a durable cleanup lifecycle after its reservation row is gone', () => {
+        const database = createDatabase();
+        insertEntry(database, {
+            activeSheetIndex: 3,
+            [SQLITE_PREPARED_INSTALL_STATE_KEY]: {
+                version: 1,
+                phase: 'cleanupPending',
+                reservationId: 'cleanup-reservation',
+                saveOperationId: 'cleanup-operation',
+                stageId: 'cleanup-stage',
+                preparedInstallId: 'cleanup-install',
+                hostLockId: 'cleanup-host',
+                previousPhysicalResourceLockKey: 'cleanup-previous-resource',
+                physicalResourceLockKey: 'cleanup-resource',
+                expectedPhysicalDigest: 'cleanup-expected',
+                intendedPhysicalDigest: 'cleanup-intended',
+                recordedAtMs: 20,
+            },
+        });
+
+        expect(() => validate_sqlite_file_state_database(database, {
+            identity: desktopIdentity,
+        })).not.toThrow();
+    });
+
+    it('rejects cleanup lifecycle records without their previous lock identity', () => {
+        const database = createDatabase();
+        insertEntry(database, {
+            [SQLITE_PREPARED_INSTALL_STATE_KEY]: {
+                version: 1,
+                phase: 'cleanupPending',
+                reservationId: 'cleanup-reservation',
+                saveOperationId: 'cleanup-operation',
+                stageId: 'cleanup-stage',
+                preparedInstallId: 'cleanup-install',
+                hostLockId: 'cleanup-host',
+                physicalResourceLockKey: 'cleanup-resource',
+                expectedPhysicalDigest: 'cleanup-expected',
+                intendedPhysicalDigest: 'cleanup-intended',
+                recordedAtMs: 20,
+            },
+        });
+
         expectValidationCategory(database, 'malformed-state');
     });
 
