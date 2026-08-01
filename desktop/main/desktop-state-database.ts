@@ -427,22 +427,44 @@ function quarantine_unparseable_reader_tokens(
                 || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
             .map((entry) => entry.name);
         if (unparseable.length === 0) return;
-        const quarantine_directory = path.join(
-            desktop_state_gate_directory(database_path),
+        const quarantine_root = path.join(
+            gate_directory,
             READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
-            randomUUID(),
         );
-        fs.mkdirSync(quarantine_directory, { recursive: true, mode: 0o700 });
-        // Durability in the same order the shared backend uses: the new directory
-        // entry is flushed before anything is moved into it, so a crash
-        // mid-quarantine cannot leave a member with no directory to have landed in.
+        // The destination needs the same guard as the source, for the same reason:
+        // this name is joined onto the gate path and never otherwise checked, so a
+        // symlink here would make `mkdirSync` follow it and land every rename in
+        // the link target — writing outside the gate tree, which is the exact
+        // invariant the source-side guard above exists to protect. Guarding only
+        // the read side would have been half a fix.
+        const quarantine_root_owned = own_directory(quarantine_root);
+        if (quarantine_root_owned === false) {
+            throw sqlite_file_state_recovery_error({
+                operation: 'reader-token-quarantine-directory',
+            });
+        }
+        const quarantine_directory = path.join(quarantine_root, randomUUID());
         const flush = (directory: string): void => {
             assert_sqlite_directory_durability_supported(
                 directory,
                 options.fsyncDirectory ?? fs.fsyncSync,
             );
         };
-        flush(path.dirname(quarantine_directory));
+        // Created one level at a time so each new directory entry can be flushed,
+        // the way `ensure_private_gate` does it. `mkdirSync(…, {recursive: true})`
+        // on the full path would create `quarantined-readers` *and* the generation
+        // directory while only the lower level ever got flushed — leaving the top
+        // link of the destination chain unrecorded. The removals from `readers/`
+        // below are flushed, so a crash could then make the moved evidence
+        // unreachable, and this module is not allowed to destroy evidence.
+        if (quarantine_root_owned === undefined) {
+            fs.mkdirSync(quarantine_root, { mode: 0o700 });
+            flush(gate_directory);
+        }
+        fs.mkdirSync(quarantine_directory, { mode: 0o700 });
+        // Before anything moves in, so a crash cannot leave a member with no
+        // directory to have landed in.
+        flush(quarantine_root);
         for (const name of unparseable) {
             fs.renameSync(
                 path.join(readers_directory, name),

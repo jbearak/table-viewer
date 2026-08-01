@@ -599,6 +599,34 @@ describe('desktop state database', () => {
         expect(fs.existsSync(path.join(gate_directory(), 'quarantined-readers'))).toBe(false);
     });
 
+    it('writes nothing outside the gate when the quarantine name is a symlink', async () => {
+        // The read side was guarded first, which left this: the destination name is
+        // joined onto the gate path and never otherwise checked, so `mkdirSync`
+        // followed the link and every rename landed in the target. Verified before
+        // the fix that the token really did land outside the gate and `preserve` did
+        // not even throw — a silent write outside the tree.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const readers = path.join(gate_directory(), 'readers');
+        fs.mkdirSync(readers, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(readers, 'not-a-uuid.reader'), 'token', { mode: 0o600 });
+        const outside = path.join(userDataDir, 'outside');
+        fs.mkdirSync(outside, { recursive: true, mode: 0o700 });
+        fs.symlinkSync(outside, path.join(gate_directory(), 'quarantined-readers'));
+
+        await expect(preserve_desktop_state_database(
+            userDataDir,
+            { allProcessesClosed: true },
+        )).rejects.toBeInstanceOf(SqliteFileStateError);
+
+        // Nothing was created or moved into the link target, and the token is still
+        // where it was — evidence preserved, not relocated out of the tree.
+        expect(fs.readdirSync(outside)).toEqual([]);
+        expect(fs.existsSync(path.join(readers, 'not-a-uuid.reader'))).toBe(true);
+    });
+
     it('moves nothing when the gate directory itself is a symlink', async () => {
         // The gate directory is derived with `path.join`, so guarding only
         // `readers` leaves this hole: through a symlinked gate, `readers` is a
