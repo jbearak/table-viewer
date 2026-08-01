@@ -97,6 +97,19 @@ describe('shared state store recency timestamps', () => {
         expect(backing.value().entries['/source'].updatedAt).toBe(1_000_000);
     });
 
+    it('does not stamp lease-only acquisition or release transactions', async () => {
+        const backing = memory_medium();
+        const store = create_authority_store(backing.medium);
+        await store.compare_and_set('/leased', 0, { activeSheetIndex: 1 });
+        const before = structuredClone(backing.value());
+
+        vi.setSystemTime(9_000_000);
+        const lease = await store.lease_entry!('/leased', (path) => path);
+        expect(backing.value()).toEqual(before);
+        await lease.release();
+        expect(backing.value()).toEqual(before);
+    });
+
     it('never regresses store or entry timestamps when the clock moves backward', async () => {
         const backing = memory_medium();
         const store = create_authority_store(backing.medium);

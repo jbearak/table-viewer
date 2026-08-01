@@ -291,6 +291,7 @@ export interface KeyedStateReadTransaction {
     read_entry(path: string): PersistedCompleteKeyedStateEntry | undefined;
     read_authority_stages(path: string): readonly PersistedAuthorityStageRecord[];
     scan_entry_metadata(): readonly PersistedKeyedStateEntryMetadata[];
+    entry_is_leased(path: string): boolean;
 }
 
 export interface KeyedStateWriteTransaction extends KeyedStateReadTransaction {
@@ -307,6 +308,9 @@ export interface KeyedStateWriteTransaction extends KeyedStateReadTransaction {
     ): void;
     delete_authority_stages_before(boundary: number): readonly string[];
     delete_entry(path: string): void;
+    insert_lease(lease_id: string, path: string): void;
+    move_leases(source_paths: readonly string[], destination_path: string): void;
+    delete_lease(lease_id: string): boolean;
 }
 
 export type KeyedStateMutationKind =
@@ -318,6 +322,8 @@ export type KeyedStateMutationKind =
     | 'discardAuthority'
     | 'cleanupAuthority'
     | 'touch'
+    | 'lease'
+    | 'releaseLease'
     | 'retention';
 
 export interface KeyedFileStatePersistence {
@@ -739,6 +745,8 @@ export function create_keyed_file_state_persistence(
             Object.keys(all.entries).map((path, index) => [path, BigInt(index + 1)]),
         );
         let changed = false;
+        let leasesChanged = false;
+        const transactionLeases = new Map(runtime_for(medium.runtime_key).leases);
         let nextRecencyOrder = BigInt(Object.keys(all.entries).length + 1);
         const mark_changed = (): void => { changed = true; };
         const ordered_paths = (): string[] => [...Object.keys(all.entries)].sort((left, right) => {
@@ -769,6 +777,12 @@ export function create_keyed_file_state_persistence(
             scan_entry_metadata: () => ordered_paths().map((path) => (
                 metadata_from_entry(path, all.entries[path], order.get(path) ?? 0n)
             )),
+            entry_is_leased(path) {
+                for (const leasedPath of transactionLeases.values()) {
+                    if (leasedPath === path) return true;
+                }
+                return false;
+            },
             allocate_revision() {
                 if (all.nextRevision >= EXHAUSTION_SENTINEL) {
                     throw new RangeError('File-state revision space is exhausted.');
@@ -891,11 +905,36 @@ export function create_keyed_file_state_persistence(
                 order.delete(path);
                 mark_changed();
             },
+            insert_lease(leaseId, path) {
+                if (transactionLeases.has(leaseId)) {
+                    throw new Error('Cannot insert a duplicate file-state lease id.');
+                }
+                transactionLeases.set(leaseId, path);
+                leasesChanged = true;
+            },
+            move_leases(sourcePaths, destinationPath) {
+                const sources = new Set(sourcePaths);
+                for (const [leaseId, path] of transactionLeases) {
+                    if (!sources.has(path) || path === destinationPath) continue;
+                    transactionLeases.set(leaseId, destinationPath);
+                    leasesChanged = true;
+                }
+            },
+            delete_lease(leaseId) {
+                const deleted = transactionLeases.delete(leaseId);
+                leasesChanged = leasesChanged || deleted;
+                return deleted;
+            },
         };
         const result = require_synchronous_transaction_result(body(tx));
         if (writable && changed) {
             all.entries = Object.fromEntries(ordered_paths().map((path) => [path, all.entries[path]]));
             await medium.write(all);
+        }
+        if (writable && leasesChanged) {
+            const leases = runtime_for(medium.runtime_key).leases;
+            leases.clear();
+            for (const [leaseId, path] of transactionLeases) leases.set(leaseId, path);
         }
         return result;
     };
@@ -946,10 +985,6 @@ function write_complete(
     });
 }
 
-function leased_paths(runtime: StateRuntime): Set<string> {
-    return new Set(runtime.leases.values());
-}
-
 function cleanup_stale_stages(
     tx: KeyedStateWriteTransaction,
     now: number,
@@ -966,14 +1001,12 @@ function cleanup_stale_stages(
 
 function evict_entries(
     tx: KeyedStateWriteTransaction,
-    runtime: StateRuntime,
     max: number,
     protectedPaths: ReadonlySet<string>,
 ): boolean {
-    const leased = leased_paths(runtime);
     const ordinary = tx.scan_entry_metadata().filter((entry) => (
         !protectedPaths.has(entry.path)
-        && !leased.has(entry.path)
+        && !tx.entry_is_leased(entry.path)
         && !entry.hasPendingEdits
         && entry.authorityStageCount === 0
     ));
@@ -990,13 +1023,12 @@ function evict_entries(
 
 function run_retention(
     tx: KeyedStateWriteTransaction,
-    runtime: StateRuntime,
     max: number,
     protectedPaths: ReadonlySet<string>,
     now: number,
 ): boolean {
     const cleaned = cleanup_stale_stages(tx, now);
-    return evict_entries(tx, runtime, max, protectedPaths) || cleaned;
+    return evict_entries(tx, max, protectedPaths) || cleaned;
 }
 
 function ensure_authority_incrementable(value: number, name: string): void {
@@ -1110,6 +1142,10 @@ function canonicalize_in_transaction(
     if (!winnerMovedUnchanged && winner.entry.path !== canonicalPath) {
         delete (next.entry as { copyProvenance?: unknown }).copyProvenance;
     }
+    tx.move_leases(
+        candidates.map((candidate) => candidate.entry.path),
+        canonicalPath,
+    );
     for (const candidate of candidates) tx.delete_entry(candidate.entry.path);
     write_complete(tx, next);
     const deletedAliases = candidates.some((candidate) => candidate.entry.path !== canonicalPath);
@@ -1120,7 +1156,6 @@ function canonicalize_in_transaction(
 
 function copy_in_transaction(
     tx: KeyedStateWriteTransaction,
-    runtime: StateRuntime,
     sourcePath: string,
     destinationPath: string,
     copyId: string,
@@ -1143,7 +1178,6 @@ function copy_in_transaction(
         };
         const changed = run_retention(
             tx,
-            runtime,
             max,
             new Set([sourcePath, destinationPath]),
             capturedAt,
@@ -1156,7 +1190,7 @@ function copy_in_transaction(
             type: 'destinationExists',
             destination: snapshot_from_complete(destination, metadata.absenceRevision),
         };
-        const changed = run_retention(tx, runtime, max, new Set([sourcePath, destinationPath]), capturedAt);
+        const changed = run_retention(tx, max, new Set([sourcePath, destinationPath]), capturedAt);
         if (changed) tx.set_updated_at(capturedAt);
         return result;
     }
@@ -1167,7 +1201,7 @@ function copy_in_transaction(
             source: { state: {}, revision: metadata.absenceRevision },
             destination: { state: {}, revision: metadata.absenceRevision },
         };
-        const changed = run_retention(tx, runtime, max, new Set([sourcePath, destinationPath]), capturedAt);
+        const changed = run_retention(tx, max, new Set([sourcePath, destinationPath]), capturedAt);
         if (changed) tx.set_updated_at(capturedAt);
         return result;
     }
@@ -1213,7 +1247,7 @@ function copy_in_transaction(
         })),
     };
     write_complete(tx, copied);
-    evict_entries(tx, runtime, max, new Set([sourcePath, destinationPath]));
+    evict_entries(tx, max, new Set([sourcePath, destinationPath]));
     tx.set_updated_at(capturedAt);
     return {
         type: 'copied',
@@ -1236,23 +1270,6 @@ export function create_keyed_authority_store(
         kind: KeyedStateMutationKind,
         body: (tx: KeyedStateWriteTransaction) => T,
     ): Promise<T> => enqueue(runtime, () => persistence.write_transaction(kind, body));
-    const writeTransactionThen = <T, U>(
-        kind: KeyedStateMutationKind,
-        body: (tx: KeyedStateWriteTransaction) => T,
-        afterCommit: (result: T) => U,
-    ): Promise<U> => enqueue(runtime, async () => afterCommit(
-        await persistence.write_transaction(kind, body),
-    ));
-    const moveLeases = (
-        candidatePaths: ReadonlySet<string> | undefined,
-        canonicalPath: string,
-    ): void => {
-        if (!candidatePaths) return;
-        for (const [leaseId, path] of runtime.leases) {
-            if (candidatePaths.has(path)) runtime.leases.set(leaseId, canonicalPath);
-        }
-    };
-
     return {
         read(filePath) {
             return readTransaction((tx) => (
@@ -1312,7 +1329,7 @@ export function create_keyed_authority_store(
                     stages: currentEntry?.stages.map((stage) => structuredClone(stage)) ?? [],
                 };
                 write_complete(tx, complete);
-                run_retention(tx, runtime, getMax(), new Set(), capturedAt);
+                run_retention(tx, getMax(), new Set(), capturedAt);
                 tx.set_updated_at(capturedAt);
                 return {
                     type: 'committed',
@@ -1375,7 +1392,7 @@ export function create_keyed_authority_store(
                     ...stages.filter((stage) => stage.id !== captured.id),
                     captured,
                 ]);
-                run_retention(tx, runtime, getMax(), new Set(), capturedAt);
+                run_retention(tx, getMax(), new Set(), capturedAt);
                 tx.set_updated_at(capturedAt);
                 return { type: 'staged' };
             });
@@ -1434,7 +1451,7 @@ export function create_keyed_authority_store(
                 (complete as { stages: readonly PersistedAuthorityStageRecord[] }).stages = complete.stages
                     .filter((candidate) => candidate.id !== stageId);
                 write_complete(tx, complete);
-                run_retention(tx, runtime, getMax(), new Set(), capturedAt);
+                run_retention(tx, getMax(), new Set(), capturedAt);
                 tx.set_updated_at(capturedAt);
                 return {
                     type: 'finalized',
@@ -1469,7 +1486,7 @@ export function create_keyed_authority_store(
                     const { copyProvenance: _copyProvenance, ...withoutProvenance } = metadata;
                     tx.write_entry_metadata(withoutProvenance);
                 }
-                run_retention(tx, runtime, getMax(), new Set(), capturedAt);
+                run_retention(tx, getMax(), new Set(), capturedAt);
                 tx.set_updated_at(capturedAt);
             });
         },
@@ -1477,14 +1494,14 @@ export function create_keyed_authority_store(
         cleanup_authority_transactions(_filePath, now = Date.now()) {
             const capturedAt = now;
             return writeTransaction('cleanupAuthority', (tx) => {
-                const changed = run_retention(tx, runtime, getMax(), new Set(), now);
+                const changed = run_retention(tx, getMax(), new Set(), now);
                 if (changed) tx.set_updated_at(capturedAt);
             });
         },
 
         canonicalize_path(canonicalPath, canonicalKey) {
             const capturedAt = Date.now();
-            return writeTransactionThen('canonicalize', (tx) => {
+            return writeTransaction('canonicalize', (tx) => {
                 const movedPaths = canonicalize_in_transaction(
                     tx,
                     canonicalPath,
@@ -1493,19 +1510,39 @@ export function create_keyed_authority_store(
                 );
                 const retained = run_retention(
                     tx,
-                    runtime,
                     getMax(),
                     new Set([canonicalPath]),
                     capturedAt,
                 );
                 if (movedPaths || retained) tx.set_updated_at(capturedAt);
-                return movedPaths;
-            }, (movedPaths) => moveLeases(movedPaths, canonicalPath));
+            });
         },
 
         lease_entry(canonicalPath, canonicalKey, copyFromIfAbsent, copyId, pendingBasis) {
             const capturedAt = Date.now();
-            return writeTransactionThen('canonicalize', (tx) => {
+            const leaseId = randomUUID();
+            let releasePromise: Promise<void> | undefined;
+            const lease: FileStateLease = {
+                release(): Promise<void> {
+                    if (releasePromise) return releasePromise;
+                    const releaseCapturedAt = Date.now();
+                    const attempt = writeTransaction('releaseLease', (tx) => {
+                        if (!tx.delete_lease(leaseId)) return;
+                        if (run_retention(
+                            tx,
+                            getMax(),
+                            new Set(),
+                            releaseCapturedAt,
+                        )) tx.set_updated_at(releaseCapturedAt);
+                    });
+                    releasePromise = attempt.catch((error: unknown) => {
+                        releasePromise = undefined;
+                        throw error;
+                    });
+                    return releasePromise;
+                },
+            };
+            return writeTransaction('lease', (tx) => {
                 const movedPaths = canonicalize_in_transaction(
                     tx,
                     canonicalPath,
@@ -1515,7 +1552,6 @@ export function create_keyed_authority_store(
                 if (copyFromIfAbsent) {
                     const result = copy_in_transaction(
                         tx,
-                        runtime,
                         copyFromIfAbsent,
                         canonicalPath,
                         copyId ?? `lease:${copyFromIfAbsent}:${canonicalPath}`,
@@ -1530,58 +1566,20 @@ export function create_keyed_authority_store(
                 } else {
                     const retained = run_retention(
                         tx,
-                        runtime,
                         getMax(),
                         new Set([canonicalPath]),
                         capturedAt,
                     );
                     if (movedPaths || retained) tx.set_updated_at(capturedAt);
                 }
-                return movedPaths;
-            }, (movedPaths) => {
-                moveLeases(movedPaths, canonicalPath);
-                const leaseId = randomUUID();
-                runtime.leases.set(leaseId, canonicalPath);
-                let releasePromise: Promise<void> | undefined;
-                return {
-                    release(): Promise<void> {
-                        if (releasePromise) return releasePromise;
-                        const releaseCapturedAt = Date.now();
-                        const attempt = enqueue(runtime, async () => {
-                            let removedPath: string | undefined;
-                            try {
-                                await persistence.write_transaction('retention', (releaseTx) => {
-                                    removedPath = runtime.leases.get(leaseId);
-                                    if (removedPath === undefined) return;
-                                    runtime.leases.delete(leaseId);
-                                    if (run_retention(
-                                        releaseTx,
-                                        runtime,
-                                        getMax(),
-                                        new Set(),
-                                        releaseCapturedAt,
-                                    )) releaseTx.set_updated_at(releaseCapturedAt);
-                                });
-                            } catch (error) {
-                                if (removedPath !== undefined) runtime.leases.set(leaseId, removedPath);
-                                throw error;
-                            }
-                        });
-                        releasePromise = attempt.catch((error: unknown) => {
-                            releasePromise = undefined;
-                            throw error;
-                        });
-                        return releasePromise;
-                    },
-                };
-            });
+                tx.insert_lease(leaseId, canonicalPath);
+            }).then(() => lease);
         },
 
         copy_entry_if_absent(sourcePath, destinationPath, copyId, pendingBasis) {
             const capturedAt = Date.now();
             return writeTransaction('copy', (tx) => copy_in_transaction(
                 tx,
-                runtime,
                 sourcePath,
                 destinationPath,
                 copyId,
@@ -1604,7 +1602,7 @@ export function create_keyed_authority_store(
                     });
                     changed = true;
                 }
-                changed = run_retention(tx, runtime, getMax(), new Set(), capturedAt) || changed;
+                changed = run_retention(tx, getMax(), new Set(), capturedAt) || changed;
                 if (changed) tx.set_updated_at(capturedAt);
             });
         },

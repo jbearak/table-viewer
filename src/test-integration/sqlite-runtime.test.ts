@@ -1,5 +1,9 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import * as vscode from 'vscode';
 
 interface SqliteError extends Error {
@@ -57,6 +61,64 @@ describe('embedded node:sqlite runtime', () => {
             ).get()?.version;
             assert.strictEqual(typeof sqlite_version, 'string');
             assert.ok((sqlite_version as string).length > 0);
+
+            const json = database.prepare(`SELECT json_valid(?) AS valid,
+                json_type(?) AS type`).get('{"value":1}', '{"value":1}');
+            assert.strictEqual(json?.valid, 1);
+            assert.strictEqual(json?.type, 'object');
+
+            database.exec('PRAGMA query_only = ON');
+            assert.throws(() => insert.run(8, 'query-only-write'));
+            database.exec('PRAGMA query_only = OFF');
+            assert.strictEqual(insert.run(9, 'query-only-restored').changes, 1);
+
+            const probeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-vscode-sqlite-probe-'));
+            try {
+                const existingPath = path.join(probeDirectory, 'existing.sqlite3');
+                new DatabaseSync(existingPath).close();
+                const existingUri = pathToFileURL(existingPath);
+                existingUri.searchParams.set('mode', 'rw');
+                new DatabaseSync(existingUri).close();
+
+                const missingPath = path.join(probeDirectory, 'missing.sqlite3');
+                const missingUri = pathToFileURL(missingPath);
+                missingUri.searchParams.set('mode', 'rw');
+                assert.throws(() => new DatabaseSync(missingUri));
+                assert.strictEqual(fs.existsSync(missingPath), false);
+
+                const linkSource = path.join(probeDirectory, 'link-source');
+                const linkTarget = path.join(probeDirectory, 'link-target');
+                fs.writeFileSync(linkSource, 'source', { mode: 0o600 });
+                fs.writeFileSync(linkTarget, 'target', { mode: 0o600 });
+                assert.throws(
+                    () => fs.linkSync(linkSource, linkTarget),
+                    (error: NodeJS.ErrnoException) => error.code === 'EEXIST',
+                );
+                assert.strictEqual(fs.readFileSync(linkTarget, 'utf8'), 'target');
+
+                let directoryError: NodeJS.ErrnoException | undefined;
+                try {
+                    const directory = fs.openSync(probeDirectory, 'r');
+                    try {
+                        fs.fsyncSync(directory);
+                    } finally {
+                        fs.closeSync(directory);
+                    }
+                } catch (error) {
+                    directoryError = error as NodeJS.ErrnoException;
+                }
+                const directoryDurability = process.platform === 'win32'
+                    ? 'fail-closed'
+                    : directoryError === undefined ? 'supported' : 'failed';
+                // Match production: Windows is explicitly fail-closed until a
+                // proven directory durability primitive is available.
+                assert.strictEqual(
+                    directoryDurability,
+                    process.platform === 'win32' ? 'fail-closed' : 'supported',
+                );
+            } finally {
+                fs.rmSync(probeDirectory, { recursive: true, force: true });
+            }
 
             let representative_error: SqliteError | undefined;
             try {

@@ -1,12 +1,29 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AuthorityFileStateStore } from '../state';
 
+export interface FileStateStoreContractInspection {
+    readonly nextRevision: number;
+    readonly absenceRevision: number;
+    readonly updatedAt?: number;
+    readonly entries: Record<string, any>;
+    readonly [key: string]: any;
+}
+
 export interface FileStateStoreContractFixture {
     create(maxStoredFiles?: number): AuthorityFileStateStore;
     createIndependent(maxStoredFiles?: number): AuthorityFileStateStore;
     seedEnvelope(envelope: unknown): Promise<void> | void;
-    persistedValue(): any;
+    /** Backend-neutral logical inspection; new fixtures should prefer this. */
+    inspect?(): FileStateStoreContractInspection;
+    /** Compatibility for existing whole-envelope fixtures. */
+    persistedValue?(): FileStateStoreContractInspection;
     failNextWrite(): Promise<() => Promise<void>>;
+}
+
+function inspect_fixture(fixture: FileStateStoreContractFixture): FileStateStoreContractInspection {
+    if (fixture.inspect) return fixture.inspect();
+    if (fixture.persistedValue) return fixture.persistedValue();
+    throw new Error('File-state contract fixture does not provide inspection.');
 }
 
 export interface FileStateStoreContractCapabilities {
@@ -164,13 +181,13 @@ export function file_state_store_contract(
                 },
             };
             await backend.seedEnvelope(legacy);
-            const before = structuredClone(backend.persistedValue());
+            const before = structuredClone(inspect_fixture(backend));
             const store = backend.create();
             await expect(store.read('/legacy')).resolves.toEqual({
                 revision: 0,
                 state: legacy['/legacy'],
             });
-            expect(backend.persistedValue()).toEqual(before);
+            expect(inspect_fixture(backend)).toEqual(before);
         });
 
         it('defaults only absent legacy authority and rejects malformed present authority without rewrite', async () => {
@@ -213,7 +230,7 @@ export function file_state_store_contract(
                     absenceRevision: 0,
                     entries: { '/malformed': { ...entry, authority } },
                 });
-                const before = structuredClone(backend.persistedValue());
+                const before = structuredClone(inspect_fixture(backend));
                 const store = backend.create();
                 await expect(store.read('/malformed')).rejects.toThrow();
                 await expect(store.compare_and_set(
@@ -221,7 +238,7 @@ export function file_state_store_contract(
                     1,
                     { activeSheetIndex: 2 },
                 )).rejects.toThrow();
-                expect(backend.persistedValue()).toEqual(before);
+                expect(inspect_fixture(backend)).toEqual(before);
             }
         });
 
@@ -432,7 +449,7 @@ export function file_state_store_contract(
             const backend = fixture();
             const store = backend.create();
             await store.compare_and_set('/counter', 0, { activeSheetIndex: 1 });
-            const nextRevision = backend.persistedValue().nextRevision;
+            const nextRevision = inspect_fixture(backend).nextRevision;
 
             await store.compare_and_set('/counter', 0, { activeSheetIndex: 2 });
             await store.compare_and_set('/counter', 1, { activeSheetIndex: 3 }, () => false);
@@ -442,7 +459,7 @@ export function file_state_store_contract(
                 { activeSheetIndex: 4 },
                 () => { throw new Error('validator'); },
             )).rejects.toThrow('validator');
-            expect(backend.persistedValue().nextRevision).toBe(nextRevision);
+            expect(inspect_fixture(backend).nextRevision).toBe(nextRevision);
         });
 
         it('stages invisibly, finalizes atomically, and discards only existing stages', async () => {
@@ -471,9 +488,9 @@ export function file_state_store_contract(
                     projectionRevision: 1,
                 },
             });
-            const beforeMissingDiscard = structuredClone(backend.persistedValue());
+            const beforeMissingDiscard = structuredClone(inspect_fixture(backend));
             await store.discard_authority_transaction('/authority', 'missing');
-            expect(backend.persistedValue()).toEqual(beforeMissingDiscard);
+            expect(inspect_fixture(backend)).toEqual(beforeMissingDiscard);
         });
 
         it('cleans stale source stages before installing replayable copy provenance', async () => {
@@ -637,13 +654,13 @@ export function file_state_store_contract(
                 },
             };
             await divergentBackend.seedEnvelope(divergent);
-            const before = structuredClone(divergentBackend.persistedValue());
+            const before = structuredClone(inspect_fixture(divergentBackend));
             const reconstructed = divergentBackend.createIndependent();
             await expect(reconstructed.canonicalize_path!(
                 'c:\\data\\divergent.xlsx',
                 (path) => path.toLowerCase(),
             )).rejects.toThrow(/divergent durable file authority/i);
-            expect(divergentBackend.persistedValue()).toEqual(before);
+            expect(inspect_fixture(divergentBackend)).toEqual(before);
         });
 
         it('keeps one complete canonical winner when an alias coexists', async () => {
@@ -785,10 +802,10 @@ export function file_state_store_contract(
                 await store.compare_and_set('/touched', 0, { activeSheetIndex: 1 });
                 const otherBasis = await store.read('/other');
                 await store.compare_and_set('/other', otherBasis.revision, { activeSheetIndex: 0 });
-                const before = structuredClone(backend.persistedValue().entries['/touched']);
+                const before = structuredClone(inspect_fixture(backend).entries['/touched']);
                 vi.setSystemTime(2_000_000);
                 await store.touch('/touched');
-                const touched = backend.persistedValue().entries['/touched'];
+                const touched = inspect_fixture(backend).entries['/touched'];
                 expect(touched.revision).toBe(before.revision);
                 expect(touched.updatedAt).toBe(before.updatedAt);
                 expect(touched.touchedAt).toBe(2_000_000);
@@ -862,14 +879,14 @@ export function file_state_store_contract(
                     id: 'finalize', kind: 'projection', ordinal: 1,
                     expectedStateRevision: 0, expectedCommitSequence: 0,
                 });
-                expect(backend.persistedValue().updatedAt).toBe(1_000_000);
+                expect(inspect_fixture(backend).updatedAt).toBe(1_000_000);
                 vi.setSystemTime(2_000_000);
                 await store.finalize_authority_transaction('/timestamp-authority', 'finalize');
-                expect(backend.persistedValue().updatedAt).toBe(2_000_000);
-                const beforeNoops = structuredClone(backend.persistedValue());
+                expect(inspect_fixture(backend).updatedAt).toBe(2_000_000);
+                const beforeNoops = structuredClone(inspect_fixture(backend));
                 await store.discard_authority_transaction('/timestamp-authority', 'missing');
                 await store.compare_and_set('/timestamp-authority', -1, { activeSheetIndex: 9 });
-                expect(backend.persistedValue()).toEqual(beforeNoops);
+                expect(inspect_fixture(backend)).toEqual(beforeNoops);
 
                 vi.setSystemTime(3_000_000);
                 await store.stage_authority_transaction('/timestamp-authority', {
@@ -878,7 +895,7 @@ export function file_state_store_contract(
                 });
                 vi.setSystemTime(4_000_000);
                 await store.discard_authority_transaction('/timestamp-authority', 'discard');
-                expect(backend.persistedValue().updatedAt).toBe(4_000_000);
+                expect(inspect_fixture(backend).updatedAt).toBe(4_000_000);
 
                 vi.setSystemTime(5_000_000);
                 await store.stage_authority_transaction('/timestamp-authority', {
@@ -888,7 +905,7 @@ export function file_state_store_contract(
                 await store.cleanup_authority_transactions(
                     '/timestamp-authority', 5_000_000 + 24 * 60 * 60 * 1000 + 1,
                 );
-                expect(backend.persistedValue().updatedAt)
+                expect(inspect_fixture(backend).updatedAt)
                     .toBe(5_000_000 + 24 * 60 * 60 * 1000 + 1);
             } finally {
                 vi.useRealTimers();
@@ -901,14 +918,14 @@ export function file_state_store_contract(
                 const backend = fixture();
                 await backend.seedEnvelope({ '/legacy-time': { activeSheetIndex: 1 } });
                 const store = backend.create();
-                const beforeRead = structuredClone(backend.persistedValue());
+                const beforeRead = structuredClone(inspect_fixture(backend));
                 await store.read('/legacy-time');
-                expect(backend.persistedValue()).toEqual(beforeRead);
+                expect(inspect_fixture(backend)).toEqual(beforeRead);
                 vi.setSystemTime(1_000_000);
                 await store.touch('/legacy-time');
                 vi.setSystemTime(2_000_000);
                 await store.compare_and_set('/legacy-time', 0, { activeSheetIndex: 2 });
-                const envelope = backend.persistedValue();
+                const envelope = inspect_fixture(backend);
                 expect(envelope.updatedAt).toBe(2_000_000);
                 expect(envelope.entries['/legacy-time']).toMatchObject({
                     revision: 1,
@@ -931,7 +948,7 @@ export function file_state_store_contract(
                 vi.setSystemTime(4_000_000);
                 await store.compare_and_set('/time-source', 1, { activeSheetIndex: 2 });
                 await store.copy_entry_if_absent!('/time-source', '/time-copy', 'time-copy');
-                const envelope = backend.persistedValue();
+                const envelope = inspect_fixture(backend);
                 expect(envelope.updatedAt).toBe(5_000_000);
                 expect(envelope.entries['/time-source'].updatedAt).toBe(5_000_000);
                 expect(envelope.entries['/time-source'].touchedAt).toBe(5_000_000);
@@ -950,12 +967,12 @@ export function file_state_store_contract(
                 expectedStateRevision: 0, expectedCommitSequence: 0,
                 nextState: { activeSheetIndex: 1 },
             });
-            const before = structuredClone(backend.persistedValue());
+            const before = structuredClone(inspect_fixture(backend));
             const restore = await backend.failNextWrite();
             await expect(store.finalize_authority_transaction('/finalize-rollback', 'stage'))
                 .rejects.toThrow();
             await restore();
-            expect(backend.persistedValue()).toEqual(before);
+            expect(inspect_fixture(backend)).toEqual(before);
             expect((await store.inspect_authority_transaction(
                 '/finalize-rollback', 'stage',
             )).stagePresent).toBe(true);
@@ -988,7 +1005,7 @@ export function file_state_store_contract(
                 const basis = await store.read(path);
                 await store.compare_and_set(path, basis.revision, { activeSheetIndex: index });
             }
-            const envelope = backend.persistedValue();
+            const envelope = inspect_fixture(backend);
             expect(Object.keys(envelope.entries)).toHaveLength(3);
             expect(JSON.stringify(envelope)).not.toContain('churn-0');
             expect(envelope.absenceRevision).toBeGreaterThan(0);
@@ -1005,7 +1022,7 @@ export function file_state_store_contract(
             const store = backend.create();
             await expect(store.compare_and_set('/exhausted', 0, { activeSheetIndex: 1 }))
                 .rejects.toThrow(/exhausted/i);
-            expect(backend.persistedValue()).toMatchObject({
+            expect(inspect_fixture(backend)).toMatchObject({
                 nextRevision: Number.MAX_SAFE_INTEGER,
                 absenceRevision: 0,
                 entries: {},
