@@ -100,7 +100,11 @@ import {
     toggle_source_column,
 } from './column-projection';
 import { use_state_sync } from './use-state-sync';
-import { host_bridge } from './host-bridge';
+import {
+    host_bridge,
+    install_pending_edit_flush_responder,
+    pending_edit_durability,
+} from './host-bridge';
 import { apply_font_family, apply_font_size } from './vscode-theme';
 import {
     edit_command_target,
@@ -380,7 +384,13 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
+    const renderer_publication_fenced_session_ref = useRef<string>();
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
+        const previous = csv_edit_session_id_ref.current;
+        if (next && next !== previous) {
+            renderer_publication_fenced_session_ref.current = undefined;
+        }
+        if (previous && previous !== next) pending_edit_durability.retire(previous);
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
@@ -632,6 +642,36 @@ export function App(): React.JSX.Element {
         snapshot_identity_ref,
     );
 
+    useLayoutEffect(() => install_pending_edit_flush_responder(async () => {
+        const edit_session_id = csv_edit_session_id_ref.current;
+        if (!edit_session_id) return { highestProducedSequence: 0 };
+
+        // This is the document-lifetime close/reload boundary. Fence the mounted
+        // grid synchronously, then fold its live overlay before sampling the
+        // App-owned store that survives generation-keyed GridShell remounts.
+        const editing = editing_ref.current;
+        editing?.stop_edit_admission();
+        editing?.commit_live_edit();
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+        const durability = pending_edit_durability.snapshot(edit_session_id);
+        const snapshot = edit_session_ref.current!.snapshot();
+        const publication_fenced = renderer_publication_fenced_session_ref.current
+            === edit_session_id;
+        const highest_produced_sequence = save_in_flight_ref.current || publication_fenced
+            ? durability.highestProducedSequence
+            : pending_edit_durability.publish(
+                edit_session_id,
+                snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
+                durability.highestAcknowledgedSequence
+                    < durability.highestProducedSequence,
+            );
+        return {
+            editSessionId: edit_session_id,
+            highestProducedSequence: highest_produced_sequence,
+        };
+    }), []);
+
     const request_transform = useCallback((
         sheet_index: number,
         state: SheetTransformState,
@@ -692,6 +732,12 @@ export function App(): React.JSX.Element {
 
     const release_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // Fence both the document-level final publication and every mounted-grid
+        // publication before the release message can reach the host. Otherwise a
+        // concurrent close flush can sample a sequence emitted after release began,
+        // which the releasing host correctly refuses and therefore never acknowledges.
+        renderer_publication_fenced_session_ref.current = csv_edit_session_id;
+        editing_ref.current?.stop_edit_admission();
         pending_save_dialog_ref.current = null;
         host_bridge.postMessage({
             type: 'releaseEditSession',
@@ -709,6 +755,8 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        renderer_publication_fenced_session_ref.current = csv_edit_session_id;
+        editing_ref.current?.stop_edit_admission();
         pending_save_dialog_ref.current = null;
         set_edit_mode(false);
         // Every edit is being thrown away, including the rejected ones.

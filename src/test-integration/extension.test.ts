@@ -25,6 +25,7 @@ describe('extension activation', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.setupPhysicalEditProtocol',
         ]) {
             assert.ok(commands.includes(id), `command ${id} not registered`);
         }

@@ -246,6 +246,46 @@ describe('paginated protocol message shapes', () => {
         expect(proof).toBe(false);
     });
 
+    it('carries sequenced full-map edits and correlated durability barriers', () => {
+        const changed: WebviewMessage = {
+            type: 'pendingEditsChanged',
+            editSessionId: 'edit:1',
+            sequence: 7,
+            edits: { '0:0': { value: 'next', base: 'old' } },
+        };
+        const acknowledged: HostMessage = {
+            type: 'pendingEditsAcknowledged',
+            editSessionId: changed.editSessionId,
+            sequence: changed.sequence,
+        };
+        const request: HostMessage = {
+            type: 'requestPendingEditsFlush',
+            requestId: 'close:1',
+        };
+        const response: WebviewMessage = {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: changed.editSessionId,
+            highestProducedSequence: changed.sequence,
+        };
+        const failure: WebviewMessage = {
+            type: 'pendingEditsFlushFailed',
+            requestId: request.requestId,
+        };
+        expect(acknowledged).toMatchObject({
+            editSessionId: changed.editSessionId,
+            sequence: changed.sequence,
+        });
+        expect(response).toMatchObject({
+            requestId: request.requestId,
+            highestProducedSequence: changed.sequence,
+        });
+        expect(failure).toEqual({
+            type: 'pendingEditsFlushFailed',
+            requestId: request.requestId,
+        });
+    });
+
     it('WebviewMessage carries a showWarning variant with a message', () => {
         const msg: WebviewMessage = {
             type: 'showWarning',

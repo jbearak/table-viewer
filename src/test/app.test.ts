@@ -29,6 +29,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     discard_keys: vi.fn((_keys: readonly string[]) => {}),
     commit_live_edit: vi.fn(),
+    stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
     select_all: vi.fn(),
     copy_sheet: vi.fn(),
@@ -44,7 +45,7 @@ const grid_shell_mock = vi.hoisted(() => ({
 // unstable subscribe would resubscribe every render, and an unstable snapshot
 // would violate the store contract and loop.
 const empty_edit_session = vi.hoisted(() => {
-    const empty = new Map<string, { value: string; base: string }>();
+    const empty: ReadonlyMap<string, { value: string; base: string }> = new Map();
     return { subscribe: () => () => {}, snapshot: () => empty };
 });
 
@@ -101,6 +102,7 @@ vi.mock('../webview/grid-shell', () => ({
                 clear_dirty: () => void;
                 discard_conflicted: () => void;
                 discard_keys: (keys: readonly string[]) => void;
+                stop_edit_admission: () => void;
                 commit_live_edit: () => void;
                 has_uncommitted_changes: () => boolean;
             } | null;
@@ -250,6 +252,7 @@ vi.mock('../webview/grid-shell', () => ({
                 clear_dirty: grid_shell_mock.clear_dirty,
                 discard_conflicted: grid_shell_mock.discard_conflicted,
                 discard_keys: grid_shell_mock.discard_keys,
+                stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
@@ -837,6 +840,7 @@ function cleanup() {
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.discard_keys.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
+    grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
@@ -4318,7 +4322,13 @@ describe('edit mode save exit', () => {
         await click_button('Discard All');
 
         expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'discardEditSession' }));
+        const discard_call = post_message.mock.invocationCallOrder.find((_order, index) => (
+            (post_message.mock.calls[index][0] as { type?: string }).type === 'discardEditSession'
+        ));
+        expect(grid_shell_mock.stop_edit_admission.mock.invocationCallOrder[0])
+            .toBeLessThan(discard_call!);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 

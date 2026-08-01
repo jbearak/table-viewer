@@ -3,7 +3,8 @@
 //     so the bundle posts WebviewMessages over ipcRenderer instead of
 //     acquireVsCodeApi();
 //  2. relays HostMessages from the main process into `window.postMessage` so
-//     the bundle's existing window 'message' listeners see them unchanged;
+//     the bundle's existing window 'message' listeners see them unchanged,
+//     including the close-flush request that main must send before teardown;
 //  3. re-applies the desktop theme as `--vscode-*` inline custom properties on
 //     <html> when the OS appearance changes — the webview's MutationObserver
 //     picks up the style mutation and rebuilds the Glide theme. The *initial*
@@ -17,8 +18,11 @@ import { contextBridge, ipcRenderer } from 'electron';
 import {
     CHANNEL_GET_THEME,
     CHANNEL_HOST_MESSAGE,
+    CHANNEL_HOST_MESSAGE_RECEIPT,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
+    type DesktopHostMessageEnvelope,
+    type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
 import { apply_theme_to_document, type ThemePayload } from '../main/theme';
 
@@ -30,10 +34,34 @@ contextBridge.exposeInMainWorld('__tableViewerHostBridge', {
     },
 });
 
-ipcRenderer.on(CHANNEL_HOST_MESSAGE, (_event, message: unknown) => {
+const RECEIPT_FIELD = '__tableViewerDesktopAcknowledgementReceipt';
+const pending_receipts = new Map<string, PendingEditAcknowledgementReceipt>();
+
+ipcRenderer.on(CHANNEL_HOST_MESSAGE, (_event, envelope: DesktopHostMessageEnvelope) => {
     // Re-dispatch into the page so the bundle's window 'message' listeners
-    // receive `event.data` exactly like a VS Code webview would.
+    // receive `event.data` exactly like a VS Code webview would. A receipt marker
+    // is ignored by the structural HostMessage protocol but lets this preload
+    // confirm that the page's message event actually ran.
+    const receipt = envelope.receipt;
+    if (receipt) pending_receipts.set(receipt.receiptId, receipt);
+    const message = receipt && envelope.message && typeof envelope.message === 'object'
+        ? { ...envelope.message, [RECEIPT_FIELD]: receipt.receiptId }
+        : envelope.message;
     window.postMessage(message, '*');
+});
+
+window.addEventListener('message', (event) => {
+    const data = event.data as Record<string, unknown> | null;
+    const receipt_id = data && typeof data[RECEIPT_FIELD] === 'string'
+        ? data[RECEIPT_FIELD]
+        : undefined;
+    if (!receipt_id) return;
+    const receipt = pending_receipts.get(receipt_id);
+    if (!receipt) return;
+    pending_receipts.delete(receipt_id);
+    // Window message listeners run synchronously in registration order. Defer the
+    // IPC receipt until the shared app's listener has also consumed this event.
+    queueMicrotask(() => ipcRenderer.send(CHANNEL_HOST_MESSAGE_RECEIPT, receipt));
 });
 
 // Latest known palette. The page HTML already carries the variables for it, but

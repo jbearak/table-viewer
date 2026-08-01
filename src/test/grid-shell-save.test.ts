@@ -335,6 +335,45 @@ describe('GridShell CSV save', () => {
         }]);
     });
 
+    it('leaves document-lifetime flush ownership outside GridShell', async () => {
+        const { post_message } = await render_grid();
+        await edit_cell('draft');
+        const produced = post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'pendingEditsChanged')
+            .at(-1);
+        expect(produced).toMatchObject({
+            editSessionId: 'session-1',
+            edits: { '0:0': { value: 'draft', base: 'base' } },
+        });
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'pendingEditsAcknowledged',
+                editSessionId: 'session-1',
+                sequence: produced.sequence,
+            } }));
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'requestPendingEditsFlush',
+                requestId: 'close-1',
+            } }));
+            await Promise.resolve();
+        });
+
+        const flush = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => (
+                message?.type === 'pendingEditsFlush'
+                && message.requestId === 'close-1'
+            ));
+        expect(flush).toEqual({
+            type: 'pendingEditsFlush',
+            requestId: 'close-1',
+            editSessionId: undefined,
+            highestProducedSequence: 0,
+        });
+    });
+
     it('blocks edits and overlapping saves while a save is in flight', async () => {
         const { post_message, editing_ref } = await render_grid();
 

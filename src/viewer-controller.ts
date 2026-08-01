@@ -110,6 +110,25 @@ export interface ViewerHostPanel extends PanelLike {
     };
 }
 
+export interface ViewerControllerScheduler {
+    setTimeout(callback: () => void, delayMs: number): unknown;
+    clearTimeout(handle: unknown): void;
+}
+
+export interface ViewerControllerOptions {
+    readonly pendingEditFlushTimeoutMs?: number;
+    readonly scheduler?: ViewerControllerScheduler;
+}
+
+export interface ViewerController extends Disposable {
+    /** Refuse every new edit session before a shutdown/activation barrier begins. */
+    stop_edit_admission(): void;
+    /** Fence the current renderer and wait for its exact durable edit acknowledgement. */
+    flush_pending_edits(): Promise<void>;
+    /** Wait for all controller work admitted before the call to settle. */
+    drain(): Promise<void>;
+}
+
 export interface ViewerProfile {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
@@ -173,6 +192,7 @@ const READY_STATE_RETRY_COUNT = 3;
 const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
+const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
 
 /**
  * The one sentence a refused `setRowHeights` says, whichever bound it hit.
@@ -196,6 +216,26 @@ const ROW_HEIGHT_LIMIT_WARNING =
 
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * Log only a bounded machine code from host/storage failures. Native filesystem
+ * errors commonly embed full paths in both `message` and `stack`; forwarding the
+ * raw object would leak those paths (and potentially filenames) into extension
+ * logs. The code is enough to distinguish expected failure classes without
+ * retaining attacker-controlled text.
+ */
+function sanitized_error_code(error: unknown): string {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)
+        ? code
+        : 'UNKNOWN';
+}
+
+function log_sanitized_failure(message: string, error: unknown): void {
+    console.error(message, { code: sanitized_error_code(error) });
 }
 
 type PhysicalAuthorityCommitResult =
@@ -354,9 +394,18 @@ export function attach_viewer(
     state_store: AuthorityFileStateStore,
     profile: ViewerProfile,
     host: ViewerHost,
-): Disposable {
+    options: ViewerControllerOptions = {},
+): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const scheduler: ViewerControllerScheduler = options.scheduler ?? {
+        setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+        clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    const pending_edit_flush_timeout_ms = Math.max(
+        0,
+        options.pendingEditFlushTimeoutMs ?? PENDING_EDIT_FLUSH_TIMEOUT_MS,
+    );
     // VS Code may make panel.webview throw as soon as the panel is disposed.
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
@@ -396,6 +445,8 @@ export function attach_viewer(
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
     let active_save_operation: CsvSaveHostOperation | undefined;
+    let active_save_drain: Promise<void> = Promise.resolve();
+    let disposal_edit_release_drain: Promise<void> = Promise.resolve();
     // Save identities whose edits `persist_accepted_save` wrote into durable state.
     // A failed save only needs a tombstone if it got that far; see the write site in
     // `release_edit_session`. Weak so a retired operation's entry goes with it —
@@ -406,12 +457,29 @@ export function attach_viewer(
         state: 'idle',
     });
     let active_edit_session_request: ReceiverRequest | undefined;
+    let edit_admission_closed = false;
     let active_edit_claim: symbol | undefined;
     let active_save_dialog_request: (ReceiverRequest & {
         readonly editSessionId: string;
     }) | undefined;
     let pending_edit_writes: Promise<void> = Promise.resolve();
+    let pending_edit_sequence_session_id: string | undefined;
+    let highest_pending_edit_sequence = 0;
+    let highest_acknowledged_edit_sequence = 0;
     const pending_edit_admissions = new Set<symbol>();
+    let renderer_ready = false;
+    let renderer_protocol_epoch = 0;
+    let next_pending_edit_flush_request = 0;
+    const pending_edit_flush_waiters = new Map<string, {
+        resolve: (result: { editSessionId?: string; sequence: number }) => void;
+        reject: (error: Error) => void;
+    }>();
+    const pending_edit_ack_waiters = new Set<{
+        editSessionId: string;
+        sequence: number;
+        resolve: () => void;
+        reject: (error: Error) => void;
+    }>();
     let active_edit_release: {
         readonly editSessionId: string;
         readonly release: symbol;
@@ -447,6 +515,40 @@ export function attach_viewer(
     let header_refresh_scheduled = false;
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
+
+    function reject_pending_edit_protocol(error: Error): void {
+        for (const waiter of pending_edit_flush_waiters.values()) waiter.reject(error);
+        pending_edit_flush_waiters.clear();
+        for (const waiter of pending_edit_ack_waiters) waiter.reject(error);
+        pending_edit_ack_waiters.clear();
+    }
+
+    function resolve_pending_edit_ack_waiters(): void {
+        for (const waiter of pending_edit_ack_waiters) {
+            if (
+                pending_edit_sequence_session_id !== waiter.editSessionId
+                || highest_acknowledged_edit_sequence < waiter.sequence
+            ) continue;
+            pending_edit_ack_waiters.delete(waiter);
+            waiter.resolve();
+        }
+    }
+
+    function wait_for_pending_edit_ack(edit_session_id: string, sequence: number): Promise<void> {
+        if (
+            pending_edit_sequence_session_id === edit_session_id
+            && highest_acknowledged_edit_sequence >= sequence
+        ) return Promise.resolve();
+        if (disposed) return Promise.reject(new Error('Viewer controller is disposed.'));
+        return new Promise<void>((resolve, reject) => {
+            pending_edit_ack_waiters.add({
+                editSessionId: edit_session_id,
+                sequence,
+                resolve,
+                reject,
+            });
+        });
+    }
 
     function post_to_receiver(
         message: HostMessage,
@@ -970,7 +1072,8 @@ export function attach_viewer(
                 return 'Finishing edit-session work; try again in a moment.';
         }
         const exhaustive: never = phase;
-        console.error('Unhandled CSV edit phase in transform admission', exhaustive);
+        void exhaustive;
+        console.error('Unhandled CSV edit phase in transform admission');
         return 'Finishing edit-session work; try again in a moment.';
     }
 
@@ -1102,7 +1205,7 @@ export function attach_viewer(
             try {
                 subscriber(snapshot);
             } catch (error) {
-                console.error('Failed to update CSV edit availability', error);
+                log_sanitized_failure('Failed to update CSV edit availability', error);
             }
         }
     }
@@ -1308,7 +1411,7 @@ export function attach_viewer(
             try {
                 await admitted_writes;
             } catch (error) {
-                console.error('Failed to settle admitted CSV edits before release', error);
+                log_sanitized_failure('Failed to settle admitted CSV edits before release', error);
             } finally {
                 if (
                     file_edit_state?.phase.type === 'releasing'
@@ -1459,7 +1562,7 @@ export function attach_viewer(
                 }
                 if (committed) notify_edit_state(committed);
             } catch (error) {
-                console.error('Failed to clear retired CSV save state', error);
+                log_sanitized_failure('Failed to clear retired CSV save state', error);
             } finally {
                 if (file_edit_state?.failedSaveCleanup === cleanup) {
                     file_edit_state.failedSaveCleanup = undefined;
@@ -1956,7 +2059,7 @@ export function attach_viewer(
             return (await cleanup_invalid_persisted_transform(error, is_current))
                 !== 'failed';
         } catch (cleanup_error) {
-            console.error('Failed to clear an invalid saved table transform', cleanup_error);
+            log_sanitized_failure('Failed to clear an invalid saved table transform', cleanup_error);
             return false;
         }
     }
@@ -2565,7 +2668,7 @@ export function attach_viewer(
                     }
                     schedule_header_refresh();
                 } catch (error) {
-                    console.error('Failed to apply an Excel header receipt', error);
+                    log_sanitized_failure('Failed to apply an Excel header receipt', error);
                     if (is_origin) {
                         session.retain_command_result({
                             type: 'excelFirstRowHeader',
@@ -2661,7 +2764,7 @@ export function attach_viewer(
                     if (!disposed) update_session_state_material(snapshot, false);
                     return true;
                 } catch (error) {
-                    console.error('Failed to recover CSV pending-edit cleanup', error);
+                    log_sanitized_failure('Failed to recover CSV pending-edit cleanup', error);
                     return false;
                 }
             })();
@@ -2748,7 +2851,7 @@ export function attach_viewer(
                 error instanceof Error ? error.message : String(error));
             return;
         }
-        console.error('Failed to reload table viewer data', error);
+        log_sanitized_failure('Failed to reload table viewer data', error);
         const message = `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
         if (post_save) {
             host.ui.show_warning(
@@ -3049,7 +3152,7 @@ export function attach_viewer(
                     || !session.ready_epoch_is_current(receiver_epoch)
                 ) return undefined;
                 if (attempt === READY_STATE_RETRY_COUNT) {
-                    console.error(
+                    log_sanitized_failure(
                         'Failed to refresh table viewer state before ready; using retained state',
                         error,
                     );
@@ -3409,7 +3512,7 @@ export function attach_viewer(
                 // not a save bug: refuse rather than clobbering blind. The user
                 // sees the external-change warning, so log the real cause to keep
                 // a genuine filesystem fault (EACCES, EBUSY, quota) diagnosable.
-                console.error('Pre-write stat failed before saving', error);
+                log_sanitized_failure('Pre-write stat failed before saving', error);
                 // Check currency first, matching the mismatch path below: a save
                 // already superseded during the stat must not emit a warning.
                 if (!save_operation_is_current(operation)) return;
@@ -3517,7 +3620,7 @@ export function attach_viewer(
 
         void refresh_subscription.request('postSave').catch((error) => {
             if (disposed) return;
-            console.error('Post-save refresh request failed (file was written)', error);
+            log_sanitized_failure('Post-save refresh request failed (file was written)', error);
             show_owner_warning(
                 'The file was saved, but Table Viewer could not refresh the table view.',
             );
@@ -3529,7 +3632,7 @@ export function attach_viewer(
         }).catch((error) => {
             finish_edit_cleanup(cleanup_operation, false);
             if (disposed) return;
-            console.error('CSV save succeeded but pending-edit cleanup failed', error);
+            log_sanitized_failure('CSV save succeeded but pending-edit cleanup failed', error);
             show_owner_warning(
                 'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.',
             );
@@ -3627,7 +3730,7 @@ export function attach_viewer(
             try {
                 await reconcile_transform_terminal(message, transform_authority);
             } catch (error) {
-                console.error(
+                log_sanitized_failure(
                     'Failed to reconcile durable table transforms after a terminal operation',
                     error,
                 );
@@ -3660,6 +3763,13 @@ export function attach_viewer(
         }
         switch (msg.type) {
             case 'ready': {
+                if (renderer_ready) {
+                    reject_pending_edit_protocol(new Error(
+                        'Viewer renderer reloaded before the pending-edit flush completed.',
+                    ));
+                }
+                renderer_ready = true;
+                renderer_protocol_epoch += 1;
                 const begun = session.begin_ready();
                 // This must happen before the first await: an older receiver's
                 // compute or CAS continuation cannot overtake the new snapshot.
@@ -3667,6 +3777,9 @@ export function attach_viewer(
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
                 active_save_dialog_request = undefined;
+                pending_edit_sequence_session_id = undefined;
+                highest_pending_edit_sequence = 0;
+                highest_acknowledged_edit_sequence = 0;
                 // The inbound ready message guarantees the receiver is installed;
                 // replay without delaying the existing ready-state concurrency.
                 void post_to_receiver({
@@ -3795,7 +3908,7 @@ export function attach_viewer(
                                         cleanup_is_current,
                                     );
                                 } catch (cleanup_error) {
-                                    console.error(
+                                    log_sanitized_failure(
                                         'Failed to clear an invalid saved table transform',
                                         cleanup_error,
                                     );
@@ -3822,7 +3935,7 @@ export function attach_viewer(
                                     continue;
                                 }
                             }
-                            console.error(
+                            log_sanitized_failure(
                                 'Failed to reconcile table transforms before ready; using retained view',
                                 error,
                             );
@@ -3832,7 +3945,7 @@ export function attach_viewer(
                                     begun.receiverEpoch,
                                 );
                             } catch (confirmation_error) {
-                                console.error(
+                                log_sanitized_failure(
                                     'Failed to confirm table state after ready reconciliation error',
                                     confirmation_error,
                                 );
@@ -3878,7 +3991,7 @@ export function attach_viewer(
                                 && session.ready_epoch_is_current(begun.receiverEpoch)
                             ) update_session_state_material(confirmed, false);
                         } catch (error) {
-                            console.error(
+                            log_sanitized_failure(
                                 'Failed to confirm the latest table state after ready rebases',
                                 error,
                             );
@@ -4199,6 +4312,14 @@ export function attach_viewer(
                 return;
             }
             case 'requestEditSession': {
+                if (edit_admission_closed) {
+                    void post_to_receiver({
+                        type: 'editSessionResult',
+                        requestId: msg.requestId,
+                        granted: false,
+                    });
+                    return;
+                }
                 cancel_edit_claim(active_edit_claim);
                 const request: ReceiverRequest = {
                     requestId: msg.requestId,
@@ -4206,7 +4327,8 @@ export function attach_viewer(
                 };
                 active_edit_session_request = request;
                 const request_is_current = () => (
-                    active_edit_session_request === request
+                    !edit_admission_closed
+                    && active_edit_session_request === request
                     && receiver_request_is_current(request)
                 );
                 const recovery_waiter = edit_phase().type === 'uncertain'
@@ -4257,7 +4379,7 @@ export function attach_viewer(
                         : undefined;
                 } catch (error) {
                     cancel_edit_claim(claim);
-                    console.error('Failed to read CSV edit-session state', error);
+                    log_sanitized_failure('Failed to read CSV edit-session state', error);
                     if (!request_is_current()) return;
                     active_edit_session_request = undefined;
                     void post_to_receiver({
@@ -4290,6 +4412,13 @@ export function attach_viewer(
                     && owner_still_available
                     && try_claim_edit_session(true, claim);
                 if (!granted) cancel_edit_claim(claim);
+                if (granted && !already_owned) {
+                    // Renderer edit sequences are scoped to one durable edit session.
+                    // A newly acquired session starts from one even when it reuses the
+                    // same receiver epoch after a save/release cycle.
+                    highest_pending_edit_sequence = 0;
+                    highest_acknowledged_edit_sequence = 0;
+                }
                 if (edit_state) update_session_state_material(edit_state);
                 // The reason half of the same question `can_edit` asked: an installed
                 // sort or filter is not a denial, because editing under one is
@@ -4765,7 +4894,7 @@ export function attach_viewer(
                         if (!disposed) update_session_state_material(snapshot, false);
                     } catch (error) {
                         finish_edit_cleanup(operation, false);
-                        console.error('Failed to clear discarded CSV edits', error);
+                        log_sanitized_failure('Failed to clear discarded CSV edits', error);
                         show_owner_warning(
                             'Table Viewer could not clear the discarded edit state. Editing remains disabled for this file.');
                     }
@@ -4775,11 +4904,44 @@ export function attach_viewer(
                 host.ui.show_warning(msg.message);
                 return;
             case 'saveCsv':
-                if (profile.editing) await handle_save(msg.operation);
+                if (profile.editing) {
+                    const save = handle_save(msg.operation);
+                    active_save_drain = save;
+                    try {
+                        await save;
+                    } finally {
+                        if (active_save_drain === save) {
+                            active_save_drain = Promise.resolve();
+                        }
+                    }
+                }
                 return;
             case 'pendingEditsChanged': {
                 if (!profile.editing || active_save_operation) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
+                if (pending_edit_sequence_session_id !== msg.editSessionId) {
+                    pending_edit_sequence_session_id = msg.editSessionId;
+                    highest_pending_edit_sequence = 0;
+                    highest_acknowledged_edit_sequence = 0;
+                }
+                // Older in-process tests and pre-upgrade renderers may omit the
+                // sequence. Admit those through the same serialized legacy path while
+                // every current renderer supplies an explicit webview-monotonic value.
+                const sequence = Number.isSafeInteger(msg.sequence) && msg.sequence > 0
+                    ? msg.sequence
+                    : highest_pending_edit_sequence + 1;
+                if (sequence <= highest_pending_edit_sequence) {
+                    if (sequence <= highest_acknowledged_edit_sequence) {
+                        await post_to_receiver({
+                            type: 'pendingEditsAcknowledged',
+                            editSessionId: msg.editSessionId,
+                            sequence,
+                        });
+                    }
+                    return;
+                }
+                highest_pending_edit_sequence = sequence;
+                const receiver_epoch = session.current_receiver_epoch;
                 const edit_session_id = msg.editSessionId;
                 const edits = msg.edits ? structuredClone(msg.edits) : null;
                 const admission = Symbol(edit_session_id);
@@ -4871,12 +5033,33 @@ export function attach_viewer(
                         }
                         notify_edit_state(result.snapshot);
                         delete_shared_edit_state_if_unused();
+                        highest_acknowledged_edit_sequence = Math.max(
+                            highest_acknowledged_edit_sequence,
+                            sequence,
+                        );
+                        await post_to_receiver({
+                            type: 'pendingEditsAcknowledged',
+                            editSessionId: msg.editSessionId,
+                            sequence,
+                        }, receiver_epoch);
+                        resolve_pending_edit_ack_waiters();
                     }
                 }).finally(() => {
                     pending_edit_admissions.delete(admission);
                 });
                 pending_edit_writes = write;
                 await write;
+                return;
+            }
+            case 'pendingEditsFlush': {
+                const waiter = pending_edit_flush_waiters.get(msg.requestId);
+                if (!waiter || !Number.isSafeInteger(msg.highestProducedSequence)) return;
+                if (msg.highestProducedSequence < 0) return;
+                pending_edit_flush_waiters.delete(msg.requestId);
+                waiter.resolve({
+                    editSessionId: msg.editSessionId,
+                    sequence: msg.highestProducedSequence,
+                });
                 return;
             }
             case 'showSaveDialog': {
@@ -4915,10 +5098,108 @@ export function attach_viewer(
         return abort_setup(error);
     }
 
+    function stop_edit_admission(): void {
+        if (edit_admission_closed) return;
+        edit_admission_closed = true;
+        active_edit_session_request = undefined;
+        cancel_edit_claim(active_edit_claim);
+    }
+
+    async function flush_pending_edits(): Promise<void> {
+        stop_edit_admission();
+        if (!profile.editing || !renderer_ready) {
+            await drain_controller();
+            return;
+        }
+
+        const protocol_epoch = renderer_protocol_epoch;
+        const request_id = `vscode-close:${++next_pending_edit_flush_request}`;
+        const handshake = (async () => {
+            const response = new Promise<{ editSessionId?: string; sequence: number }>(
+                (resolve, reject) => {
+                    pending_edit_flush_waiters.set(request_id, { resolve, reject });
+                },
+            );
+            if (!await post_to_receiver({
+                type: 'requestPendingEditsFlush',
+                requestId: request_id,
+            })) {
+                const error = new Error('Viewer renderer is unavailable for pending-edit flush.');
+                pending_edit_flush_waiters.delete(request_id);
+                reject_pending_edit_protocol(error);
+                throw error;
+            }
+
+            const flushed = await response;
+            await drain_controller();
+            if (renderer_protocol_epoch !== protocol_epoch) {
+                throw new Error('Viewer renderer reloaded during the pending-edit flush.');
+            }
+            if (flushed.sequence > 0) {
+                if (!flushed.editSessionId) {
+                    throw new Error('Viewer renderer reported edits without an edit session.');
+                }
+                await wait_for_pending_edit_ack(flushed.editSessionId, flushed.sequence);
+            }
+            // Work admitted by the flush and acknowledgement delivery is downstream
+            // of the first drain, so close only after a second stable drain.
+            await drain_controller();
+        })();
+
+        let timeout_handle: unknown = undefined;
+        const timeout = new Promise<never>((_resolve, reject) => {
+            timeout_handle = scheduler.setTimeout(() => {
+                const error = new Error(
+                    'Viewer renderer did not complete the pending-edit flush in time.',
+                );
+                pending_edit_flush_waiters.delete(request_id);
+                reject_pending_edit_protocol(error);
+                reject(error);
+            }, pending_edit_flush_timeout_ms);
+        });
+        try {
+            await Promise.race([handshake, timeout]);
+        } finally {
+            scheduler.clearTimeout(timeout_handle);
+        }
+    }
+
+    async function drain_controller(): Promise<void> {
+        for (;;) {
+            const edit_tail = pending_edit_writes;
+            const save_tail = active_save_drain;
+            const disposal_release_tail = disposal_edit_release_drain;
+            const layout_tail = layout_write_tail;
+            const transform_tails = [...transform_commit_barriers]
+                .map((barrier) => barrier.completion);
+            await Promise.all([
+                edit_tail,
+                save_tail,
+                disposal_release_tail,
+                layout_tail,
+                ...transform_tails,
+            ]);
+            if (
+                edit_tail === pending_edit_writes
+                && save_tail === active_save_drain
+                && disposal_release_tail === disposal_edit_release_drain
+                && layout_tail === layout_write_tail
+                && transform_commit_barriers.size === 0
+            ) return;
+        }
+    }
+
     return {
+        stop_edit_admission,
+        flush_pending_edits,
+        drain: drain_controller,
         dispose() {
             if (disposed) return;
             disposed = true;
+            renderer_ready = false;
+            reject_pending_edit_protocol(new Error(
+                'Viewer controller was disposed before the pending-edit flush completed.',
+            ));
             load_seq++;
             reset_reload_retry();
             cancel_refresh_retry_wait();
@@ -4936,7 +5217,9 @@ export function attach_viewer(
                 }
             };
             cleanup(() => cancel_edit_claim(active_edit_claim));
-            cleanup(() => { void release_edit_session(); });
+            disposal_edit_release_drain = pending_edit_writes
+                .catch(() => {})
+                .then(async () => { await release_edit_session(); });
             cleanup(() => {
                 file_edit_state?.activeTransformPanels.delete(transform_panel_token);
             });

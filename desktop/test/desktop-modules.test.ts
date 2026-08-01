@@ -229,17 +229,20 @@ describe('unsaved-edit indicator', () => {
             type: 'pendingEditsChanged',
             edits: { '0:0': { value: 'draft', base: 'a' } },
             editSessionId: 's',
+            sequence: 1,
         })).toBe(true);
         // Saving posts null; an empty map means the same thing.
         expect(dirty_from_webview_message({
             type: 'pendingEditsChanged',
             edits: null,
             editSessionId: 's',
+            sequence: 2,
         })).toBe(false);
         expect(dirty_from_webview_message({
             type: 'pendingEditsChanged',
             edits: {},
             editSessionId: 's',
+            sequence: 3,
         })).toBe(false);
     });
 
@@ -396,17 +399,58 @@ describe('window geometry', () => {
 });
 
 describe('viewer-panel adapter', () => {
+    function controlled_deadlines() {
+        const scheduled: Array<{ active: boolean; callback: () => void; delayMs: number }> = [];
+        const schedule = vi.fn((callback: () => void, delayMs: number) => {
+            const deadline = { active: true, callback, delayMs };
+            scheduled.push(deadline);
+            return () => { deadline.active = false; };
+        });
+        return {
+            schedule,
+            expire_next() {
+                const deadline = scheduled.find((candidate) => candidate.active);
+                if (!deadline) throw new Error('missing active deadline');
+                deadline.active = false;
+                deadline.callback();
+            },
+            active_count: () => scheduled.filter((deadline) => deadline.active).length,
+        };
+    }
+
     function fake_transport() {
         const sent: HostMessage[] = [];
         const listeners = new Set<(msg: WebviewMessage) => void>();
+        const generation_listeners = new Set<(error: Error) => void>();
+        const loss_listeners = new Set<(error: Error, retryable: boolean) => void>();
+        const responsive_listeners = new Set<() => void>();
+        const receipt_listeners = new Set<(receipt: import('../shared/ipc').PendingEditAcknowledgementReceipt) => void>();
+        const receipts: import('../shared/ipc').PendingEditAcknowledgementReceipt[] = [];
         const transport: ViewerPanelTransport = {
-            send(message) {
+            send(message, _generation, receipt) {
                 sent.push(message);
+                if (receipt) receipts.push(receipt);
                 return true;
             },
             on_message(listener) {
                 listeners.add(listener);
                 return () => listeners.delete(listener);
+            },
+            on_renderer_generation_changed(listener) {
+                generation_listeners.add(listener);
+                return () => generation_listeners.delete(listener);
+            },
+            on_renderer_unavailable(listener) {
+                loss_listeners.add(listener);
+                return () => loss_listeners.delete(listener);
+            },
+            on_renderer_responsive(listener) {
+                responsive_listeners.add(listener);
+                return () => responsive_listeners.delete(listener);
+            },
+            on_pending_edit_ack_receipt(listener) {
+                receipt_listeners.add(listener);
+                return () => receipt_listeners.delete(listener);
             },
         };
         return {
@@ -415,7 +459,33 @@ describe('viewer-panel adapter', () => {
             emit(msg: WebviewMessage) {
                 for (const listener of [...listeners]) listener(msg);
             },
-            listener_count: () => listeners.size,
+            navigate_renderer(error = new Error('renderer replaced')) {
+                for (const listener of [...generation_listeners]) listener(error);
+            },
+            lose_renderer(error = new Error('renderer lost'), retryable = false) {
+                for (const listener of [...loss_listeners]) listener(error, retryable);
+            },
+            restore_renderer() {
+                for (const listener of [...responsive_listeners]) listener();
+            },
+            last_receipt() {
+                const receipt = receipts.at(-1);
+                if (!receipt) throw new Error('missing acknowledgement receipt request');
+                return receipt;
+            },
+            emit_receipt(receipt: import('../shared/ipc').PendingEditAcknowledgementReceipt) {
+                for (const listener of [...receipt_listeners]) listener(receipt);
+            },
+            acknowledge_last_delivery() {
+                const receipt = receipts.at(-1);
+                if (!receipt) throw new Error('missing acknowledgement receipt request');
+                for (const listener of [...receipt_listeners]) listener(receipt);
+            },
+            listener_count: () => listeners.size
+                + generation_listeners.size
+                + loss_listeners.size
+                + responsive_listeners.size
+                + receipt_listeners.size,
         };
     }
 
@@ -442,7 +512,371 @@ describe('viewer-panel adapter', () => {
         subscription.dispose(); // idempotent
         emit({ type: 'ready' });
         expect(received).toHaveLength(1);
-        expect(listener_count()).toBe(0);
+        // The panel keeps its private message and renderer lifecycle listeners.
+        expect(listener_count()).toBe(5);
+    });
+
+    it('treats an immediate pre-ready close as sequence zero', async () => {
+        const { transport, sent } = fake_transport();
+        const panel = create_viewer_panel(transport);
+
+        await expect(panel.flush_pending_edits()).resolves.toEqual({ sequence: 0, rendererGeneration: 0 });
+        expect(sent).toEqual([]);
+    });
+
+    it('rejects an explicit renderer flush failure and leaves a retry clean', async () => {
+        const { transport, emit, sent } = fake_transport();
+        const deadlines = controlled_deadlines();
+        const panel = create_viewer_panel(transport, deadlines.schedule);
+        emit({ type: 'ready' });
+
+        const failed = panel.flush_pending_edits();
+        const failed_request = sent.at(-1);
+        if (failed_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing failed flush request');
+        }
+        emit({ type: 'pendingEditsFlushFailed', requestId: failed_request.requestId });
+        await expect(failed).rejects.toThrow('could not flush pending edits');
+        expect(deadlines.active_count()).toBe(0);
+
+        const retried = panel.flush_pending_edits();
+        const retry_request = sent.at(-1);
+        if (retry_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing retry flush request');
+        }
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: retry_request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(retried).resolves.toMatchObject({ sequence: 0 });
+        expect(deadlines.active_count()).toBe(0);
+    });
+
+    it('rejects a positive flush sequence without a session', async () => {
+        const { transport, emit, sent } = fake_transport();
+        const deadlines = controlled_deadlines();
+        const panel = create_viewer_panel(transport, deadlines.schedule);
+        emit({ type: 'ready' });
+
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 1,
+        });
+
+        await expect(flush).rejects.toThrow('malformed pending-edit flush');
+        expect(deadlines.active_count()).toBe(0);
+    });
+
+    it('bounds a flush wait and permits a fresh retry', async () => {
+        const { transport, emit, sent } = fake_transport();
+        const deadlines = controlled_deadlines();
+        const panel = create_viewer_panel(transport, deadlines.schedule);
+        emit({ type: 'ready' });
+
+        const timed_out = panel.flush_pending_edits();
+        deadlines.expire_next();
+        await expect(timed_out).rejects.toThrow('Timed out waiting');
+
+        const retried = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing retry flush');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(retried).resolves.toMatchObject({ sequence: 0 });
+        expect(deadlines.active_count()).toBe(0);
+    });
+
+    it('waits for the exact session acknowledgement reported by renderer flush', async () => {
+        const { transport, emit, sent, acknowledge_last_delivery } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        expect(request?.type).toBe('requestPendingEditsFlush');
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:1',
+            highestProducedSequence: 2,
+        });
+        const result = await flush;
+        const acknowledged = panel.wait_for_pending_edit_ack(
+            result.rendererGeneration,
+            result.editSessionId,
+            result.sequence,
+        );
+        let settled = false;
+        void acknowledged.then(() => { settled = true; });
+
+        panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:1',
+            sequence: 1,
+        });
+        acknowledge_last_delivery();
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:1',
+            sequence: 2,
+        });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+        acknowledge_last_delivery();
+        await acknowledged;
+        expect(settled).toBe(true);
+    });
+
+    it('accepts only the exact generation, session, and sequence receipt', async () => {
+        const { transport, emit, sent, last_receipt, emit_receipt } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:receipt-scope',
+            highestProducedSequence: 7,
+        });
+        const result = await flush;
+        const acknowledged = panel.wait_for_pending_edit_ack(
+            result.rendererGeneration,
+            result.editSessionId,
+            result.sequence,
+        );
+        let settled = false;
+        void acknowledged.then(() => { settled = true; });
+        panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:receipt-scope',
+            sequence: 7,
+        });
+        const receipt = last_receipt();
+
+        emit_receipt({ ...receipt, rendererGeneration: receipt.rendererGeneration + 1 });
+        emit_receipt({ ...receipt, editSessionId: 'edit:other' });
+        emit_receipt({ ...receipt, sequence: receipt.sequence + 1 });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        emit_receipt(receipt);
+        await acknowledged;
+        expect(settled).toBe(true);
+    });
+
+    it('bounds acknowledgement receipt waits, cleans stale receipts, and permits retry', async () => {
+        const { transport, emit, sent, last_receipt, emit_receipt } = fake_transport();
+        const deadlines = controlled_deadlines();
+        const panel = create_viewer_panel(transport, deadlines.schedule);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:deadline',
+            highestProducedSequence: 3,
+        });
+        const result = await flush;
+
+        const timed_out = panel.wait_for_pending_edit_ack(
+            result.rendererGeneration,
+            result.editSessionId,
+            result.sequence,
+        );
+        panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:deadline',
+            sequence: 3,
+        });
+        const stale_receipt = last_receipt();
+        deadlines.expire_next();
+        await expect(timed_out).rejects.toThrow('Timed out waiting');
+
+        const retried = panel.wait_for_pending_edit_ack(
+            result.rendererGeneration,
+            result.editSessionId,
+            result.sequence,
+        );
+        let settled = false;
+        void retried.then(() => { settled = true; });
+        emit_receipt(stale_receipt);
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:deadline',
+            sequence: 3,
+        });
+        emit_receipt(last_receipt());
+        await retried;
+        expect(deadlines.active_count()).toBe(0);
+    });
+
+    it('rejects old-generation waiters after a successful main-frame navigation', async () => {
+        const { transport, emit, sent, navigate_renderer } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+
+        const old_flush = panel.flush_pending_edits();
+        navigate_renderer(new Error('successful reload replaced renderer'));
+        await expect(old_flush).rejects.toThrow('successful reload replaced renderer');
+        // The replacement renderer has not become ready and cannot have produced edits.
+        await expect(panel.flush_pending_edits()).resolves.toEqual({ sequence: 0, rendererGeneration: 1 });
+
+        emit({ type: 'ready' });
+        const next_flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:next',
+            highestProducedSequence: 1,
+        });
+        await expect(next_flush).resolves.toEqual({
+            editSessionId: 'edit:next',
+            sequence: 1,
+            rendererGeneration: 1,
+        });
+    });
+
+    it('rejects an old-generation acknowledgement waiter after successful navigation', async () => {
+        const { transport, emit, sent, navigate_renderer } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:old',
+            highestProducedSequence: 1,
+        });
+        await flush;
+
+        const acknowledged = panel.wait_for_pending_edit_ack(0, 'edit:old', 1);
+        navigate_renderer(new Error('successful navigation replaced renderer'));
+
+        await expect(acknowledged).rejects.toThrow('successful navigation replaced renderer');
+    });
+
+    it('rejects obsolete waiters when ready repeats for a new renderer generation', async () => {
+        const { transport, emit, sent } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const old_flush = panel.flush_pending_edits();
+        const old_request = sent.at(-1);
+        if (old_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing old flush request');
+        }
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: old_request.requestId,
+            editSessionId: 'edit:repeated-ready',
+            highestProducedSequence: 2,
+        });
+        const old_result = await old_flush;
+        const old_ack = panel.wait_for_pending_edit_ack(
+            old_result.rendererGeneration,
+            old_result.editSessionId,
+            old_result.sequence,
+        );
+
+        emit({ type: 'ready' });
+
+        await expect(old_ack).rejects.toThrow('new protocol generation');
+        await expect(panel.wait_for_pending_edit_ack(
+            old_result.rendererGeneration,
+            old_result.editSessionId,
+            old_result.sequence,
+        )).rejects.toThrow('generation changed');
+        const next_flush = panel.flush_pending_edits();
+        const next_request = sent.at(-1);
+        if (next_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing next flush request');
+        }
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: next_request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(next_flush).resolves.toMatchObject({ rendererGeneration: 1 });
+    });
+
+    it('rejects a flush waiter when a ready renderer is lost', async () => {
+        const { transport, emit, lose_renderer } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+
+        const flush = panel.flush_pending_edits();
+        lose_renderer(new Error('navigation failed'));
+
+        await expect(flush).rejects.toThrow('navigation failed');
+        await expect(panel.flush_pending_edits()).rejects.toThrow('navigation failed');
+    });
+
+    it('allows a fresh flush after an unresponsive renderer becomes responsive', async () => {
+        const { transport, emit, sent, lose_renderer, restore_renderer } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const interrupted = panel.flush_pending_edits();
+
+        lose_renderer(new Error('renderer unresponsive'), true);
+        await expect(interrupted).rejects.toThrow('renderer unresponsive');
+        await expect(panel.flush_pending_edits()).rejects.toThrow('renderer unresponsive');
+
+        restore_renderer();
+        const retried = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing retry flush');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(retried).resolves.toMatchObject({
+            sequence: 0,
+            rendererGeneration: 0,
+        });
+    });
+
+    it('rejects an acknowledgement waiter when the renderer is lost', async () => {
+        const { transport, emit, sent, lose_renderer } = fake_transport();
+        const panel = create_viewer_panel(transport);
+        emit({ type: 'ready' });
+        const flush = panel.flush_pending_edits();
+        const request = sent.at(-1);
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:1',
+            highestProducedSequence: 1,
+        });
+        await flush;
+
+        const acknowledged = panel.wait_for_pending_edit_ack(0, 'edit:1', 1);
+        lose_renderer(new Error('renderer terminated'));
+
+        await expect(acknowledged).rejects.toThrow('renderer terminated');
     });
 
     it('panel dispose drops messages and unsubscribes everything', () => {
@@ -450,7 +884,7 @@ describe('viewer-panel adapter', () => {
         const panel = create_viewer_panel(transport);
         panel.webview.onDidReceiveMessage(() => {});
         panel.webview.onDidReceiveMessage(() => {});
-        expect(listener_count()).toBe(2);
+        expect(listener_count()).toBe(7);
 
         panel.dispose();
         expect(listener_count()).toBe(0);

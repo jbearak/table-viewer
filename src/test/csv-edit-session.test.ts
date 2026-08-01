@@ -378,6 +378,184 @@ beforeEach(() => {
 });
 
 describe('CSV edit sessions', () => {
+    it('flushes only after the exact renderer sequence reaches the current backend', async () => {
+        const versioned = state_store();
+        const write_started = deferred();
+        const write_gate = deferred();
+        let gate_pending_edits = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (gate_pending_edits && next.pendingEdits) {
+                    write_started.resolve();
+                    await write_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/exact-flush.csv'),
+            with_in_memory_authority_transactions(store),
+            csv_table_profile(),
+            fake_viewer_host,
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit:flush' });
+        const granted = latest_edit_session_message(panel);
+        expect(granted).toMatchObject({ granted: true, editSessionId: expect.any(String) });
+
+        gate_pending_edits = true;
+        const pending_write = panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: granted!.editSessionId!,
+            sequence: 1,
+            edits: { '0:0': { value: 'draft', base: 'a' } },
+        });
+        await write_started.promise;
+
+        let flush_settled = false;
+        const flush = controller.flush_pending_edits().then(() => { flush_settled = true; });
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )));
+        const request = panel.__messages.find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )) as { requestId: string };
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: granted!.editSessionId!,
+            highestProducedSequence: 1,
+        });
+        await Promise.resolve();
+        expect(flush_settled).toBe(false);
+
+        write_gate.resolve();
+        await pending_write;
+        await flush;
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: granted!.editSessionId!,
+            sequence: 1,
+        });
+        controller.dispose();
+        await controller.drain();
+    });
+
+    it('bounds an unresponsive renderer flush and permits a later retry', async () => {
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const timers = new Map<symbol, () => void>();
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/bounded-flush.csv'),
+            with_in_memory_authority_transactions(state_store().store),
+            csv_table_profile(),
+            fake_viewer_host,
+            {
+                pendingEditFlushTimeoutMs: 25,
+                scheduler: {
+                    setTimeout(callback) {
+                        const handle = Symbol('timer');
+                        timers.set(handle, callback);
+                        return handle;
+                    },
+                    clearTimeout(handle) {
+                        timers.delete(handle as symbol);
+                    },
+                },
+            },
+        );
+        await panel.__receive({ type: 'ready' });
+
+        const first = controller.flush_pending_edits();
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )));
+        expect(timers.size).toBe(1);
+        [...timers.values()][0]();
+        await expect(first).rejects.toThrow('did not complete');
+
+        const request_count = panel.__messages.filter((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )).length;
+        const retry = controller.flush_pending_edits();
+        await wait_for_observable(() => panel.__messages.filter((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )).length > request_count);
+        const retry_request = panel.__messages.filter((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )).at(-1) as { requestId: string };
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: retry_request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(retry).resolves.toBeUndefined();
+        expect(timers.size).toBe(0);
+
+        controller.dispose();
+        await controller.drain();
+    });
+
+    it('drains an admitted overlay projection before disposal releases the session', async () => {
+        const versioned = state_store();
+        const write_started = deferred();
+        const write_gate = deferred();
+        let gate_pending_edits = false;
+        const store: FileStateStore = {
+            ...versioned.store,
+            async compare_and_set(path, expected, next, validate) {
+                if (gate_pending_edits && next.pendingEdits) {
+                    write_started.resolve();
+                    await write_gate.promise;
+                }
+                return versioned.store.compare_and_set(path, expected, next, validate);
+            },
+        };
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/dispose-overlay.csv'),
+            with_in_memory_authority_transactions(store),
+            csv_table_profile(),
+            fake_viewer_host,
+        );
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit:dispose' });
+        const granted = latest_edit_session_message(panel);
+        expect(granted).toMatchObject({ granted: true, editSessionId: expect.any(String) });
+
+        gate_pending_edits = true;
+        const pending_write = panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: granted!.editSessionId!,
+            sequence: 1,
+            edits: { '0:0': { value: 'last keystroke', base: 'a' } },
+        });
+        await write_started.promise;
+
+        controller.dispose();
+        let drained = false;
+        const drain = controller.drain().then(() => { drained = true; });
+        await Promise.resolve();
+        expect(drained).toBe(false);
+
+        write_gate.resolve();
+        await pending_write;
+        await drain;
+        expect(versioned.get_state('/tmp/dispose-overlay.csv').pendingEdits).toEqual({
+            '0:0': { value: 'last keystroke', base: 'a' },
+        });
+    });
+
     it('invalidates old receiver retries before awaiting ready-state refresh', async () => {
         vi.useFakeTimers();
         const versioned = state_store();
@@ -1047,13 +1225,19 @@ describe('CSV edit sessions', () => {
                 ...versioned.store,
                 async read(path) {
                     if (reject_state_io && failure === 'read') {
-                        throw new Error('edit state read rejected');
+                        throw Object.assign(
+                            new Error(`edit state read rejected at ${path}`),
+                            { code: 'EACCES' },
+                        );
                     }
                     return versioned.store.read(path);
                 },
                 async touch(path) {
                     if (reject_state_io && failure === 'touch') {
-                        throw new Error('edit state touch rejected');
+                        throw Object.assign(
+                            new Error(`edit state touch rejected at ${path}`),
+                            { code: 'EACCES' },
+                        );
                     }
                     return versioned.store.touch(path);
                 },
@@ -1082,8 +1266,10 @@ describe('CSV edit sessions', () => {
             });
             expect(error).toHaveBeenCalledWith(
                 'Failed to read CSV edit-session state',
-                expect.any(Error),
+                { code: 'EACCES' },
             );
+            expect(JSON.stringify(error.mock.calls)).not.toContain(file_path);
+            expect(JSON.stringify(error.mock.calls)).not.toContain('edit state');
 
             reject_state_io = false;
             await sibling.__receive({
@@ -1226,9 +1412,15 @@ describe('CSV edit sessions', () => {
         const pending = owner.__receive({
             type: 'pendingEditsChanged',
             editSessionId: session_id,
+            sequence: 7,
             edits: { '0:0': { value: 'latest', base: 'a' } },
         });
         await compare_started.promise;
+        expect(owner.__messages.some((message: any) => (
+            message?.type === 'pendingEditsAcknowledged'
+            && message.editSessionId === session_id
+            && message.sequence === 7
+        ))).toBe(false);
         const release = owner.__receive({
             type: 'releaseEditSession',
             editSessionId: session_id,
@@ -1238,6 +1430,11 @@ describe('CSV edit sessions', () => {
 
         compare_gate.resolve();
         await Promise.all([pending, release]);
+        expect(owner.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session_id,
+            sequence: 7,
+        });
         expect(versioned.get_state(file_path).pendingEdits).toEqual({
             '0:0': { value: 'latest', base: 'a' },
         });
@@ -1414,7 +1611,7 @@ describe('CSV edit sessions', () => {
         await expect(release).resolves.toBeUndefined();
         expect(error).toHaveBeenCalledWith(
             'Failed to settle admitted CSV edits before release',
-            expect.any(Error),
+            { code: 'UNKNOWN' },
         );
 
         await sibling.__receive({ type: 'requestEditSession', requestId: 'after-rejection' });
@@ -2476,7 +2673,7 @@ describe('CSV edit sessions', () => {
         await flush_promises();
         expect(error).toHaveBeenCalledWith(
             'Failed to clear retired CSV save state',
-            expect.any(Error),
+            { code: 'UNKNOWN' },
         );
 
         await second.__receive({ type: 'requestEditSession', requestId: 'second' });
@@ -4345,7 +4542,7 @@ describe('CSV edit sessions', () => {
         expect(latest_snapshot(panel).state.transforms).toEqual([invalid]);
         expect(error).toHaveBeenCalledWith(
             'Failed to clear an invalid saved table transform',
-            expect.objectContaining({ message: 'transient ready cleanup persistence failure' }),
+            { code: 'UNKNOWN' },
         );
 
         await panel.__receive({ type: 'ready' });
@@ -4398,7 +4595,7 @@ describe('CSV edit sessions', () => {
         expect(versioned.revision(file_path)).toBe(0);
         expect(error).toHaveBeenCalledWith(
             expect.stringContaining('Failed to reconcile table transforms'),
-            expect.any(Error),
+            { code: 'UNKNOWN' },
         );
     });
 
@@ -4428,7 +4625,7 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path).transforms).toEqual([saved_transform]);
         expect(error).toHaveBeenCalledWith(
             expect.stringContaining('Failed to reconcile table transforms'),
-            expect.any(Error),
+            { code: 'UNKNOWN' },
         );
     });
 
@@ -4557,7 +4754,7 @@ describe('CSV edit sessions', () => {
         expect(versioned.get_state(file_path).transforms).toEqual([invalid]);
         expect(error).toHaveBeenCalledWith(
             'Failed to clear an invalid saved table transform',
-            expect.objectContaining({ message: 'transient cleanup persistence failure' }),
+            { code: 'UNKNOWN' },
         );
 
         panel.__messages.length = 0;
@@ -4610,7 +4807,7 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path).transforms).toEqual([undefined, second]);
         expect(error).toHaveBeenCalledWith(
             expect.stringContaining('Failed to reconcile durable table transforms'),
-            expect.any(InvalidPersistedTransformError),
+            { code: 'UNKNOWN' },
         );
     });
 

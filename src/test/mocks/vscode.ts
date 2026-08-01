@@ -111,6 +111,10 @@ export const ViewColumn = {
     Beside: 2,
 };
 
+export const env = {
+    remoteName: undefined as string | undefined,
+};
+
 export class RelativePattern {
     readonly baseUri: UriLike;
     readonly base: UriLike;
@@ -185,6 +189,7 @@ function make_panel(title: string): MockWebviewPanel {
     const message_handlers: MessageHandler[] = [];
     const dispose_handlers: (() => unknown)[] = [];
     let protocol_sequence = 0;
+    const pending_edit_sequences = new Map<string, number>();
     const panel: MockWebviewPanel = {
         title,
         webview: {
@@ -271,6 +276,21 @@ function make_panel(title: string): MockWebviewPanel {
                 if (grant?.editSessionId) {
                     forwarded = { ...forwarded, editSessionId: grant.editSessionId };
                 }
+            }
+            if (
+                typeof forwarded === 'object'
+                && forwarded !== null
+                && 'type' in forwarded
+                && forwarded.type === 'pendingEditsChanged'
+                && !('sequence' in forwarded)
+            ) {
+                const session_id = 'editSessionId' in forwarded
+                    && typeof forwarded.editSessionId === 'string'
+                    ? forwarded.editSessionId
+                    : '';
+                const sequence = (pending_edit_sequences.get(session_id) ?? 0) + 1;
+                pending_edit_sequences.set(session_id, sequence);
+                forwarded = { ...forwarded, sequence };
             }
             if (
                 typeof forwarded === 'object'
@@ -433,6 +453,9 @@ export const window = {
         return undefined;
     },
     showWarningMessage(..._args: unknown[]): unknown {
+        return undefined;
+    },
+    showInformationMessage(..._args: unknown[]): unknown {
         return undefined;
     },
     onDidChangeTextEditorVisibleRanges() {
