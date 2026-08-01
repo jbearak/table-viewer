@@ -973,6 +973,23 @@ if (!got_lock) {
         });
     }
 
+    /**
+     * Run one best-effort report during startup failure, swallowing anything it
+     * throws.
+     *
+     * Deliberately swallowing: every caller is already on the failure path, and
+     * the statements that follow — draining the store and exiting — are the ones
+     * that must not be skipped. There is also nowhere left to report a failed
+     * report to, since the reporting channels are exactly what just failed.
+     */
+    const report_startup_failure = (report: () => void): void => {
+        try {
+            report();
+        } catch {
+            // Intentionally empty: see above.
+        }
+    };
+
     // `start_app` is async, and an unhandled rejection in the main process is
     // fatal — with no window on screen it would be a silent exit. Report it and
     // close the gate instead, so nothing buffered runs against a backend that
@@ -986,11 +1003,23 @@ if (!got_lock) {
         // `.message`. Logging the object would put a user's filenames and the
         // location of their state database into the terminal and into any crash
         // report that scrapes it.
-        console.error(`Table Viewer failed to start (${desktop_state_error_log_line(error)})`);
-        dialog.showErrorBox(
-            'Table Viewer could not start',
-            'An unexpected error prevented Table Viewer from starting. Please try again.',
-        );
+        //
+        // Both reports are wrapped for the same reason the quit barrier wraps
+        // its own: `console.error` throws EPIPE once the parent has closed
+        // stdout, and `showErrorBox` can throw before the GUI is up — and this
+        // catch body is an async function whose promise is discarded by the
+        // `void` above, so a throw here would skip the drain *and* `app.exit(1)`
+        // and surface as an unhandled rejection. Telling the user is best
+        // effort; releasing the connection and exiting are not.
+        report_startup_failure(() => {
+            console.error(`Table Viewer failed to start (${desktop_state_error_log_line(error)})`);
+        });
+        report_startup_failure(() => {
+            dialog.showErrorBox(
+                'Table Viewer could not start',
+                'An unexpected error prevented Table Viewer from starting. Please try again.',
+            );
+        });
         // The throw may have happened *after* the store was published, and
         // `app.exit()` does not fire `before-quit` — so without this the process
         // would exit with a live SQLite connection, its writer-session row and
@@ -1002,7 +1031,15 @@ if (!got_lock) {
         // promise is memoized). Either way the process exits — a close that also
         // fails must not turn a reported startup failure into a silent hang.
         if ((await state_backend.drain()).type === 'close-failed') {
-            console.error('Table Viewer could not release its state backend while failing to start.');
+            // Wrapped for the same reason, and it matters most here: this is the
+            // last statement before `app.exit(1)`, so an EPIPE from it would
+            // leave the process running with nothing on screen — the silent hang
+            // this whole catch exists to prevent.
+            report_startup_failure(() => {
+                console.error(
+                    'Table Viewer could not release its state backend while failing to start.',
+                );
+            });
         }
         app.exit(1);
     });
