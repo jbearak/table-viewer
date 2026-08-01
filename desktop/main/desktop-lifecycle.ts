@@ -300,9 +300,15 @@ export interface DesktopStateBackend<TStore extends ClosableStateBackend> {
     /**
      * Take that refusal back, because the quit will not happen after all.
      *
-     * Only for a barrier that ended before the connection closed — a vetoed
-     * window close. The app is staying up, so an app that has silently stopped
-     * opening files would be a worse outcome than the quit the user cancelled.
+     * For a barrier that ended before the connection closed — a vetoed window
+     * close, or a close fence that rejected. The app is staying up, so an app that
+     * has silently stopped opening files would be a worse outcome than the quit
+     * the user cancelled.
+     *
+     * A no-op once `drain` has attempted a close, whatever the outcome. That is
+     * enforced here rather than assumed of the caller: the connection is gone or
+     * in whatever state a failed close left it, so re-admitting would attach a
+     * controller to it and release buffered `open-file` work over it.
      */
     abandon_shutdown(): void;
     /**
@@ -343,6 +349,15 @@ export function create_desktop_state_backend<TStore extends ClosableStateBackend
      *  rejection, so this is the honest answer for every later caller: there is
      *  nothing left to attempt. */
     let close_failed = false;
+    /** Latched the instant a close is attempted — the point of no return. Past it
+     *  the connection is either released or in whatever state a failed close left
+     *  it, so `abandon_shutdown` must not put admission back. The barrier is shaped
+     *  so it should never ask, but "should never" is an assumption, and the two
+     *  statements that run after the close (`report_close_failure`, which is a
+     *  console.error and throws on EPIPE, and `resume_quit`, which is app.quit())
+     *  are exactly the kind of thing that turns an assumption into a resurrected
+     *  store. Enforced here so the invariant holds for any caller. */
+    let close_attempted = false;
 
     /** Phase first (so no buffered startup work is released into a closing
      *  backend), then admission (so no new viewer can attach a controller).
@@ -374,11 +389,18 @@ export function create_desktop_state_backend<TStore extends ClosableStateBackend
             enter_shutdown();
         },
         abandon_shutdown(): void {
-            // Only ever reached before the connection closed, so there is no
-            // half-closed store to reason about. Ordered as the mirror of
-            // `enter_shutdown`: admission back first, then the phase, so no
-            // request can be released by the phase change into a manager that is
-            // still refusing.
+            // Past the point of no return this is a no-op rather than a mirror:
+            // once a close has been attempted there is no un-closed connection to
+            // go back to, and re-admitting would let `open_file` attach a
+            // controller to a released store and let the phase change release
+            // buffered `open-file` work over it. Deliberately not conditioned on
+            // `published` alone — a *failed* close leaves it set on purpose (so a
+            // caller can see which connection it was), and that store is no more
+            // usable than a cleared one.
+            if (close_attempted) return;
+            // Ordered as the mirror of `enter_shutdown`: admission back first, then
+            // the phase, so no request can be released by the phase change into a
+            // manager that is still refusing.
             draining = false;
             resume_admission();
             lifecycle.abandon_drain();
@@ -392,6 +414,10 @@ export function create_desktop_state_backend<TStore extends ClosableStateBackend
             if (closing) return closing;
             const store = published;
             if (!store) return Promise.resolve({ type: 'closed' as const });
+            // Latched before the call, not in its continuations: the close is in
+            // flight from this line on, and an `abandon_shutdown` arriving during it
+            // is already too late to have an un-closed connection to restore.
+            close_attempted = true;
             // `published` is cleared only on success, so a caller inspecting it
             // after a failure still sees which connection was left in whatever
             // state the failed close left it.

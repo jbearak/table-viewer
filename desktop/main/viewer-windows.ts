@@ -107,7 +107,9 @@ export interface AppQuitShutdownPort {
      */
     begin(): void;
     /** Undo `begin`, because a viewer vetoed its close and the app is staying
-     *  up. Reached only before the connection closed. */
+     *  up. Called from exactly one branch of the barrier — the one that runs
+     *  before `drain` — and the barrier's promise chain is shaped so that no
+     *  failure after the close can reach it. See `create_app_quit_coordinator`. */
     abandon(): void;
     /** Release the connection. Never rejects: the outcome is the value, because
      *  a failed close is terminal rather than retryable. */
@@ -176,12 +178,23 @@ export function create_app_quit_coordinator(
         // its list is never fenced.
         shutdown.begin();
         quit_barrier = close_viewer_windows()
+            // Scoped to the close fence alone, and deliberately not to the whole
+            // chain: the fence is the one stage where a rejection means the same
+            // thing as a veto (nothing has been closed, the app is staying up), so
+            // it is folded into the same `false` here — before `drain` is even
+            // reachable. A `.catch` further down would also cover the drain
+            // callback, where `report_close_failure` (a console.error, which
+            // throws on EPIPE) and `resume_quit` (app.quit()) run *after* the
+            // connection is gone; abandoning there would re-admit `open_file` and
+            // release buffered `open-file` work onto a closed, cleared store.
+            .catch(() => false)
             .then((closed) => {
-                // A viewer vetoed its close (unacknowledged edits, lost renderer).
-                // The app is staying up, so the backend must stay open — draining
-                // it would strand a window that still holds an attached controller
-                // — and admission goes back, because refusing to open files in an
-                // app the user just chose to keep running is a bug of its own.
+                // A viewer vetoed its close (unacknowledged edits, lost renderer),
+                // or the fence itself rejected. The app is staying up, so the
+                // backend must stay open — draining it would strand a window that
+                // still holds an attached controller — and admission goes back,
+                // because refusing to open files in an app the user just chose to
+                // keep running is a bug of its own.
                 if (!closed) {
                     shutdown.abandon();
                     return;
@@ -192,19 +205,32 @@ export function create_app_quit_coordinator(
                     // A failed close is terminal, not retryable: see the module
                     // comment above. Report it and quit anyway rather than trap
                     // the user in an app that can only be force-quit.
-                    if (outcome.type === 'close-failed') shutdown.report_close_failure();
+                    //
+                    // Latched before the report, not after: reporting is I/O
+                    // (console.error over a pipe the parent may have closed), and
+                    // a throw there must not be what decides whether the app can
+                    // ever quit again.
                     allow_quit = true;
+                    if (outcome.type === 'close-failed') {
+                        try {
+                            shutdown.report_close_failure();
+                        } catch {
+                            // Best-effort, for the same reason the failed close
+                            // does not block: the connection is already released,
+                            // and a stdout that has gone away must not be what
+                            // keeps the app on screen.
+                        }
+                    }
                     resume_quit();
                 });
             })
-            // before-quit cannot await this barrier. A rejection can now only come
-            // from the close fence (`drain` answers with a value), and consuming it
-            // here keeps it off the main process's unhandled-rejection path.
-            // Admission is restored for the same reason as a veto: the app is still
-            // up and quitting is still retryable with `allow_quit` false.
-            .catch(() => {
-                shutdown.abandon();
-            })
+            // before-quit cannot await this barrier, so every rejection has to be
+            // consumed here to stay off the main process's unhandled-rejection
+            // path. Consumed and nothing else: the only rejections that reach this
+            // point come from after the connection closed (see above), and there is
+            // no state left to put back — `allow_quit` is already latched and the
+            // store is already released.
+            .catch(() => {})
             .finally(() => {
                 quit_barrier = undefined;
             });
@@ -572,11 +598,18 @@ export class ViewerWindowManager {
      *
      * Narrowly safe, and only for the one caller that owns the ordering: the quit
      * coordinator, on the path where `close_all` answered false (a viewer vetoed
-     * its close) or the fence itself rejected. Both are decided strictly *before*
-     * the drain runs, so the connection this manager reads through has not been
-     * touched — which is the whole precondition. Calling it after a drain would
-     * be exactly the bug `stop_admission` exists to prevent: a viewer attached to
-     * a connection that is closing or closed.
+     * its close) or the fence itself rejected. Both are decided *before* the drain
+     * runs, so the connection this manager reads through has not been touched —
+     * which is the whole precondition. Calling it after a drain would be exactly
+     * the bug `stop_admission` exists to prevent: a viewer attached to a connection
+     * that is closing or closed.
+     *
+     * That precondition is not left to the caller's good behaviour. The barrier's
+     * close-fence `.catch` is scoped so no post-close failure can route here, and
+     * `create_desktop_state_backend`'s `abandon_shutdown` — the only thing in the
+     * app that calls this method — is a hard no-op once a close has been attempted.
+     * The method itself is a plain setter, so the enforcement has to live upstream;
+     * these are the two places it does.
      *
      * It exists because the alternative is worse than the risk it carries. A
      * vetoed close leaves the app running, and leaving admission off there gives

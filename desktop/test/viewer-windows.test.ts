@@ -1050,6 +1050,146 @@ describe('application quit coordinator', () => {
         expect(wiring.backend.published).toBeUndefined();
     });
 
+    /**
+     * The real backend and manager behind the barrier, with every port call in one
+     * ordered log and the two post-close statements injectable.
+     *
+     * Post-close, because that is the whole point: `report_close_failure` is a
+     * `console.error` in main.ts and throws on EPIPE, and `resume_quit` is
+     * `app.quit()`. Both run *after* the connection has been released, so a throw
+     * from either must not be able to reach `abandon` — the store is gone and
+     * re-admitting would attach a controller to it.
+     */
+    function post_close_wiring(
+        store: { close(): Promise<void> },
+        hooks: { on_report?: () => void; on_resume?: () => void } = {},
+    ) {
+        const lifecycle = create_desktop_lifecycle();
+        const viewer_manager = manager();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => viewer_manager.stop_admission(),
+            () => viewer_manager.resume_admission(),
+        );
+        const calls: string[] = [];
+        const shutdown: AppQuitShutdownPort = {
+            begin: () => { calls.push('begin'); backend.begin_shutdown(); },
+            abandon: () => { calls.push('abandon'); backend.abandon_shutdown(); },
+            drain: () => { calls.push('drain'); return backend.drain(); },
+            report_close_failure: () => {
+                calls.push('report');
+                hooks.on_report?.();
+            },
+        };
+        const resume_quit = vi.fn(() => {
+            calls.push('resume');
+            hooks.on_resume?.();
+        });
+        return { lifecycle, viewer_manager, backend, shutdown, calls, resume_quit };
+    }
+
+    /** Rejections that escaped to the process, which in the main process is fatal.
+     *  Vitest fails the run on one by itself; this makes the assertion local and
+     *  explicit, so the test says what it is protecting. */
+    function watch_unhandled_rejections() {
+        const escaped: unknown[] = [];
+        const listener = (reason: unknown) => { escaped.push(reason); };
+        process.on('unhandledRejection', listener);
+        return {
+            escaped,
+            /** Let the microtask queue drain and the rejection be reported, then
+             *  stop watching. A turn of the event loop, not a delay. */
+            async settle(): Promise<void> {
+                await new Promise<void>((done) => { setImmediate(done); });
+                await new Promise<void>((done) => { setImmediate(done); });
+                process.removeListener('unhandledRejection', listener);
+            },
+        };
+    }
+
+    it('never re-admits when reporting a failed close throws', async () => {
+        // `report_close_failure` is a console.error, and console.error throws
+        // EPIPE once the parent has closed stdout. The close has already run by
+        // then, so this throw must not be routed to `abandon`: doing so would put
+        // the lifecycle back to `ready` and let `open_file` attach a controller to
+        // a connection nobody can use.
+        const rejections = watch_unhandled_rejections();
+        const store = { close: async (): Promise<void> => { throw new Error('close failed'); } };
+        const wiring = post_close_wiring(store, {
+            on_report: () => { throw new Error('EPIPE: stdout is gone'); },
+        });
+        await wiring.backend.publish(store);
+        wiring.lifecycle.become_ready();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            wiring.resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(wiring.calls).toContain('report'));
+
+        // Reporting is best-effort, so the quit it precedes still happens: a dead
+        // stdout must not be what keeps the app on screen over a closed store.
+        await vi.waitFor(() => expect(wiring.resume_quit).toHaveBeenCalledOnce());
+        expect(wiring.calls).toEqual(['begin', 'drain', 'report', 'resume']);
+        // Admission stays shut and the phase stays drained.
+        expect(wiring.viewer_manager.open_file('/tmp/after-report-threw.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+        expect(wiring.lifecycle.phase).toBe('draining');
+        expect(wiring.backend.draining).toBe(true);
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+        // And the quit is not blocking again — a failed close never was.
+        const resumed = { preventDefault: vi.fn() };
+        before_quit(resumed);
+        expect(resumed.preventDefault).not.toHaveBeenCalled();
+
+        await rejections.settle();
+        expect(rejections.escaped).toEqual([]);
+    });
+
+    it('never re-admits when the resumed quit itself throws', async () => {
+        // `resume_quit` is `app.quit()`, called with the connection already closed
+        // and cleared. A throw from it used to land in the barrier's trailing
+        // catch, which called `abandon`: admission came back, the lifecycle went
+        // back to `ready`, and a buffered `open-file` ran immediately — over a
+        // store that no longer exists.
+        const rejections = watch_unhandled_rejections();
+        const closes: string[] = [];
+        const store = { close: async (): Promise<void> => { closes.push('close'); } };
+        const wiring = post_close_wiring(store, {
+            on_resume: () => { throw new Error('app.quit failed'); },
+        });
+        await wiring.backend.publish(store);
+        wiring.lifecycle.become_ready();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            wiring.resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(wiring.resume_quit).toHaveBeenCalledOnce());
+
+        // The store really is gone, which is why re-admitting would be a bug
+        // rather than a nicety.
+        expect(closes).toEqual(['close']);
+        expect(wiring.backend.published).toBeUndefined();
+        expect(wiring.calls).toEqual(['begin', 'drain', 'resume']);
+        expect(wiring.viewer_manager.open_file('/tmp/after-resume-threw.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+        expect(wiring.lifecycle.phase).toBe('draining');
+        expect(wiring.backend.draining).toBe(true);
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+
+        await rejections.settle();
+        expect(rejections.escaped).toEqual([]);
+    });
+
     it('admits no new viewer window once admission has stopped', async () => {
         const viewer_manager = manager();
         viewer_manager.open_file('/tmp/before-drain.csv');

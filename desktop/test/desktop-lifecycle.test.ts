@@ -245,6 +245,90 @@ describe('desktop state backend', () => {
         expect(store.closes).toEqual([1]);
     });
 
+    it('refuses to take the refusal back once a close has been attempted', async () => {
+        // The invariant the doc comment used to only assert. Everything the quit
+        // barrier does after the drain — reporting a failed close (a console.error,
+        // which throws on EPIPE) and calling app.quit() — runs with the connection
+        // already released, and a throw from either used to route back here. There
+        // is no un-closed connection left to restore at that point, so re-admitting
+        // would attach a controller to a released store and release buffered
+        // `open-file` work over it.
+        const lifecycle = create_desktop_lifecycle();
+        const resume_admission = vi.fn();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => {},
+            resume_admission,
+        );
+        const store = fake_store();
+        await backend.publish(store);
+        lifecycle.become_ready();
+
+        await expect(backend.drain()).resolves.toEqual({ type: 'closed' });
+        backend.abandon_shutdown();
+
+        expect(resume_admission).not.toHaveBeenCalled();
+        expect(backend.draining).toBe(true);
+        expect(lifecycle.phase).toBe('draining');
+        const ran: string[] = [];
+        lifecycle.submit(() => ran.push('after-close'));
+        expect(ran).toEqual([]);
+    });
+
+    it('refuses it after a failed close too, published store notwithstanding', async () => {
+        // A failed close deliberately leaves `published` set, so a caller can still
+        // see which connection it was for — which is exactly why the guard cannot be
+        // "published is undefined". That store is no more usable than a cleared one:
+        // the close already ran and the underlying close memoizes its rejection.
+        const lifecycle = create_desktop_lifecycle();
+        const resume_admission = vi.fn();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => {},
+            resume_admission,
+        );
+        const store = fake_store();
+        await backend.publish(store);
+        lifecycle.become_ready();
+        store.fail_next_close();
+
+        await expect(backend.drain()).resolves.toEqual({ type: 'close-failed' });
+        backend.abandon_shutdown();
+
+        expect(resume_admission).not.toHaveBeenCalled();
+        expect(backend.published).toBe(store);
+        expect(backend.draining).toBe(true);
+        expect(lifecycle.phase).toBe('draining');
+    });
+
+    it('refuses it while a close is still in flight', async () => {
+        // Latched at the call, not in its continuations: from the moment
+        // `store.close()` is entered there is no un-closed connection to go back to,
+        // so an abandon racing the close is already too late.
+        const lifecycle = create_desktop_lifecycle();
+        const resume_admission = vi.fn();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => {},
+            resume_admission,
+        );
+        let release!: () => void;
+        const closing = new Promise<void>((done) => { release = done; });
+        const store = { close: (): Promise<void> => closing };
+        await backend.publish(store);
+        lifecycle.become_ready();
+
+        const drained = backend.drain();
+        backend.abandon_shutdown();
+
+        expect(resume_admission).not.toHaveBeenCalled();
+        expect(backend.draining).toBe(true);
+        expect(lifecycle.phase).toBe('draining');
+
+        release();
+        await expect(drained).resolves.toEqual({ type: 'closed' });
+    });
+
     it('closes rather than publishes a store that finishes opening after a drain', async () => {
         // Cmd-Q during startup: the drain runs while the open is still in
         // flight, so it closes nothing. Publishing afterwards would strand the
