@@ -581,7 +581,10 @@ type ActivationMarkerFileInspection =
     | { readonly status: 'invalid' }
     | { readonly status: 'read'; readonly bytes: Buffer; readonly opened: fs.BigIntStats };
 
-function inspect_activation_marker_file(filePath: string): ActivationMarkerFileInspection {
+function inspect_activation_marker_file(
+    filePath: string,
+    onCandidateRead?: () => void,
+): ActivationMarkerFileInspection {
     const noFollow = process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW;
     let descriptor: number;
     try {
@@ -601,6 +604,7 @@ function inspect_activation_marker_file(filePath: string): ActivationMarkerFileI
         } else {
             assert_private_directory(opened);
             const bytes = fs.readFileSync(descriptor);
+            onCandidateRead?.();
             result = exact_file_still_present(filePath, opened)
                 ? { status: 'read', bytes, opened }
                 : { status: 'invalid' };
@@ -832,9 +836,11 @@ export class PhysicalResourceLockManager {
         }
 
         const markerPath = path.join(this.lockRoot, ACTIVATION_MARKER);
-        const inspection = inspect_activation_marker_file(markerPath);
+        const inspection = inspect_activation_marker_file(
+            markerPath,
+            this.onActivationMarkerCandidateRead,
+        );
         try {
-            if (inspection.status === 'read') this.onActivationMarkerCandidateRead?.();
             assert_same_root(this.lockRoot, rootIdentity);
         } catch {
             return { status: 'invalid' };
