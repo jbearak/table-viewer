@@ -155,6 +155,8 @@ export interface PhysicalLockManagerOptions {
     /** Test/host crash instrumentation after a release candidate is identity-pinned. */
     readonly onReleaseCandidatePinned?: (memberPath: string) => void;
     readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
+    /** Test-only race instrumentation after marker bytes are read from a pinned descriptor. */
+    readonly onActivationMarkerCandidateRead?: () => void;
     readonly filesystemType?: FilesystemTypeInspector;
     readonly targetFilesystemType?: FilesystemTypeInspector;
 }
@@ -627,6 +629,7 @@ export class PhysicalResourceLockManager {
     private readonly onAcquisitionEvent?: (event: PhysicalLockAcquisitionEvent) => void;
     private readonly onReleaseCandidatePinned?: (memberPath: string) => void;
     private readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
+    private readonly onActivationMarkerCandidateRead?: () => void;
     private readonly filesystemType?: FilesystemTypeInspector;
     private readonly targetFilesystemType?: FilesystemTypeInspector;
     private releaseDirectoryFlushPending = false;
@@ -645,6 +648,7 @@ export class PhysicalResourceLockManager {
         this.onAcquisitionEvent = options.onAcquisitionEvent;
         this.onReleaseCandidatePinned = options.onReleaseCandidatePinned;
         this.onReleaseMemberUnlinked = options.onReleaseMemberUnlinked;
+        this.onActivationMarkerCandidateRead = options.onActivationMarkerCandidateRead;
         this.filesystemType = options.filesystemType;
         this.targetFilesystemType = options.targetFilesystemType;
     }
@@ -830,6 +834,7 @@ export class PhysicalResourceLockManager {
         const markerPath = path.join(this.lockRoot, ACTIVATION_MARKER);
         const inspection = inspect_activation_marker_file(markerPath);
         try {
+            if (inspection.status === 'read') this.onActivationMarkerCandidateRead?.();
             assert_same_root(this.lockRoot, rootIdentity);
         } catch {
             return { status: 'invalid' };

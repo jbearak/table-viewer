@@ -1205,27 +1205,25 @@ describe('physical resource locks', () => {
     });
 
     it('fails closed when the marker is replaced during inspection', () => {
-        const manager = new PhysicalResourceLockManager({ lockRoot });
+        const markerPath = path.join(lockRoot, 'physical-edit-protocol.v1');
+        let markerBytes = Buffer.alloc(0);
+        let replaceMarker = false;
+        const manager = new PhysicalResourceLockManager({
+            lockRoot,
+            onActivationMarkerCandidateRead() {
+                if (!replaceMarker) return;
+                fs.unlinkSync(markerPath);
+                fs.writeFileSync(markerPath, markerBytes, { mode: 0o600 });
+            },
+        });
         const attestation = {
             allOtherTableViewerProcessesClosed: true,
             allOtherEditingProductsUpdated: true,
             currentProcessFencedFlushedAndViewOnly: true,
         } as const;
         manager.install_activation_marker(attestation);
-        const markerPath = path.join(lockRoot, 'physical-edit-protocol.v1');
-        const markerBytes = fs.readFileSync(markerPath);
-        const originalRealpath = fs.realpathSync.native;
-        let rootInspections = 0;
-        vi.spyOn(fs.realpathSync, 'native').mockImplementation((candidate) => {
-            if (candidate === lockRoot) {
-                rootInspections += 1;
-                if (rootInspections === 3) {
-                    fs.unlinkSync(markerPath);
-                    fs.writeFileSync(markerPath, markerBytes, { mode: 0o600 });
-                }
-            }
-            return originalRealpath(candidate);
-        });
+        markerBytes = fs.readFileSync(markerPath);
+        replaceMarker = true;
 
         expect(manager.inspect_activation_marker()).toEqual({ status: 'invalid' });
     });
