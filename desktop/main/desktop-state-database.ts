@@ -388,8 +388,14 @@ function quarantine_unparseable_reader_tokens(
     // `physicalPath`. Three rounds of defects here all had the same shape — a
     // path built with `path.join` and handed to `fs` without anything having
     // established that it is the directory we meant — so the structure, not
-    // another check, is the fix: after this block no unverified string reaches an
-    // `fs` call.
+    // another check, is the fix.
+    //
+    // The rule is: a path is captured before it is used, or it is a `readdir`
+    // basename joined onto an already-captured directory. The one deliberate
+    // exception is the `mkdirSync` that *creates* a directory, which cannot
+    // consult a capture that does not exist yet; those are non-recursive, so they
+    // fail closed on EEXIST rather than following a planted symlink, and the
+    // directory is captured immediately afterwards.
     //
     // `capture_managed_directory` is the shared backend's own primitive and is
     // strictly stronger than a local `lstat`: it rejects symlinks, confirms real
@@ -424,7 +430,6 @@ function quarantine_unparseable_reader_tokens(
     } catch (error) {
         throw quarantine_failure(error);
     }
-    const readers_directory = readers.physicalPath;
     // Duplicated rather than imported from the shared backend: this is the shape
     // the backend *rejects*, so the predicate that decides what to quarantine has
     // to keep matching that rejection even if a future token name gains a
@@ -436,7 +441,7 @@ function quarantine_unparseable_reader_tokens(
     // `quarantine_failure` documents: an unsanitized errno escaping here would
     // carry an absolute path out of the module.
     try {
-        const unparseable = fs.readdirSync(readers_directory, { withFileTypes: true })
+        const unparseable = fs.readdirSync(readers.physicalPath, { withFileTypes: true })
             .filter((entry) => entry.name.endsWith('.reader'))
             .filter((entry) => !entry.isFile()
                 || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
@@ -472,23 +477,39 @@ function quarantine_unparseable_reader_tokens(
             gate.physicalPath,
             'reader-token-quarantine-directory',
         );
-        const quarantine_directory = path.join(quarantine_root.physicalPath, randomUUID());
-        fs.mkdirSync(quarantine_directory, { mode: 0o700 });
+        const generation_path = path.join(quarantine_root.physicalPath, randomUUID());
+        fs.mkdirSync(generation_path, { mode: 0o700 });
+        // Captured like every other directory here, and not because this one is
+        // reachable the way the earlier three were: the name is a fresh v4 UUID
+        // created by a non-recursive `mkdirSync` that fails closed on EEXIST, so it
+        // cannot be pre-planted, only raced. It is captured anyway so the rule
+        // holds without exceptions — an exception is what the next person editing
+        // this loop would have to notice and preserve, and the last three defects
+        // here came from exactly that kind of "safe by argument, not by check".
+        const generation = capture_managed_directory(
+            generation_path,
+            quarantine_root.physicalPath,
+            'reader-token-quarantine-directory',
+        );
         // Before anything moves in, so a crash cannot leave a member with no
-        // directory to have landed in. Both endpoints are re-asserted immediately
-        // before the renames, as the shared backend does around its own mutations:
-        // capture-then-use always leaves a window, and this closes it.
+        // directory to have landed in.
         flush(quarantine_root.physicalPath);
-        assert_managed_directory(readers, 'reader-token-quarantine-directory');
-        assert_managed_directory(quarantine_root, 'reader-token-quarantine-directory');
         for (const name of unparseable) {
+            // Re-asserted per iteration, not once before the loop, matching
+            // `advance_preservation`'s discipline in the shared backend: asserting
+            // only once would cover the first rename and leave the rest running on
+            // a stale check.
+            assert_managed_directory(readers, 'reader-token-quarantine-directory');
+            assert_managed_directory(generation, 'reader-token-quarantine-directory');
             fs.renameSync(
-                path.join(readers_directory, name),
-                path.join(quarantine_directory, name),
+                path.join(readers.physicalPath, name),
+                path.join(generation.physicalPath, name),
             );
         }
-        flush(quarantine_directory);
-        flush(readers_directory);
+        assert_managed_directory(generation, 'reader-token-quarantine-directory');
+        flush(generation.physicalPath);
+        assert_managed_directory(readers, 'reader-token-quarantine-directory');
+        flush(readers.physicalPath);
     } catch (error) {
         throw quarantine_failure(error);
     }
