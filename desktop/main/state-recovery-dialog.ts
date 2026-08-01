@@ -409,7 +409,6 @@ const ABSENT_MAIN_EVIDENCE_OPERATION = 'absent-main-evidence';
  * with no arm at all is already a compile error in `state_recovery_wording`.
  */
 export const REFINED_ONLY_KINDS: readonly StateRecoveryKind[] = [
-    'compatibility',
     'leftover-setup',
 ];
 

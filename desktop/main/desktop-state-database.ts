@@ -343,6 +343,11 @@ export async function preserve_desktop_state_database(
     }
     const gate = await acquire_sqlite_exclusive_recovery_gate(database_path, options);
     let completed = false;
+    // Captured rather than thrown from the `finally` below: a `throw` there
+    // silently discards whatever exception was already in flight, which is
+    // exactly the failure this function exists to avoid. It is rethrown after
+    // the try/finally settles, and only when nothing else went wrong.
+    let release_error: unknown;
     try {
         await reclaim_interrupted_recovery_residue(gate, confirmation);
         // Resume explicitly when a blockade is already present, rather than
@@ -368,7 +373,6 @@ export async function preserve_desktop_state_database(
         // unconditional `finally { await gate.release() }` replaced the honest
         // ENOSPC/EIO with a generic recovery error *and* left the intent behind
         // anyway — relabeling an IOERR, which the failure policy forbids.
-        let release_error: unknown;
         try {
             if (!inspect_sqlite_recovery_gate(database_path).recoveryBlocked) {
                 await gate.release();
@@ -376,8 +380,8 @@ export async function preserve_desktop_state_database(
         } catch (error) {
             release_error = error;
         }
-        // Only when nothing else went wrong: a failed release must never
-        // displace the failure the user actually needs to see.
-        if (completed && release_error !== undefined) throw release_error;
     }
+    // Reached only when the preservation itself succeeded, so a failed release
+    // can never displace the failure the user actually needs to see.
+    if (completed && release_error !== undefined) throw release_error;
 }
