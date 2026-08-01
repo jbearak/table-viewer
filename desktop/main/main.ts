@@ -20,7 +20,12 @@ import {
     shell,
 } from 'electron';
 import type { OpenedSqliteFileStateStore } from '../../src/sqlite-file-state-persistence';
-import { DesktopConfigStore, settings_file_path, type DesktopSettings } from './desktop-config';
+import {
+    canonical_existing_path,
+    DesktopConfigStore,
+    settings_file_path,
+    type DesktopSettings,
+} from './desktop-config';
 import {
     create_app_quit_coordinator,
     ViewerWindowManager,
@@ -808,12 +813,32 @@ const state_recovery_dialogs: StateRecoveryDialogs = {
 
 // --- app lifecycle ----------------------------------------------------------
 
-// Test hook: the Playwright smoke test points userData at a temp directory so
-// runs are isolated (state store, settings, and the single-instance lock all
-// live under userData).
+// A real production override, not merely a test hook — it is read from the
+// environment of any launch, and the Playwright smoke test is only its best-known
+// consumer (it points userData at a temp directory so runs are isolated).
+//
+// Two launches whose values name the same physical directory by different paths —
+// a symlink, a `.`-relative path, a case-different spelling on a
+// case-insensitive volume — each win `requestSingleInstanceLock()` below, because
+// that lock is keyed on the userData path Electron was given rather than on the
+// directory it resolves to. Both processes then coordinate through the same
+// `state/` tree while each believes it is the only instance, and "Set Aside and
+// Start Fresh" carries an attestation that no other process holds the database:
+// under attestation the shared backend reclaims the peer's reader token by exact
+// id and moves the set out from under its live handle (which is the sanctioned
+// trade — reclaiming any other way would mean PID/TTL/heartbeat expiry).
+//
+// Resolved with `realpathSync` where possible so the ordinary aliasing cases
+// collapse to one value and the lock does its job. That closes the aliasing hole
+// but not the deliberate one: two genuinely different userData directories whose
+// `state/` subdirectories are the same physical directory still both win, and no
+// single-process check can see that. Do not set this to a location another Table
+// Viewer instance is already using.
 const custom_user_data = process.env.TABLE_VIEWER_USER_DATA_DIR;
 if (custom_user_data) {
-    app.setPath('userData', path.resolve(custom_user_data));
+    // `canonical_existing_path` resolves relative to cwd itself, so the old
+    // `path.resolve` is subsumed rather than dropped.
+    app.setPath('userData', canonical_existing_path(custom_user_data));
 }
 
 const got_lock = app.requestSingleInstanceLock();

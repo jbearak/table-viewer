@@ -17,7 +17,7 @@ function welcome_pages() {
 
 test.beforeAll(async () => {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
-    user_data_dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-welcome-smoke-'));
+    user_data_dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-welcome-smoke-')));
     app = await electron.launch({
         args: [main_js],
         cwd: repo_dir,
@@ -138,7 +138,7 @@ test('File → New Window opens another launcher', async () => {
 // this test has to quit the app it is asserting about, and `afterAll` runs after
 // every test in the file.
 test('quitting drains and releases the state database reader token', async () => {
-    const own_user_data = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-quit-smoke-'));
+    const own_user_data = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-quit-smoke-')));
     const own_app = await electron.launch({
         args: [main_js],
         cwd: repo_dir,

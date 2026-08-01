@@ -139,7 +139,7 @@ async function click_grid_cell(
 
 test.beforeAll(async () => {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
-    user_data_dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-smoke-'));
+    user_data_dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-smoke-')));
     app = await electron.launch({
         args: [main_js, csv_fixture, xlsx_fixture],
         cwd: repo_dir,
