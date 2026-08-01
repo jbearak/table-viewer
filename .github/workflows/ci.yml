@@ -83,9 +83,6 @@ jobs:
       - name: Typecheck
         run: npm run typecheck:all
 
-      - name: Unit tests excluding unsupported Windows SQLite backend
-        run: npm test -- --exclude "src/test/sqlite-*.test.ts"
-
       - name: SQLite Windows public-open fail-closed test
         run: npm run test:sqlite:windows-fail-closed
 
@@ -98,5 +95,8 @@ jobs:
       - name: Electron SQLite runtime probe
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\node_modules\.bin\electron.cmd dist\runtime-probes\electron-sqlite-runtime-probe.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

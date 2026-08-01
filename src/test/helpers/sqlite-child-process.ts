@@ -42,9 +42,17 @@ export class SqliteWorkerRequestError extends Error {
     }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, description: string): Promise<T> {
+function withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    description: string,
+    onTimeout?: () => void,
+): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${description}.`)), timeoutMs);
+        const timer = setTimeout(() => {
+            onTimeout?.();
+            reject(new Error(`Timed out waiting for ${description}.`));
+        }, timeoutMs);
         timer.unref();
         promise.then(
             (value) => {
@@ -200,7 +208,12 @@ export class SqliteChildProcess {
                 reject(error);
             });
         });
-        return withTimeout(result, this.#timeoutMs, `SQLite worker command ${command}`);
+        return withTimeout(
+            result,
+            this.#timeoutMs,
+            `SQLite worker command ${command}`,
+            () => this.#pending.delete(id),
+        );
     }
 
     waitForEvent(name: string): Promise<SqliteWorkerEvent> {
@@ -227,9 +240,19 @@ export class SqliteChildProcess {
     ): Promise<SqliteWorkerEvent> {
         const existing = this.#events.findIndex(predicate);
         if (existing >= 0) return Promise.resolve(this.#events.splice(existing, 1)[0]);
-        return withTimeout(new Promise((resolve, reject) => {
-            this.#eventWaiters.push({ predicate, resolve, reject });
-        }), this.#timeoutMs, description);
+        let waiter!: {
+            readonly predicate: (event: SqliteWorkerEvent) => boolean;
+            resolve(event: SqliteWorkerEvent): void;
+            reject(error: unknown): void;
+        };
+        const result = new Promise<SqliteWorkerEvent>((resolve, reject) => {
+            waiter = { predicate, resolve, reject };
+            this.#eventWaiters.push(waiter);
+        });
+        return withTimeout(result, this.#timeoutMs, description, () => {
+            const waiterIndex = this.#eventWaiters.indexOf(waiter);
+            if (waiterIndex >= 0) this.#eventWaiters.splice(waiterIndex, 1);
+        });
     }
 
     async close(): Promise<void> {

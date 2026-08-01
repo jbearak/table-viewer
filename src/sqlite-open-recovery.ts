@@ -453,11 +453,19 @@ function flush_directory(directoryPath: string, hooks?: SqliteOpenRecoveryHooks)
 
 function write_private_file_exclusive(filePath: string, data: string): void {
     const descriptor = fs.openSync(filePath, 'wx', PRIVATE_FILE_MODE);
+    let primaryError: unknown;
     try {
         fs.writeFileSync(descriptor, data, 'utf8');
         fs.fsyncSync(descriptor);
+    } catch (error) {
+        primaryError = error;
+        throw error;
     } finally {
-        fs.closeSync(descriptor);
+        try {
+            fs.closeSync(descriptor);
+        } catch (error) {
+            if (primaryError === undefined) throw error;
+        }
     }
 }
 
@@ -467,8 +475,23 @@ function replace_private_json(
     hooks?: SqliteOpenRecoveryHooks,
 ): void {
     const temporaryPath = `${filePath}.tmp.${randomUUID()}`;
-    write_private_file_exclusive(temporaryPath, JSON.stringify(value));
-    fs.renameSync(temporaryPath, filePath);
+    let renamed = false;
+    try {
+        write_private_file_exclusive(temporaryPath, JSON.stringify(value));
+        fs.renameSync(temporaryPath, filePath);
+        renamed = true;
+    } catch (error) {
+        if (!renamed) {
+            try {
+                fs.unlinkSync(temporaryPath);
+            } catch {
+                // Preserve the primary creation, write, flush, or rename failure.
+            }
+        }
+        throw error;
+    }
+    // Once rename succeeds the temporary pathname no longer exists; a later
+    // directory-flush failure must leave the installed replacement as evidence.
     flush_directory(path.dirname(filePath), hooks);
 }
 
@@ -1530,7 +1553,7 @@ async function advance_preservation(
                 fs.unlinkSync(sourcePath);
                 flush_directory(paths.parentDirectory, hooks);
                 await emit(hooks, 'preserve-after-member-source-removal');
-            } else if (fs.existsSync(sourcePath)) {
+            } else if (!path_entry_is_absent(sourcePath)) {
                 throw sqlite_file_state_recovery_error({ operation: 'preserve-source-changed' });
             }
             member = { ...member, sourceRemoved: true };
@@ -1546,7 +1569,7 @@ async function advance_preservation(
     for (const member of manifest.members) {
         assert_managed_directory(recoveryIdentity, 'preserve-final-validation');
         if (!stat_matches(path.join(recoveryDirectory, member.targetName), member)
-            || fs.existsSync(path.join(paths.parentDirectory, member.sourceName))) {
+            || !path_entry_is_absent(path.join(paths.parentDirectory, member.sourceName))) {
             throw sqlite_file_state_recovery_error({ operation: 'preserve-validation' });
         }
     }

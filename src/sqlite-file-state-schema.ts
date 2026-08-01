@@ -6,6 +6,9 @@ export const SQLITE_FILE_STATE_FORMAT = 'tableViewer.fileState.sqlite.v1';
 export const SQLITE_FILE_STATE_PROTOCOL_VERSION = 1;
 export const SQLITE_FILE_STATE_EXHAUSTION_SENTINEL = 9_007_199_254_740_991;
 export const SQLITE_FILE_STATE_MAX_COUNTER = SQLITE_FILE_STATE_EXHAUSTION_SENTINEL - 1;
+// Structural validation intentionally permits next_revision to equal the sentinel
+// as a representable exhausted state. next_ownership_generation must remain below
+// it because that field always denotes the next ownership generation to allocate.
 export const SQLITE_FILE_STATE_V1_MIGRATION_NAME = 'canonical-file-state-v1';
 
 export type SqliteFileStateProductKind = 'desktop' | 'vscode';
@@ -736,9 +739,9 @@ export function migrate_sqlite_file_state_schema(
     database.exec('PRAGMA trusted_schema = OFF');
     database.exec('PRAGMA synchronous = FULL');
     database.exec('PRAGMA secure_delete = ON');
-    database.exec(`PRAGMA application_id = ${SQLITE_FILE_STATE_APPLICATION_ID}`);
     database.exec('BEGIN IMMEDIATE');
     try {
+        database.exec(`PRAGMA application_id = ${SQLITE_FILE_STATE_APPLICATION_ID}`);
         apply_v1_migration(database, identity, options);
         options.beforeSetUserVersion?.();
         database.exec(`PRAGMA user_version = ${SQLITE_FILE_STATE_USER_VERSION}`);

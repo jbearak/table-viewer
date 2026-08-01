@@ -544,23 +544,6 @@ describe('raw preflight and writable rollback-journal recovery', () => {
 });
 
 describe('public SQLite open failure distinctions and preservation', () => {
-    it.runIf(process.platform === 'win32')(
-        'fails public open on Windows at unsupported directory durability without creating database evidence',
-        async () => {
-            const error = await expectCategory(publicOpen(), 'unsupported');
-            expect(error.metadata.operation).toBe('directory-durability');
-            expect(fs.existsSync(databasePath())).toBe(false);
-            expect(fs.readdirSync(tempDirectory).filter((name) =>
-                name !== '.file-state.sqlite3.recovery-gate')).toEqual([]);
-
-            const gateDirectory = path.join(tempDirectory, '.file-state.sqlite3.recovery-gate');
-            if (fs.existsSync(gateDirectory)) {
-                expect(fs.readdirSync(gateDirectory)).toEqual(['readers']);
-                expect(fs.readdirSync(path.join(gateDirectory, 'readers'))).toEqual([]);
-            }
-        },
-    );
-
     it.each([
         ['future schema', (database: DatabaseSync) => database.exec('PRAGMA user_version = 2'), 'schema'],
         ['future protocol', (database: DatabaseSync) => database.exec(`UPDATE state_meta SET
@@ -977,8 +960,9 @@ describe('complete candidates and no-clobber installation', () => {
                         .find((name) => name.includes('.init-candidate.'));
                     if (!candidate) throw new Error('candidate missing');
                     const candidatePath = path.join(tempDirectory, candidate);
-                    fs.unlinkSync(candidatePath);
-                    fs.writeFileSync(candidatePath, 'replacement');
+                    const replacementPath = path.join(tempDirectory, 'candidate-cleanup-replacement');
+                    fs.writeFileSync(replacementPath, 'replacement');
+                    fs.renameSync(replacementPath, candidatePath);
                 },
             },
         ), 'recovery');
@@ -1109,7 +1093,7 @@ describe('restartable preserve-as-a-unit recovery', () => {
         expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(0);
 
         fs.unlinkSync(targetPath);
-        fs.writeFileSync(targetPath, 'main-state');
+        fs.writeFileSync(targetPath, 'replacement-main-state');
         expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(1);
         await exclusive.release();
     });
@@ -1150,6 +1134,29 @@ describe('restartable preserve-as-a-unit recovery', () => {
         expect(inventory.recoveryBlocked).toBe(false);
         expect(inventory.incompleteRecoveryDirectories).toBe(0);
         await secondExclusive.release();
+    });
+
+    it('fails closed when the canonical source becomes a dangling symlink after target installation', async () => {
+        fs.writeFileSync(databasePath(), 'main-state');
+        const danglingTarget = path.join(tempDirectory, 'missing-symlink-target');
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+
+        await expectCategory(preserve_sqlite_basename_set(databasePath(), {
+            gate: exclusive,
+            onEvent(event) {
+                if (event !== 'preserve-after-member-install') return;
+                fs.unlinkSync(databasePath());
+                fs.symlinkSync(danglingTarget, databasePath());
+            },
+        }), 'recovery');
+
+        expect(fs.lstatSync(databasePath()).isSymbolicLink()).toBe(true);
+        expect(fs.readlinkSync(databasePath())).toBe(danglingTarget);
+        expect(fs.existsSync(path.join(
+            tempDirectory,
+            '.file-state.sqlite3.recovery-gate',
+            'recovery-block.json',
+        ))).toBe(true);
     });
 
     it('durably removes a blockade left beside a complete manifest only after revalidation', async () => {
@@ -1297,6 +1304,31 @@ describe('restartable preserve-as-a-unit recovery', () => {
         expect(fs.readFileSync(databasePath(), 'utf8')).toBe('canonical-state');
         expect(fs.readFileSync(conflictingTarget!, 'utf8')).toBe('do-not-overwrite');
         expect((await inventory_sqlite_basename(databasePath())).recoveryBlocked).toBe(true);
+    });
+
+    it('removes a manifest temporary file when replacement rename fails', async () => {
+        fs.writeFileSync(databasePath(), 'canonical-state');
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let recoveryDirectory: string | undefined;
+
+        await expectCategory(preserve_sqlite_basename_set(databasePath(), {
+            gate: exclusive,
+            onEvent(event) {
+                if (event !== 'preserve-after-member-install') return;
+                const recoveryName = fs.readdirSync(tempDirectory)
+                    .find((name) => name.startsWith('file-state.sqlite3.recovery.'));
+                if (!recoveryName) throw new Error('recovery directory missing');
+                recoveryDirectory = path.join(tempDirectory, recoveryName);
+                const manifestPath = path.join(recoveryDirectory, 'manifest.json');
+                fs.unlinkSync(manifestPath);
+                fs.mkdirSync(manifestPath);
+            },
+        }), 'recovery');
+
+        expect(recoveryDirectory).toBeDefined();
+        expect(fs.readdirSync(recoveryDirectory!)
+            .filter((name) => name.includes('.tmp.'))).toEqual([]);
+        expect(fs.readFileSync(databasePath(), 'utf8')).toBe('canonical-state');
     });
 
     it('blocks startup while an interrupted recovery manifest is active', async () => {

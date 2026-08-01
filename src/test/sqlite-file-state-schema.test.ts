@@ -191,7 +191,7 @@ describe('canonical SQLite file-state schema', () => {
         })).toThrow('injected failure');
 
         expect(pragmaNumber(database, 'user_version')).toBe(0);
-        expect(pragmaNumber(database, 'application_id')).toBe(SQLITE_FILE_STATE_APPLICATION_ID);
+        expect(pragmaNumber(database, 'application_id')).toBe(0);
         expect(database.prepare(`SELECT name FROM sqlite_schema
             WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL`).all()).toEqual([]);
     });
