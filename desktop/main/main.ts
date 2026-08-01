@@ -19,12 +19,36 @@ import {
     protocol,
     shell,
 } from 'electron';
-import {
-    create_json_file_state_store,
-    json_state_file_path,
-} from '../../src/json-file-state-store';
+import type { OpenedSqliteFileStateStore } from '../../src/sqlite-file-state-persistence';
 import { DesktopConfigStore, settings_file_path, type DesktopSettings } from './desktop-config';
-import { create_app_quit_coordinator, ViewerWindowManager } from './viewer-windows';
+import {
+    create_app_quit_coordinator,
+    ViewerWindowManager,
+    type AppQuitShutdownPort,
+} from './viewer-windows';
+import {
+    create_desktop_lifecycle,
+    create_desktop_state_backend,
+    launcher_steps_aside,
+    route_desktop_window_request,
+    type DesktopWindowRequest,
+} from './desktop-lifecycle';
+import {
+    desktop_state_diagnostics_directory,
+    desktop_state_error_log_line,
+    desktop_state_failure_log_line,
+    open_desktop_state_database,
+    preserve_desktop_state_database,
+} from './desktop-state-database';
+import {
+    create_state_recovery_flow,
+    state_recovery_button_layout,
+    state_recovery_choice_at,
+    state_recovery_wording,
+    type StateRecoveryChoice,
+    type StateRecoveryDetail,
+    type StateRecoveryDialogs,
+} from './state-recovery-dialog';
 import {
     resolve_theme_id,
     theme_payload,
@@ -98,16 +122,69 @@ let about_window: BrowserWindow | undefined;
 /** Open launcher windows; tracked so opening a file can replace the one it was
  *  launched from (a viewer window that opens a file keeps its own file). */
 const welcome_windows = new Set<BrowserWindow>();
-/** Files requested before the app was ready (macOS `open-file` fires early). */
-const pending_open_paths: string[] = [];
+
+/** The one startup/shutdown gate. Electron delivers `open-file`,
+ *  `second-instance`, and `activate` before the state backend exists — and can
+ *  keep delivering them while it is draining — so every request that would make
+ *  a viewer window goes through here rather than being tested against
+ *  `viewer_windows` directly. */
+const lifecycle = create_desktop_lifecycle();
+
+/**
+ * The open SQLite file-state backend: who may use it, and who closes it.
+ *
+ * All the ordering rules live in desktop-lifecycle.ts so they are testable
+ * without Electron — publishing into a drain closes the store instead, and a
+ * close that fails is reported as its own terminal outcome rather than as a
+ * retryable one it cannot actually be. The connection is released on the quit
+ * path only after every viewer window has finished its own renderer/backend
+ * fence, while *admission* stops at the barrier's first tick — see
+ * `create_app_quit_coordinator`.
+ */
+const state_backend = create_desktop_state_backend<OpenedSqliteFileStateStore>(
+    lifecycle,
+    () => viewer_windows?.stop_admission(),
+    () => viewer_windows?.resume_admission(),
+);
+
+/**
+ * The quit barrier's view of the backend.
+ *
+ * `begin` runs on entry to the barrier rather than after the window fence: a
+ * window created during the fence is never fenced (see `close_all`), and would
+ * survive the drain holding a controller over a closed connection. `abandon`
+ * is the way back for a barrier that ends before the connection closes.
+ */
+const quit_shutdown: AppQuitShutdownPort = {
+    begin: () => state_backend.begin_shutdown(),
+    abandon: () => state_backend.abandon_shutdown(),
+    drain: () => state_backend.drain(),
+    /** The category-free case: the store swallowed its own error, so there is
+     *  nothing here that could carry a path. The user is told because the quit
+     *  proceeds anyway — a close that failed cannot be re-attempted (the
+     *  underlying promise is memoized), so refusing to quit would only trade a
+     *  visible warning for an app that can be left only by force-quitting. */
+    report_close_failure: () => {
+        console.error(
+            'Table Viewer could not release its saved view settings cleanly while quitting.'
+            + ' The connection was closed; quitting continued because the release cannot be'
+            + ' retried.',
+        );
+    },
+};
 
 // Electron's first app.quit() is synchronous, while viewer close is fenced by
 // renderer and state-backend acknowledgements. Resume quit after those windows
-// close; the allow-quit guard admits the second before-quit event on macOS too.
+// close and the SQLite connection has been released; the allow-quit guard admits
+// the second before-quit event on macOS too.
+//
+// Constructed at module scope, before either the window manager or the state
+// backend exists, so every dependency is read through a closure over a mutable
+// module binding rather than captured now.
 const coordinate_app_quit = create_app_quit_coordinator(
-    () => viewer_windows?.has_windows() ?? false,
     () => viewer_windows?.close_all() ?? Promise.resolve(true),
     () => app.quit(),
+    quit_shutdown,
 );
 
 // The viewer page and the shared webview bundle are served from a privileged
@@ -166,20 +243,55 @@ function register_app_protocol(): void {
 }
 
 /**
- * Show each supported file in its own window. `source` is the window the request
- * came from, if any: a welcome window is only a launcher, so it steps aside once
- * it has produced a viewer window.
+ * Run one window-creating request: through the lifecycle gate first, then
+ * through the pure router.
+ *
+ * Every path that could put a window on screen goes through this one function —
+ * `open-file`, `second-instance`, `activate`, File → Open, File → New Window,
+ * and the argv replay at the end of `start_app`. Two separate reasons:
+ *
+ * - the gate. Before the state backend is open the request is buffered and
+ *   replayed; once the app is failing or draining it is dropped. A window whose
+ *   controller has no store to read from is worse than no window at all.
+ * - the routing. Which of those requests makes a launcher, which opens files,
+ *   and which is already satisfied by what is on screen is decided by
+ *   `route_desktop_window_request`, which is electron-free and under test.
+ *
+ * `source` is the window the request came from, if any: a launcher is only a
+ * launcher, so it steps aside once it has produced a viewer window.
  */
-function open_files(paths: string[], source?: BrowserWindow): void {
-    const files = paths.filter(is_supported_file);
-    if (files.length === 0) return;
-    if (!viewer_windows) {
-        // Before app-ready there is no state store yet; replay once there is.
-        pending_open_paths.push(...files);
-        return;
-    }
-    for (const file of files) viewer_windows.open_file(file);
-    if (source && welcome_windows.has(source) && !source.isDestroyed()) source.close();
+function submit_window_request(request: DesktopWindowRequest, source?: BrowserWindow): void {
+    lifecycle.submit(() => {
+        const action = route_desktop_window_request(request, {
+            hasViewerWindow: viewer_windows?.has_windows() ?? false,
+            hasLauncherWindow: welcome_windows.size > 0,
+        });
+        if (action.kind === 'none') return;
+        if (action.kind === 'show-launcher') {
+            const window = show_welcome_window();
+            if (action.focus) window.focus();
+            return;
+        }
+        if (!viewer_windows) return;
+        let opened_any = false;
+        for (const file of action.files) {
+            if (viewer_windows.open_file(file)) opened_any = true;
+        }
+        const from_launcher = source !== undefined && welcome_windows.has(source);
+        if (launcher_steps_aside(opened_any, from_launcher) && !source!.isDestroyed()) {
+            source!.close();
+        }
+    });
+}
+
+/** Show each supported file in its own window. Unsupported paths are dropped
+ *  here rather than in the router, which reasons about counts of files it is
+ *  being asked to open. */
+function open_files(paths: readonly string[], source?: BrowserWindow): void {
+    submit_window_request(
+        { kind: 'open-files', files: paths.filter(is_supported_file) },
+        source,
+    );
 }
 
 /** Zoom the window a View-menu item fired for (per-window, like a browser). */
@@ -358,7 +470,7 @@ function build_menu(): void {
                 {
                     label: 'New Window',
                     accelerator: 'CmdOrCtrl+N',
-                    click: () => void show_welcome_window(),
+                    click: () => submit_window_request({ kind: 'new-window' }),
                 },
                 {
                     label: 'Open…',
@@ -603,6 +715,97 @@ function watch_settings(): void {
     });
 }
 
+// --- state-backend recovery -------------------------------------------------
+
+/**
+ * The recovery flow's dialogs, bound to real electron `dialog` / `shell`.
+ *
+ * Every modal is parentless: these run before any window exists, from inside
+ * `whenReady` and before the first viewer or launcher is created.
+ */
+const state_recovery_dialogs: StateRecoveryDialogs = {
+    // Only the `dialog.showMessageBox` call itself lives here. The prose, the
+    // button row, and the index → choice mapping are all electron-free in
+    // state-recovery-dialog.ts, where they are under test.
+    async show_recovery(detail: StateRecoveryDetail): Promise<StateRecoveryChoice> {
+        const { message, detail: body } = state_recovery_wording(detail.kind);
+        const layout = state_recovery_button_layout(detail.canPreserve);
+        const { response } = await dialog.showMessageBox({
+            type: 'error',
+            message,
+            detail: body,
+            buttons: [...layout.buttons],
+            defaultId: layout.defaultId,
+            cancelId: layout.cancelId,
+            noLink: true,
+        });
+        return state_recovery_choice_at(layout, response);
+    },
+
+    /** The second gate on preservation. The affirmative button *is* the
+     *  attestation — there is no way for one process to verify from the inside
+     *  that no other process holds the database, so it is fail-closed and
+     *  explicit, following `run_physical_edit_protocol_setup`. */
+    async confirm_preserve(detail: StateRecoveryDetail): Promise<boolean> {
+        const attestation = 'I Attest All Table Viewer Windows and Apps Are Closed';
+        const { response } = await dialog.showMessageBox({
+            type: 'warning',
+            message: 'Set the existing saved view settings aside and start a fresh set?',
+            detail: 'Do this only after quitting every other Table Viewer window and every'
+                + ' other Table Viewer app on this computer. Moving them while another process'
+                + ' still has them open can leave both copies unusable. Nothing is deleted:'
+                + ' the existing set is moved to a recovery folder next to it and kept for'
+                + ' troubleshooting, and Table Viewer starts a new empty one.'
+                // Only for a move that really was started. `leftover-setup` is
+                // deliberately not included: no move was ever attempted there,
+                // and claiming to resume one would be a false statement about
+                // what is about to happen.
+                + (detail.kind === 'interrupted'
+                    ? ' This resumes the move that was interrupted earlier.'
+                    : ''),
+            buttons: ['Cancel', attestation],
+            // Negative by default and on dismissal: an accidental Return or Escape
+            // must never be the attestation.
+            defaultId: 0,
+            cancelId: 0,
+            noLink: true,
+        });
+        return response === 1;
+    },
+
+    async open_folder(directory: string): Promise<void> {
+        // The one callback that receives a path, and only because the OS needs it
+        // to reveal the folder — it is never rendered as text.
+        await shell.openPath(directory);
+    },
+
+    /** Deliberately does not claim nothing was moved.
+     *
+     *  Setting the settings aside is a multi-step move, and it can fail partway
+     *  — after which some members really are already in the recovery folder.
+     *  The honest invariants are the ones the state machine actually guarantees:
+     *  the move did not *complete*, nothing was deleted, and the next attempt
+     *  resumes this same unfinished move rather than starting a second one. As
+     *  everywhere else in this flow, no path, filename, or SQL text appears.
+     *
+     *  Takes no argument, matching the port: the prose is fixed, and every
+     *  invariant it states holds for every kind that can reach it. */
+    async show_error(): Promise<void> {
+        await dialog.showMessageBox({
+            type: 'error',
+            message: 'Table Viewer could not finish setting the existing saved view settings'
+                + ' aside.',
+            detail: 'The move did not complete. Some of the settings may already have been'
+                + ' moved into a recovery folder, and nothing was deleted. Table Viewer will'
+                + ' resume this same unfinished move the next time you try, so it will not'
+                + ' start a second one. This usually means the location ran out of space, is'
+                + ' not writable, or another process still has the settings open.',
+            buttons: ['OK'],
+            noLink: true,
+        });
+    },
+};
+
 // --- app lifecycle ----------------------------------------------------------
 
 // Test hook: the Playwright smoke test points userData at a temp directory so
@@ -619,11 +822,21 @@ if (!got_lock) {
 } else {
     app.on('before-quit', coordinate_app_quit);
 
+    // Buffered like every other window-making request: a second launch can arrive
+    // while this instance is still opening SQLite, and it must neither be dropped
+    // nor make a launcher during the quit drain. What it does once admitted — open
+    // its files, or behave like File → New Window and focus — is
+    // `route_desktop_window_request`'s `second-instance` arm.
+    //
+    // The argv is resolved here rather than inside the buffered work: the paths
+    // are relative to the *second* process's cwd, which is information only this
+    // event carries.
     app.on('second-instance', (_event, argv, working_directory) => {
-        const files = file_args(argv.slice(1), working_directory);
-        // A second launch with no file behaves like File → New Window.
-        if (files.length === 0) show_welcome_window().focus();
-        else open_files(files);
+        submit_window_request({
+            kind: 'second-instance',
+            // Already filtered to supported extensions by `file_args`.
+            files: file_args(argv.slice(1), working_directory),
+        });
     });
 
     // macOS: Finder "Open with", dock drops, and `open` deliver open-file
@@ -633,7 +846,22 @@ if (!got_lock) {
         open_files([file_path]);
     });
 
-    void app.whenReady().then(() => {
+    /**
+     * Bring the app up, in two stages.
+     *
+     * Everything that does not need a state backend comes first — the settings
+     * store, the appearance preference, the protocol handler, the IPC channels,
+     * the settings watcher, the menu, and the nativeTheme listener. That order is
+     * load-bearing: a recovery modal below may be the very first thing the user
+     * sees, and it has to be shown by an app that is already themed and otherwise
+     * functional rather than one that is still half-built.
+     *
+     * Only then is the SQLite file-state database opened. It is the viewer's
+     * authority, not a cache, so there is no silent fallback: a failure goes to
+     * the recovery conversation, and a user who chooses to quit gets no window at
+     * all.
+     */
+    async function start_app(): Promise<void> {
         config_store = new DesktopConfigStore(
             settings_file_path(app.getPath('userData')),
         );
@@ -644,30 +872,125 @@ if (!got_lock) {
         watch_settings();
         build_menu();
         nativeTheme.on('updated', broadcast_theme);
-        viewer_windows = new ViewerWindowManager(
-            create_json_file_state_store(
-                json_state_file_path(app.getPath('userData')),
+
+        const user_data_dir = app.getPath('userData');
+        // The one place a state-open failure is logged, so every attempt — the
+        // first and each retry the recovery flow makes — leaves a record. This is
+        // where `failure.operation` goes: it names the internal stage that failed,
+        // which is the only thing that makes two identically-categorized failures
+        // distinguishable afterwards, and it is safe to emit because it is already
+        // narrowed upstream to a short identifier. It never reaches a modal — see
+        // `StateRecoveryFailure`.
+        const open_state = async () => {
+            const result = await open_desktop_state_database(
+                user_data_dir,
+                __APP_VERSION__,
                 () => config_store.settings().maxStoredFiles,
-            ),
-            config_store,
-            VIEWER_PRELOAD,
+            );
+            if (result.type === 'failed') {
+                console.error(
+                    'Table Viewer could not open its saved view settings'
+                    + ` (${desktop_state_failure_log_line(result.failure)})`,
+                );
+            }
+            return result;
+        };
+        const first_attempt = await open_state();
+        let opened: OpenedSqliteFileStateStore;
+        if (first_attempt.type === 'opened') {
+            opened = first_attempt.opened;
+        } else {
+            const flow = create_state_recovery_flow<OpenedSqliteFileStateStore>({
+                dialogs: state_recovery_dialogs,
+                open: open_state,
+                preserve: () => preserve_desktop_state_database(
+                    user_data_dir,
+                    // The attestation the user gave in `confirm_preserve`, which
+                    // the flow only reaches on an affirmative answer.
+                    { allProcessesClosed: true },
+                ),
+                diagnostics_directory: () => desktop_state_diagnostics_directory(user_data_dir),
+            });
+            const outcome = await flow.run(first_attempt.failure);
+            if (outcome.type === 'quit') {
+                // Terminal: the buffer is dropped permanently, so a queued
+                // `open-file` cannot make a storeless window on the way out. No
+                // drain either — there is nothing open to close.
+                lifecycle.become_failed();
+                app.exit(0);
+                return;
+            }
+            opened = outcome.opened;
+        }
+
+        // Cmd-Q can arrive while the open above is still in flight: the drain
+        // then runs with nothing to close, and a store published afterwards
+        // would never be closed — stranding its writer-session row and leases
+        // and possibly leaving a hot journal for the next launch. `publish`
+        // closes it instead and answers false, and no window is created.
+        if (!await state_backend.publish(opened)) return;
+        viewer_windows = new ViewerWindowManager(opened.store, config_store, VIEWER_PRELOAD);
+        // After the window manager exists, and before the argv files below: the
+        // flush releases whatever `open-file` / `second-instance` / `activate`
+        // buffered during startup, and that work looks for a live
+        // `viewer_windows`.
+        lifecycle.become_ready();
+
+        // This launch's own files, or — when it has none and nothing else has
+        // produced a window, a buffered open-file from a Finder double-click
+        // included — a launcher. Both are the `startup` arm of the router, and
+        // both go through the gate like every other window-creating path, so a
+        // drain that began during the flush above cannot be followed by a new
+        // window.
+        submit_window_request({
+            kind: 'startup',
+            files: file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
+        });
+    }
+
+    // `start_app` is async, and an unhandled rejection in the main process is
+    // fatal — with no window on screen it would be a silent exit. Report it and
+    // close the gate instead, so nothing buffered runs against a backend that
+    // never arrived.
+    void app.whenReady().then(start_app).catch(async (error) => {
+        lifecycle.become_failed();
+        // A category, never the error. This catch is reachable from a throw out
+        // of `viewer_windows.open_file(file)` or `show_welcome_window()`, which
+        // run synchronously inside `start_app`, and those errors carry a CSV file
+        // path — as does any raw `NodeJS.ErrnoException`, in both `.path` and
+        // `.message`. Logging the object would put a user's filenames and the
+        // location of their state database into the terminal and into any crash
+        // report that scrapes it.
+        console.error(`Table Viewer failed to start (${desktop_state_error_log_line(error)})`);
+        dialog.showErrorBox(
+            'Table Viewer could not start',
+            'An unexpected error prevented Table Viewer from starting. Please try again.',
         );
-        const files = [
-            ...pending_open_paths.splice(0),
-            ...file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
-        ];
-        if (files.length > 0) open_files(files);
-        else show_welcome_window();
+        // The throw may have happened *after* the store was published, and
+        // `app.exit()` does not fire `before-quit` — so without this the process
+        // would exit with a live SQLite connection, its writer-session row and
+        // leases still claimed and possibly a hot journal left behind. Best
+        // effort: exiting is the outcome either way, and a close that also fails
+        // must not turn a reported startup failure into a silent hang.
+        // No try/catch: `drain` answers with a value rather than rejecting,
+        // because a close that failed cannot be re-attempted (the underlying
+        // promise is memoized). Either way the process exits — a close that also
+        // fails must not turn a reported startup failure into a silent hang.
+        if ((await state_backend.drain()).type === 'close-failed') {
+            console.error('Table Viewer could not release its state backend while failing to start.');
+        }
+        app.exit(1);
     });
 
     // macOS dock click with nothing to work in. Preferences deliberately does not
     // count: it is a utility window, so activating with only it open should still
     // produce a launcher.
+    //
+    // Buffered rather than dropped when it arrives before ready: `activate` can
+    // fire during startup, and the user who clicked the dock icon is asking for a
+    // window either way — `start_app` checks for one before adding its own.
     app.on('activate', () => {
-        if (!app.isReady()) return;
-        const has_document_window = (viewer_windows?.has_windows() ?? false)
-            || welcome_windows.size > 0;
-        if (!has_document_window) show_welcome_window();
+        submit_window_request({ kind: 'activate' });
     });
 
     app.on('window-all-closed', () => {
