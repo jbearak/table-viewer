@@ -780,6 +780,35 @@ describe('physical resource locks', () => {
         })).toBe(1);
     });
 
+    it('binds release-pin reconciliation to one descriptor and preserves a replacement path', async () => {
+        let pin = '';
+        let replaced = false;
+        const replacement = Buffer.from('replacement release pin');
+        const manager = new PhysicalResourceLockManager({
+            lockRoot,
+            onReleasePinCandidateRead(candidate) {
+                if (candidate !== pin || replaced) return;
+                replaced = true;
+                fs.unlinkSync(candidate);
+                fs.writeFileSync(candidate, replacement, { mode: 0o600 });
+            },
+        });
+        const lock = await manager.acquire(target);
+        expect(lock).not.toBeNull();
+        const memberName = fs.readdirSync(lockRoot).find((name) => name.endsWith('.lock'))!;
+        const member = path.join(lockRoot, memberName);
+        pin = path.join(lockRoot, `.release-v1-${memberName}-${lock!.hostLockId}`);
+        fs.linkSync(member, pin);
+
+        expect(() => manager.discover_attested_stale_locks({
+            allTableViewerProcessesClosed: true,
+        })).toThrow(/release pin changed/);
+
+        expect(replaced).toBe(true);
+        expect(fs.readFileSync(pin)).toEqual(replacement);
+        expect(JSON.parse(fs.readFileSync(member, 'utf8')).hostLockId).toBe(lock!.hostLockId);
+    });
+
     it('never unlinks a replacement owner after exact-token release has pinned the old member', async () => {
         const replacementToken = 'e'.repeat(64);
         let member = '';

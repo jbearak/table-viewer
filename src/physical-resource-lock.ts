@@ -155,6 +155,8 @@ export interface PhysicalLockManagerOptions {
     /** Test/host crash instrumentation after a release candidate is identity-pinned. */
     readonly onReleaseCandidatePinned?: (memberPath: string) => void;
     readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
+    /** Test-only race instrumentation after release-pin bytes are read from a pinned descriptor. */
+    readonly onReleasePinCandidateRead?: (pinPath: string) => void;
     /** Test-only race instrumentation after marker bytes are read from a pinned descriptor. */
     readonly onActivationMarkerCandidateRead?: () => void;
     readonly filesystemType?: FilesystemTypeInspector;
@@ -633,6 +635,7 @@ export class PhysicalResourceLockManager {
     private readonly onAcquisitionEvent?: (event: PhysicalLockAcquisitionEvent) => void;
     private readonly onReleaseCandidatePinned?: (memberPath: string) => void;
     private readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
+    private readonly onReleasePinCandidateRead?: (pinPath: string) => void;
     private readonly onActivationMarkerCandidateRead?: () => void;
     private readonly filesystemType?: FilesystemTypeInspector;
     private readonly targetFilesystemType?: FilesystemTypeInspector;
@@ -652,6 +655,7 @@ export class PhysicalResourceLockManager {
         this.onAcquisitionEvent = options.onAcquisitionEvent;
         this.onReleaseCandidatePinned = options.onReleaseCandidatePinned;
         this.onReleaseMemberUnlinked = options.onReleaseMemberUnlinked;
+        this.onReleasePinCandidateRead = options.onReleasePinCandidateRead;
         this.onActivationMarkerCandidateRead = options.onActivationMarkerCandidateRead;
         this.filesystemType = options.filesystemType;
         this.targetFilesystemType = options.targetFilesystemType;
@@ -1109,14 +1113,16 @@ export class PhysicalResourceLockManager {
             assert_same_root(this.lockRoot, rootIdentity);
             const pinPath = path.join(this.lockRoot, pinName);
             const memberPath = path.join(this.lockRoot, match[1]);
+            let pinDescriptor: number | undefined;
             try {
-                const pinStat = fs.lstatSync(pinPath, { bigint: true });
-                if (!pinStat.isFile() || pinStat.isSymbolicLink()
-                    || pinStat.size > BigInt(MAX_METADATA_BYTES)) {
+                const noFollow = process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW;
+                pinDescriptor = fs.openSync(pinPath, fs.constants.O_RDONLY | noFollow);
+                const pinStat = fs.fstatSync(pinDescriptor, { bigint: true });
+                if (!pinStat.isFile() || pinStat.size > BigInt(MAX_METADATA_BYTES)) {
                     throw new Error('Physical release pin is invalid');
                 }
                 assert_private_directory(pinStat);
-                const metadata = parse_lock_metadata(fs.readFileSync(pinPath));
+                const metadata = parse_lock_metadata(fs.readFileSync(pinDescriptor));
                 if (!metadata || metadata.hostLockId !== match[2]
                     || (authority?.physicalResourceLockKey !== null
                         && authority?.physicalResourceLockKey !== undefined
@@ -1124,21 +1130,55 @@ export class PhysicalResourceLockManager {
                     || !metadata.lockMemberNames.includes(match[1])) {
                     throw new Error('Physical release pin metadata is invalid');
                 }
+                this.onReleasePinCandidateRead?.(pinPath);
+                if (!exact_file_still_present(pinPath, pinStat)) {
+                    throw new Error('Physical release pin changed during reconciliation');
+                }
                 try {
                     const memberStat = fs.lstatSync(memberPath, { bigint: true });
                     if (memberStat.dev !== pinStat.dev || memberStat.ino !== pinStat.ino) {
                         throw new Error('Physical release pin conflicts with a replacement owner');
                     }
-                    fs.unlinkSync(pinPath);
                 } catch (error) {
                     if (!is_node_error(error) || error.code !== 'ENOENT') throw error;
-                    fs.renameSync(pinPath, memberPath);
+                    // Restore the authoritative member as another hard link first. The
+                    // descriptor identity check below prevents a substituted pin from
+                    // lending its pathname to a replacement owner. Durably install the
+                    // member before removing the sole recovery pin.
+                    try {
+                        fs.linkSync(pinPath, memberPath);
+                    } catch (linkError) {
+                        if (!is_node_error(linkError) || linkError.code !== 'EEXIST') throw linkError;
+                    }
+                    const restored = fs.lstatSync(memberPath, { bigint: true });
+                    if (!restored.isFile() || restored.isSymbolicLink()
+                        || restored.dev !== pinStat.dev || restored.ino !== pinStat.ino) {
+                        throw new Error('Physical release pin conflicts with a replacement owner');
+                    }
+                    flush_directory(this.lockRoot, this.durableDirectoryOperations);
+                    assert_same_root(this.lockRoot, rootIdentity);
+                    mutated = true;
                 }
-                mutated = true;
+                // Do not let descriptor-authorized metadata act on a subsequently
+                // substituted pathname. A concurrent reconciler may already have
+                // removed this exact pin; any other identity is a hard failure.
+                if (exact_file_still_present(pinPath, pinStat)) {
+                    const linksBeforeUnlink = fs.fstatSync(pinDescriptor, { bigint: true }).nlink;
+                    fs.unlinkSync(pinPath);
+                    const linksAfterUnlink = fs.fstatSync(pinDescriptor, { bigint: true }).nlink;
+                    if (linksAfterUnlink >= linksBeforeUnlink) {
+                        throw new Error('Physical release pin changed during reconciliation');
+                    }
+                    mutated = true;
+                } else if (fs.existsSync(pinPath)) {
+                    throw new Error('Physical release pin changed during reconciliation');
+                }
             } catch (error) {
                 // Another cold reconciler may have completed this exact pin after
                 // the directory snapshot. A vanished pin needs no further work.
                 if (!is_node_error(error) || error.code !== 'ENOENT') throw error;
+            } finally {
+                if (pinDescriptor !== undefined) fs.closeSync(pinDescriptor);
             }
         }
         if (mutated) {
