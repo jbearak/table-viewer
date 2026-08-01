@@ -171,6 +171,21 @@ test('opens each file in its own window and renders both grids', async () => {
     expect((await window_titles()).map(file_of).sort()).toEqual(['basic.csv', 'basic.xlsx']);
 });
 
+// The viewer's state authority is a real SQLite database now, and it is opened
+// *before* the window manager exists — so by the time a grid has painted, the file
+// must already be on disk with a v1 header in it. An empty or missing file here
+// would mean a viewer window got attached to something other than the database.
+// (Both windows are waited for in beforeAll, so the painting is already done.)
+test('the SQLite file-state database is created before any viewer content', async () => {
+    const database = path.join(user_data_dir, 'state', 'file-state.sqlite3');
+    await expect
+        .poll(() => (fs.existsSync(database) ? fs.statSync(database).size : 0), { timeout: 15_000 })
+        .toBeGreaterThan(0);
+    // A SQLite file, not merely a non-empty one the app happened to touch.
+    expect(fs.readFileSync(database).subarray(0, 15).toString('latin1'))
+        .toBe('SQLite format 3');
+});
+
 test('windows are separately sized and positioned', async () => {
     const bounds = await app.evaluate(({ BrowserWindow }) =>
         BrowserWindow.getAllWindows().map((window) => window.getBounds()));

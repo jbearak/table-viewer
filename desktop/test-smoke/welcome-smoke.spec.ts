@@ -117,3 +117,75 @@ test('File → New Window opens another launcher', async () => {
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[1].close());
     await expect.poll(() => welcome_pages().length, { timeout: 15_000 }).toBe(1);
 });
+
+// Quitting from the launcher — no viewer window open at all — still has to drain
+// and close the SQLite connection: the state backend holds a writer-session row
+// and its leases whether or not a file is open.
+//
+// The observable signature is the shared reader token, not a journal. Under
+// `journal_mode = DELETE` a rollback journal exists only for the duration of a
+// write transaction, so an idle launcher-only session never has one at all — an
+// absent-journal assertion would pass with the drain deleted outright, and pass
+// after a hard kill too. The gate's reader token is the thing that actually
+// distinguishes a clean close: `open_sqlite_file_state_store` writes a
+// `<uuid>.reader` into `state/.file-state.sqlite3.recovery-gate/readers/` for the
+// life of the connection (the gate layout is built by `gate_paths` in
+// src/sqlite-open-recovery.ts), and only `close()` removes it. A killed process
+// leaves it behind, where it becomes the residue that makes the next launch's
+// recovery wait — which is precisely the outcome the drain exists to avoid.
+//
+// Its own short-lived app with its own userData rather than the shared one above:
+// this test has to quit the app it is asserting about, and `afterAll` runs after
+// every test in the file.
+test('quitting drains and releases the state database reader token', async () => {
+    const own_user_data = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-quit-smoke-'));
+    const own_app = await electron.launch({
+        args: [main_js],
+        cwd: repo_dir,
+        env: { ...process.env, TABLE_VIEWER_USER_DATA_DIR: own_user_data },
+    });
+    try {
+        const database = path.join(own_user_data, 'state', 'file-state.sqlite3');
+        const readers = path.join(
+            path.dirname(database),
+            `.${path.basename(database)}.recovery-gate`,
+            'readers',
+        );
+        /** Reader tokens currently held against this database. */
+        const reader_tokens = () => (fs.existsSync(readers)
+            ? fs.readdirSync(readers).filter((name) => name.endsWith('.reader'))
+            : []);
+        // The launcher is up and the database is open with its token held, so the
+        // release asserted below is about a clean shutdown rather than about
+        // nothing having run.
+        await expect
+            .poll(
+                () => own_app.windows().filter((page) => page.url().endsWith('welcome.html')).length,
+                { timeout: 30_000 },
+            )
+            .toBe(1);
+        await expect
+            .poll(() => fs.existsSync(database), { timeout: 30_000 })
+            .toBe(true);
+        await expect
+            .poll(() => reader_tokens().length, { timeout: 30_000 })
+            .toBe(1);
+
+        // The real quit path (before-quit → close fence → drain), not a window
+        // close: `app.close()` alone would not exercise the guarded quit.
+        await own_app.evaluate(({ app }) => app.quit()).catch(() => {
+            // The quit can tear the harness connection down before the call
+            // resolves; the token assertion below is the real signal.
+        });
+        await expect
+            .poll(() => reader_tokens(), { timeout: 30_000 })
+            .toEqual([]);
+        // And the database itself is still there — a drain, never a delete.
+        expect(fs.existsSync(database)).toBe(true);
+    } finally {
+        await own_app.close().catch(() => {
+            // Already gone: app.quit() above is the expected way this app ends.
+        });
+        fs.rmSync(own_user_data, { recursive: true, force: true });
+    }
+});
