@@ -7,6 +7,7 @@ import {
     DesktopConfigStore,
     MAX_FONT_SIZE_PX,
     MIN_FONT_SIZE_PX,
+    canonical_existing_path,
     sanitize_settings,
     settings_file_path,
 } from '../main/desktop-config';
@@ -192,6 +193,48 @@ describe('desktop-config', () => {
         expect(port.font_family()).toBe(`Monaco, ${MONO_FONT}`);
         store.update({ fontFamily: '   ' });
         expect(port.font_family()).toBeNull();
+    });
+});
+
+describe('userData path canonicalization', () => {
+    let dir: string;
+    beforeEach(() => {
+        dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-userdata-')));
+    });
+    afterEach(() => {
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('collapses aliased spellings of one directory onto one value', () => {
+        // Why this matters: `app.requestSingleInstanceLock()` is keyed on the
+        // userData path Electron was given, not on the directory it resolves to,
+        // so two launches of `TABLE_VIEWER_USER_DATA_DIR` naming the same
+        // directory differently each won the lock and then coordinated through the
+        // same `state/` tree while each believed it was alone — after which the
+        // attested "Set Aside and Start Fresh" reclaims the peer's reader token by
+        // exact id and moves the database out from under its live handle.
+        const real = path.join(dir, 'real');
+        fs.mkdirSync(real);
+        const link = path.join(dir, 'link');
+        fs.symlinkSync(real, link);
+
+        expect(canonical_existing_path(link)).toBe(real);
+        expect(canonical_existing_path(path.join(dir, '.', 'real')))
+            .toBe(canonical_existing_path(real));
+        expect(canonical_existing_path(path.join(real, 'x', '..')))
+            .toBe(canonical_existing_path(real));
+    });
+
+    it('resolves the existing prefix of a path that does not exist yet', () => {
+        // A first launch names a userData directory Electron has yet to create, and
+        // `realpath` on a missing path throws — refusing to start would be a worse
+        // outcome than an unresolved name, so only the existing prefix is resolved
+        // and the remainder is appended.
+        const link = path.join(dir, 'link');
+        fs.symlinkSync(dir, link);
+
+        expect(canonical_existing_path(path.join(link, 'not', 'created', 'yet')))
+            .toBe(path.join(dir, 'not', 'created', 'yet'));
     });
 });
 

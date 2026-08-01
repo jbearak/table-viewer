@@ -27,6 +27,45 @@ export function settings_file_path(user_data_dir: string): string {
     return path.join(user_data_dir, SETTINGS_FILE_NAME);
 }
 
+/**
+ * The physical spelling of a userData directory, for the paths that must agree
+ * about identity rather than merely about text.
+ *
+ * `app.requestSingleInstanceLock()` is keyed on the userData path Electron was
+ * given, not on the directory it resolves to, so two launches that name one
+ * directory differently — through a symlink, a `.`-relative path, or a
+ * case-different spelling on a case-insensitive volume — each win the lock and
+ * then coordinate through the same `state/` tree while each believes it is alone.
+ * That matters more here than it would for a cache, because "Set Aside and Start
+ * Fresh" carries an all-processes-closed attestation under which the shared
+ * backend will reclaim a peer's reader token by exact id and move the database out
+ * from under its live handle.
+ *
+ * Only the *existing* prefix is resolved, and the remainder is appended
+ * unresolved: on a first launch the directory does not exist yet, and `realpath`
+ * on a missing path throws — refusing to start over a directory Electron is about
+ * to create would be a worse outcome than an unresolved name. Any failure falls
+ * back to the input for the same reason: this narrows an aliasing hole, it is not
+ * a precondition for running.
+ */
+export function canonical_existing_path(target: string): string {
+    const absolute = path.resolve(target);
+    let existing = absolute;
+    const missing: string[] = [];
+    for (;;) {
+        try {
+            return path.join(fs.realpathSync.native(existing), ...missing);
+        } catch {
+            const parent = path.dirname(existing);
+            // The filesystem root itself did not resolve: nothing above it left
+            // to try, so the caller gets the name it gave us.
+            if (parent === existing) return absolute;
+            missing.unshift(path.basename(existing));
+            existing = parent;
+        }
+    }
+}
+
 export interface DesktopSettings {
     /** Empty string means "use the theme default font". */
     fontFamily: string;

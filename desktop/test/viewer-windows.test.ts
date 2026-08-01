@@ -132,12 +132,39 @@ vi.mock('../../src/viewer-controller', () => ({
 import {
     create_app_quit_coordinator,
     ViewerWindowManager,
+    type AppQuitShutdownPort,
 } from '../main/viewer-windows';
+import {
+    create_desktop_lifecycle,
+    create_desktop_state_backend,
+    type DesktopDrainOutcome,
+} from '../main/desktop-lifecycle';
 
 function deferred() {
     let resolve!: () => void;
     const promise = new Promise<void>((done) => { resolve = done; });
     return { promise, resolve };
+}
+
+/**
+ * The quit barrier's shutdown port, with every call recorded in one ordered log.
+ *
+ * One log rather than four spies because the properties under test are all
+ * *orderings*: admission must close before the window fence rather than after
+ * it, and it must reopen only on the paths that leave the app running.
+ */
+function shutdown_port(drain: () => Promise<DesktopDrainOutcome>) {
+    const calls: string[] = [];
+    const port: AppQuitShutdownPort = {
+        begin: vi.fn(() => { calls.push('begin'); }),
+        abandon: vi.fn(() => { calls.push('abandon'); }),
+        drain: vi.fn(async () => {
+            calls.push('drain');
+            return drain();
+        }),
+        report_close_failure: vi.fn(() => { calls.push('report'); }),
+    };
+    return { ...port, calls };
 }
 
 function controlled_deadlines() {
@@ -610,7 +637,6 @@ describe('application quit coordinator', () => {
             return true;
         });
         const before_quit = create_app_quit_coordinator(
-            () => true,
             close_viewers,
             resume_quit,
         );
@@ -639,7 +665,6 @@ describe('application quit coordinator', () => {
             .mockResolvedValueOnce(true);
         const resume_quit = vi.fn();
         const before_quit = create_app_quit_coordinator(
-            () => true,
             close_viewers,
             resume_quit,
         );
@@ -664,7 +689,6 @@ describe('application quit coordinator', () => {
             .mockResolvedValueOnce(true);
         const resume_quit = vi.fn();
         const before_quit = create_app_quit_coordinator(
-            () => true,
             close_viewers,
             resume_quit,
         );
@@ -677,5 +701,524 @@ describe('application quit coordinator', () => {
         before_quit({ preventDefault: vi.fn() });
         await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledTimes(2));
         await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+    });
+
+    // Regression guard for the removed "no viewer windows, quit immediately"
+    // fast path: with a real SQLite connection open, a welcome-window-only quit
+    // still has to release the connection, writer session, and leases.
+    //
+    // Wired to a *real* manager with no windows rather than a stub, because that
+    // is the property the removed has-windows parameter used to be responsible
+    // for: `close_all()` over an empty list resolves true, so the window stage is
+    // a no-op that still lets the drain run, and no separate emptiness probe is
+    // needed to arrange that.
+    it('drains the state backend even with no viewer windows open', async () => {
+        const draining = deferred();
+        const viewer_manager = manager();
+        const resume_quit = vi.fn();
+        const shutdown = shutdown_port(async () => {
+            await draining.promise;
+            return { type: 'closed' };
+        });
+        const before_quit = create_app_quit_coordinator(
+            () => viewer_manager.close_all(),
+            resume_quit,
+            shutdown,
+        );
+        expect(viewer_manager.has_windows()).toBe(false);
+
+        const first = { preventDefault: vi.fn() };
+        before_quit(first);
+        expect(first.preventDefault).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(shutdown.drain).toHaveBeenCalledOnce());
+        expect(resume_quit).not.toHaveBeenCalled();
+        // No window was invented to satisfy the empty close stage.
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+
+        draining.resolve();
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        // Admission closes first and is never taken back on a completed quit.
+        expect(shutdown.calls).toEqual(['begin', 'drain']);
+        expect(shutdown.report_close_failure).not.toHaveBeenCalled();
+
+        const resumed = { preventDefault: vi.fn() };
+        before_quit(resumed);
+        expect(resumed.preventDefault).not.toHaveBeenCalled();
+        expect(shutdown.drain).toHaveBeenCalledOnce();
+        expect(resume_quit).toHaveBeenCalledOnce();
+    });
+
+    it('stops admission, then closes viewer windows, then drains the backend', async () => {
+        // The whole ordering in one log. `stop:admission` first is the fix for the
+        // window-created-during-the-fence hole: `close_all` snapshots its entry
+        // list, so a window admitted after `close:start` is never fenced, survives
+        // the drain over a closed connection, and then vetoes every later quit.
+        const closing = deferred();
+        const draining = deferred();
+        const calls: string[] = [];
+        const close_viewers = vi.fn(async () => {
+            calls.push('close:start');
+            await closing.promise;
+            calls.push('close:done');
+            return true;
+        });
+        const shutdown: AppQuitShutdownPort = {
+            begin: vi.fn(() => { calls.push('stop:admission'); }),
+            abandon: vi.fn(() => { calls.push('resume:admission'); }),
+            drain: vi.fn(async (): Promise<DesktopDrainOutcome> => {
+                calls.push('drain:start');
+                await draining.promise;
+                calls.push('drain:done');
+                return { type: 'closed' };
+            }),
+            report_close_failure: vi.fn(() => { calls.push('report'); }),
+        };
+        const resume_quit = vi.fn(() => { calls.push('resume'); });
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        // Synchronous with the event: there is no tick between the before-quit and
+        // the refusal for an `open-file` to slip through.
+        expect(calls).toEqual(['stop:admission', 'close:start']);
+        expect(shutdown.drain).not.toHaveBeenCalled();
+
+        closing.resolve();
+        await vi.waitFor(() => expect(shutdown.drain).toHaveBeenCalledOnce());
+        expect(calls).toEqual(['stop:admission', 'close:start', 'close:done', 'drain:start']);
+        expect(resume_quit).not.toHaveBeenCalled();
+
+        draining.resolve();
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(calls).toEqual([
+            'stop:admission', 'close:start', 'close:done', 'drain:start', 'drain:done', 'resume',
+        ]);
+        expect(shutdown.abandon).not.toHaveBeenCalled();
+    });
+
+    it('reports a failed close and quits rather than trapping the app', async () => {
+        // A rejected close is terminal, not retryable: `OpenedSqliteFileStateStore`
+        // memoizes its close promise, so a second attempt returns the same settled
+        // rejection without touching the connection. Blocking the quit therefore
+        // bought nothing and cost everything — every later Cmd-Q re-entered a
+        // barrier that could only fail identically, over an already-closed
+        // connection, leaving force-quit as the only exit.
+        const close_viewers = vi.fn(async () => true);
+        const shutdown = shutdown_port(async () => ({ type: 'close-failed' }));
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            shutdown,
+        );
+
+        const first = { preventDefault: vi.fn() };
+        before_quit(first);
+        expect(first.preventDefault).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        // Visible rather than silent: the connection state is whatever the failed
+        // close left it, and the user is told, but the app is quittable.
+        expect(shutdown.report_close_failure).toHaveBeenCalledOnce();
+        expect(shutdown.calls).toEqual(['begin', 'drain', 'report']);
+
+        // And the resumed quit is admitted, which is the property the old
+        // never-latched `allow_quit` destroyed.
+        const resumed = { preventDefault: vi.fn() };
+        before_quit(resumed);
+        expect(resumed.preventDefault).not.toHaveBeenCalled();
+        expect(shutdown.drain).toHaveBeenCalledOnce();
+    });
+
+    it('restores admission and stays retryable when the close fence rejects', async () => {
+        const close_viewers = vi.fn()
+            .mockRejectedValueOnce(new Error('close fence failed'))
+            .mockResolvedValueOnce(true);
+        const shutdown = shutdown_port(async () => ({ type: 'closed' }));
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(shutdown.abandon).toHaveBeenCalledOnce());
+        expect(shutdown.drain).not.toHaveBeenCalled();
+        expect(resume_quit).not.toHaveBeenCalled();
+        // The app is still up, so it must still open files.
+        expect(shutdown.calls).toEqual(['begin', 'abandon']);
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(shutdown.calls).toEqual(['begin', 'abandon', 'begin', 'drain']);
+    });
+
+    it('never drains the backend when a viewer vetoes its close, and re-admits', async () => {
+        const close_viewers = vi.fn()
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
+        const shutdown = shutdown_port(async () => ({ type: 'closed' }));
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(shutdown.abandon).toHaveBeenCalledOnce());
+
+        // The connection stays open — a window still holds an attached controller
+        // — and admission goes back, because refusing to open files in an app the
+        // user just chose to keep running is a bug of its own.
+        expect(shutdown.drain).not.toHaveBeenCalled();
+        expect(resume_quit).not.toHaveBeenCalled();
+        expect(shutdown.calls).toEqual(['begin', 'abandon']);
+
+        // Still retryable, and the retry gets its own barrier.
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(shutdown.calls).toEqual(['begin', 'abandon', 'begin', 'drain']);
+    });
+
+    it('shares one barrier, and one admission stop, across concurrent before-quits', async () => {
+        const draining = deferred();
+        const shutdown = shutdown_port(async () => {
+            await draining.promise;
+            return { type: 'closed' };
+        });
+        const close_viewers = vi.fn(async () => true);
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            shutdown,
+        );
+
+        const first = { preventDefault: vi.fn() };
+        const duplicate = { preventDefault: vi.fn() };
+        before_quit(first);
+        before_quit(duplicate);
+        expect(first.preventDefault).toHaveBeenCalledOnce();
+        expect(duplicate.preventDefault).toHaveBeenCalledOnce();
+        expect(close_viewers).toHaveBeenCalledOnce();
+        // macOS delivers a second before-quit; both must join the one barrier
+        // rather than each closing admission and each racing a drain.
+        expect(shutdown.begin).toHaveBeenCalledOnce();
+
+        await vi.waitFor(() => expect(shutdown.drain).toHaveBeenCalledOnce());
+        const late = { preventDefault: vi.fn() };
+        before_quit(late);
+        expect(late.preventDefault).toHaveBeenCalledOnce();
+        expect(shutdown.drain).toHaveBeenCalledOnce();
+        expect(shutdown.begin).toHaveBeenCalledOnce();
+
+        draining.resolve();
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(shutdown.calls).toEqual(['begin', 'drain']);
+        expect(close_viewers).toHaveBeenCalledOnce();
+    });
+
+    /** The real backend, wired to a real manager, behind the barrier — the shape
+     *  main.ts builds. Only the store is a fake. */
+    function real_shutdown(store: { close(): Promise<void> }) {
+        const lifecycle = create_desktop_lifecycle();
+        const viewer_manager = manager();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => viewer_manager.stop_admission(),
+            () => viewer_manager.resume_admission(),
+        );
+        const reported: number[] = [];
+        const shutdown: AppQuitShutdownPort = {
+            begin: () => backend.begin_shutdown(),
+            abandon: () => backend.abandon_shutdown(),
+            drain: () => backend.drain(),
+            report_close_failure: () => { reported.push(reported.length + 1); },
+        };
+        return {
+            lifecycle, viewer_manager, backend, shutdown, reported, store,
+            publish: () => backend.publish(store),
+        };
+    }
+
+    it('never leaves the app unquittable when the real store close fails', async () => {
+        // Where the defect lived. The underlying close memoizes its rejection
+        // (`closePromise ??=` in sqlite-file-state-persistence.ts), so the second
+        // drain returned the SAME already-rejected promise without re-attempting
+        // anything — the documented "real retry" never retried, `allow_quit` was
+        // never latched, and the app could only be force-quit over a connection
+        // that had already been released.
+        const closes: string[] = [];
+        let memoized: Promise<void> | undefined;
+        const store = {
+            close(): Promise<void> {
+                // Memoized exactly as the real store is: one attempt, forever.
+                memoized ??= (async () => {
+                    closes.push('attempt');
+                    throw new Error('close failed');
+                })();
+                return memoized;
+            },
+        };
+        const wiring = real_shutdown(store);
+        await wiring.publish();
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        // Attempted once, reported once, and quitting proceeded.
+        expect(closes).toEqual(['attempt']);
+        expect(wiring.reported).toEqual([1]);
+
+        // The resumed before-quit is admitted, so the app really does exit.
+        const resumed = { preventDefault: vi.fn() };
+        before_quit(resumed);
+        expect(resumed.preventDefault).not.toHaveBeenCalled();
+        // And a further drain answers the same terminal outcome without
+        // re-awaiting the memoized rejection.
+        await expect(wiring.backend.drain()).resolves.toEqual({ type: 'close-failed' });
+        expect(closes).toEqual(['attempt']);
+    });
+
+    it('refuses a window created during the quit barrier, and re-admits on a veto', async () => {
+        // The concrete failure: one viewer open, Cmd-Q, and while its flush/ack
+        // fence runs the user double-clicks a CSV in Finder. `close_all` has
+        // already snapshotted its entry list, so a window admitted now is never
+        // fenced — it survives the drain holding a controller over a closed
+        // connection and then vetoes every later quit.
+        const store = { close: async (): Promise<void> => {} };
+        const wiring = real_shutdown(store);
+        await wiring.publish();
+        wiring.lifecycle.become_ready();
+        wiring.viewer_manager.open_file('/tmp/open-before-quit.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(1);
+
+        // A close that never resolves on its own, so the barrier really is open
+        // while the request below arrives — no fixed delay involved.
+        const fence = deferred();
+        let vetoes = true;
+        const close_viewers = vi.fn(async () => {
+            await fence.promise;
+            return !vetoes;
+        });
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            close_viewers,
+            resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledOnce());
+
+        // Mid-fence Finder double-click. Refused at both gates: the class refuses
+        // to attach a controller, and the lifecycle phase refuses the request.
+        expect(wiring.viewer_manager.open_file('/tmp/during-barrier.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(1);
+        expect(wiring.lifecycle.phase).toBe('draining');
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+
+        // The viewer vetoes. The app stays up, so it must open files again — an
+        // app that silently ignores every double-click is a bug of its own.
+        fence.resolve();
+        await vi.waitFor(() => expect(wiring.lifecycle.phase).toBe('ready'));
+        expect(resume_quit).not.toHaveBeenCalled();
+        expect(wiring.backend.published).toBe(store);
+        expect(wiring.backend.draining).toBe(false);
+        expect(wiring.viewer_manager.open_file('/tmp/after-veto.csv')).toBeDefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(2);
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(1);
+
+        // And the retry, once nothing vetoes, completes the quit.
+        vetoes = false;
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(wiring.backend.published).toBeUndefined();
+    });
+
+    /**
+     * The real backend and manager behind the barrier, with every port call in one
+     * ordered log and the two post-close statements injectable.
+     *
+     * Post-close, because that is the whole point: `report_close_failure` is a
+     * `console.error` in main.ts and throws on EPIPE, and `resume_quit` is
+     * `app.quit()`. Both run *after* the connection has been released, so a throw
+     * from either must not be able to reach `abandon` — the store is gone and
+     * re-admitting would attach a controller to it.
+     */
+    /** The store is not a parameter: each caller publishes its own through
+     *  `backend.publish`, so taking one here only invited the two to disagree. */
+    function post_close_wiring(
+        hooks: { on_report?: () => void; on_resume?: () => void } = {},
+    ) {
+        const lifecycle = create_desktop_lifecycle();
+        const viewer_manager = manager();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => viewer_manager.stop_admission(),
+            () => viewer_manager.resume_admission(),
+        );
+        const calls: string[] = [];
+        const shutdown: AppQuitShutdownPort = {
+            begin: () => { calls.push('begin'); backend.begin_shutdown(); },
+            abandon: () => { calls.push('abandon'); backend.abandon_shutdown(); },
+            drain: () => { calls.push('drain'); return backend.drain(); },
+            report_close_failure: () => {
+                calls.push('report');
+                hooks.on_report?.();
+            },
+        };
+        const resume_quit = vi.fn(() => {
+            calls.push('resume');
+            hooks.on_resume?.();
+        });
+        return { lifecycle, viewer_manager, backend, shutdown, calls, resume_quit };
+    }
+
+    /** Rejections that escaped to the process, which in the main process is fatal.
+     *  Vitest fails the run on one by itself; this makes the assertion local and
+     *  explicit, so the test says what it is protecting. */
+    function watch_unhandled_rejections() {
+        const escaped: unknown[] = [];
+        const listener = (reason: unknown) => { escaped.push(reason); };
+        process.on('unhandledRejection', listener);
+        return {
+            escaped,
+            /** Let the microtask queue drain and the rejection be reported, then
+             *  stop watching. A turn of the event loop, not a delay. */
+            async settle(): Promise<void> {
+                await new Promise<void>((done) => { setImmediate(done); });
+                await new Promise<void>((done) => { setImmediate(done); });
+                process.removeListener('unhandledRejection', listener);
+            },
+        };
+    }
+
+    it('never re-admits when reporting a failed close throws', async () => {
+        // `report_close_failure` is a console.error, and console.error throws
+        // EPIPE once the parent has closed stdout. The close has already run by
+        // then, so this throw must not be routed to `abandon`: doing so would put
+        // the lifecycle back to `ready` and let `open_file` attach a controller to
+        // a connection nobody can use.
+        const rejections = watch_unhandled_rejections();
+        const store = { close: async (): Promise<void> => { throw new Error('close failed'); } };
+        const wiring = post_close_wiring({
+            on_report: () => { throw new Error('EPIPE: stdout is gone'); },
+        });
+        await wiring.backend.publish(store);
+        wiring.lifecycle.become_ready();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            wiring.resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(wiring.calls).toContain('report'));
+
+        // Reporting is best-effort, so the quit it precedes still happens: a dead
+        // stdout must not be what keeps the app on screen over a closed store.
+        await vi.waitFor(() => expect(wiring.resume_quit).toHaveBeenCalledOnce());
+        expect(wiring.calls).toEqual(['begin', 'drain', 'report', 'resume']);
+        // Admission stays shut and the phase stays drained.
+        expect(wiring.viewer_manager.open_file('/tmp/after-report-threw.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+        expect(wiring.lifecycle.phase).toBe('draining');
+        expect(wiring.backend.draining).toBe(true);
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+        // And the quit is not blocking again — a failed close never was.
+        const resumed = { preventDefault: vi.fn() };
+        before_quit(resumed);
+        expect(resumed.preventDefault).not.toHaveBeenCalled();
+
+        await rejections.settle();
+        expect(rejections.escaped).toEqual([]);
+    });
+
+    it('never re-admits when the resumed quit itself throws', async () => {
+        // `resume_quit` is `app.quit()`, called with the connection already closed
+        // and cleared. A throw from it used to land in the barrier's trailing
+        // catch, which called `abandon`: admission came back, the lifecycle went
+        // back to `ready`, and a buffered `open-file` ran immediately — over a
+        // store that no longer exists.
+        const rejections = watch_unhandled_rejections();
+        const closes: string[] = [];
+        const store = { close: async (): Promise<void> => { closes.push('close'); } };
+        const wiring = post_close_wiring({
+            on_resume: () => { throw new Error('app.quit failed'); },
+        });
+        await wiring.backend.publish(store);
+        wiring.lifecycle.become_ready();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            wiring.resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(wiring.resume_quit).toHaveBeenCalledOnce());
+
+        // The store really is gone, which is why re-admitting would be a bug
+        // rather than a nicety.
+        expect(closes).toEqual(['close']);
+        expect(wiring.backend.published).toBeUndefined();
+        expect(wiring.calls).toEqual(['begin', 'drain', 'resume']);
+        expect(wiring.viewer_manager.open_file('/tmp/after-resume-threw.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+        expect(wiring.lifecycle.phase).toBe('draining');
+        expect(wiring.backend.draining).toBe(true);
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+
+        await rejections.settle();
+        expect(rejections.escaped).toEqual([]);
+    });
+
+    it('admits no new viewer window once admission has stopped', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/before-drain.csv');
+        const window = latest_window();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(1);
+
+        viewer_manager.stop_admission();
+
+        expect(viewer_manager.open_file('/tmp/during-drain.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(1);
+        // Even a file that already has a window is refused while draining.
+        expect(viewer_manager.open_file('/tmp/before-drain.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(1);
+        // The windows already open still close through the normal fence.
+        expect(viewer_manager.has_windows()).toBe(true);
+        emit_webview(window, { type: 'ready' });
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(true);
+        expect(viewer_manager.has_windows()).toBe(false);
     });
 });

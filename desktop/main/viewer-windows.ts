@@ -32,6 +32,7 @@ import {
     type ViewerPanelDeadlineScheduler,
 } from './viewer-panel';
 import { dirty_from_host_message, dirty_from_webview_message } from './dirty-state';
+import type { DesktopDrainOutcome } from './desktop-lifecycle';
 import { resolve_theme_id, window_background_color, type ThemePayload } from './theme';
 import {
     CHANNEL_HOST_MESSAGE,
@@ -88,36 +89,147 @@ const RESIZE_SETTLE_MS = 250;
 let next_window_id = 1;
 
 /**
- * Coordinate Electron's synchronous before-quit event with asynchronous viewer
- * close fences. The resumed app.quit() call is admitted exactly once after all
- * viewer windows have closed; a failed fence leaves quitting retryable.
+ * The state backend as the quit barrier sees it: admission it can close and
+ * reopen, a connection it can release, and a way to say that release failed.
+ *
+ * Separated from the concrete backend so the barrier stays electron-free and
+ * store-free; main.ts binds it to `create_desktop_state_backend`.
+ */
+export interface AppQuitShutdownPort {
+    /**
+     * Stop admitting new controller and window work.
+     *
+     * Called on entry to the barrier, before the window-close fence — the fence
+     * is asynchronous and the OS keeps delivering `open-file` throughout it, and
+     * a window created in that gap is not in the fence's snapshotted list. It
+     * would never be fenced, would survive the drain holding a controller over a
+     * closed connection, and would then veto every later quit.
+     */
+    begin(): void;
+    /** Undo `begin`, because a viewer vetoed its close and the app is staying
+     *  up. Called from exactly one branch of the barrier — the one that runs
+     *  before `drain` — and the barrier's promise chain is shaped so that no
+     *  failure after the close can reach it. See `create_app_quit_coordinator`. */
+    abandon(): void;
+    /** Release the connection. Never rejects: the outcome is the value, because
+     *  a failed close is terminal rather than retryable. */
+    drain(): Promise<DesktopDrainOutcome>;
+    /** Report a close that failed. The quit still proceeds — see the barrier. */
+    report_close_failure(): void;
+}
+
+/**
+ * Coordinate Electron's synchronous before-quit event with the asynchronous
+ * shutdown barrier: admission stops, then viewer close fences, then the state
+ * backend drain. The resumed app.quit() call is admitted exactly once after all
+ * three; a vetoed window close leaves quitting retryable *and* puts admission
+ * back, because the app is staying up and one that has silently stopped opening
+ * files is a worse outcome than the quit the user cancelled.
+ *
+ * A close that fails does not block the quit. That is not a relaxation of
+ * durability: the close already ran, and both
+ * `OpenedSqliteFileStateStore.close` and the runtime beneath it memoize their
+ * promise, so a "retry" returns the same settled rejection without touching the
+ * connection. Blocking would therefore buy nothing and cost everything — with
+ * `allow_quit` still false, every later Cmd-Q re-entered a barrier that could
+ * only fail identically, leaving force-quit as the only exit over a connection
+ * that had already been closed. So the failure is reported and the quit
+ * proceeds. A window *veto* is a different case and still blocks, because there
+ * the app really can succeed on a retry.
+ *
+ * There is deliberately no "no viewer windows, quit immediately" fast path any
+ * more, and no window-count probe of any kind. That shortcut was correct only
+ * while the state backend was in-memory. With a real SQLite connection open, a
+ * quit issued from the welcome window — or, on macOS, after the user closed
+ * every viewer but left the app running — still has to release the connection,
+ * the writer-session row and the leases it holds. Skipping the drain there
+ * leaves those rows claimed by a process that no longer exists and can leave a
+ * hot journal behind for the next launch to recover.
+ *
+ * So the barrier always runs both stages. `close_viewer_windows` over an empty
+ * window list already resolves true having done nothing, which is exactly what a
+ * "there is nothing to close" branch would have computed — a separate
+ * has-windows port was only a second way to reach that answer, and a second way
+ * to get it wrong.
  */
 export function create_app_quit_coordinator(
-    has_viewer_windows: () => boolean,
     close_viewer_windows: () => Promise<boolean>,
     resume_quit: () => void,
+    shutdown: AppQuitShutdownPort = {
+        begin: () => {},
+        abandon: () => {},
+        drain: () => Promise.resolve({ type: 'closed' }),
+        report_close_failure: () => {},
+    },
 ): (event: { preventDefault(): void }) => void {
     let allow_quit = false;
     let quit_barrier: Promise<void> | undefined;
 
     return (event) => {
         if (allow_quit) return;
-        if (!has_viewer_windows()) {
-            allow_quit = true;
-            return;
-        }
 
         event.preventDefault();
+        // Concurrent `before-quit` events (macOS delivers a second one) share the
+        // one barrier, so admission is closed exactly once per barrier too.
         if (quit_barrier) return;
+        // First, and synchronously with the event: everything after this point is
+        // asynchronous, and the OS can deliver an `open-file` between any two
+        // ticks of it. A window admitted after `close_viewer_windows` snapshots
+        // its list is never fenced.
+        shutdown.begin();
         quit_barrier = close_viewer_windows()
+            // Scoped to the close fence alone, and deliberately not to the whole
+            // chain: the fence is the one stage where a rejection means the same
+            // thing as a veto (nothing has been closed, the app is staying up), so
+            // it is folded into the same `false` here — before `drain` is even
+            // reachable. A `.catch` further down would also cover the drain
+            // callback, where `report_close_failure` (a console.error, which
+            // throws on EPIPE) and `resume_quit` (app.quit()) run *after* the
+            // connection is gone; abandoning there would re-admit `open_file` and
+            // release buffered `open-file` work onto a closed, cleared store.
+            .catch(() => false)
             .then((closed) => {
-                if (!closed) return;
-                allow_quit = true;
-                resume_quit();
+                // A viewer vetoed its close (unacknowledged edits, lost renderer),
+                // or the fence itself rejected. The app is staying up, so the
+                // backend must stay open — draining it would strand a window that
+                // still holds an attached controller — and admission goes back,
+                // because refusing to open files in an app the user just chose to
+                // keep running is a bug of its own.
+                if (!closed) {
+                    shutdown.abandon();
+                    return;
+                }
+                // Only after every viewer has finished its own flush/drain/ack
+                // fence, so no controller can still admit work into the backend.
+                return shutdown.drain().then((outcome) => {
+                    // A failed close is terminal, not retryable: see the module
+                    // comment above. Report it and quit anyway rather than trap
+                    // the user in an app that can only be force-quit.
+                    //
+                    // Latched before the report, not after: reporting is I/O
+                    // (console.error over a pipe the parent may have closed), and
+                    // a throw there must not be what decides whether the app can
+                    // ever quit again.
+                    allow_quit = true;
+                    if (outcome.type === 'close-failed') {
+                        try {
+                            shutdown.report_close_failure();
+                        } catch {
+                            // Best-effort, for the same reason the failed close
+                            // does not block: the connection is already released,
+                            // and a stdout that has gone away must not be what
+                            // keeps the app on screen.
+                        }
+                    }
+                    resume_quit();
+                });
             })
-            // before-quit cannot await this barrier. Consume a failed close fence
-            // here so it cannot surface as an unhandled main-process rejection;
-            // finally clears the claim so the next quit request can retry it.
+            // before-quit cannot await this barrier, so every rejection has to be
+            // consumed here to stay off the main process's unhandled-rejection
+            // path. Consumed and nothing else: the only rejections that reach this
+            // point come from after the connection closed (see above), and there is
+            // no state left to put back — `allow_quit` is already latched and the
+            // store is already released.
             .catch(() => {})
             .finally(() => {
                 quit_barrier = undefined;
@@ -134,6 +246,9 @@ export class ViewerWindowManager {
     /** The sequence behind the size currently stored, so a write from an older
      *  resize arriving late (see `store_size`) can be recognized and dropped. */
     private last_stored_seq = 0;
+    /** Set once shutdown has begun (see `stop_admission`). No new viewer may be
+     *  attached to the state backend after that point. */
+    private admitting = true;
 
     constructor(
         private readonly state_store: AuthorityFileStateStore,
@@ -144,9 +259,16 @@ export class ViewerWindowManager {
 
     /**
      * Show `file_path` in its own window, or focus the window already showing
-     * it. Returns the window either way.
+     * it. Returns the window either way, or nothing once admission has stopped
+     * (see `stop_admission`) — a file opened during shutdown is dropped rather
+     * than attached to a backend that is already draining.
      */
-    open_file(file_path: string): BrowserWindow {
+    open_file(file_path: string): BrowserWindow | undefined {
+        // Checked before the existing-window lookup as well: during the draining
+        // phase even re-focusing is refused, because the OS can deliver an
+        // open-file event at any moment and the answer has to be "not now"
+        // uniformly rather than depending on which files happen to be open.
+        if (!this.admitting) return undefined;
         const file_key = canonical_file_key(file_path);
         const existing = this.windows.find((entry) => entry.fileKey === file_key);
         if (existing) {
@@ -323,10 +445,18 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
-        // PR3 ships the coordination protocol but not a proven desktop
-        // conditional-install primitive or SQLite authority cutover. Keep the
-        // unreleased desktop editor view-only rather than falling back to the
-        // legacy unconditional physical write path.
+        // Unconditionally view-only, and deliberately not conditioned on
+        // anything. This is the single source of truth for desktop editing in
+        // this PR: the SQLite authority cutover lands here, but the desktop's
+        // physical write path does not, because it still needs a proven
+        // conditional-install primitive. Nothing is consulted — no activation
+        // marker, no setting, no environment — precisely so there is no
+        // arrangement of state on a user's machine that turns writes on.
+        //
+        // The PR 3 activation-marker gate is a *PR 5* concern: it arrives with
+        // the desktop release gates, and only then does this line become a
+        // decision rather than a constant. A read of that marker here would look
+        // like the gate while changing nothing, which is worse than its absence.
         const profile = profile_for(file_path, this.config_store.config_port());
         profile.editing = false;
         const controller = attach_viewer(
@@ -430,6 +560,65 @@ export class ViewerWindowManager {
     /** Whether any file is open, i.e. the app has a document window on screen. */
     has_windows(): boolean {
         return this.windows.length > 0;
+    }
+
+    /**
+     * Enter the draining phase: `open_file` becomes a no-op, so no window — and
+     * therefore no controller and no backend work — can join after the quit
+     * barrier has begun.
+     *
+     * Called on *entry* to the barrier, before the window-close fence, not after
+     * it: the fence is asynchronous, the OS keeps delivering `open-file`
+     * throughout it, and `close_all` snapshots its entry list — so a window
+     * admitted in that gap is never fenced at all, survives the drain holding a
+     * controller over a closed connection, and then vetoes every later quit.
+     *
+     * Reversible, but only through `resume_admission`, and only for a barrier
+     * that ended before the connection closed. See that method for why.
+     *
+     * Everything already open keeps working: `has_windows` and `close_all` are
+     * how the barrier drives those windows to completion.
+     *
+     * Kept as defense in depth even though every current caller of `open_file`
+     * is already inside `lifecycle.submit`, which refuses work once draining.
+     * The two gates guard different things and are not interchangeable: the
+     * lifecycle gate stops *requests* reaching this class, while this flag is the
+     * class's own refusal to attach a controller to a connection that is closing
+     * — the invariant that must hold for any future call site, including one that
+     * reaches `open_file` without going through the gate. It is also what makes
+     * `open_file`'s `undefined` return meaningful, which is how `open_files` in
+     * main.ts knows not to close the launcher it was invoked from.
+     */
+    stop_admission(): void {
+        this.admitting = false;
+    }
+
+    /**
+     * Admit windows again, because the quit that stopped them will not happen.
+     *
+     * Narrowly safe, and only for the one caller that owns the ordering: the quit
+     * coordinator, on the path where `close_all` answered false (a viewer vetoed
+     * its close) or the fence itself rejected. Both are decided *before* the drain
+     * runs, so the connection this manager reads through has not been touched —
+     * which is the whole precondition. Calling it after a drain would be exactly
+     * the bug `stop_admission` exists to prevent: a viewer attached to a connection
+     * that is closing or closed.
+     *
+     * That precondition is not left to the caller's good behaviour. The barrier's
+     * close-fence `.catch` is scoped so no post-close failure can route here, and
+     * `create_desktop_state_backend`'s `abandon_shutdown` — the only thing in the
+     * app that calls this method — is a hard no-op once a close has been attempted.
+     * The method itself is a plain setter, so the enforcement has to live upstream;
+     * these are the two places it does.
+     *
+     * It exists because the alternative is worse than the risk it carries. A
+     * vetoed close leaves the app running, and leaving admission off there gives
+     * the user an app that silently ignores every Finder double-click, with no
+     * message and no way back short of quitting — the thing they just declined to
+     * do.
+     */
+    resume_admission(): void {
+        this.admitting = true;
     }
 
     /** Close every viewer through the same renderer/backend fence as native close. */
