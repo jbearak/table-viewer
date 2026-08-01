@@ -509,7 +509,9 @@ export class ViewerWindowManager {
                 if (lifecycle.intent === 'close') {
                     entry.allowClose = true;
                     entry.window.close();
-                    return entry.window.isDestroyed();
+                    const closed = entry.window.isDestroyed();
+                    if (!closed) entry.allowClose = false;
+                    return closed;
                 }
                 if (lifecycle.ignoreCache) entry.window.webContents.reloadIgnoringCache();
                 else entry.window.webContents.reload();
@@ -545,7 +547,13 @@ export class ViewerWindowManager {
             // fence. Its flush continues, but completion closes instead of
             // navigating, so there is never a second concurrent renderer flush.
             entry.lifecycle.intent = 'close';
-            return entry.lifecycle.promise;
+            return entry.lifecycle.promise.then((settled) => {
+                if (entry.window.isDestroyed()) return true;
+                // The reload branch may have observed its intent just before this
+                // close claimed it. Only a destroyed window proves the claim won;
+                // after a successful reload, start one fresh serialized close fence.
+                return settled ? this.close_entry(entry) : false;
+            });
         }
         return this.start_lifecycle(entry, 'close');
     }

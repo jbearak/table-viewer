@@ -72,8 +72,11 @@ export class TableViewerEditorProvider
 
     async drain_viewers(): Promise<void> {
         const close_barrier = this.#close_barrier;
-        await close_barrier;
-        while (this.#drains.size > 0) await Promise.allSettled([...this.#drains]);
+        try {
+            await close_barrier;
+        } finally {
+            while (this.#drains.size > 0) await Promise.allSettled([...this.#drains]);
+        }
     }
 
     async openCustomDocument(uri: vscode.Uri): Promise<TableViewerDocument> {

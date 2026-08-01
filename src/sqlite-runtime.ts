@@ -865,7 +865,12 @@ function async_write_transaction<T>(
             };
             sqlite_safe_integer(expected.sequence, 'writer committed sequence', 1, Number.MAX_SAFE_INTEGER - 1);
             assert_nonempty(expected.operationId as string, 'operationId');
-            update_session_marker(runtime, database, expected, runtime.options.now());
+            try {
+                update_session_marker(runtime, database, expected, runtime.options.now());
+            } catch (error) {
+                try { database.exec('ROLLBACK'); } catch { /* Preserve marker failure. */ }
+                throw safe_error(error, 'write-marker');
+            }
             let commitInvoked = false;
             try {
                 const commit = (): void => {

@@ -697,7 +697,7 @@ function decode_stage(value: unknown): PersistedAuthorityStage {
     return stage;
 }
 
-function state_has_pending_edits(state: StoredPerFileState): boolean {
+export function state_has_pending_edits(state: StoredPerFileState): boolean {
     const pending = (state as PerFileState).pendingEdits;
     return !!pending && Object.keys(pending).length > 0;
 }
@@ -1462,8 +1462,9 @@ export function create_keyed_authority_store(
                 const validationPasses = validation === undefined || validation === true;
                 const owner = tx.read_edit_session(filePath);
                 const reservation = tx.read_physical_write_reservation(filePath);
-                const basisMatches = !basis || (
-                    (basis.editOwner === undefined
+                const basisMatches = basis === undefined
+                    ? owner === undefined
+                    : ((basis.editOwner === undefined
                         ? owner === undefined
                         : edit_sessions_equal(basis.editOwner, owner))
                     && (basis.recoveryRecordId === undefined
@@ -1473,8 +1474,7 @@ export function create_keyed_authority_store(
                     && (basis.expectedPhysicalRevision === undefined
                         || authority.physicalRevision === basis.expectedPhysicalRevision)
                     && (basis.expectedProjectionRevision === undefined
-                        || authority.projectionRevision === basis.expectedProjectionRevision)
-                );
+                        || authority.projectionRevision === basis.expectedProjectionRevision));
                 if (
                     !validationPasses
                     || reservation !== undefined

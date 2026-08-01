@@ -22,6 +22,7 @@ import {
 } from '../sqlite-file-state-persistence';
 import { SqliteFileStateError } from '../sqlite-file-state-errors';
 import { inspect_sqlite_recovery_gate } from '../sqlite-open-recovery';
+import { SqliteFileStateRepository } from '../sqlite-file-state-repository';
 import { PhysicalResourceLockManager } from '../physical-resource-lock';
 import {
     prepare_physical_install,
@@ -228,6 +229,14 @@ describe('SQLite file-state persistence', () => {
         const acquired = await store.acquire_edit_session('/owned.csv', (value) => value, hostLock);
         expect(acquired.type).toBe('acquired');
         if (acquired.type !== 'acquired') throw new Error('expected edit owner');
+        await expect(store.compare_and_set(
+            '/owned.csv',
+            1,
+            { activeSheetIndex: 9 },
+        )).resolves.toMatchObject({
+            type: 'conflict',
+            snapshot: { revision: 1, state: { activeSheetIndex: 1 } },
+        });
         const pending = await store.compare_and_set(
             '/owned.csv',
             1,
@@ -1088,6 +1097,16 @@ describe('SQLite file-state persistence', () => {
             expectPreserved();
         }
 
+        const finalizeAfterReleaseError = new Error('finalization failed after fence release');
+        vi.spyOn(SqliteFileStateRepository.prototype, 'transition_reservation_to_cleanup')
+            .mockImplementationOnce(() => { throw finalizeAfterReleaseError; });
+        const finalizeAfterRelease = makeIo({ targets: ['intended', 'intended'] });
+        await expect(store.reconcile_reserved_physical_write(
+            '/matrix.csv', reserved.reservation.reservationId, finalizeAfterRelease.io,
+        )).rejects.toBe(finalizeAfterReleaseError);
+        expect(finalizeAfterRelease.release).toHaveBeenCalledTimes(1);
+        expectPreserved();
+
         let finalizeReleaseAttempts = 0;
         const finalizeCleanupPending = makeIo({
             targets: ['intended', 'intended'],
@@ -1175,6 +1194,40 @@ describe('SQLite file-state persistence', () => {
         const released = new DatabaseSync(database.databasePath, { readOnly: true });
         expect(released.prepare('SELECT count(*) AS count FROM edit_sessions').get()?.count).toBe(0);
         released.close();
+        await opened.close();
+    });
+
+    it('moves one edit owner when canonicalization supplies a duplicate source path', async () => {
+        const database = freshDatabase();
+        const opened = await open_sqlite_file_state_store(database.databasePath, database.options);
+        await opened.store.compare_and_set('/duplicate-owner.csv', 0, {});
+        await opened.store.compare_and_set('/duplicate-destination.csv', 0, {});
+        const acquired = await opened.store.acquire_edit_session(
+            '/duplicate-owner.csv',
+            (value) => value,
+            {
+                hostLockId: 'duplicate-owner-host',
+                physicalResourceLockKey: 'duplicate-owner-resource',
+                verify: async () => true,
+                release: async () => undefined,
+            },
+        );
+        if (acquired.type !== 'acquired') throw new Error('expected duplicate-path owner');
+
+        await opened.persistence.write_transaction('canonicalize', (tx) => {
+            tx.move_edit_session(
+                ['/duplicate-owner.csv', '/duplicate-owner.csv'],
+                '/duplicate-destination.csv',
+            );
+        });
+        await expect(opened.persistence.read_transaction((tx) => (
+            tx.read_edit_session('/duplicate-destination.csv')
+        ))).resolves.toMatchObject({
+            editSessionId: acquired.session.editSessionId,
+            ownershipGeneration: acquired.session.ownershipGeneration,
+        });
+
+        await opened.store.release_edit_session('/duplicate-owner.csv', acquired.session);
         await opened.close();
     });
 
@@ -1542,7 +1595,33 @@ describe('SQLite file-state persistence', () => {
             preparedInstall: bundle,
         });
         if (reserved.type !== 'reserved') throw new Error('expected fail-closed reservation');
-        await hostLock.release();
+
+        const rejectedAttestationRelease = vi.fn(async () => undefined);
+        const rejectedAttestationManager = new PhysicalResourceLockManager({ lockRoot });
+        vi.spyOn(rejectedAttestationManager, 'attest_reservation_lock').mockReturnValue({
+            hostLockId: bundle.hostLockId,
+            physicalResourceLockKey: bundle.physicalResourceLockKey,
+            identity: hostLock.identity,
+            verify: async () => false,
+            extendWithObjectIdentity: (identity) => hostLock.extendWithObjectIdentity(identity),
+            release: rejectedAttestationRelease,
+        });
+        await expect(reopen_reserved_physical_write(opened.persistence, {
+            targetPath: target,
+            lockManager: rejectedAttestationManager,
+            installer: { platformEnforced: true, async acquire() { return { type: 'unsupported' }; } },
+        })).resolves.toEqual({ type: 'recoveryRequired', reason: 'lockEvidenceMissing' });
+        expect(rejectedAttestationRelease).toHaveBeenCalledTimes(1);
+
+        await fs.promises.rm(bundle.directory, { recursive: true, force: true });
+        await expect(reopen_reserved_physical_write(opened.persistence, {
+            targetPath: target,
+            lockManager: new PhysicalResourceLockManager({ lockRoot }),
+            installer: { platformEnforced: true, async acquire() { return { type: 'unsupported' }; } },
+        })).resolves.toEqual({ type: 'recoveryRequired', reason: 'preparedEvidenceInvalid' });
+        const reacquired = await manager.acquire(target);
+        expect(reacquired).not.toBeNull();
+        await reacquired?.release();
 
         await expect(reopen_reserved_physical_write(opened.persistence, {
             targetPath: target,
@@ -1735,6 +1814,27 @@ describe('SQLite file-state persistence', () => {
 
         await store.discard_authority_transaction('/entry', 'stage');
         expect(instrumented.counts).toEqual({ reads: 0, writes: 0 });
+    });
+
+    it('scans metadata without decoding each logical state payload', async () => {
+        const database = freshDatabase();
+        const persistence = await database.openPersistence();
+        const store = create_keyed_authority_store(persistence);
+        await store.compare_and_set('/metadata.csv', 0, { activeSheetIndex: 1 });
+
+        const direct = new DatabaseSync(database.databasePath);
+        direct.prepare('UPDATE entries SET state_json = ? WHERE path = ?').run(
+            JSON.stringify({ activeSheetIndex: 'invalid-logical-payload' }),
+            '/metadata.csv',
+        );
+        direct.close();
+
+        const [metadata] = await persistence.read_transaction((tx) => tx.scan_entry_metadata());
+        expect(metadata).toMatchObject({ path: '/metadata.csv', stateRevision: 1 });
+        expect(metadata).not.toHaveProperty('hasPreparedInstallCleanup');
+        await expect(persistence.read_transaction((tx) => tx.read_entry('/metadata.csv')))
+            .rejects.toMatchObject({ category: 'malformed-state' });
+        await persistence.close();
     });
 
     it('bounds ordinary payload reads and copy reads to requested entries', async () => {

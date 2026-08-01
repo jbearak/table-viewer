@@ -6,6 +6,7 @@ import {
     sqlite_file_state_counter_error,
     sqlite_file_state_malformed_error,
 } from './sqlite-file-state-errors';
+import { state_has_pending_edits } from './state';
 import type {
     KeyedStateReadTransaction,
     KeyedStateStoreMetadata,
@@ -98,11 +99,6 @@ function safe_input_integer(
 function safe_input_timestamp(value: number | undefined): number | null {
     if (value === undefined) return null;
     return safe_input_integer(value, 0, Number.MAX_SAFE_INTEGER);
-}
-
-function state_has_pending_edits(state: StoredPerFileState): boolean {
-    const pending = (state as { pendingEdits?: Record<string, unknown> }).pendingEdits;
-    return !!pending && Object.keys(pending).length > 0;
 }
 
 export const SQLITE_PREPARED_INSTALL_STATE_KEY = '__tableViewerSqlitePreparedInstall';
@@ -310,8 +306,14 @@ function metadata_from_row(
             },
         }),
         ...(stageCount === undefined ? {} : { authorityStageCount: stageCount }),
-        ...(row.state_json === undefined
-            || decode_state_json(row.state_json).lifecycle?.phase !== 'cleanupPending'
+        ...(row.has_prepared_install_cleanup === undefined
+            || integer(
+                tx,
+                row.has_prepared_install_cleanup,
+                'prepared install cleanup flag',
+                0,
+                1,
+            ) === 0
             ? {}
             : { hasPreparedInstallCleanup: true }),
         ...(optional_integer(tx, row.oldest_authority_stage_created_at_ms, 'oldest stage timestamp') === undefined
@@ -326,15 +328,21 @@ function metadata_from_row(
     };
 }
 
-const ENTRY_METADATA_COLUMNS = `e.path, e.state_revision, e.state_json, e.has_pending_edits,
+const ENTRY_METADATA_COLUMNS = `e.path, e.state_revision, e.has_pending_edits,
     e.authority_commit_sequence, e.authority_revision, e.physical_revision,
     e.projection_revision, e.physical_digest, e.recency_order, e.updated_at_ms,
     e.touched_at_ms, e.recovery_entry_id, e.recovery_record_id,
     e.copy_id, e.copy_source_path, e.copy_source_revision,
+    CASE WHEN json_extract(
+        e.state_json,
+        '$.${SQLITE_PREPARED_INSTALL_STATE_KEY}.phase'
+    ) = 'cleanupPending' THEN 1 ELSE 0 END AS has_prepared_install_cleanup,
     (SELECT count(*) FROM authority_stages s WHERE s.entry_path = e.path)
         AS authority_stage_count,
     (SELECT min(s.created_at_ms) FROM authority_stages s WHERE s.entry_path = e.path)
         AS oldest_authority_stage_created_at_ms`;
+
+const COMPLETE_ENTRY_COLUMNS = `${ENTRY_METADATA_COLUMNS}, e.state_json`;
 
 function stage_from_row(
     tx: SqliteReadTransactionContext,
@@ -414,7 +422,7 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
     }
 
     read_entry(path: string): PersistedCompleteKeyedStateEntry | undefined {
-        const row = this.#tx.prepare(`SELECT ${ENTRY_METADATA_COLUMNS}
+        const row = this.#tx.prepare(`SELECT ${COMPLETE_ENTRY_COLUMNS}
             FROM entries e WHERE e.path = ?`).get(path);
         if (!row) return undefined;
         const metadata = metadata_from_row(this.#tx, row);
@@ -1067,9 +1075,17 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
 
     move_edit_session(source_paths: readonly string[], destination_path: string): void {
         const tx = this.#write_tx();
-        const owners = new Set(source_paths.map((path) => this.read_edit_session(path)).filter((owner) => owner));
-        if (owners.size > 1) malformed();
-        const owner = [...owners][0];
+        const owners = [...new Set(source_paths)]
+            .map((path) => this.read_edit_session(path))
+            .filter((owner): owner is PersistedEditSessionRecord => owner !== undefined);
+        const owner = owners[0];
+        if (owner && owners.some((candidate) => (
+            candidate.physicalResourceLockKey !== owner.physicalResourceLockKey
+            || candidate.hostLockId !== owner.hostLockId
+            || candidate.editSessionId !== owner.editSessionId
+            || candidate.ownerWriterSessionId !== owner.ownerWriterSessionId
+            || candidate.ownershipGeneration !== owner.ownershipGeneration
+        ))) malformed();
         if (!owner || owner.entryPath === destination_path) return;
         const result = tx.prepare(`UPDATE edit_sessions SET entry_path = ?
             WHERE entry_path = ? AND NOT EXISTS (

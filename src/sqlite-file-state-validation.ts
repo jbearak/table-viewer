@@ -23,7 +23,10 @@ import {
     decode_prepared_install_lifecycle,
     SQLITE_PREPARED_INSTALL_STATE_KEY,
 } from './sqlite-file-state-repository';
-import type { PersistedPreparedInstallLifecycleRecord } from './state';
+import {
+    state_has_pending_edits,
+    type PersistedPreparedInstallLifecycleRecord,
+} from './state';
 
 type SqliteRow = Record<string, unknown>;
 
@@ -283,11 +286,6 @@ function state_from_json(value: unknown): StoredPerFileState {
     return decode_state_json(value).state;
 }
 
-function has_pending_edits(state: StoredPerFileState): boolean {
-    const pending = (state as { pendingEdits?: unknown }).pendingEdits;
-    return !!pending && typeof pending === 'object' && Object.keys(pending).length > 0;
-}
-
 function validate_entries(
     database: DatabaseSync,
     requiresRecovery: boolean,
@@ -298,7 +296,7 @@ function validate_entries(
     for (const entry of entryRows) {
         const path = text(entry.path);
         const state = state_from_json(entry.state_json);
-        const pending = has_pending_edits(state);
+        const pending = state_has_pending_edits(state);
         pendingByPath.set(path, pending);
         if ((safe_number(entry.has_pending_edits) === 1) !== pending) {
             throw sqlite_file_state_malformed_error({ rowCount: entryRows.length });
@@ -519,7 +517,7 @@ function validate_coordination(
             && pending.get(text(reservation.entry_path))
             && reservation.next_state_json !== null) {
             const next = state_from_json(reservation.next_state_json);
-            if (!has_pending_edits(next) && reservation.recovery_record_id === null) {
+            if (!state_has_pending_edits(next) && reservation.recovery_record_id === null) {
                 throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
             }
         }

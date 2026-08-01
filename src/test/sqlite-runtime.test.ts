@@ -414,6 +414,29 @@ describe('SQLite path-interned runtime', () => {
         })).resolves.toBeUndefined();
     });
 
+    it('rolls back and categorizes a writer marker update failure', async () => {
+        const runtime = await openRuntime();
+        await expect(runtime.write_transaction('marker-failure', (tx) => {
+            tx.prepare(`UPDATE state_meta SET store_updated_at_ms = 13
+                WHERE singleton = 1`).run();
+            tx.prepare(`CREATE TEMP TRIGGER fail_writer_marker
+                BEFORE UPDATE OF last_committed_sequence ON writer_sessions
+                BEGIN SELECT RAISE(FAIL, 'marker failure'); END`).run();
+        })).rejects.toBeInstanceOf(SqliteFileStateError);
+
+        const afterFailure = inspectionDatabase();
+        expect(afterFailure.prepare(
+            'SELECT store_updated_at_ms FROM state_meta WHERE singleton = 1',
+        ).get()?.store_updated_at_ms).toBeNull();
+        expect(marker(afterFailure, runtime.writer_session_id)?.sequence).toBe(0n);
+        afterFailure.close();
+
+        await expect(runtime.write_transaction('marker-recovered', (tx) => {
+            tx.prepare(`UPDATE state_meta SET store_updated_at_ms = 14
+                WHERE singleton = 1`).run();
+        })).resolves.toBeUndefined();
+    });
+
     it('reconciles a successful commit whose response was lost without replaying the callback', async () => {
         let callbackCalls = 0;
         let loseResponse = true;

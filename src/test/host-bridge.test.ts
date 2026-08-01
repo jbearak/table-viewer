@@ -9,6 +9,10 @@ describe('host-bridge', () => {
         vi.unstubAllGlobals();
         delete (globalThis as { __tableViewerHostBridge?: unknown })
             .__tableViewerHostBridge;
+        delete (globalThis as { __tableViewerPendingEditMessageDispatch?: unknown })
+            .__tableViewerPendingEditMessageDispatch;
+        delete (globalThis as { __tableViewerPendingEditMessageListenerWindow?: unknown })
+            .__tableViewerPendingEditMessageListenerWindow;
     });
 
     it('wraps acquireVsCodeApi in VS Code hosts', async () => {
@@ -69,6 +73,35 @@ describe('host-bridge', () => {
         expect(JSON.stringify(injected.postMessage.mock.calls)).not.toContain('private');
     });
 
+    it('installs only one flush listener across fresh module evaluations', async () => {
+        const first = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = first;
+        const target = new EventTarget();
+        vi.stubGlobal('window', target);
+        await import('../webview/host-bridge');
+
+        vi.resetModules();
+        const second = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = second;
+        await import('../webview/host-bridge');
+
+        target.dispatchEvent(new MessageEvent('message', { data: {
+            type: 'requestPendingEditsFlush',
+            requestId: 'one-listener',
+        } }));
+
+        await vi.waitFor(() => expect(second.postMessage).toHaveBeenCalledTimes(1));
+        expect(second.postMessage).toHaveBeenCalledWith({
+            type: 'pendingEditsFlush',
+            requestId: 'one-listener',
+            editSessionId: undefined,
+            highestProducedSequence: 0,
+        });
+        expect(first.postMessage).not.toHaveBeenCalled();
+    });
+
     it('keeps monotonic pending-edit sequences across subscribers', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })
@@ -100,6 +133,9 @@ describe('host-bridge', () => {
             highestProducedSequence: 2,
             highestAcknowledgedSequence: 1,
         });
+
+        pending_edit_durability.retire('session:1');
+        expect(pending_edit_durability.publish('session:1', null)).toBe(1);
     });
 
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {

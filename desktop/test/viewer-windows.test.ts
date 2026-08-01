@@ -379,6 +379,83 @@ describe('viewer window close protocol', () => {
         expect(window.destroyed).toBe(false);
     });
 
+    it('starts a fresh close fence when native close loses the reload completion race', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/reload-close-completion-race.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        window.webContents.reload.mockImplementation(() => window.close());
+
+        viewer_manager.reload(window as any, false);
+        const first_request = window.webContents.sent.find(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )?.message;
+        if (first_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing reload flush request');
+        }
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: first_request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledOnce());
+        await vi.waitFor(() => expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toHaveLength(2));
+        expect(window.destroyed).toBe(false);
+
+        const second_request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (second_request?.type !== 'requestPendingEditsFlush') {
+            throw new Error('missing close retry flush request');
+        }
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: second_request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await vi.waitFor(() => expect(window.destroyed).toBe(true));
+    });
+
+    it('re-fences a later close when another listener vetoes destruction', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/close-veto-retry.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        const veto = (event: { preventDefault(): void }) => event.preventDefault();
+        window.on('close', veto);
+
+        window.close();
+        let requests = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        );
+        const first = requests[0]?.message;
+        if (first?.type !== 'requestPendingEditsFlush') throw new Error('missing first flush');
+        emit_webview(window, {
+            type: 'pendingEditsFlush', requestId: first.requestId, highestProducedSequence: 0,
+        });
+        await vi.waitFor(() => expect(window.closeCalls).toBe(2));
+        expect(window.destroyed).toBe(false);
+
+        window.removeListener('close', veto);
+        window.close();
+        await vi.waitFor(() => {
+            requests = window.webContents.sent.filter(
+                ({ message }) => message.type === 'requestPendingEditsFlush',
+            );
+            expect(requests).toHaveLength(2);
+        });
+        const second = requests[1]?.message;
+        if (second?.type !== 'requestPendingEditsFlush') throw new Error('missing retry flush');
+        emit_webview(window, {
+            type: 'pendingEditsFlush', requestId: second.requestId, highestProducedSequence: 0,
+        });
+        await vi.waitFor(() => expect(window.destroyed).toBe(true));
+    });
+
     it('lets close supersede a pending reload without starting another flush', async () => {
         const first_drain = deferred();
         const second_drain = deferred();
@@ -463,12 +540,10 @@ describe('viewer window close protocol', () => {
         expect(window.destroyed).toBe(false);
 
         window.emit('responsive');
-        await vi.waitFor(() => {
-            window.close();
-            expect(window.webContents.sent.filter(
-                ({ message }) => message.type === 'requestPendingEditsFlush',
-            )).toHaveLength(2);
-        });
+        window.close();
+        await vi.waitFor(() => expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toHaveLength(2));
         const request = window.webContents.sent.filter(
             ({ message }) => message.type === 'requestPendingEditsFlush',
         ).at(-1)?.message;
@@ -575,12 +650,11 @@ describe('application quit coordinator', () => {
         await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledOnce());
         expect(resume_quit).not.toHaveBeenCalled();
 
-        await vi.waitFor(() => {
-            const retry = { preventDefault: vi.fn() };
-            before_quit(retry);
-            expect(retry.preventDefault).toHaveBeenCalledOnce();
-            expect(close_viewers).toHaveBeenCalledTimes(2);
-        });
+        await expect(close_viewers.mock.results[0].value).rejects.toThrow('close fence failed');
+        const retry = { preventDefault: vi.fn() };
+        before_quit(retry);
+        expect(retry.preventDefault).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledTimes(2));
         await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
     });
 
@@ -599,10 +673,9 @@ describe('application quit coordinator', () => {
         await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledTimes(1));
         expect(resume_quit).not.toHaveBeenCalled();
 
-        await vi.waitFor(() => {
-            before_quit({ preventDefault: vi.fn() });
-            expect(close_viewers).toHaveBeenCalledTimes(2);
-        });
+        await expect(close_viewers.mock.results[0].value).resolves.toBe(false);
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(close_viewers).toHaveBeenCalledTimes(2));
         await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
     });
 });

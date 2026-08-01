@@ -800,21 +800,6 @@ export function GridShell({
         return pending_edit_durability.publish(edit_session_id, edits, force);
     }, [edit_session_id]);
 
-    const post_pending_edits_with_live_value = useCallback((value: string) => {
-        if (
-            !edit_mode
-            || !edit_session_id
-            || close_barrier_ref.current
-            || save_in_flight_ref.current
-        ) return;
-        const live = read_live_edit_ref.current();
-        if (!live) return;
-        const edits = Object.fromEntries(store.snapshot()) as Record<string, DirtyEntry>;
-        if (value === live.original) delete edits[live.key];
-        else edits[live.key] = { value, base: live.original };
-        post_pending_edits(Object.keys(edits).length > 0 ? edits : null);
-    }, [edit_mode, edit_session_id, post_pending_edits, save_in_flight_ref, store]);
-
     useEffect(() => {
         if (!edit_session_id) {
             set_pending_edit_status({
@@ -1905,12 +1890,9 @@ export function GridShell({
             const handle_change = (next: GridCell) => {
                 if (save_in_flight_ref.current || close_barrier_ref.current) return;
                 props.onChange(next);
-                const value = next.kind === GridCellKind.Text ? next.data ?? '' : '';
-                // Publish the overlay value early, not merely the last committed
-                // dirty map. This narrows the loss window when VS Code closes a panel
-                // before a request/response flush can run; host receipt and persistence
-                // are still established only by the acknowledgement protocol.
-                post_pending_edits_with_live_value(value);
+                // Keep the live overlay in the renderer snapshot without turning
+                // every keystroke into a host state write. A close/reload flush reads
+                // this snapshot synchronously; ordinary edits publish on commit.
                 refresh_live_uncommitted();
             };
             const handle_finished: CsvCellEditorProps['onFinishedEditing'] = (
@@ -1940,7 +1922,6 @@ export function GridShell({
     }, [
         capture_open_overlay_row,
         post_pending_edits,
-        post_pending_edits_with_live_value,
         refresh_live_uncommitted,
         release_open_overlay_row,
         save_in_flight_ref,

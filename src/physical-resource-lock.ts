@@ -1109,31 +1109,37 @@ export class PhysicalResourceLockManager {
             assert_same_root(this.lockRoot, rootIdentity);
             const pinPath = path.join(this.lockRoot, pinName);
             const memberPath = path.join(this.lockRoot, match[1]);
-            const pinStat = fs.lstatSync(pinPath, { bigint: true });
-            if (!pinStat.isFile() || pinStat.isSymbolicLink()
-                || pinStat.size > BigInt(MAX_METADATA_BYTES)) {
-                throw new Error('Physical release pin is invalid');
-            }
-            assert_private_directory(pinStat);
-            const metadata = parse_lock_metadata(fs.readFileSync(pinPath));
-            if (!metadata || metadata.hostLockId !== match[2]
-                || (authority?.physicalResourceLockKey !== null
-                    && authority?.physicalResourceLockKey !== undefined
-                    && metadata.physicalResourceLockKey !== authority.physicalResourceLockKey)
-                || !metadata.lockMemberNames.includes(match[1])) {
-                throw new Error('Physical release pin metadata is invalid');
-            }
             try {
-                const memberStat = fs.lstatSync(memberPath, { bigint: true });
-                if (memberStat.dev !== pinStat.dev || memberStat.ino !== pinStat.ino) {
-                    throw new Error('Physical release pin conflicts with a replacement owner');
+                const pinStat = fs.lstatSync(pinPath, { bigint: true });
+                if (!pinStat.isFile() || pinStat.isSymbolicLink()
+                    || pinStat.size > BigInt(MAX_METADATA_BYTES)) {
+                    throw new Error('Physical release pin is invalid');
                 }
-                fs.unlinkSync(pinPath);
+                assert_private_directory(pinStat);
+                const metadata = parse_lock_metadata(fs.readFileSync(pinPath));
+                if (!metadata || metadata.hostLockId !== match[2]
+                    || (authority?.physicalResourceLockKey !== null
+                        && authority?.physicalResourceLockKey !== undefined
+                        && metadata.physicalResourceLockKey !== authority.physicalResourceLockKey)
+                    || !metadata.lockMemberNames.includes(match[1])) {
+                    throw new Error('Physical release pin metadata is invalid');
+                }
+                try {
+                    const memberStat = fs.lstatSync(memberPath, { bigint: true });
+                    if (memberStat.dev !== pinStat.dev || memberStat.ino !== pinStat.ino) {
+                        throw new Error('Physical release pin conflicts with a replacement owner');
+                    }
+                    fs.unlinkSync(pinPath);
+                } catch (error) {
+                    if (!is_node_error(error) || error.code !== 'ENOENT') throw error;
+                    fs.renameSync(pinPath, memberPath);
+                }
+                mutated = true;
             } catch (error) {
+                // Another cold reconciler may have completed this exact pin after
+                // the directory snapshot. A vanished pin needs no further work.
                 if (!is_node_error(error) || error.code !== 'ENOENT') throw error;
-                fs.renameSync(pinPath, memberPath);
             }
-            mutated = true;
         }
         if (mutated) {
             flush_directory(this.lockRoot, this.durableDirectoryOperations);

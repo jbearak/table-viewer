@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
 import {
     create_physical_edit_activation_boundary,
@@ -38,6 +38,10 @@ function context() {
 }
 
 describe('physical edit activation boundary', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
     it('uses only ephemeral state after an armed marker', async () => {
         const fixture = context();
         const boundary = await create_physical_edit_activation_boundary(
@@ -58,7 +62,8 @@ describe('physical edit activation boundary', () => {
         expect(fixture.update).not.toHaveBeenCalled();
     });
 
-    it('preserves Memento editing without creating an absent coordination root', async () => {
+    it.skipIf(process.getuid?.() === 0)(
+        'preserves Memento editing without creating an absent coordination root', async () => {
         const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-activation-missing-'));
         const parent = path.join(directory, 'unwritable-parent');
         const root = path.join(parent, 'missing', 'physical-locks');

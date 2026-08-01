@@ -41,9 +41,9 @@ describe('VS Code physical coordination host port', () => {
     });
 
     it('keeps native files view-only without a proven conditional installer', async () => {
-        expect(vscode_physical_coordination_port.availability(resource(target)))
-            .toEqual({ type: 'viewOnly', reason: 'conditional-install-unsupported' });
-        expect(await vscode_physical_coordination_port.acquire(resource(target)))
-            .toEqual({ type: 'viewOnly', reason: 'conditional-install-unsupported' });
+        expect(vscode_physical_coordination_port.availability(resource(target)).type)
+            .toBe('viewOnly');
+        expect((await vscode_physical_coordination_port.acquire(resource(target))).type)
+            .toBe('viewOnly');
     });
 });

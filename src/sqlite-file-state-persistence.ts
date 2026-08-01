@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import {
     create_coordinated_keyed_authority_store,
     drain_keyed_state_runtime,
+    state_has_pending_edits,
     type CoordinatedAuthorityFileStateStore,
     type CoordinatedKeyedFileStatePersistence,
     type DurableFileAuthority,
@@ -112,8 +113,17 @@ export async function reopen_reserved_physical_write(
     } catch {
         return { type: 'recoveryRequired', reason: 'lockEvidenceMissing' };
     }
-    if (!hostLock || !await hostLock.verify()) {
-        return { type: 'recoveryRequired', reason: 'lockEvidenceMissing' };
+    if (!hostLock) return { type: 'recoveryRequired', reason: 'lockEvidenceMissing' };
+    const failAfterAttestation = async (
+        reason: Extract<ReopenedReservedPhysicalWrite, { type: 'recoveryRequired' }>['reason'],
+    ): Promise<ReopenedReservedPhysicalWrite> => {
+        try { await hostLock.release(); } catch { /* Failure remains fail-closed. */ }
+        return { type: 'recoveryRequired', reason };
+    };
+    try {
+        if (!await hostLock.verify()) return failAfterAttestation('lockEvidenceMissing');
+    } catch {
+        return failAfterAttestation('lockEvidenceMissing');
     }
     let bundle: ReturnType<typeof reopen_prepared_physical_install>;
     try {
@@ -123,7 +133,7 @@ export async function reopen_reserved_physical_write(
             hostLock,
         });
     } catch {
-        return { type: 'recoveryRequired', reason: 'preparedEvidenceInvalid' };
+        return failAfterAttestation('preparedEvidenceInvalid');
     }
     if (bundle.preparedInstallId !== record.preparedInstallId
         || bundle.hostLockId !== record.hostLockId
@@ -131,7 +141,7 @@ export async function reopen_reserved_physical_write(
         || bundle.physicalResourceLockKey !== record.physicalResourceLockKey
         || bundle.expectedPhysicalDigest !== record.expectedPhysicalDigest
         || bundle.intendedPhysicalDigest !== record.intendedPhysicalDigest) {
-        return { type: 'recoveryRequired', reason: 'bindingMismatch' };
+        return failAfterAttestation('bindingMismatch');
     }
     const binding = Object.freeze({
         preparedInstallId: record.preparedInstallId,
@@ -314,8 +324,7 @@ export function create_sqlite_file_state_persistence_from_runtime(
                 ...current.entry,
                 stateRevision: revision,
                 stateJson: nextJson,
-                hasPendingEdits: !!(nextState as { pendingEdits?: object }).pendingEdits
-                    && Object.keys((nextState as { pendingEdits: object }).pendingEdits).length > 0,
+                hasPendingEdits: state_has_pending_edits(nextState),
                 authority: nextAuthority,
                 recencyOrder: repo.allocate_recency_order(),
                 updatedAtMs: Math.max(current.entry.updatedAtMs ?? now(), now()),
@@ -600,10 +609,10 @@ export function create_sqlite_file_state_persistence_from_runtime(
                     } catch {
                         return recoveryRequired(true, true);
                     }
-                    return { type: 'committed', authority: finalizeReservation(repo, record) } as const;
                 } catch (error) {
                     return releaseFenceAfterThrownOperation(io, error);
                 }
+                return { type: 'committed', authority: finalizeReservation(repo, record) } as const;
             });
         },
         reconcile_reserved_physical_write(filePath, reservationId, io) {
@@ -630,18 +639,18 @@ export function create_sqlite_file_state_persistence_from_runtime(
                         } catch {
                             return recoveryRequired(false, true);
                         }
-                        if (!repo.clear_reserved_install_lifecycle(
-                            record.entryPath,
-                            record.reservationId,
-                        ) || !repo.delete_reservation(record.entryPath, record.reservationId)) {
-                            throw sqlite_file_state_error('recovery', {
-                                operation: 'reservation-abort',
-                            });
-                        }
-                        return { type: 'notInstalled' } as const;
                     } catch (error) {
                         return releaseFenceAfterThrownOperation(io, error);
                     }
+                    if (!repo.clear_reserved_install_lifecycle(
+                        record.entryPath,
+                        record.reservationId,
+                    ) || !repo.delete_reservation(record.entryPath, record.reservationId)) {
+                        throw sqlite_file_state_error('recovery', {
+                            operation: 'reservation-abort',
+                        });
+                    }
+                    return { type: 'notInstalled' } as const;
                 }
                 if (target !== 'intended') return recoveryRequired();
                 const fence = await io.acquireConditionalInstallFence('intended');
@@ -657,10 +666,10 @@ export function create_sqlite_file_state_persistence_from_runtime(
                     } catch {
                         return recoveryRequired(true, true);
                     }
-                    return { type: 'finalized', authority: finalizeReservation(repo, record) } as const;
                 } catch (error) {
                     return releaseFenceAfterThrownOperation(io, error);
                 }
+                return { type: 'finalized', authority: finalizeReservation(repo, record) } as const;
             });
         },
         discover_prepared_install_cleanups() {

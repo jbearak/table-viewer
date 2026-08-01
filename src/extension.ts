@@ -28,7 +28,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         () => boundary.viewOnly,
     );
     if (boundary.markerStatus === 'invalid') {
-        await vscode.window.showErrorMessage(
+        void vscode.window.showErrorMessage(
             'Table Viewer could not verify the physical-edit protocol marker. Files remain available in view-only mode. Close and update every Table Viewer product, then repair or remove the unreadable or tampered coordination marker before arming the protocol again.',
         );
     }

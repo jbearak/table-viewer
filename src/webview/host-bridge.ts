@@ -147,44 +147,59 @@ export const pending_edit_durability = {
         );
         notify_pending_edit_channel(channel);
     },
+    retire(editSessionId: string): void {
+        pending_edit_channels.delete(editSessionId);
+    },
 };
 
-if (typeof window !== 'undefined') {
+type PendingEditMessageGlobal = typeof globalThis & {
+    __tableViewerPendingEditMessageDispatch?: (event: MessageEvent) => void;
+    __tableViewerPendingEditMessageListenerWindow?: Window;
+};
+
+const pending_edit_message_global = globalThis as PendingEditMessageGlobal;
+pending_edit_message_global.__tableViewerPendingEditMessageDispatch = (event: MessageEvent) => {
+    const message = event.data;
+    if (
+        message?.type === 'requestPendingEditsFlush'
+        && typeof message.requestId === 'string'
+    ) {
+        const request_id = message.requestId;
+        // Start the responder in a promise callback so both a synchronous throw
+        // and an asynchronous rejection produce the same explicit, correlated
+        // failure response. The reason stays inside the renderer: the host only
+        // needs to know that the durability boundary was not established.
+        void Promise.resolve()
+            .then(() => pending_edit_flush_responder())
+            .then(
+                (result) => host_bridge.postMessage({
+                    type: 'pendingEditsFlush',
+                    requestId: request_id,
+                    editSessionId: result.editSessionId,
+                    highestProducedSequence: result.highestProducedSequence,
+                }),
+                () => host_bridge.postMessage({
+                    type: 'pendingEditsFlushFailed',
+                    requestId: request_id,
+                }),
+            )
+            // A failed host transport cannot be reported over that same
+            // transport, but must not become an unhandled renderer rejection.
+            .catch(() => {});
+        return;
+    }
+    if (
+        message?.type !== 'pendingEditsAcknowledged'
+        || typeof message.editSessionId !== 'string'
+        || !Number.isSafeInteger(message.sequence)
+    ) return;
+    pending_edit_durability.acknowledge(message.editSessionId, message.sequence);
+};
+
+if (typeof window !== 'undefined'
+    && pending_edit_message_global.__tableViewerPendingEditMessageListenerWindow !== window) {
     window.addEventListener('message', (event: MessageEvent) => {
-        const message = event.data;
-        if (
-            message?.type === 'requestPendingEditsFlush'
-            && typeof message.requestId === 'string'
-        ) {
-            const request_id = message.requestId;
-            // Start the responder in a promise callback so both a synchronous throw
-            // and an asynchronous rejection produce the same explicit, correlated
-            // failure response. The reason stays inside the renderer: the host only
-            // needs to know that the durability boundary was not established.
-            void Promise.resolve()
-                .then(() => pending_edit_flush_responder())
-                .then(
-                    (result) => host_bridge.postMessage({
-                        type: 'pendingEditsFlush',
-                        requestId: request_id,
-                        editSessionId: result.editSessionId,
-                        highestProducedSequence: result.highestProducedSequence,
-                    }),
-                    () => host_bridge.postMessage({
-                        type: 'pendingEditsFlushFailed',
-                        requestId: request_id,
-                    }),
-                )
-                // A failed host transport cannot be reported over that same
-                // transport, but must not become an unhandled renderer rejection.
-                .catch(() => {});
-            return;
-        }
-        if (
-            message?.type !== 'pendingEditsAcknowledged'
-            || typeof message.editSessionId !== 'string'
-            || !Number.isSafeInteger(message.sequence)
-        ) return;
-        pending_edit_durability.acknowledge(message.editSessionId, message.sequence);
+        pending_edit_message_global.__tableViewerPendingEditMessageDispatch?.(event);
     });
+    pending_edit_message_global.__tableViewerPendingEditMessageListenerWindow = window;
 }

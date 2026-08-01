@@ -386,9 +386,11 @@ export function App(): React.JSX.Element {
     const csv_edit_session_id_ref = useRef<string>();
     const renderer_publication_fenced_session_ref = useRef<string>();
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
-        if (next && next !== csv_edit_session_id_ref.current) {
+        const previous = csv_edit_session_id_ref.current;
+        if (next && next !== previous) {
             renderer_publication_fenced_session_ref.current = undefined;
         }
+        if (previous && previous !== next) pending_edit_durability.retire(previous);
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
