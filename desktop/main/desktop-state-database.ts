@@ -23,11 +23,15 @@ import {
 import type { SqliteDesktopFileStateIdentity } from '../../src/sqlite-file-state-schema';
 import {
     acquire_sqlite_exclusive_recovery_gate,
+    assert_managed_directory,
     assert_sqlite_directory_durability_supported,
+    capture_managed_directory,
     inspect_sqlite_recovery_gate,
     preserve_sqlite_basename_set,
     reclaim_stale_sqlite_exclusive_intent,
     resume_sqlite_basename_preservation,
+    safe_error,
+    type ManagedDirectoryIdentity,
     type SqliteExclusiveRecoveryGate,
     type SqliteOpenRecoveryHooks,
 } from '../../src/sqlite-open-recovery';
@@ -360,11 +364,15 @@ function desktop_state_gate_directory(database_path: string): string {
  * without this an `ENOTDIR`/`EACCES` here would put a real filesystem path into
  * whatever the caller logs or shows. `SqliteFileStateError` already carries
  * nothing but a category and a sanitized operation name.
+ *
+ * `safe_error` rather than `categorize_sqlite_file_state_error` so an errno maps
+ * to the category that actually describes it — `EACCES` to `inaccessible`,
+ * `ENOSPC` to `full` — instead of collapsing to `unknown`. Same mapping the
+ * shared backend applies to its own filesystem failures, so a quarantine failure
+ * and an equivalent failure one call later tell the same story.
  */
 function quarantine_failure(error: unknown) {
-    return categorize_sqlite_file_state_error(error, {
-        operation: 'reader-token-quarantine',
-    });
+    return safe_error('reader-token-quarantine', error);
 }
 
 function quarantine_unparseable_reader_tokens(
@@ -375,41 +383,48 @@ function quarantine_unparseable_reader_tokens(
     if (confirmation?.allProcessesClosed !== true) {
         throw new Error('Quarantining reader tokens requires all processes closed.');
     }
-    const gate_directory = desktop_state_gate_directory(database_path);
-    const readers_directory = path.join(gate_directory, 'readers');
-    // `lstatSync`, not `existsSync`: the latter follows symlinks, so a link
-    // anywhere on this path would send every rename below outside the gate tree —
-    // moving files this function has no business touching, and doing it *before*
-    // the backend's own managed-directory check could object.
+    // Every directory this function touches is *captured* rather than merely
+    // path-joined, and every child is derived from its parent's verified
+    // `physicalPath`. Three rounds of defects here all had the same shape — a
+    // path built with `path.join` and handed to `fs` without anything having
+    // established that it is the directory we meant — so the structure, not
+    // another check, is the fix: after this block no unverified string reaches an
+    // `fs` call.
     //
-    // Both levels are checked, not just `readers`: the gate directory is derived
-    // by `path.join`, so a symlinked *gate* would leave `readers` looking like a
-    // perfectly ordinary directory to `lstat` while every path built from it
-    // resolved somewhere else entirely. Checking only the leaf is the kind of
-    // guard that reads correct and isn't.
-    //
-    // A link or a non-directory at either level is left exactly as found for the
-    // recovery dialog to surface. This function's job is to clear entries inside
-    // *our own* readers directory, and if that directory is not ours then nothing
-    // inside it is either.
-    const own_directory = (directory: string): boolean | undefined => {
-        try {
-            return fs.lstatSync(directory).isDirectory();
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return undefined;
-            throw quarantine_failure(error);
-        }
-    };
-    for (const directory of [gate_directory, readers_directory]) {
-        const owned = own_directory(directory);
-        // Nothing to clear: no gate, or a gate with no readers directory yet.
-        if (owned === undefined) return;
-        if (!owned) {
-            throw sqlite_file_state_recovery_error({
-                operation: 'reader-token-quarantine-directory',
-            });
-        }
+    // `capture_managed_directory` is the shared backend's own primitive and is
+    // strictly stronger than a local `lstat`: it rejects symlinks, confirms real
+    // parentage via `realpath`, and re-`lstat`s to confirm dev/ino stability,
+    // which closes the window between the check and the use. Reusing it also
+    // means this function cannot drift from the rules the backend enforces one
+    // call later.
+    const state_directory = path.dirname(database_path);
+    const gate_path = desktop_state_gate_directory(database_path);
+    // Absent, not malformed: no gate at all means there is nothing to clear, and
+    // the caller's own gate inspection is what decides whether that is a problem.
+    if (!fs.existsSync(gate_path)) return;
+    let gate: ManagedDirectoryIdentity;
+    let readers: ManagedDirectoryIdentity;
+    try {
+        // The physical parent is resolved first so a symlinked *ancestor* — the
+        // userData directory itself, say — cannot make an honest gate look
+        // misparented, which would refuse a recovery that should have worked.
+        gate = capture_managed_directory(
+            gate_path,
+            fs.realpathSync.native(state_directory),
+            'reader-token-quarantine-directory',
+        );
+        const readers_path = path.join(gate.physicalPath, 'readers');
+        // No readers directory yet is likewise nothing to clear.
+        if (!fs.existsSync(readers_path)) return;
+        readers = capture_managed_directory(
+            readers_path,
+            gate.physicalPath,
+            'reader-token-quarantine-directory',
+        );
+    } catch (error) {
+        throw quarantine_failure(error);
     }
+    const readers_directory = readers.physicalPath;
     // Duplicated rather than imported from the shared backend: this is the shape
     // the backend *rejects*, so the predicate that decides what to quarantine has
     // to keep matching that rejection even if a future token name gains a
@@ -427,44 +442,45 @@ function quarantine_unparseable_reader_tokens(
                 || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
             .map((entry) => entry.name);
         if (unparseable.length === 0) return;
-        const quarantine_root = path.join(
-            gate_directory,
-            READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
-        );
-        // The destination needs the same guard as the source, for the same reason:
-        // this name is joined onto the gate path and never otherwise checked, so a
-        // symlink here would make `mkdirSync` follow it and land every rename in
-        // the link target — writing outside the gate tree, which is the exact
-        // invariant the source-side guard above exists to protect. Guarding only
-        // the read side would have been half a fix.
-        const quarantine_root_owned = own_directory(quarantine_root);
-        if (quarantine_root_owned === false) {
-            throw sqlite_file_state_recovery_error({
-                operation: 'reader-token-quarantine-directory',
-            });
-        }
-        const quarantine_directory = path.join(quarantine_root, randomUUID());
         const flush = (directory: string): void => {
             assert_sqlite_directory_durability_supported(
                 directory,
                 options.fsyncDirectory ?? fs.fsyncSync,
             );
         };
-        // Created one level at a time so each new directory entry can be flushed,
-        // the way `ensure_private_gate` does it. `mkdirSync(…, {recursive: true})`
-        // on the full path would create `quarantined-readers` *and* the generation
-        // directory while only the lower level ever got flushed — leaving the top
-        // link of the destination chain unrecorded. The removals from `readers/`
-        // below are flushed, so a crash could then make the moved evidence
-        // unreachable, and this module is not allowed to destroy evidence.
-        if (quarantine_root_owned === undefined) {
-            fs.mkdirSync(quarantine_root, { mode: 0o700 });
-            flush(gate_directory);
+        // The destination is captured exactly like the source, and derived from
+        // the gate's verified `physicalPath` rather than joined onto a raw string.
+        // A symlink here would otherwise make `mkdirSync` land every rename in the
+        // link target — the same escape as the read side, which is why both now go
+        // through one primitive instead of two hand-written checks.
+        //
+        // Created one level at a time, the way `ensure_private_gate` does it, so
+        // the entry recording `quarantined-readers` inside the gate can be flushed
+        // before anything moves in. A single recursive mkdir would create both
+        // levels while only the lower one was ever flushed.
+        const quarantine_root_path = path.join(
+            gate.physicalPath,
+            READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
+        );
+        const quarantine_root_existed = fs.existsSync(quarantine_root_path);
+        if (!quarantine_root_existed) {
+            fs.mkdirSync(quarantine_root_path, { mode: 0o700 });
+            flush(gate.physicalPath);
         }
+        const quarantine_root = capture_managed_directory(
+            quarantine_root_path,
+            gate.physicalPath,
+            'reader-token-quarantine-directory',
+        );
+        const quarantine_directory = path.join(quarantine_root.physicalPath, randomUUID());
         fs.mkdirSync(quarantine_directory, { mode: 0o700 });
         // Before anything moves in, so a crash cannot leave a member with no
-        // directory to have landed in.
-        flush(quarantine_root);
+        // directory to have landed in. Both endpoints are re-asserted immediately
+        // before the renames, as the shared backend does around its own mutations:
+        // capture-then-use always leaves a window, and this closes it.
+        flush(quarantine_root.physicalPath);
+        assert_managed_directory(readers, 'reader-token-quarantine-directory');
+        assert_managed_directory(quarantine_root, 'reader-token-quarantine-directory');
         for (const name of unparseable) {
             fs.renameSync(
                 path.join(readers_directory, name),

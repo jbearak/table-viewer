@@ -127,7 +127,7 @@ interface GatePaths {
     readonly recoveryBlockPath: string;
 }
 
-interface ManagedDirectoryIdentity {
+export interface ManagedDirectoryIdentity {
     readonly directoryPath: string;
     readonly physicalPath: string;
     readonly physicalParentPath: string;
@@ -301,7 +301,7 @@ function is_node_error(error: unknown): error is NodeJS.ErrnoException {
     return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === 'string';
 }
 
-function safe_error(operation: string, error: unknown): SqliteFileStateError {
+export function safe_error(operation: string, error: unknown): SqliteFileStateError {
     if (error instanceof SqliteFileStateError) return error;
     if (is_node_error(error)) {
         switch (error.code) {
@@ -330,7 +330,7 @@ function safe_error(operation: string, error: unknown): SqliteFileStateError {
     return sqlite_file_state_recovery_error({ operation });
 }
 
-function capture_managed_directory(
+export function capture_managed_directory(
     directoryPath: string,
     physicalParentPath: string,
     operation: string,
@@ -358,7 +358,7 @@ function capture_managed_directory(
     };
 }
 
-function assert_managed_directory(identity: ManagedDirectoryIdentity, operation: string): void {
+export function assert_managed_directory(identity: ManagedDirectoryIdentity, operation: string): void {
     const actual = capture_managed_directory(
         identity.directoryPath,
         identity.physicalParentPath,
