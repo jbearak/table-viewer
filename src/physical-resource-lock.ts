@@ -157,6 +157,8 @@ export interface PhysicalLockManagerOptions {
     readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
     /** Test-only race instrumentation after release-pin bytes are read from a pinned descriptor. */
     readonly onReleasePinCandidateRead?: (pinPath: string) => void;
+    /** Test-only race instrumentation after a missing member is observed, before restoration. */
+    readonly onReleasePinBeforeRestore?: (pinPath: string, memberPath: string) => void;
     /** Test-only race instrumentation after marker bytes are read from a pinned descriptor. */
     readonly onActivationMarkerCandidateRead?: () => void;
     readonly filesystemType?: FilesystemTypeInspector;
@@ -636,6 +638,7 @@ export class PhysicalResourceLockManager {
     private readonly onReleaseCandidatePinned?: (memberPath: string) => void;
     private readonly onReleaseMemberUnlinked?: (memberPath: string) => void;
     private readonly onReleasePinCandidateRead?: (pinPath: string) => void;
+    private readonly onReleasePinBeforeRestore?: (pinPath: string, memberPath: string) => void;
     private readonly onActivationMarkerCandidateRead?: () => void;
     private readonly filesystemType?: FilesystemTypeInspector;
     private readonly targetFilesystemType?: FilesystemTypeInspector;
@@ -656,6 +659,7 @@ export class PhysicalResourceLockManager {
         this.onReleaseCandidatePinned = options.onReleaseCandidatePinned;
         this.onReleaseMemberUnlinked = options.onReleaseMemberUnlinked;
         this.onReleasePinCandidateRead = options.onReleasePinCandidateRead;
+        this.onReleasePinBeforeRestore = options.onReleasePinBeforeRestore;
         this.onActivationMarkerCandidateRead = options.onActivationMarkerCandidateRead;
         this.filesystemType = options.filesystemType;
         this.targetFilesystemType = options.targetFilesystemType;
@@ -1145,15 +1149,35 @@ export class PhysicalResourceLockManager {
                     // descriptor identity check below prevents a substituted pin from
                     // lending its pathname to a replacement owner. Durably install the
                     // member before removing the sole recovery pin.
+                    let createdMember: fs.BigIntStats | undefined;
+                    this.onReleasePinBeforeRestore?.(pinPath, memberPath);
                     try {
                         fs.linkSync(pinPath, memberPath);
+                        createdMember = fs.lstatSync(memberPath, { bigint: true });
                     } catch (linkError) {
                         if (!is_node_error(linkError) || linkError.code !== 'EEXIST') throw linkError;
                     }
                     const restored = fs.lstatSync(memberPath, { bigint: true });
                     if (!restored.isFile() || restored.isSymbolicLink()
                         || restored.dev !== pinStat.dev || restored.ino !== pinStat.ino) {
-                        throw new Error('Physical release pin conflicts with a replacement owner');
+                        const conflict = new Error(
+                            'Physical release pin conflicts with a replacement owner',
+                        );
+                        if (createdMember) {
+                            try {
+                                remove_exact_created_file(
+                                    memberPath,
+                                    createdMember,
+                                    this.durableDirectoryOperations,
+                                );
+                            } catch (cleanupError) {
+                                throw new AggregateError(
+                                    [conflict, cleanupError],
+                                    'Failed to clean up a substituted physical release member',
+                                );
+                            }
+                        }
+                        throw conflict;
                     }
                     flush_directory(this.lockRoot, this.durableDirectoryOperations);
                     assert_same_root(this.lockRoot, rootIdentity);

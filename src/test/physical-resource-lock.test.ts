@@ -809,6 +809,37 @@ describe('physical resource locks', () => {
         expect(JSON.parse(fs.readFileSync(member, 'utf8')).hostLockId).toBe(lock!.hostLockId);
     });
 
+    it('removes only a wrongly restored member after a pin-only substitution', async () => {
+        let pin = '';
+        let member = '';
+        let replaced = false;
+        const replacement = Buffer.from('replacement pin-only release');
+        const manager = new PhysicalResourceLockManager({
+            lockRoot,
+            onReleasePinBeforeRestore(candidatePin, candidateMember) {
+                if (candidatePin !== pin || candidateMember !== member || replaced) return;
+                replaced = true;
+                fs.unlinkSync(candidatePin);
+                fs.writeFileSync(candidatePin, replacement, { mode: 0o600 });
+            },
+        });
+        const lock = await manager.acquire(target);
+        expect(lock).not.toBeNull();
+        const memberName = fs.readdirSync(lockRoot).find((name) => name.endsWith('.lock'))!;
+        member = path.join(lockRoot, memberName);
+        pin = path.join(lockRoot, `.release-v1-${memberName}-${lock!.hostLockId}`);
+        fs.linkSync(member, pin);
+        fs.unlinkSync(member);
+
+        expect(() => manager.discover_attested_stale_locks({
+            allTableViewerProcessesClosed: true,
+        })).toThrow(/replacement owner/);
+
+        expect(replaced).toBe(true);
+        expect(fs.existsSync(member)).toBe(false);
+        expect(fs.readFileSync(pin)).toEqual(replacement);
+    });
+
     it('never unlinks a replacement owner after exact-token release has pinned the old member', async () => {
         const replacementToken = 'e'.repeat(64);
         let member = '';
