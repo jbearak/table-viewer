@@ -216,6 +216,41 @@ describe('desktop state backend', () => {
         expect(lifecycle.phase).toBe('draining');
     });
 
+    it('orders the phase and the admission refusal, in mirrored directions', async () => {
+        // Both sequences are load-bearing and neither is observable from the
+        // outside once they have settled, so each callback records the phase it
+        // was *called with*. Reversing either statement in
+        // `create_desktop_state_backend` leaves every other test in this file and
+        // in viewer-windows.test.ts green, which is why this one exists.
+        //
+        // Entering: phase first, so `submit` has already stopped releasing
+        // buffered startup work by the time a window could be admitted. If
+        // admission stopped first, the gate would still be `ready` for one
+        // statement and a queued `open-file` could be flushed into a closing
+        // backend.
+        //
+        // Abandoning: the exact mirror — admission back first, then the phase, so
+        // the phase change cannot release a buffered request into a manager that
+        // is still refusing it. That request would be silently dropped rather
+        // than opened, in an app the user just chose to keep running.
+        const log: string[] = [];
+        const lifecycle = create_desktop_lifecycle();
+        const backend = create_desktop_state_backend(
+            lifecycle,
+            () => log.push(`stop@${lifecycle.phase}`),
+            () => log.push(`resume@${lifecycle.phase}`),
+        );
+        await backend.publish(fake_store());
+        lifecycle.become_ready();
+
+        backend.begin_shutdown();
+        expect(log).toEqual(['stop@draining']);
+
+        backend.abandon_shutdown();
+        expect(log).toEqual(['stop@draining', 'resume@draining']);
+        expect(lifecycle.phase).toBe('ready');
+    });
+
     it('takes the refusal back, connection untouched, when the quit is abandoned', async () => {
         const lifecycle = create_desktop_lifecycle();
         const stop_admission = vi.fn();

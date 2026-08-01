@@ -1060,8 +1060,9 @@ describe('application quit coordinator', () => {
      * from either must not be able to reach `abandon` — the store is gone and
      * re-admitting would attach a controller to it.
      */
+    /** The store is not a parameter: each caller publishes its own through
+     *  `backend.publish`, so taking one here only invited the two to disagree. */
     function post_close_wiring(
-        store: { close(): Promise<void> },
         hooks: { on_report?: () => void; on_resume?: () => void } = {},
     ) {
         const lifecycle = create_desktop_lifecycle();
@@ -1115,7 +1116,7 @@ describe('application quit coordinator', () => {
         // a connection nobody can use.
         const rejections = watch_unhandled_rejections();
         const store = { close: async (): Promise<void> => { throw new Error('close failed'); } };
-        const wiring = post_close_wiring(store, {
+        const wiring = post_close_wiring({
             on_report: () => { throw new Error('EPIPE: stdout is gone'); },
         });
         await wiring.backend.publish(store);
@@ -1159,7 +1160,7 @@ describe('application quit coordinator', () => {
         const rejections = watch_unhandled_rejections();
         const closes: string[] = [];
         const store = { close: async (): Promise<void> => { closes.push('close'); } };
-        const wiring = post_close_wiring(store, {
+        const wiring = post_close_wiring({
             on_resume: () => { throw new Error('app.quit failed'); },
         });
         await wiring.backend.publish(store);
