@@ -8,6 +8,7 @@
 // Pure Node (no electron import) so it is unit-testable; main.ts passes the
 // `app.getPath('userData')` value, exactly as it does for `settings_file_path`
 // and `json_state_file_path`.
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
@@ -22,8 +23,8 @@ import {
 import type { SqliteDesktopFileStateIdentity } from '../../src/sqlite-file-state-schema';
 import {
     acquire_sqlite_exclusive_recovery_gate,
+    assert_sqlite_directory_durability_supported,
     inspect_sqlite_recovery_gate,
-    inventory_sqlite_basename,
     preserve_sqlite_basename_set,
     reclaim_stale_sqlite_exclusive_intent,
     resume_sqlite_basename_preservation,
@@ -187,15 +188,34 @@ function open_failure(error: unknown, operation: string): DesktopStateOpenResult
  * dialog tells as the `interrupted` story and whose preserve action can now
  * resume and clear it (see `preserve_desktop_state_database`).
  *
+ * The gate's two durable markers are the *whole* predicate, and deliberately so.
+ * The blockade marker is written before the first member moves and removed only
+ * after the manifest says `complete`, and the exclusive intent is removed last of
+ * all — so every way a move can stop partway leaves at least one of them, and a
+ * settled basename has neither.
+ *
+ * An earlier revision also refused when `inventory_sqlite_basename` reported
+ * `incompleteRecoveryDirectories > 0`. That is not a stable predicate for this
+ * app and it bricked the ordinary success path: `validate_completed_preservation`
+ * requires a completed recovery directory's original source names to still be
+ * *absent*, while the whole purpose of this flow is to re-initialize exactly that
+ * name immediately after preserving. From the second launch onward every
+ * successfully preserved directory therefore counted as "incomplete", so the app
+ * opened once after a successful "Set Aside and Start Fresh" and then refused
+ * forever, with Try Again re-failing identically and Set Aside throwing
+ * `orphan-preservation-manifest` — no in-app escape at all, and reachable without
+ * any crash. A half-moved set is a strictly smaller condition than that, and the
+ * markers above already cover it.
+ *
  * Deliberately non-blocking and non-mutating: `inspect_sqlite_recovery_gate` is
- * synchronous and acquires no token, and `inventory_sqlite_basename` only reads.
- * Neither can be starved by the condition it is looking for.
+ * synchronous and acquires no token, so it cannot be starved by the condition it
+ * is looking for.
  *
  * Returns the failure to report, or undefined to proceed with the open.
  */
-async function preflight_recovery_condition(
+function preflight_recovery_condition(
     database_path: string,
-): Promise<DesktopStateOpenResult | undefined> {
+): DesktopStateOpenResult | undefined {
     // First run: the directory the store itself creates does not exist yet, so
     // there is nothing to be blocked by — and inspecting would both fail with
     // ENOENT and create the gate before the store has made its own directory.
@@ -213,20 +233,14 @@ async function preflight_recovery_condition(
                 'desktop-state-preflight',
             );
         }
-        const inventory = await inventory_sqlite_basename(database_path);
-        // A recovery directory that does not validate as complete means a move
-        // is half-done. Opening the main file would serve state detached from
-        // whichever members already left, so fail closed into the resume path.
-        if (inventory.recoveryBlocked || inventory.incompleteRecoveryDirectories > 0) {
-            return open_failure(
-                sqlite_file_state_recovery_error({ operation: 'desktop-state-preflight' }),
-                'desktop-state-preflight',
-            );
-        }
         return undefined;
     } catch (error) {
         // A preflight that cannot read its own gate is itself a reportable
-        // condition — never a reason to fall through into the retry loop.
+        // condition — never a reason to fall through into the retry loop. The
+        // original category and stage survive, because a gate directory that
+        // cannot be listed at all is a different story from a recovery in
+        // progress: a malformed reader-token filename reaches the dialog as
+        // `reader-token-inventory` and gets its own prose.
         return open_failure(error, 'desktop-state-preflight');
     }
 }
@@ -245,7 +259,7 @@ export async function open_desktop_state_database(
     options: { readonly now?: () => number } = {},
 ): Promise<DesktopStateOpenResult> {
     const now = options.now ?? Date.now;
-    const blocked = await preflight_recovery_condition(
+    const blocked = preflight_recovery_condition(
         desktop_state_database_path(user_data_dir),
     );
     if (blocked) return blocked;
@@ -298,6 +312,94 @@ async function reclaim_interrupted_recovery_residue(
     }
 }
 
+/** Where a reader-token filename that the gate's inventory cannot parse is moved
+ *  to, under the gate directory so it can never be mistaken for a basename
+ *  member and never travels with a preserved set. One fresh generation
+ *  subdirectory per quarantine run, so two runs cannot collide on a name and
+ *  nothing has to be overwritten. */
+const READER_TOKEN_QUARANTINE_DIRECTORY_NAME = 'quarantined-readers';
+
+function desktop_state_gate_directory(database_path: string): string {
+    return path.join(
+        path.dirname(database_path),
+        `.${path.basename(database_path)}.recovery-gate`,
+    );
+}
+
+/**
+ * Set aside any `*.reader` entry whose name the gate's own inventory refuses,
+ * exactly and only under the all-processes-closed attestation.
+ *
+ * Without this, a single malformed reader-token filename is a permanent
+ * dead-end: `existing_reader_token_ids` throws `reader-token-inventory` for any
+ * `*.reader` whose stem is not a UUID, so the open fails *and*
+ * `preserve_desktop_state_database` throws the same error out of
+ * `inspect_sqlite_recovery_gate` before it can acquire the gate — leaving the
+ * recovery dialog looping with no in-app action that can clear it, and the user
+ * hand-editing a hidden directory as the only escape.
+ *
+ * This weakens no exact-token semantics, because an entry it touches was never a
+ * token: every reader token this code has ever created is named
+ * `<uuid>.reader` and contains that same uuid (see
+ * `acquire_sqlite_shared_reader_gate`), so a name that fails `UUID_PATTERN` — or
+ * an entry that is not a regular file at all — cannot represent a live reader
+ * and cannot be reclaimed, waited on, or matched by any exact-token check. A
+ * *valid* token is deliberately left completely alone here; reclaiming one stays
+ * the exclusive gate's exact-id path, with no PID, TTL, age, or heartbeat.
+ *
+ * A move, never a delete, and into the diagnostics folder's own tree: the bytes
+ * are evidence about how the directory got into this state, and nothing in this
+ * module is allowed to destroy evidence.
+ */
+function quarantine_unparseable_reader_tokens(
+    database_path: string,
+    confirmation: { readonly allProcessesClosed: true },
+    options: SqliteOpenRecoveryHooks,
+): void {
+    if (confirmation?.allProcessesClosed !== true) {
+        throw new Error('Quarantining reader tokens requires all processes closed.');
+    }
+    const readers_directory = path.join(desktop_state_gate_directory(database_path), 'readers');
+    if (!fs.existsSync(readers_directory)) return;
+    // Duplicated rather than imported from the shared backend: this is the shape
+    // the backend *rejects*, so the predicate that decides what to quarantine has
+    // to keep matching that rejection even if a future token name gains a
+    // different generator. `randomUUID` is v4, which is what the backend's own
+    // pattern accepts.
+    const uuid_pattern
+        = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const unparseable = fs.readdirSync(readers_directory, { withFileTypes: true })
+        .filter((entry) => entry.name.endsWith('.reader'))
+        .filter((entry) => !entry.isFile()
+            || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
+        .map((entry) => entry.name);
+    if (unparseable.length === 0) return;
+    const quarantine_directory = path.join(
+        desktop_state_gate_directory(database_path),
+        READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
+        randomUUID(),
+    );
+    fs.mkdirSync(quarantine_directory, { recursive: true, mode: 0o700 });
+    // Durability in the same order the shared backend uses: the new directory
+    // entry is flushed before anything is moved into it, so a crash mid-quarantine
+    // cannot leave a member with no directory to have landed in.
+    const flush = (directory: string): void => {
+        assert_sqlite_directory_durability_supported(
+            directory,
+            options.fsyncDirectory ?? fs.fsyncSync,
+        );
+    };
+    flush(path.dirname(quarantine_directory));
+    for (const name of unparseable) {
+        fs.renameSync(
+            path.join(readers_directory, name),
+            path.join(quarantine_directory, name),
+        );
+    }
+    flush(quarantine_directory);
+    flush(readers_directory);
+}
+
 /**
  * Move the unopenable database aside so the next launch starts clean, keeping
  * the old bytes for diagnostics.
@@ -309,9 +411,12 @@ async function reclaim_interrupted_recovery_residue(
  * -shm}` set as one unit — because preserving only some members would leave
  * behind a WAL that a later open would replay into a *different* main file.
  *
- * Three things beyond "start a move" happen here, all of them only because the
+ * Four things beyond "start a move" happen here, all of them only because the
  * attestation was given:
  *
+ * - a `*.reader` entry whose name the gate's inventory cannot parse — which was
+ *   therefore never one of our tokens — is quarantined, so the very inventory
+ *   this function depends on can run at all;
  * - a stale exclusive intent left by an interrupted attempt is reclaimed by
  *   exact token, so this attempt can acquire the gate at all;
  * - stale reader tokens are reclaimed by exact id, so the exclusive wait can
@@ -332,6 +437,11 @@ export async function preserve_desktop_state_database(
     // make our own `write_private_file_exclusive` fail with EEXIST, i.e. the
     // user could never retry the very operation that was interrupted.
     if (fs.existsSync(path.dirname(database_path))) {
+        // First of all, and before `inspect_sqlite_recovery_gate` — which lists
+        // the readers directory and throws `reader-token-inventory` on an
+        // unparseable name, from *this* line, making the whole recovery action
+        // unreachable for a condition only the recovery action can clear.
+        quarantine_unparseable_reader_tokens(database_path, confirmation, options);
         const residue = inspect_sqlite_recovery_gate(database_path);
         if (residue.exclusiveIntentTokenId !== undefined) {
             await reclaim_stale_sqlite_exclusive_intent(

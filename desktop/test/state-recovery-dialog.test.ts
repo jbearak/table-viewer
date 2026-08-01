@@ -27,7 +27,8 @@ const DIAGNOSTICS_DIRECTORY = '/tmp/table-viewer-diagnostics';
  *  added to the union has to be acknowledged here too. */
 const KINDS: readonly StateRecoveryKind[] = [
     'transient', 'environment', 'capacity', 'io', 'corrupt', 'compatibility',
-    'unsupported-platform', 'interrupted', 'leftover-setup', 'unknown',
+    'unsupported-platform', 'interrupted', 'leftover-setup', 'obstructed',
+    'coordination-residue', 'unknown',
 ];
 
 /** The whole `SqliteFileStateErrorCategory` union, spelled out for the same
@@ -81,6 +82,16 @@ function flow(
         preserve,
         diagnostics_directory: () => DIAGNOSTICS_DIRECTORY,
     });
+}
+
+/** The prose with explicit denials of damage removed, so what remains is only
+ *  what the text *asserts*. "They are not damaged" must not read as a corruption
+ *  claim — it is the opposite of one, and the `compatibility`, `obstructed`, and
+ *  `coordination-residue` arms say exactly that on purpose. */
+function damage_claims(kind: StateRecoveryKind): string {
+    const { message, detail } = state_recovery_wording(kind);
+    return `${message} ${detail}`
+        .replace(/\b(?:are|is|was|were)\s+not\s+(?:corrupt(?:ed)?|damaged)\b/gi, '');
 }
 
 describe('state recovery classification', () => {
@@ -179,6 +190,86 @@ describe('state recovery classification', () => {
         expect(prose).not.toMatch(/unfinished move|previous attempt/i);
     });
 
+    it('tells a headerless file as damage, not as another product’s property', () => {
+        // `read_sqlite_raw_header` throws `schema` for bad magic or a file too
+        // short to hold a header, and `schema` defaults to `compatibility` —
+        // whose prose says the settings belong to a different product or a newer
+        // version, that "they are not damaged", and that setting them aside would
+        // leave the other product without them. For a garbage file every clause is
+        // false and the last discourages the only action that recovers. This is
+        // the mirror of the `io`-must-not-say-corruption rule.
+        const headerless = classify_state_recovery_failure({
+            category: 'schema',
+            operation: 'raw-header',
+        });
+        // The identity fence is deliberately NOT refined: a well-formed SQLite
+        // file carrying another application id is exactly what `compatibility`
+        // describes.
+        const foreign_identity = classify_state_recovery_failure({
+            category: 'schema',
+            operation: 'raw-application-id',
+        });
+
+        expect(headerless).toMatchObject({ kind: 'corrupt', canPreserve: true });
+        expect(foreign_identity.kind).toBe('compatibility');
+        expect(headerless.kind).not.toBe(foreign_identity.kind);
+    });
+
+    it('tells an obstructed member name as an obstruction, not a resumed move', () => {
+        // A folder or link on one of the settings set's own names. `member_for`
+        // rejects it with `inventory-member-type`; no move was ever attempted, so
+        // the `interrupted` claim that continuing resumes one is precisely the
+        // false statement `leftover-setup` was introduced to eliminate.
+        const detail = classify_state_recovery_failure({
+            category: 'recovery',
+            operation: 'inventory-member-type',
+        });
+
+        // Not preservable, and provably so rather than as a judgement: the
+        // preserve action inventories the same obstructed name and throws the same
+        // error before moving anything, so the offer would be a loop out of which
+        // only Quit leads.
+        expect(detail).toMatchObject({ kind: 'obstructed', canPreserve: false });
+        expect(state_recovery_button_layout(detail.canPreserve).choices)
+            .toEqual(['retry', 'open-diagnostics', 'quit']);
+        const prose = Object.values(state_recovery_wording('obstructed')).join(' ');
+        expect(prose).not.toMatch(/resum/i);
+        expect(prose).not.toMatch(/unfinished move|previous attempt|did not finish/i);
+        // Explicit denials of damage stripped first, exactly as in
+        // `damage_claims` below, so what is checked is what the text *asserts*.
+        expect(damage_claims('obstructed')).not.toMatch(/corrupt|damaged/i);
+    });
+
+    it('tells unrecognized coordination residue as its own refusal to guess', () => {
+        // An entry in the private gate directory whose name was never one of our
+        // reader tokens. Not damage to the settings, and not an interrupted move —
+        // it is a refusal to guess whether a live window still holds them, and the
+        // preserve action can now set it aside.
+        const detail = classify_state_recovery_failure({
+            category: 'recovery',
+            operation: 'reader-token-inventory',
+        });
+
+        expect(detail).toMatchObject({ kind: 'coordination-residue', canPreserve: true });
+        const prose = Object.values(state_recovery_wording('coordination-residue')).join(' ');
+        expect(prose).not.toMatch(/resum/i);
+        expect(prose).not.toMatch(/unfinished move|previous attempt|did not finish/i);
+        expect(damage_claims('coordination-residue')).not.toMatch(/corrupt|damaged/i);
+        // It does promise what the quarantine actually guarantees: a set-aside,
+        // never a delete.
+        expect(prose).toMatch(/never deleting/i);
+    });
+
+    it('keeps the generic recovery default for a stage it cannot distinguish', () => {
+        // The refinements are additive: a `recovery` failure whose stage is not one
+        // of the distinguished ones still gets the interrupted-move story, which is
+        // the right default for the preflight's own blockade/intent report.
+        expect(classify_state_recovery_failure({
+            category: 'recovery',
+            operation: 'desktop-state-preflight',
+        })).toMatchObject({ kind: 'interrupted', canPreserve: true });
+    });
+
     it('never offers to move state aside for an environment or capacity failure', () => {
         expect(classify_state_recovery_failure({ category: 'readonly' }))
             .toMatchObject({ kind: 'environment', canPreserve: false });
@@ -231,6 +322,8 @@ describe('state recovery classification', () => {
             { category: 'unsupported', operation: 'directory-durability' },
             { category: 'recovery' },
             { category: 'recovery', operation: 'absent-main-evidence' },
+            { category: 'recovery', operation: 'inventory-member-type' },
+            { category: 'recovery', operation: 'reader-token-inventory' },
             { category: 'unknown' },
         ];
         const kinds = representatives.map(
@@ -267,16 +360,6 @@ describe('state recovery wording', () => {
         expect(new Set(KINDS))
             .toEqual(new Set([...Object.values(KIND_BY_CATEGORY), ...REFINED_ONLY_KINDS]));
     });
-
-    /** The prose with explicit denials of damage removed, so what remains is only
-     *  what the text *asserts*. "They are not damaged" must not read as a
-     *  corruption claim — it is the opposite of one, and the `compatibility` arm
-     *  says exactly that on purpose. */
-    function damage_claims(kind: StateRecoveryKind): string {
-        const { message, detail } = state_recovery_wording(kind);
-        return `${message} ${detail}`
-            .replace(/\b(?:are|is|was|were)\s+not\s+(?:corrupt(?:ed)?|damaged)\b/gi, '');
-    }
 
     // The whole reason this prose is exported from an electron-free module. Both
     // arms are a wording *requirement*, not a preference: an I/O error is a

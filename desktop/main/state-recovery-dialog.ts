@@ -61,6 +61,18 @@ export type StateRecoveryChoice = 'retry' | 'open-diagnostics' | 'quit' | 'prese
  *                 files with no database beside them. No move was ever started,
  *                 so this must not be told as a resumed one; the preserve action
  *                 sets the leftovers aside and starts fresh.
+ * - `obstructed`  something that is not a settings file — a folder, a link, a
+ *                 device node — occupies a name the settings set owns. Nothing of
+ *                 ours is damaged and no move was attempted, so neither the
+ *                 `corrupt` nor the `interrupted` story is true. Preservation is
+ *                 *impossible* here rather than merely unhelpful: the move
+ *                 inventories that same name and fails on it identically — see
+ *                 `can_preserve`.
+ * - `coordination-residue` the private folder Table Viewer uses to coordinate
+ *                 its own windows holds an entry it does not recognize, so it
+ *                 will not guess whether a window still has the settings open.
+ *                 Again no move was attempted; the preserve action sets the
+ *                 unrecognized entry aside along with the settings.
  * - `unknown`     unclassified. Conservative wording; preservation is offered
  *                 only behind the confirmation, like everything else.
  */
@@ -74,6 +86,8 @@ export type StateRecoveryKind =
     | 'unsupported-platform'
     | 'interrupted'
     | 'leftover-setup'
+    | 'obstructed'
+    | 'coordination-residue'
     | 'unknown';
 
 /**
@@ -254,6 +268,42 @@ export function state_recovery_wording(kind: StateRecoveryKind): StateRecoveryWo
                     + ' troubleshooting, never deleting them — and starts a fresh set. There'
                     + ' were no saved settings to lose, and your files on disk are untouched.',
             };
+        case 'obstructed':
+            // Something that is not a file of ours sits on a name the settings
+            // set owns — most often a folder created by hand or restored by a
+            // sync client. The `interrupted` story would claim a move that was
+            // never attempted (this is exactly the false claim `leftover-setup`
+            // was introduced to eliminate), and the `corrupt` story would claim
+            // damage to settings that may not even exist. Naming the obstruction
+            // is both honest and the only thing the user can act on, since the
+            // one action Table Viewer could take here is the one it must not: it
+            // will not move or delete something it did not create.
+            return {
+                message: 'Something other than Table Viewer’s saved view settings is in the'
+                    + ' place they belong.',
+                detail: 'A folder or other item is using the name Table Viewer needs, so it has'
+                    + ' stopped rather than touch something it did not create. Nothing of yours'
+                    + ' has been changed or moved, and your files are not damaged. Open the'
+                    + ' diagnostics folder to see what is there and move it somewhere else'
+                    + ' yourself, then try again.',
+            };
+        case 'coordination-residue':
+            // The gate directory beside the database, which Table Viewer uses to
+            // tell whether another of its own windows holds the settings open.
+            // An entry it cannot recognize there is not damage to the settings
+            // and not an interrupted move: it is a refusal to guess about a live
+            // window, and the preserve action can now set the unrecognized entry
+            // aside (see `quarantine_unparseable_reader_tokens`).
+            return {
+                message: 'Table Viewer cannot tell whether another of its windows still has the'
+                    + ' saved view settings open.',
+                detail: 'The private folder it uses to keep its own windows in step holds an'
+                    + ' entry it does not recognize, and it will not guess. The settings'
+                    + ' themselves are not damaged and nothing has been moved. After you have'
+                    + ' closed every other Table Viewer window, continuing sets the unrecognized'
+                    + ' entry aside — keeping it for troubleshooting, never deleting it — along'
+                    + ' with the existing settings, and starts a fresh set.',
+            };
         case 'unknown':
             return {
                 message: 'Table Viewer could not make sense of its saved view settings.',
@@ -400,6 +450,22 @@ export const KIND_BY_CATEGORY: Readonly<
  *  in src/sqlite-open-recovery.ts. */
 const ABSENT_MAIN_EVIDENCE_OPERATION = 'absent-main-evidence';
 
+/** The stage that rejects a *non-file* — a directory, a symlink, an
+ *  implausibly-sized entry — sitting on one of the basename set's own names.
+ *  Thrown by `member_for` in src/sqlite-open-recovery.ts, from every path that
+ *  inventories the basename, including the preserve action's own. */
+const INVENTORY_MEMBER_TYPE_OPERATION = 'inventory-member-type';
+
+/** The stage that rejects an unparseable entry in the coordination gate's
+ *  readers directory. Thrown by `existing_reader_token_ids` in
+ *  src/sqlite-open-recovery.ts. */
+const READER_TOKEN_INVENTORY_OPERATION = 'reader-token-inventory';
+
+/** The stage that rejects a file whose first bytes are not a SQLite header at
+ *  all — wrong magic, or too short to hold one. Thrown by
+ *  `read_sqlite_raw_header` in src/sqlite-open-recovery.ts. */
+const RAW_HEADER_OPERATION = 'raw-header';
+
 /**
  * Every kind a refinement can produce that no category defaults to.
  *
@@ -410,6 +476,8 @@ const ABSENT_MAIN_EVIDENCE_OPERATION = 'absent-main-evidence';
  */
 export const REFINED_ONLY_KINDS: readonly StateRecoveryKind[] = [
     'leftover-setup',
+    'obstructed',
+    'coordination-residue',
 ];
 
 /**
@@ -426,11 +494,31 @@ export const REFINED_ONLY_KINDS: readonly StateRecoveryKind[] = [
  *   forever, and — because `transient` allows preservation — invite the user to
  *   move a perfectly valid *newer* database aside. That is exactly what the
  *   `compatibility` prose exists to prevent, so the fence gets it.
- * - `recovery` is thrown both for a preserve that stopped partway and for a
- *   first run that was killed during initialization, leaving setup files with no
- *   database beside them (`absent-main-evidence`). The action is the same, but
- *   the second is not a resumed move — no move was ever attempted — so it gets
- *   its own story rather than a confident claim about one that never happened.
+ * - `recovery` is the backend's catch-all, and three of its stages mean quite
+ *   different things. `absent-main-evidence` is a first run that was killed
+ *   during initialization, leaving setup files with no database beside them: the
+ *   action is the same fresh preserve, but no move was ever attempted.
+ *   `inventory-member-type` is a *non-file* — typically a folder created by hand
+ *   or restored by a sync client — occupying one of the settings set's own names;
+ *   again no move was attempted, and the preserve action cannot help because it
+ *   inventories the same name and fails identically. `reader-token-inventory` is
+ *   an unrecognized entry in the private coordination folder, which is a refusal
+ *   to guess about a live window rather than anything about the settings
+ *   themselves. Left unrefined, all three were told as a confidently resumed move
+ *   that never started.
+ * - `schema` is thrown both for a database whose *contents* are not this build's
+ *   — the honest ownership story — and, via `raw-header`, for a file whose first
+ *   bytes are not a SQLite header at all. The latter is not a database, so the
+ *   `compatibility` prose is false in every clause: it says the settings belong to
+ *   another product or a newer version, that "they are not damaged", and that
+ *   setting them aside would leave the other product without them — which
+ *   actively discourages the only action that recovers. It got `corrupt` because
+ *   for a file with no header `corrupt` is the honest word. (The story used to
+ *   flip on file length: shredding a real database left the header intact past
+ *   about 100 bytes and reached SQLite, which reports `corrupt` correctly, while
+ *   a shorter truncation was told as ownership.) `raw-application-id` is
+ *   deliberately *not* refined — a well-formed SQLite file carrying someone
+ *   else's application id is exactly what `compatibility` describes.
  */
 export function refine_state_recovery_kind(
     failure: StateRecoveryFailure,
@@ -440,9 +528,13 @@ export function refine_state_recovery_kind(
         && (failure.protocol !== undefined || failure.coordinationGeneration !== undefined)) {
         return 'compatibility';
     }
-    if (failure.category === 'recovery'
-        && failure.operation === ABSENT_MAIN_EVIDENCE_OPERATION) {
-        return 'leftover-setup';
+    if (failure.category === 'schema' && failure.operation === RAW_HEADER_OPERATION) {
+        return 'corrupt';
+    }
+    if (failure.category === 'recovery') {
+        if (failure.operation === ABSENT_MAIN_EVIDENCE_OPERATION) return 'leftover-setup';
+        if (failure.operation === INVENTORY_MEMBER_TYPE_OPERATION) return 'obstructed';
+        if (failure.operation === READER_TOKEN_INVENTORY_OPERATION) return 'coordination-residue';
     }
     return base;
 }
@@ -461,7 +553,17 @@ function can_preserve(kind: StateRecoveryKind): boolean {
     // Quit. Retry stays offered for all three: a different location or mount can
     // answer differently, and the failure table treats an unsupported primitive
     // as an explicit refusal, never as corruption or as someone else's ownership.
-    return kind !== 'environment' && kind !== 'capacity' && kind !== 'unsupported-platform';
+    //
+    // `obstructed` is excluded for the same reason as `unsupported-platform`, and
+    // provably so: the preserve action inventories the very name that is
+    // obstructed (`member_for` in src/sqlite-open-recovery.ts) and throws
+    // `inventory-member-type` from there before it can move anything, so every
+    // attempt fails identically and the offer would be a dialog loop whose only
+    // exit is Quit. The one thing that would clear it — removing whatever occupies
+    // the name — is something Table Viewer must not do, because it did not create
+    // it; so the prose points the user at the diagnostics folder instead.
+    return kind !== 'environment' && kind !== 'capacity'
+        && kind !== 'unsupported-platform' && kind !== 'obstructed';
 }
 
 /** Reduce a failure to exactly what a dialog may see. */

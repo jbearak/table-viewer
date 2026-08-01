@@ -428,6 +428,161 @@ describe('desktop state database', () => {
             { activeSheetIndex: 1 },
         );
         expect(committed.type).toBe('committed');
+
+        // The launch *after* the one that follows a successful preserve — the
+        // regression that made a successful "Set Aside and Start Fresh" strictly
+        // worse than the hang the preflight was added to fix. The preflight also
+        // refused when `inventory_sqlite_basename` reported
+        // `incompleteRecoveryDirectories > 0`, and a *completed* recovery
+        // directory only validates while its original source names are still
+        // absent — which this very flow re-creates on purpose. So the app opened
+        // once and then refused forever, with Try Again re-failing identically and
+        // Set Aside throwing `orphan-preservation-manifest`: no in-app escape at
+        // all, reached without any crash.
+        await reopened.opened.close();
+        opened.length = 0;
+        const relaunched = await within_no_hang_budget(open());
+        expect(relaunched.type).toBe('opened');
+        if (relaunched.type !== 'opened') throw new Error('expected a second clean launch');
+        // The state the first fresh launch wrote is still there: this is a
+        // reopen, not another fresh start hiding the same failure.
+        await expect(relaunched.opened.store.read('/fresh.csv')).resolves.toMatchObject({
+            state: { activeSheetIndex: 1 },
+        });
+        // And nothing was deleted to make that open work. The preserved set and
+        // the manifest that records which members moved are the user's only copy
+        // of whatever unsaved work the old database held; an implementation that
+        // "fixed" the open by clearing the recovery directory would pass every
+        // assertion above.
+        const still_there = fs.readdirSync(state_directory, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.includes('.recovery.'));
+        expect(still_there.map((entry) => entry.name))
+            .toEqual([recovery_directories[0].name]);
+        expect(fs.readdirSync(
+            path.join(state_directory, recovery_directories[0].name),
+        ).sort()).toEqual(preserved);
+        const manifest = JSON.parse(fs.readFileSync(
+            path.join(state_directory, recovery_directories[0].name, 'manifest.json'),
+            'utf8',
+        )) as { state?: string };
+        expect(manifest.state).toBe('complete');
+    });
+
+    it('quarantines an unparseable reader-token name instead of dead-ending the flow', async () => {
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        // Every token this code creates is `<uuid>.reader` containing that uuid,
+        // so this name was never one — but `existing_reader_token_ids` throws
+        // `reader-token-inventory` for it, which failed the open *and* the
+        // preserve (from `inspect_sqlite_recovery_gate`, before the gate could be
+        // acquired). The dialog then looped with no action able to clear it.
+        const readers = path.join(gate_directory(), 'readers');
+        fs.mkdirSync(readers, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(readers, 'not-a-uuid.reader'), 'whatever', { mode: 0o600 });
+
+        const blocked = await within_no_hang_budget(open());
+        expect(blocked.type).toBe('failed');
+        if (blocked.type !== 'failed') throw new Error('expected a blocked open');
+        // Reported with its own stage, so the dialog can tell the honest story
+        // rather than claiming an interrupted move that never happened.
+        expect(blocked.failure.category).toBe('recovery');
+        expect(blocked.failure.operation).toBe('reader-token-inventory');
+        expect(classify_state_recovery_failure(blocked.failure))
+            .toMatchObject({ kind: 'coordination-residue', canPreserve: true });
+
+        // The action the dialog offers now completes instead of throwing the same
+        // inventory error back at itself.
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        expect(fs.existsSync(path.join(readers, 'not-a-uuid.reader'))).toBe(false);
+        // Set aside, never deleted: the bytes are evidence about how the directory
+        // reached this state, and nothing in this module destroys evidence.
+        const quarantine_root = path.join(gate_directory(), 'quarantined-readers');
+        const generations = fs.readdirSync(quarantine_root);
+        expect(generations).toHaveLength(1);
+        expect(fs.readFileSync(
+            path.join(quarantine_root, generations[0], 'not-a-uuid.reader'),
+            'utf8',
+        )).toBe('whatever');
+        // And the escape actually works end to end.
+        await expect(within_no_hang_budget(open())).resolves.toMatchObject({ type: 'opened' });
+    });
+
+    it('leaves a valid reader token untouched when it quarantines an invalid name', async () => {
+        // The exact-token semantics this must not weaken: a well-formed token is
+        // indistinguishable from a live peer's, so it stays put and is reclaimed
+        // only by the exclusive gate's exact-id path under the attestation. The
+        // quarantine may only touch names that could never have been tokens.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const readers = path.join(gate_directory(), 'readers');
+        const valid = seed_stale_reader_token();
+        fs.writeFileSync(path.join(readers, 'not-a-uuid.reader'), 'x', { mode: 0o600 });
+
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        // Both are gone from `readers/` afterwards, but by different routes: the
+        // valid one through `reclaimStaleReaderToken`'s exact-id check, the
+        // invalid one into quarantine — so only the invalid one still exists.
+        expect(fs.existsSync(path.join(readers, `${valid}.reader`))).toBe(false);
+        const quarantine_root = path.join(gate_directory(), 'quarantined-readers');
+        const generations = fs.readdirSync(quarantine_root);
+        expect(generations).toHaveLength(1);
+        expect(fs.readdirSync(path.join(quarantine_root, generations[0])))
+            .toEqual(['not-a-uuid.reader']);
+    });
+
+    it('reports a non-file on a basename member as its own condition, not a resumed move', async () => {
+        // A folder — created by hand, or restored by a sync client — on the name
+        // the settings set owns. `member_for` rejects it with
+        // `inventory-member-type` from every path that inventories the basename,
+        // including the preserve action's own, so the honest story is neither
+        // "a previous set-aside did not finish" nor damage to a database that may
+        // not exist.
+        fs.mkdirSync(desktop_state_database_path(userDataDir), { recursive: true });
+        const before = snapshot_state_directory();
+
+        const result = await within_no_hang_budget(open());
+
+        expect(result.type).toBe('failed');
+        if (result.type !== 'failed') throw new Error('expected a failed open');
+        expect(result.failure.category).toBe('recovery');
+        expect(result.failure.operation).toBe('inventory-member-type');
+        const detail = classify_state_recovery_failure(result.failure);
+        // No preserve offered, because it cannot run: it inventories the same
+        // obstructed name and fails identically, which is a dialog loop whose
+        // only exit is Quit.
+        expect(detail).toMatchObject({ kind: 'obstructed', canPreserve: false });
+        expect(snapshot_state_directory()).toEqual(with_empty_gate(before));
+    });
+
+    it('calls a headerless main file damaged rather than another product’s', async () => {
+        // `read_sqlite_raw_header` throws `schema` for bad magic, and `schema`
+        // defaults to the `compatibility` story — whose every clause is false
+        // here: it says the settings belong to another product or a newer version,
+        // that they are "not damaged", and that setting them aside would leave the
+        // other product without them, which discourages the only action that
+        // recovers. The story even flipped on file length, since a longer
+        // truncation of a real database keeps its header and reaches SQLite, which
+        // reports `corrupt` correctly.
+        seed_database_file('file-state.sqlite3', Buffer.alloc(50, 0x41));
+
+        const result = await within_no_hang_budget(open());
+
+        expect(result.type).toBe('failed');
+        if (result.type !== 'failed') throw new Error('expected a failed open');
+        expect(result.failure.category).toBe('schema');
+        expect(result.failure.operation).toBe('raw-header');
+        expect(classify_state_recovery_failure(result.failure))
+            .toMatchObject({ kind: 'corrupt', canPreserve: true });
     });
 
     it('rejects preservation without the all-processes-closed confirmation', async () => {
