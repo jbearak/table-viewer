@@ -599,6 +599,32 @@ describe('desktop state database', () => {
         expect(fs.existsSync(path.join(gate_directory(), 'quarantined-readers'))).toBe(false);
     });
 
+    it('moves nothing when the gate directory itself is a symlink', async () => {
+        // The gate directory is derived with `path.join`, so guarding only
+        // `readers` leaves this hole: through a symlinked gate, `readers` is a
+        // genuine directory and passes a leaf-only check, while every path built
+        // from it resolves into the link target. Same escape as the case above, one
+        // level up, and it needs its own test because the leaf guard cannot see it.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const outside = path.join(userDataDir, 'outside');
+        fs.mkdirSync(path.join(outside, 'readers'), { recursive: true, mode: 0o700 });
+        const decoy = path.join(outside, 'readers', 'not-a-uuid.reader');
+        fs.writeFileSync(decoy, 'outside the gate', { mode: 0o600 });
+        fs.rmSync(gate_directory(), { recursive: true, force: true });
+        fs.symlinkSync(outside, gate_directory());
+
+        await expect(preserve_desktop_state_database(
+            userDataDir,
+            { allProcessesClosed: true },
+        )).rejects.toBeInstanceOf(SqliteFileStateError);
+
+        expect(fs.readFileSync(decoy, 'utf8')).toBe('outside the gate');
+        expect(fs.existsSync(path.join(outside, 'quarantined-readers'))).toBe(false);
+    });
+
     it('reports a non-file on a basename member as its own condition, not a resumed move', async () => {
         // A folder — created by hand, or restored by a sync client — on the name
         // the settings set owns. `member_for` rejects it with

@@ -375,25 +375,40 @@ function quarantine_unparseable_reader_tokens(
     if (confirmation?.allProcessesClosed !== true) {
         throw new Error('Quarantining reader tokens requires all processes closed.');
     }
-    const readers_directory = path.join(desktop_state_gate_directory(database_path), 'readers');
-    // `lstatSync`, not `existsSync`: the latter follows symlinks, so a `readers`
-    // symlink would send every rename below outside the gate tree — moving files
-    // this function has no business touching, and doing it *before* the backend's
-    // own managed-directory check could object. A non-directory or a link is left
-    // exactly as found for the recovery dialog to surface; this function's job is
-    // to clear entries *inside* our own readers directory, and if that directory
-    // is not ours then nothing here is either.
-    let readers: fs.Stats;
-    try {
-        readers = fs.lstatSync(readers_directory);
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return;
-        throw quarantine_failure(error);
-    }
-    if (!readers.isDirectory()) {
-        throw sqlite_file_state_recovery_error({
-            operation: 'reader-token-quarantine-directory',
-        });
+    const gate_directory = desktop_state_gate_directory(database_path);
+    const readers_directory = path.join(gate_directory, 'readers');
+    // `lstatSync`, not `existsSync`: the latter follows symlinks, so a link
+    // anywhere on this path would send every rename below outside the gate tree —
+    // moving files this function has no business touching, and doing it *before*
+    // the backend's own managed-directory check could object.
+    //
+    // Both levels are checked, not just `readers`: the gate directory is derived
+    // by `path.join`, so a symlinked *gate* would leave `readers` looking like a
+    // perfectly ordinary directory to `lstat` while every path built from it
+    // resolved somewhere else entirely. Checking only the leaf is the kind of
+    // guard that reads correct and isn't.
+    //
+    // A link or a non-directory at either level is left exactly as found for the
+    // recovery dialog to surface. This function's job is to clear entries inside
+    // *our own* readers directory, and if that directory is not ours then nothing
+    // inside it is either.
+    const own_directory = (directory: string): boolean | undefined => {
+        try {
+            return fs.lstatSync(directory).isDirectory();
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return undefined;
+            throw quarantine_failure(error);
+        }
+    };
+    for (const directory of [gate_directory, readers_directory]) {
+        const owned = own_directory(directory);
+        // Nothing to clear: no gate, or a gate with no readers directory yet.
+        if (owned === undefined) return;
+        if (!owned) {
+            throw sqlite_file_state_recovery_error({
+                operation: 'reader-token-quarantine-directory',
+            });
+        }
     }
     // Duplicated rather than imported from the shared backend: this is the shape
     // the backend *rejects*, so the predicate that decides what to quarantine has
