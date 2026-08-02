@@ -369,6 +369,13 @@ describe('attested quarantine of malformed gate markers', () => {
         // from a marker that was never created at all.
         expect(fs.readdirSync(soleQuarantineGeneration())).toEqual(['exclusive-intent']);
         expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentMalformed).toBe(false);
+        // The birth-time capability probe leaves nothing behind. It writes a
+        // throwaway file into this very directory to decide whether `createdAt` is a
+        // usable discriminator here, and a leaked probe file would sit in the gate
+        // directory of every user who ever hit the quarantine — listed by the
+        // diagnostics window as unexplained residue next to real evidence.
+        expect(fs.readdirSync(gateDirectory()).filter((name) => name.includes('birthtime')))
+            .toEqual([]);
         // And the gate is acquirable again, which is the escape that did not exist.
         const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
         await exclusive.release();
@@ -834,8 +841,19 @@ describe('attested quarantine of malformed gate markers', () => {
         //
         // What must hold on every filesystem: the replacement is a different
         // incarnation, so the marker is refused and left where it is with the
-        // replacement's bytes intact.
-        expect(replacement.birthtimeNs).not.toBe(original.birthtimeNs);
+        // replacement's bytes intact. Those two assertions are the test.
+        //
+        // The birth times differing is *not* universal, and asserting it
+        // unconditionally would fail before those two ever ran. A filesystem with no
+        // birth time reports a stable `0` on both sides, which is exactly the case
+        // the production guard measures for and degrades around — and there the
+        // refusal comes from the inode, or from the `stillMalformed` re-read, not
+        // from this field. So it is asserted only where a birth time is recorded at
+        // all, which is what makes it an assertion about the discriminator rather
+        // than about the host.
+        if (original.birthtimeNs !== 0n && replacement.birthtimeNs !== 0n) {
+            expect(replacement.birthtimeNs).not.toBe(original.birthtimeNs);
+        }
         expect(result.movedCount).toBe(0);
         expect(fs.readFileSync(intentPath, 'utf8')).toBe('cccccccc');
     });

@@ -646,12 +646,83 @@ interface MarkerIdentity {
      * another guise. Creation time survives a rewrite and changes on a recreate,
      * which is exactly the distinction needed.
      *
-     * Where a filesystem does not record it, this degrades to the previous
-     * three-field check rather than to a false match: an unsupported birthtime is
-     * a stable 0 on both sides of the comparison, so it neither rescues nor breaks
-     * anything, and the `stillMalformed` re-read below remains the backstop.
+     * **Only where the filesystem actually records one.** Node reports no birth
+     * time in two different ways, and they are not equally harmless. Where the
+     * kernel took the `statx` path and the filesystem left `stx_btime` unset, this
+     * is a stable `0` on both sides of the comparison: it neither rescues nor
+     * breaks anything, and the check degrades to the three-field one it replaced.
+     * Where libuv fell back to `stat(2)` instead, it copies **ctime** into the
+     * birth-time field — and then this silently *is* the ctime comparison that was
+     * already rejected, so an in-place rewrite reads as a different incarnation and
+     * the quarantine refuses a marker it is required to move. That is a false
+     * refusal reintroduced through the back door, and it cannot be told apart by
+     * inspecting one value: on a freshly created file a genuine birth time equals
+     * ctime too.
+     *
+     * So it is not inspected — it is measured, at the directory in question, by
+     * `birthtime_is_a_usable_discriminator`, and the field is only *compared* when
+     * that measurement says a birth time here survives an in-place rewrite. When it
+     * does not, the comparison drops back to three fields with the `stillMalformed`
+     * re-read as the backstop, which is exactly where this guard stood before the
+     * field was added.
      */
     readonly createdAt: bigint;
+}
+
+/**
+ * Whether a birth time recorded in this directory is an incarnation discriminator
+ * at all, established by observation rather than assumed from the platform.
+ *
+ * Asked of a directory this module just created, and answered by doing to a
+ * throwaway file precisely what a live peer does to a marker: rewrite it in place,
+ * same length, same inode. A real birth time is unmoved by that. A `ctime` copied
+ * into the birth-time field by libuv's `stat(2)` fallback is not — and treating
+ * that as an incarnation change is how the comparison turns into a refusal to do
+ * required work (see `MarkerIdentity`).
+ *
+ * Three ways to answer no, all of them degrading to the three-field check:
+ *
+ *  - the birth time moved: it is a `ctime` in disguise.
+ *  - the birth time is `0`: unrecorded, so it discriminates nothing.
+ *  - the rewrite left `ctime` unmoved: then a birth time that *is* a `ctime` would
+ *    have looked stable, so the observation proves nothing and must not be trusted.
+ *    Coarse timestamp granularity is the case this covers.
+ *
+ * The probe file is created and removed before any marker moves, so nothing it
+ * does can be mistaken for quarantined evidence, and a probe that cannot run at
+ * all answers no rather than throwing — the quarantine's job does not depend on
+ * being able to measure this.
+ */
+function birthtime_is_a_usable_discriminator(directoryPath: string): boolean {
+    const probePath = path.join(directoryPath, `.birthtime-support.${randomUUID()}`);
+    try {
+        write_private_file_exclusive(probePath, '0');
+        const created = fs.lstatSync(probePath, { bigint: true });
+        // In place and same length: `openSync('r+')`, never a truncate or a
+        // rename, so device, inode, and size are all unchanged and the birth time
+        // is the only field under test.
+        const descriptor = fs.openSync(probePath, 'r+');
+        try {
+            fs.writeSync(descriptor, '1', 0, 'utf8');
+            fs.fsyncSync(descriptor);
+        } finally {
+            fs.closeSync(descriptor);
+        }
+        const rewritten = fs.lstatSync(probePath, { bigint: true });
+        return created.birthtimeNs !== 0n
+            && created.birthtimeNs === rewritten.birthtimeNs
+            && created.ctimeNs !== rewritten.ctimeNs;
+    } catch {
+        return false;
+    } finally {
+        try {
+            fs.unlinkSync(probePath);
+        } catch {
+            // A leftover probe file is inert — it claims no marker's name, so
+            // nothing classifies or enforces on it — and failing to remove it must
+            // not change the answer or fail the quarantine.
+        }
+    }
 }
 
 /** Undefined when the entry is absent or is not a regular file; a symlink is
@@ -1180,6 +1251,16 @@ export async function quarantine_malformed_sqlite_gate_markers(
         let movedCount = 0;
         let movedFromReaders = false;
         let movedFromGate = false;
+        // Measured once, in the gate directory the markers themselves live in, and
+        // before the first rename. The gate directory rather than the quarantine
+        // generation because that is the filesystem the markers are on and the
+        // generation is evidence storage; a probe file there would have to be
+        // explained to anyone reading the quarantine afterwards. Nothing claims a
+        // marker's name, so no classifier or enforcer can see it, and it is removed
+        // before any move regardless.
+        const compare_created_at = birthtime_is_a_usable_discriminator(
+            identities.gate.physicalPath,
+        );
         // Re-asserted per move rather than once before the loop, matching
         // `advance_preservation`: one assertion up front covers the first rename
         // and leaves every later one running on a stale check.
@@ -1237,17 +1318,22 @@ export async function quarantine_malformed_sqlite_gate_markers(
             // is changing under us is precisely the live peer this must not
             // touch.
             //
-            // Creation time is part of the comparison because device/inode/size is
-            // not an incarnation test on filesystems that recycle inodes; see
-            // `MarkerIdentity`. The `stillMalformed` re-read below is the backstop
-            // either way: it runs on the bytes present at rename time, so a marker
-            // a live peer has since made *valid* is refused there even if the
-            // identity comparison were fooled.
+            // Creation time joins the comparison because device/inode/size is not
+            // an incarnation test on filesystems that recycle inodes — but only
+            // where it was *measured* to be a real birth time rather than a `ctime`
+            // wearing its name, because comparing a ctime refuses in-place rewrites
+            // this is required to move. Both halves of that are in
+            // `MarkerIdentity` and `birthtime_is_a_usable_discriminator`.
+            //
+            // The `stillMalformed` re-read below is the backstop under either
+            // answer: it runs on the bytes present at rename time, so a marker a
+            // live peer has since made *valid* is refused there even if the identity
+            // comparison were fooled.
             if (actual === undefined
                 || actual.device !== expected.device
                 || actual.inode !== expected.inode
                 || actual.size !== expected.size
-                || actual.createdAt !== expected.createdAt) {
+                || (compare_created_at && actual.createdAt !== expected.createdAt)) {
                 return;
             }
             let contents: string;
