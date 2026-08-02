@@ -317,6 +317,17 @@ describe('attested quarantine of malformed gate markers', () => {
         return path.join(gateDirectory(), 'readers');
     }
 
+    /**
+     * The quarantine subtree the module creates, by name.
+     *
+     * Used by the become-valid-mid-run tests as their cut point: its appearance
+     * means classification is finished and the renames have not started, which is
+     * exactly the window those tests need and is observable rather than counted.
+     */
+    function quarantineRoot(): string {
+        return path.join(gateDirectory(), 'quarantined-markers');
+    }
+
     /** The single quarantine generation one run creates, as an absolute path. */
     function soleQuarantineGeneration(): string {
         const root = path.join(gateDirectory(), 'quarantined-markers');
@@ -750,14 +761,23 @@ describe('attested quarantine of malformed gate markers', () => {
         const before = fs.lstatSync(target.markerPath);
         expect(target.malformed).toHaveLength(target.becomesValid.length);
 
-        let flushes = 0;
+        // Swapped on the first flush that happens *after* classification, found by
+        // observing the quarantine directory the run creates rather than by
+        // counting calls. An ordinal ("the third flush") encodes how many
+        // directories the implementation happens to flush, which differs with the
+        // filesystem — it passed locally and failed on CI's tmpfs, where the count
+        // is not the same. `swapped` keeps it to exactly one write.
+        let swapped = false;
         const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
             fsyncDirectory(descriptor) {
-                flushes += 1;
-                if (flushes === 3) fs.writeFileSync(target.markerPath, target.becomesValid);
+                if (!swapped && fs.existsSync(quarantineRoot())) {
+                    swapped = true;
+                    fs.writeFileSync(target.markerPath, target.becomesValid);
+                }
                 fs.fsyncSync(descriptor);
             },
         });
+        expect(swapped).toBe(true);
 
         const after = fs.lstatSync(target.markerPath);
         // Proves the identity check cannot be what saved it.
@@ -776,11 +796,13 @@ describe('attested quarantine of malformed gate markers', () => {
         fs.writeFileSync(intentPath, 'aaaaaaaa', { mode: 0o600 });
         const originalInode = fs.lstatSync(intentPath).ino;
 
-        let flushes = 0;
+        // Keyed on the quarantine directory appearing, not on a flush ordinal —
+        // see the sibling test above for why counting calls is not portable.
+        let swapped = false;
         const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
             fsyncDirectory(descriptor) {
-                flushes += 1;
-                if (flushes === 3) {
+                if (!swapped && fs.existsSync(quarantineRoot())) {
+                    swapped = true;
                     fs.unlinkSync(intentPath);
                     fs.writeFileSync(intentPath, 'cccccccc', { mode: 0o600 });
                 }
@@ -788,6 +810,7 @@ describe('attested quarantine of malformed gate markers', () => {
             },
         });
 
+        expect(swapped).toBe(true);
         expect(fs.lstatSync(intentPath).ino).not.toBe(originalInode);
         expect(result.movedCount).toBe(0);
         expect(fs.readFileSync(intentPath, 'utf8')).toBe('cccccccc');

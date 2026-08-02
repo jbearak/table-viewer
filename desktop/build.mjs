@@ -52,12 +52,17 @@ await build({
 // The recovery gate is a second entry point rather than part of the probe
 // because it forks itself: the child re-enters the same bundle and hard-aborts at
 // a durable cut point, and a bundle that also had to survive being imported for
-// its exported helpers would be two contracts in one file.
+// its exported helpers would be two contracts in one file. The Windows durability
+// probe is a third for the same reason — it forks itself too — and because it
+// answers a different question: not "does the contract hold" but "which
+// primitives does this platform actually have", which is an investigation whose
+// negative results are results rather than failures.
 await build({
     ...node_common,
     entryPoints: [
         join(desktop_dir, 'electron-sqlite-runtime-probe.mjs'),
         join(desktop_dir, 'packaged-recovery-gate.mjs'),
+        join(desktop_dir, 'windows-durability-probe.mjs'),
     ],
     outdir: join(repo_dir, 'dist', 'runtime-probes'),
 });

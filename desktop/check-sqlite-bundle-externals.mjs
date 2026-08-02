@@ -39,6 +39,14 @@ await assert_externalized_sqlite(
     'desktop packaged recovery gate bundle',
     'dist', 'runtime-probes', 'packaged-recovery-gate.js',
 );
+// The Windows durability probe drives production initialization at real durable
+// cut points to see what the platform's primitives do. A bundled SQLite would make
+// it an investigation of the wrong engine, and its whole output would be evidence
+// about a build nobody ships.
+await assert_externalized_sqlite(
+    'desktop windows durability probe bundle',
+    'dist', 'runtime-probes', 'windows-durability-probe.js',
+);
 // The bundle actually shipped to users. It carries the desktop's SQLite file-state
 // backend, so it — not only the probe beside it — is what has to be verified.
 await assert_externalized_sqlite('desktop main bundle', 'dist', 'desktop', 'main.js');
@@ -51,14 +59,18 @@ await assert_externalized_sqlite('desktop main bundle', 'dist', 'desktop', 'main
  * A one-word change to an `outdir` would undo it silently, so it is asserted
  * rather than left to the comment beside it.
  */
-for (const name of ['electron-sqlite-runtime-probe.js', 'packaged-recovery-gate.js']) {
+for (const name of [
+    'electron-sqlite-runtime-probe.js',
+    'packaged-recovery-gate.js',
+    'windows-durability-probe.js',
+]) {
     if (existsSync(join(repo_dir, 'dist', 'desktop', name))) {
         throw new Error(`${name} was emitted into the packaged desktop directory`);
     }
 }
 
 process.stdout.write(
-    'extension bundle script, desktop main bundle, desktop runtime probe bundle, and'
-    + ' packaged recovery gate bundle externalize node:sqlite; runtime-only bundles are'
-    + ' outside the packaged desktop directory\n',
+    'extension bundle script, desktop main bundle, desktop runtime probe bundle,'
+    + ' packaged recovery gate bundle, and windows durability probe bundle externalize'
+    + ' node:sqlite; runtime-only bundles are outside the packaged desktop directory\n',
 );

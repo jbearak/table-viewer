@@ -89,6 +89,40 @@ addon, so the app declines the platform up front rather than running with view
 state it cannot persist; `desktop/packaged-recovery-gate.mjs` asserts that
 refusal on Windows and the full recovery matrix elsewhere.
 
+### Windows durability verification
+
+Windows is not a dropped target. The refusal above is a statement about
+*evidence*, not about Windows, so `desktop/windows-durability-probe.mjs` runs on
+the CI `windows-durability` job to gather it: which flush and write-through
+primitives the packaged Electron runtime can actually reach, what each one
+guarantees and what it does not, what the volume's filesystem really is (reported,
+not assumed), and — as a skeleton, one or two representative cut points today —
+what a kill-crash at a durable cut point leaves behind. It emits one JSON object
+with a `verdict` of `verified`, `not-verified`, or `inconclusive`, derived from
+those observations rather than written down.
+
+The decision tree the verdict feeds, both branches of which are explicit:
+
+- **The gate verifies.** Windows ships the SQLite state backend on exactly the
+  evidence standard macOS ships on — a documented durability contract plus
+  kill-crash verification against the packaged runtime, which is the same trust
+  basis `fsync` gives on POSIX. Only then is
+  `assert_sqlite_directory_durability_supported` revisited.
+- **The gate cannot verify.** Windows ships view-only, exactly as it does today:
+  files open and display, and the persistent state backend is declined up front.
+
+Neither branch permits silent weakening. A `not-verified` verdict is a result and
+does **not** fail CI — a job that failed on an unproven primitive would only
+create pressure to find a way to make it pass. Only a malfunction of the probe
+itself fails. Equally, a `verified` verdict is unreachable from a partial run: the
+report lists covered *and* pending cut points, and the verdict requires the matrix
+to be complete, so two green cut points can never be mistaken for verification.
+Completing that matrix is the next step; extending `REPRESENTATIVE_CUT_POINTS` in
+the probe is all it takes mechanically.
+
+Run it locally on a Windows machine with `npm run probe:windows:durability`. On
+any other platform it reports that it did not run and exits 0.
+
 The font family and font size preferences style the whole app — viewer windows, the welcome window, the Preferences window itself, and the About window — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 
 The Appearance preference (`theme`) is `system` by default, which follows the OS light/dark setting; `light` and `dark` pin it. It is applied by handing the value to Electron's `nativeTheme.themeSource`, so Appearance only picks the *mode*. Two further preferences pick which theme paints each mode: `lightThemeId` and `darkThemeId`. Keeping a slot per mode means switching Appearance back and forth never loses the theme chosen for the other mode.

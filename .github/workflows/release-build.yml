@@ -233,71 +233,84 @@ jobs:
   # The Windows desktop release fence.
   #
   # This job used to package an NSIS installer and a portable exe for x64 and
-  # arm64. It now packages nothing, on purpose: the desktop's state authority is
-  # SQLite, and this build cannot open a SQLite state database on Windows at all.
-  # Every durable step of the storage protocol — candidate install, marker
-  # creation, member move — is made durable by flushing the containing directory,
-  # Node exposes no proven win32 primitive for that (`fs.openSync` on a directory
-  # fails, and `FlushFileBuffers` on a file handle says nothing about rename and
-  # unlink ordering), and a real primitive would need a native addon that the
-  # packaging contract forbids (desktop/check-sqlite-bundle-externals.mjs,
-  # desktop/after-pack.mjs, desktop/README.md). So `desktop_state_platform_support`
-  # declines the platform up front and the app reports one honest, non-looping
-  # refusal. The failure policy forbids the alternative outright: no empty and no
-  # read-only authority.
+  # arm64. It packages nothing today, on purpose — but it no longer fails, and
+  # that distinction is the whole of this block.
   #
-  # Shipping a Windows exe in that state would ship a viewer whose settings
-  # silently never persist. There is no correct artifact to publish, so this job
-  # publishes none — and fails, loudly, rather than being deleted.
+  # The desktop's state authority is SQLite, and this build cannot open a SQLite
+  # state database on Windows. Every durable step of the storage protocol —
+  # candidate install, marker creation, member move — is made durable by flushing
+  # the containing directory, and Node exposes no *verified* win32 primitive for
+  # that: `fs.openSync` on a directory fails, and `FlushFileBuffers` on a file
+  # handle says nothing about rename and unlink ordering. So
+  # `desktop_state_platform_support` declines the platform up front and the app
+  # reports one honest, non-looping refusal rather than running with an authority
+  # it cannot persist. The failure policy forbids the alternative outright: no
+  # empty and no read-only authority.
   #
-  # Failing rather than removing is the whole point, and it follows from the
-  # mechanics the previous comment here documented: this job failing fails the
-  # entire Release Build run, and release-publish.yml only triggers on
-  # `workflow_run.conclusion == 'success'`. So while this fence stands, *nothing*
-  # publishes — not a broken Windows build, and not a macOS build that quietly
-  # dropped its Windows downloads from the release page. Deleting the job would
-  # instead let the run go green and publish a release whose Windows assets had
-  # simply vanished, with no record of why: a silent change to what ships, which
-  # is exactly the outcome this fence exists to prevent. A failing job with this
-  # message cannot be reached by accident and cannot be satisfied by waiting.
+  # An earlier revision of this job failed hard, which stopped the *entire*
+  # release run — `release-publish.yml` triggers only on
+  # `workflow_run.conclusion == 'success'`, so a fenced Windows job also withheld
+  # the macOS build. That coupling is withdrawn. Windows being unproven is not a
+  # reason to stop shipping the platform that is proven, and the missing-artifact
+  # hole that once justified it is closed at the publish side instead:
+  # release-publish.yml now *fails* on an absent `windows-<tag>` artifact unless
+  # dispatched with `allow_missing_windows`, so a release cannot silently drop its
+  # Windows downloads. This job therefore skips loudly and lets the run proceed.
   #
-  # Removing the fence is therefore a deliberate act with a stated precondition,
-  # not a cleanup: either a proven win32 directory-durability primitive exists
-  # within the no-native-addon packaging contract, or the product decides Windows
-  # desktop is not a supported target and its downloads are withdrawn on purpose.
-  # Until one of those happens, `npm run desktop:package:win` remains available
-  # for developers — it is a local build, not a published artifact.
+  # Windows is not withdrawn as a target. The open question is empirical — which
+  # write-through and flush primitives the packaged runtime can actually reach on
+  # NTFS, and what they guarantee across a kill — and it is answered by the
+  # `windows-durability` job in ci.yml, not by argument here. The decision tree is
+  # fixed in advance so neither outcome can be quietly reinterpreted:
+  #
+  #   * the durability gate verifies  -> Windows ships on the same evidence
+  #     standard as macOS: a documented durability contract plus kill-crash
+  #     verification, which is exactly the trust basis fsync gives us on POSIX.
+  #     Replace this job with the real packaging steps.
+  #   * the gate cannot verify        -> Windows ships view-only, per the plan's
+  #     existing posture for a platform without a proven primitive.
+  #
+  # Neither branch permits a silent weakening: shipping requires the evidence, and
+  # not shipping requires saying so. `npm run desktop:package:win` remains
+  # available for developers either way — a local build, never a published one.
+
   desktop-windows:
     runs-on: windows-latest
 
     steps:
       # No checkout, no toolchain, no dependencies. Nothing this job could
-      # install would change the answer, and a job that built anything at all
-      # would leave something for a future step to pick up and upload.
-      - name: Refuse to package an unsupported Windows desktop artifact
+      # install would change the answer today, and a job that built anything at
+      # all would leave something for a future step to pick up and upload.
+      #
+      # Exits 0. The release run continues and the macOS artifact publishes; the
+      # guarantee that a release cannot silently omit Windows lives in
+      # release-publish.yml, which fails on a missing `windows-<tag>` artifact
+      # unless explicitly dispatched with `allow_missing_windows`.
+      - name: Report that Windows desktop packaging is pending durability verification
         shell: bash
         run: |
           set -euo pipefail
           cat >&2 <<'MESSAGE'
-          ERROR: Windows desktop packaging is fenced off and this release cannot publish.
+          NOTE: no Windows desktop artifact is produced by this release.
 
           The desktop app stores its view settings in SQLite, and this build cannot
-          open that database on Windows: the storage protocol requires a durable
-          directory flush, Node exposes no proven Windows primitive for one, and a
-          native addon is forbidden by the packaging contract. The app declines the
-          platform up front rather than running with an authority it cannot persist.
+          open that database on Windows: every durable step of the storage protocol
+          flushes the containing directory, and no win32 primitive for that has been
+          verified from the packaged runtime. The app declines the platform up front
+          rather than running with an authority it cannot persist, so a Windows exe
+          built today would be a viewer whose settings never survive a restart.
 
-          A Windows exe built today would be a viewer whose settings never survive a
-          restart, so no Windows artifact is produced and the whole release run fails
-          rather than publishing without one.
+          Windows is NOT withdrawn as a target. Which primitives are actually
+          reachable, and what they guarantee across a kill, is being established
+          empirically by the `windows-durability` job in ci.yml. When that gate
+          verifies, Windows ships on the same evidence standard as macOS — a
+          documented durability contract plus kill-crash verification — and this job
+          is replaced with the real packaging steps. If it cannot verify, Windows
+          ships view-only.
 
-          To lift this fence, one of the following must be true and this job replaced
-          deliberately:
-            * a proven Windows directory-durability primitive is available without a
-              native addon, and the packaged recovery gate passes on windows-latest; or
-            * Windows desktop is formally withdrawn as a target and its downloads are
-              removed from the release page on purpose.
+          This job no longer fails the release run: Windows being unproven is not a
+          reason to withhold the platform that is proven. A release that omits the
+          Windows assets is still caught at publish time.
 
           Developers can still build locally with: npm run desktop:package:win
           MESSAGE
-          exit 1

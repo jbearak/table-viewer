@@ -195,6 +195,7 @@
     "probe:sqlite:electron": "npm run bundle:desktop && electron dist/runtime-probes/electron-sqlite-runtime-probe.js",
     "probe:sqlite:bundles": "npm run bundle && npm run bundle:desktop && node desktop/check-sqlite-bundle-externals.mjs",
     "probe:sqlite:runtimes": "npm run probe:sqlite:host && npm run probe:sqlite:electron && npm run test:integration",
+    "probe:windows:durability": "npm run bundle:desktop && electron dist/runtime-probes/windows-durability-probe.js",
     "gate:sqlite:recovery": "npm run bundle:desktop && electron dist/runtime-probes/packaged-recovery-gate.js",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",

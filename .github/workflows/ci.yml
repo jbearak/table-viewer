@@ -186,3 +186,48 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\node_modules\.bin\electron.cmd dist\runtime-probes\packaged-recovery-gate.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # The Windows durability verification gate. It decides nothing on its own; it
+  # gathers the evidence the Windows decision tree turns on (see the comment block
+  # at the top of desktop/windows-durability-probe.mjs and the "Windows durability
+  # verification" section of desktop/README.md):
+  #
+  #   verifies       -> Windows ships the SQLite state backend on the same evidence
+  #                     standard as macOS: a written durability contract plus
+  #                     kill-crash verification against the packaged runtime.
+  #   cannot verify  -> Windows ships view-only, exactly as it does today.
+  #
+  # Neither branch is a silent weakening, and *this job must not push the answer*.
+  # A verdict of `not-verified` is information about the platform, not a broken
+  # build, so it exits 0. Only a malfunction of the probe itself — a runner that
+  # cannot make a temp directory, a child that cannot spawn, an unexpected throw —
+  # is a failure, and the probe signals that with a non-zero exit of its own.
+  windows-durability:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Windows durability verification probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Builds its own bundle rather than inheriting another job's, so a
+          # reordering elsewhere cannot turn this into a missing-file error that
+          # fails without having measured anything.
+          npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\windows-durability-probe.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
