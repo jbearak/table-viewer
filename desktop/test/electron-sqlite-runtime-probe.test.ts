@@ -72,13 +72,22 @@ describe('electron sqlite runtime probe v1 contract', () => {
         // undefined — and the directory must be one that really exists, or the
         // assertion would fail for a reason unrelated to durability.
         const seen: Array<Parameters<DurabilityAssertion>> = [];
-        const record: DurabilityAssertion = (...args) => { seen.push(args); };
+        // Existence is recorded *at call time*, not afterwards: production removes
+        // the probe directory in its `finally`, so a check after the call is always
+        // false and would hold even if production passed a path it never created.
+        const existedWhenCalled: boolean[] = [];
+        const record: DurabilityAssertion = (...args) => {
+            existedWhenCalled.push(existsSync(args[0]));
+            seen.push(args);
+        };
 
         expect(v1_contract_for_platform('linux', record)).toBe('installed');
 
         expect(seen).toHaveLength(1);
         expect(seen[0][1]).toBeUndefined();
         expect(seen[0][2]).toBe('linux');
+        expect(existedWhenCalled).toEqual([true]);
+        // And cleaned up afterwards, so the probe leaves nothing behind.
         expect(existsSync(seen[0][0])).toBe(false);
     });
 

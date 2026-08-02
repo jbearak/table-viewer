@@ -159,8 +159,13 @@ test.describe('desktop state relaunch gates', () => {
             // fixture is unsorted.
             await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
             // And exactly one live connection — the relaunch neither leaked the
-            // previous one's token nor opened twice.
-            expect(reader_tokens(user_data_dir)).toHaveLength(1);
+            // previous one's token nor opened twice. Polled, not read once: the
+            // grid painting and the main process writing its reader token are
+            // separate paths, so on a slow launch the token can appear after
+            // `viewer_page` resolves.
+            await expect
+                .poll(() => reader_tokens(user_data_dir).length, { timeout: 30_000 })
+                .toBe(1);
 
             // Left clean for the next test, and so the sort does not persist into
             // an unrelated fixture run.

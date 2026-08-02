@@ -692,8 +692,11 @@ describe('viewer window close protocol', () => {
         expect(intercepted).toBe(true);
         expect(window.destroyed).toBe(false);
         // And the unfenced-close guard is restored, so a later user close still
-        // goes through a fresh fence rather than tearing down unfenced.
+        // goes through a fresh fence rather than tearing down unfenced. Asserted
+        // on the flag itself: `closeCalls` only proves `close()` ran, which is
+        // true either way and says nothing about the guard.
         expect(window.closeCalls).toBeGreaterThan(0);
+        expect(viewer_entry(viewer_manager, '/tmp/late-veto.csv').allowClose).toBe(false);
     });
 
     // The worst failure in this function, because it loses work rather than

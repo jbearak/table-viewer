@@ -1206,6 +1206,22 @@ export async function quarantine_malformed_sqlite_gate_markers(
             // Refused rather than re-classified in place, because a marker that
             // is changing under us is precisely the live peer this must not
             // touch.
+            //
+            // device/inode/size is not a perfect incarnation test on its own — an
+            // unlink-and-recreate can reuse the freed inode, and a same-length
+            // replacement then matches all three. Adding `ctimeNs` was tried and
+            // rejected: an in-place rewrite that leaves the marker *still
+            // malformed* also changes ctime, so comparing it refuses markers this
+            // primitive must move, which is the inert-primitive failure wearing a
+            // different hat (the "bytes churn but never become a token" test
+            // catches exactly that).
+            //
+            // It does not need to be perfect, because it is not the last gate. The
+            // `stillMalformed` re-read below runs on the bytes actually present at
+            // rename time, so the outcome that would matter — moving a marker a
+            // live peer has since made *valid* — is refused there regardless of
+            // whether the identity check was fooled. Identity narrows the window;
+            // the contents re-check is what closes it.
             if (actual === undefined
                 || actual.device !== expected.device
                 || actual.inode !== expected.inode

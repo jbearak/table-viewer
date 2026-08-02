@@ -105,15 +105,21 @@ describe('desktop lifecycle gate', () => {
         // every later quit.
         const lifecycle = create_desktop_lifecycle();
         const ran: string[] = [];
+        // Recorded rather than asserted inside the buffered work: `become_ready`
+        // wraps each item in a `try`/`catch` that swallows everything, so an
+        // assertion failure here would vanish and resurface later as an unrelated
+        // one.
+        let drain_began: boolean | undefined;
         lifecycle.submit(() => ran.push('first'));
         lifecycle.submit(() => {
             ran.push('quits');
-            expect(lifecycle.begin_drain()).toBe(true);
+            drain_began = lifecycle.begin_drain();
         });
         lifecycle.submit(() => ran.push('must-not-run'));
 
         lifecycle.become_ready();
 
+        expect(drain_began).toBe(true);
         expect(ran).toEqual(['first', 'quits']);
         expect(lifecycle.phase).toBe('draining');
         // A vetoed close restores admission but never the work the drain
