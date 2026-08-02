@@ -787,13 +787,18 @@ describe('attested quarantine of malformed gate markers', () => {
         expect(fs.readFileSync(target.markerPath, 'utf8')).toBe(target.becomesValid);
     });
 
-    // Note on coverage: this case only *bites* where the filesystem recycles the
-    // freed inode. APFS does not, ext4 and tmpfs do, so it passes vacuously on
-    // macOS and is load-bearing on CI — it caught the missing `createdAt` field
-    // twice from the Linux runner while no local run ever reproduced it. A
-    // constructed collision was attempted instead and abandoned: a hardlink shares
-    // both inode and birthtime, so it cannot stand in for a recreate. Do not
-    // "simplify" this to a local-only assertion; the Linux runner is the coverage.
+    // Note on coverage: the *guard* is exercised everywhere, but the specific
+    // hazard it defends against — a recreate that recycles the freed inode, so
+    // device, inode, and size all still match — only occurs where the filesystem
+    // recycles. ext4 and tmpfs do; APFS does not. So this passes on macOS whether
+    // or not the guard is correct, and only the Linux runner can tell the
+    // difference. It caught the missing creation-time field from CI while no local
+    // run ever reproduced it.
+    //
+    // A deterministic collision was attempted and abandoned: a hardlink shares
+    // inode *and* birthtime, so it cannot stand in for a recreate. Do not
+    // "simplify" this to a local-only assertion, and do not assert that the inode
+    // changed — reuse is the case under test, not a failure of it.
     it('refuses a marker replaced by a different file of the same size', async () => {
         // Identity, not just size: an unlink-and-recreate leaves the byte count
         // unchanged while the inode changes, and whatever wrote it is a party
@@ -801,7 +806,7 @@ describe('attested quarantine of malformed gate markers', () => {
         fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
         const intentPath = path.join(gateDirectory(), 'exclusive-intent');
         fs.writeFileSync(intentPath, 'aaaaaaaa', { mode: 0o600 });
-        const originalInode = fs.lstatSync(intentPath).ino;
+        const original = fs.lstatSync(intentPath, { bigint: true });
 
         // Keyed on the quarantine directory appearing, not on a flush ordinal —
         // see the sibling test above for why counting calls is not portable.
@@ -818,7 +823,19 @@ describe('attested quarantine of malformed gate markers', () => {
         });
 
         expect(swapped).toBe(true);
-        expect(fs.lstatSync(intentPath).ino).not.toBe(originalInode);
+        const replacement = fs.lstatSync(intentPath, { bigint: true });
+        // Deliberately *not* asserting the inode changed. Whether the recreate
+        // lands on a fresh inode or recycles the freed one is the filesystem's
+        // choice — ext4 and tmpfs reuse it, APFS does not — and the reuse case is
+        // precisely the hazard this guard exists for. Asserting a change would
+        // demand the collision never happen, which is the opposite of the point,
+        // and it failed on CI for exactly that reason (`expected 8947075 not to be
+        // 8947075`) *after* the guard had already done its job.
+        //
+        // What must hold on every filesystem: the replacement is a different
+        // incarnation, so the marker is refused and left where it is with the
+        // replacement's bytes intact.
+        expect(replacement.birthtimeNs).not.toBe(original.birthtimeNs);
         expect(result.movedCount).toBe(0);
         expect(fs.readFileSync(intentPath, 'utf8')).toBe('cccccccc');
     });
