@@ -1048,7 +1048,6 @@ async function main() {
             write_output(process.stderr, `${safe_failure_text(error)}\n`);
             process.exit(2);
         }
-        return;
     }
 
     let exit_code = 0;
