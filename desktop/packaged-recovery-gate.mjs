@@ -227,6 +227,10 @@ async function assert_no_partial_v1(database_path) {
  * the child's death is the observable event, and `process.abort()` guarantees it
  * arrives.
  */
+/** Backstop for a child that neither aborts nor exits; see `run_crashing_child`.
+ *  Orders of magnitude above a healthy child, which dies in milliseconds. */
+const CHILD_STUCK_LIMIT_MS = 120_000;
+
 function run_crashing_child(role, cut_point, user_data_dir) {
     const script = process.argv[1];
     const sandbox_arguments = process.argv.includes('--no-sandbox') ? ['--no-sandbox'] : [];
@@ -237,6 +241,15 @@ function run_crashing_child(role, cut_point, user_data_dir) {
                 [ROLE_VARIABLE]: role,
                 [CUT_POINT_VARIABLE]: cut_point,
                 TABLE_VIEWER_GATE_USER_DATA: user_data_dir,
+                // Run the child as plain Node inside the Electron binary. The
+                // property under test is that the *embedded runtime* — its
+                // node:sqlite, its fsync, its rename — survives a kill at a durable
+                // boundary; none of that needs Chromium, a window, or a desktop
+                // session. Booting the browser stack anyway made the child hang on
+                // a headless CI runner, which has no D-Bus for it to reach
+                // ("Failed to connect to the bus"), and a hung child hung the
+                // parent with it. `ELECTRON_RUN_AS_NODE` skips that entire layer.
+                ELECTRON_RUN_AS_NODE: '1',
             },
             // The child writes nothing to stdout; its stderr is piped so that a
             // fixture that failed *before* reaching its cut point can say why.
@@ -247,14 +260,33 @@ function run_crashing_child(role, cut_point, user_data_dir) {
         });
         let stderr = '';
         child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+        // A child that neither reaches its cut point nor exits would otherwise
+        // hang this promise, and with it the whole job, until the CI runner's own
+        // limit killed it with no diagnosis — which is exactly what a headless
+        // runner produced before the child stopped booting Chromium. Every child
+        // here aborts within milliseconds, so this is a stuck-process backstop and
+        // never a race against slow work: it is deliberately far above any healthy
+        // duration, and it reports rather than passing.
+        const stuck = setTimeout(() => {
+            child.kill('SIGKILL');
+            reject(new GateAssertionError(
+                `child for ${role}/${cut_point} never reached its cut point or exited`
+                + `${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
+            ));
+        }, CHILD_STUCK_LIMIT_MS);
+        stuck.unref?.();
+        const settle = (finish) => (...args) => {
+            clearTimeout(stuck);
+            finish(...args);
+        };
         // Spawn itself failed (no executable, EAGAIN). Reduced like everything
         // else that reaches a public pipe: the raw error names a path.
-        child.on('error', (error) => {
+        child.on('error', settle((error) => {
             reject(new GateAssertionError(
                 `child for ${role}/${cut_point} could not be spawned (${safe_failure_text(error)})`,
             ));
-        });
-        child.on('exit', (code, signal) => {
+        }));
+        child.on('exit', settle((code, signal) => {
             // A clean exit means the cut point was never reached, so the residue
             // the parent is about to inspect would not be crash residue at all.
             // Exit 2 is the child's own classified failure, and its reduced
@@ -268,7 +300,7 @@ function run_crashing_child(role, cut_point, user_data_dir) {
                 return;
             }
             resolve({ code, signal });
-        });
+        }));
     });
 }
 
@@ -987,13 +1019,16 @@ async function main() {
             // Reaching here means the cut point never fired. Exit 0 so the parent
             // reports "exited cleanly instead of aborting" — a gate that never ran
             // must fail loudly rather than pass vacuously.
-            app.exit(0);
+            //
+            // `process.exit`, not `app.exit`: the child runs under
+            // ELECTRON_RUN_AS_NODE, where there is no `app` to call.
+            process.exit(0);
         } catch (error) {
             // The same reduction the parent applies, and for the same reason: this
             // text is forwarded to the parent, which prints it into a public CI
             // log. A raw error message here would carry the temp path.
             write_output(process.stderr, `${safe_failure_text(error)}\n`);
-            app.exit(2);
+            process.exit(2);
         }
         return;
     }
