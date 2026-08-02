@@ -232,10 +232,28 @@ async function assert_no_partial_v1(database_path) {
 const CHILD_STUCK_LIMIT_MS = 120_000;
 
 function run_crashing_child(role, cut_point, user_data_dir) {
-    const script = process.argv[1];
-    const sandbox_arguments = process.argv.includes('--no-sandbox') ? ['--no-sandbox'] : [];
+    // This module's own file, resolved from `import.meta.url` rather than taken
+    // from `process.argv[1]`.
+    //
+    // Electron does not reserve argv[1] for the script: it holds whatever the first
+    // argument happened to be, so under the `--no-sandbox` the Linux runner
+    // requires, `argv[1]` is the literal string `--no-sandbox`. The child was
+    // therefore spawned with no script to run at all — it exited by a signal,
+    // convincingly enough that the parent accepted it as an abort, having created
+    // nothing. The gate then correctly reported that no residue existed and nothing
+    // had been under test, which is why that assertion is there.
+    //
+    // `--no-sandbox` is also deliberately not forwarded. The parent needs it as a
+    // real Electron app; the child is plain Node (see `ELECTRON_RUN_AS_NODE`), and
+    // Node rejects Chromium flags outright with `bad option: --no-sandbox`.
+    //
+    // `__filename`, not `import.meta.url`: desktop/build.mjs bundles this to CJS,
+    // where esbuild replaces `import.meta` with an empty object, so the URL form
+    // resolves to undefined at runtime. `__filename` is the real path of the
+    // bundled file that is actually executing, which is what the child must re-run.
+    const script = __filename;
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [...sandbox_arguments, script], {
+        const child = spawn(process.execPath, [script], {
             env: {
                 ...process.env,
                 [ROLE_VARIABLE]: role,
