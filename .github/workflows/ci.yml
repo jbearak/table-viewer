@@ -63,9 +63,10 @@ jobs:
       # src/ code, which is the whole reason it is not a vitest suite.
       #
       # Same xvfb + --no-sandbox treatment as the probe above, and for the same
-      # reason. The flag is passed to the parent and the driver forwards it to the
-      # crashing children it forks, so they do not fail for a sandbox reason that
-      # has nothing to do with the property under test.
+      # reason — but the flag applies to the Electron parent only. The crashing
+      # children the driver forks run as plain Node under ELECTRON_RUN_AS_NODE,
+      # which rejects Chromium flags outright, so the driver deliberately does not
+      # forward it (see the comment on `run_crashing_child`).
       #
       # The `bundle:desktop` here is the third in this job, and deliberately not
       # deduplicated: it takes a couple of seconds, and paying it buys a step that

@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       allow_missing_windows:
-        description: 'Publish even though the Windows desktop artifact is absent (Windows is fenced off; only set this once Windows has been deliberately withdrawn as a target)'
+        description: 'Publish even though the Windows desktop artifact is absent. Only consulted for a hand-dispatched publish, which bypasses the build run conclusion check that a tag-triggered publish relies on; set it to say the omission is intended rather than a failed build.'
         required: false
         default: false
         type: boolean
@@ -84,6 +84,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THE_TAG: ${{ env.RELEASE_TAG }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          # `workflow_run` (a pushed tag) or `workflow_dispatch` (a human). The
+          # Windows branch below turns on which one this is, so it is read from a
+          # named variable rather than interpolated into the middle of a
+          # conditional.
+          PUBLISH_TRIGGER: ${{ github.event_name }}
           # Only ever true when a human dispatched with it explicitly; the
           # workflow_run trigger has no way to supply it. See the Windows branch.
           ALLOW_MISSING_WINDOWS: ${{ inputs.allow_missing_windows }}
@@ -92,7 +97,7 @@ jobs:
 
           ARTIFACT_NAME="release-${THE_TAG}"
 
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+          if [[ "$PUBLISH_TRIGGER" == "workflow_run" ]]; then
             BUILD_RUN_ID="$WORKFLOW_RUN_ID"
           else
             BUILD_RUN_ID=$(gh api --paginate "repos/${{ github.repository }}/actions/artifacts" \
@@ -139,46 +144,55 @@ jobs:
           fi
 
           # Same story for the Windows exes, in their own directory for the same
-          # reason — but a missing one is NOT merely a warning while the Windows
-          # desktop fence is standing.
+          # reason. What a *missing* one means, though, depends entirely on which
+          # trigger fired — and getting that wrong once made every tag-triggered
+          # publish impossible, so the two cases are spelled out.
           #
-          # release-build.yml's `desktop-windows` job deliberately fails: this
+          # release-build.yml's `desktop-windows` job packages nothing today: this
           # build cannot open its SQLite state database on Windows, so there is no
-          # correct Windows artifact to publish. That fence relies on a failing
-          # build run blocking the publish — which holds for the `workflow_run`
-          # trigger, because the job's `if` requires `conclusion == 'success'`.
+          # correct Windows artifact to publish. It reports that and exits 0 — it
+          # does NOT fail — because Windows being unproven must never withhold the
+          # macOS release. See the long comment on that job.
           #
-          # It does NOT hold for `workflow_dispatch`: that arm of the same `if`
-          # bypasses the conclusion check entirely, so a hand-dispatched publish
-          # against a tag whose Windows job failed would sail past the fence and
-          # attach a release silently missing its Windows downloads. That is
-          # precisely the outcome the fence exists to prevent, and a `::warning::`
-          # in a log nobody reads is not a decision — so this fails closed instead.
+          # `workflow_run` — a pushed tag. The build run's own conclusion is the
+          # fence: this job's `if` requires `conclusion == 'success'`, so a build
+          # that genuinely broke never gets here at all. Reaching here with no
+          # `windows-<tag>` artifact is therefore the expected state of the fence,
+          # not a lost artifact, and failing on it would block the macOS dmg, the
+          # .vsix, the GitHub Release, and the Homebrew bump for a platform that was
+          # never being shipped. Warn and continue.
           #
-          # The escape hatch is explicit and auditable rather than accidental:
-          # dispatch with ALLOW_MISSING_WINDOWS=true only once Windows has been
-          # deliberately withdrawn as a target.
+          # `workflow_dispatch` — a human. That arm of the same `if` bypasses the
+          # conclusion check entirely, so a hand-dispatched publish against a tag
+          # whose build run *failed* would sail past the fence and attach a release
+          # silently missing downloads it was supposed to have. Nothing else stands
+          # between that and a published release, so this fails closed, and the
+          # escape hatch is explicit and auditable rather than accidental: dispatch
+          # with allow_missing_windows=true to say that omission is intended.
           if grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
             gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
             echo "windows=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$PUBLISH_TRIGGER" == "workflow_run" ]]; then
+            echo "windows=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app. The desktop-windows job in release-build.yml is fenced off pending durability verification, and the build run's own success is what vouches for this publish."
           elif [[ "${ALLOW_MISSING_WINDOWS:-false}" == "true" ]]; then
             echo "windows=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app because ALLOW_MISSING_WINDOWS was set."
+            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app because allow_missing_windows was set."
           else
             echo "windows=false" >> "$GITHUB_OUTPUT"
             cat >&2 <<MESSAGE
-          ERROR: no windows-${THE_TAG} artifact, and this publish would ship a release
-          without the Windows downloads.
+          ERROR: no windows-${THE_TAG} artifact, and this hand-dispatched publish would
+          ship a release without the Windows downloads.
 
-          The Windows desktop packaging job in release-build.yml is fenced off on
-          purpose: this build cannot open its SQLite state database on Windows, so no
-          Windows artifact is produced and that build run fails. A publish triggered by
-          workflow_run is blocked by that failure; a hand-dispatched publish is not,
-          which is how this run got here.
+          A publish triggered by a pushed tag is vouched for by the build run's own
+          conclusion, and treats an absent Windows artifact as the expected state of the
+          fence in release-build.yml. This publish was dispatched by hand, which bypasses
+          that conclusion check — so an absent artifact here may equally mean the build
+          run failed, and publishing anyway would silently drop downloads the release was
+          supposed to have.
 
-          Refusing rather than publishing a release whose Windows downloads have
-          silently disappeared. If Windows has been deliberately withdrawn as a target
-          and the release page is meant to omit it, re-dispatch with:
+          Re-run the build for this tag, or, if Windows is meant to be omitted from the
+          release page, say so explicitly:
 
             gh workflow run release-publish.yml -f tag=${THE_TAG} -f allow_missing_windows=true
           MESSAGE

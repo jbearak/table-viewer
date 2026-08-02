@@ -533,9 +533,37 @@ function run_cut_point_child(cut_point, user_data_dir) {
                 resolve({ outcome: 'failed-before-cut-point', reason: stderr.trim() || 'unreported' });
                 return;
             }
-            // Neither a clean exit nor a classified failure: `process.abort()`
-            // fired, which is what reaching the cut point looks like.
-            resolve({ outcome: 'aborted-at-cut-point', signal: signal ?? 'none' });
+            // An abort is *positively* identified, never inferred from "not one of
+            // the codes above". `process.abort()` raises SIGABRT, which on POSIX
+            // arrives as the signal and on Windows surfaces as the CRT's abort exit
+            // code (3) or as STATUS_FATAL_APP_EXIT (0xC0000409) when the runtime
+            // takes the fast-fail path instead.
+            //
+            // Everything else is an unexplained death — an Electron launch failure,
+            // an OOM kill, a crash before the cut point that never reached the
+            // classified exit(2) — and it must not be filed as a covered cut point.
+            // `survey_cut_points` derives `complete` from every entry having
+            // aborted, and `derive_verdict` derives `verified` from `complete`, so
+            // calling an unexplained death an abort is a path from a broken child to
+            // a claim that Windows durability was verified. Harmless only while
+            // `pending` is non-empty; the moment REPRESENTATIVE_CUT_POINTS becomes
+            // the full matrix it is not, and that extension is the stated next step.
+            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            resolve(aborted
+                ? { outcome: 'aborted-at-cut-point', signal: signal ?? 'none' }
+                : {
+                    outcome: 'exited-unexpectedly',
+                    exitCode: typeof code === 'number' ? code : 'none',
+                    signal: signal ?? 'none',
+                    // The code and the signal, and a *boolean* for the stderr —
+                    // never the text. The `failed-before-cut-point` branch above can
+                    // forward its stderr because the child wrote it through its own
+                    // `safe_failure_text`. Nothing has reduced the output of a child
+                    // that died before reaching that handler: an Electron launch
+                    // failure or a raw errno stack carries absolute paths, and this
+                    // report is a public CI artifact.
+                    reportedSomething: stderr.trim().length > 0,
+                });
         });
     });
 }
@@ -548,6 +576,13 @@ function run_cut_point_child(cut_point, user_data_dir) {
  * dressing it up as one is exactly the silent weakening the decision tree
  * forbids. The `pending` list beside it is what stops a reader from mistaking two
  * covered cut points for a matrix.
+ *
+ * `complete` requires every attempted cut point to have *aborted*, positively
+ * identified as such by `run_cut_point_child`. An entry appears in `covered`
+ * whatever the child did, because an attempt that exited cleanly or died
+ * unexplained is a finding worth printing — but only an abort counts toward the
+ * matrix, so a run full of `exited-unexpectedly` children reports them and stays
+ * short of `complete`.
  */
 async function survey_cut_points() {
     const covered = [];
