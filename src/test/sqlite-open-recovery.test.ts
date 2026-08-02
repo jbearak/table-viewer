@@ -787,6 +787,13 @@ describe('attested quarantine of malformed gate markers', () => {
         expect(fs.readFileSync(target.markerPath, 'utf8')).toBe(target.becomesValid);
     });
 
+    // Note on coverage: this case only *bites* where the filesystem recycles the
+    // freed inode. APFS does not, ext4 and tmpfs do, so it passes vacuously on
+    // macOS and is load-bearing on CI — it caught the missing `createdAt` field
+    // twice from the Linux runner while no local run ever reproduced it. A
+    // constructed collision was attempted instead and abandoned: a hardlink shares
+    // both inode and birthtime, so it cannot stand in for a recreate. Do not
+    // "simplify" this to a local-only assertion; the Linux runner is the coverage.
     it('refuses a marker replaced by a different file of the same size', async () => {
         // Identity, not just size: an unlink-and-recreate leaves the byte count
         // unchanged while the inode changes, and whatever wrote it is a party

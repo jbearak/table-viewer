@@ -627,6 +627,31 @@ interface MarkerIdentity {
     readonly device: bigint;
     readonly inode: bigint;
     readonly size: bigint;
+    /**
+     * Creation time, compared for **equality only** — never against a clock, a
+     * threshold, or an age, so no TTL or expiry is derived from it. The question
+     * is "is this the same incarnation I classified", not "how old is it".
+     *
+     * device/inode/size alone is not an incarnation test. An unlink followed by a
+     * create in the same directory can reuse the freed inode, and a replacement
+     * with the same byte count then matches all three fields — so a file this run
+     * never classified is treated as the file it did. That is not theoretical: it
+     * is what failed CI here, twice, while never once reproducing on APFS, which
+     * does not recycle inodes eagerly. ext4 and tmpfs do.
+     *
+     * Creation time rather than `ctimeNs`, which was tried first and is wrong:
+     * ctime also changes on an *in-place rewrite*, and a marker rewritten in place
+     * that is still malformed must still be moved. Comparing ctime made the
+     * primitive refuse work it is required to do — the inert-primitive failure in
+     * another guise. Creation time survives a rewrite and changes on a recreate,
+     * which is exactly the distinction needed.
+     *
+     * Where a filesystem does not record it, this degrades to the previous
+     * three-field check rather than to a false match: an unsupported birthtime is
+     * a stable 0 on both sides of the comparison, so it neither rescues nor breaks
+     * anything, and the `stillMalformed` re-read below remains the backstop.
+     */
+    readonly createdAt: bigint;
 }
 
 /** Undefined when the entry is absent or is not a regular file; a symlink is
@@ -640,7 +665,12 @@ function capture_marker_identity(filePath: string): MarkerIdentity | undefined {
         throw error;
     }
     if (!stat.isFile()) return undefined;
-    return { device: stat.dev, inode: stat.ino, size: stat.size };
+    return {
+        device: stat.dev,
+        inode: stat.ino,
+        size: stat.size,
+        createdAt: stat.birthtimeNs,
+    };
 }
 
 /**
@@ -1207,25 +1237,17 @@ export async function quarantine_malformed_sqlite_gate_markers(
             // is changing under us is precisely the live peer this must not
             // touch.
             //
-            // device/inode/size is not a perfect incarnation test on its own — an
-            // unlink-and-recreate can reuse the freed inode, and a same-length
-            // replacement then matches all three. Adding `ctimeNs` was tried and
-            // rejected: an in-place rewrite that leaves the marker *still
-            // malformed* also changes ctime, so comparing it refuses markers this
-            // primitive must move, which is the inert-primitive failure wearing a
-            // different hat (the "bytes churn but never become a token" test
-            // catches exactly that).
-            //
-            // It does not need to be perfect, because it is not the last gate. The
-            // `stillMalformed` re-read below runs on the bytes actually present at
-            // rename time, so the outcome that would matter — moving a marker a
-            // live peer has since made *valid* — is refused there regardless of
-            // whether the identity check was fooled. Identity narrows the window;
-            // the contents re-check is what closes it.
+            // Creation time is part of the comparison because device/inode/size is
+            // not an incarnation test on filesystems that recycle inodes; see
+            // `MarkerIdentity`. The `stillMalformed` re-read below is the backstop
+            // either way: it runs on the bytes present at rename time, so a marker
+            // a live peer has since made *valid* is refused there even if the
+            // identity comparison were fooled.
             if (actual === undefined
                 || actual.device !== expected.device
                 || actual.inode !== expected.inode
-                || actual.size !== expected.size) {
+                || actual.size !== expected.size
+                || actual.createdAt !== expected.createdAt) {
                 return;
             }
             let contents: string;
