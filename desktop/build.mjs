@@ -45,11 +45,20 @@ await build({
     define: { __APP_VERSION__: JSON.stringify(version) },
 });
 
-// Runtime-only probe bundle. Keep it outside dist/desktop so electron-builder
-// cannot accidentally ship test code with the standalone application.
+// Runtime-only probe and gate bundles. Keep them outside dist/desktop so
+// electron-builder cannot accidentally ship test code with the standalone
+// application.
+//
+// The recovery gate is a second entry point rather than part of the probe
+// because it forks itself: the child re-enters the same bundle and hard-aborts at
+// a durable cut point, and a bundle that also had to survive being imported for
+// its exported helpers would be two contracts in one file.
 await build({
     ...node_common,
-    entryPoints: [join(desktop_dir, 'electron-sqlite-runtime-probe.mjs')],
+    entryPoints: [
+        join(desktop_dir, 'electron-sqlite-runtime-probe.mjs'),
+        join(desktop_dir, 'packaged-recovery-gate.mjs'),
+    ],
     outdir: join(repo_dir, 'dist', 'runtime-probes'),
 });
 

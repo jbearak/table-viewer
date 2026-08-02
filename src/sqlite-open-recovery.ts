@@ -163,10 +163,56 @@ export interface SqliteAllProcessesClosedConfirmation {
     readonly allProcessesClosed: true;
 }
 
+/**
+ * What inspection found in the gate, as a *classification* rather than a verdict.
+ *
+ * Every field is total: a marker is absent, valid, or malformed, and inspection
+ * never throws for the third case. That totality is the whole point. Each of the
+ * gate's durable markers is created by an `open`+`write`+`fsync` sequence, so a
+ * crash between the `open` and the `write` leaves a zero-length file that parses
+ * as nothing — and inspection runs *before*, and gates, the attested quarantine
+ * that is the only thing allowed to clear such a file. An inspection that threw
+ * there made every torn write permanently unrecoverable from inside the app: the
+ * open failed, and the recovery action failed at the same line, with no in-app
+ * escape at all.
+ *
+ * Genuine I/O failures — anything that is not ENOENT and not malformed content —
+ * still throw, and still through `safe_error`, so no path reaches a caller.
+ */
 export interface SqliteRecoveryGateInventory {
+    /** Present only for an intent whose contents are an exact token id. */
     readonly exclusiveIntentTokenId?: string;
+    /** An intent file exists but carries no token id — a torn or foreign write. */
+    readonly exclusiveIntentMalformed: boolean;
+    /** Entries that are `<uuid>.reader` files containing that same uuid. */
     readonly readerTokenIds: readonly string[];
+    /**
+     * On-disk names of `*.reader` entries that are not tokens: an unparseable
+     * name, a non-file, or a valid name whose contents are not its own id.
+     *
+     * Names, never contents, and never for an error message: this data is
+     * crash- or attacker-controlled, so it may be used to *move* the entry and
+     * nothing else. Nothing in this module puts it in a `SqliteFileStateError`.
+     */
+    readonly malformedReaderTokenNames: readonly string[];
+    /** A well-formed blockade marker naming its exact generation directory. */
     readonly recoveryBlocked: boolean;
+    /** A blockade marker exists but does not parse — a torn or foreign write. */
+    readonly recoveryBlockMalformed: boolean;
+}
+
+/** Everything one attested quarantine run moved out of the live gate. */
+export interface SqliteGateQuarantineResult {
+    readonly movedCount: number;
+    /** The generation subdirectory created for this run, absent when nothing
+     *  was malformed and therefore nothing was created. */
+    readonly generation?: string;
+}
+
+export interface SqliteGateQuarantineOptions extends SqliteOpenRecoveryHooks {
+    /** The product's chosen name for the quarantine subtree inside the gate
+     *  directory. A constant chosen by the caller, never derived from disk. */
+    readonly quarantineDirectoryName?: string;
 }
 
 export interface SqliteOpenedDatabase {
@@ -330,7 +376,7 @@ export function safe_error(operation: string, error: unknown): SqliteFileStateEr
     return sqlite_file_state_recovery_error({ operation });
 }
 
-export function capture_managed_directory(
+function capture_managed_directory(
     directoryPath: string,
     physicalParentPath: string,
     operation: string,
@@ -358,7 +404,7 @@ export function capture_managed_directory(
     };
 }
 
-export function assert_managed_directory(identity: ManagedDirectoryIdentity, operation: string): void {
+function assert_managed_directory(identity: ManagedDirectoryIdentity, operation: string): void {
     const actual = capture_managed_directory(
         identity.directoryPath,
         identity.physicalParentPath,
@@ -508,6 +554,47 @@ function exact_token_matches(
     }
 }
 
+/**
+ * The single definition of "this directory entry could be one of our tokens".
+ *
+ * Shared by the strict enforcer below and by `classify_reader_tokens`, for the
+ * same reason `parse_recovery_block` is shared: these two answered the same
+ * question from two independent copies of the predicate, they agreed only by
+ * coincidence, and when the copies drifted the classifier stopped reporting a
+ * shape the enforcer still refused — which is a permanent dead-end, since the
+ * open then succeeds while every later preserve fails identically with no
+ * in-app action able to clear it.
+ *
+ * Deliberately *name and file-type only*, which is the whole of what the
+ * enforcer may consider. Contents are the classifier's additional question and
+ * stay there: `existing_reader_token_ids` must treat a well-formed name as a
+ * live peer's token regardless of what it holds, because refusing to guess
+ * about a live reader is the point.
+ *
+ * Returns undefined when the entry is not `<uuid>.reader` *or* is not a regular
+ * file — every token this module creates is both.
+ *
+ * The suffix is a separate question (`claims_reader_token_name`)
+ * because both callers must first distinguish "not in our namespace at all",
+ * which they *skip*, from "claims a token's name but is not one", which one
+ * refuses and the other classifies. Deriving both from `READER_TOKEN_SUFFIX`
+ * keeps that split from becoming a third place the suffix is spelled out — a
+ * caller that pre-filtered on its own literal would silently see zero entries
+ * if this one ever changed.
+ */
+const READER_TOKEN_SUFFIX = '.reader';
+
+function claims_reader_token_name(entry: fs.Dirent): boolean {
+    return entry.name.endsWith(READER_TOKEN_SUFFIX);
+}
+
+function reader_token_id_of(entry: fs.Dirent): string | undefined {
+    if (!claims_reader_token_name(entry)) return undefined;
+    const tokenId = entry.name.slice(0, -READER_TOKEN_SUFFIX.length);
+    if (!entry.isFile() || !UUID_PATTERN.test(tokenId)) return undefined;
+    return tokenId;
+}
+
 function existing_reader_token_ids(
     paths: GatePaths,
     identities: GateDirectoryIdentities,
@@ -516,14 +603,144 @@ function existing_reader_token_ids(
     assert_managed_directory(identities.readers, 'readers-directory-list');
     const tokenIds: string[] = [];
     for (const entry of fs.readdirSync(paths.readersDirectory, { withFileTypes: true })) {
-        if (!entry.name.endsWith('.reader')) continue;
-        const tokenId = entry.name.slice(0, -'.reader'.length);
-        if (!entry.isFile() || !UUID_PATTERN.test(tokenId)) {
+        if (!claims_reader_token_name(entry)) continue;
+        const tokenId = reader_token_id_of(entry);
+        // Enforcement: anything claiming a token's name that this module could
+        // never have written is a refusal to guess, not a classification.
+        if (tokenId === undefined) {
             throw sqlite_file_state_recovery_error({ operation: 'reader-token-inventory' });
         }
         tokenIds.push(tokenId);
     }
     return tokenIds.sort();
+}
+
+/**
+ * The exact incarnation of a marker file at the moment it was classified.
+ *
+ * Carried from classification to the rename so the quarantine can prove it is
+ * moving the same bytes it judged, rather than whatever now occupies the name.
+ * Identity and size only — no timestamps, because a time comparison would be
+ * the age-based reasoning this module refuses everywhere else.
+ */
+interface MarkerIdentity {
+    readonly device: bigint;
+    readonly inode: bigint;
+    readonly size: bigint;
+}
+
+/** Undefined when the entry is absent or is not a regular file; a symlink is
+ *  deliberately not followed, matching every other lstat in this module. */
+function capture_marker_identity(filePath: string): MarkerIdentity | undefined {
+    let stat: fs.BigIntStats;
+    try {
+        stat = fs.lstatSync(filePath, { bigint: true });
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+    }
+    if (!stat.isFile()) return undefined;
+    return { device: stat.dev, inode: stat.ino, size: stat.size };
+}
+
+/**
+ * A `*.reader` entry that is not a live token.
+ *
+ * `identity` is present only for a regular file, and `tokenId` only when the
+ * *name* parsed as a uuid — i.e. when a later write could still make the entry
+ * a genuine token, which an unparseable name never can.
+ *
+ * Both are optional because a non-regular file (a directory, symlink, or fifo
+ * on a token's name) still has to be *reported and clearable*. Requiring an
+ * identity here is precisely the regression this shape exists to prevent: such
+ * an entry vanished from inspection while `existing_reader_token_ids` kept
+ * refusing it, so the app opened normally and then failed every preserve
+ * identically, with no in-app escape at all.
+ */
+interface MalformedReaderCandidate {
+    readonly name: string;
+    readonly tokenId?: string;
+    readonly identity?: MarkerIdentity;
+}
+
+interface ClassifiedReaderTokens {
+    readonly tokenIds: readonly string[];
+    readonly malformedNames: readonly string[];
+    readonly malformedCandidates: readonly MalformedReaderCandidate[];
+}
+
+/**
+ * The non-throwing sibling of `existing_reader_token_ids`.
+ *
+ * A *classifier*, not a relaxed enforcer. `existing_reader_token_ids` stays
+ * strict because its two callers — `waitForReaders` and `reclaimStaleReaderToken`
+ * — are enforcement: neither may proceed past an entry it cannot account for.
+ * This one answers the different question the quarantine and the recovery dialog
+ * need, "what is here, and which of it was never a token", and it answers it for
+ * every entry rather than stopping at the first surprise.
+ *
+ * Contents are checked here and deliberately not there: every token this module
+ * creates is `<uuid>.reader` holding that same uuid, so a valid name with other
+ * contents was never a live reader — but the strict inventory only validates the
+ * name, so such an entry was counted as a live reader, failed
+ * `reclaimStaleReaderToken`'s exact-token check, and left `waitForReaders`
+ * spinning on a reader that never existed.
+ *
+ * A read failure that is not ENOENT is a genuine I/O condition and propagates;
+ * only unreadable-as-a-token is a classification.
+ */
+function classify_reader_tokens(
+    paths: GatePaths,
+    identities: GateDirectoryIdentities,
+): ClassifiedReaderTokens {
+    assert_managed_directory(identities.gate, 'gate-directory-readers');
+    assert_managed_directory(identities.readers, 'readers-directory-list');
+    const tokenIds: string[] = [];
+    const malformed: MalformedReaderCandidate[] = [];
+    for (const entry of fs.readdirSync(paths.readersDirectory, { withFileTypes: true })) {
+        if (!claims_reader_token_name(entry)) continue;
+        const entryPath = path.join(paths.readersDirectory, entry.name);
+        // Exactly the enforcer's predicate, shared rather than restated.
+        const tokenId = reader_token_id_of(entry);
+        if (tokenId === undefined) {
+            // Reported whether or not an identity could be captured. A directory,
+            // symlink, or fifo on a token's name has no `MarkerIdentity` — and
+            // must still be visible here, because the enforcer refuses it and
+            // only the attested quarantine can clear it. Dropping it for want of
+            // an identity is what silently reinstated the dead-end.
+            const unusable = capture_marker_identity(entryPath);
+            malformed.push({
+                name: entry.name,
+                ...(unusable === undefined ? {} : { identity: unusable }),
+            });
+            continue;
+        }
+        // Captured before the contents are read, so the identity recorded is the
+        // one whose bytes the classification below is about.
+        const identity = capture_marker_identity(entryPath);
+        // Raced away between the readdir and the stat: a live peer releasing its
+        // own token, which is ordinary and not malformed.
+        if (identity === undefined) continue;
+        let contents: string;
+        try {
+            contents = fs.readFileSync(entryPath, 'utf8');
+        } catch (error) {
+            // ENOENT is a live peer releasing its own token between the readdir
+            // and the read, which is the ordinary case and not malformed. Any
+            // other errno is a real filesystem condition the caller must see.
+            if (is_node_error(error) && error.code === 'ENOENT') continue;
+            throw error;
+        }
+        if (contents === tokenId) tokenIds.push(tokenId);
+        else malformed.push({ name: entry.name, tokenId, identity });
+    }
+    const malformedCandidates = [...malformed].sort((left, right) =>
+        left.name.localeCompare(right.name));
+    return {
+        tokenIds: tokenIds.sort(),
+        malformedNames: malformedCandidates.map((candidate) => candidate.name),
+        malformedCandidates,
+    };
 }
 
 export async function acquire_sqlite_shared_reader_gate(
@@ -668,25 +885,131 @@ export async function acquire_sqlite_exclusive_recovery_gate(
     }
 }
 
+/**
+ * The single definition of what an exclusive-intent marker's contents must be.
+ *
+ * The block marker has `parse_recovery_block` and the reader token has
+ * `reader_token_id_of`; this one was still stated twice — in the classifier and
+ * again in the quarantine's re-check lambda. They cannot disagree today, being
+ * the same constant over the same input, but that is exactly what was true of
+ * every other pair here before it drifted.
+ */
+function parse_exclusive_intent(raw: string): string | undefined {
+    return UUID_PATTERN.test(raw) ? raw : undefined;
+}
+
+/** Absent, an exact token id, or present-but-unparseable — never a throw for
+ *  the third case, which is what a crash between the marker's `open` and its
+ *  `write` leaves behind. */
+function classify_exclusive_intent(
+    paths: GatePaths,
+    identities: GateDirectoryIdentities,
+): { tokenId?: string; malformed: boolean; identity?: MarkerIdentity } {
+    assert_managed_directory(identities.gate, 'exclusive-intent-inspect');
+    // Absent, present-as-a-file, or present-as-something-else — all three are
+    // classifications, none is a throw. A *directory* on this name made
+    // `readFileSync` fail EISDIR, which is not ENOENT and so propagated: the
+    // preflight refused the open and the preserve refused too, which is the same
+    // dialog loop with no exit that totality exists to prevent.
+    const present = fs.lstatSync(paths.exclusiveIntentPath, { throwIfNoEntry: false });
+    if (present === undefined) return { malformed: false };
+    if (!present.isFile()) return { malformed: true };
+    // Captured before the read, so the identity belongs to the bytes classified.
+    const identity = capture_marker_identity(paths.exclusiveIntentPath);
+    let value: string;
+    try {
+        value = fs.readFileSync(paths.exclusiveIntentPath, 'utf8');
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return { malformed: false };
+        throw error;
+    }
+    const tokenId = parse_exclusive_intent(value);
+    if (tokenId === undefined) return { malformed: true, identity };
+    return { tokenId, malformed: false };
+}
+
+/** The same three-way classification for the blockade marker. Deliberately not
+ *  `read_recovery_block`, which throws on malformed JSON *and* is what the
+ *  resume path calls: routing a torn marker to resume was dead-end (b). */
+/**
+ * The single definition of what a well-formed blockade marker is.
+ *
+ * Shared by the classifier below and by `read_recovery_block`, the enforcer,
+ * and deliberately not duplicated between them. The two callers legitimately
+ * differ in what they *do* with the answer — one classifies, one throws — but
+ * if they ever differed in what they *accept*, dead-end (b) comes straight
+ * back: a classifier laxer than the enforcer reports a torn marker as a
+ * legitimate blockade, the desktop routes to
+ * `resume_sqlite_basename_preservation` on that word, and the enforcer then
+ * refuses to parse the very file the classifier vouched for — a loop no in-app
+ * action can break.
+ *
+ * A test asserting the two agreed would only have pinned the shapes someone
+ * thought to enumerate; there being one copy is what makes the drift
+ * unrepresentable. ENOENT handling and the `assert_managed_directory` stage
+ * names stay with each caller, because those genuinely differ.
+ *
+ * Returns undefined for "not a blockade marker", never throwing — including for
+ * unparseable JSON, which is exactly what a crash between the marker's `open`
+ * and its `write` leaves behind.
+ */
+function parse_recovery_block(raw: string, paths: GatePaths): RecoveryBlock | undefined {
+    let value: Partial<RecoveryBlock>;
+    try {
+        value = JSON.parse(raw) as Partial<RecoveryBlock>;
+    } catch {
+        return undefined;
+    }
+    if (value?.format !== 'tableViewer.sqliteRecoveryBlock.v1'
+        || typeof value.generation !== 'string'
+        || !UUID_PATTERN.test(value.generation)
+        || value.recoveryDirectoryName !== `${paths.basename}${RECOVERY_MARKER}${value.generation}`) {
+        return undefined;
+    }
+    return value as RecoveryBlock;
+}
+
+function classify_recovery_block(
+    paths: GatePaths,
+    identities: GateDirectoryIdentities,
+): { valid: boolean; malformed: boolean; identity?: MarkerIdentity } {
+    assert_managed_directory(identities.gate, 'recovery-block-inspect');
+    // Total over file types for the same reason as the intent marker above: a
+    // directory here threw EISDIR out of `readFileSync` and blocked both the
+    // open and the recovery action.
+    const present = fs.lstatSync(paths.recoveryBlockPath, { throwIfNoEntry: false });
+    if (present === undefined) return { valid: false, malformed: false };
+    if (!present.isFile()) return { valid: false, malformed: true };
+    // Captured before the read, so the identity belongs to the bytes classified.
+    const identity = capture_marker_identity(paths.recoveryBlockPath);
+    let raw: string;
+    try {
+        raw = fs.readFileSync(paths.recoveryBlockPath, 'utf8');
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return { valid: false, malformed: false };
+        throw error;
+    }
+    // Present but unacceptable is the *malformed* case, not the absent one: the
+    // file still obstructs everything a well-formed blockade would.
+    return parse_recovery_block(raw, paths) === undefined
+        ? { valid: false, malformed: true, identity }
+        : { valid: true, malformed: false };
+}
+
 export function inspect_sqlite_recovery_gate(canonicalPath: string): SqliteRecoveryGateInventory {
     const paths = gate_paths(canonicalPath);
     try {
         const identities = ensure_private_gate(paths);
-        let exclusiveIntentTokenId: string | undefined;
-        try {
-            assert_managed_directory(identities.gate, 'exclusive-intent-inspect');
-            const value = fs.readFileSync(paths.exclusiveIntentPath, 'utf8');
-            if (!/^[0-9a-f-]{36}$/i.test(value)) {
-                throw sqlite_file_state_recovery_error({ operation: 'exclusive-intent-inspect' });
-            }
-            exclusiveIntentTokenId = value;
-        } catch (error) {
-            if (!is_node_error(error) || error.code !== 'ENOENT') throw error;
-        }
+        const intent = classify_exclusive_intent(paths, identities);
+        const readers = classify_reader_tokens(paths, identities);
+        const block = classify_recovery_block(paths, identities);
         return {
-            exclusiveIntentTokenId,
-            readerTokenIds: existing_reader_token_ids(paths, identities),
-            recoveryBlocked: fs.existsSync(paths.recoveryBlockPath),
+            ...(intent.tokenId === undefined ? {} : { exclusiveIntentTokenId: intent.tokenId }),
+            exclusiveIntentMalformed: intent.malformed,
+            readerTokenIds: readers.tokenIds,
+            malformedReaderTokenNames: readers.malformedNames,
+            recoveryBlocked: block.valid,
+            recoveryBlockMalformed: block.malformed,
         };
     } catch (error) {
         throw safe_error('recovery-gate-inspect', error);
@@ -714,6 +1037,292 @@ export async function reclaim_stale_sqlite_exclusive_intent(
     }
 }
 
+const DEFAULT_GATE_QUARANTINE_DIRECTORY_NAME = 'quarantined-markers';
+
+/**
+ * Create one level of managed directory beneath an already-captured parent.
+ *
+ * Non-recursive on purpose, so it fails closed on EEXIST rather than following a
+ * planted symlink, and captured immediately afterwards so the caller never holds
+ * a path that nothing has verified. The `mkdirSync` is the one place a capture
+ * cannot precede the use, because the directory does not exist yet.
+ */
+function create_managed_child_directory(
+    parent: ManagedDirectoryIdentity,
+    name: string,
+    operation: string,
+    hooks: SqliteOpenRecoveryHooks | undefined,
+): ManagedDirectoryIdentity {
+    // Checked *before* the `mkdirSync`, not left to the capture afterwards. The
+    // capture does reject a traversal name — but only after `mkdirSync` has
+    // already created the directory somewhere outside this parent, and the
+    // failing path then leaves it behind. `'../<basename>.recovery.<uuid>'` is
+    // the worst shape: an empty, recovery-directory-shaped entry in the basename
+    // namespace, which is exactly what `find_empty_pre_manifest_preservation`
+    // selects and `inventory_sqlite_basename` counts as incomplete — the
+    // primitive whose only job is restoring recoverability manufacturing an
+    // unrecoverable state instead. Same discipline as `capture_recovery_directory`.
+    if (path.basename(name) !== name || name === '' || name === '.' || name === '..') {
+        throw sqlite_file_state_recovery_error({ operation: 'gate-quarantine-name' });
+    }
+    const childPath = path.join(parent.physicalPath, name);
+    try {
+        fs.mkdirSync(childPath, { mode: PRIVATE_DIRECTORY_MODE });
+    } catch (error) {
+        // EEXIST is only tolerable for a directory we then prove is a real,
+        // non-symlinked child of this exact parent; `capture_managed_directory`
+        // is what proves it, so a planted link fails there rather than here.
+        if (!is_node_error(error) || error.code !== 'EEXIST') throw error;
+    }
+    const identity = capture_managed_directory(childPath, parent.physicalPath, operation);
+    // Flushed before anything is written inside, so a crash cannot leave a moved
+    // marker in a directory whose own entry never reached the disk.
+    assert_managed_directory(parent, operation);
+    flush_directory(parent.physicalPath, hooks);
+    return identity;
+}
+
+/**
+ * Move every malformed gate marker out of the live gate, under the explicit
+ * all-processes-closed attestation.
+ *
+ * The one primitive that may clear a marker inspection classified malformed, and
+ * the reason inspection is allowed to be total: a torn `exclusive-intent`, a torn
+ * `recovery-block.json`, and a `*.reader` entry that was never a token are each
+ * unrecoverable from inside the app unless *something* attested may set them
+ * aside, and nothing else is.
+ *
+ * The rules it does not bend:
+ *
+ * - it **moves**, never deletes. A torn marker is evidence about how the
+ *   directory reached this state, and nothing in this module destroys evidence.
+ * - a *valid* marker is untouched, including one that becomes valid *after*
+ *   classification. A well-formed intent or reader token is indistinguishable
+ *   from a live peer's, so clearing one stays the exclusive gate's exact-id path
+ *   — and there is no PID, TTL, age, or heartbeat anywhere here, because
+ *   reclaiming by time would let a momentarily slow live peer have its database
+ *   moved out from under it. Each entry is therefore re-read and re-classified
+ *   immediately before its rename, and the move refused on any change: the
+ *   zero-length instant inside `write_private_file_exclusive` is a real window,
+ *   not a theoretical one, and a peer that finishes its write inside it owns a
+ *   live marker no matter what the earlier classification said.
+ * - the quarantine subtree's name must be a plain basename, checked before any
+ *   directory is created rather than after.
+ * - without the attestation it refuses, before touching anything.
+ * - every directory is *captured* before it is used, and every child is derived
+ *   from its parent's verified `physicalPath` rather than joined onto a raw
+ *   string. A symlinked *gate* is the case a leaf-only check cannot see: through
+ *   one, `readers/` is a genuine directory that passes its own lstat while every
+ *   path built from it resolves into the link target.
+ */
+export async function quarantine_malformed_sqlite_gate_markers(
+    canonicalPath: string,
+    confirmation: SqliteAllProcessesClosedConfirmation,
+    options: SqliteGateQuarantineOptions = {},
+): Promise<SqliteGateQuarantineResult> {
+    const paths = gate_paths(canonicalPath);
+    try {
+        if (confirmation?.allProcessesClosed !== true) {
+            throw sqlite_file_state_recovery_error({ operation: 'gate-quarantine-attestation' });
+        }
+        const identities = ensure_private_gate(paths, options);
+        const intent = classify_exclusive_intent(paths, identities);
+        const readers = classify_reader_tokens(paths, identities);
+        const block = classify_recovery_block(paths, identities);
+        if (!intent.malformed && !block.malformed && readers.malformedNames.length === 0) {
+            return { movedCount: 0 };
+        }
+        const quarantineRoot = create_managed_child_directory(
+            identities.gate,
+            options.quarantineDirectoryName ?? DEFAULT_GATE_QUARANTINE_DIRECTORY_NAME,
+            'gate-quarantine-directory',
+            options,
+        );
+        // One fresh generation per run, so two runs cannot collide on a name and
+        // nothing ever has to be overwritten to make room for evidence.
+        const generation = randomUUID();
+        const generationDirectory = create_managed_child_directory(
+            quarantineRoot,
+            generation,
+            'gate-quarantine-directory',
+            options,
+        );
+        let movedCount = 0;
+        let movedFromReaders = false;
+        let movedFromGate = false;
+        // Re-asserted per move rather than once before the loop, matching
+        // `advance_preservation`: one assertion up front covers the first rename
+        // and leaves every later one running on a stale check.
+        //
+        // The *entry* is re-read too, immediately before its rename, and the
+        // move is refused unless it is still the same incarnation and still
+        // malformed. Asserting only the directory left a wide window — two
+        // `mkdirSync`, two `flush_directory`, and a `capture_managed_directory`
+        // separate classification from the first rename — and the shape that
+        // fits through it is not hypothetical: it is exactly the transient
+        // `write_private_file_exclusive` produces, `openSync('wx')` → *(a
+        // zero-length file exists right here)* → `writeFileSync` → `fsync`. A
+        // live peer mid-`acquire_sqlite_shared_reader_gate` therefore had its
+        // token classified malformed and moved, then wrote into the moved file
+        // and returned a gate it believed was live, while a fresh exclusive gate
+        // saw no readers at all — a live reader evicted on content shape alone,
+        // with none of the exact-id attestation this function's own contract
+        // promises. Identity comparison, not liveness guessing: still no PID,
+        // TTL, age, or heartbeat anywhere.
+        const move = (
+            source: ManagedDirectoryIdentity,
+            name: string,
+            stillMalformed: (contents: string) => boolean,
+            expected: MarkerIdentity | undefined,
+        ): void => {
+            assert_managed_directory(source, 'gate-quarantine-move');
+            assert_managed_directory(generationDirectory, 'gate-quarantine-move');
+            const markerPath = path.join(source.physicalPath, name);
+            if (expected === undefined) {
+                // A non-regular file on a marker's name: a directory, a symlink,
+                // a fifo. It has no identity to compare and no contents to
+                // re-classify, but it is not nothing — the enforcers refuse it,
+                // so it must still be clearable or it is a permanent dead-end.
+                //
+                // The become-valid race this function guards against cannot apply
+                // here: nothing this module writes is ever a non-regular file, so
+                // such an entry can never turn into one of our markers, and there
+                // is no live peer whose work could be stolen. It is re-checked as
+                // still-not-a-file immediately before the rename all the same, so
+                // an entry replaced by a genuine marker in the meantime is left
+                // alone. Renamed, not removed: `renameSync` moves a directory or
+                // a symlink itself, so the evidence survives intact.
+                const stillPresent = fs.lstatSync(markerPath, { throwIfNoEntry: false });
+                if (stillPresent === undefined || stillPresent.isFile()) return;
+                fs.renameSync(markerPath, path.join(generationDirectory.physicalPath, name));
+                movedCount += 1;
+                if (source === identities.readers) movedFromReaders = true;
+                else movedFromGate = true;
+                return;
+            }
+            const actual = capture_marker_identity(markerPath);
+            // Vanished, replaced, or grown since classification: whatever is
+            // there now was not what was classified, so it is not ours to move.
+            // Refused rather than re-classified in place, because a marker that
+            // is changing under us is precisely the live peer this must not
+            // touch.
+            if (actual === undefined
+                || actual.device !== expected.device
+                || actual.inode !== expected.inode
+                || actual.size !== expected.size) {
+                return;
+            }
+            let contents: string;
+            try {
+                contents = fs.readFileSync(markerPath, 'utf8');
+            } catch (error) {
+                if (is_node_error(error) && error.code === 'ENOENT') return;
+                throw error;
+            }
+            if (!stillMalformed(contents)) return;
+            fs.renameSync(
+                markerPath,
+                path.join(generationDirectory.physicalPath, name),
+            );
+            movedCount += 1;
+            if (source === identities.readers) movedFromReaders = true;
+            else movedFromGate = true;
+        };
+        for (const candidate of readers.malformedCandidates) {
+            move(
+                identities.readers,
+                candidate.name,
+                // A `<uuid>.reader` is a token only when it holds that same uuid;
+                // a name that never parsed as one can never become valid.
+                (contents) => candidate.tokenId === undefined || contents !== candidate.tokenId,
+                candidate.identity,
+            );
+        }
+        // Gated on `malformed` alone, never on the identity being present: a
+        // *non-file* marker is malformed and has no identity, and skipping it for
+        // want of one is exactly the regression this guards. `move` takes the
+        // undefined-identity branch for those.
+        if (intent.malformed) {
+            move(
+                identities.gate,
+                EXCLUSIVE_INTENT_NAME,
+                (contents) => parse_exclusive_intent(contents) === undefined,
+                intent.identity,
+            );
+        }
+        if (block.malformed) {
+            move(
+                identities.gate,
+                RECOVERY_BLOCK_NAME,
+                (contents) => parse_recovery_block(contents, paths) === undefined,
+                block.identity,
+            );
+        }
+        // Flushed only where something actually moved, since a refused move
+        // leaves the directory entry untouched.
+        assert_managed_directory(generationDirectory, 'gate-quarantine-flush');
+        flush_directory(generationDirectory.physicalPath, options);
+        if (movedFromReaders) {
+            assert_managed_directory(identities.readers, 'gate-quarantine-flush');
+            flush_directory(identities.readers.physicalPath, options);
+        }
+        if (movedFromGate) {
+            assert_managed_directory(identities.gate, 'gate-quarantine-flush');
+            flush_directory(identities.gate.physicalPath, options);
+        }
+        return { movedCount, generation };
+    } catch (error) {
+        throw safe_error('gate-quarantine', error);
+    }
+}
+
+/**
+ * The single definition of "this name is in our candidate namespace".
+ *
+ * Extracted for the same reason as `parse_recovery_block` and
+ * `reader_token_id_of`, and after the same defect: the inventory tested only the
+ * prefix while `expected_member_kind` also required a uuid tail, so a
+ * `<basename>.init-candidate.zzz` was counted as absence evidence that blocked
+ * the open and then refused by name when the user reached for the very recovery
+ * action the refusal pointed them at — `preserve-member-name`, with no in-app
+ * escape. An interrupted install, a sync client, or a restore produces that file
+ * without anyone hand-editing anything.
+ *
+ * **Prefix only, deliberately.** Reconciling the two on the *strict* rule would
+ * have made the inventory ignore such a file, which is worse: it sits in the
+ * namespace this module installs from, so ignoring it means initializing a fresh
+ * database beside an unexplained artifact — precisely the "never initialize when
+ * a candidate remains" rule the plan states. Accepting it as a preservable
+ * member instead means the set-aside moves it with the rest of the set, which is
+ * both honest and clearable.
+ *
+ * The narrower "is this a candidate *we* built" question still exists, but it is
+ * answered by content — `recognize_sqlite_initialization_candidate` opens the
+ * file and validates its schema and identity — not by trusting a filename.
+ */
+function is_candidate_member_name(paths: GatePaths, name: string): boolean {
+    const candidatePrefix = `${paths.basename}${CANDIDATE_MARKER}`;
+    return name.startsWith(candidatePrefix) && name.length > candidatePrefix.length;
+}
+
+/**
+ * Refusing a non-regular file here is enforcement, and deliberately *not* the
+ * classify-then-quarantine treatment the gate markers get.
+ *
+ * The rule "whatever the open path refuses on, the attested recovery path must be
+ * able to clear" is scoped to **module-owned** namespaces. The recovery gate is
+ * ours: we create every marker in it, so anything malformed there is our own
+ * residue and clearing it is our responsibility. The basename set lives in the
+ * user's `state/` directory, and a folder or link occupying one of its names was
+ * put there by someone else — a sync client, a restore, a hand-edit. Moving it
+ * would be Table Viewer silently touching state it did not create.
+ *
+ * So no action is offered rather than an action that fails: `obstructed` is
+ * excluded from `can_preserve` in desktop/main/state-recovery-dialog.ts, and the
+ * prose names the obstruction so the user can resolve it. That is the honest
+ * shape — the dead-end this module eliminates is an *offered* action that fails
+ * identically every time, not the absence of an offer.
+ */
 function member_for(filePath: string, kind: SqliteBasenameMember['kind']): SqliteBasenameMember | undefined {
     try {
         const stat = fs.lstatSync(filePath, { bigint: true });
@@ -743,7 +1352,7 @@ export async function inventory_sqlite_basename(
         assert_managed_directory(identities.gate, 'inventory-gate-directory');
         const names = fs.readdirSync(paths.parentDirectory, { withFileTypes: true });
         const candidates = names
-            .filter((entry) => entry.name.startsWith(`${paths.basename}${CANDIDATE_MARKER}`))
+            .filter((entry) => is_candidate_member_name(paths, entry.name))
             .map((entry) => member_for(path.join(paths.parentDirectory, entry.name), 'candidate'))
             .filter((member): member is SqliteBasenameMember => member !== undefined)
             .sort((left, right) => left.name.localeCompare(right.name));
@@ -1198,8 +1807,13 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         assert_exclusive_gate(paths, options.gate);
         await options.gate.waitForReaders();
         assert_exclusive_gate(paths, options.gate);
+        // Same namespace predicate as the inventory and `expected_member_kind`.
+        // The stronger question — is this a candidate *we* built — is answered
+        // below by `recognize_sqlite_initialization_candidate`, which opens the
+        // file and validates its schema and exact identity rather than trusting
+        // its name.
         if (path.dirname(resolvedCandidate) !== paths.parentDirectory
-            || !path.basename(resolvedCandidate).startsWith(`${paths.basename}${CANDIDATE_MARKER}`)) {
+            || !is_candidate_member_name(paths, path.basename(resolvedCandidate))) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-resume-path' });
         }
         const inventory = await inventory_sqlite_basename(resolved, options);
@@ -1300,10 +1914,7 @@ function expected_member_kind(paths: GatePaths, name: string): SqliteBasenameMem
     if (name === `${paths.basename}-journal`) return 'journal';
     if (name === `${paths.basename}-wal`) return 'wal';
     if (name === `${paths.basename}-shm`) return 'shm';
-    const candidatePrefix = `${paths.basename}${CANDIDATE_MARKER}`;
-    if (name.startsWith(candidatePrefix) && UUID_PATTERN.test(name.slice(candidatePrefix.length))) {
-        return 'candidate';
-    }
+    if (is_candidate_member_name(paths, name)) return 'candidate';
     return undefined;
 }
 
@@ -1441,14 +2052,15 @@ function read_recovery_block(
 ): RecoveryBlock | undefined {
     try {
         assert_managed_directory(gateIdentity, 'recovery-block-read');
-        const value = JSON.parse(fs.readFileSync(paths.recoveryBlockPath, 'utf8')) as Partial<RecoveryBlock>;
-        if (value.format !== 'tableViewer.sqliteRecoveryBlock.v1'
-            || typeof value.generation !== 'string'
-            || !UUID_PATTERN.test(value.generation)
-            || value.recoveryDirectoryName !== `${paths.basename}${RECOVERY_MARKER}${value.generation}`) {
+        // Same acceptance predicate as `classify_recovery_block`, by
+        // construction rather than by agreement — see `parse_recovery_block`.
+        // Only the response differs: this is an enforcement path, so anything
+        // the shared parser rejects is a refusal, never a classification.
+        const value = parse_recovery_block(fs.readFileSync(paths.recoveryBlockPath, 'utf8'), paths);
+        if (value === undefined) {
             throw sqlite_file_state_recovery_error({ operation: 'recovery-block' });
         }
-        return value as RecoveryBlock;
+        return value;
     } catch (error) {
         if (is_node_error(error) && error.code === 'ENOENT') return undefined;
         throw error;
@@ -1489,9 +2101,28 @@ function validate_completed_preservation(
     }
     for (const member of manifest.members) {
         assert_managed_directory(recoveryIdentity, 'preserve-complete-directory');
+        // Completion is proven by the manifest and by the *preserved* bytes:
+        // every member marked installed and source-removed, and every target
+        // still the exact incarnation the manifest recorded.
+        //
+        // Deliberately *not* by the source name still being absent. Absence is
+        // only meaningful while the move is in flight and the gate is still
+        // exclusive, which is where `advance_preservation`'s final loop enforces
+        // it — the sole remaining enforcement point, pinned by "refuses to mark a
+        // move complete while a source name is reoccupied mid-move" in
+        // src/test/sqlite-open-recovery.test.ts. Deleting the clause there while
+        // this one is gone would let a preserve report `complete` over a source
+        // member still sitting on its canonical name, so the two must move
+        // together. Once the move is complete the gate is released and the app
+        // legitimately re-creates `<basename>` — that is the entire point of
+        // "Set Aside and Start Fresh" — so requiring absence here re-classified
+        // every already-completed recovery directory as incomplete from the next
+        // launch onward. `preserve_sqlite_basename_set` then took the orphan
+        // branch, found no resumable manifest, and threw
+        // `orphan-preservation-manifest`: recovery worked exactly once per
+        // directory, and the second one had no in-app escape.
         if (!member.installed || !member.sourceRemoved
-            || !stat_matches(path.join(recoveryDirectory, member.targetName), member)
-            || !path_entry_is_absent(path.join(paths.parentDirectory, member.sourceName))) {
+            || !stat_matches(path.join(recoveryDirectory, member.targetName), member)) {
             throw sqlite_file_state_recovery_error({ operation: 'preserve-complete-validation' });
         }
     }
@@ -1566,6 +2197,15 @@ async function advance_preservation(
             await emit(hooks, 'preserve-after-progress-flush');
         }
     }
+    // The one place source-absence is enforced, and load-bearing precisely
+    // because it is the only one: `validate_completed_preservation` deliberately
+    // does not repeat it, since by the time a manifest says `complete` the gate
+    // has been released and the app re-creates the canonical name on purpose.
+    // Here the gate is still exclusive and the move is still in flight, so
+    // anything back on a source name means the set is not the set the manifest
+    // describes. Removing this clause would turn a loud refusal into a preserve
+    // that reports success over a half-moved set; the test named in
+    // `validate_completed_preservation`'s comment pins exactly that.
     for (const member of manifest.members) {
         assert_managed_directory(recoveryIdentity, 'preserve-final-validation');
         if (!stat_matches(path.join(recoveryDirectory, member.targetName), member)

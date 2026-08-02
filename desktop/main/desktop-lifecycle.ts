@@ -107,6 +107,17 @@ export function create_desktop_lifecycle(): DesktopLifecycle {
             const pending = buffered;
             buffered = [];
             for (const work of pending) {
+                // Rechecked every iteration, not once before the loop. A
+                // buffered request is arbitrary app work — opening a file can
+                // discover the backend is unusable and call `become_failed`, and
+                // a Cmd-Q handled inside one can call `begin_drain` — so the
+                // phase can change *during* the flush. Without this, the
+                // remaining items ran against a backend that was already dead or
+                // draining, which is the exact thing `submit` refuses to admit
+                // one line above. Dropped rather than re-buffered, matching
+                // `discard()`: neither terminal phase has a later flush that
+                // could run them.
+                if (phase !== 'ready') return;
                 try {
                     work();
                 } catch {

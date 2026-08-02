@@ -73,15 +73,102 @@ const electron_mock = vi.hoisted(() => {
             BrowserWindow.instances.push(this);
         }
 
+        /**
+         * Electron's own close-event contract, including `defaultPrevented`.
+         *
+         * The flag is not decoration: `close_fenced_window` uses it to tell a
+         * veto from a close that is merely still in flight, because on macOS
+         * `close()` returns with the window alive and destroys it a tick later.
+         * A fake that only offered `preventDefault` let a synchronous-destruction
+         * double stand in for that, which is exactly how the real hang — every
+         * fenced close reported as a veto, so the app never drained — passed the
+         * unit suite while failing the packaged app.
+         *
+         * `closeAsync` models the platform behaviour directly: the destruction is
+         * deferred to a microtask, so any code that reads `isDestroyed()` right
+         * after `close()` sees what macOS shows it.
+         */
+        closeAsync = false;
+
+        /**
+         * `close()` throws instead of closing.
+         *
+         * A real possibility rather than a contrivance: `close` on a window being
+         * torn down by the OS can raise, and the fence's own `close` listeners run
+         * inside this call, so anything one of them throws surfaces here too.
+         */
+        closeThrows = false;
+
+        /**
+         * The close event dispatches, nobody calls `preventDefault`, and the
+         * window is still never destroyed.
+         *
+         * Chromium's own behaviour when a renderer holds a `beforeunload` handler:
+         * the main-process `close` event has already fired, uncancelled, by the
+         * time Chromium cancels the close itself. It announces that cancellation
+         * on the webContents as `will-prevent-unload`, which is modelled here —
+         * that event is the only in-band signal distinguishing this from a close
+         * that is merely slow, and until the fence observed it there was nothing
+         * left to resolve the promise.
+         */
+        closeStalls = false;
+
+        /**
+         * `close()` destroys the window and *then* throws.
+         *
+         * The order is what makes this its own case rather than a variant of
+         * `closeThrows`: the close genuinely succeeded, so `closed` has already
+         * fired and the fence has already settled, and only afterwards does an
+         * exception surface. Reachable in the real app because the app's own
+         * creation-time `close` listener runs inside `close()` and calls into
+         * `close_entry`/`flush_size`, so anything either throws comes back out of
+         * this call after the window is gone.
+         */
+        closeThrowsAfterDestroy = false;
+
+        /**
+         * `close()` destroys the window without emitting `closed`.
+         *
+         * Electron's `closed` is an event, not a guarantee: a window torn down by
+         * the OS, or destroyed while the emit path is already unwinding, can leave
+         * `isDestroyed()` true with no event ever delivered. It is the one shape in
+         * which the window's own state and its event stream disagree, which makes
+         * it the only way to test that the fence trusts the former.
+         */
+        closeDestroysSilently = false;
+
         close() {
             this.closeCalls += 1;
-            let prevented = false;
-            this.emit('close', { preventDefault: () => { prevented = true; } });
-            if (prevented) return;
-            this.destroyed = true;
-            this.webContents.destroyed = true;
-            this.webContents.emit('destroyed');
-            this.emit('closed');
+            if (this.closeThrows) throw new Error('close failed');
+            if (this.closeDestroysSilently) {
+                this.destroyed = true;
+                this.webContents.destroyed = true;
+                return;
+            }
+            const event = {
+                defaultPrevented: false,
+                preventDefault() { this.defaultPrevented = true; },
+            };
+            this.emit('close', event);
+            if (event.defaultPrevented) return;
+            if (this.closeStalls) {
+                // Chromium cancels on the renderer's behalf and says so. The
+                // window is not destroyed and no `closed` will ever arrive.
+                this.webContents.emit('will-prevent-unload', {
+                    defaultPrevented: false,
+                    preventDefault() { this.defaultPrevented = true; },
+                });
+                return;
+            }
+            const destroy = () => {
+                this.destroyed = true;
+                this.webContents.destroyed = true;
+                this.webContents.emit('destroyed');
+                this.emit('closed');
+            };
+            if (this.closeAsync) queueMicrotask(destroy);
+            else destroy();
+            if (this.closeThrowsAfterDestroy) throw new Error('teardown listener failed');
         }
 
         isDestroyed() { return this.destroyed; }
@@ -131,8 +218,13 @@ vi.mock('../../src/viewer-controller', () => ({
 
 import {
     create_app_quit_coordinator,
+    decide_desktop_editing,
+    desktop_conditional_install_fence_available,
+    desktop_editing_gate_ports,
     ViewerWindowManager,
     type AppQuitShutdownPort,
+    type DesktopEditingDecision,
+    type DesktopEditingGatePorts,
 } from '../main/viewer-windows';
 import {
     create_desktop_lifecycle,
@@ -185,7 +277,10 @@ function controlled_deadlines() {
     };
 }
 
-function manager(deadline_scheduler?: (callback: () => void, delayMs: number) => () => void) {
+function manager(
+    deadline_scheduler?: (callback: () => void, delayMs: number) => () => void,
+    editing_decision?: (file_path: string) => DesktopEditingDecision,
+) {
     const config = {
         settings: () => ({
             theme: 'system',
@@ -198,12 +293,20 @@ function manager(deadline_scheduler?: (callback: () => void, delayMs: number) =>
         config_port: () => ({}),
         update: vi.fn(),
     };
-    return new ViewerWindowManager(
-        {} as any,
-        config as any,
-        '/viewer-preload.js',
-        deadline_scheduler,
-    );
+    return editing_decision
+        ? new ViewerWindowManager(
+            {} as any,
+            config as any,
+            '/viewer-preload.js',
+            deadline_scheduler,
+            editing_decision,
+        )
+        : new ViewerWindowManager(
+            {} as any,
+            config as any,
+            '/viewer-preload.js',
+            deadline_scheduler,
+        );
 }
 
 function latest_window() {
@@ -211,6 +314,30 @@ function latest_window() {
     const window = windows.at(-1);
     if (!window) throw new Error('viewer window was not created');
     return window;
+}
+
+/**
+ * The manager's internal record for one open file.
+ *
+ * Reaches past `private` deliberately and narrowly: `allowClose` is the flag that
+ * decides whether a user-initiated close is fenced or tears the window down
+ * unfenced (losing unacknowledged `pendingEdits`), and it is not observable from
+ * outside — the promise cannot show it, because a second `resolve` on a settled
+ * promise is silently ignored, so a broken settle guard looks identical from
+ * there. Asserting on it is what makes idempotence testable at all.
+ */
+function viewer_entry(
+    viewer_manager: ViewerWindowManager,
+    file_path: string,
+): { allowClose: boolean } {
+    const entries = (viewer_manager as unknown as {
+        windows: Array<{ fileKey: string; allowClose: boolean }>;
+    }).windows;
+    const entry = entries.find((candidate) => candidate.fileKey.includes(
+        file_path.replace(/^.*\//, ''),
+    ));
+    if (!entry) throw new Error(`no viewer entry for ${file_path}`);
+    return entry;
 }
 
 function emit_webview(window: InstanceType<typeof electron_mock.BrowserWindow>, message: WebviewMessage) {
@@ -244,12 +371,145 @@ beforeEach(() => {
     controller_mock.profile_for.mockClear();
 });
 
+/**
+ * Ports with every arm already answering yes, so each test below turns exactly
+ * one of them off and the failing arm is the only thing under test. Nothing here
+ * is a claim about the product: the real
+ * `desktop_conditional_install_fence_available` is asserted separately, and it is
+ * what the shipping build consults.
+ */
+function permissive_gate_ports(
+    overrides: Partial<DesktopEditingGatePorts> = {},
+): DesktopEditingGatePorts {
+    return {
+        activation_marker_armed: () => true,
+        eligibility: () => ({ eligible: true, lockRoot: '/lock-root' }),
+        conditional_install_fence_available: () => true,
+        ...overrides,
+    };
+}
+
+describe('desktop editing gate', () => {
+    // The gate that keeps this release view-only, stated per platform so it
+    // fails the day someone adds a conditional installer for one of them without
+    // extending the gate. Everything else is arranged to say yes, so a pass here
+    // is specifically about the install fence and nothing else — if this starts
+    // returning `editing: true` for a platform, an installer landed without a
+    // decision about whether the whole coordinated-save protocol is proven on it.
+    it.each(['darwin', 'win32', 'linux'] as const)(
+        'ships %s view-only for want of a conditional-install fence',
+        (platform) => {
+            expect(desktop_conditional_install_fence_available(platform)).toBe(false);
+            // Every other arm says yes and the *real* fence probe is wired in, so
+            // the refusal can only be the fence.
+            expect(decide_desktop_editing(
+                '/tmp/gate.csv',
+                permissive_gate_ports({
+                    conditional_install_fence_available: desktop_conditional_install_fence_available,
+                }),
+                platform,
+            )).toEqual({ editing: false, reason: 'conditional-install-unsupported' });
+        },
+    );
+
+    // The production ports, not the permissive stand-ins: the value the window
+    // manager actually reaches for must reach the same answer, so a future
+    // rewiring of `desktop_editing_gate_ports` cannot make the matrix above a
+    // test of a function nothing calls.
+    it.each(['darwin', 'win32', 'linux'] as const)(
+        'answers view-only on %s through the production ports',
+        (platform) => {
+            expect(
+                decide_desktop_editing('/tmp/gate.csv', desktop_editing_gate_ports, platform).editing,
+            ).toBe(false);
+        },
+    );
+
+    it('refuses editing before the physical-edit protocol marker is armed', () => {
+        expect(decide_desktop_editing(
+            '/tmp/unarmed.csv',
+            permissive_gate_ports({ activation_marker_armed: () => false }),
+            'darwin',
+        )).toEqual({ editing: false, reason: 'protocol-unarmed' });
+    });
+
+    // The marker is checked first so an unarmed host says so rather than
+    // reporting whichever later arm also happens to fail — a user who has not
+    // armed the protocol must not be told their disk is unsupported.
+    it('reports the unarmed marker ahead of every later refusal', () => {
+        expect(decide_desktop_editing(
+            '/mnt/share/data.csv',
+            permissive_gate_ports({
+                activation_marker_armed: () => false,
+                eligibility: () => ({ eligible: false, reason: 'shared-mount' }),
+                conditional_install_fence_available: () => false,
+            }),
+            'linux',
+        )).toEqual({ editing: false, reason: 'protocol-unarmed' });
+    });
+
+    it.each([
+        'non-file',
+        'remote-host',
+        'shared-mount',
+        'wsl',
+        'unsupported-platform',
+        'unverifiable-filesystem',
+    ] as const)('carries the %s ineligibility through as the view-only reason', (reason) => {
+        expect(decide_desktop_editing(
+            '/tmp/ineligible.csv',
+            permissive_gate_ports({ eligibility: () => ({ eligible: false, reason }) }),
+            'darwin',
+        )).toEqual({ editing: false, reason });
+    });
+
+    // Eligibility is filesystem I/O (statfs, realpath, lstat), so it can fail for
+    // reasons that have nothing to do with safety. A gate that could not be
+    // evaluated is a closed gate; the one thing it must never do is fall through.
+    it.each([
+        ['the marker check', { activation_marker_armed: () => { throw new Error('marker'); } }],
+        ['the eligibility probe', { eligibility: () => { throw new Error('statfs'); } }],
+        ['the fence probe', {
+            conditional_install_fence_available: () => { throw new Error('fence'); },
+        }],
+    ])('fails closed when %s throws', (_name, override) => {
+        expect(decide_desktop_editing(
+            '/tmp/throws.csv',
+            permissive_gate_ports(override as Partial<DesktopEditingGatePorts>),
+            'darwin',
+        )).toEqual({ editing: false, reason: 'unverifiable-filesystem' });
+    });
+
+    // The one arrangement that returns editing, asserted so the gate is known to
+    // be a decision rather than a function that can only say no. Reaching it in
+    // production requires a real conditional-install fence, which is the thing
+    // that does not exist.
+    it('permits editing only when every arm passes', () => {
+        expect(decide_desktop_editing('/tmp/all-pass.csv', permissive_gate_ports(), 'darwin'))
+            .toEqual({ editing: true });
+    });
+});
+
 describe('viewer window close protocol', () => {
     it('keeps the desktop viewer profile view-only', () => {
         const viewer_manager = manager();
         viewer_manager.open_file('/tmp/view-only.csv');
 
         expect(controller_mock.profile).toMatchObject({ editing: false });
+    });
+
+    // The window manager consults the gate rather than hardcoding the answer:
+    // the decision is per file, and the profile carries whatever it returned.
+    it('takes the viewer profile edit flag from the gate decision', () => {
+        const decided: string[] = [];
+        const viewer_manager = manager(undefined, (file_path) => {
+            decided.push(file_path);
+            return { editing: true };
+        });
+        viewer_manager.open_file('/tmp/gate-consulted.csv');
+
+        expect(decided).toEqual(['/tmp/gate-consulted.csv']);
+        expect(controller_mock.profile).toMatchObject({ editing: true });
     });
 
     it('deduplicates native closes and orders flush, drains, acknowledgement, then close', async () => {
@@ -305,6 +565,577 @@ describe('viewer window close protocol', () => {
         await vi.waitFor(() => expect(window.destroyed).toBe(true));
         expect(window.closeCalls).toBe(3);
         expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    // Where the packaged app hung. On macOS `BrowserWindow.close()` returns with
+    // the window still alive, so the old `close(); return isDestroyed()` probe
+    // read `false` for a close that was proceeding normally, reported it as a
+    // veto, and made `close_all` answer false — the quit barrier abandoned, the
+    // SQLite connection was never released, its reader token was left behind, and
+    // the app could only be force-quit. The synchronous unit-test double hid it
+    // completely; `closeAsync` is that platform behaviour, in a test.
+    it('treats an asynchronously destroyed window as closed, not vetoed', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/async-close.csv');
+        const window = latest_window();
+        window.closeAsync = true;
+        emit_webview(window, { type: 'ready' });
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        // True, and only once the window really is gone: the drain that follows
+        // must not overtake a controller that is still attached.
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+        expect(viewer_manager.has_windows()).toBe(false);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    // The other half: a genuine veto is still a veto when the close is
+    // asynchronous. `defaultPrevented` is what tells the two apart, so this is
+    // the test that stops the fix above from becoming "always report success".
+    it('still reports a veto when an asynchronous close is refused', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/async-close-veto.csv');
+        const window = latest_window();
+        window.closeAsync = true;
+        emit_webview(window, { type: 'ready' });
+        window.on('close', (event: { preventDefault(): void }) => event.preventDefault());
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(false);
+        expect(window.destroyed).toBe(false);
+        // And the unfenced-close guard is back on, so the next user close starts
+        // a fresh fence rather than tearing down without one.
+        window.close();
+        await vi.waitFor(() => expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toHaveLength(2));
+    });
+
+    // The dispatch-order hazard. `close_fenced_window` attaches its own `close`
+    // listener immediately before calling `close()`, and an earlier version read
+    // `defaultPrevented` from inside that listener — i.e. at *its* point in the
+    // dispatch order. A listener sitting after it that vetoes therefore set the
+    // flag too late to be seen: the fence concluded "not vetoed", waited for a
+    // `closed` event that a vetoed window never emits, and the promise never
+    // settled. `close_all` never resolved, the quit barrier never completed, and
+    // the app became unquittable — the exact symptom the async-close fix removed,
+    // reintroduced through a different door.
+    //
+    // No listener registered after the observer exists today (the app's own is
+    // attached at window creation, so it is always earlier, and during a fence it
+    // returns early on `allowClose`). That made the old code correct purely by an
+    // ordering invariant nothing stated or enforced — precisely the kind of
+    // assumption a later menu handler or lazily-attached listener breaks. This
+    // test removes the dependence on it.
+    //
+    // The late listener is installed by intercepting the one `on('close', …)` the
+    // fence itself performs, which is the only moment "after the observer" exists.
+    // Dispatch stays plain registration order; nothing about the event model is
+    // rigged.
+    it('reports a veto from a listener registered after the fence observer', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/late-veto.csv');
+        const window = latest_window();
+        window.closeAsync = true;
+        emit_webview(window, { type: 'ready' });
+
+        const real_on = window.on.bind(window);
+        let intercepted = false;
+        window.on = ((event: string, listener: (...args: any[]) => void) => {
+            const result = real_on(event, listener);
+            if (event === 'close' && !intercepted) {
+                intercepted = true;
+                // Registered last, so it runs after the fence's observer has
+                // already sampled the event.
+                real_on('close', (close_event: { preventDefault(): void }) => {
+                    close_event.preventDefault();
+                });
+            }
+            return result;
+        }) as typeof window.on;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        // Settles at all — the property that was actually broken — and settles
+        // false, because the window is staying open.
+        await expect(closing).resolves.toBe(false);
+        expect(intercepted).toBe(true);
+        expect(window.destroyed).toBe(false);
+        // And the unfenced-close guard is restored, so a later user close still
+        // goes through a fresh fence rather than tearing down unfenced.
+        expect(window.closeCalls).toBeGreaterThan(0);
+    });
+
+    // The worst failure in this function, because it loses work rather than
+    // merely hanging. `allowClose` is set immediately before `close()`, and only
+    // the veto branch put it back — so a `close()` that *threw* left the guard
+    // latched on. The user then sees "could not safely close this window… the
+    // window will remain open so you can retry", retries, and the `close`
+    // listener at window creation sees `allowClose === true` and returns early:
+    // no flush request, no controller drain, no acknowledgement, window gone.
+    // Unacknowledged `pendingEdits` can be the only copy of unsaved CSV work, and
+    // the reassuring dialog is what makes it a trap rather than a visible error.
+    it('re-arms the unfenced-close guard when close() throws', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/close-throws.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        window.closeThrows = true;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        // The fence reports failure and the window stays open, as the dialog says.
+        await expect(closing).resolves.toBe(false);
+        await vi.waitFor(() => expect(electron_mock.dialog.showMessageBox).toHaveBeenCalled());
+        expect(window.destroyed).toBe(false);
+
+        // The retry the dialog invited must go through a *fresh* fence. Before
+        // this was fixed it tore the window down with no flush at all.
+        window.closeThrows = false;
+        window.close();
+        await vi.waitFor(() => expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toHaveLength(2));
+        expect(window.destroyed).toBe(false);
+    });
+
+    // The remaining way the fence could wait forever: the close event dispatches,
+    // nobody vetoes it, and the window is still never destroyed — which is what
+    // Chromium does for a renderer holding a `beforeunload` handler when the main
+    // process registers no `will-prevent-unload` listener. The old code read "not
+    // vetoed" and waited for a `closed` that never comes, so `close_all` never
+    // settled, the quit barrier never finished, admission was never restored, and
+    // the app could neither quit nor open files.
+    it('settles rather than hanging when a close dispatches but never completes', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/close-stalls.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        window.closeStalls = true;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        // Settles at all — the property that was broken — and settles false,
+        // because the window is demonstrably staying open.
+        await expect(closing).resolves.toBe(false);
+        expect(window.destroyed).toBe(false);
+        // And the guard is re-armed, so the user's next close is fenced afresh
+        // rather than tearing the window down unfenced.
+        window.closeStalls = false;
+        window.close();
+        await vi.waitFor(() => expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toHaveLength(2));
+    });
+
+    // The fourth defect, and the one that motivated turning the fence into an
+    // explicit state machine. `close()` destroys the window and *then* throws:
+    // `closed` has already fired, so the fence has already settled `true` and the
+    // close really did succeed — but the `catch` re-raised unconditionally, so
+    // `start_lifecycle` also showed "Table Viewer could not safely close this
+    // window." One invocation, two terminal outcomes that contradict each other,
+    // and a user told a successful close had failed. A retry would then re-fence
+    // an already-destroyed window.
+    //
+    // The exception is not swallowed: a teardown listener that throws is a real
+    // fault worth seeing. It is reported rather than promoted to the close's own
+    // outcome, because the close is not what failed.
+    // Run in both destruction orderings, because they failed differently and only
+    // one is macOS's real behaviour. With a synchronous destroy the promise had
+    // already resolved, so the throw was swallowed by the executor — the outcome
+    // was right but a genuine teardown fault vanished without trace. With an
+    // asynchronous destroy — what macOS actually does — the throw beat the
+    // destruction, the promise *rejected*, the failure dialog appeared, and the
+    // window was destroyed anyway. That is the contradiction.
+    it.each([false, true])(
+        'reports one outcome when close() destroys the window and then throws (async=%s)',
+        async (close_async) => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const viewer_manager = manager();
+            viewer_manager.open_file('/tmp/close-throws-after-destroy.csv');
+            const window = latest_window();
+            emit_webview(window, { type: 'ready' });
+            window.closeAsync = close_async;
+            window.closeThrowsAfterDestroy = true;
+
+            const closing = viewer_manager.close_all();
+            const request = window.webContents.sent.filter(
+                ({ message }) => message.type === 'requestPendingEditsFlush',
+            ).at(-1)?.message;
+            if (request?.type !== 'requestPendingEditsFlush') {
+                throw new Error('missing flush request');
+            }
+            emit_webview(window, {
+                type: 'pendingEditsFlush',
+                requestId: request.requestId,
+                highestProducedSequence: 0,
+            });
+
+            // The window closed, so that is the outcome — the promise says so.
+            await expect(closing).resolves.toBe(true);
+            expect(window.destroyed).toBe(true);
+            // And the user is not told otherwise.
+            expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+            // The throw is surfaced, just not as the close's verdict: a teardown
+            // listener that fails is a real fault, and the synchronous ordering
+            // used to discard it entirely.
+            expect(errors).toHaveBeenCalled();
+        } finally {
+            errors.mockRestore();
+        }
+    });
+
+    // The remaining terminal shapes, as explicit cases rather than as properties
+    // that happen to hold. The fence has exactly three outcomes and five ways to
+    // reach them; four rounds of defects here were each one unreached combination,
+    // so the combinations are enumerated and asserted rather than reasoned about.
+
+    // `will-prevent-unload` arriving a tick after `close()` returns, rather than
+    // synchronously inside it — same cancellation, later delivery.
+    it('settles refused when the unload cancellation arrives asynchronously', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/late-prevent-unload.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        // Neither destroys nor vetoes: the cancellation is delivered afterwards.
+        window.closeStalls = true;
+        window.close = (() => {
+            window.closeCalls += 1;
+            window.emit('close', {
+                defaultPrevented: false,
+                preventDefault(this: { defaultPrevented: boolean }) {
+                    this.defaultPrevented = true;
+                },
+            });
+            queueMicrotask(() => window.webContents.emit('will-prevent-unload', {
+                defaultPrevented: false,
+                preventDefault(this: { defaultPrevented: boolean }) {
+                    this.defaultPrevented = true;
+                },
+            }));
+        }) as typeof window.close;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(false);
+        expect(window.destroyed).toBe(false);
+    });
+
+    // A `closed` event for a window that is not destroyed — a stray signal must
+    // not be able to un-settle a verdict already reached, and must not be taken as
+    // proof of a close that did not happen.
+    it('ignores a spurious closed event after the fence has settled', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/spurious-closed.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        window.closeStalls = true;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(closing).resolves.toBe(false);
+
+        // Arrives after the verdict. The settle guard makes it a no-op, and the
+        // fence has already stopped listening.
+        window.emit('closed');
+        expect(window.destroyed).toBe(false);
+    });
+
+    // The guard the whole state machine rests on: `settle` transitions once, and
+    // every later call is inert. Asserted through `allowClose` rather than through
+    // the promise, because the promise cannot show it — a second `resolve` is
+    // silently ignored by the promise itself, so the resolved value looks
+    // identical whether or not the guard exists. `allowClose` is the side effect
+    // that is *not* idempotent: a second `settle({type:'refused'})` after a
+    // successful close would re-arm the fence guard on a destroyed window, which
+    // is the exact flag the pendingEdits data-loss fix depends on.
+    //
+    // The path is real rather than contrived. `stop_observing` skips removing the
+    // `will-prevent-unload` listener when the webContents is already destroyed —
+    // which is precisely the case after a successful close — so that listener
+    // genuinely outlives the settled fence and a later emit really does re-enter
+    // `settle`.
+    it('ignores a second settle signal after the window has closed', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/settle-once.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        // Captured before the close: a successful `close_all` tears the entry out
+        // of the manager, so looking it up afterwards finds nothing. The object
+        // itself is what the fence mutates, and it outlives that removal.
+        const entry = viewer_entry(viewer_manager, '/tmp/settle-once.csv');
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+        // A close that succeeded leaves the guard disarmed: the window is gone,
+        // and nothing may re-arm it.
+        expect(entry.allowClose).toBe(true);
+
+        // Every signal that could reach a settled fence, fired after the verdict.
+        window.webContents.emit('will-prevent-unload', {
+            defaultPrevented: false,
+            preventDefault(this: { defaultPrevented: boolean }) {
+                this.defaultPrevented = true;
+            },
+        });
+        window.emit('closed');
+
+        // Unchanged. Without the `settled` guard the refused branch would have set
+        // this to false, contradicting a close that really happened.
+        expect(entry.allowClose).toBe(true);
+        await expect(closing).resolves.toBe(true);
+    });
+
+    // The verdict comes from the window's own state, never from the path taken to
+    // reach it. This is the property behind defect 4 — "whether the close
+    // succeeded is decided by the window, not by the presence of an exception" —
+    // and until now nothing enforced it: forcing the post-`close()` check to
+    // ignore `isDestroyed()` left every test green.
+    //
+    // A silent destruction is the only shape that can prove it, because it is the
+    // only one where the window's state and its event stream disagree: the window
+    // is gone, but no `closed` was ever emitted, so a fence that trusted events
+    // alone would call a completed close a refusal — and, worse, re-arm
+    // `allowClose` on a destroyed window.
+    it('reports closed for a window destroyed without emitting closed', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/silent-destroy.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        const entry = viewer_entry(viewer_manager, '/tmp/silent-destroy.csv');
+        window.closeDestroysSilently = true;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+        // Not re-armed: this outcome is `closed`, and only a window that survives
+        // may leave the fence guard armed.
+        expect(entry.allowClose).toBe(true);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    // The same verdict rule on the throwing path, which has its own `isDestroyed`
+    // check and its own mutant. A window destroyed silently *and* a throw on the
+    // way out: the close still succeeded, so the exception is a teardown fault to
+    // report, not a reason to tell the user the window would not close.
+    it('reports closed when a silent destruction is followed by a throw', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const viewer_manager = manager();
+            viewer_manager.open_file('/tmp/silent-destroy-throw.csv');
+            const window = latest_window();
+            emit_webview(window, { type: 'ready' });
+            const entry = viewer_entry(viewer_manager, '/tmp/silent-destroy-throw.csv');
+            window.close = (() => {
+                window.closeCalls += 1;
+                window.destroyed = true;
+                window.webContents.destroyed = true;
+                throw new Error('teardown listener failed');
+            }) as typeof window.close;
+
+            const closing = viewer_manager.close_all();
+            const request = window.webContents.sent.filter(
+                ({ message }) => message.type === 'requestPendingEditsFlush',
+            ).at(-1)?.message;
+            if (request?.type !== 'requestPendingEditsFlush') {
+                throw new Error('missing flush request');
+            }
+            emit_webview(window, {
+                type: 'pendingEditsFlush',
+                requestId: request.requestId,
+                highestProducedSequence: 0,
+            });
+
+            await expect(closing).resolves.toBe(true);
+            expect(entry.allowClose).toBe(true);
+            expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+            expect(errors).toHaveBeenCalled();
+        } finally {
+            errors.mockRestore();
+        }
+    });
+
+    // The companion half for both verdict tests: a window that is genuinely still
+    // alive when `close()` throws must reach `failed`, not `closed`. Without this,
+    // the two tests above would pass against a fence that simply reported `closed`
+    // unconditionally — which is exactly the mutant they exist to kill, inverted.
+    it('reports failure when close() throws and the window survives', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/throw-survives.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        const entry = viewer_entry(viewer_manager, '/tmp/throw-survives.csv');
+        window.closeThrows = true;
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(false);
+        expect(window.destroyed).toBe(false);
+        // Re-armed, because the window is staying: this is the pendingEdits guard.
+        expect(entry.allowClose).toBe(false);
+        // And the user is told, because unlike a post-close teardown fault this
+        // really is a close that did not happen.
+        await vi.waitFor(() => expect(electron_mock.dialog.showMessageBox).toHaveBeenCalled());
+    });
+
+    // The companion half, and the rule this PR keeps relearning: an assertion that
+    // something does *not* happen is worthless without one proving it happens at
+    // all. Here that means the `refused` branch really does re-arm `allowClose` —
+    // so the test above is pinning idempotence rather than a side effect that
+    // never fires in the first place.
+    it('re-arms allowClose when the first settle is a refusal', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/settle-refused.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        window.closeStalls = true;
+        const entry = viewer_entry(viewer_manager, '/tmp/settle-refused.csv');
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+
+        await expect(closing).resolves.toBe(false);
+        // The action fires: a refusal disarms nothing and re-arms the guard.
+        expect(entry.allowClose).toBe(false);
+        expect(window.destroyed).toBe(false);
+    });
+
+    // The quit path over a mixed set: one window vetoes, one is cancelled by
+    // Chromium. `close_all` must settle false without hanging on either.
+    it('settles close_all when one window vetoes and another cancels its unload', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/mixed-veto.csv');
+        const vetoing = latest_window();
+        emit_webview(vetoing, { type: 'ready' });
+        vetoing.on('close', (event: { preventDefault(): void }) => event.preventDefault());
+
+        viewer_manager.open_file('/tmp/mixed-stall.csv');
+        const stalling = latest_window();
+        emit_webview(stalling, { type: 'ready' });
+        stalling.closeStalls = true;
+
+        const closing = viewer_manager.close_all();
+        for (const window of [vetoing, stalling]) {
+            const request = window.webContents.sent.filter(
+                ({ message }) => message.type === 'requestPendingEditsFlush',
+            ).at(-1)?.message;
+            if (request?.type !== 'requestPendingEditsFlush') {
+                throw new Error('missing flush request');
+            }
+            emit_webview(window, {
+                type: 'pendingEditsFlush',
+                requestId: request.requestId,
+                highestProducedSequence: 0,
+            });
+        }
+
+        await expect(closing).resolves.toBe(false);
+        expect(vetoing.destroyed).toBe(false);
+        expect(stalling.destroyed).toBe(false);
     });
 
     it('closes before renderer readiness without sending a flush request', async () => {
@@ -1189,6 +2020,106 @@ describe('application quit coordinator', () => {
 
         await rejections.settle();
         expect(rejections.escaped).toEqual([]);
+    });
+
+    // The whole quit path over a *real* window, so the ordering asserted is the
+    // one the app performs rather than one a stubbed `close_viewers` asserts
+    // about itself: the renderer's flush is answered, its acknowledgement receipt
+    // comes back, the controller drains, and only then is the window destroyed —
+    // and only after that is the connection released. Every step before the drain
+    // is what makes an acknowledged edit durable; a drain that overtook any of
+    // them would close the store out from under the write it was waiting for.
+    it('acknowledges the renderer, closes the window, and only then drains', async () => {
+        const store_events: string[] = [];
+        const store = {
+            close: async (): Promise<void> => { store_events.push('store:close'); },
+        };
+        const wiring = real_shutdown(store);
+        await wiring.publish();
+        wiring.lifecycle.become_ready();
+        wiring.viewer_manager.open_file('/tmp/quit-ack-order.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+        const resume_quit = vi.fn(() => { store_events.push('resume'); });
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        // The barrier is open on the renderer, not on a timer: nothing has closed
+        // and nothing has drained while the flush request is outstanding.
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        expect(window.destroyed).toBe(false);
+        expect(store_events).toEqual([]);
+
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:quit',
+            highestProducedSequence: 7,
+        });
+        // The acknowledgement has to reach the *page*, not merely be sent: the
+        // desktop receipt is what proves delivery, and the close waits for it.
+        await vi.waitFor(() => expect(controller_mock.panel).toBeDefined());
+        controller_mock.panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:quit',
+            sequence: 7,
+        });
+        expect(window.destroyed).toBe(false);
+        expect(store_events).toEqual([]);
+
+        acknowledge_last_delivery(window);
+        await vi.waitFor(() => expect(window.destroyed).toBe(true));
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        // The window was gone before the connection was released, and the quit
+        // resumed only after both.
+        expect(store_events).toEqual(['store:close', 'resume']);
+        expect(wiring.backend.published).toBeUndefined();
+    });
+
+    // The narrower half of the mid-barrier race: not a request arriving while the
+    // close fence runs (covered above), but one arriving after every window has
+    // closed and while the connection is being released. There is no window left
+    // to veto, so nothing would fence it — it would attach a controller to a
+    // store that is mid-close, which is the same defect one tick later.
+    it('refuses a window request arriving between the close fence and the drain', async () => {
+        const draining = deferred();
+        const store = {
+            close: async (): Promise<void> => { await draining.promise; },
+        };
+        const wiring = real_shutdown(store);
+        await wiring.publish();
+        wiring.lifecycle.become_ready();
+        const resume_quit = vi.fn();
+        const before_quit = create_app_quit_coordinator(
+            () => wiring.viewer_manager.close_all(),
+            resume_quit,
+            wiring.shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        // Inside the drain: the close fence is done (no windows to close) and the
+        // store's close has been entered but not settled.
+        await vi.waitFor(() => expect(wiring.backend.draining).toBe(true));
+        expect(resume_quit).not.toHaveBeenCalled();
+
+        expect(wiring.viewer_manager.open_file('/tmp/during-drain.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
+        let submitted = 0;
+        wiring.lifecycle.submit(() => { submitted += 1; });
+        expect(submitted).toBe(0);
+
+        draining.resolve();
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        // Still refused after the drain settles — a completed quit never re-admits.
+        expect(wiring.viewer_manager.open_file('/tmp/after-drain.csv')).toBeUndefined();
+        expect(electron_mock.BrowserWindow.instances).toHaveLength(0);
     });
 
     it('admits no new viewer window once admission has stopped', async () => {

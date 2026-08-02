@@ -42,13 +42,15 @@ Both pass `-c.mac.identity=null`, so they never need a certificate. Gatekeeper w
 npm run desktop:package:win   # setup + portable exe, x64 + arm64
 ```
 
-Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling. The release workflow therefore has a separate `desktop-windows` job on a `windows-latest` runner; it invokes exactly this script.
+Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling.
+
+**This script is developer-only; no release publishes its output.** The desktop's view state lives in SQLite, and this build cannot open that database on Windows (see [State and settings](#state-and-settings) below), so a Windows exe built today would be a viewer whose settings never survive a restart. `release-build.yml`'s `desktop-windows` job therefore packages nothing and fails deliberately, which fails the whole release run and blocks `release-publish.yml`; the publish workflow independently refuses to attach a release with no Windows artifact unless it is dispatched with `allow_missing_windows=true`. The rest of this section documents what the script produces locally and what a future unfenced Windows release would ship.
 
 Four exes land in `dist/desktop-packages/`: `table-viewer-<version>-<arch>-setup.exe` and `table-viewer-<version>-<arch>-portable.exe` for each of `x64` and `arm64`. The per-target `artifactName` overrides in `electron-builder.yml` exist because both targets emit `.exe` and would otherwise collide on the shared name, and `nsis.buildUniversalInstaller: false` is what splits the installer per architecture instead of shipping one that carries both payloads.
 
 File associations on Windows are registered by `desktop/installer.nsh` (wired in via `nsis.include`), not by electron-builder's `fileAssociations`. The generated ones write the *default* value of `HKCU\Software\Classes\.csv` — which is how Windows records the default program — so installing would have taken `.xlsx` from Excel. The hand-written version writes a vendor-prefixed ProgID plus an `OpenWithProgids` entry instead, so the app shows up in "Open with…" and the user's default is untouched. This is also why `fileAssociations` is scoped under `mac:` in the config: electron-builder concatenates the root and per-platform lists, so a top-level entry cannot be kept away from Windows.
 
-Windows builds are always unsigned: there is no Authenticode certificate, so nothing in the config or the workflow attempts signing, and CI pins `CSC_IDENTITY_AUTO_DISCOVERY=false` so a certificate sitting in a runner's store can't quietly change the artifact. SmartScreen shows "Windows protected your PC" on first run; the README tells users to click More info → Run anyway.
+Windows builds are always unsigned: there is no Authenticode certificate, so nothing in the config attempts signing. A local build sets no `CSC_IDENTITY_AUTO_DISCOVERY`, so pin it yourself (`CSC_IDENTITY_AUTO_DISCOVERY=false`) if your machine has a certificate in its store that you don't want silently applied. SmartScreen shows "Windows protected your PC" on first run of an unsigned exe.
 
 The config lives in `desktop/electron-builder.yml`:
 
@@ -71,8 +73,21 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 
 ## State and settings
 
-- Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
+- Per-file view state: `userData/state/file-state.sqlite3`, a SQLite database in
+  rollback-journal mode (`journal_mode=DELETE`, `synchronous=FULL`). Its hot
+  `-journal` sidecar belongs to it and is never separated from it — the two are
+  preserved, moved, and recovered as one set. Coordination markers live beside it
+  in `.file-state.sqlite3.recovery-gate/`, and a set-aside database is moved to a
+  sibling `file-state.sqlite3.recovery.<uuid>/` directory rather than deleted.
+  Physically separate from the VS Code extension's database; no state is shared
+  or synchronized between the two.
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
+
+The desktop app requires a platform on which a directory flush can be proven
+durable. Windows currently has no such primitive available without a native
+addon, so the app declines the platform up front rather than running with view
+state it cannot persist; `desktop/packaged-recovery-gate.mjs` asserts that
+refusal on Windows and the full recovery matrix elsewhere.
 
 The font family and font size preferences style the whole app — viewer windows, the welcome window, the Preferences window itself, and the About window — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 

@@ -10,6 +10,11 @@ on:
         description: 'Tag to release (e.g., v0.1.1)'
         required: true
         type: string
+      allow_missing_windows:
+        description: 'Publish even though the Windows desktop artifact is absent (Windows is fenced off; only set this once Windows has been deliberately withdrawn as a target)'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: release-publish-${{ inputs.tag || github.event.workflow_run.head_branch }}
@@ -79,6 +84,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THE_TAG: ${{ env.RELEASE_TAG }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          # Only ever true when a human dispatched with it explicitly; the
+          # workflow_run trigger has no way to supply it. See the Windows branch.
+          ALLOW_MISSING_WINDOWS: ${{ inputs.allow_missing_windows }}
         run: |
           set -euo pipefail
 
@@ -131,14 +139,50 @@ jobs:
           fi
 
           # Same story for the Windows exes, in their own directory for the same
-          # reason. Nothing downstream depends on them beyond being attached to
-          # the release, so a missing artifact is a warning, not a failure.
+          # reason — but a missing one is NOT merely a warning while the Windows
+          # desktop fence is standing.
+          #
+          # release-build.yml's `desktop-windows` job deliberately fails: this
+          # build cannot open its SQLite state database on Windows, so there is no
+          # correct Windows artifact to publish. That fence relies on a failing
+          # build run blocking the publish — which holds for the `workflow_run`
+          # trigger, because the job's `if` requires `conclusion == 'success'`.
+          #
+          # It does NOT hold for `workflow_dispatch`: that arm of the same `if`
+          # bypasses the conclusion check entirely, so a hand-dispatched publish
+          # against a tag whose Windows job failed would sail past the fence and
+          # attach a release silently missing its Windows downloads. That is
+          # precisely the outcome the fence exists to prevent, and a `::warning::`
+          # in a log nobody reads is not a decision — so this fails closed instead.
+          #
+          # The escape hatch is explicit and auditable rather than accidental:
+          # dispatch with ALLOW_MISSING_WINDOWS=true only once Windows has been
+          # deliberately withdrawn as a target.
           if grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
             gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
             echo "windows=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${ALLOW_MISSING_WINDOWS:-false}" == "true" ]]; then
+            echo "windows=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app because ALLOW_MISSING_WINDOWS was set."
           else
             echo "windows=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app."
+            cat >&2 <<MESSAGE
+          ERROR: no windows-${THE_TAG} artifact, and this publish would ship a release
+          without the Windows downloads.
+
+          The Windows desktop packaging job in release-build.yml is fenced off on
+          purpose: this build cannot open its SQLite state database on Windows, so no
+          Windows artifact is produced and that build run fails. A publish triggered by
+          workflow_run is blocked by that failure; a hand-dispatched publish is not,
+          which is how this run got here.
+
+          Refusing rather than publishing a release whose Windows downloads have
+          silently disappeared. If Windows has been deliberately withdrawn as a target
+          and the release page is meant to omit it, re-dispatch with:
+
+            gh workflow run release-publish.yml -f tag=${THE_TAG} -f allow_missing_windows=true
+          MESSAGE
+            exit 1
           fi
 
       - name: Verify checksums

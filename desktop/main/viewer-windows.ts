@@ -23,6 +23,13 @@ import type { AuthorityFileStateStore } from '../../src/state';
 import type { ViewerHost } from '../../src/host-ports';
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
+import type { PhysicalEditViewOnlyReason } from '../../src/host-ports';
+import {
+    native_physical_edit_eligibility,
+    physical_lock_root,
+    PhysicalResourceLockManager,
+    type PhysicalEditEligibility,
+} from '../../src/physical-resource-lock';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
@@ -87,6 +94,132 @@ const RESIZE_SETTLE_MS = 250;
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
  *  closed window's zoom level is not inherited by the next one. */
 let next_window_id = 1;
+
+/**
+ * Why a viewer window is view-only, or that it may edit.
+ *
+ * A reason rather than a bare boolean because the decision has to be auditable:
+ * "editing is off" is the same observable outcome whether the platform has no
+ * install fence, the protocol was never armed, or the file lives on a share, and
+ * those are three different stories to tell a user and three different things to
+ * fix. `PhysicalEditViewOnlyReason` is the shared vocabulary the host port
+ * already answers in (src/host-ports.ts), so nothing here invents a second one.
+ */
+export type DesktopEditingDecision =
+    | { readonly editing: true }
+    | { readonly editing: false; readonly reason: PhysicalEditViewOnlyReason | 'protocol-unarmed' };
+
+/**
+ * Everything the decision consults, injected so it stays electron-free and
+ * testable on every platform from any platform.
+ *
+ * `conditional_install_fence_available` is a function rather than a constant
+ * because it is the arm that will one day change: the day a platform gains a
+ * real `PlatformConditionalInstaller`, that implementation is what answers here,
+ * and the test below starts failing until this gate is updated with it.
+ */
+export interface DesktopEditingGatePorts {
+    /** Is the durable `physical-edit-protocol.v1` marker installed and valid? */
+    activation_marker_armed(): boolean;
+    /** Native/local/lock-root eligibility for this exact resource. */
+    eligibility(file_path: string): PhysicalEditEligibility;
+    /**
+     * Does this platform have a *platform-enforced* conditional install fence —
+     * an atomic compare/exchange or detach/no-clobber primitive that returns the
+     * exact displaced version?
+     *
+     * There is none. `unsupported_conditional_installer` is the only
+     * `PlatformConditionalInstaller` value in the repository outside test
+     * doubles, and it answers `unsupported` for every acquisition. A pre-check
+     * plus unconditional rename is explicitly forbidden, so no platform may be
+     * excepted here until a real primitive exists.
+     */
+    conditional_install_fence_available(platform: NodeJS.Platform): boolean;
+}
+
+/**
+ * The one production answer for "does this platform have a conditional install
+ * fence?", and it is `false` everywhere.
+ *
+ * Stated as a function of the platform, and consulted per platform, so that the
+ * shape of the eventual per-platform rollout already exists: a platform that
+ * proves the primitive is added here, and only here. Until then this is the arm
+ * that keeps every desktop build view-only, which is exactly what the release
+ * gates require — a platform exposing only unconditional replacement ships
+ * view-only rather than bypassing the gate.
+ */
+export function desktop_conditional_install_fence_available(
+    _platform: NodeJS.Platform,
+): boolean {
+    return false;
+}
+
+function default_activation_marker_armed(): boolean {
+    const root = physical_lock_root();
+    if (!root) return false;
+    try {
+        return new PhysicalResourceLockManager({ lockRoot: root })
+            .inspect_activation_marker().status === 'active';
+    } catch {
+        // An unreadable, replaced, or otherwise unverifiable marker is not an
+        // armed one. Same fail-closed reading as PhysicalEditProtocolMarker.
+        return false;
+    }
+}
+
+export const desktop_editing_gate_ports: DesktopEditingGatePorts = {
+    activation_marker_armed: default_activation_marker_armed,
+    eligibility: (file_path) => native_physical_edit_eligibility({
+        scheme: 'file',
+        filePath: file_path,
+    }),
+    conditional_install_fence_available: desktop_conditional_install_fence_available,
+};
+
+/**
+ * Decide whether one desktop viewer window may edit its file.
+ *
+ * Replaces what used to be `profile.editing = false` with a comment. The
+ * constant was honest about the outcome but said nothing about *why*, so it was
+ * indistinguishable from an oversight and would have been deleted by the first
+ * person who added an installer. This is the same outcome, arrived at by asking
+ * the three questions the plan requires, in the order that makes the failing one
+ * nameable:
+ *
+ * 1. the `physical-edit-protocol.v1` activation marker is armed (PR 3's cold
+ *    attestation actually happened on this host);
+ * 2. this exact resource is natively eligible — a local `file:` object on a
+ *    proven-local filesystem with a proven-local host-wide lock root, not a
+ *    share, a WSL `/mnt` path, or a remote host; and
+ * 3. the platform has a real conditional-install fence.
+ *
+ * Every arm fails closed, including the ones that throw: an eligibility probe is
+ * filesystem I/O and may fail for reasons that have nothing to do with safety,
+ * and "we could not tell" is never "yes". Editing is returned from exactly one
+ * place, reached only when all three questions answered yes.
+ */
+export function decide_desktop_editing(
+    file_path: string,
+    ports: DesktopEditingGatePorts = desktop_editing_gate_ports,
+    platform: NodeJS.Platform = process.platform,
+): DesktopEditingDecision {
+    try {
+        if (!ports.activation_marker_armed()) {
+            return { editing: false, reason: 'protocol-unarmed' };
+        }
+        const eligibility = ports.eligibility(file_path);
+        if (!eligibility.eligible) return { editing: false, reason: eligibility.reason };
+        if (!ports.conditional_install_fence_available(platform)) {
+            return { editing: false, reason: 'conditional-install-unsupported' };
+        }
+        return { editing: true };
+    } catch {
+        // A gate that could not be evaluated is a closed gate. Reported as the
+        // filesystem answer it is rather than as a fourth pseudo-reason, so the
+        // user-facing vocabulary stays the shared one.
+        return { editing: false, reason: 'unverifiable-filesystem' };
+    }
+}
 
 /**
  * The state backend as the quit barrier sees it: admission it can close and
@@ -255,6 +388,11 @@ export class ViewerWindowManager {
         private readonly config_store: DesktopConfigStore,
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
+        /** Injectable only so the gate can be exercised per platform from a
+         *  unit test; production always uses the real ports. */
+        private readonly editing_decision: (
+            file_path: string,
+        ) => DesktopEditingDecision = (file_path) => decide_desktop_editing(file_path),
     ) {}
 
     /**
@@ -445,20 +583,18 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
-        // Unconditionally view-only, and deliberately not conditioned on
-        // anything. This is the single source of truth for desktop editing in
-        // this PR: the SQLite authority cutover lands here, but the desktop's
-        // physical write path does not, because it still needs a proven
-        // conditional-install primitive. Nothing is consulted — no activation
-        // marker, no setting, no environment — precisely so there is no
-        // arrangement of state on a user's machine that turns writes on.
+        // The single source of truth for desktop editing, and now a decision
+        // rather than a constant: `decide_desktop_editing` asks for the armed
+        // activation marker, this resource's native eligibility, and a
+        // platform-enforced conditional-install fence, and fails closed on each.
         //
-        // The PR 3 activation-marker gate is a *PR 5* concern: it arrives with
-        // the desktop release gates, and only then does this line become a
-        // decision rather than a constant. A read of that marker here would look
-        // like the gate while changing nothing, which is worse than its absence.
+        // In this release the answer is view-only on every platform, because no
+        // platform has that fence — but it is view-only *for a stated reason*,
+        // which is what makes it a gate. Adding an installer without extending
+        // `desktop_conditional_install_fence_available` changes nothing here and
+        // fails the platform matrix test in desktop/test/viewer-windows.test.ts.
         const profile = profile_for(file_path, this.config_store.config_port());
-        profile.editing = false;
+        profile.editing = this.editing_decision(file_path).editing;
         const controller = attach_viewer(
             panel,
             file_path,
@@ -681,6 +817,164 @@ export class ViewerWindowManager {
         await entry.controller.drain();
     }
 
+    /**
+     * Close a window whose renderer/backend fence has already completed, and
+     * report whether it really closed.
+     *
+     * A small state machine rather than a chain of conditionals, because this is
+     * the fifth revision of it and each of the previous four fixed one ordering
+     * while leaving another broken. The shape is what keeps it correct:
+     *
+     * - exactly three terminal outcomes — `closed`, `refused`, `failed`;
+     * - one guarded transition (`settle`) that ignores every call after the
+     *   first, so no ordering can produce two verdicts or two settlements;
+     * - every branch ends by naming its outcome, so "what happens if…" is
+     *   answered by reading the enum rather than by simulating the control flow.
+     *
+     * Three properties must survive any future edit:
+     *
+     * 1. **It always settles.** No branch may wait for an event that might not
+     *    come. There is deliberately no deadline: a slow-but-successful close has
+     *    to resolve `true`, so every terminal is driven by an observed event.
+     * 2. **It never reports `closed` for a window that is staying open**, and
+     *    never reports otherwise for one that is gone. The verdict follows
+     *    observed reality — `isDestroyed()` — not the path taken to reach it.
+     * 3. **`allowClose` is re-armed on every outcome except `closed`.** That flag
+     *    disarms the creation-time guard that fences user-initiated closes; left
+     *    latched, the next close tears the window down with no renderer flush and
+     *    no acknowledgement, discarding `pendingEdits` that may be the only copy
+     *    of unsaved CSV work.
+     *
+     * One residual is accepted deliberately. A close that dispatches its event,
+     * is vetoed by nobody, produces no `will-prevent-unload`, and then never
+     * destroys the window would not settle. That state is *indistinguishable
+     * from a slow-but-successful close* — both look like "dispatched, nobody
+     * objected, waiting" — so no observation can separate them, and the only
+     * mechanism that could is a deadline. A deadline would resolve the slow case
+     * wrongly, which is the worse trade: reporting a veto for a window that is
+     * closing normally is how the packaged app became unquittable in the first
+     * place. Every terminal state Electron actually reaches emits one of the
+     * three signals below, so this path is not known to occur; it is recorded
+     * because it is the one hole the enumeration cannot close by construction.
+     *
+     * The three signals it reads, and why each is needed:
+     *
+     * - **`closed`** — the only proof a close finished. On macOS `close()` returns
+     *   with the window still alive and destroys it a tick later, so a synchronous
+     *   `isDestroyed()` probe reports every successful close as a veto.
+     * - **the `close` event object, inspected after dispatch** — Electron passes
+     *   one object to every listener in registration order, so a veto is only
+     *   fully known once they have all run. Reading it from inside a listener sees
+     *   only the vetoes that preceded that listener.
+     * - **`will-prevent-unload`** — Chromium cancelling on the renderer's behalf
+     *   (a `beforeunload` handler) produces a `close` event nobody vetoed followed
+     *   by a window that is never destroyed. This is the only in-band signal for
+     *   it, and without it that case waits forever.
+     */
+    private close_fenced_window(entry: ViewerWindow): Promise<boolean> {
+        if (entry.window.isDestroyed()) return Promise.resolve(true);
+        return new Promise<boolean>((resolve, reject) => {
+            type Outcome =
+                /** The window is gone. The only outcome that leaves `allowClose` set. */
+                | { readonly type: 'closed' }
+                /** The window is staying open, and this is not an error: a veto, or
+                 *  Chromium cancelling the unload. Retryable by the user. */
+                | { readonly type: 'refused' }
+                /** `close()` itself raised before anything closed. */
+                | { readonly type: 'failed'; readonly error: unknown };
+
+            let settled = false;
+            /** The event Electron dispatched, read after `close()` returns so that
+             *  every listener — including any registered after this one — has had
+             *  its chance to veto. */
+            let dispatched: Electron.Event | undefined;
+
+            const web_contents = entry.window.webContents;
+            const capture_event = (event: Electron.Event) => { dispatched = event; };
+            const on_closed = () => settle({ type: 'closed' });
+            /** Deliberately not overridden with `preventDefault()`: forcing a close
+             *  past a `beforeunload` is the renderer barrier's decision, not a
+             *  shutdown fence's to make silently. */
+            const on_prevent_unload = () => settle({ type: 'refused' });
+
+            const stop_observing = () => {
+                entry.window.removeListener('close', capture_event);
+                entry.window.removeListener('closed', on_closed);
+                if (!web_contents.isDestroyed()) {
+                    web_contents.removeListener('will-prevent-unload', on_prevent_unload);
+                }
+            };
+
+            /** The single transition out of "in progress". Every later call is a
+             *  no-op, which is what makes a second signal — a late `closed`, a
+             *  throw after destruction — unable to contradict the first. */
+            function settle(outcome: Outcome): void {
+                if (settled) return;
+                settled = true;
+                stop_observing();
+                // Re-armed for every outcome but `closed`, so a window that is
+                // still on screen is only ever torn down through a fresh fence.
+                if (outcome.type !== 'closed') entry.allowClose = false;
+                if (outcome.type === 'failed') reject(outcome.error);
+                else resolve(outcome.type === 'closed');
+            }
+
+            // Registered before `close()`, because a synchronous destruction fires
+            // `closed` from inside it.
+            entry.window.on('close', capture_event);
+            entry.window.once('closed', on_closed);
+            if (!web_contents.isDestroyed()) {
+                web_contents.on('will-prevent-unload', on_prevent_unload);
+            }
+
+            entry.allowClose = true;
+            try {
+                entry.window.close();
+            } catch (error) {
+                // Ordering matters here, and getting it wrong was the fourth
+                // defect: the app's own `close` listener runs inside `close()`, so
+                // a throw can surface either side of the destruction. Whether the
+                // close succeeded is decided by the window, never by the presence
+                // of an exception — a teardown fault is reported, not promoted
+                // into a false "could not close this window".
+                //
+                // The verdict is taken one microtask later rather than
+                // immediately, because at this instant an asynchronous destruction
+                // may be queued but not yet run, and "still alive right now" would
+                // read that as a failure. This is not a deadline: a microtask
+                // always runs, `settle` is idempotent so a `closed` arriving first
+                // simply wins, and nothing here waits on an event that may never
+                // come.
+                queueMicrotask(() => {
+                    if (settled) {
+                        console.error('Viewer window teardown failed after it closed', error);
+                        return;
+                    }
+                    if (entry.window.isDestroyed()) {
+                        console.error('Viewer window teardown failed after it closed', error);
+                        settle({ type: 'closed' });
+                        return;
+                    }
+                    settle({ type: 'failed', error });
+                });
+                return;
+            }
+            // Settled already by a synchronous `closed` or cancellation.
+            if (settled) return;
+            if (entry.window.isDestroyed()) {
+                settle({ type: 'closed' });
+                return;
+            }
+            // Dispatch is complete, so the event now carries every listener's
+            // verdict. No event at all means `close` never dispatched, which is not
+            // a window on its way out — refused, rather than waited on forever.
+            if (dispatched !== undefined && !dispatched.defaultPrevented) {
+                return; // Closing asynchronously; `on_closed` settles it.
+            }
+            settle({ type: 'refused' });
+        });
+    }
+
     private start_lifecycle(
         entry: ViewerWindow,
         intent: 'reload' | 'close',
@@ -695,13 +989,7 @@ export class ViewerWindowManager {
         lifecycle.promise = this.fence_renderer(entry)
             .then(() => {
                 if (entry.window.isDestroyed()) return true;
-                if (lifecycle.intent === 'close') {
-                    entry.allowClose = true;
-                    entry.window.close();
-                    const closed = entry.window.isDestroyed();
-                    if (!closed) entry.allowClose = false;
-                    return closed;
-                }
+                if (lifecycle.intent === 'close') return this.close_fenced_window(entry);
                 if (lifecycle.ignoreCache) entry.window.webContents.reloadIgnoringCache();
                 else entry.window.webContents.reload();
                 return true;

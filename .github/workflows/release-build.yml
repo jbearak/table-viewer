@@ -230,106 +230,74 @@ jobs:
             dist/desktop-packages/table-viewer-*.zip
             dist/desktop-packages/*.sha256
 
-  # The standalone Windows app: an NSIS installer and a portable single-file
-  # exe, each for x64 and arm64. Its own job because electron-builder's Windows
-  # targets must be built on Windows, and so that a Windows packaging failure
-  # is immediately attributable rather than hidden inside the macOS job.
+  # The Windows desktop release fence.
   #
-  # It is NOT isolated in the blast-radius sense, and that is deliberate: this
-  # job failing fails the whole Release Build run, and release-publish.yml only
-  # triggers on `workflow_run.conclusion == 'success'`, so nothing publishes
-  # until the Windows build is fixed and the run re-run. The alternative
-  # (continue-on-error) would quietly ship a release missing its Windows
-  # downloads. The missing-artifact tolerance on the publish side is for a
-  # different case: old tags built before this job existed, and runs whose
-  # artifacts have aged out.
+  # This job used to package an NSIS installer and a portable exe for x64 and
+  # arm64. It now packages nothing, on purpose: the desktop's state authority is
+  # SQLite, and this build cannot open a SQLite state database on Windows at all.
+  # Every durable step of the storage protocol — candidate install, marker
+  # creation, member move — is made durable by flushing the containing directory,
+  # Node exposes no proven win32 primitive for that (`fs.openSync` on a directory
+  # fails, and `FlushFileBuffers` on a file handle says nothing about rename and
+  # unlink ordering), and a real primitive would need a native addon that the
+  # packaging contract forbids (desktop/check-sqlite-bundle-externals.mjs,
+  # desktop/after-pack.mjs, desktop/README.md). So `desktop_state_platform_support`
+  # declines the platform up front and the app reports one honest, non-looping
+  # refusal. The failure policy forbids the alternative outright: no empty and no
+  # read-only authority.
   #
-  # Deliberately no `environment: release` here: unlike the macOS job there are
-  # no secrets to read. Windows builds ship unsigned — an Authenticode
-  # certificate is a paid annual subscription we have chosen not to buy, so
-  # SmartScreen shows its "Windows protected your PC" prompt on first run and
-  # the user clicks More info -> Run anyway. That is documented in the README.
+  # Shipping a Windows exe in that state would ship a viewer whose settings
+  # silently never persist. There is no correct artifact to publish, so this job
+  # publishes none — and fails, loudly, rather than being deleted.
+  #
+  # Failing rather than removing is the whole point, and it follows from the
+  # mechanics the previous comment here documented: this job failing fails the
+  # entire Release Build run, and release-publish.yml only triggers on
+  # `workflow_run.conclusion == 'success'`. So while this fence stands, *nothing*
+  # publishes — not a broken Windows build, and not a macOS build that quietly
+  # dropped its Windows downloads from the release page. Deleting the job would
+  # instead let the run go green and publish a release whose Windows assets had
+  # simply vanished, with no record of why: a silent change to what ships, which
+  # is exactly the outcome this fence exists to prevent. A failing job with this
+  # message cannot be reached by accident and cannot be satisfied by waiting.
+  #
+  # Removing the fence is therefore a deliberate act with a stated precondition,
+  # not a cleanup: either a proven win32 directory-durability primitive exists
+  # within the no-native-addon packaging contract, or the product decides Windows
+  # desktop is not a supported target and its downloads are withdrawn on purpose.
+  # Until one of those happens, `npm run desktop:package:win` remains available
+  # for developers — it is a local build, not a published artifact.
   desktop-windows:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout tag
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
-          # The job never runs an authenticated git or gh command — only a local
-          # `git rev-parse` against the fetched tag — so there is no reason to
-          # leave the job token in .git/config where a package script could
-          # reach it.
-          persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
-        with:
-          node-version: '26.5.1'
-          cache: npm
-
-      - name: Validate tag + version
+      # No checkout, no toolchain, no dependencies. Nothing this job could
+      # install would change the answer, and a job that built anything at all
+      # would leave something for a future step to pick up and upload.
+      - name: Refuse to package an unsupported Windows desktop artifact
         shell: bash
-        env:
-          THE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          cat >&2 <<'MESSAGE'
+          ERROR: Windows desktop packaging is fenced off and this release cannot publish.
 
-          if [[ ! "$THE_TAG" =~ ^v[0-9] ]]; then
-            echo "ERROR: tag must start with 'v' and a digit (e.g., v0.1.1). Got: $THE_TAG" >&2
-            exit 1
-          fi
+          The desktop app stores its view settings in SQLite, and this build cannot
+          open that database on Windows: the storage protocol requires a durable
+          directory flush, Node exposes no proven Windows primitive for one, and a
+          native addon is forbidden by the packaging contract. The app declines the
+          platform up front rather than running with an authority it cannot persist.
 
-          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
-            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
-            exit 1
-          fi
+          A Windows exe built today would be a viewer whose settings never survive a
+          restart, so no Windows artifact is produced and the whole release run fails
+          rather than publishing without one.
 
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [[ "$THE_TAG" != "v${PKG_VERSION}" ]]; then
-            echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION" >&2
-            exit 1
-          fi
+          To lift this fence, one of the following must be true and this job replaced
+          deliberately:
+            * a proven Windows directory-durability primitive is available without a
+              native addon, and the packaged recovery gate passes on windows-latest; or
+            * Windows desktop is formally withdrawn as a target and its downloads are
+              removed from the release page on purpose.
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Package desktop app (unsigned)
-        run: npm run desktop:package:win
-        env:
-          # No Authenticode certificate is configured, and a runner picking one
-          # up from its certificate store would make the artifact
-          # non-reproducible. Be explicit rather than relying on there being
-          # none to find.
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-
-      # Four exes are expected: {x64,arm64} x {setup,portable}. Assert the count
-      # rather than trusting the glob, so a silently dropped target shows up
-      # here and not as a missing download on the release page.
-      - name: Calculate checksums
-        shell: bash
-        working-directory: dist/desktop-packages
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          exes=(table-viewer-*.exe)
-          if [[ "${#exes[@]}" -ne 4 ]]; then
-            echo "ERROR: expected 4 .exe files (x64/arm64 x setup/portable), found ${#exes[@]}." >&2
-            ls -la >&2
-            exit 1
-          fi
-          for exe in "${exes[@]}"; do
-            sha256sum "$exe" | tee "$exe.sha256"
-          done
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: windows-${{ inputs.tag || github.ref_name }}
-          if-no-files-found: error
-          retention-days: 30
-          path: |
-            dist/desktop-packages/table-viewer-*.exe
-            dist/desktop-packages/table-viewer-*.exe.sha256
+          Developers can still build locally with: npm run desktop:package:win
+          MESSAGE
+          exit 1

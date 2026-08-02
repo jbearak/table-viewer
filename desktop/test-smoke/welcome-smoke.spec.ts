@@ -2,11 +2,17 @@
 // window, and File → New Window opens another one. Launched separately from
 // desktop-smoke.spec.ts because the file arguments are what differ.
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { test, expect, _electron as electron } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import type { ElectronApplication } from '@playwright/test';
-import { click_menu_item, close_preferences, main_js, repo_dir } from './smoke-helpers';
+import {
+    click_menu_item,
+    close_preferences,
+    isolated_user_data,
+    launch_app,
+    reader_tokens,
+    state_database_path,
+} from './smoke-helpers';
 
 let app: ElectronApplication;
 let user_data_dir: string;
@@ -16,13 +22,8 @@ function welcome_pages() {
 }
 
 test.beforeAll(async () => {
-    expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
-    user_data_dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-welcome-smoke-')));
-    app = await electron.launch({
-        args: [main_js],
-        cwd: repo_dir,
-        env: { ...process.env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
-    });
+    user_data_dir = isolated_user_data('tv-welcome-smoke-');
+    app = await launch_app(user_data_dir);
     await expect.poll(() => welcome_pages().length, { timeout: 30_000 }).toBe(1);
 });
 
@@ -138,23 +139,10 @@ test('File → New Window opens another launcher', async () => {
 // this test has to quit the app it is asserting about, and `afterAll` runs after
 // every test in the file.
 test('quitting drains and releases the state database reader token', async () => {
-    const own_user_data = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-quit-smoke-')));
-    const own_app = await electron.launch({
-        args: [main_js],
-        cwd: repo_dir,
-        env: { ...process.env, TABLE_VIEWER_USER_DATA_DIR: own_user_data },
-    });
+    const own_user_data = isolated_user_data('tv-quit-smoke-');
+    const own_app = await launch_app(own_user_data);
     try {
-        const database = path.join(own_user_data, 'state', 'file-state.sqlite3');
-        const readers = path.join(
-            path.dirname(database),
-            `.${path.basename(database)}.recovery-gate`,
-            'readers',
-        );
-        /** Reader tokens currently held against this database. */
-        const reader_tokens = () => (fs.existsSync(readers)
-            ? fs.readdirSync(readers).filter((name) => name.endsWith('.reader'))
-            : []);
+        const database = state_database_path(own_user_data);
         // The launcher is up and the database is open with its token held, so the
         // release asserted below is about a clean shutdown rather than about
         // nothing having run.
@@ -168,7 +156,7 @@ test('quitting drains and releases the state database reader token', async () =>
             .poll(() => fs.existsSync(database), { timeout: 30_000 })
             .toBe(true);
         await expect
-            .poll(() => reader_tokens().length, { timeout: 30_000 })
+            .poll(() => reader_tokens(own_user_data).length, { timeout: 30_000 })
             .toBe(1);
 
         // The real quit path (before-quit → close fence → drain), not a window
@@ -178,7 +166,7 @@ test('quitting drains and releases the state database reader token', async () =>
             // resolves; the token assertion below is the real signal.
         });
         await expect
-            .poll(() => reader_tokens(), { timeout: 30_000 })
+            .poll(() => reader_tokens(own_user_data), { timeout: 30_000 })
             .toEqual([]);
         // And the database itself is still there — a drain, never a delete.
         expect(fs.existsSync(database)).toBe(true);
