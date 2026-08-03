@@ -7,6 +7,10 @@ import {
     run_physical_edit_protocol_setup,
     type PhysicalEditActivationBoundary,
 } from './physical-edit-activation';
+import {
+    evaluate_sqlite_migration_cold_start,
+    prepare_sqlite_migration_arming,
+} from './sqlite-migration-arming';
 
 let active_boundary: PhysicalEditActivationBoundary | undefined;
 let active_disposables: vscode.Disposable[] = [];
@@ -18,8 +22,10 @@ function active_custom_tab_uri(): vscode.Uri | undefined {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    const coldArming = await evaluate_sqlite_migration_cold_start(context);
     const marker = new PhysicalEditProtocolMarker();
     const boundary = await create_physical_edit_activation_boundary(context, marker);
+    if (coldArming.blocksStateWriters) await boundary.enter_view_only();
     active_boundary = boundary;
 
     const viewer_registration = register_table_viewer(
@@ -50,6 +56,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         viewer_registration,
         vscode.commands.registerCommand('tableViewer.setupPhysicalEditProtocol', async () => {
             await run_physical_edit_protocol_setup(marker, boundary, stop_viewers);
+        }),
+        vscode.commands.registerCommand('tableViewer.armSqliteMigration', async () => {
+            await prepare_sqlite_migration_arming(context, boundary, stop_viewers);
+        }),
+        vscode.commands.registerCommand('tableViewer.upgradeToSqlitePersistence', async () => {
+            // Direct upgraders use the identical seed/snapshot/restart sequence; no
+            // shortcut may create a canonical database or skip the cold boundary.
+            await prepare_sqlite_migration_arming(context, boundary, stop_viewers);
         }),
         vscode.commands.registerCommand('tableViewer.showCsvPreviewToSide', (uri?: vscode.Uri) => {
             const target = uri ?? vscode.window.activeTextEditor?.document.uri;

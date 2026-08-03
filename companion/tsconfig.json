@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "dist-types",
+    "rootDir": "..",
+    "types": ["vscode", "node"]
+  },
+  "include": ["src/**/*", "../src/sqlite-open-recovery.ts", "../src/sqlite-file-state-errors.ts", "../src/sqlite-file-state-schema.ts", "../src/sqlite-file-state-validation.ts", "../src/types.ts", "../src/immutable.ts"]
+}

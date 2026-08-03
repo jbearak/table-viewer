@@ -5,10 +5,14 @@ import { fileURLToPath } from 'node:url';
 
 const repo_dir = fileURLToPath(new URL('..', import.meta.url));
 const package_json = JSON.parse(await readFile(join(repo_dir, 'package.json'), 'utf8'));
-const extension_bundle = package_json.scripts?.bundle;
-if (typeof extension_bundle !== 'string'
-    || !extension_bundle.includes('--external:node:sqlite')) {
-    throw new Error('extension server bundle does not explicitly externalize node:sqlite');
+for (const [label, script_name] of [
+    ['extension server bundle', 'bundle'],
+    ['companion extension bundle', 'bundle:companion'],
+]) {
+    const command = package_json.scripts?.[script_name];
+    if (typeof command !== 'string' || !command.includes('--external:node:sqlite')) {
+        throw new Error(`${label} does not explicitly externalize node:sqlite`);
+    }
 }
 
 /**
@@ -28,6 +32,10 @@ async function assert_externalized_sqlite(label, ...segments) {
     }
 }
 
+await assert_externalized_sqlite(
+    'companion extension bundle',
+    'companion', 'dist', 'extension.js',
+);
 await assert_externalized_sqlite(
     'desktop runtime probe bundle',
     'dist', 'runtime-probes', 'electron-sqlite-runtime-probe.js',
@@ -70,7 +78,7 @@ for (const name of [
 }
 
 process.stdout.write(
-    'extension bundle script, desktop main bundle, desktop runtime probe bundle,'
-    + ' packaged recovery gate bundle, and windows durability probe bundle externalize'
+    'extension and companion bundle scripts, companion bundle, desktop main bundle,'
+    + ' desktop runtime probe bundle, packaged recovery gate bundle, and windows durability probe bundle externalize'
     + ' node:sqlite; runtime-only bundles are outside the packaged desktop directory\n',
 );

@@ -284,6 +284,19 @@ export interface SqliteInitializeOptions extends SqliteOpenRecoveryHooks {
     readonly gate?: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate;
 }
 
+/** Schema adapter for another Table Viewer SQLite basename that uses the same
+ * no-clobber, recovery-gate, sidecar, permission, and durability protocol. */
+export interface SqliteCustomDatabaseSpec {
+    readonly applicationId: number;
+    initialize(database: DatabaseSync): void;
+    validate(database: DatabaseSync): void;
+}
+
+export interface SqliteCustomInitializeOptions extends SqliteOpenRecoveryHooks {
+    readonly timeoutMs?: number;
+    readonly gate?: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate;
+}
+
 export interface SqlitePreserveOptions extends SqliteOpenRecoveryHooks {
     readonly gate: SqliteExclusiveRecoveryGate;
 }
@@ -1891,6 +1904,141 @@ function remove_exact_candidate(
     }
     fs.unlinkSync(candidatePath);
     flush_directory(path.dirname(candidatePath), hooks);
+}
+
+function recognize_custom_initialization_candidate(
+    candidatePath: string,
+    spec: SqliteCustomDatabaseSpec,
+): boolean {
+    let database: DatabaseSync | undefined;
+    try {
+        read_sqlite_raw_header(candidatePath, spec.applicationId);
+        database = new DatabaseSync(path.resolve(candidatePath), {
+            readOnly: true,
+            enableDoubleQuotedStringLiterals: false,
+        });
+        spec.validate(database);
+        return true;
+    } catch {
+        return false;
+    } finally {
+        database?.close();
+    }
+}
+
+async function build_custom_candidate(
+    paths: GatePaths,
+    spec: SqliteCustomDatabaseSpec,
+    hooks: SqliteOpenRecoveryHooks,
+): Promise<string> {
+    const candidatePath = path.join(paths.parentDirectory, `${paths.basename}${CANDIDATE_MARKER}${randomUUID()}`);
+    let database: DatabaseSync | undefined;
+    try {
+        database = new DatabaseSync(candidatePath, {
+            enableDoubleQuotedStringLiterals: false,
+        });
+        spec.initialize(database);
+        await emit(hooks, 'candidate-after-schema');
+        database.close();
+        database = undefined;
+        await emit(hooks, 'candidate-after-close');
+        for (const suffix of ['-journal', '-wal', '-shm']) {
+            if (fs.existsSync(`${candidatePath}${suffix}`)) {
+                throw sqlite_file_state_recovery_error({ operation: 'candidate-sidecar' });
+            }
+        }
+        fs.chmodSync(candidatePath, PRIVATE_FILE_MODE);
+        flush_file(candidatePath);
+        await emit(hooks, 'candidate-after-file-flush');
+        flush_directory(paths.parentDirectory, hooks);
+        await emit(hooks, 'candidate-after-directory-flush');
+        if (!recognize_custom_initialization_candidate(candidatePath, spec)) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-validation' });
+        }
+        return candidatePath;
+    } catch (error) {
+        try {
+            database?.close();
+        } catch {
+            // Preserve the first failure.
+        }
+        throw safe_error('candidate-build', error);
+    }
+}
+
+/** Initialize another Table Viewer-owned SQLite basename with the same durable
+ * candidate/no-clobber protocol as canonical file state. */
+export async function initialize_custom_sqlite_database_no_clobber(
+    canonicalPath: string,
+    spec: SqliteCustomDatabaseSpec,
+    options: SqliteCustomInitializeOptions = {},
+): Promise<SqliteInitializationResult> {
+    const resolved = resolve_sqlite_canonical_path(canonicalPath);
+    const paths = gate_paths(resolved);
+    const suppliedGate = options.gate;
+    const gate = suppliedGate ?? await acquire_sqlite_shared_reader_gate(resolved, options);
+    let candidatePath: string | undefined;
+    let openedDatabase: SqliteOpenedDatabase | undefined;
+    try {
+        if (gate.canonicalPath !== resolved) {
+            throw sqlite_file_state_recovery_error({ operation: 'initialization-gate-path' });
+        }
+        if (gate.kind === 'exclusive-recovery') {
+            assert_exclusive_gate(paths, gate);
+            await gate.waitForReaders();
+            assert_exclusive_gate(paths, gate);
+        }
+        const inventory = await inventory_sqlite_basename(resolved, options);
+        assert_preflight_inventory(inventory);
+        if (inventory.main) {
+            const database = openedDatabase = await open_existing_under_gate(resolved, gate, {
+                ...options,
+                expectedApplicationId: spec.applicationId,
+                validate: spec.validate,
+            }, suppliedGate === undefined);
+            await emit(options, 'winner-validated');
+            return { installed: false, wonInstallation: false, database };
+        }
+        candidatePath = await build_custom_candidate(paths, spec, options);
+        await emit(options, 'candidate-before-install');
+        if (!recognize_custom_initialization_candidate(candidatePath, spec)) {
+            throw sqlite_file_state_schema_error({ operation: 'candidate-install-validation' });
+        }
+        const candidateStat = fs.statSync(candidatePath, { bigint: true });
+        let wonInstallation = false;
+        try {
+            fs.linkSync(candidatePath, resolved);
+            wonInstallation = true;
+            flush_directory(paths.parentDirectory, options);
+            await emit(options, 'candidate-after-install');
+        } catch (error) {
+            if (!is_node_error(error) || error.code !== 'EEXIST') throw error;
+        }
+        const database = openedDatabase = await open_existing_under_gate(resolved, gate, {
+            ...options,
+            expectedApplicationId: spec.applicationId,
+            validate: spec.validate,
+        }, suppliedGate === undefined);
+        await emit(options, 'winner-validated');
+        remove_exact_candidate(candidatePath, candidateStat, options);
+        candidatePath = undefined;
+        return { installed: wonInstallation, wonInstallation, database };
+    } catch (error) {
+        if (openedDatabase) {
+            try {
+                await openedDatabase.close();
+            } catch {
+                // Preserve the first failure.
+            }
+        } else if (suppliedGate === undefined) {
+            try {
+                await gate.release();
+            } catch {
+                // Preserve the first failure.
+            }
+        }
+        throw safe_error('no-clobber-initialize', error);
+    }
 }
 
 export async function initialize_sqlite_database_no_clobber(

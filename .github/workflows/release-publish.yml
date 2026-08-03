@@ -48,7 +48,8 @@ jobs:
         with:
           node-version: '26.5.1'
 
-      - name: Validate tag + version
+      - name: Validate tag + versions
+        id: version
         shell: bash
         env:
           THE_TAG: ${{ env.RELEASE_TAG }}
@@ -71,11 +72,17 @@ jobs:
           fi
 
           PKG_VERSION=$(node -p "require('./package.json').version")
+          COMPANION_VERSION=$(node -p "require('./companion/package.json').version")
           EXPECTED_TAG="v${PKG_VERSION}"
           if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
             echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
             exit 1
           fi
+          if [[ "$COMPANION_VERSION" != "$PKG_VERSION" ]]; then
+            echo "ERROR: companion/package.json version $COMPANION_VERSION does not match package.json $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
         id: artifacts
@@ -92,6 +99,7 @@ jobs:
           # Only ever true when a human dispatched with it explicitly; the
           # workflow_run trigger has no way to supply it. See the Windows branch.
           ALLOW_MISSING_WINDOWS: ${{ inputs.allow_missing_windows }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -113,6 +121,17 @@ jobs:
 
           gh run download "$BUILD_RUN_ID" --name "$ARTIFACT_NAME"
 
+          for required in \
+            "table-viewer-${VERSION}.vsix" \
+            "table-viewer-${VERSION}.vsix.sha256" \
+            "companion/table-viewer-companion-${VERSION}.vsix" \
+            "companion/table-viewer-companion-${VERSION}.vsix.sha256"; do
+            if [[ ! -f "$required" ]]; then
+              echo "ERROR: mandatory release artifact is missing: $required" >&2
+              exit 1
+            fi
+          done
+
           # Only an *absent* artifact is tolerable (see below); a download that
           # fails on an artifact the run really has is a transient or permission
           # problem, and swallowing it would publish a release quietly missing
@@ -125,11 +144,9 @@ jobs:
             --jq '.artifacts[] | select(.expired == false) | .name')
 
           # The desktop job of the same run produces the macOS app that the
-          # Homebrew cask downloads. Land it in desktop-dist/ rather than the
-          # workspace root: `table-viewer-*` would otherwise match both the
-          # .vsix and the dmg/zip, and `vsce publish --packagePath
-          # table-viewer-*.vsix` and the checksum globs expect a flat, .vsix-only
-          # directory.
+          # Homebrew cask downloads. Land it in desktop-dist/ rather than beside
+          # the exact main and companion VSIX paths, so desktop downloads cannot
+          # be mistaken for extension packages or their checksums.
           #
           # Absent is not fatal: tags built before the desktop job existed, and
           # runs whose artifacts have aged out, have no desktop-* artifact. The
@@ -199,11 +216,13 @@ jobs:
             exit 1
           fi
 
-      - name: Verify checksums
+      - name: Verify main and desktop checksums
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          sha256sum -c table-viewer-*.vsix.sha256
+          sha256sum -c "table-viewer-${VERSION}.vsix.sha256"
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
             (cd desktop-dist && sha256sum -c ./*.sha256)
           fi
@@ -211,17 +230,53 @@ jobs:
             (cd windows-dist && sha256sum -c ./*.sha256)
           fi
 
+      - name: Verify companion checksum
+        shell: bash
+        working-directory: companion
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum -c "table-viewer-companion-${VERSION}.vsix.sha256"
+
+      - name: Inspect extension packages
+        run: npm run probe:vsix:packages
+
       - name: Install publish tools
         run: npm install --global @vscode/vsce@3.7.1 ovsx@0.10.9
 
-      - name: Publish to VS Code Marketplace
-        run: vsce publish --packagePath table-viewer-*.vsix --pat "$VSCE_PAT"
+      - name: Publish companion to VS Code Marketplace
+        run: vsce publish --skip-duplicate --packagePath "companion/table-viewer-companion-${VERSION}.vsix" --pat "$VSCE_PAT"
         env:
+          VERSION: ${{ steps.version.outputs.version }}
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      - name: Publish to Open VSX
-        run: ovsx publish table-viewer-*.vsix --pat "$OVSX_PAT"
+      - name: Wait for companion Marketplace availability
+        run: node scripts/wait-extension-version.mjs marketplace jbearak table-viewer-companion "$VERSION"
         env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Publish companion to Open VSX
+        run: ovsx publish --skip-duplicate "companion/table-viewer-companion-${VERSION}.vsix" --pat "$OVSX_PAT"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+
+      - name: Wait for companion Open VSX availability
+        run: node scripts/wait-extension-version.mjs open-vsx jbearak table-viewer-companion "$VERSION"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Publish main extension to VS Code Marketplace
+        run: vsce publish --skip-duplicate --packagePath "table-viewer-${VERSION}.vsix" --pat "$VSCE_PAT"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish main extension to Open VSX
+        run: ovsx publish --skip-duplicate "table-viewer-${VERSION}.vsix" --pat "$OVSX_PAT"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
 
       - name: Create GitHub Release
@@ -236,8 +291,10 @@ jobs:
           # globs are a no-op when this tag has no desktop artifact (see the
           # download step) rather than failing the release.
           files: |
-            table-viewer-*.vsix
-            table-viewer-*.vsix.sha256
+            table-viewer-${{ steps.version.outputs.version }}.vsix
+            table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
+            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix
+            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix.sha256
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
             desktop-dist/*.sha256
