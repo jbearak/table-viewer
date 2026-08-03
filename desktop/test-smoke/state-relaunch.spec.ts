@@ -212,8 +212,27 @@ test.describe('desktop state relaunch gates', () => {
         const second = await launch_app(user_data_dir, [csv_fixture]);
         try {
             // The gate: the app opens the crashed-on database and paints. Any
-            // rollback journal the kill left is replayed by SQLite as part of
-            // that open, so a visible grid *is* the recovery having succeeded.
+            // rollback journal the kill left is replayed by SQLite as part of that
+            // open, so a visible grid *is* the recovery having succeeded.
+            //
+            // What this does NOT claim is that a hot journal was present. It usually
+            // is not: `apply_sort` waits for the transform's terminal acknowledgement,
+            // which is posted after the durable commit, and a DELETE-mode commit
+            // removes its own journal — so the kill most often lands on an idle
+            // connection. Racing the commit from up here would be a timing-dependent
+            // GUI test, which is exactly the kind this suite refuses to write, and it
+            // is unnecessary: the journal-replay property is proven deterministically
+            // by `packaged-recovery-gate.mjs`'s `rollback_journal_gate`, which aborts
+            // *inside* an open write transaction with a shrunken page cache and then
+            // asserts the journal existed, that the main file grew, and that the
+            // uncommitted mark and scratch table were both undone. That gate runs in
+            // CI on every push.
+            //
+            // The property under test here is the complementary one, and it is
+            // genuinely unproven anywhere else: the whole packaged startup path — the
+            // reader gate, the connection, the drain, and whatever replay the open
+            // performs — survives a SIGKILL and reaches a painted grid without
+            // claiming a recovery it did not perform.
             const page = await viewer_page(second);
             expect(hot_journal_present(user_data_dir)).toBe(false);
             expect(recovery_residue(user_data_dir)).toEqual({

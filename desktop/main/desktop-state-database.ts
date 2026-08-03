@@ -253,25 +253,66 @@ function is_within(directory: string, root: string): boolean {
 }
 
 /**
- * Control locations to ask the same question of, ordered, each sharing as little
- * as possible with the caller's.
+ * The device a path is on, or `undefined` when that cannot be established.
+ *
+ * The nearest *existing* ancestor is what gets stat'd, because a userData
+ * directory does not exist on a first launch and the question is about the volume
+ * it will land on. `undefined` is a real answer meaning "unknown", never a device
+ * id that might accidentally compare equal to something.
+ */
+function device_of(directory: string): bigint | undefined {
+    let candidate = path.resolve(directory);
+    for (;;) {
+        try {
+            return fs.statSync(candidate, { bigint: true }).dev;
+        } catch {
+            const parent = path.dirname(candidate);
+            if (parent === candidate) return undefined;
+            candidate = parent;
+        }
+    }
+}
+
+/**
+ * Control locations to ask the same question of, ordered, each on a *different
+ * filesystem* from the caller's.
  *
  * The temp directory first, because on a real install userData lives under the
  * user's home and the two are usually different filesystems — which is what makes
- * agreement between them evidence about the operating system rather than about
- * one mount. A caller whose directory is already under one root (tests and the
- * packaged gate both work in the temp tree) would get a control on the *same*
- * filesystem, agreeing for the wrong reason, so any root containing the caller's
- * directory is dropped.
+ * agreement between them evidence about the operating system rather than about one
+ * mount.
+ *
+ * Discriminated by **device identity, not by path containment**. Textual
+ * containment was the original test and it is not sufficient in either direction:
+ * `TMPDIR` and userData can be different paths on one mount (macOS `/tmp` and
+ * `$HOME` share a device on a stock install — measured, not assumed; so do a
+ * userData and a `TMPDIR` both on a single NFS mount). Both probes then refuse for
+ * the same *location-specific* reason, the loop stops at that first refusal, and a
+ * fixable one-mount problem is reported as "this platform cannot do it, wait for a
+ * future build" — the exact misdirection the platform/location split exists to
+ * prevent, and the one whose cost is highest, because the story it tells offers no
+ * remedy at all.
+ *
+ * A root whose device cannot be determined is kept rather than dropped. It may
+ * still be genuinely unrelated, and `durability_answer_at` classifies a location it
+ * cannot probe as `unavailable`, which already gets no vote — so an unknown device
+ * degrades to the existing "could not ask" path instead of silently removing the
+ * only available control. Containment is still applied, because a control *inside*
+ * the caller's own tree is not a control whatever its device says.
  *
  * More than one because a control that cannot be written to has no vote, and on a
- * sandboxed or hardened host either root may be unavailable. Returning a list
- * lets the caller keep asking until something actually answers, instead of
- * treating "could not ask" as agreement.
+ * sandboxed or hardened host either root may be unavailable. Returning a list lets
+ * the caller keep asking until something actually answers, instead of treating
+ * "could not ask" as agreement.
  */
 function control_roots_for(user_data_dir: string): readonly string[] {
-    return [os.tmpdir(), os.homedir()]
-        .filter((root) => !is_within(user_data_dir, root));
+    const intended_device = device_of(user_data_dir);
+    return [os.tmpdir(), os.homedir()].filter((root) => {
+        if (is_within(user_data_dir, root)) return false;
+        if (intended_device === undefined) return true;
+        const control_device = device_of(root);
+        return control_device === undefined || control_device !== intended_device;
+    });
 }
 
 /**

@@ -317,6 +317,33 @@ function run_crashing_child(role, cut_point, user_data_dir) {
                 ));
                 return;
             }
+            // An abort is *positively* identified, never inferred from "not 0 and
+            // not 2". `process.abort()` raises SIGABRT, which arrives as the signal
+            // on POSIX and as the CRT's abort code (3) or STATUS_FATAL_APP_EXIT
+            // (0xC0000409) on Windows.
+            //
+            // Anything else — SIGSEGV, an OOM kill, a launch failure, a plain exit 1
+            // from somewhere that never reached the classified exit(2) — is an
+            // unexplained death, and accepting it as an abort is how a gate passes
+            // without its cut point ever firing. The residue invariants are a partial
+            // defence and not a sufficient one: they check that residue *exists* and
+            // that members survived, which a child that died at some *other*
+            // boundary can satisfy, so the gate would then report a cut point as
+            // covered on evidence produced by a different one.
+            //
+            // Same reasoning, and now the same rule, as
+            // `windows-durability-probe.mjs`'s classifier. That one inferred aborts
+            // until it was fixed; this is the sibling defect.
+            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            if (!aborted) {
+                reject(new GateAssertionError(
+                    `child for ${role}/${cut_point} died without aborting`
+                    + ` (code=${typeof code === 'number' ? code : 'none'},`
+                    + ` signal=${signal ?? 'none'})`
+                    + `${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
+                ));
+                return;
+            }
             resolve({ code, signal });
         }));
     });

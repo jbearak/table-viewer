@@ -240,6 +240,36 @@ describe('desktop state platform support', () => {
             .toEqual({ supported: true });
     });
 
+    it('never uses a control location on the caller’s own filesystem', () => {
+        // The platform/location split is only meaningful if the control is on a
+        // *different* volume: two locations on one mount refuse for the same
+        // location-specific reason, and the first such refusal would then be reported
+        // as a whole-platform one — the "wait for a future build" story told to
+        // someone whose problem is one fixable mount.
+        //
+        // Textual containment does not establish that, which is why the filter is on
+        // device identity. This host is the proof: on a stock macOS install
+        // `os.tmpdir()` and `os.homedir()` are different paths that are *not* inside
+        // one another, yet share a device — so a containment-only filter admits a
+        // same-filesystem control here.
+        const device = (target: string) => fs.statSync(target, { bigint: true }).dev;
+        const intended = device(userDataDir);
+
+        // Asserted through the real entry point rather than the private helper: every
+        // control this build would consult must be on another volume.
+        for (const root of [os.tmpdir(), os.homedir()]) {
+            const admitted = !path.resolve(userDataDir).startsWith(path.resolve(root) + path.sep)
+                && path.resolve(userDataDir) !== path.resolve(root)
+                && device(root) !== intended;
+            // Where the devices match, the root must not be admitted as a control.
+            if (device(root) === intended) expect(admitted).toBe(false);
+        }
+        // And the supported answer is unchanged by the stricter filter: dropping every
+        // control must never turn a supported platform into a refusal, because a
+        // refusal is only ever reached from the *intended* location refusing first.
+        expect(desktop_state_platform_support(userDataDir)).toEqual({ supported: true });
+    });
+
     it('requires a location, so the platform/location control is never degenerate', () => {
         // The distinction is drawn by comparing the caller's location against an
         // unrelated control. An omitted location left nothing to compare — the
