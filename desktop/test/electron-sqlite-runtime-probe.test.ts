@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { SqliteFileStateError } from '../../src/sqlite-file-state-errors';
 
@@ -15,7 +16,16 @@ vi.mock('electron', () => ({
 // implementation the bundle runs.
 const probe_specifier = '../electron-sqlite-runtime-probe.mjs';
 
-let v1_contract_for_platform: (platform: string) => string;
+type DurabilityAssertion = (
+    directory: string,
+    fsyncDirectory: ((descriptor: number) => void) | undefined,
+    platform: string,
+) => void;
+
+let v1_contract_for_platform: (
+    platform?: string,
+    assert?: DurabilityAssertion,
+) => string;
 let assert_v1_refusal: (error: unknown, databaseCreated: boolean) => Record<string, unknown>;
 
 beforeAll(async () => {
@@ -32,7 +42,63 @@ describe('electron sqlite runtime probe v1 contract', () => {
     });
 
     it('requires the fail-closed refusal on win32', () => {
+        // The real production assertion, driven with win32 — not a re-test of the
+        // platform string. This is the whole reason the probe calls the enforcer:
+        // if production ever stopped refusing on win32, this expectation would
+        // fail here rather than silently letting the probe assert a stale
+        // contract in CI.
         expect(v1_contract_for_platform('win32')).toBe('fail-closed');
+    });
+
+    it('follows the production rule rather than a copy of its platform test', () => {
+        // The drift check, stated as a test: a stand-in enforcer that declines
+        // every platform must flip the contract on a platform the real rule
+        // supports. A probe that had kept its own `platform === 'win32'` literal
+        // would answer 'installed' here and go on asserting an install that
+        // production no longer performs.
+        const declines: DurabilityAssertion = () => {
+            throw new SqliteFileStateError('unsupported', { operation: 'directory-durability' });
+        };
+        expect(v1_contract_for_platform('darwin', declines)).toBe('fail-closed');
+
+        const allows: DurabilityAssertion = () => {};
+        expect(v1_contract_for_platform('win32', allows)).toBe('installed');
+    });
+
+    it('is called exactly as production calls itself, on a real directory', () => {
+        // The injected-capability path is production's test-only door. A probe
+        // that passed a working `fsyncDirectory` through it would report a
+        // contract no shipped build can honor, so the middle argument must stay
+        // undefined — and the directory must be one that really exists, or the
+        // assertion would fail for a reason unrelated to durability.
+        const seen: Array<Parameters<DurabilityAssertion>> = [];
+        // Existence is recorded *at call time*, not afterwards: production removes
+        // the probe directory in its `finally`, so a check after the call is always
+        // false and would hold even if production passed a path it never created.
+        const existedWhenCalled: boolean[] = [];
+        const record: DurabilityAssertion = (...args) => {
+            existedWhenCalled.push(existsSync(args[0]));
+            seen.push(args);
+        };
+
+        expect(v1_contract_for_platform('linux', record)).toBe('installed');
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0][1]).toBeUndefined();
+        expect(seen[0][2]).toBe('linux');
+        expect(existedWhenCalled).toEqual([true]);
+        // And cleaned up afterwards, so the probe leaves nothing behind.
+        expect(existsSync(seen[0][0])).toBe(false);
+    });
+
+    it('never swallows a failure that is not a durability refusal', () => {
+        // A refusal is `unsupported`; anything else is a real fault and must not
+        // be reported as a platform contract. Reporting an EIO as 'fail-closed'
+        // would be the relabeling the failure policy forbids, one layer up.
+        const io: DurabilityAssertion = () => {
+            throw new SqliteFileStateError('io', { operation: 'directory-durability' });
+        };
+        expect(() => v1_contract_for_platform('linux', io)).toThrow(SqliteFileStateError);
     });
 });
 

@@ -27,9 +27,15 @@ const DIAGNOSTICS_DIRECTORY = '/tmp/table-viewer-diagnostics';
  *  added to the union has to be acknowledged here too. */
 const KINDS: readonly StateRecoveryKind[] = [
     'transient', 'environment', 'capacity', 'io', 'corrupt', 'compatibility',
-    'unsupported-platform', 'interrupted', 'leftover-setup', 'obstructed',
-    'coordination-residue', 'unknown',
+    'unsupported-platform', 'unsupported-location', 'interrupted', 'leftover-setup',
+    'obstructed', 'coordination-residue', 'unknown',
 ];
+
+/** The stage `desktop_state_platform_support` reports for a refusal that held at
+ *  the intended location *and* at an unrelated control location. Spelled out
+ *  rather than imported so this suite stays free of the backend, and pinned
+ *  against the producing constant by its own test below. */
+const PLATFORM_DURABILITY_OPERATION = 'platform-durability-unsupported';
 
 /** The whole `SqliteFileStateErrorCategory` union, spelled out for the same
  *  reason: a category added upstream must be given a story deliberately, not by
@@ -119,19 +125,71 @@ describe('state recovery classification', () => {
         // on every attempt. Offering it produced a dialog loop whose only exit was
         // Quit: retry failed the same way, and preserve failed into `show_error`
         // and looped.
-        const detail = classify_state_recovery_failure({
+        for (const failure of [
+            { category: 'unsupported' as const, operation: 'directory-durability' },
+            { category: 'unsupported' as const, operation: PLATFORM_DURABILITY_OPERATION },
+        ]) {
+            const detail = classify_state_recovery_failure(failure);
+            expect(detail.canPreserve, failure.operation).toBe(false);
+            expect(detail.kind, failure.operation).not.toBe(
+                classify_state_recovery_failure({ category: 'schema' }).kind,
+            );
+            // Retry stays offered — a different location or mount can answer
+            // differently — alongside Diagnostics and Quit, and nothing else.
+            expect(state_recovery_button_layout(detail.canPreserve).choices)
+                .toEqual(['retry', 'open-diagnostics', 'quit']);
+        }
+    });
+
+    it('separates a declined platform from a location that cannot be flushed', () => {
+        // One missing guarantee, two opposite remedies. The location story tells
+        // the user to keep the settings on an ordinary local disk, which is right
+        // for a network mount and useless on Windows; the platform story tells
+        // them to wait for a later build, which is right on Windows and strands
+        // someone whose network drive was the whole problem. Getting these
+        // backwards is a wrong answer delivered confidently, so the split is
+        // pinned here rather than left to prose review.
+        const platform = classify_state_recovery_failure({
+            category: 'unsupported',
+            operation: PLATFORM_DURABILITY_OPERATION,
+        });
+        const location = classify_state_recovery_failure({
             category: 'unsupported',
             operation: 'directory-durability',
         });
 
-        expect(detail).toMatchObject({ kind: 'unsupported-platform', canPreserve: false });
-        expect(detail.kind).not.toBe(
-            classify_state_recovery_failure({ category: 'schema' }).kind,
+        expect(platform).toMatchObject({ kind: 'unsupported-platform', canPreserve: false });
+        expect(location).toMatchObject({ kind: 'unsupported-location', canPreserve: false });
+        expect(state_recovery_wording('unsupported-platform'))
+            .not.toEqual(state_recovery_wording('unsupported-location'));
+
+        // The platform story must not send the user looking for a location that
+        // works, because there is not one on this system.
+        const platform_prose = Object.values(state_recovery_wording('unsupported-platform')).join(' ');
+        expect(platform_prose).not.toMatch(/local disk|network|another (location|place|drive)/i);
+        // And the location story must not tell someone with a fixable problem to
+        // wait for a future release.
+        const location_prose = Object.values(state_recovery_wording('unsupported-location')).join(' ');
+        expect(location_prose).not.toMatch(/still being completed|not yet supported/i);
+        expect(location_prose).toMatch(/local disk/i);
+    });
+
+    it('pins the platform-declaration stage against the constant that produces it', async () => {
+        // The one place the two modules agree on a literal. `state-recovery-dialog`
+        // is deliberately free of backend imports, so the string is duplicated —
+        // and a duplicated literal that can drift silently is exactly what this
+        // assertion exists to prevent: a rename on the producing side would
+        // otherwise leave every Windows launch telling the location story, whose
+        // advice cannot help there.
+        const { DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION } = await import(
+            '../main/desktop-state-database'
         );
-        // Retry stays offered — a different location or mount can answer
-        // differently — alongside Diagnostics and Quit, and nothing else.
-        expect(state_recovery_button_layout(detail.canPreserve).choices)
-            .toEqual(['retry', 'open-diagnostics', 'quit']);
+        expect(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION)
+            .toBe(PLATFORM_DURABILITY_OPERATION);
+        expect(classify_state_recovery_failure({
+            category: 'unsupported',
+            operation: DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
+        }).kind).toBe('unsupported-platform');
     });
 
     it('routes real lock contention to the retry-oriented kind', () => {
@@ -320,6 +378,7 @@ describe('state recovery classification', () => {
             { category: 'corrupt' },
             { category: 'schema' },
             { category: 'unsupported', operation: 'directory-durability' },
+            { category: 'unsupported', operation: PLATFORM_DURABILITY_OPERATION },
             { category: 'recovery' },
             { category: 'recovery', operation: 'absent-main-evidence' },
             { category: 'recovery', operation: 'inventory-member-type' },
@@ -377,23 +436,31 @@ describe('state recovery wording', () => {
         expect(damage_claims('corrupt')).toMatch(/damaged/i);
     });
 
-    it('makes no ownership or damage claim for an unsupported platform', () => {
+    it('makes no ownership or damage claim for either unsupported kind', () => {
         // Three separate wrongs in the old `compatibility` mapping, and all three
         // are wording: the data does not belong to another product, it does not
         // belong to a newer version, and setting it aside would not leave anyone
-        // else without it. Nothing is damaged either.
-        const prose = damage_claims('unsupported-platform');
+        // else without it. Nothing is damaged either. Both unsupported arms are
+        // held to it — the location arm is newer and is where a borrowed clause
+        // would land.
+        for (const kind of ['unsupported-platform', 'unsupported-location'] as const) {
+            const prose = damage_claims(kind);
 
-        expect(prose).not.toMatch(/corrupt|damaged/i);
-        expect(prose).not.toMatch(/belong/i);
-        expect(prose).not.toMatch(/different Table Viewer product|another product/i);
-        expect(prose).not.toMatch(/newer version|older version/i);
-        expect(prose).not.toMatch(/set(ting)? (these|them|it) aside/i);
-        // And it says the honest thing instead: the guarantee is unavailable and
-        // this platform's support is unfinished.
-        expect(prose).toMatch(/cannot store/i);
-        expect(prose).toMatch(/guarantee/i);
-        expect(prose).toMatch(/still being completed/i);
+            expect(prose, kind).not.toMatch(/corrupt|damaged/i);
+            expect(prose, kind).not.toMatch(/belong/i);
+            expect(prose, kind).not.toMatch(/different Table Viewer product|another product/i);
+            expect(prose, kind).not.toMatch(/newer version|older version/i);
+            expect(prose, kind).not.toMatch(/set(ting)? (these|them|it) aside/i);
+            // And each says the honest thing instead: the guarantee is unavailable
+            // and nothing was touched while discovering that.
+            expect(prose, kind).toMatch(/guarantee/i);
+            expect(prose, kind).toMatch(/nothing has been changed or moved/i);
+        }
+        // The platform arm additionally states that this system's support is
+        // unfinished, which is the one honest thing it can offer in place of an
+        // action.
+        expect(damage_claims('unsupported-platform')).toMatch(/cannot store/i);
+        expect(damage_claims('unsupported-platform')).toMatch(/still being completed/i);
     });
 
     it('gives every kind its own non-empty story', () => {
@@ -627,27 +694,29 @@ describe('state recovery flow', () => {
         // durability primitive, so every "Set Aside" failed into `show_error` and
         // re-presented, retry failed identically, and Quit was the only exit. The
         // button is simply not there now, so the flow cannot be asked for it.
-        const failure: StateRecoveryFailure = {
-            category: 'unsupported',
-            operation: 'directory-durability',
-        };
-        const scripted = dialogs(['retry', 'quit']);
-        const preserve = vi.fn(async () => { throw new Error('unsupported'); });
-        const open = vi.fn().mockResolvedValueOnce({ type: 'failed', failure });
+        for (const [operation, kind] of [
+            ['directory-durability', 'unsupported-location'],
+            [PLATFORM_DURABILITY_OPERATION, 'unsupported-platform'],
+        ] as const) {
+            const failure: StateRecoveryFailure = { category: 'unsupported', operation };
+            const scripted = dialogs(['retry', 'quit']);
+            const preserve = vi.fn(async () => { throw new Error('unsupported'); });
+            const open = vi.fn().mockResolvedValueOnce({ type: 'failed', failure });
 
-        const outcome = await flow(scripted, open, preserve).run(failure);
+            const outcome = await flow(scripted, open, preserve).run(failure);
 
-        expect(outcome).toEqual({ type: 'quit' });
-        // Retry is still offered and still allowed to fail — a different mount can
-        // answer differently — but the preserve was never on the menu.
-        expect(open).toHaveBeenCalledOnce();
-        expect(preserve).not.toHaveBeenCalled();
-        expect(scripted.confirm_preserve).not.toHaveBeenCalled();
-        expect(scripted.show_error).not.toHaveBeenCalled();
-        for (const detail of scripted.seen) {
-            expect(detail).toMatchObject({ kind: 'unsupported-platform', canPreserve: false });
-            expect(state_recovery_button_layout(detail.canPreserve).choices)
-                .not.toContain('preserve-and-create');
+            expect(outcome, operation).toEqual({ type: 'quit' });
+            // Retry is still offered and still allowed to fail — a different mount
+            // can answer differently — but the preserve was never on the menu.
+            expect(open, operation).toHaveBeenCalledOnce();
+            expect(preserve, operation).not.toHaveBeenCalled();
+            expect(scripted.confirm_preserve, operation).not.toHaveBeenCalled();
+            expect(scripted.show_error, operation).not.toHaveBeenCalled();
+            for (const detail of scripted.seen) {
+                expect(detail, operation).toMatchObject({ kind, canPreserve: false });
+                expect(state_recovery_button_layout(detail.canPreserve).choices, operation)
+                    .not.toContain('preserve-and-create');
+            }
         }
     });
 

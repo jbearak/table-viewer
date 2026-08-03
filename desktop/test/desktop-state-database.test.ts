@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SqliteOpenRecoveryEvent } from '../../src/sqlite-open-recovery';
 import {
@@ -10,9 +11,14 @@ import {
 } from '../../src/sqlite-file-state-errors';
 import { classify_state_recovery_failure } from '../main/state-recovery-dialog';
 import {
+    control_roots_for,
+    nearest_existing_ancestor,
     DESKTOP_STATE_DATABASE_ID,
     DESKTOP_STATE_IDENTITY,
+    DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
     DESKTOP_STATE_STORAGE_ENVIRONMENT_ID,
+    desktop_state_platform_support,
+    desktop_state_durability_refusal_operation,
     desktop_state_database_path,
     desktop_state_diagnostics_directory,
     desktop_state_error_log_line,
@@ -210,6 +216,209 @@ afterEach(async () => {
         }
     }
     fs.rmSync(userDataDir, { recursive: true, force: true });
+});
+
+describe('desktop state platform support', () => {
+    it('declares this platform supported and leaves nothing behind', () => {
+        // Local CI and every developer machine run a platform production supports,
+        // so the observable contract here is the *absence* of side effects: the
+        // question is asked before the app has decided it can store anything, and
+        // the unsupported dialog goes on to promise that nothing was changed or
+        // moved. A probe directory left behind would falsify that promise on the
+        // one platform where it matters most.
+        const before = fs.readdirSync(userDataDir).sort();
+
+        expect(desktop_state_platform_support(userDataDir)).toEqual({ supported: true });
+
+        expect(fs.readdirSync(userDataDir).sort()).toEqual(before);
+        expect(fs.existsSync(desktop_state_diagnostics_directory(userDataDir))).toBe(false);
+    });
+
+    it('answers for a userData directory that does not exist yet', () => {
+        // The open consults this before anything creates the state tree, so a
+        // missing directory must produce a platform answer rather than an
+        // accidental refusal — that refusal would be the app declining to run on a
+        // system it fully supports, on its very first launch.
+        expect(desktop_state_platform_support(path.join(userDataDir, 'not-created-yet')))
+            .toEqual({ supported: true });
+    });
+
+    it('really runs the probe when userData is several levels from existing', () => {
+        // A missing userData must not make the question go *unasked*. `mkdtempSync`
+        // in a nonexistent parent fails ENOENT, which `durability_answer_at`
+        // classifies as `unavailable` — and for the intended location that silently
+        // skipped the platform question entirely. On Windows, where the refusal is
+        // unconditional and comes from the very assertion this probe exists to run,
+        // a first launch would then report `supported`, let the open create the state
+        // tree, and surface the failure later as a fixable *location* error: the
+        // opposite of the up-front, nothing-created platform refusal promised.
+        //
+        // So the probe runs in the nearest existing ancestor, which is on the
+        // filesystem the directory will land on anyway.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-userdata-'));
+        try {
+            const missing = path.join(root, 'a', 'b', 'userData');
+            // The mechanism, asserted directly. On a supported platform both a probe
+            // that ran and a probe that never ran produce `supported: true`, so the
+            // *result* cannot distinguish them and only this can: the location the
+            // probe is created in must be a directory that exists.
+            expect(nearest_existing_ancestor(missing)).toBe(root);
+            expect(fs.existsSync(nearest_existing_ancestor(missing))).toBe(true);
+
+            const answer = desktop_state_platform_support(missing);
+            expect(answer).toEqual({ supported: true });
+            // And still no side effects: the ancestor is where the probe went, so it
+            // is the place a leak would show up, and the missing path stays missing.
+            expect(fs.readdirSync(root)).toEqual([]);
+            expect(fs.existsSync(missing)).toBe(false);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('keeps a same-volume control rather than being left with none', () => {
+        // A control on another volume is better evidence, so it is asked first — but
+        // a same-volume control must never be *excluded*, and this is the case that
+        // proves why. Excluding by device identity was tried and broke Windows: there
+        // userData, `os.tmpdir()`, and `os.homedir()` are all on `C:`, and userData
+        // sits beneath the home directory, so containment removes one root and device
+        // identity removed the other. With no control left, `control_refused` stays
+        // false and win32 — the most platform-wide refusal there is — reports under
+        // the backend's *location* stage, telling every Windows user to move their
+        // settings somewhere that cannot exist. `packaged-recovery-gate.mjs` asserts
+        // `platform-durability-unsupported` on that path, so the Windows CI gate
+        // would fail with it.
+        //
+        // Asserted against the production selector itself, never a reimplementation
+        // of it here — a test that recomputes the containment rule cannot observe the
+        // filter/preference distinction that is the entire point.
+        const device = (target: string) => fs.statSync(target, { bigint: true }).dev;
+        const intended = device(userDataDir);
+
+        // The Windows shape, reproduced on this host: a userData whose volume every
+        // candidate root shares. On macOS and Linux `os.tmpdir()` and `os.homedir()`
+        // are commonly one device, and even where they are not, a userData placed
+        // under the temp root shares that root's device by construction.
+        const same_volume = fs.mkdtempSync(path.join(os.tmpdir(), 'same-volume-'));
+        try {
+            expect(device(same_volume)).toBe(device(os.tmpdir()));
+            // `os.tmpdir()` contains this directory, so containment correctly drops it;
+            // `os.homedir()` does not, and it must survive even when it shares the
+            // volume. Under the device-as-filter regression this list was empty, which
+            // is what mislabels the win32 refusal as a fixable location problem.
+            const controls = control_roots_for(same_volume);
+            expect(controls.length).toBeGreaterThan(0);
+        } finally {
+            fs.rmSync(same_volume, { recursive: true, force: true });
+        }
+
+        // And the preference still holds where a distinct volume exists: any control
+        // not sharing the caller's device is asked before any that does.
+        const ranked = control_roots_for(userDataDir);
+        const shares = ranked.map((root) => device(root) === intended);
+        expect(shares).toEqual([...shares].sort((a, b) => Number(a) - Number(b)));
+        // And the supported answer is unchanged: a refusal is only ever reached from
+        // the *intended* location refusing first, so control selection cannot turn a
+        // supported platform into a refusal.
+        expect(desktop_state_platform_support(userDataDir)).toEqual({ supported: true });
+    });
+
+    it('excludes controls related to userData in either containment direction', () => {
+        const candidate = os.tmpdir();
+
+        // The control contains userData: probing it would ask an ancestor of the
+        // intended location rather than an unrelated location.
+        const below_candidate = path.join(candidate, 'future-userData');
+        expect(control_roots_for(below_candidate)).not.toContain(candidate);
+
+        // The control is inside userData: probing it would ask the tree under test
+        // itself. This is the opposite argument order and kills a one-sided filter.
+        const above_candidate = path.dirname(candidate);
+        expect(control_roots_for(above_candidate)).not.toContain(candidate);
+    });
+
+    it('keeps an unconditional platform refusal when no unrelated control exists', () => {
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            true,
+            false,
+        )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            false,
+            true,
+        )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            false,
+            false,
+        )).toBe('directory-durability');
+    });
+
+    it('requires a location, so the platform/location control is never degenerate', () => {
+        // The distinction is drawn by comparing the caller's location against an
+        // unrelated control. An omitted location left nothing to compare — the
+        // control became the same directory, agreed with itself, and every refusal
+        // was promoted to the whole-platform story ("wait for a future build") even
+        // when one unusual mount was the entire problem. Requiring the argument is
+        // what makes the comparison real, so the signature is asserted rather than
+        // left to review.
+        // The parameter is required, so omitting it is a compile error — which is
+        // the real enforcement, and `@ts-expect-error` fails the typecheck if the
+        // optional marker ever comes back.
+        expect(desktop_state_platform_support).toHaveLength(1);
+        // @ts-expect-error the omitted-location overload is deliberately gone.
+        const degenerate = () => desktop_state_platform_support();
+        // And the runtime behaviour is the honest one either way: with nothing to
+        // compare against it must never claim the *platform* is unsupported, which
+        // is the misdirection the old fallback produced.
+        expect(degenerate().supported).toBe(true);
+    });
+
+    it('reports a whole-platform refusal under its own stage, not the backend’s', async () => {
+        // The Windows case, which cannot be run here. What *is* checked on any
+        // host is the pairing the dialog depends on: the constant this module
+        // exports is the exact stage the classifier refines into the platform
+        // story. If the two drift, a Windows user gets the location story, whose
+        // only advice — keep the settings on an ordinary local disk — cannot help
+        // anywhere on that machine.
+        expect(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION)
+            .toMatch(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
+        expect(classify_state_recovery_failure({
+            category: 'unsupported',
+            operation: DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
+        })).toMatchObject({ kind: 'unsupported-platform', canPreserve: false });
+    });
+
+    it('is consulted before the open creates or inspects anything', async () => {
+        // The ordering that makes the refusal honest. With the declaration first,
+        // a declined platform reports without the coordination gate having been
+        // created; the recovery preflight, which runs next, creates it as a side
+        // effect of inspecting it. Proven by the supported path: after a *failed*
+        // open on a supported platform the gate exists, which is only true because
+        // the preflight ran — i.e. because the declaration let it.
+        seed_database_file('file-state.sqlite3', 'not a database');
+        const result = await open();
+
+        expect(result.type).toBe('failed');
+        if (result.type !== 'failed') throw new Error('expected a failed open');
+        expect(result.failure.category).not.toBe('unsupported');
+        // The witness the comment above names, actually asserted rather than only
+        // described: the open got *past* the declaration and reached the machinery
+        // that creates the gate. Verified by mutation — forcing the declaration to
+        // refuse fails this line.
+        //
+        // Deliberately not claimed as a witness of the *preflight* specifically. It
+        // is not one: `acquire_sqlite_shared_reader_gate` calls `ensure_private_gate`
+        // too, so deleting `preflight_recovery_condition` from
+        // `open_desktop_state_database` leaves the gate directory present and this
+        // assertion green. What it pins is the ordering this test is named for — the
+        // declaration runs first and, on a supported platform, permits everything
+        // after it — and *that* is what would otherwise have been untested here,
+        // since a corrupt database fails to open with a non-`unsupported` category
+        // whether the declaration ran or not.
+        expect(fs.existsSync(gate_directory())).toBe(true);
+    });
 });
 
 describe('desktop state database', () => {
@@ -434,14 +643,20 @@ describe('desktop state database', () => {
 
         // The launch *after* the one that follows a successful preserve — the
         // regression that made a successful "Set Aside and Start Fresh" strictly
-        // worse than the hang the preflight was added to fix. The preflight also
-        // refused when `inventory_sqlite_basename` reported
-        // `incompleteRecoveryDirectories > 0`, and a *completed* recovery
-        // directory only validates while its original source names are still
-        // absent — which this very flow re-creates on purpose. So the app opened
-        // once and then refused forever, with Try Again re-failing identically and
-        // Set Aside throwing `orphan-preservation-manifest`: no in-app escape at
-        // all, reached without any crash.
+        // worse than the hang the preflight was added to fix. It had two
+        // independent causes, and both are now fixed at their source. The
+        // preflight once also refused on `incompleteRecoveryDirectories > 0`,
+        // which is not a stable predicate for this app; and
+        // `validate_completed_preservation` required a completed recovery
+        // directory's original source names to still be absent, which this very
+        // flow re-creates on purpose. That second one is the deeper of the two:
+        // it made `inventory_sqlite_basename` misreport a finished directory as
+        // incomplete for good, so `preserve_sqlite_basename_set` took its orphan
+        // branch and threw `orphan-preservation-manifest` — a *second* set-aside
+        // in one userData directory was impossible even with the preflight
+        // narrowed. Source-absence is now enforced only where it is meaningful,
+        // inside `advance_preservation`'s final loop, while the move is in
+        // flight and the gate is still exclusive.
         await reopened.opened.close();
         opened.length = 0;
         const relaunched = await within_no_hang_budget(open());
@@ -504,7 +719,7 @@ describe('desktop state database', () => {
         expect(fs.existsSync(path.join(readers, 'not-a-uuid.reader'))).toBe(false);
         // Set aside, never deleted: the bytes are evidence about how the directory
         // reached this state, and nothing in this module destroys evidence.
-        const quarantine_root = path.join(gate_directory(), 'quarantined-readers');
+        const quarantine_root = path.join(gate_directory(), 'quarantined-gate-markers');
         const generations = fs.readdirSync(quarantine_root);
         expect(generations).toHaveLength(1);
         expect(fs.readFileSync(
@@ -513,6 +728,174 @@ describe('desktop state database', () => {
         )).toBe('whatever');
         // And the escape actually works end to end.
         await expect(within_no_hang_budget(open())).resolves.toMatchObject({ type: 'opened' });
+    });
+
+    it.each([
+        // A crash between the marker's `open` and its `write` — the gate creates
+        // every marker with `write_private_file_exclusive`, so the torn shape is
+        // a zero-length file, not hand-edited residue.
+        ['a torn exclusive intent', 'exclusive-intent', ''],
+        ['a torn recovery blockade', 'recovery-block.json', ''],
+    ] as const)('recovers from %s instead of dead-ending', async (_label, name, contents) => {
+        // Each of these was permanent. The torn intent made
+        // `inspect_sqlite_recovery_gate` throw `exclusive-intent-inspect` from
+        // the line that runs *before* — and gates — the reclamation that is the
+        // only attested way to clear it, while the reader gate spun on the file's
+        // mere presence. The torn blockade was reported by a bare `existsSync` as
+        // a real blockade, so the preserve routed to
+        // `resume_sqlite_basename_preservation`, whose `read_recovery_block` then
+        // threw on `JSON.parse`. Both are one condition: strict parsing on the
+        // inspection path that gates the attested repair.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.store.compare_and_set('/sheet.csv', 0, { activeSheetIndex: 4 });
+        await first.opened.close();
+        opened.length = 0;
+        fs.mkdirSync(gate_directory(), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(gate_directory(), name), contents, { mode: 0o600 });
+
+        // Still refused, and still without hanging: a torn marker obstructs the
+        // reader gate exactly as a well-formed one does, so reporting it is
+        // honest. What changed is that reporting no longer means throwing.
+        const before = snapshot_state_directory();
+        const blocked = await within_no_hang_budget(open());
+        expect(blocked.type).toBe('failed');
+        if (blocked.type !== 'failed') throw new Error('expected a blocked open');
+        expect(blocked.failure.category).toBe('recovery');
+        expect(classify_state_recovery_failure(blocked.failure).canPreserve).toBe(true);
+        // Refused by the *preflight*, which is the load-bearing part: it is
+        // non-blocking and acquires nothing, so it cannot be starved by the
+        // condition it is looking for. Letting a torn marker through to the open
+        // proper would still fail — `assert_preflight_inventory` also tests the
+        // blockade path for presence — but only after acquiring a reader gate,
+        // which is the spin this preflight exists to prevent.
+        expect(blocked.failure.operation).toBe('desktop-state-preflight');
+        // Reported, never cleared by the open itself, and nothing else touched.
+        expect(gate_file_exists(name)).toBe(true);
+        expect(snapshot_state_directory()).toEqual(before);
+
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        expect(gate_file_exists(name)).toBe(false);
+        // Moved, not deleted: an empty marker is evidence that a write was cut
+        // between its `open` and its `write`, which is a different diagnosis from
+        // a marker that was never created.
+        const quarantine_root = path.join(gate_directory(), 'quarantined-gate-markers');
+        const generations = fs.readdirSync(quarantine_root);
+        expect(generations).toHaveLength(1);
+        expect(fs.readdirSync(path.join(quarantine_root, generations[0]))).toEqual([name]);
+        // The database itself was preserved as a unit, not repaired in place.
+        expect(fs.existsSync(desktop_state_database_path(userDataDir))).toBe(false);
+        const preserved = fs.readdirSync(
+            desktop_state_diagnostics_directory(userDataDir),
+            { withFileTypes: true },
+        ).filter((entry) => entry.isDirectory() && entry.name.includes('.recovery.'));
+        expect(preserved).toHaveLength(1);
+        await expect(within_no_hang_budget(open())).resolves.toMatchObject({ type: 'opened' });
+    });
+
+    it('recovers from a reader token whose name is valid but whose contents are not', async () => {
+        // `existing_reader_token_ids` validates only the filename, so this was
+        // inventoried as a live reader: `reclaimStaleReaderToken` then failed its
+        // exact-token check and threw `reader-token-reclaim`, and `waitForReaders`
+        // spun forever on a reader that never existed. The earlier desktop-side
+        // quarantine covered unparseable *names* only, deliberately, so nothing
+        // in the app could clear this shape.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.close();
+        opened.length = 0;
+        const readers = path.join(gate_directory(), 'readers');
+        fs.mkdirSync(readers, { recursive: true, mode: 0o700 });
+        const impostor_id = randomUUID();
+        const impostor = path.join(readers, `${impostor_id}.reader`);
+        fs.writeFileSync(impostor, 'not-its-own-id', { mode: 0o600 });
+
+        const blocked = await within_no_hang_budget(open());
+        expect(blocked.type).toBe('failed');
+        if (blocked.type !== 'failed') throw new Error('expected a blocked open');
+        expect(blocked.failure.category).toBe('recovery');
+        expect(blocked.failure.operation).toBe('reader-token-inventory');
+        expect(classify_state_recovery_failure(blocked.failure))
+            .toMatchObject({ kind: 'coordination-residue', canPreserve: true });
+
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        expect(fs.existsSync(impostor)).toBe(false);
+        const quarantine_root = path.join(gate_directory(), 'quarantined-gate-markers');
+        const generations = fs.readdirSync(quarantine_root);
+        expect(generations).toHaveLength(1);
+        expect(fs.readFileSync(
+            path.join(quarantine_root, generations[0], `${impostor_id}.reader`),
+            'utf8',
+        )).toBe('not-its-own-id');
+        await expect(within_no_hang_budget(open())).resolves.toMatchObject({ type: 'opened' });
+    });
+
+    it('sets aside a second time in one userData directory, keeping the first set intact', async () => {
+        // Recovery used to work exactly once per directory: after a successful
+        // set-aside the app re-creates `file-state.sqlite3`, which made the
+        // *completed* recovery directory validate as incomplete forever, so the
+        // second preserve entered the orphan branch and threw
+        // `orphan-preservation-manifest` — with Try Again failing identically.
+        const first = await open();
+        if (first.type !== 'opened') throw new Error('expected an opened database');
+        await first.opened.store.compare_and_set('/first.csv', 0, { activeSheetIndex: 1 });
+        await first.opened.close();
+        opened.length = 0;
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        const second = await within_no_hang_budget(open());
+        if (second.type !== 'opened') throw new Error('expected a fresh database');
+        await second.opened.store.compare_and_set('/second.csv', 0, { activeSheetIndex: 2 });
+        await second.opened.close();
+        opened.length = 0;
+
+        await within_no_hang_budget(
+            preserve_desktop_state_database(userDataDir, { allProcessesClosed: true }),
+        );
+
+        const state_directory = desktop_state_diagnostics_directory(userDataDir);
+        const recovery_directories = fs.readdirSync(state_directory, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.includes('.recovery.'))
+            .map((entry) => entry.name);
+        // Two distinct sets, side by side. Nothing was overwritten to make room:
+        // each preserve gets its own generation directory.
+        expect(recovery_directories).toHaveLength(2);
+        for (const name of recovery_directories) {
+            const members = fs.readdirSync(path.join(state_directory, name)).sort();
+            expect(members).toEqual(['file-state.sqlite3', 'manifest.json']);
+            const manifest = JSON.parse(fs.readFileSync(
+                path.join(state_directory, name, 'manifest.json'),
+                'utf8',
+            )) as { state?: string };
+            expect(manifest.state).toBe('complete');
+        }
+        // And the *first* preserved database still holds the entry it was
+        // preserved with — the second set-aside did not touch it. It may be the
+        // user's only copy of unsaved work.
+        const contents = recovery_directories.map((name) => {
+            const database = new DatabaseSync(
+                path.join(state_directory, name, 'file-state.sqlite3'),
+                { readOnly: true },
+            );
+            try {
+                return database.prepare('SELECT COUNT(*) AS count FROM entries WHERE path = ?')
+                    .get('/first.csv')?.count;
+            } finally {
+                database.close();
+            }
+        });
+        expect(contents).toContain(1);
+
+        const third = await within_no_hang_budget(open());
+        expect(third.type).toBe('opened');
     });
 
     it('leaves a valid reader token untouched when it quarantines an invalid name', async () => {
@@ -536,7 +919,7 @@ describe('desktop state database', () => {
         // valid one through `reclaimStaleReaderToken`'s exact-id check, the
         // invalid one into quarantine — so only the invalid one still exists.
         expect(fs.existsSync(path.join(readers, `${valid}.reader`))).toBe(false);
-        const quarantine_root = path.join(gate_directory(), 'quarantined-readers');
+        const quarantine_root = path.join(gate_directory(), 'quarantined-gate-markers');
         const generations = fs.readdirSync(quarantine_root);
         expect(generations).toHaveLength(1);
         expect(fs.readdirSync(path.join(quarantine_root, generations[0])))
@@ -566,10 +949,19 @@ describe('desktop state database', () => {
         const categorized = failure as SqliteFileStateError;
         expect(categorized.category).toBe('recovery');
         expect((categorized as unknown as { path?: string }).path).toBeUndefined();
-        for (const secret of [userDataDir, os.tmpdir(), 'file-state.sqlite3', 'readers']) {
+        // The absolute path and the database's own name are the secrets. The
+        // sanitized stage name is not one, even when it happens to contain the
+        // word `readers`: `readers-directory-verify` is a compile-time constant
+        // of the shared backend, already matched by
+        // `[A-Za-z][A-Za-z0-9_-]{0,63}` and already emitted by every other
+        // failure at this stage. Asserting against the bare word would have
+        // forbidden the module from ever naming its own stage, which is the one
+        // diagnostic the failure policy explicitly permits.
+        for (const secret of [userDataDir, os.tmpdir(), 'file-state.sqlite3']) {
             expect(categorized.message).not.toContain(secret);
             expect(JSON.stringify(categorized.metadata)).not.toContain(secret);
         }
+        expect(categorized.metadata.operation).toMatch(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
     });
 
     it('moves nothing when the readers directory is a symlink out of the gate', async () => {
@@ -596,7 +988,7 @@ describe('desktop state database', () => {
 
         // The decoy never moved, and no quarantine tree was created for it.
         expect(fs.readFileSync(decoy, 'utf8')).toBe('outside the gate');
-        expect(fs.existsSync(path.join(gate_directory(), 'quarantined-readers'))).toBe(false);
+        expect(fs.existsSync(path.join(gate_directory(), 'quarantined-gate-markers'))).toBe(false);
     });
 
     it('writes nothing outside the gate when the quarantine name is a symlink', async () => {
@@ -614,7 +1006,7 @@ describe('desktop state database', () => {
         fs.writeFileSync(path.join(readers, 'not-a-uuid.reader'), 'token', { mode: 0o600 });
         const outside = path.join(userDataDir, 'outside');
         fs.mkdirSync(outside, { recursive: true, mode: 0o700 });
-        fs.symlinkSync(outside, path.join(gate_directory(), 'quarantined-readers'));
+        fs.symlinkSync(outside, path.join(gate_directory(), 'quarantined-gate-markers'));
 
         await expect(preserve_desktop_state_database(
             userDataDir,
@@ -650,7 +1042,7 @@ describe('desktop state database', () => {
         )).rejects.toBeInstanceOf(SqliteFileStateError);
 
         expect(fs.readFileSync(decoy, 'utf8')).toBe('outside the gate');
-        expect(fs.existsSync(path.join(outside, 'quarantined-readers'))).toBe(false);
+        expect(fs.existsSync(path.join(outside, 'quarantined-gate-markers'))).toBe(false);
     });
 
     it('reports a non-file on a basename member as its own condition, not a resumed move', async () => {

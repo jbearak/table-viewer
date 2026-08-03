@@ -42,13 +42,15 @@ Both pass `-c.mac.identity=null`, so they never need a certificate. Gatekeeper w
 npm run desktop:package:win   # setup + portable exe, x64 + arm64
 ```
 
-Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling. The release workflow therefore has a separate `desktop-windows` job on a `windows-latest` runner; it invokes exactly this script.
+Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling.
+
+**This script is developer-only; no release publishes its output.** The desktop's view state lives in SQLite, and this build cannot open that database on Windows (see [State and settings](#state-and-settings) below), so a Windows exe built today would be a viewer whose settings never survive a restart. `release-build.yml`'s `desktop-windows` job therefore packages nothing. It reports that and **exits 0**: the macOS release still ships, because Windows being unproven must not withhold the platform that is proven. The missing-artifact guarantee lives in `release-publish.yml`, and which way it falls depends on the trigger — a publish from a pushed tag warns and continues, since the build run's own `success` conclusion is what vouches for it, while a hand-dispatched publish bypasses that conclusion check and therefore fails on an absent `windows-<tag>` artifact unless dispatched with `allow_missing_windows=true`. The rest of this section documents what the script produces locally and what a future unfenced Windows release would ship.
 
 Four exes land in `dist/desktop-packages/`: `table-viewer-<version>-<arch>-setup.exe` and `table-viewer-<version>-<arch>-portable.exe` for each of `x64` and `arm64`. The per-target `artifactName` overrides in `electron-builder.yml` exist because both targets emit `.exe` and would otherwise collide on the shared name, and `nsis.buildUniversalInstaller: false` is what splits the installer per architecture instead of shipping one that carries both payloads.
 
 File associations on Windows are registered by `desktop/installer.nsh` (wired in via `nsis.include`), not by electron-builder's `fileAssociations`. The generated ones write the *default* value of `HKCU\Software\Classes\.csv` — which is how Windows records the default program — so installing would have taken `.xlsx` from Excel. The hand-written version writes a vendor-prefixed ProgID plus an `OpenWithProgids` entry instead, so the app shows up in "Open with…" and the user's default is untouched. This is also why `fileAssociations` is scoped under `mac:` in the config: electron-builder concatenates the root and per-platform lists, so a top-level entry cannot be kept away from Windows.
 
-Windows builds are always unsigned: there is no Authenticode certificate, so nothing in the config or the workflow attempts signing, and CI pins `CSC_IDENTITY_AUTO_DISCOVERY=false` so a certificate sitting in a runner's store can't quietly change the artifact. SmartScreen shows "Windows protected your PC" on first run; the README tells users to click More info → Run anyway.
+Windows builds are always unsigned: there is no Authenticode certificate, so nothing in the config attempts signing. SmartScreen shows "Windows protected your PC" on first run of an unsigned exe. Note that `CSC_IDENTITY_AUTO_DISCOVERY` does *not* apply here despite the generic name — in electron-builder it is read only by `isAutoDiscoveryCodeSignIdentity`, whose sole consumer is the macOS signing path, so it governs Developer ID keychain discovery and has no effect on Windows certificate selection. That is why `release-build.yml` pins it off on the *macOS* packaging step, and why there is nothing to pin for a local Windows build. To keep a certificate in your store from being picked up on Windows, use electron-builder's `win.certificateSubjectName`/`certificateSha1` or `CSC_LINK`, which are the knobs that path actually consults.
 
 The config lives in `desktop/electron-builder.yml`:
 
@@ -63,16 +65,65 @@ The config lives in `desktop/electron-builder.yml`:
 npm run test:desktop-smoke
 ```
 
-Two Playwright Electron specs (`desktop/test-smoke/`) drive the built dev bundle. `desktop-smoke.spec.ts` launches it with a csv and an xlsx fixture and asserts each file opened in its own titled window with its grid rendered, that the windows are independently sized and zoomed, that a column sort applies and clears, that the Edit menu's Copy and Select All reach the grid, and that the Appearance and Color theme preferences repaint the open windows (asserted against CSS custom properties, never rendered pixels — the Glide canvas is not drivable headlessly), and that the About window opens with its version and notice links. `welcome-smoke.spec.ts` launches it with no file and covers the launcher plus File → New Window. They run the real app binary, so they are kept separate from the vitest suite and are not wired into CI (the GitHub Actions Linux runner would need xvfb plus Electron sandbox flags; run it locally on a desktop OS instead).
+Three Playwright Electron specs (`desktop/test-smoke/`) drive the built dev bundle. `desktop-smoke.spec.ts` launches it with a csv and an xlsx fixture and asserts each file opened in its own titled window with its grid rendered, that the windows are independently sized and zoomed, that a column sort applies and clears, that the Edit menu's Copy and Select All reach the grid, and that the Appearance and Color theme preferences repaint the open windows (asserted against CSS custom properties, never rendered pixels — the Glide canvas is not drivable headlessly), and that the About window opens with its version and notice links. `welcome-smoke.spec.ts` launches it with no file and covers the launcher plus File → New Window. `state-relaunch.spec.ts` asserts the plan's relaunch gate: that a clean quit-and-relaunch restores view state from the same `userData` directory, and that a forced termination recovers under the rollback journal on the next launch.
 
-**Leave the machine alone while it runs.** These specs drive a real app on your real desktop, and the menu-routed commands (Edit → Copy, Select All, View → Zoom) stop reaching the grid once the app is no longer frontmost — so switching to another window mid-run fails the suite. It is not a hermetic test: reproduced deliberately by activating another app on a loop, it fails the very first run, always in one of the focus-dependent tests. Everything that *can* be waited for is (see `click_grid_cell` and `focus_viewer`); frontmost-ness is the part no amount of waiting fixes, since taking focus back would just fight whoever is using the machine.
+**Only one of the three runs in CI, and the split is a property of how they are written.** The `desktop-relaunch` job in `.github/workflows/ci.yml` runs `npm run test:desktop-smoke:relaunch` on `macos-latest` — `state-relaunch.spec.ts` alone. It is CI-safe because it drives no menu commands and makes no focus assertions: everything it checks it reads back through the grid's accessibility cell and the state database, neither of which depends on the app being frontmost. **Keep it that way.** A focus assertion or a menu-routed command added to that spec makes the CI job flaky on a shared runner, and it will fail intermittently rather than plainly. Its focus-dependent siblings stay out of CI for exactly that reason (the Linux runner would also need xvfb plus Electron sandbox flags); run the full `npm run test:desktop-smoke` locally on a desktop OS instead.
+
+**Leave the machine alone while the full suite runs.** These specs drive a real app on your real desktop, and the menu-routed commands (Edit → Copy, Select All, View → Zoom) stop reaching the grid once the app is no longer frontmost — so switching to another window mid-run fails the suite. It is not a hermetic test: reproduced deliberately by activating another app on a loop, it fails the very first run, always in one of the focus-dependent tests. Everything that *can* be waited for is (see `click_grid_cell` and `focus_viewer`); frontmost-ness is the part no amount of waiting fixes, since taking focus back would just fight whoever is using the machine.
 
 The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, state store, single-instance lock); the smoke test uses it to isolate each run in a temp directory. It is read from the environment of *any* launch, so treat it as a production override rather than a test-only hook. The single-instance lock is keyed on the userData path Electron is given, so the value is resolved through `canonical_existing_path` (existing prefix via `realpath`) to collapse symlink, relative, and case-different spellings of one directory onto a single key. That is not a full guarantee: two genuinely different userData directories whose `state/` subdirectories are the same physical directory still each win the lock, and no single-process check can detect it — after which "Set Aside and Start Fresh", whose all-processes-closed attestation authorizes reclaiming a peer's reader token by exact id, would move the database out from under the other instance's live handle. Do not point it at a location another Table Viewer instance is using.
 
 ## State and settings
 
-- Per-file view state: `userData/state/tableViewer.fileState.v1.json` (same envelope schema as the VS Code extension's globalState store; not shared between the two in v1).
+- Per-file view state: `userData/state/file-state.sqlite3`, a SQLite database in
+  rollback-journal mode (`journal_mode=DELETE`, `synchronous=FULL`). Its hot
+  `-journal` sidecar belongs to it and is never separated from it — the two are
+  preserved, moved, and recovered as one set. Coordination markers live beside it
+  in `.file-state.sqlite3.recovery-gate/`, and a set-aside database is moved to a
+  sibling `file-state.sqlite3.recovery.<uuid>/` directory rather than deleted.
+  Physically separate from the VS Code extension's database; no state is shared
+  or synchronized between the two.
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
+
+The desktop app requires a platform on which a directory flush can be proven
+durable. Windows currently has no such primitive available without a native
+addon, so the app declines the platform up front rather than running with view
+state it cannot persist; `desktop/packaged-recovery-gate.mjs` asserts that
+refusal on Windows and the full recovery matrix elsewhere.
+
+### Windows durability verification
+
+Windows is not a dropped target. The refusal above is a statement about
+*evidence*, not about Windows, so `desktop/windows-durability-probe.mjs` runs on
+the CI `windows-durability` job to gather it: which flush and write-through
+primitives the packaged Electron runtime can actually reach, what each one
+guarantees and what it does not, what the volume's filesystem really is (reported,
+not assumed), and — as a skeleton, one or two representative cut points today —
+what a kill-crash at a durable cut point leaves behind. It emits one JSON object
+with a `verdict` of `verified`, `not-verified`, or `inconclusive`, derived from
+those observations rather than written down.
+
+The decision tree the verdict feeds, both branches of which are explicit:
+
+- **The gate verifies.** Windows ships the SQLite state backend on exactly the
+  evidence standard macOS ships on — a documented durability contract plus
+  kill-crash verification against the packaged runtime, which is the same trust
+  basis `fsync` gives on POSIX. Only then is
+  `assert_sqlite_directory_durability_supported` revisited.
+- **The gate cannot verify.** Windows ships view-only, exactly as it does today:
+  files open and display, and the persistent state backend is declined up front.
+
+Neither branch permits silent weakening. A `not-verified` verdict is a result and
+does **not** fail CI — a job that failed on an unproven primitive would only
+create pressure to find a way to make it pass. Only a malfunction of the probe
+itself fails. Equally, a `verified` verdict is unreachable from a partial run: the
+report lists covered *and* pending cut points, and the verdict requires the matrix
+to be complete, so two green cut points can never be mistaken for verification.
+Completing that matrix is the next step; extending `REPRESENTATIVE_CUT_POINTS` in
+the probe is all it takes mechanically.
+
+Run it locally on a Windows machine with `npm run probe:windows:durability`. On
+any other platform it reports that it did not run and exits 0.
 
 The font family and font size preferences style the whole app — viewer windows, the welcome window, the Preferences window itself, and the About window — mirroring how the extension's font settings apply to its entire UI. Worksheet tabs (the sheet strip *inside* an Excel file) default to a vertical orientation.
 

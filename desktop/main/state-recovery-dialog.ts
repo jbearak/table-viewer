@@ -49,12 +49,23 @@ export type StateRecoveryChoice = 'retry' | 'open-diagnostics' | 'quit' | 'prese
  *                 negotiates. An ownership/version error, NOT corruption — the
  *                 file may be perfectly valid and belong to another product or
  *                 a newer build.
- * - `unsupported-platform` this build cannot store its view settings here at
- *                 all, because a durability guarantee it requires is not
- *                 available on this system or location. Nothing is wrong with
- *                 any data and nobody else owns it: the app simply refuses to
- *                 pretend a flush happened. Preservation is *impossible* here,
- *                 not merely unhelpful — see `can_preserve`.
+ * - `unsupported-platform` this build declines to store its view settings on
+ *                 this operating system *at all*. Declared up front by
+ *                 `desktop_state_platform_support` before anything is opened or
+ *                 created, not diagnosed from a failed open. Nothing is wrong
+ *                 with any data and nobody else owns it: the durability
+ *                 primitive the storage protocol is built on has no proven
+ *                 implementation here, and the app refuses to pretend a flush
+ *                 happened. Preservation is *impossible*, not merely unhelpful —
+ *                 see `can_preserve`.
+ * - `unsupported-location` the same missing guarantee, but discovered at the
+ *                 storage location on a system this build does support — an
+ *                 exotic or network filesystem whose directory flush is
+ *                 unavailable. Distinct from the above because the *action*
+ *                 differs: this one can be fixed today by putting the settings
+ *                 somewhere else, while the platform refusal can only be fixed
+ *                 by a later build. Telling either story in place of the other
+ *                 sends the user after a fix that does not exist.
  * - `interrupted` a previous preserve/move did not finish. The preserve action
  *                 resumes that state machine rather than starting a new one.
  * - `leftover-setup` a first-run initialization did not finish, leaving setup
@@ -84,6 +95,7 @@ export type StateRecoveryKind =
     | 'corrupt'
     | 'compatibility'
     | 'unsupported-platform'
+    | 'unsupported-location'
     | 'interrupted'
     | 'leftover-setup'
     | 'obstructed'
@@ -228,12 +240,14 @@ export function state_recovery_wording(kind: StateRecoveryKind): StateRecoveryWo
         case 'unsupported-platform':
             // Neither corruption nor ownership: the durability primitive this
             // build requires in order to promise that a saved setting survived a
-            // power loss is simply not available here, and the app refuses to
-            // pretend otherwise rather than storing settings it cannot stand
-            // behind. Saying "another product owns them" here would be a false
-            // statement about ownership, and offering to set them aside would
-            // offer an action that cannot even run — moving files needs the same
-            // guarantee that is missing.
+            // power loss is simply not available on this operating system, and the
+            // app refuses to pretend otherwise rather than storing settings it
+            // cannot stand behind. Saying "another product owns them" here would be
+            // a false statement about ownership, and offering to set them aside
+            // would offer an action that cannot even run — moving files needs the
+            // same guarantee that is missing. It also must not suggest a different
+            // location: nowhere on this system answers differently, so that advice
+            // would send the user after a fix that does not exist.
             return {
                 message: 'This build of Table Viewer cannot store its view settings on this'
                     + ' system.',
@@ -243,6 +257,26 @@ export function state_recovery_wording(kind: StateRecoveryKind): StateRecoveryWo
                     + ' nothing has been changed or moved. Support for viewing on this system is'
                     + ' still being completed. Your CSV, TSV, and spreadsheet files are'
                     + ' unaffected.',
+            };
+        case 'unsupported-location':
+            // The same missing guarantee, but only where the settings are being
+            // kept — the rest of the system answers normally. That difference is
+            // the entire content of this arm: there is an action the user can take
+            // today, and the platform arm above must not be borrowed here or it
+            // would tell someone with a fixable problem that they have to wait for
+            // a future build. Preservation is excluded for the same reason it is
+            // there: the move runs through the exclusive recovery gate, which
+            // needs the very flush that is unavailable at this location.
+            return {
+                message: 'Table Viewer cannot safely keep its saved view settings where they'
+                    + ' are being stored.',
+                detail: 'The place they are kept — often a network drive or an unusual disk'
+                    + ' format — cannot give Table Viewer the guarantee it needs that a saved'
+                    + ' setting has really reached the disk, and it will not save settings it'
+                    + ' cannot promise to keep. Nothing is wrong with any of your data, and'
+                    + ' nothing has been changed or moved. Running Table Viewer with its settings'
+                    + ' kept on an ordinary local disk resolves this. Your CSV, TSV, and'
+                    + ' spreadsheet files are unaffected.',
             };
         case 'interrupted':
             return {
@@ -430,8 +464,13 @@ export const KIND_BY_CATEGORY: Readonly<
     schema: 'compatibility',
     // A durability primitive this build requires is absent. Its own story: no
     // ownership claim is true here, and preservation cannot even run — the move
-    // needs the same missing guarantee.
-    unsupported: 'unsupported-platform',
+    // needs the same missing guarantee. Defaults to the *location* story, which
+    // is the conservative choice of the two: it offers a fix the user can try,
+    // where the platform story tells them to wait for a future build. Being
+    // wrong in that direction costs one failed attempt; being wrong the other way
+    // strands someone whose problem was solvable. `desktop_state_platform_support`
+    // labels the whole-platform case explicitly and it is refined out below.
+    unsupported: 'unsupported-location',
     // Defaults to a genuinely interrupted preserve; an orphaned first-run setup
     // is refined out below.
     recovery: 'interrupted',
@@ -478,7 +517,17 @@ export const REFINED_ONLY_KINDS: readonly StateRecoveryKind[] = [
     'leftover-setup',
     'obstructed',
     'coordination-residue',
+    'unsupported-platform',
 ];
+
+/** The stage `desktop_state_platform_support` reports when the durability
+ *  refusal held at the intended location *and* at an unrelated control location,
+ *  i.e. when it is a property of the operating system rather than of one
+ *  filesystem. Kept in sync with
+ *  `DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION`, which is where it is
+ *  produced; the pairing is pinned by a test rather than by an import, because
+ *  this module is deliberately free of backend dependencies. */
+const PLATFORM_DURABILITY_OPERATION = 'platform-durability-unsupported';
 
 /**
  * Resolve the two categories whose single name covers two different stories.
@@ -519,6 +568,16 @@ export const REFINED_ONLY_KINDS: readonly StateRecoveryKind[] = [
  *   a shorter truncation was told as ownership.) `raw-application-id` is
  *   deliberately *not* refined — a well-formed SQLite file carrying someone
  *   else's application id is exactly what `compatibility` describes.
+ * - `unsupported` is one missing guarantee with two opposite remedies. Told as
+ *   the location story it says "keep the settings on an ordinary local disk",
+ *   which is exactly right for a network mount and exactly wrong on Windows,
+ *   where nowhere on the machine answers differently and the advice sends the
+ *   user hunting for a setting that cannot help. Told as the platform story it
+ *   says "wait for a later build", which is right on Windows and strands someone
+ *   whose network drive was the whole problem. Only
+ *   `desktop_state_platform_support` can tell them apart — it asks the intended
+ *   location and an unrelated control location and compares — so only its stage
+ *   is refined, and every other `unsupported` keeps the remedy-offering default.
  */
 export function refine_state_recovery_kind(
     failure: StateRecoveryFailure,
@@ -530,6 +589,9 @@ export function refine_state_recovery_kind(
     }
     if (failure.category === 'schema' && failure.operation === RAW_HEADER_OPERATION) {
         return 'corrupt';
+    }
+    if (failure.category === 'unsupported' && failure.operation === PLATFORM_DURABILITY_OPERATION) {
+        return 'unsupported-platform';
     }
     if (failure.category === 'recovery') {
         if (failure.operation === ABSENT_MAIN_EVIDENCE_OPERATION) return 'leftover-setup';
@@ -545,14 +607,15 @@ function can_preserve(kind: StateRecoveryKind): boolean {
     // location the move itself cannot succeed, and offering it would promise a
     // quarantine that never happened. `capacity` is excluded for the mirror
     // reason — a move needs room, and the honest message is that the change was
-    // rolled back and nothing was lost. `unsupported-platform` is the strongest
+    // rolled back and nothing was lost. Both unsupported kinds are the strongest
     // case of the same rule: preservation runs through
     // `acquire_sqlite_exclusive_recovery_gate`, which asserts the very
     // durability primitive that is missing, so the move would fail identically
     // on every attempt — offering it produces a dialog loop whose only exit is
-    // Quit. Retry stays offered for all three: a different location or mount can
-    // answer differently, and the failure table treats an unsupported primitive
-    // as an explicit refusal, never as corruption or as someone else's ownership.
+    // Quit. Retry stays offered for all of them: a different location or mount
+    // can answer differently, and the failure table treats an unsupported
+    // primitive as an explicit refusal, never as corruption or as someone else's
+    // ownership.
     //
     // `obstructed` is excluded for the same reason as `unsupported-platform`, and
     // provably so: the preserve action inventories the very name that is
@@ -563,7 +626,8 @@ function can_preserve(kind: StateRecoveryKind): boolean {
     // the name — is something Table Viewer must not do, because it did not create
     // it; so the prose points the user at the diagnostics folder instead.
     return kind !== 'environment' && kind !== 'capacity'
-        && kind !== 'unsupported-platform' && kind !== 'obstructed';
+        && kind !== 'unsupported-platform' && kind !== 'unsupported-location'
+        && kind !== 'obstructed';
 }
 
 /** Reduce a failure to exactly what a dialog may see. */

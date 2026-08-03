@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SqliteFileStateError } from '../sqlite-file-state-errors';
@@ -20,10 +20,12 @@ import {
     inventory_sqlite_basename,
     open_existing_sqlite_database,
     preserve_sqlite_basename_set,
+    quarantine_malformed_sqlite_gate_markers,
     read_sqlite_raw_header,
     reclaim_stale_sqlite_exclusive_intent,
     recognize_sqlite_initialization_candidate,
     resume_sqlite_basename_preservation,
+    sqlite_directory_durability_is_platform_unsupported,
     type SqliteOpenRecoveryEvent,
 } from '../sqlite-open-recovery';
 
@@ -172,8 +174,11 @@ describe('basename-scoped recovery gate', () => {
         expect(exclusive.listReaderTokenIds()).toEqual([reader.tokenId]);
         expect(inspect_sqlite_recovery_gate(databasePath())).toEqual({
             exclusiveIntentTokenId: exclusive.tokenId,
+            exclusiveIntentMalformed: false,
             readerTokenIds: [reader.tokenId],
+            malformedReaderTokenNames: [],
             recoveryBlocked: false,
+            recoveryBlockMalformed: false,
         });
 
         await expectCategory(
@@ -220,7 +225,17 @@ describe('basename-scoped recovery gate', () => {
         const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
 
         expect(() => exclusive.listReaderTokenIds()).toThrow(SqliteFileStateError);
-        expect(() => inspect_sqlite_recovery_gate(databasePath())).toThrow(SqliteFileStateError);
+        // Inspection *classifies* this rather than throwing, which is the whole
+        // point of separating it from the two enforcement callers: the entry is
+        // reported as malformed alongside the valid token, so the attested
+        // quarantine — the only thing allowed to clear it — is reachable. It
+        // used to throw from here, which is precisely what made the condition
+        // permanent: the open failed and the recovery action failed at the same
+        // line. Enforcement stays strict, as `listReaderTokenIds` above proves.
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            readerTokenIds: [reader.tokenId],
+            malformedReaderTokenNames: ['not-a-uuid.reader'],
+        });
         await expectCategory(
             exclusive.reclaimStaleReaderToken(reader.tokenId, { allProcessesClosed: true }),
             'recovery',
@@ -292,6 +307,874 @@ describe('basename-scoped recovery gate', () => {
     });
 });
 
+describe('attested quarantine of malformed gate markers', () => {
+    const attested = { allProcessesClosed: true } as const;
+
+    function gateDirectory(): string {
+        return path.join(tempDirectory, '.file-state.sqlite3.recovery-gate');
+    }
+
+    function readersDirectory(): string {
+        return path.join(gateDirectory(), 'readers');
+    }
+
+    /**
+     * The quarantine subtree the module creates, by name.
+     *
+     * Used by the become-valid-mid-run tests as their cut point: its appearance
+     * means classification is finished and the renames have not started, which is
+     * exactly the window those tests need and is observable rather than counted.
+     */
+    function quarantineRoot(): string {
+        return path.join(gateDirectory(), 'quarantined-markers');
+    }
+
+    /** The single quarantine generation one run creates, as an absolute path. */
+    function soleQuarantineGeneration(): string {
+        const root = path.join(gateDirectory(), 'quarantined-markers');
+        const generations = fs.readdirSync(root);
+        expect(generations).toHaveLength(1);
+        return path.join(root, generations[0]);
+    }
+
+    /** Exactly what a crash between the marker's `open` and its `write` leaves:
+     *  the entry exists and is empty. Not hand-edited residue — the gate's own
+     *  `write_private_file_exclusive` creates every marker this way. */
+    function tearMarker(name: string): string {
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const markerPath = path.join(gateDirectory(), name);
+        fs.writeFileSync(markerPath, '', { mode: 0o600 });
+        return markerPath;
+    }
+
+    it('classifies a torn exclusive intent instead of throwing, and quarantines it', async () => {
+        const intentPath = tearMarker('exclusive-intent');
+
+        // Before: inspection threw `exclusive-intent-inspect` from here, and it
+        // runs *before* — and gates — `reclaim_stale_sqlite_exclusive_intent`,
+        // the only attested path that could have cleared the file. So the torn
+        // marker made both the open and the recovery action fail identically,
+        // forever, while the reader gate spun on the marker's mere presence.
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        expect(inspected.exclusiveIntentMalformed).toBe(true);
+        // Absent as a property, not merely undefined: `preflight_recovery_condition`
+        // and the reclamation both discriminate on presence.
+        expect('exclusiveIntentTokenId' in inspected).toBe(false);
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(intentPath)).toBe(false);
+        // Moved, never deleted: the empty file is evidence that a write was cut
+        // between its `open` and its `write`, which is a different diagnosis
+        // from a marker that was never created at all.
+        expect(fs.readdirSync(soleQuarantineGeneration())).toEqual(['exclusive-intent']);
+        expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentMalformed).toBe(false);
+        // The birth-time capability probe leaves nothing behind. It writes a
+        // throwaway file into this very directory to decide whether `createdAt` is a
+        // usable discriminator here, and a leaked probe file would sit in the gate
+        // directory of every user who ever hit the quarantine — listed by the
+        // diagnostics window as unexplained residue next to real evidence.
+        expect(fs.readdirSync(gateDirectory()).filter((name) => name.includes('birthtime')))
+            .toEqual([]);
+        // And the gate is acquirable again, which is the escape that did not exist.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        await exclusive.release();
+    });
+
+    it.each([
+        ['exclusive-intent'],
+        ['recovery-block.json'],
+    ] as const)('classifies an oversized %s as malformed without reading it whole', async (name) => {
+        // These markers are read on the *startup* path, in the main process, before
+        // any window or dialog exists. Nothing this module writes could produce a
+        // large one — an intent is a uuid, a blockade is a three-field object — but
+        // they are plain files in a user-visible directory, and a backup restore, a
+        // sync client, or an unrelated tool can leave anything at all on the name. An
+        // unbounded read there hangs or OOMs the launch with no UI to explain it,
+        // which contradicts this module's whole posture: a damaged gate produces a
+        // dialog, never a dead process.
+        //
+        // A *sparse* 8 GiB file: `ftruncate` gives it that apparent size while using
+        // almost no blocks, so the test stays fast and does not need 8 GiB of disk.
+        // It is also the decisive size rather than a merely large one — an unbounded
+        // `readFileSync` on it fails `ERR_STRING_TOO_LONG`, which is not ENOENT and so
+        // propagates out of inspection as `recovery-gate-inspect`: the preflight
+        // refuses the open, the quarantine throws from the same shape, and the dialog
+        // loops with no exit. That is the permanent dead-end this module is built to
+        // never have, and it is what the bound prevents. A merely large file would
+        // parse successfully and prove nothing.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const markerPath = path.join(gateDirectory(), name);
+        const descriptor = fs.openSync(markerPath, 'w', 0o600);
+        fs.ftruncateSync(descriptor, 8 * 1024 * 1024 * 1024);
+        fs.closeSync(descriptor);
+
+        // Malformed, not valid and not absent: an oversized file obstructs everything
+        // a well-formed marker would, so it must be visible to inspection.
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        if (name === 'exclusive-intent') {
+            expect(inspected.exclusiveIntentMalformed).toBe(true);
+            // Emphatically not reported as a token id: `reclaim_stale_sqlite_exclusive_intent`
+            // *unlinks* what it is given, and its guard is a bare contents comparison.
+            expect('exclusiveIntentTokenId' in inspected).toBe(false);
+        } else {
+            expect(inspected.recoveryBlockMalformed).toBe(true);
+            expect(inspected.recoveryBlocked).toBe(false);
+        }
+
+        // And the escape works: the attested quarantine moves it, so the gate is
+        // usable again rather than permanently blocked by an unparseable file.
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(markerPath)).toBe(false);
+        // Moved, not truncated or deleted: it is still evidence, at its full size.
+        expect(fs.statSync(path.join(soleQuarantineGeneration(), name)).size)
+            .toBe(8 * 1024 * 1024 * 1024);
+    });
+
+    it('treats an oversized reader token as malformed, never as a live reader', async () => {
+        // The same bound on the readers directory, where it matters most: this read
+        // runs once per entry, so an unbounded one is the startup hang multiplied by
+        // however many entries are present. Classifying it as a live token would be
+        // worse than slow — `waitForReaders` would then block forever on a reader
+        // that never existed.
+        const tokenId = '00000000-0000-4000-8000-000000000001';
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const tokenPath = path.join(readersDirectory(), `${tokenId}.reader`);
+        // Sparse and past the string limit, for the reason given in the sibling above:
+        // unbounded, this read throws ERR_STRING_TOO_LONG and turns inspection itself
+        // into the dead-end totality exists to prevent.
+        const descriptor = fs.openSync(tokenPath, 'w', 0o600);
+        fs.ftruncateSync(descriptor, 8 * 1024 * 1024 * 1024);
+        fs.closeSync(descriptor);
+
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        expect(inspected.readerTokenIds).toEqual([]);
+        expect(inspected.malformedReaderTokenNames).toEqual([`${tokenId}.reader`]);
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(tokenPath)).toBe(false);
+        // The enforcer agrees, which is the property that keeps the gate acquirable.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        expect(exclusive.listReaderTokenIds()).toEqual([]);
+        await exclusive.waitForReaders();
+        await exclusive.release();
+    });
+
+    it.each([
+        ['zero-length', ''],
+        ['non-UUID text', 'garbage-not-a-token'],
+        ['UUID-shaped but not a v4 UUID', '00000000-0000-0000-0000-000000000000'],
+    ] as const)('quarantines rather than reclaims a %s exclusive intent', async (_label, contents) => {
+        // Classification is what decides *which* clearing path an intent takes,
+        // and the two paths differ in a way the constraints care about:
+        // quarantine **moves**, while `reclaim_stale_sqlite_exclusive_intent`
+        // **unlinks**. Its guard is `exact_token_matches`, a bare contents
+        // comparison with no shape check at all — so anything the classifier
+        // reports as a valid token id can be handed straight back to it and
+        // deleted. Only `classify_exclusive_intent`'s UUID check keeps a
+        // non-token out of that path, which makes it the line standing between
+        // "evidence preserved" and "evidence destroyed", not a cosmetic filter.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const intentPath = path.join(gateDirectory(), 'exclusive-intent');
+        fs.writeFileSync(intentPath, contents, { mode: 0o600 });
+
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        expect(inspected.exclusiveIntentMalformed).toBe(true);
+        // Never offered as a reclaimable token id: the desktop feeds exactly
+        // this field to `reclaim_stale_sqlite_exclusive_intent`.
+        expect('exclusiveIntentTokenId' in inspected).toBe(false);
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        // Moved with its bytes intact, not unlinked. Asserting only that the
+        // live gate no longer holds it would pass against a delete.
+        expect(fs.existsSync(intentPath)).toBe(false);
+        expect(fs.readFileSync(
+            path.join(soleQuarantineGeneration(), 'exclusive-intent'),
+            'utf8',
+        )).toBe(contents);
+    });
+
+    it('classifies a torn recovery block instead of routing it to an unparseable resume', async () => {
+        const blockPath = tearMarker('recovery-block.json');
+
+        // `existsSync` reported this as a genuine blockade, so the desktop routed
+        // to `resume_sqlite_basename_preservation`, whose `read_recovery_block`
+        // then threw on `JSON.parse` — a blockade nothing could lift.
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            recoveryBlocked: false,
+            recoveryBlockMalformed: true,
+        });
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(blockPath)).toBe(false);
+        expect(fs.readdirSync(soleQuarantineGeneration())).toEqual(['recovery-block.json']);
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            recoveryBlocked: false,
+            recoveryBlockMalformed: false,
+        });
+    });
+
+    it('classifies a reader token whose name is valid but whose contents are not', async () => {
+        // The strict inventory validates only the filename, so this was counted
+        // as a live reader: `reclaimStaleReaderToken` then failed its exact-token
+        // check and `waitForReaders` spun on a reader that never existed. The
+        // desktop-side quarantine covered unparseable *names* only, by design, so
+        // nothing could clear it.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const impostorId = '00000000-0000-4000-8000-000000000001';
+        const impostorPath = path.join(readersDirectory(), `${impostorId}.reader`);
+        fs.writeFileSync(impostorPath, 'not-its-own-id', { mode: 0o600 });
+
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            readerTokenIds: [],
+            malformedReaderTokenNames: [`${impostorId}.reader`],
+        });
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(impostorPath)).toBe(false);
+        expect(fs.readFileSync(
+            path.join(soleQuarantineGeneration(), `${impostorId}.reader`),
+            'utf8',
+        )).toBe('not-its-own-id');
+        // The exclusive wait now completes instead of spinning forever.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        await exclusive.waitForReaders();
+        await exclusive.release();
+    });
+
+    it('leaves a valid intent and a valid reader token completely untouched', async () => {
+        // The exact-token semantics the quarantine may not weaken: a well-formed
+        // marker is indistinguishable from a live peer's, so clearing one stays
+        // the exclusive gate's exact-id path. There is no age, PID, TTL, or
+        // heartbeat here — the impostor is set aside for what it *is*, not for
+        // how old it is, which is why its timestamps are made ancient and the
+        // valid token's are not.
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        const validTokenPath = path.join(readersDirectory(), `${reader.tokenId}.reader`);
+        const impostorPath = path.join(readersDirectory(), 'not-a-uuid.reader');
+        fs.writeFileSync(impostorPath, 'impostor', { mode: 0o600 });
+        fs.utimesSync(validTokenPath, new Date(0), new Date(0));
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.readFileSync(validTokenPath, 'utf8')).toBe(reader.tokenId);
+        expect(fs.readFileSync(path.join(tempDirectory, '.file-state.sqlite3.recovery-gate', 'exclusive-intent'), 'utf8'))
+            .toBe(exclusive.tokenId);
+        expect(fs.readdirSync(soleQuarantineGeneration())).toEqual(['not-a-uuid.reader']);
+        // Still the live gate's own markers afterwards, by the gate's own checks.
+        expect(exclusive.listReaderTokenIds()).toEqual([reader.tokenId]);
+        await reader.release();
+        await exclusive.release();
+    });
+
+    it('moves all three malformed shapes in one attested run and creates one generation', async () => {
+        tearMarker('exclusive-intent');
+        tearMarker('recovery-block.json');
+        fs.writeFileSync(path.join(readersDirectory(), 'not-a-uuid.reader'), 'x', { mode: 0o600 });
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(3);
+        expect(fs.readdirSync(soleQuarantineGeneration()).sort()).toEqual([
+            'exclusive-intent',
+            'not-a-uuid.reader',
+            'recovery-block.json',
+        ]);
+        expect(fs.readdirSync(readersDirectory())).toEqual([]);
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentMalformed: false,
+            malformedReaderTokenNames: [],
+            recoveryBlockMalformed: false,
+        });
+    });
+
+    it.each([
+        ['wrong format', (block: any) => { block.format = 'tableViewer.sqliteRecoveryBlock.v2'; }],
+        ['missing format', (block: any) => { delete block.format; }],
+        ['non-string generation', (block: any) => { block.generation = 7; }],
+        // The generation *and* the directory name are moved together, so the
+        // directory-name check is satisfied and only the UUID check can reject
+        // this. Mutating the generation alone would be caught by the other
+        // clause, leaving the UUID check itself unpinned.
+        ['self-consistent non-UUID generation', (block: any) => {
+            block.generation = 'not-a-uuid';
+            block.recoveryDirectoryName = 'file-state.sqlite3.recovery.not-a-uuid';
+        }],
+        ['foreign recovery directory', (block: any) => {
+            block.recoveryDirectoryName = `other.sqlite3.recovery.${block.generation}`;
+        }],
+        ['generation/directory disagreement', (block: any) => {
+            block.recoveryDirectoryName
+                = 'file-state.sqlite3.recovery.00000000-0000-4000-8000-0000000000ff';
+        }],
+    ] as const)('classifies a blockade with %s as malformed, exactly as the enforcer rejects it', async (
+        _label,
+        mutate,
+    ) => {
+        // The acceptance boundary of `parse_recovery_block`, pinned from *both*
+        // sides at once. `classify_recovery_block` and `read_recovery_block`
+        // share that one predicate rather than each carrying a copy, and this is
+        // what makes weakening it visible: a laxer predicate would report the
+        // marker as a legitimate blockade here, the desktop would route to
+        // `resume_sqlite_basename_preservation` on that word, and the enforcer
+        // would then refuse to parse the very file the classifier vouched for —
+        // dead-end (b), reintroduced by editing one of two duplicated checks.
+        //
+        // Asserting the two *agree* would only pin the shapes enumerated below.
+        // Sharing the predicate is what makes disagreement unrepresentable; these
+        // cases pin the boundary itself so a shared weakening is caught too.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const block: Record<string, unknown> = {
+            format: 'tableViewer.sqliteRecoveryBlock.v1',
+            generation: '00000000-0000-4000-8000-000000000001',
+            recoveryDirectoryName:
+                'file-state.sqlite3.recovery.00000000-0000-4000-8000-000000000001',
+        };
+        mutate(block);
+        const blockPath = path.join(gateDirectory(), 'recovery-block.json');
+        fs.writeFileSync(blockPath, JSON.stringify(block), { mode: 0o600 });
+
+        // Classifier side: malformed, never a valid blockade.
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            recoveryBlocked: false,
+            recoveryBlockMalformed: true,
+        });
+
+        // Enforcer side, through the resume path that reads the same marker: it
+        // refuses rather than acting on it. Reached with a real exclusive gate so
+        // this is the production path, not a direct call to an internal.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        await expectCategory(
+            resume_sqlite_basename_preservation(databasePath(), { gate: exclusive }),
+            'recovery',
+        );
+
+        // And the attested quarantine can clear it, which is the escape that a
+        // marker classified valid-but-unreadable would never have reached.
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(result.movedCount).toBe(1);
+        expect(fs.readdirSync(soleQuarantineGeneration())).toEqual(['recovery-block.json']);
+        expect(fs.existsSync(blockPath)).toBe(false);
+    });
+
+    it.each([
+        ['bare parent', '..'],
+        ['parent-relative sibling', '../SIBLING'],
+        ['nested traversal', '../../ESCAPE'],
+        // The worst shape: an empty, recovery-directory-shaped entry in the
+        // basename namespace is exactly what `find_empty_pre_manifest_preservation`
+        // selects and what `inventory_sqlite_basename` counts as incomplete. Two
+        // of them make `orphan-preservation-count` throw and
+        // `preserve_sqlite_basename_set` refuse outright — the primitive whose
+        // only job is restoring recoverability manufacturing an unrecoverable
+        // state instead.
+        ['recovery-directory shape', '../file-state.sqlite3.recovery.00000000-0000-4000-8000-0000000000aa'],
+        ['nested path', 'nested/child'],
+        ['current directory', '.'],
+        ['empty', ''],
+    ] as const)('refuses a %s quarantine name and creates nothing outside the gate', async (
+        _label,
+        quarantineDirectoryName,
+    ) => {
+        // The name reaches `path.join(gate.physicalPath, name)`, so a traversal
+        // escapes the gate entirely. `capture_managed_directory` does reject it
+        // — but only *after* `mkdirSync` already created the directory somewhere
+        // else, and the failing path then leaves it behind. So the parent
+        // listing, not merely the thrown category, is the assertion that matters:
+        // a check placed after the mkdir passes a category-only test.
+        const intentPath = tearMarker('exclusive-intent');
+        const parentBefore = fs.readdirSync(tempDirectory).sort();
+        const gateBefore = fs.readdirSync(gateDirectory()).sort();
+
+        const error = await expectCategory(
+            quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+                quarantineDirectoryName,
+            }),
+            'recovery',
+        );
+
+        expect(error.message).not.toContain(tempDirectory);
+        // Nothing created anywhere: not beside the gate, not in the basename
+        // namespace, not inside the gate itself.
+        expect(fs.readdirSync(tempDirectory).sort()).toEqual(parentBefore);
+        expect(fs.readdirSync(gateDirectory()).sort()).toEqual(gateBefore);
+        // And the marker it was asked to quarantine is untouched, so the refusal
+        // is total rather than partial.
+        expect(fs.existsSync(intentPath)).toBe(true);
+    });
+
+    it.each([
+        ['reader token', 'token'],
+        ['exclusive intent', 'intent'],
+        ['recovery blockade', 'block'],
+    ] as const)('does not move a %s that becomes valid between classification and rename', async (
+        _label,
+        kind,
+    ) => {
+        // Not an injected-hook artifact: this is precisely the transient
+        // `write_private_file_exclusive` produces — `openSync('wx')` → *(a
+        // zero-length file exists right here)* → `writeFileSync` → `fsync`. A
+        // live peer mid-`acquire_sqlite_shared_reader_gate` sits in that state
+        // for real, and two `mkdirSync`, two `flush_directory`, and a
+        // `capture_managed_directory` separate classification from the first
+        // rename. Moving the file anyway evicted a live reader on content shape
+        // alone, with none of the exact-id attestation this primitive promises:
+        // the peer's write then landed in the moved file and it returned a gate
+        // it believed was live, while a fresh exclusive gate saw no readers.
+        const tokenId = '00000000-0000-4000-8000-000000000001';
+        const generationId = '00000000-0000-4000-8000-0000000000cc';
+        const completions = {
+            token: {
+                markerPath: path.join(readersDirectory(), `${tokenId}.reader`),
+                becomesValid: tokenId,
+            },
+            intent: {
+                markerPath: path.join(gateDirectory(), 'exclusive-intent'),
+                becomesValid: '00000000-0000-4000-8000-0000000000bb',
+            },
+            block: {
+                markerPath: path.join(gateDirectory(), 'recovery-block.json'),
+                becomesValid: JSON.stringify({
+                    format: 'tableViewer.sqliteRecoveryBlock.v1',
+                    generation: generationId,
+                    recoveryDirectoryName: `file-state.sqlite3.recovery.${generationId}`,
+                }),
+            },
+        }[kind];
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        // The zero-length instant, exactly as a crash or an in-flight peer leaves it.
+        fs.writeFileSync(completions.markerPath, '', { mode: 0o600 });
+
+        let peerCompleted = false;
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+            // Keyed on the quarantine root appearing, not on a flush ordinal — see
+            // `quarantineRoot`. Its existence means classification is finished and
+            // no rename has started, which is the window this test needs, and it is
+            // observable rather than counted.
+            fsyncDirectory(descriptor) {
+                if (!peerCompleted && fs.existsSync(quarantineRoot())) {
+                    peerCompleted = true;
+                    fs.writeFileSync(completions.markerPath, completions.becomesValid);
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+
+        expect(peerCompleted).toBe(true);
+        // Left alone: the marker is valid now, whatever it looked like when it
+        // was classified, so clearing it belongs to the exclusive gate's
+        // exact-id path and not to this one.
+        expect(result.movedCount).toBe(0);
+        expect(fs.readFileSync(completions.markerPath, 'utf8')).toBe(completions.becomesValid);
+        // Nothing was quarantined. A generation directory is only created when a
+        // move is attempted and only kept when one succeeded, so after a wholly
+        // refused run there is either no root at all or no generation under it.
+        const generations = fs.existsSync(quarantineRoot())
+            ? fs.readdirSync(quarantineRoot())
+            : [];
+        expect(generations).toEqual([]);
+    });
+
+    it('still moves a marker whose bytes churn but never become a token', async () => {
+        // The other side of the re-check: it must refuse markers that turned
+        // *valid*, not refuse everything. Written same-length and in place, so
+        // device, inode, and size all still match and only the validity question
+        // decides — without this case, a `move` that returned early
+        // unconditionally would satisfy every "does not move" test above while
+        // silently making the whole primitive a no-op.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const intentPath = path.join(gateDirectory(), 'exclusive-intent');
+        fs.writeFileSync(intentPath, 'aaaaaaaa', { mode: 0o600 });
+        const before = fs.lstatSync(intentPath);
+
+        // Keyed on the quarantine root appearing rather than on a flush ordinal, and
+        // one-shot so the rewrite happens exactly once. `rewritten` is asserted
+        // below: without it a guard that never fired would leave every assertion
+        // here passing over a marker that was never churned at all.
+        let rewritten = false;
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+            fsyncDirectory(descriptor) {
+                if (!rewritten && fs.existsSync(quarantineRoot())) {
+                    rewritten = true;
+                    fs.writeFileSync(intentPath, 'bbbbbbbb');
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+
+        expect(rewritten).toBe(true);
+        // Same incarnation, same size, still not a uuid — so it is still nobody's
+        // live marker and the quarantine may set it aside.
+        expect(fs.lstatSync(path.join(soleQuarantineGeneration(), 'exclusive-intent')).ino)
+            .toBe(before.ino);
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(intentPath)).toBe(false);
+        expect(fs.readFileSync(
+            path.join(soleQuarantineGeneration(), 'exclusive-intent'),
+            'utf8',
+        )).toBe('bbbbbbbb');
+    });
+
+    it.each([
+        ['exclusive intent', 'intent'],
+        ['reader token', 'token'],
+    ] as const)('does not move a %s that becomes valid in place, same inode and same size', async (
+        _label,
+        kind,
+    ) => {
+        // The re-classification, isolated from the identity comparison. Both
+        // markers here start as a 36-character non-token and become a
+        // 36-character uuid written in place, so device, inode, and size are all
+        // unchanged and *only* re-reading the contents can tell the difference.
+        // Without this pair, deleting the `stillMalformed` check leaves every
+        // other TOCTOU test passing, because those transitions happen to change
+        // the file's length.
+        const tokenId = '00000000-0000-4000-8000-000000000001';
+        const target = {
+            intent: {
+                markerPath: path.join(gateDirectory(), 'exclusive-intent'),
+                malformed: 'zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz',
+                becomesValid: '00000000-0000-4000-8000-0000000000bb',
+            },
+            token: {
+                markerPath: path.join(readersDirectory(), `${tokenId}.reader`),
+                malformed: 'zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz',
+                becomesValid: tokenId,
+            },
+        }[kind];
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(target.markerPath, target.malformed, { mode: 0o600 });
+        const before = fs.lstatSync(target.markerPath);
+        expect(target.malformed).toHaveLength(target.becomesValid.length);
+
+        // Swapped on the first flush that happens *after* classification, found by
+        // observing the quarantine directory the run creates rather than by
+        // counting calls. An ordinal ("the third flush") encodes how many
+        // directories the implementation happens to flush, which differs with the
+        // filesystem — it passed locally and failed on CI's tmpfs, where the count
+        // is not the same. `swapped` keeps it to exactly one write.
+        let swapped = false;
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+            fsyncDirectory(descriptor) {
+                if (!swapped && fs.existsSync(quarantineRoot())) {
+                    swapped = true;
+                    fs.writeFileSync(target.markerPath, target.becomesValid);
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+        expect(swapped).toBe(true);
+
+        const after = fs.lstatSync(target.markerPath);
+        // Proves the identity check cannot be what saved it.
+        expect(after.ino).toBe(before.ino);
+        expect(after.size).toBe(before.size);
+        expect(result.movedCount).toBe(0);
+        expect(fs.readFileSync(target.markerPath, 'utf8')).toBe(target.becomesValid);
+    });
+
+    // Note on coverage: the *guard* is exercised everywhere, but the specific
+    // hazard it defends against — a recreate that recycles the freed inode, so
+    // device, inode, and size all still match — only occurs where the filesystem
+    // recycles. ext4 and tmpfs do; APFS does not. So this passes on macOS whether
+    // or not the guard is correct, and only the Linux runner can tell the
+    // difference. It caught the missing creation-time field from CI while no local
+    // run ever reproduced it.
+    //
+    // A deterministic collision was attempted and abandoned: a hardlink shares
+    // inode *and* birthtime, so it cannot stand in for a recreate. Do not
+    // "simplify" this to a local-only assertion, and do not assert that the inode
+    // changed — reuse is the case under test, not a failure of it.
+    it('refuses a marker replaced by a different file of the same size', async () => {
+        // Identity, not just size: an unlink-and-recreate leaves the byte count
+        // unchanged while the inode changes, and whatever wrote it is a party
+        // this run never classified.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const intentPath = path.join(gateDirectory(), 'exclusive-intent');
+        fs.writeFileSync(intentPath, 'aaaaaaaa', { mode: 0o600 });
+        const original = fs.lstatSync(intentPath, { bigint: true });
+
+        // Keyed on the quarantine directory appearing, not on a flush ordinal —
+        // see the sibling test above for why counting calls is not portable.
+        let swapped = false;
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+            fsyncDirectory(descriptor) {
+                if (!swapped && fs.existsSync(quarantineRoot())) {
+                    swapped = true;
+                    fs.unlinkSync(intentPath);
+                    fs.writeFileSync(intentPath, 'cccccccc', { mode: 0o600 });
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+
+        expect(swapped).toBe(true);
+        const replacement = fs.lstatSync(intentPath, { bigint: true });
+        // Deliberately *not* asserting the inode changed. Whether the recreate
+        // lands on a fresh inode or recycles the freed one is the filesystem's
+        // choice — ext4 and tmpfs reuse it, APFS does not — and the reuse case is
+        // precisely the hazard this guard exists for. Asserting a change would
+        // demand the collision never happen, which is the opposite of the point,
+        // and it failed on CI for exactly that reason (`expected 8947075 not to be
+        // 8947075`) *after* the guard had already done its job.
+        //
+        // What must hold on every filesystem: the replacement is a different
+        // incarnation, so the marker is refused and left where it is with the
+        // replacement's bytes intact. Those two assertions are the test.
+        //
+        // The birth times differing is *not* universal, and asserting it
+        // unconditionally would fail before those two ever ran. A filesystem with no
+        // birth time reports a stable `0` on both sides, which is exactly the case
+        // the production guard measures for and degrades around — and there the
+        // refusal comes from the inode, or from the `stillMalformed` re-read, not
+        // from this field. So it is asserted only where a birth time is recorded at
+        // all, which is what makes it an assertion about the discriminator rather
+        // than about the host.
+        if (original.birthtimeNs !== 0n && replacement.birthtimeNs !== 0n) {
+            expect(replacement.birthtimeNs).not.toBe(original.birthtimeNs);
+        }
+        expect(result.movedCount).toBe(0);
+        expect(fs.readFileSync(intentPath, 'utf8')).toBe('cccccccc');
+    });
+
+    it.each([
+        ['directory', (target: string) => fs.mkdirSync(target)],
+        ['symlink', (target: string) => fs.symlinkSync('/nonexistent-target', target)],
+        ['fifo', (target: string) => execFileSync('mkfifo', [target])],
+    ] as const)('reports and clears a %s occupying a reader-token name', async (_label, create) => {
+        // A non-regular file on a token's name is refused by
+        // `existing_reader_token_ids`, so it *must* be visible to inspection and
+        // clearable by the quarantine. When it was neither, the result was worse
+        // than the original dead-end: the preflight saw nothing, so the app
+        // opened normally and said nothing, and then every preserve failed with
+        // `reader-token-inventory` while the dialog kept offering "Set Aside" —
+        // no in-app escape, and no warning either.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const name = '00000000-0000-4000-8000-000000000001.reader';
+        const target = path.join(readersDirectory(), name);
+        create(target);
+
+        // Visible to inspection, which is what the preflight refuses on.
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            readerTokenIds: [],
+            malformedReaderTokenNames: [name],
+        });
+        // And genuinely fatal to the enforcer until cleared, which is why
+        // inspection reporting it is load-bearing rather than cosmetic.
+        const blocked = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        expect(() => blocked.listReaderTokenIds()).toThrow(SqliteFileStateError);
+        await blocked.release();
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.lstatSync(target, { throwIfNoEntry: false })).toBeUndefined();
+        // Moved as the thing it is, not deleted and not dereferenced: a symlink
+        // arrives as a symlink, a directory as a directory.
+        const quarantined = path.join(soleQuarantineGeneration(), name);
+        expect(fs.lstatSync(quarantined, { throwIfNoEntry: false })).toBeDefined();
+        expect(fs.readdirSync(soleQuarantineGeneration())).toEqual([name]);
+        // The escape works end to end: the enforcer runs again.
+        const recovered = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        expect(recovered.listReaderTokenIds()).toEqual([]);
+        await recovered.waitForReaders();
+        await recovered.release();
+    });
+
+    it('does not move a non-file marker replaced by a real one before the rename', async () => {
+        // The non-file branch has no identity to compare and no contents to
+        // re-classify, so its only protection is re-confirming the entry is
+        // still not a regular file. Without that it would rename whatever now
+        // occupies the name — including a genuine marker a live peer wrote in
+        // the meantime, which is the same eviction-by-stale-classification the
+        // identity check exists to prevent, reached by the other branch.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const intentPath = path.join(gateDirectory(), 'exclusive-intent');
+        fs.mkdirSync(intentPath);
+        const liveToken = '00000000-0000-4000-8000-0000000000bb';
+
+        // Keyed on the quarantine root appearing — after classification, before any
+        // rename — rather than on a flush ordinal, and one-shot. A peer clears the
+        // obstruction and takes the gate inside that window. `replaced` is asserted
+        // below so a guard that never fired cannot pass this test vacuously: an
+        // untouched directory is refused for the wrong reason and every assertion
+        // here would still hold.
+        let replaced = false;
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
+            fsyncDirectory(descriptor) {
+                if (!replaced && fs.existsSync(quarantineRoot())) {
+                    replaced = true;
+                    fs.rmSync(intentPath, { recursive: true, force: true });
+                    fs.writeFileSync(intentPath, liveToken, { mode: 0o600 });
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+
+        expect(replaced).toBe(true);
+        expect(result.movedCount).toBe(0);
+        // The peer's intent is intact and still a live exclusive claim.
+        expect(fs.readFileSync(intentPath, 'utf8')).toBe(liveToken);
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: liveToken,
+            exclusiveIntentMalformed: false,
+        });
+    });
+
+    it.each([
+        ['exclusive-intent'],
+        ['recovery-block.json'],
+    ] as const)('classifies a directory occupying %s instead of throwing', async (name) => {
+        // Inspection is meant to be total. It was not total over *file types*: a
+        // directory on either marker's name made `readFileSync` fail EISDIR,
+        // which is not ENOENT and so propagated as `recovery-gate-inspect` — the
+        // preflight refused the open, the quarantine threw from the same shape,
+        // and the dialog looped with no exit. Rarer than a torn write, same
+        // permanence.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const target = path.join(gateDirectory(), name);
+        fs.mkdirSync(target);
+        // Something inside, so a "cleared" implementation that quietly removed an
+        // empty directory instead of moving it would be caught.
+        fs.writeFileSync(path.join(target, 'evidence'), 'why it got this way');
+
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        expect(name === 'exclusive-intent'
+            ? inspected.exclusiveIntentMalformed
+            : inspected.recoveryBlockMalformed).toBe(true);
+        // Never offered as a usable marker: the desktop feeds these to the
+        // reclamation and the resume path respectively.
+        expect('exclusiveIntentTokenId' in inspected).toBe(false);
+        expect(inspected.recoveryBlocked).toBe(false);
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result.movedCount).toBe(1);
+        expect(fs.lstatSync(target, { throwIfNoEntry: false })).toBeUndefined();
+        // Moved whole, contents and all.
+        expect(fs.readFileSync(
+            path.join(soleQuarantineGeneration(), name, 'evidence'),
+            'utf8',
+        )).toBe('why it got this way');
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentMalformed: false,
+            recoveryBlockMalformed: false,
+        });
+    });
+
+    it('refuses without the all-processes-closed attestation and moves nothing', async () => {
+        const intentPath = tearMarker('exclusive-intent');
+
+        for (const confirmation of [
+            { allProcessesClosed: false },
+            {},
+        ] as unknown as Array<{ allProcessesClosed: true }>) {
+            await expectCategory(
+                quarantine_malformed_sqlite_gate_markers(databasePath(), confirmation),
+                'recovery',
+            );
+        }
+
+        expect(fs.readFileSync(intentPath, 'utf8')).toBe('');
+        expect(fs.existsSync(path.join(gateDirectory(), 'quarantined-markers'))).toBe(false);
+    });
+
+    it('creates nothing when every marker is well formed', async () => {
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+
+        expect(result).toEqual({ movedCount: 0 });
+        expect(fs.existsSync(path.join(gateDirectory(), 'quarantined-markers'))).toBe(false);
+        await reader.release();
+    });
+
+    it('moves nothing through a symlinked gate directory', async () => {
+        // The case a leaf-only check cannot see: through a symlinked *gate*,
+        // `readers/` is a genuine directory that passes its own lstat while every
+        // path built from it resolves into the link target. Both this and the
+        // symlinked-leaf case are covered by the same captured-parent discipline.
+        const outside = path.join(tempDirectory, 'outside');
+        fs.mkdirSync(path.join(outside, 'readers'), { recursive: true, mode: 0o700 });
+        const decoy = path.join(outside, 'readers', 'not-a-uuid.reader');
+        fs.writeFileSync(decoy, 'outside the gate', { mode: 0o600 });
+        fs.symlinkSync(outside, gateDirectory(), 'dir');
+
+        const error = await expectCategory(
+            quarantine_malformed_sqlite_gate_markers(databasePath(), attested),
+            'recovery',
+        );
+
+        expect(error.message).not.toContain(tempDirectory);
+        expect(fs.readFileSync(decoy, 'utf8')).toBe('outside the gate');
+        expect(fs.existsSync(path.join(outside, 'quarantined-markers'))).toBe(false);
+    });
+
+    it('writes nothing outside the gate when the quarantine name is a symlink', async () => {
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const impostorPath = path.join(readersDirectory(), 'not-a-uuid.reader');
+        fs.writeFileSync(impostorPath, 'impostor', { mode: 0o600 });
+        const outside = path.join(tempDirectory, 'outside');
+        fs.mkdirSync(outside, { recursive: true, mode: 0o700 });
+        fs.symlinkSync(outside, path.join(gateDirectory(), 'quarantined-markers'), 'dir');
+
+        const error = await expectCategory(
+            quarantine_malformed_sqlite_gate_markers(databasePath(), attested),
+            'recovery',
+        );
+
+        expect(error.message).not.toContain(tempDirectory);
+        expect(fs.readdirSync(outside)).toEqual([]);
+        expect(fs.readFileSync(impostorPath, 'utf8')).toBe('impostor');
+    });
+
+    it('never names the crash-controlled entry, on the failing path or the succeeding one', async () => {
+        // The malformed reader-token *name* is crash- or attacker-controlled
+        // data, so it may be used to move the entry and for nothing else. This
+        // code also runs ahead of any sanitizing layer a caller might have, so a
+        // raw `NodeJS.ErrnoException` escaping it would carry the whole absolute
+        // path in `.path` and embed it in `.message`.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const secretName = 'private-user-secret.reader';
+        const secretPath = path.join(readersDirectory(), secretName);
+        fs.writeFileSync(secretPath, 'x', { mode: 0o600 });
+        // A plain file where the quarantine subtree belongs — reachable without
+        // hand-editing, since a sync client or a restore can leave one.
+        const obstruction = path.join(gateDirectory(), 'quarantined-markers');
+        fs.writeFileSync(obstruction, 'not a directory', { mode: 0o600 });
+
+        const error = await expectCategory(
+            quarantine_malformed_sqlite_gate_markers(databasePath(), attested),
+            'recovery',
+        );
+
+        expect(error.message).not.toContain(secretName);
+        expect(error.message).not.toContain(tempDirectory);
+        expect(JSON.stringify(error.metadata)).not.toContain(secretName);
+        expect((error as unknown as { path?: string }).path).toBeUndefined();
+        // Nothing moved, and the obstruction is left as the evidence it is.
+        expect(fs.readFileSync(secretPath, 'utf8')).toBe('x');
+        expect(fs.readFileSync(obstruction, 'utf8')).toBe('not a directory');
+
+        // The success path says nothing about it either: the result carries a
+        // count and a fresh generation id, never an on-disk name.
+        fs.unlinkSync(obstruction);
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(JSON.stringify(result)).not.toContain(secretName);
+    });
+});
+
 describe('raw preflight and writable rollback-journal recovery', () => {
     it('rejects non-SQLite, app-ID-zero, and unexpected-app-ID files without mutation', async () => {
         const cases: Array<{ name: string; create: (file: string) => void }> = [
@@ -346,6 +1229,158 @@ describe('raw preflight and writable rollback-journal recovery', () => {
             expect(fs.readFileSync(`${file}${suffix}`)).toEqual(before);
         },
     );
+
+    it.each(['-journal', '-wal', '-shm', '.init-candidate.evidence', '.init-candidate.zzz'])(
+        'lets the attested preserve clear %s evidence that blocked the open',
+        async (suffix) => {
+            // The companion half of the refusal above, and the half whose absence
+            // hid a live dead-end. A `.init-candidate.` tail that is not a uuid
+            // was counted as absence evidence by `inventory_sqlite_basename`
+            // (prefix-only) and then refused by name in the preserve path
+            // (`expected_member_kind`, prefix + uuid) — so the open refused, the
+            // dialog offered "Set Aside and Start Fresh", and that action threw
+            // `preserve-member-name` every time. No in-app action cleared it, and
+            // the gate quarantine could not help: it owns the three gate markers,
+            // not the basename namespace. Reachable from an interrupted install,
+            // a sync client, or a restore.
+            //
+            // Pinning only "the open refuses" would have passed throughout. A
+            // refusal assertion needs a companion proving the escape still fires.
+            const file = databasePath();
+            const evidencePath = `${file}${suffix}`;
+            fs.writeFileSync(evidencePath, 'evidence');
+
+            const exclusive = await acquire_sqlite_exclusive_recovery_gate(file);
+            const preserved = await preserve_sqlite_basename_set(file, { gate: exclusive });
+            await exclusive.release();
+
+            // Moved as a member of the set, never deleted: it sits in our
+            // namespace, so it travels with the rest rather than being left
+            // behind for a fresh database to be initialized beside.
+            expect(fs.existsSync(evidencePath)).toBe(false);
+            expect(fs.readFileSync(
+                path.join(preserved.recoveryDirectory, path.basename(evidencePath)),
+                'utf8',
+            )).toBe('evidence');
+
+            // And the escape genuinely completes: a fresh database initializes.
+            const result = await initialize_sqlite_database_no_clobber(
+                file,
+                identity,
+                { appliedAtMs: 100, appVersion: '0.7.0' },
+            );
+            expect(result.installed).toBe(true);
+            await result.database.close();
+        },
+    );
+
+    it.each([
+        ['candidate', 'file-state.sqlite3.init-candidate.zzz'],
+        ['canonical main', 'file-state.sqlite3'],
+        ['wal sidecar', 'file-state.sqlite3-wal'],
+    ] as const)('refuses a directory occupying the %s name identically from open and preserve', async (
+        _label,
+        name,
+    ) => {
+        // Deliberate, and *uniform across the whole basename set* — which is the
+        // evidence that it is a policy rather than an oversight in the candidate
+        // namespace specifically. `member_for`'s `!stat.isFile()` is enforcement:
+        // a directory is not a basename member and must never be moved as one.
+        //
+        // It is not the unclearable class the gate markers were in, because the
+        // refusal is never paired with an action that then fails. The desktop
+        // classifies `inventory-member-type` as `obstructed` with
+        // `canPreserve: false` (see `can_preserve` in state-recovery-dialog.ts),
+        // so no set-aside is offered at all; the dialog instead names the
+        // obstruction and points at the diagnostics folder. The one action that
+        // would clear it — removing something Table Viewer did not create — is
+        // the one it must not take.
+        //
+        // Pinned here so the three paths cannot drift into disagreeing about
+        // which names this applies to: a future change that made the candidate
+        // namespace movable-as-a-directory while `main` stayed enforced would be
+        // the asymmetry that started this whole series.
+        const file = databasePath();
+        fs.mkdirSync(path.join(tempDirectory, name));
+        fs.writeFileSync(path.join(tempDirectory, name, 'inside'), 'not ours to move');
+
+        await expectCategory(inventory_sqlite_basename(file), 'recovery');
+        const openFailure = await expectCategory(open_existing_sqlite_database(file), 'recovery');
+        expect(openFailure.metadata.operation).toBe('inventory-member-type');
+
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(file);
+        const preserveFailure = await expectCategory(
+            preserve_sqlite_basename_set(file, { gate: exclusive }),
+            'recovery',
+        );
+        // Identical stage from both paths, which is what lets the desktop
+        // recognize the condition and decline to offer an action that cannot work.
+        expect(preserveFailure.metadata.operation).toBe('inventory-member-type');
+        await exclusive.release();
+
+        // Untouched, contents and all: refusing is the point, not a failure to
+        // clean up. Nothing of the user's was moved or deleted.
+        expect(fs.readFileSync(path.join(tempDirectory, name, 'inside'), 'utf8'))
+            .toBe('not ours to move');
+    });
+
+    it('treats a non-uuid candidate tail as one namespace for inventory and preservation', async () => {
+        // The two predicates stated the candidate namespace differently. This
+        // pins them on one answer from both directions at once: the inventory
+        // must see the entry, and the preserve path must accept the same entry as
+        // a nameable member. Either half alone is satisfied by the drifted code.
+        const file = databasePath();
+        fs.writeFileSync(file, 'main-state');
+        for (const tail of ['zzz', 'not-a-uuid', '00000000-0000-4000-8000-000000000001']) {
+            fs.writeFileSync(`${file}.init-candidate.${tail}`, `candidate-${tail}`);
+        }
+
+        const inventory = await inventory_sqlite_basename(file);
+        expect(inventory.candidates.map((candidate) => candidate.name).sort()).toEqual([
+            'file-state.sqlite3.init-candidate.00000000-0000-4000-8000-000000000001',
+            'file-state.sqlite3.init-candidate.not-a-uuid',
+            'file-state.sqlite3.init-candidate.zzz',
+        ]);
+
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(file);
+        const preserved = await preserve_sqlite_basename_set(file, { gate: exclusive });
+        await exclusive.release();
+
+        // Every one of them named, moved, and intact — the whole set as a unit.
+        expect(preserved.memberCount).toBe(4);
+        for (const tail of ['zzz', 'not-a-uuid', '00000000-0000-4000-8000-000000000001']) {
+            const name = `file-state.sqlite3.init-candidate.${tail}`;
+            expect(fs.existsSync(path.join(tempDirectory, name))).toBe(false);
+            expect(fs.readFileSync(path.join(preserved.recoveryDirectory, name), 'utf8'))
+                .toBe(`candidate-${tail}`);
+        }
+    });
+
+    it('excludes a bare candidate marker with no tail from the namespace', async () => {
+        // `<basename>.init-candidate.` with nothing after it names no candidate
+        // this module could ever have built — the marker is a separator, and
+        // `build_candidate` always appends a uuid. Left out of the namespace
+        // deliberately, and asserted separately because the case has to be
+        // *present on disk* to be meaningful: an assertion made while the file
+        // does not exist passes against any predicate at all.
+        const file = databasePath();
+        fs.writeFileSync(file, 'main-state');
+        const bare = `${file}.init-candidate.`;
+        fs.writeFileSync(bare, 'not-a-candidate');
+
+        const inventory = await inventory_sqlite_basename(file);
+
+        expect(inventory.candidates).toEqual([]);
+        // Not ours, so the preserve leaves it exactly where it is rather than
+        // sweeping an unrelated file into the recovery set.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(file);
+        const preserved = await preserve_sqlite_basename_set(file, { gate: exclusive });
+        await exclusive.release();
+        expect(preserved.memberCount).toBe(1);
+        expect(fs.readFileSync(bare, 'utf8')).toBe('not-a-candidate');
+        expect(fs.existsSync(path.join(preserved.recoveryDirectory, path.basename(bare))))
+            .toBe(false);
+    });
 
     it('inventories every candidate-prefixed entry and preserves non-regular evidence', async () => {
         const target = path.join(tempDirectory, 'candidate-symlink-target');
@@ -456,6 +1491,13 @@ describe('raw preflight and writable rollback-journal recovery', () => {
     });
 
     it('fails closed explicitly on Windows without a proven directory primitive', () => {
+        expect(sqlite_directory_durability_is_platform_unsupported('win32', fs.fsyncSync))
+            .toBe(true);
+        expect(sqlite_directory_durability_is_platform_unsupported('win32', () => {}))
+            .toBe(false);
+        expect(sqlite_directory_durability_is_platform_unsupported('darwin', fs.fsyncSync))
+            .toBe(false);
+
         try {
             assert_sqlite_directory_durability_supported(tempDirectory, fs.fsyncSync, 'win32');
             throw new Error('Windows directory durability unexpectedly succeeded');
@@ -1087,11 +2129,22 @@ describe('restartable preserve-as-a-unit recovery', () => {
         fs.writeFileSync(manifestPath, JSON.stringify(manifest));
         expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(0);
 
+        // A file back on the canonical name does *not* make a finished recovery
+        // unfinished. Completion is a property of the manifest and of the moved
+        // bytes, both of which are still exactly as `advance_preservation` left
+        // them; the source name is free again precisely because the move
+        // finished, and re-initializing it is what the app does next. Requiring
+        // absence here made every completed directory count as incomplete from
+        // the following launch onward, which sent `preserve_sqlite_basename_set`
+        // into its orphan branch and threw `orphan-preservation-manifest` — so a
+        // userData directory could be recovered exactly once, ever.
         fs.linkSync(targetPath, databasePath());
-        expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(1);
+        expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(0);
         fs.unlinkSync(databasePath());
         expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(0);
 
+        // The preserved bytes themselves are still the invariant: replace the
+        // target and the directory is incomplete again, whatever the manifest says.
         fs.unlinkSync(targetPath);
         fs.writeFileSync(targetPath, 'replacement-main-state');
         expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories).toBe(1);
@@ -1134,6 +2187,61 @@ describe('restartable preserve-as-a-unit recovery', () => {
         expect(inventory.recoveryBlocked).toBe(false);
         expect(inventory.incompleteRecoveryDirectories).toBe(0);
         await secondExclusive.release();
+    });
+
+    it('refuses to mark a move complete while a source name is reoccupied mid-move', async () => {
+        // The single point of enforcement for source-absence, and the reason
+        // `validate_completed_preservation` may drop its own copy of the check.
+        // Absence is meaningful *here* and nowhere else: this loop runs while the
+        // move is in flight and the gate is still exclusive, so nothing may
+        // legitimately be on the canonical name yet. After completion the gate is
+        // released and the app re-creates that very name on purpose, which is why
+        // asserting absence at validation time made recovery work once per
+        // directory (dead-end (d)).
+        //
+        // Pinned deliberately: with the check now in one place instead of two, a
+        // future simplification of this loop would let a preserve report
+        // `complete` while a member still sits on its source name — a set that is
+        // half-moved but labelled finished, which is silent divergence rather
+        // than the loud refusal every other failure here produces.
+        fs.writeFileSync(databasePath(), 'main-state');
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let reoccupied = false;
+
+        const error = await expectCategory(preserve_sqlite_basename_set(databasePath(), {
+            gate: exclusive,
+            onEvent(event) {
+                // After the real source was unlinked and before the final loop
+                // runs: exactly the window an uncoordinated writer, a sync
+                // client, or a racing peer could reoccupy the name in.
+                if (event !== 'preserve-after-member-source-removal' || reoccupied) return;
+                reoccupied = true;
+                fs.writeFileSync(databasePath(), 'reoccupied-source');
+            },
+        }), 'recovery');
+
+        expect(reoccupied).toBe(true);
+        // The specific stage, not merely "some recovery error": the target still
+        // matches its manifest entry, so `stat_matches` is satisfied and only the
+        // absence clause can have produced this.
+        expect(error.metadata.operation).toBe('preserve-validation');
+        const recoveryName = fs.readdirSync(tempDirectory)
+            .find((name) => name.startsWith('file-state.sqlite3.recovery.'));
+        expect(recoveryName).toBeDefined();
+        const manifest = JSON.parse(fs.readFileSync(
+            path.join(tempDirectory, recoveryName!, 'manifest.json'),
+            'utf8',
+        ));
+        // Never labelled complete, and the moved bytes are still the preserved
+        // ones — the refusal happened before any of that could be claimed.
+        expect(manifest.state).toBe('moving');
+        expect(fs.readFileSync(path.join(tempDirectory, recoveryName!, 'file-state.sqlite3'), 'utf8'))
+            .toBe('main-state');
+        // The blockade stays up, so the next attested attempt resumes rather than
+        // opening a main file detached from the set it belongs to.
+        expect(inspect_sqlite_recovery_gate(databasePath()).recoveryBlocked).toBe(true);
+        // And the reoccupying file is left exactly as found: it is not ours.
+        expect(fs.readFileSync(databasePath(), 'utf8')).toBe('reoccupied-source');
     });
 
     it('fails closed when the canonical source becomes a dangling symlink after target installation', async () => {
@@ -1180,7 +2288,17 @@ describe('restartable preserve-as-a-unit recovery', () => {
         await secondExclusive.release();
     });
 
-    it('keeps a complete-manifest blockade when the canonical source path is recreated', async () => {
+    it('clears a complete-manifest blockade without disturbing a recreated canonical source', async () => {
+        // Previously this asserted that a file back on the canonical name kept
+        // the blockade forever. That was the wrong place to enforce
+        // source-absence: by the time the manifest says `complete` every member
+        // is already in the recovery directory and the source name is free by
+        // construction, so re-creating it is the ordinary next step rather than
+        // evidence of a half-moved set. Enforcing it here instead made the
+        // *successful* path unrecoverable — see the dropped clause in
+        // `validate_completed_preservation`. Source-absence still holds where it
+        // means something: `advance_preservation`'s final loop, which runs while
+        // the move is in flight and the gate is still exclusive.
         fs.writeFileSync(databasePath(), 'main-state');
         const originalInode = fs.statSync(databasePath()).ino;
         const firstExclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
@@ -1198,12 +2316,50 @@ describe('restartable preserve-as-a-unit recovery', () => {
             databasePath(), firstExclusive.tokenId, { allProcessesClosed: true },
         );
         const secondExclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
-        await expectCategory(
-            resume_sqlite_basename_preservation(databasePath(), { gate: secondExclusive }),
-            'recovery',
+        const resumed = await resume_sqlite_basename_preservation(
+            databasePath(), { gate: secondExclusive },
         );
+
+        // The blockade is gone because the move it guarded is genuinely finished.
+        expect(inspect_sqlite_recovery_gate(databasePath()).recoveryBlocked).toBe(false);
+        // Neither the recreated file nor the preserved bytes were touched: the
+        // resume observed completion, it did not move anything a second time.
         expect(fs.readFileSync(databasePath(), 'utf8')).toBe('recreated-main');
-        expect(inspect_sqlite_recovery_gate(databasePath()).recoveryBlocked).toBe(true);
+        expect(fs.readFileSync(path.join(resumed.recoveryDirectory, 'file-state.sqlite3'), 'utf8'))
+            .toBe('main-state');
+        await secondExclusive.release();
+    });
+
+    it('preserves a second complete set in a directory that already holds one', async () => {
+        // Recovery once worked exactly once per directory. `validate_completed_preservation`
+        // required the first set's source names to still be absent, so as soon as
+        // the app re-created `file-state.sqlite3` — the entire purpose of "Set
+        // Aside and Start Fresh" — the finished directory was re-classified as
+        // incomplete, `preserve_sqlite_basename_set` took its orphan branch,
+        // found no resumable manifest, and threw `orphan-preservation-manifest`.
+        fs.writeFileSync(databasePath(), 'first-main');
+        const first = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        const firstResult = await preserve_sqlite_basename_set(databasePath(), { gate: first });
+        await first.release();
+
+        fs.writeFileSync(databasePath(), 'second-main');
+        expect((await inventory_sqlite_basename(databasePath())).incompleteRecoveryDirectories)
+            .toBe(0);
+        const second = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        const secondResult = await preserve_sqlite_basename_set(databasePath(), { gate: second });
+        await second.release();
+
+        expect(secondResult.recoveryDirectory).not.toBe(firstResult.recoveryDirectory);
+        expect(fs.existsSync(databasePath())).toBe(false);
+        // Both sets intact, and neither one moved into the other: the second
+        // preserve is a new set-aside, never a resume of a finished one.
+        expect(fs.readFileSync(path.join(firstResult.recoveryDirectory, 'file-state.sqlite3'), 'utf8'))
+            .toBe('first-main');
+        expect(fs.readFileSync(path.join(secondResult.recoveryDirectory, 'file-state.sqlite3'), 'utf8'))
+            .toBe('second-main');
+        const inventory = await inventory_sqlite_basename(databasePath());
+        expect(inventory.recoveryDirectories).toBe(2);
+        expect(inventory.incompleteRecoveryDirectories).toBe(0);
     });
 
     it('keeps a complete-manifest blockade when the completed target no longer matches', async () => {

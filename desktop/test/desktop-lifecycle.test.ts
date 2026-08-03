@@ -71,6 +71,64 @@ describe('desktop lifecycle gate', () => {
         expect(ran).toEqual([]);
     });
 
+    it('drops the rest of the flush when a buffered item fails the backend', () => {
+        // A buffered request is arbitrary app work: opening a file can discover
+        // the backend is unusable and call `become_failed` from inside the
+        // flush. Rechecking only before the loop left every remaining item
+        // running against a dead backend — exactly what `submit` refuses to
+        // admit one line away, so the gate contradicted itself depending on
+        // which side of the loop a request arrived on.
+        const lifecycle = create_desktop_lifecycle();
+        const ran: string[] = [];
+        lifecycle.submit(() => ran.push('first'));
+        lifecycle.submit(() => {
+            ran.push('fails-the-backend');
+            lifecycle.become_failed();
+        });
+        lifecycle.submit(() => ran.push('must-not-run'));
+        lifecycle.submit(() => ran.push('must-not-run-either'));
+
+        lifecycle.become_ready();
+
+        expect(ran).toEqual(['first', 'fails-the-backend']);
+        expect(lifecycle.phase).toBe('failed');
+        // Dropped, not re-buffered: `failed` is terminal, so there is no later
+        // flush that could ever run them.
+        lifecycle.become_ready();
+        expect(ran).toEqual(['first', 'fails-the-backend']);
+    });
+
+    it('drops the rest of the flush when a buffered item begins the drain', () => {
+        // The other half: a Cmd-Q handled inside buffered work. A window opened
+        // after this point is never fenced by the close barrier, survives the
+        // drain holding a controller over a closed connection, and then vetoes
+        // every later quit.
+        const lifecycle = create_desktop_lifecycle();
+        const ran: string[] = [];
+        // Recorded rather than asserted inside the buffered work: `become_ready`
+        // wraps each item in a `try`/`catch` that swallows everything, so an
+        // assertion failure here would vanish and resurface later as an unrelated
+        // one.
+        let drain_began: boolean | undefined;
+        lifecycle.submit(() => ran.push('first'));
+        lifecycle.submit(() => {
+            ran.push('quits');
+            drain_began = lifecycle.begin_drain();
+        });
+        lifecycle.submit(() => ran.push('must-not-run'));
+
+        lifecycle.become_ready();
+
+        expect(drain_began).toBe(true);
+        expect(ran).toEqual(['first', 'quits']);
+        expect(lifecycle.phase).toBe('draining');
+        // A vetoed close restores admission but never the work the drain
+        // dropped, matching `abandon_drain`'s stated contract.
+        lifecycle.abandon_drain();
+        expect(lifecycle.phase).toBe('ready');
+        expect(ran).toEqual(['first', 'quits']);
+    });
+
     it('admits exactly one drain per barrier and no work once draining', () => {
         const lifecycle = create_desktop_lifecycle();
         lifecycle.become_ready();

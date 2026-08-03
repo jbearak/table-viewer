@@ -57,10 +57,75 @@ jobs:
         # only for this isolated runtime-capability check.
         run: npm run bundle:desktop && xvfb-run -a ./node_modules/.bin/electron --no-sandbox dist/runtime-probes/electron-sqlite-runtime-probe.js
 
+      # The packaged-desktop release gates: initialization crash at every durable
+      # cut point, rollback-journal recovery, sidecar fail-closed, and a crash at
+      # every preservation cut point. Proven inside Electron against the real
+      # src/ code, which is the whole reason it is not a vitest suite.
+      #
+      # Same xvfb + --no-sandbox treatment as the probe above, and for the same
+      # reason — but the flag applies to the Electron parent only. The crashing
+      # children the driver forks run as plain Node under ELECTRON_RUN_AS_NODE,
+      # which rejects Chromium flags outright, so the driver deliberately does not
+      # forward it (see the comment on `run_crashing_child`).
+      #
+      # The `bundle:desktop` here is the third in this job, and deliberately not
+      # deduplicated: it takes a couple of seconds, and paying it buys a step that
+      # cannot be broken by reordering or removing the ones above. The `&&` is
+      # load-bearing — it is what stops a failed build from leaving a *stale*
+      # bundle to be tested, which produces a confident report about code that is
+      # no longer on disk.
+      - name: Packaged SQLite recovery gates
+        env:
+          # Without this the driver would also pass by declaring the platform
+          # unsupported and skipping every gate, which looks identical to the
+          # gates having run and passed.
+          TABLE_VIEWER_GATE_EXPECT_PLATFORM: supported
+        run: npm run bundle:desktop && xvfb-run -a ./node_modules/.bin/electron --no-sandbox dist/runtime-probes/packaged-recovery-gate.js
+
       # The VS Code Extension Host is a GUI app; Linux runners are headless,
       # so launch it under a virtual framebuffer.
       - name: Integration tests (VS Code Extension Host)
         run: xvfb-run -a npm run test:integration
+
+  # The plan's "packaged macOS clean relaunch and forced termination recover exact
+  # state under rollback journal" gate. It has to be a macOS runner and a real
+  # windowed app: the property is that the *whole* startup/quit path — reader
+  # gate, connection, drain, journal replay — survives a restart, and no headless
+  # substitute exercises it.
+  #
+  # Separate from the smoke suite proper, which is deliberately not in CI: the
+  # focus-dependent specs there drive menu commands that only reach the grid while
+  # the app is frontmost, so they fail on any machine whose desktop is being used
+  # (documented in desktop/README.md). The relaunch specs use no menu commands and
+  # no focus assertions, which is what makes them CI-safe when their siblings are
+  # not. Keep that property when editing them, or this job becomes flaky.
+  desktop-relaunch:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      # Clean relaunch and SIGKILL relaunch. A forced termination leaves a hot
+      # rollback journal and a stranded reader token on purpose — the token is
+      # never reclaimed by PID or age — so the gate asserts the relaunch opens
+      # anyway and claims no recovery it did not perform.
+      - name: Packaged desktop relaunch gates
+        run: npm run test:desktop-smoke:relaunch
 
   windows-sqlite:
     runs-on: windows-latest
@@ -99,4 +164,71 @@ jobs:
           npm run bundle:desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\node_modules\.bin\electron.cmd dist\runtime-probes\electron-sqlite-runtime-probe.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The same driver as the Linux job, asserting the opposite contract. Here
+      # there is no recovery to prove: the build declines the platform before any
+      # open, so what must hold is that the declaration is the platform one (not
+      # the fixable-location one), that no database and no coordination state were
+      # created while discovering it, and that a real initialization attempt still
+      # refuses. The explicit expectation is what stops this from passing by
+      # accidentally declaring itself supported and skipping everything.
+      - name: Packaged SQLite platform refusal gate
+        shell: pwsh
+        env:
+          TABLE_VIEWER_GATE_EXPECT_PLATFORM: unsupported
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Builds its own bundle rather than inheriting the previous step's. A
+          # reordering or a removal above would otherwise turn this gate into a
+          # missing-file error — which fails, but for the wrong reason and without
+          # having checked anything.
+          npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\packaged-recovery-gate.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # The Windows durability verification gate. It decides nothing on its own; it
+  # gathers the evidence the Windows decision tree turns on (see the comment block
+  # at the top of desktop/windows-durability-probe.mjs and the "Windows durability
+  # verification" section of desktop/README.md):
+  #
+  #   verifies       -> Windows ships the SQLite state backend on the same evidence
+  #                     standard as macOS: a written durability contract plus
+  #                     kill-crash verification against the packaged runtime.
+  #   cannot verify  -> Windows ships view-only, exactly as it does today.
+  #
+  # Neither branch is a silent weakening, and *this job must not push the answer*.
+  # A verdict of `not-verified` is information about the platform, not a broken
+  # build, so it exits 0. Only a malfunction of the probe itself — a runner that
+  # cannot make a temp directory, a child that cannot spawn, an unexpected throw —
+  # is a failure, and the probe signals that with a non-zero exit of its own.
+  windows-durability:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Windows durability verification probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Builds its own bundle rather than inheriting another job's, so a
+          # reordering elsewhere cannot turn this into a missing-file error that
+          # fails without having measured anything.
+          npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\windows-durability-probe.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

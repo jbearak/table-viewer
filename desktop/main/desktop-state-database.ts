@@ -6,10 +6,9 @@
 // desktop side only.
 //
 // Pure Node (no electron import) so it is unit-testable; main.ts passes the
-// `app.getPath('userData')` value, exactly as it does for `settings_file_path`
-// and `json_state_file_path`.
-import { randomUUID } from 'node:crypto';
+// `app.getPath('userData')` value, exactly as it does for `settings_file_path`.
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import {
     open_sqlite_file_state_store,
@@ -18,20 +17,19 @@ import {
 import {
     categorize_sqlite_file_state_error,
     sqlite_file_state_recovery_error,
+    SqliteFileStateError,
     type SqliteFileStateErrorCategory,
 } from '../../src/sqlite-file-state-errors';
 import type { SqliteDesktopFileStateIdentity } from '../../src/sqlite-file-state-schema';
 import {
     acquire_sqlite_exclusive_recovery_gate,
-    assert_managed_directory,
     assert_sqlite_directory_durability_supported,
-    capture_managed_directory,
     inspect_sqlite_recovery_gate,
     preserve_sqlite_basename_set,
+    quarantine_malformed_sqlite_gate_markers,
     reclaim_stale_sqlite_exclusive_intent,
     resume_sqlite_basename_preservation,
-    safe_error,
-    type ManagedDirectoryIdentity,
+    sqlite_directory_durability_is_platform_unsupported,
     type SqliteExclusiveRecoveryGate,
     type SqliteOpenRecoveryHooks,
 } from '../../src/sqlite-open-recovery';
@@ -178,6 +176,292 @@ function open_failure(error: unknown, operation: string): DesktopStateOpenResult
     };
 }
 
+/** The throwaway directory the durability question is asked of. */
+/**
+ * The stage a whole-platform refusal is reported under.
+ *
+ * Deliberately not the backend's `directory-durability`, and that substitution is
+ * the only discriminator the dialog gets. Both refusals are the same missing
+ * guarantee, but they have opposite fixes: a *location* that cannot be flushed is
+ * fixable today by storing the settings somewhere else, while a *platform* this
+ * build declines can only be fixed by a later build. Passing the backend's stage
+ * straight through would collapse the two and send half the users after a fix
+ * that does not exist. Within the sanitizer's `[A-Za-z][A-Za-z0-9_-]{0,63}`, so
+ * it survives into `DesktopStateOpenFailure` intact.
+ */
+export const DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION = 'platform-durability-unsupported';
+
+export function desktop_state_durability_refusal_operation(
+    intended_operation: string | undefined,
+    platform_refused: boolean,
+    control_refused: boolean,
+): string | undefined {
+    return platform_refused || control_refused
+        ? DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION
+        : intended_operation;
+}
+
+/**
+ * What asking the production rule at one location told us.
+ *
+ * Three outcomes, not two, and the third is load-bearing. "The flush works here",
+ * "the flush is refused here", and "the question could not be asked here" are
+ * genuinely different, and collapsing the last into either of the others is how a
+ * control location silently stops being a control: an unwritable or nonexistent
+ * probe root would otherwise read as "no refusal", which is indistinguishable
+ * from a location that answered normally.
+ */
+type DurabilityAnswer =
+    | { readonly kind: 'supported' }
+    | { readonly kind: 'refused'; readonly error: SqliteFileStateError }
+    | { readonly kind: 'unavailable' };
+
+/**
+ * Ask the production rule whether a directory here can be durably flushed.
+ *
+ * Returns the answer rather than throwing it, because the caller needs to run
+ * this twice — the whole platform/location distinction is the *difference*
+ * between two answers, not a property of either one.
+ */
+function durability_answer_at(parent_directory: string): DurabilityAnswer {
+    let probe_directory: string | undefined;
+    try {
+        // A directory we create and remove, never the canonical state directory:
+        // this runs before the app has decided it can store anything here, and
+        // creating the real tree as a side effect of asking the question would
+        // break the "nothing has been changed or moved" claim the unsupported
+        // dialog goes on to make.
+        //
+        // Placed in the nearest *existing* ancestor, because on a first launch
+        // `parent_directory` does not exist yet and `mkdtempSync` would fail ENOENT
+        // — which this function classifies as `unavailable`, i.e. "the question went
+        // unasked". For a *control* that is merely a lost vote, but for the intended
+        // location it silently skipped the platform question altogether: on Windows,
+        // where the refusal is unconditional and comes from the production assertion
+        // this probe exists to run, a first launch therefore reported `supported`,
+        // the open went on to create the state tree, and the failure arrived later as
+        // a fixable-location error. That is precisely the up-front, nothing-created
+        // platform refusal the design promises, not delivered.
+        //
+        // The ancestor is the right place to ask: durability is a property of the
+        // filesystem the directory will land on, and the nearest existing ancestor is
+        // on that filesystem by construction.
+        probe_directory = fs.mkdtempSync(
+            path.join(nearest_existing_ancestor(parent_directory), '.tableviewer-durability-'),
+        );
+        assert_sqlite_directory_durability_supported(probe_directory);
+        return { kind: 'supported' };
+    } catch (error) {
+        // Only a durability refusal is an answer to the question asked. Anything
+        // else — an unwritable or absent parent, a sandbox that forbids the write
+        // — means the question went unasked here; the open itself classifies that
+        // correctly for the *intended* location (as `environment`, retryable once
+        // access is restored), and for a control location it means this control
+        // has no vote.
+        return error instanceof SqliteFileStateError && error.category === 'unsupported'
+            ? { kind: 'refused', error }
+            : { kind: 'unavailable' };
+    } finally {
+        if (probe_directory !== undefined) {
+            try {
+                fs.rmSync(probe_directory, { recursive: true, force: true });
+            } catch {
+                // An empty probe directory left behind is inert; failing to remove
+                // it must not change the answer.
+            }
+        }
+    }
+}
+
+/**
+ * The deepest ancestor of `directory` that exists, or `directory` itself.
+ *
+ * Falls back to the filesystem root, which is why callers can treat the result as a
+ * path they may `stat` or write a probe into — though both are still attempted
+ * inside a `try`, since existing is not the same as writable.
+ */
+export function nearest_existing_ancestor(directory: string): string {
+    let candidate = path.resolve(directory);
+    for (;;) {
+        if (fs.existsSync(candidate)) return candidate;
+        const parent = path.dirname(candidate);
+        if (parent === candidate) return candidate;
+        candidate = parent;
+    }
+}
+
+/** Whether `directory` is the root itself or lives beneath it. */
+function is_within(directory: string, root: string): boolean {
+    const relative = path.relative(path.resolve(root), path.resolve(directory));
+    return relative === '' || (
+        !path.isAbsolute(relative)
+        && relative !== '..'
+        && !relative.startsWith(`..${path.sep}`)
+    );
+}
+
+/**
+ * The device a path is on, or `undefined` when that cannot be established.
+ *
+ * The nearest *existing* ancestor is what gets stat'd, because a userData
+ * directory does not exist on a first launch and the question is about the volume
+ * it will land on. `undefined` is a real answer meaning "unknown", never a device
+ * id that might accidentally compare equal to something.
+ */
+function device_of(directory: string): bigint | undefined {
+    try {
+        return fs.statSync(nearest_existing_ancestor(directory), { bigint: true }).dev;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Control locations to ask the same question of, ordered so that the ones sharing
+ * least with the caller's are asked first.
+ *
+ * Two locations agreeing is only evidence about the *operating system* to the
+ * extent that they have nothing else in common, so a control on a different volume
+ * is worth more than one on the same volume. That is a question of **ordering, not
+ * eligibility**, and the distinction is the whole of this function.
+ *
+ * A same-volume control is *not* dropped, and it must not be. Excluding by device
+ * identity was tried and is wrong: on a stock Windows install userData,
+ * `os.tmpdir()`, and `os.homedir()` are all on `C:` — and userData is beneath the
+ * home directory, so containment removes that one too. Filtering by device then
+ * leaves *no control at all*, `control_refused` stays false, and win32 — where the
+ * refusal is unconditional and the most platform-wide refusal there is — gets
+ * reported under the backend's location stage. The dialog would tell every Windows
+ * user to move their settings to an ordinary local disk, advice that cannot help
+ * anywhere on that machine, and `packaged-recovery-gate.mjs` asserts
+ * `platform-durability-unsupported` on exactly that path, so the Windows CI gate
+ * fails too. Reproduced against the real layout before this was written.
+ *
+ * Ordering still buys the thing device identity was reached for: where a different
+ * volume *is* available — the usual macOS and Linux install, with userData under
+ * `$HOME` and a `TMPDIR` elsewhere — it is consulted first, so the strongest
+ * available control decides. Where the host genuinely has one volume, a same-volume
+ * control is the best evidence obtainable, and treating "the only control I have
+ * agrees" as no answer at all is strictly worse than treating it as an answer.
+ *
+ * Containment is still an exclusion rather than a preference. A control that contains
+ * the caller's tree probes an ancestor of the intended location; a control inside the
+ * caller's tree probes the directory under test itself. Either relation shares more
+ * than the operating system, so neither location is a control whatever its device says.
+ *
+ * More than one because a control that cannot be written to has no vote, and on a
+ * sandboxed or hardened host either root may be unavailable. Returning a list lets
+ * the caller keep asking until something actually answers, instead of treating
+ * "could not ask" as agreement.
+ */
+export function control_roots_for(user_data_dir: string): readonly string[] {
+    const intended_device = device_of(user_data_dir);
+    const admitted = [os.tmpdir(), os.homedir()]
+        .filter((root) =>
+            !is_within(user_data_dir, root)
+            && !is_within(root, user_data_dir),
+        );
+    // A stable partition, not a sort: `sort` on a boolean comparator is not
+    // guaranteed to preserve the tmpdir-before-homedir order among equals, and that
+    // order is itself deliberate.
+    const shares_volume = (root: string): boolean =>
+        intended_device !== undefined && device_of(root) === intended_device;
+    return [
+        ...admitted.filter((root) => !shares_volume(root)),
+        ...admitted.filter((root) => shares_volume(root)),
+    ];
+}
+
+/**
+ * Whether this build is willing to keep a SQLite state database here at all,
+ * decided *before* any open is attempted.
+ *
+ * The desktop's durability contract is unconditional: every marker, candidate,
+ * member move, and install is made durable by flushing the containing directory,
+ * and `assert_sqlite_directory_durability_supported` refuses rather than treat a
+ * skipped flush as a successful one. Node exposes no proven win32 primitive for
+ * that — `fs.openSync` on a directory fails outright, and `FlushFileBuffers` on a
+ * file handle says nothing about the ordering of the rename and unlink operations
+ * the install and preserve protocols are built from. A real primitive needs a
+ * native addon, and the packaging contract forbids one (see
+ * desktop/check-sqlite-bundle-externals.mjs, desktop/after-pack.mjs, and
+ * desktop/README.md, all of which assert no native addon and no runtime
+ * node_modules in the app bundle). So on Windows this build cannot open its state
+ * database, and the failure policy forbids shipping with empty or read-only
+ * authority in its place.
+ *
+ * Consulted up front rather than diagnosed from a failed open. The alternative
+ * reaches the same conclusion by a longer route and reaches it worse in three
+ * ways: it creates the coordination gate before refusing, it makes the story the
+ * user is told depend on which internal stage happened to notice first, and it
+ * leaves the platform decision implicit in a predicate two modules away. Stating
+ * it here makes the refusal one fixed, non-looping story with nothing created and
+ * nothing touched — which is what the failure policy asks of a platform whose
+ * durability primitive is missing.
+ *
+ * Derived from the production assertion's own exported capability predicate, never
+ * from a second `win32` literal. A duplicated platform predicate can drift from its
+ * enforcer, and the drift is silent by construction: the copy keeps answering
+ * confidently after the original has changed. An unconditional platform refusal is
+ * therefore classified directly even when a production userData override contains
+ * every candidate control root.
+ *
+ * Other refusals are told apart by *where* they occur. The intended location is
+ * asked first; if it refuses, unrelated control locations are asked. A control that
+ * also refuses makes this a property of the platform, since the two locations have
+ * nothing in common but the operating system. A control that answers normally makes
+ * it a property of that one filesystem — an exotic or network mount — which the user
+ * can act on today.
+ *
+ * A control that cannot be asked at all gets no vote, and if *no* control can be
+ * asked the answer stays with the location story. That asymmetry is deliberate:
+ * the location story offers a remedy to try, so being wrong in that direction
+ * costs one failed attempt, while wrongly claiming the whole platform is
+ * unsupported tells someone with a fixable mount to wait for a future build.
+ *
+ * `user_data_dir` is required, and deliberately so. An earlier revision let it be
+ * omitted and fell back to the temp directory, which quietly destroyed the
+ * distinction this function exists to draw: the intended location and the control
+ * were then the same directory, so the control always agreed and *every* refusal
+ * — including a purely local one — was reported as a whole-platform refusal. That
+ * is the "wait for a future build" story told to someone whose problem was one
+ * unusual mount, which is precisely the misdirection the split was added to
+ * prevent. A caller that genuinely wants the platform question asked in the
+ * abstract passes a throwaway directory of its own; there is then still a real
+ * control, and the answer stays honest.
+ */
+export function desktop_state_platform_support(
+    user_data_dir: string,
+): { readonly supported: true } | { readonly supported: false; readonly failure: DesktopStateOpenFailure } {
+    const intended = durability_answer_at(user_data_dir);
+    if (intended.kind !== 'refused') return { supported: true };
+    const platform_refused = sqlite_directory_durability_is_platform_unsupported();
+    // The first control that can actually answer decides; an unavailable one is
+    // skipped rather than counted as agreement.
+    let control_refused = false;
+    for (const root of control_roots_for(user_data_dir)) {
+        const control = durability_answer_at(root);
+        if (control.kind === 'unavailable') continue;
+        control_refused = control.kind === 'refused';
+        break;
+    }
+    return {
+        supported: false,
+        failure: {
+            category: intended.error.category,
+            // An unconditional platform refusal or two unrelated refusals: the
+            // platform itself. Only the intended location refused, or no control
+            // could be reached: this filesystem, reported under the backend's own
+            // stage so the dialog tells the fixable story.
+            operation: desktop_state_durability_refusal_operation(
+                intended.error.metadata.operation,
+                platform_refused,
+                control_refused,
+            ),
+        },
+    };
+}
+
 /**
  * Refuse the open, without acquiring anything, when the basename is under an
  * unfinished recovery.
@@ -197,6 +481,14 @@ function open_failure(error: unknown, operation: string): DesktopStateOpenResult
  * after the manifest says `complete`, and the exclusive intent is removed last of
  * all — so every way a move can stop partway leaves at least one of them, and a
  * settled basename has neither.
+ *
+ * A marker counts whether or not it *parses*. Each is created by an
+ * `open`+`write`+`fsync`, so a crash in the gap leaves a zero-length file, and a
+ * zero-length `exclusive-intent` blocks the reader gate exactly as a well-formed
+ * one does — the reader gate tests only for the file's presence. Refusing on
+ * presence alone therefore keeps the predicate honest, and the attested preserve
+ * is what clears it; inspection no longer throws on either shape, because
+ * throwing here is what made the torn case unrecoverable.
  *
  * An earlier revision also refused when `inventory_sqlite_basename` reported
  * `incompleteRecoveryDirectories > 0`. That is not a stable predicate for this
@@ -226,12 +518,33 @@ function preflight_recovery_condition(
     if (!fs.existsSync(path.dirname(database_path))) return undefined;
     try {
         const gate = inspect_sqlite_recovery_gate(database_path);
+        // An entry in the readers directory that was never one of our tokens —
+        // by its name or by its contents — is reported with its own stage, so
+        // the dialog tells it as `coordination-residue` ("something unexpected
+        // in the coordination folder") rather than as an interrupted move that
+        // never happened. It is refused rather than ignored because the recovery
+        // action is the only thing that can clear it, and an app that opened
+        // normally would never offer that action: `waitForReaders` would then
+        // spin on the entry forever the next time a preserve was attempted.
+        if (gate.malformedReaderTokenNames.length > 0) {
+            return open_failure(
+                sqlite_file_state_recovery_error({ operation: 'reader-token-inventory' }),
+                'reader-token-inventory',
+            );
+        }
         // An intent is either a live peer mid-recovery or the residue of an
         // interrupted one. From inside one process those are indistinguishable
         // — and must stay indistinguishable, because telling them apart would
         // mean PID/TTL/heartbeat expiry. Both are honestly "a recovery is in
         // progress", which is a dialog, not a spin.
-        if (gate.exclusiveIntentTokenId !== undefined || gate.recoveryBlocked) {
+        //
+        // A *malformed* marker of either kind is refused identically, because it
+        // obstructs identically: the reader gate tests only for the intent
+        // file's presence, so a zero-length one left by a crash between the
+        // marker's `open` and its `write` spins every later launch exactly as a
+        // well-formed one does.
+        if (gate.exclusiveIntentTokenId !== undefined || gate.exclusiveIntentMalformed
+            || gate.recoveryBlocked || gate.recoveryBlockMalformed) {
             return open_failure(
                 sqlite_file_state_recovery_error({ operation: 'desktop-state-preflight' }),
                 'desktop-state-preflight',
@@ -242,9 +555,8 @@ function preflight_recovery_condition(
         // A preflight that cannot read its own gate is itself a reportable
         // condition — never a reason to fall through into the retry loop. The
         // original category and stage survive, because a gate directory that
-        // cannot be listed at all is a different story from a recovery in
-        // progress: a malformed reader-token filename reaches the dialog as
-        // `reader-token-inventory` and gets its own prose.
+        // cannot be read at all — a plain file where `readers/` belongs, say —
+        // is a different story from a recovery in progress.
         return open_failure(error, 'desktop-state-preflight');
     }
 }
@@ -263,6 +575,13 @@ export async function open_desktop_state_database(
     options: { readonly now?: () => number } = {},
 ): Promise<DesktopStateOpenResult> {
     const now = options.now ?? Date.now;
+    // Before the recovery preflight, because the recovery preflight itself
+    // inspects — and therefore creates — the gate directory. On a platform this
+    // build declines, the promise the dialog makes is that nothing was changed or
+    // moved, and creating a coordination directory in order to discover that is
+    // already a change.
+    const support = desktop_state_platform_support(user_data_dir);
+    if (!support.supported) return { type: 'failed', failure: support.failure };
     const blocked = preflight_recovery_condition(
         desktop_state_database_path(user_data_dir),
     );
@@ -316,203 +635,52 @@ async function reclaim_interrupted_recovery_residue(
     }
 }
 
-/** Where a reader-token filename that the gate's inventory cannot parse is moved
- *  to, under the gate directory so it can never be mistaken for a basename
- *  member and never travels with a preserved set. One fresh generation
- *  subdirectory per quarantine run, so two runs cannot collide on a name and
- *  nothing has to be overwritten. */
-const READER_TOKEN_QUARANTINE_DIRECTORY_NAME = 'quarantined-readers';
-
-function desktop_state_gate_directory(database_path: string): string {
-    return path.join(
-        path.dirname(database_path),
-        `.${path.basename(database_path)}.recovery-gate`,
-    );
-}
+/**
+ * Where a gate marker the backend's inspection classified malformed is moved to,
+ * under the gate directory so it can never be mistaken for a basename member and
+ * never travels with a preserved set.
+ *
+ * Named for markers rather than readers because that is what it holds: a torn
+ * `exclusive-intent` and a torn `recovery-block.json` land here too, and each of
+ * those was its own permanent dead-end for exactly the same reason an
+ * unparseable reader name was.
+ */
+const GATE_MARKER_QUARANTINE_DIRECTORY_NAME = 'quarantined-gate-markers';
 
 /**
- * Set aside any `*.reader` entry whose name the gate's own inventory refuses,
+ * Set aside every gate marker the backend's own inspection classified malformed,
  * exactly and only under the all-processes-closed attestation.
  *
- * Without this, a single malformed reader-token filename is a permanent
- * dead-end: `existing_reader_token_ids` throws `reader-token-inventory` for any
- * `*.reader` whose stem is not a UUID, so the open fails *and*
- * `preserve_desktop_state_database` throws the same error out of
- * `inspect_sqlite_recovery_gate` before it can acquire the gate — leaving the
- * recovery dialog looping with no in-app action that can clear it, and the user
- * hand-editing a hidden directory as the only escape.
+ * A thin call now, and deliberately so. The hand-written version here covered
+ * unparseable reader-token *names* only, while three other torn-marker shapes —
+ * a zero-length `exclusive-intent`, a zero-length `recovery-block.json`, and a
+ * `<uuid>.reader` whose contents are not that uuid — were the same permanent
+ * dead-end by the same mechanism: the inspection path parsed a durable marker
+ * strictly and threw, and it ran before, and gated, the only attested path
+ * allowed to clear it. Four patches would have been four chances for the fifth
+ * shape to be missed; one primitive in the module that defines the markers
+ * cannot drift from them.
  *
- * This weakens no exact-token semantics, because an entry it touches was never a
- * token: every reader token this code has ever created is named
- * `<uuid>.reader` and contains that same uuid (see
- * `acquire_sqlite_shared_reader_gate`), so a name that fails `UUID_PATTERN` — or
- * an entry that is not a regular file at all — cannot represent a live reader
- * and cannot be reclaimed, waited on, or matched by any exact-token check. A
- * *valid* token is deliberately left completely alone here; reclaiming one stays
- * the exclusive gate's exact-id path, with no PID, TTL, age, or heartbeat.
+ * What stays here is the desktop's own choice: the subtree's name, which appears
+ * in the diagnostics folder the recovery dialog reveals, and the fact that this
+ * product quarantines at all.
  *
- * A move, never a delete, and into the diagnostics folder's own tree: the bytes
- * are evidence about how the directory got into this state, and nothing in this
- * module is allowed to destroy evidence.
+ * The guarantees the primitive keeps, restated because this call site depends on
+ * them: it moves and never deletes, it leaves every *valid* marker completely
+ * alone, it refuses without the attestation, and it uses no PID, TTL, age, or
+ * heartbeat anywhere. It also returns `SqliteFileStateError` for every
+ * filesystem failure, so no `NodeJS.ErrnoException` — whose `.path` and
+ * `.message` both carry an absolute path — can escape this module.
  */
-/**
- * Reduce any filesystem failure from the quarantine to a category.
- *
- * Load-bearing, not defensive tidiness: a raw `NodeJS.ErrnoException` carries
- * the absolute path in `.path` *and* embeds it in `.message`, and this function
- * runs before the backend's own sanitizing layer would have caught it — so
- * without this an `ENOTDIR`/`EACCES` here would put a real filesystem path into
- * whatever the caller logs or shows. `SqliteFileStateError` already carries
- * nothing but a category and a sanitized operation name.
- *
- * `safe_error` rather than `categorize_sqlite_file_state_error` so an errno maps
- * to the category that actually describes it — `EACCES` to `inaccessible`,
- * `ENOSPC` to `full` — instead of collapsing to `unknown`. Same mapping the
- * shared backend applies to its own filesystem failures, so a quarantine failure
- * and an equivalent failure one call later tell the same story.
- */
-function quarantine_failure(error: unknown) {
-    return safe_error('reader-token-quarantine', error);
-}
-
-function quarantine_unparseable_reader_tokens(
+async function quarantine_malformed_gate_markers(
     database_path: string,
     confirmation: { readonly allProcessesClosed: true },
     options: SqliteOpenRecoveryHooks,
-): void {
-    if (confirmation?.allProcessesClosed !== true) {
-        throw new Error('Quarantining reader tokens requires all processes closed.');
-    }
-    // Every directory this function touches is *captured* rather than merely
-    // path-joined, and every child is derived from its parent's verified
-    // `physicalPath`. Three rounds of defects here all had the same shape — a
-    // path built with `path.join` and handed to `fs` without anything having
-    // established that it is the directory we meant — so the structure, not
-    // another check, is the fix.
-    //
-    // The rule is: a path is captured before it is used, or it is a `readdir`
-    // basename joined onto an already-captured directory. The one deliberate
-    // exception is the `mkdirSync` that *creates* a directory, which cannot
-    // consult a capture that does not exist yet; those are non-recursive, so they
-    // fail closed on EEXIST rather than following a planted symlink, and the
-    // directory is captured immediately afterwards.
-    //
-    // `capture_managed_directory` is the shared backend's own primitive and is
-    // strictly stronger than a local `lstat`: it rejects symlinks, confirms real
-    // parentage via `realpath`, and re-`lstat`s to confirm dev/ino stability,
-    // which closes the window between the check and the use. Reusing it also
-    // means this function cannot drift from the rules the backend enforces one
-    // call later.
-    const state_directory = path.dirname(database_path);
-    const gate_path = desktop_state_gate_directory(database_path);
-    // Absent, not malformed: no gate at all means there is nothing to clear, and
-    // the caller's own gate inspection is what decides whether that is a problem.
-    if (!fs.existsSync(gate_path)) return;
-    let gate: ManagedDirectoryIdentity;
-    let readers: ManagedDirectoryIdentity;
-    try {
-        // The physical parent is resolved first so a symlinked *ancestor* — the
-        // userData directory itself, say — cannot make an honest gate look
-        // misparented, which would refuse a recovery that should have worked.
-        gate = capture_managed_directory(
-            gate_path,
-            fs.realpathSync.native(state_directory),
-            'reader-token-quarantine-directory',
-        );
-        const readers_path = path.join(gate.physicalPath, 'readers');
-        // No readers directory yet is likewise nothing to clear.
-        if (!fs.existsSync(readers_path)) return;
-        readers = capture_managed_directory(
-            readers_path,
-            gate.physicalPath,
-            'reader-token-quarantine-directory',
-        );
-    } catch (error) {
-        throw quarantine_failure(error);
-    }
-    // Duplicated rather than imported from the shared backend: this is the shape
-    // the backend *rejects*, so the predicate that decides what to quarantine has
-    // to keep matching that rejection even if a future token name gains a
-    // different generator. `randomUUID` is v4, which is what the backend's own
-    // pattern accepts.
-    const uuid_pattern
-        = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    // Every filesystem call below is inside this try for the reason
-    // `quarantine_failure` documents: an unsanitized errno escaping here would
-    // carry an absolute path out of the module.
-    try {
-        const unparseable = fs.readdirSync(readers.physicalPath, { withFileTypes: true })
-            .filter((entry) => entry.name.endsWith('.reader'))
-            .filter((entry) => !entry.isFile()
-                || !uuid_pattern.test(entry.name.slice(0, -'.reader'.length)))
-            .map((entry) => entry.name);
-        if (unparseable.length === 0) return;
-        const flush = (directory: string): void => {
-            assert_sqlite_directory_durability_supported(
-                directory,
-                options.fsyncDirectory ?? fs.fsyncSync,
-            );
-        };
-        // The destination is captured exactly like the source, and derived from
-        // the gate's verified `physicalPath` rather than joined onto a raw string.
-        // A symlink here would otherwise make `mkdirSync` land every rename in the
-        // link target — the same escape as the read side, which is why both now go
-        // through one primitive instead of two hand-written checks.
-        //
-        // Created one level at a time, the way `ensure_private_gate` does it, so
-        // the entry recording `quarantined-readers` inside the gate can be flushed
-        // before anything moves in. A single recursive mkdir would create both
-        // levels while only the lower one was ever flushed.
-        const quarantine_root_path = path.join(
-            gate.physicalPath,
-            READER_TOKEN_QUARANTINE_DIRECTORY_NAME,
-        );
-        const quarantine_root_existed = fs.existsSync(quarantine_root_path);
-        if (!quarantine_root_existed) {
-            fs.mkdirSync(quarantine_root_path, { mode: 0o700 });
-            flush(gate.physicalPath);
-        }
-        const quarantine_root = capture_managed_directory(
-            quarantine_root_path,
-            gate.physicalPath,
-            'reader-token-quarantine-directory',
-        );
-        const generation_path = path.join(quarantine_root.physicalPath, randomUUID());
-        fs.mkdirSync(generation_path, { mode: 0o700 });
-        // Captured like every other directory here, and not because this one is
-        // reachable the way the earlier three were: the name is a fresh v4 UUID
-        // created by a non-recursive `mkdirSync` that fails closed on EEXIST, so it
-        // cannot be pre-planted, only raced. It is captured anyway so the rule
-        // holds without exceptions — an exception is what the next person editing
-        // this loop would have to notice and preserve, and the last three defects
-        // here came from exactly that kind of "safe by argument, not by check".
-        const generation = capture_managed_directory(
-            generation_path,
-            quarantine_root.physicalPath,
-            'reader-token-quarantine-directory',
-        );
-        // Before anything moves in, so a crash cannot leave a member with no
-        // directory to have landed in.
-        flush(quarantine_root.physicalPath);
-        for (const name of unparseable) {
-            // Re-asserted per iteration, not once before the loop, matching
-            // `advance_preservation`'s discipline in the shared backend: asserting
-            // only once would cover the first rename and leave the rest running on
-            // a stale check.
-            assert_managed_directory(readers, 'reader-token-quarantine-directory');
-            assert_managed_directory(generation, 'reader-token-quarantine-directory');
-            fs.renameSync(
-                path.join(readers.physicalPath, name),
-                path.join(generation.physicalPath, name),
-            );
-        }
-        assert_managed_directory(generation, 'reader-token-quarantine-directory');
-        flush(generation.physicalPath);
-        assert_managed_directory(readers, 'reader-token-quarantine-directory');
-        flush(readers.physicalPath);
-    } catch (error) {
-        throw quarantine_failure(error);
-    }
+): Promise<void> {
+    await quarantine_malformed_sqlite_gate_markers(database_path, confirmation, {
+        ...options,
+        quarantineDirectoryName: GATE_MARKER_QUARANTINE_DIRECTORY_NAME,
+    });
 }
 
 /**
@@ -529,9 +697,10 @@ function quarantine_unparseable_reader_tokens(
  * Four things beyond "start a move" happen here, all of them only because the
  * attestation was given:
  *
- * - a `*.reader` entry whose name the gate's inventory cannot parse — which was
- *   therefore never one of our tokens — is quarantined, so the very inventory
- *   this function depends on can run at all;
+ * - every gate marker the backend classifies as malformed — a torn
+ *   `exclusive-intent`, a torn `recovery-block.json`, a `*.reader` entry whose
+ *   name or contents were never ours — is quarantined, so the very inspection
+ *   this function depends on can produce a usable answer at all;
  * - a stale exclusive intent left by an interrupted attempt is reclaimed by
  *   exact token, so this attempt can acquire the gate at all;
  * - stale reader tokens are reclaimed by exact id, so the exclusive wait can
@@ -552,11 +721,13 @@ export async function preserve_desktop_state_database(
     // make our own `write_private_file_exclusive` fail with EEXIST, i.e. the
     // user could never retry the very operation that was interrupted.
     if (fs.existsSync(path.dirname(database_path))) {
-        // First of all, and before `inspect_sqlite_recovery_gate` — which lists
-        // the readers directory and throws `reader-token-inventory` on an
-        // unparseable name, from *this* line, making the whole recovery action
-        // unreachable for a condition only the recovery action can clear.
-        quarantine_unparseable_reader_tokens(database_path, confirmation, options);
+        // First of all: the quarantine is what makes every later step in this
+        // function *reachable*. A malformed marker left in place would either
+        // make the reclamation below unable to name a token to reclaim (a torn
+        // intent has no id to match), route the preserve into a resume that
+        // cannot parse its own blockade, or leave `waitForReaders` spinning on
+        // an entry that was never a live reader.
+        await quarantine_malformed_gate_markers(database_path, confirmation, options);
         const residue = inspect_sqlite_recovery_gate(database_path);
         if (residue.exclusiveIntentTokenId !== undefined) {
             await reclaim_stale_sqlite_exclusive_intent(

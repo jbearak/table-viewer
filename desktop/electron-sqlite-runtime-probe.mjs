@@ -9,6 +9,7 @@ import { run_sqlite_api_probe } from './sqlite-api-probe.mjs';
 // of it. A drift between production and the probe would be the one failure mode a
 // runtime probe cannot afford.
 import {
+    assert_sqlite_directory_durability_supported,
     initialize_sqlite_database_no_clobber,
 } from '../src/sqlite-open-recovery';
 import {
@@ -36,18 +37,44 @@ function write_output(stream, text) {
  * Which v1 contract this platform is required to satisfy.
  *
  * Windows has no proven Node primitive for durably flushing a directory entry, so
- * production refuses the SQLite backend there outright (see
- * `assert_sqlite_directory_durability_supported`). The probe must therefore assert
- * a *different* contract per platform rather than assuming installation succeeds
- * everywhere: on Windows the observable guarantee is the refusal itself, and a
- * silent success there would be the actual regression.
+ * production refuses the SQLite backend there outright. The probe must therefore
+ * assert a *different* contract per platform rather than assuming installation
+ * succeeds everywhere: on Windows the observable guarantee is the refusal itself,
+ * and a silent success there would be the actual regression.
  *
- * Split out as a pure function of the platform so both contracts are reachable
- * from a unit test on any host — the win32 branch cannot otherwise be exercised
- * outside CI.
+ * Derived by *running* the production rule against a throwaway directory rather
+ * than by re-testing `platform === 'win32'`. The second copy of a predicate is
+ * the bug: it keeps answering confidently after the original has changed, and the
+ * probe would then assert a stale contract — asserting an install on a platform
+ * production had just started refusing, or a refusal on one it had just started
+ * supporting, with nothing to catch either. Calling the enforcer makes the two
+ * unable to disagree, and picks up a *location* that cannot be flushed on the
+ * same evidence.
+ *
+ * `platform` is still a parameter, and the injected `assert` still takes one, so
+ * the win32 branch stays reachable from a unit test on any host: production's
+ * assertion accepts the platform explicitly, which is what makes it drivable
+ * without being duplicated.
  */
-export function v1_contract_for_platform(platform) {
-    return platform === 'win32' ? 'fail-closed' : 'installed';
+export function v1_contract_for_platform(
+    platform = process.platform,
+    assert = assert_sqlite_directory_durability_supported,
+) {
+    const probe_directory = mkdtempSync(join(tmpdir(), 'table-viewer-durability-contract-'));
+    try {
+        // Exactly production's default operations: passing anything else here
+        // would be the injected-capability path production never takes, and would
+        // report a contract no shipped build can honor.
+        assert(probe_directory, undefined, platform);
+        return 'installed';
+    } catch (error) {
+        if (error instanceof SqliteFileStateError && error.category === 'unsupported') {
+            return 'fail-closed';
+        }
+        throw error;
+    } finally {
+        rmSync(probe_directory, { recursive: true, force: true });
+    }
 }
 
 /**

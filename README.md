@@ -130,14 +130,13 @@ brew install --cask jbearak/table-viewer/table-viewer
 
 Builds are not yet signed or notarized, so macOS blocks the first launch; the cask prints how to approve it. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
 
-On Windows (10/11, x64 or arm64) download from the [latest release](https://github.com/jbearak/table-viewer/releases/latest):
-
-- `table-viewer-<version>-<arch>-setup.exe` — installer. Adds a Start Menu entry, lists Table Viewer under "Open with…" for table files (without taking over your existing default for `.csv`/`.xlsx`), and registers an uninstaller in Add/Remove Programs. It offers a choice of installing just for you (no admin rights, the default) or for all users (requires admin).
-- `table-viewer-<version>-<arch>-portable.exe` — single file, runs without installing. No Start Menu entry and no file associations; useful where installing software isn't permitted.
-
-Pick `x64` unless you have an Arm-based PC (Surface Pro X/11, Snapdragon laptops), in which case pick `arm64`.
-
-Windows builds are unsigned — code signing certificates are expensive, and this project isn't developed on Windows — so SmartScreen shows **"Windows protected your PC"** the first time you run either exe. Click **More info**, then **Run anyway**. Each `.exe` has a matching `.sha256` on the release page if you want to verify the download first.
+**Windows desktop builds are paused.** The desktop app keeps its per-file view
+state in a SQLite database, and storing it safely requires durably flushing a
+directory entry — an operation Node exposes no proven primitive for on Windows,
+and which cannot be added without a native addon the packaging deliberately
+excludes. Rather than ship a build whose sorts, filters, and layouts might not
+survive a restart, the app declines the platform up front and no Windows artifact
+is published. The VS Code extension is unaffected and works normally on Windows.
 
 **In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
 
@@ -158,7 +157,7 @@ Clone the repo and run `npm install`.
 
 - `npm run desktop:dev` — build the bundles and launch the app with Electron
 - `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
-- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows
+- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows. Developer-only: the resulting app declines to open its state database (see the Windows note above), and the release workflow does not publish Windows artifacts.
 - `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
 
 `./scripts/setup.sh` builds and installs both front ends locally in one go — the `.vsix` into every supported editor on `PATH`, and (on macOS) the desktop app into `/Applications`. See the [development guide](docs/development.md) for its flags and exact behavior.

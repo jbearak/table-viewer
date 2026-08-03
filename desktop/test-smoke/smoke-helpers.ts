@@ -1,10 +1,87 @@
 // Shared helpers for the Electron smoke specs.
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
-import { expect } from '@playwright/test';
+import { expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 
 export const repo_dir = path.resolve(__dirname, '..', '..');
 export const main_js = path.join(repo_dir, 'dist', 'desktop', 'main.js');
+
+/**
+ * A private userData directory for one app launch.
+ *
+ * `realpathSync.native` because the state backend canonicalizes every path it
+ * touches, and on macOS `os.tmpdir()` is a symlink — without this the directory
+ * the test inspects and the one the app writes to are spelled differently.
+ */
+export function isolated_user_data(prefix: string): string {
+    return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
+/** Launch the built desktop bundle against `user_data_dir`, opening `files`. */
+export function launch_app(
+    user_data_dir: string,
+    files: readonly string[] = [],
+): Promise<ElectronApplication> {
+    expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
+    return electron.launch({
+        args: [main_js, ...files],
+        cwd: repo_dir,
+        env: { ...process.env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
+    });
+}
+
+/** The desktop's SQLite file-state database inside `user_data_dir`. */
+export function state_database_path(user_data_dir: string): string {
+    return path.join(user_data_dir, 'state', 'file-state.sqlite3');
+}
+
+/**
+ * The recovery gate's directory layout, mirroring `gate_paths` in
+ * src/sqlite-open-recovery.ts. Duplicated rather than imported: these specs
+ * inspect the app's on-disk residue from outside the app, and a helper that
+ * imported the implementation would agree with it by construction even after it
+ * had drifted from what the app actually writes.
+ */
+function gate_directory(user_data_dir: string): string {
+    const database = state_database_path(user_data_dir);
+    return path.join(path.dirname(database), `.${path.basename(database)}.recovery-gate`);
+}
+
+/** Shared-reader tokens currently held against the state database. One per live
+ *  connection; only `close()` removes one, so a killed process leaves its own. */
+export function reader_tokens(user_data_dir: string): string[] {
+    const readers = path.join(gate_directory(user_data_dir), 'readers');
+    try {
+        return fs.readdirSync(readers).filter((name) => name.endsWith('.reader'));
+    } catch (error) {
+        // The gate directory is removed as the app shuts down, and this helper is
+        // polled across that moment. An absent directory means no tokens.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw error;
+    }
+}
+
+/** Whether a recovery is claimed or blockaded — either would make the next
+ *  launch refuse to open rather than opening the database. */
+export function recovery_residue(user_data_dir: string): {
+    exclusiveIntent: boolean;
+    recoveryBlocked: boolean;
+} {
+    const gate = gate_directory(user_data_dir);
+    return {
+        exclusiveIntent: fs.existsSync(path.join(gate, 'exclusive-intent')),
+        recoveryBlocked: fs.existsSync(path.join(gate, 'recovery-block.json')),
+    };
+}
+
+/** Whether a rollback journal is sitting beside the database. Under
+ *  `journal_mode = DELETE` one exists only inside a write transaction, so its
+ *  presence after a launch settles means an interrupted write is unrecovered. */
+export function hot_journal_present(user_data_dir: string): boolean {
+    return fs.existsSync(`${state_database_path(user_data_dir)}-journal`);
+}
 
 /**
  * Invoke an application-menu item by label, the way the native menu would.
