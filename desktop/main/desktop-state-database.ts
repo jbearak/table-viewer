@@ -274,45 +274,55 @@ function device_of(directory: string): bigint | undefined {
 }
 
 /**
- * Control locations to ask the same question of, ordered, each on a *different
- * filesystem* from the caller's.
+ * Control locations to ask the same question of, ordered so that the ones sharing
+ * least with the caller's are asked first.
  *
- * The temp directory first, because on a real install userData lives under the
- * user's home and the two are usually different filesystems — which is what makes
- * agreement between them evidence about the operating system rather than about one
- * mount.
+ * Two locations agreeing is only evidence about the *operating system* to the
+ * extent that they have nothing else in common, so a control on a different volume
+ * is worth more than one on the same volume. That is a question of **ordering, not
+ * eligibility**, and the distinction is the whole of this function.
  *
- * Discriminated by **device identity, not by path containment**. Textual
- * containment was the original test and it is not sufficient in either direction:
- * `TMPDIR` and userData can be different paths on one mount (macOS `/tmp` and
- * `$HOME` share a device on a stock install — measured, not assumed; so do a
- * userData and a `TMPDIR` both on a single NFS mount). Both probes then refuse for
- * the same *location-specific* reason, the loop stops at that first refusal, and a
- * fixable one-mount problem is reported as "this platform cannot do it, wait for a
- * future build" — the exact misdirection the platform/location split exists to
- * prevent, and the one whose cost is highest, because the story it tells offers no
- * remedy at all.
+ * A same-volume control is *not* dropped, and it must not be. Excluding by device
+ * identity was tried and is wrong: on a stock Windows install userData,
+ * `os.tmpdir()`, and `os.homedir()` are all on `C:` — and userData is beneath the
+ * home directory, so containment removes that one too. Filtering by device then
+ * leaves *no control at all*, `control_refused` stays false, and win32 — where the
+ * refusal is unconditional and the most platform-wide refusal there is — gets
+ * reported under the backend's location stage. The dialog would tell every Windows
+ * user to move their settings to an ordinary local disk, advice that cannot help
+ * anywhere on that machine, and `packaged-recovery-gate.mjs` asserts
+ * `platform-durability-unsupported` on exactly that path, so the Windows CI gate
+ * fails too. Reproduced against the real layout before this was written.
  *
- * A root whose device cannot be determined is kept rather than dropped. It may
- * still be genuinely unrelated, and `durability_answer_at` classifies a location it
- * cannot probe as `unavailable`, which already gets no vote — so an unknown device
- * degrades to the existing "could not ask" path instead of silently removing the
- * only available control. Containment is still applied, because a control *inside*
- * the caller's own tree is not a control whatever its device says.
+ * Ordering still buys the thing device identity was reached for: where a different
+ * volume *is* available — the usual macOS and Linux install, with userData under
+ * `$HOME` and a `TMPDIR` elsewhere — it is consulted first, so the strongest
+ * available control decides. Where the host genuinely has one volume, a same-volume
+ * control is the best evidence obtainable, and treating "the only control I have
+ * agrees" as no answer at all is strictly worse than treating it as an answer.
+ *
+ * Containment is still an exclusion rather than a preference: a control *inside* the
+ * caller's own tree shares the directory under test, not merely its volume, so it is
+ * no control at all whatever its device says.
  *
  * More than one because a control that cannot be written to has no vote, and on a
  * sandboxed or hardened host either root may be unavailable. Returning a list lets
  * the caller keep asking until something actually answers, instead of treating
  * "could not ask" as agreement.
  */
-function control_roots_for(user_data_dir: string): readonly string[] {
+export function control_roots_for(user_data_dir: string): readonly string[] {
     const intended_device = device_of(user_data_dir);
-    return [os.tmpdir(), os.homedir()].filter((root) => {
-        if (is_within(user_data_dir, root)) return false;
-        if (intended_device === undefined) return true;
-        const control_device = device_of(root);
-        return control_device === undefined || control_device !== intended_device;
-    });
+    const admitted = [os.tmpdir(), os.homedir()]
+        .filter((root) => !is_within(user_data_dir, root));
+    // A stable partition, not a sort: `sort` on a boolean comparator is not
+    // guaranteed to preserve the tmpdir-before-homedir order among equals, and that
+    // order is itself deliberate.
+    const shares_volume = (root: string): boolean =>
+        intended_device !== undefined && device_of(root) === intended_device;
+    return [
+        ...admitted.filter((root) => !shares_volume(root)),
+        ...admitted.filter((root) => shares_volume(root)),
+    ];
 }
 
 /**

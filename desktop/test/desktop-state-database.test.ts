@@ -11,6 +11,7 @@ import {
 } from '../../src/sqlite-file-state-errors';
 import { classify_state_recovery_failure } from '../main/state-recovery-dialog';
 import {
+    control_roots_for,
     DESKTOP_STATE_DATABASE_ID,
     DESKTOP_STATE_IDENTITY,
     DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
@@ -240,33 +241,50 @@ describe('desktop state platform support', () => {
             .toEqual({ supported: true });
     });
 
-    it('never uses a control location on the caller’s own filesystem', () => {
-        // The platform/location split is only meaningful if the control is on a
-        // *different* volume: two locations on one mount refuse for the same
-        // location-specific reason, and the first such refusal would then be reported
-        // as a whole-platform one — the "wait for a future build" story told to
-        // someone whose problem is one fixable mount.
+    it('keeps a same-volume control rather than being left with none', () => {
+        // A control on another volume is better evidence, so it is asked first — but
+        // a same-volume control must never be *excluded*, and this is the case that
+        // proves why. Excluding by device identity was tried and broke Windows: there
+        // userData, `os.tmpdir()`, and `os.homedir()` are all on `C:`, and userData
+        // sits beneath the home directory, so containment removes one root and device
+        // identity removed the other. With no control left, `control_refused` stays
+        // false and win32 — the most platform-wide refusal there is — reports under
+        // the backend's *location* stage, telling every Windows user to move their
+        // settings somewhere that cannot exist. `packaged-recovery-gate.mjs` asserts
+        // `platform-durability-unsupported` on that path, so the Windows CI gate
+        // would fail with it.
         //
-        // Textual containment does not establish that, which is why the filter is on
-        // device identity. This host is the proof: on a stock macOS install
-        // `os.tmpdir()` and `os.homedir()` are different paths that are *not* inside
-        // one another, yet share a device — so a containment-only filter admits a
-        // same-filesystem control here.
+        // Asserted against the production selector itself, never a reimplementation
+        // of it here — a test that recomputes the containment rule cannot observe the
+        // filter/preference distinction that is the entire point.
         const device = (target: string) => fs.statSync(target, { bigint: true }).dev;
         const intended = device(userDataDir);
 
-        // Asserted through the real entry point rather than the private helper: every
-        // control this build would consult must be on another volume.
-        for (const root of [os.tmpdir(), os.homedir()]) {
-            const admitted = !path.resolve(userDataDir).startsWith(path.resolve(root) + path.sep)
-                && path.resolve(userDataDir) !== path.resolve(root)
-                && device(root) !== intended;
-            // Where the devices match, the root must not be admitted as a control.
-            if (device(root) === intended) expect(admitted).toBe(false);
+        // The Windows shape, reproduced on this host: a userData whose volume every
+        // candidate root shares. On macOS and Linux `os.tmpdir()` and `os.homedir()`
+        // are commonly one device, and even where they are not, a userData placed
+        // under the temp root shares that root's device by construction.
+        const same_volume = fs.mkdtempSync(path.join(os.tmpdir(), 'same-volume-'));
+        try {
+            expect(device(same_volume)).toBe(device(os.tmpdir()));
+            // `os.tmpdir()` contains this directory, so containment correctly drops it;
+            // `os.homedir()` does not, and it must survive even when it shares the
+            // volume. Under the device-as-filter regression this list was empty, which
+            // is what mislabels the win32 refusal as a fixable location problem.
+            const controls = control_roots_for(same_volume);
+            expect(controls.length).toBeGreaterThan(0);
+        } finally {
+            fs.rmSync(same_volume, { recursive: true, force: true });
         }
-        // And the supported answer is unchanged by the stricter filter: dropping every
-        // control must never turn a supported platform into a refusal, because a
-        // refusal is only ever reached from the *intended* location refusing first.
+
+        // And the preference still holds where a distinct volume exists: any control
+        // not sharing the caller's device is asked before any that does.
+        const ranked = control_roots_for(userDataDir);
+        const shares = ranked.map((root) => device(root) === intended);
+        expect(shares).toEqual([...shares].sort((a, b) => Number(a) - Number(b)));
+        // And the supported answer is unchanged: a refusal is only ever reached from
+        // the *intended* location refusing first, so control selection cannot turn a
+        // supported platform into a refusal.
         expect(desktop_state_platform_support(userDataDir)).toEqual({ supported: true });
     });
 
