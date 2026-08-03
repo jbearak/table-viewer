@@ -504,12 +504,18 @@ describe('viewer window close protocol', () => {
         const decided: string[] = [];
         const viewer_manager = manager(undefined, (file_path) => {
             decided.push(file_path);
-            return { editing: true };
+            // `editing: false`, deliberately *differing* from the `profile_for` mock
+            // default of `{ editing: true }`. Returning `true` here made the profile
+            // assertion below unfalsifiable: it matched the mock's own default, so
+            // deleting `profile.editing = this.editing_decision(file_path).editing`
+            // from viewer-windows.ts left this test green. The `decided` assertion
+            // proved the gate was *consulted*; nothing proved its answer was used.
+            return { editing: false, reason: 'conditional-install-unsupported' };
         });
         viewer_manager.open_file('/tmp/gate-consulted.csv');
 
         expect(decided).toEqual(['/tmp/gate-consulted.csv']);
-        expect(controller_mock.profile).toMatchObject({ editing: true });
+        expect(controller_mock.profile).toMatchObject({ editing: false });
     });
 
     it('deduplicates native closes and orders flush, drains, acknowledgement, then close', async () => {

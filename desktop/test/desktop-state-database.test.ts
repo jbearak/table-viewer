@@ -288,6 +288,21 @@ describe('desktop state platform support', () => {
         expect(result.type).toBe('failed');
         if (result.type !== 'failed') throw new Error('expected a failed open');
         expect(result.failure.category).not.toBe('unsupported');
+        // The witness the comment above names, actually asserted rather than only
+        // described: the open got *past* the declaration and reached the machinery
+        // that creates the gate. Verified by mutation — forcing the declaration to
+        // refuse fails this line.
+        //
+        // Deliberately not claimed as a witness of the *preflight* specifically. It
+        // is not one: `acquire_sqlite_shared_reader_gate` calls `ensure_private_gate`
+        // too, so deleting `preflight_recovery_condition` from
+        // `open_desktop_state_database` leaves the gate directory present and this
+        // assertion green. What it pins is the ordering this test is named for — the
+        // declaration runs first and, on a supported platform, permits everything
+        // after it — and *that* is what would otherwise have been untested here,
+        // since a corrupt database fails to open with a non-`unsupported` category
+        // whether the declaration ran or not.
+        expect(fs.existsSync(gate_directory())).toBe(true);
     });
 });
 

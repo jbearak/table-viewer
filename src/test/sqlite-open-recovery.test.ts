@@ -674,15 +674,14 @@ describe('attested quarantine of malformed gate markers', () => {
         // The zero-length instant, exactly as a crash or an in-flight peer leaves it.
         fs.writeFileSync(completions.markerPath, '', { mode: 0o600 });
 
-        let flushes = 0;
         let peerCompleted = false;
         const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
-            // `ensure_private_gate` flushes twice before classification; the
-            // window opens on the third flush, which is the quarantine root's —
-            // after every `classify_*` call and before the first rename.
+            // Keyed on the quarantine root appearing, not on a flush ordinal — see
+            // `quarantineRoot`. Its existence means classification is finished and
+            // no rename has started, which is the window this test needs, and it is
+            // observable rather than counted.
             fsyncDirectory(descriptor) {
-                flushes += 1;
-                if (flushes >= 3 && !peerCompleted) {
+                if (!peerCompleted && fs.existsSync(quarantineRoot())) {
                     peerCompleted = true;
                     fs.writeFileSync(completions.markerPath, completions.becomesValid);
                 }
@@ -696,11 +695,13 @@ describe('attested quarantine of malformed gate markers', () => {
         // exact-id path and not to this one.
         expect(result.movedCount).toBe(0);
         expect(fs.readFileSync(completions.markerPath, 'utf8')).toBe(completions.becomesValid);
-        const quarantineRoot = path.join(gateDirectory(), 'quarantined-markers');
-        const generations = fs.existsSync(quarantineRoot) ? fs.readdirSync(quarantineRoot) : [];
-        for (const entry of generations) {
-            expect(fs.readdirSync(path.join(quarantineRoot, entry))).toEqual([]);
-        }
+        // Nothing was quarantined. A generation directory is only created when a
+        // move is attempted and only kept when one succeeded, so after a wholly
+        // refused run there is either no root at all or no generation under it.
+        const generations = fs.existsSync(quarantineRoot())
+            ? fs.readdirSync(quarantineRoot())
+            : [];
+        expect(generations).toEqual([]);
     });
 
     it('still moves a marker whose bytes churn but never become a token', async () => {
@@ -715,15 +716,22 @@ describe('attested quarantine of malformed gate markers', () => {
         fs.writeFileSync(intentPath, 'aaaaaaaa', { mode: 0o600 });
         const before = fs.lstatSync(intentPath);
 
-        let flushes = 0;
+        // Keyed on the quarantine root appearing rather than on a flush ordinal, and
+        // one-shot so the rewrite happens exactly once. `rewritten` is asserted
+        // below: without it a guard that never fired would leave every assertion
+        // here passing over a marker that was never churned at all.
+        let rewritten = false;
         const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
             fsyncDirectory(descriptor) {
-                flushes += 1;
-                if (flushes === 3) fs.writeFileSync(intentPath, 'bbbbbbbb');
+                if (!rewritten && fs.existsSync(quarantineRoot())) {
+                    rewritten = true;
+                    fs.writeFileSync(intentPath, 'bbbbbbbb');
+                }
                 fs.fsyncSync(descriptor);
             },
         });
 
+        expect(rewritten).toBe(true);
         // Same incarnation, same size, still not a uuid — so it is still nobody's
         // live marker and the quarantine may set it aside.
         expect(fs.lstatSync(path.join(soleQuarantineGeneration(), 'exclusive-intent')).ino)
@@ -914,13 +922,17 @@ describe('attested quarantine of malformed gate markers', () => {
         fs.mkdirSync(intentPath);
         const liveToken = '00000000-0000-4000-8000-0000000000bb';
 
-        let flushes = 0;
+        // Keyed on the quarantine root appearing — after classification, before any
+        // rename — rather than on a flush ordinal, and one-shot. A peer clears the
+        // obstruction and takes the gate inside that window. `replaced` is asserted
+        // below so a guard that never fired cannot pass this test vacuously: an
+        // untouched directory is refused for the wrong reason and every assertion
+        // here would still hold.
+        let replaced = false;
         const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested, {
-            // Third flush is the quarantine root's: after classification, before
-            // any rename. A peer clears the obstruction and takes the gate.
             fsyncDirectory(descriptor) {
-                flushes += 1;
-                if (flushes === 3) {
+                if (!replaced && fs.existsSync(quarantineRoot())) {
+                    replaced = true;
                     fs.rmSync(intentPath, { recursive: true, force: true });
                     fs.writeFileSync(intentPath, liveToken, { mode: 0o600 });
                 }
@@ -928,6 +940,7 @@ describe('attested quarantine of malformed gate markers', () => {
             },
         });
 
+        expect(replaced).toBe(true);
         expect(result.movedCount).toBe(0);
         // The peer's intent is intact and still a live exclusive claim.
         expect(fs.readFileSync(intentPath, 'utf8')).toBe(liveToken);

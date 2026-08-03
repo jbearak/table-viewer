@@ -1382,8 +1382,31 @@ export async function quarantine_malformed_sqlite_gate_markers(
                 block.identity,
             );
         }
-        // Flushed only where something actually moved, since a refused move
-        // leaves the directory entry untouched.
+        // Flushed only where something actually moved, since a refused move leaves
+        // the directory entry untouched.
+        //
+        // A run in which *every* move was refused holds no evidence, so its
+        // generation is removed rather than left behind. The become-valid and
+        // replaced-marker cases pin `movedCount === 0`, and those are ordinary
+        // outcomes a live peer produces — so without this, every launch that raced a
+        // peer added another empty `quarantined-markers/<uuid>` to the gate, and the
+        // diagnostics window would show a growing row of generations that recorded
+        // nothing. It is also what `SqliteGateQuarantineResult.generation` already
+        // promises: absent when nothing was created.
+        //
+        // `rmdirSync`, never `rm -r`: it removes an empty directory and *fails* on a
+        // non-empty one. This runs on the path where nothing was moved, so a
+        // generation with anything in it means the premise is wrong, and refusing to
+        // recurse is what stops this cleanup from ever destroying evidence.
+        if (movedCount === 0) {
+            assert_managed_directory(generationDirectory, 'gate-quarantine-flush');
+            fs.rmdirSync(generationDirectory.physicalPath);
+            // The removal is the directory-entry change that has to be made durable
+            // now, and it is the *root's* entry that changed.
+            assert_managed_directory(quarantineRoot, 'gate-quarantine-flush');
+            flush_directory(quarantineRoot.physicalPath, options);
+            return { movedCount: 0 };
+        }
         assert_managed_directory(generationDirectory, 'gate-quarantine-flush');
         flush_directory(generationDirectory.physicalPath, options);
         if (movedFromReaders) {
