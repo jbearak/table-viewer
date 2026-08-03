@@ -29,6 +29,7 @@ import {
     quarantine_malformed_sqlite_gate_markers,
     reclaim_stale_sqlite_exclusive_intent,
     resume_sqlite_basename_preservation,
+    sqlite_directory_durability_is_platform_unsupported,
     type SqliteExclusiveRecoveryGate,
     type SqliteOpenRecoveryHooks,
 } from '../../src/sqlite-open-recovery';
@@ -190,6 +191,16 @@ function open_failure(error: unknown, operation: string): DesktopStateOpenResult
  */
 export const DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION = 'platform-durability-unsupported';
 
+export function desktop_state_durability_refusal_operation(
+    intended_operation: string | undefined,
+    platform_refused: boolean,
+    control_refused: boolean,
+): string | undefined {
+    return platform_refused || control_refused
+        ? DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION
+        : intended_operation;
+}
+
 /**
  * What asking the production rule at one location told us.
  *
@@ -281,9 +292,12 @@ export function nearest_existing_ancestor(directory: string): string {
 
 /** Whether `directory` is the root itself or lives beneath it. */
 function is_within(directory: string, root: string): boolean {
-    const resolved = path.resolve(directory);
-    const resolved_root = path.resolve(root);
-    return resolved === resolved_root || resolved.startsWith(resolved_root + path.sep);
+    const relative = path.relative(path.resolve(root), path.resolve(directory));
+    return relative === '' || (
+        !path.isAbsolute(relative)
+        && relative !== '..'
+        && !relative.startsWith(`..${path.sep}`)
+    );
 }
 
 /**
@@ -330,9 +344,10 @@ function device_of(directory: string): bigint | undefined {
  * control is the best evidence obtainable, and treating "the only control I have
  * agrees" as no answer at all is strictly worse than treating it as an answer.
  *
- * Containment is still an exclusion rather than a preference: a control *inside* the
- * caller's own tree shares the directory under test, not merely its volume, so it is
- * no control at all whatever its device says.
+ * Containment is still an exclusion rather than a preference. A control that contains
+ * the caller's tree probes an ancestor of the intended location; a control inside the
+ * caller's tree probes the directory under test itself. Either relation shares more
+ * than the operating system, so neither location is a control whatever its device says.
  *
  * More than one because a control that cannot be written to has no vote, and on a
  * sandboxed or hardened host either root may be unavailable. Returning a list lets
@@ -342,7 +357,10 @@ function device_of(directory: string): bigint | undefined {
 export function control_roots_for(user_data_dir: string): readonly string[] {
     const intended_device = device_of(user_data_dir);
     const admitted = [os.tmpdir(), os.homedir()]
-        .filter((root) => !is_within(user_data_dir, root));
+        .filter((root) =>
+            !is_within(user_data_dir, root)
+            && !is_within(root, user_data_dir),
+        );
     // A stable partition, not a sort: `sort` on a boolean comparator is not
     // guaranteed to preserve the tmpdir-before-homedir order among equals, and that
     // order is itself deliberate.
@@ -381,17 +399,19 @@ export function control_roots_for(user_data_dir: string): readonly string[] {
  * nothing touched — which is what the failure policy asks of a platform whose
  * durability primitive is missing.
  *
- * Derived from the production assertion, never from a second `win32` literal. A
- * duplicated platform predicate can drift from its enforcer, and the drift is
- * silent by construction: the copy keeps answering confidently after the original
- * has changed.
+ * Derived from the production assertion's own exported capability predicate, never
+ * from a second `win32` literal. A duplicated platform predicate can drift from its
+ * enforcer, and the drift is silent by construction: the copy keeps answering
+ * confidently after the original has changed. An unconditional platform refusal is
+ * therefore classified directly even when a production userData override contains
+ * every candidate control root.
  *
- * The two refusals are told apart by *where* they occur rather than by a second
- * platform test. The intended location is asked first; if it refuses, unrelated
- * control locations are asked. A control that also refuses makes this a property
- * of the platform, since the two locations have nothing in common but the
- * operating system. A control that answers normally makes it a property of that
- * one filesystem — an exotic or network mount — which the user can act on today.
+ * Other refusals are told apart by *where* they occur. The intended location is
+ * asked first; if it refuses, unrelated control locations are asked. A control that
+ * also refuses makes this a property of the platform, since the two locations have
+ * nothing in common but the operating system. A control that answers normally makes
+ * it a property of that one filesystem — an exotic or network mount — which the user
+ * can act on today.
  *
  * A control that cannot be asked at all gets no vote, and if *no* control can be
  * asked the answer stays with the location story. That asymmetry is deliberate:
@@ -415,6 +435,7 @@ export function desktop_state_platform_support(
 ): { readonly supported: true } | { readonly supported: false; readonly failure: DesktopStateOpenFailure } {
     const intended = durability_answer_at(user_data_dir);
     if (intended.kind !== 'refused') return { supported: true };
+    const platform_refused = sqlite_directory_durability_is_platform_unsupported();
     // The first control that can actually answer decides; an unavailable one is
     // skipped rather than counted as agreement.
     let control_refused = false;
@@ -428,12 +449,15 @@ export function desktop_state_platform_support(
         supported: false,
         failure: {
             category: intended.error.category,
-            // Both refused: the platform itself. Only the intended location
-            // refused, or no control could be reached: this filesystem, reported
-            // under the backend's own stage so the dialog tells the fixable story.
-            operation: control_refused
-                ? DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION
-                : intended.error.metadata.operation,
+            // An unconditional platform refusal or two unrelated refusals: the
+            // platform itself. Only the intended location refused, or no control
+            // could be reached: this filesystem, reported under the backend's own
+            // stage so the dialog tells the fixable story.
+            operation: desktop_state_durability_refusal_operation(
+                intended.error.metadata.operation,
+                platform_refused,
+                control_refused,
+            ),
         },
     };
 }

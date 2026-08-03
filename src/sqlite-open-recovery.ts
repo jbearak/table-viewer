@@ -464,6 +464,13 @@ function flush_file(filePath: string): void {
     }
 }
 
+export function sqlite_directory_durability_is_platform_unsupported(
+    platform: NodeJS.Platform = process.platform,
+    fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
+): boolean {
+    return platform === 'win32' && fsyncDirectory === fs.fsyncSync;
+}
+
 export function assert_sqlite_directory_durability_supported(
     directoryPath: string,
     fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
@@ -473,7 +480,7 @@ export function assert_sqlite_directory_durability_supported(
     // changes. Refuse the backend explicitly instead of treating a skipped flush as
     // durable success. Tests may inject a capability implementation at the operation
     // boundary, but production never assumes one exists.
-    if (platform === 'win32' && fsyncDirectory === fs.fsyncSync) {
+    if (sqlite_directory_durability_is_platform_unsupported(platform, fsyncDirectory)) {
         throw sqlite_file_state_error('unsupported', { operation: 'directory-durability' });
     }
     let descriptor: number | undefined;

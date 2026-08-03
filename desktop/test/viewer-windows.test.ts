@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import {
@@ -333,9 +334,10 @@ function viewer_entry(
     const entries = (viewer_manager as unknown as {
         windows: Array<{ fileKey: string; allowClose: boolean }>;
     }).windows;
-    const entry = entries.find((candidate) => candidate.fileKey.includes(
-        file_path.replace(/^.*\//, ''),
-    ));
+    const basename = path.basename(file_path);
+    const entry = entries.find(
+        (candidate) => path.basename(candidate.fileKey) === basename,
+    );
     if (!entry) throw new Error(`no viewer entry for ${file_path}`);
     return entry;
 }
@@ -516,6 +518,19 @@ describe('viewer window close protocol', () => {
 
         expect(decided).toEqual(['/tmp/gate-consulted.csv']);
         expect(controller_mock.profile).toMatchObject({ editing: false });
+    });
+
+    it('finds a viewer entry by exact basename rather than substring', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/prefix-target.csv');
+        viewer_manager.open_file('/tmp/target.csv');
+        const entries = (viewer_manager as unknown as {
+            windows: Array<{ allowClose: boolean }>;
+        }).windows;
+        entries[0].allowClose = false;
+        entries[1].allowClose = true;
+
+        expect(viewer_entry(viewer_manager, '/tmp/target.csv').allowClose).toBe(true);
     });
 
     it('deduplicates native closes and orders flush, drains, acknowledgement, then close', async () => {
@@ -1004,8 +1019,8 @@ describe('viewer window close protocol', () => {
 
         await expect(closing).resolves.toBe(true);
         expect(window.destroyed).toBe(true);
-        // Not re-armed: this outcome is `closed`, and only a window that survives
-        // may leave the fence guard armed.
+        // `allowClose` stays true: the outcome is `closed`, and only a window
+        // that survives has the guard restored to false.
         expect(entry.allowClose).toBe(true);
         expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
     });

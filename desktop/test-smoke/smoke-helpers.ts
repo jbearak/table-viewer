@@ -53,9 +53,14 @@ function gate_directory(user_data_dir: string): string {
  *  connection; only `close()` removes one, so a killed process leaves its own. */
 export function reader_tokens(user_data_dir: string): string[] {
     const readers = path.join(gate_directory(user_data_dir), 'readers');
-    return fs.existsSync(readers)
-        ? fs.readdirSync(readers).filter((name) => name.endsWith('.reader'))
-        : [];
+    try {
+        return fs.readdirSync(readers).filter((name) => name.endsWith('.reader'));
+    } catch (error) {
+        // The gate directory is removed as the app shuts down, and this helper is
+        // polled across that moment. An absent directory means no tokens.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw error;
+    }
 }
 
 /** Whether a recovery is claimed or blockaded — either would make the next

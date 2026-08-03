@@ -18,6 +18,7 @@ import {
     DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
     DESKTOP_STATE_STORAGE_ENVIRONMENT_ID,
     desktop_state_platform_support,
+    desktop_state_durability_refusal_operation,
     desktop_state_database_path,
     desktop_state_diagnostics_directory,
     desktop_state_error_log_line,
@@ -320,6 +321,38 @@ describe('desktop state platform support', () => {
         // the *intended* location refusing first, so control selection cannot turn a
         // supported platform into a refusal.
         expect(desktop_state_platform_support(userDataDir)).toEqual({ supported: true });
+    });
+
+    it('excludes controls related to userData in either containment direction', () => {
+        const candidate = os.tmpdir();
+
+        // The control contains userData: probing it would ask an ancestor of the
+        // intended location rather than an unrelated location.
+        const below_candidate = path.join(candidate, 'future-userData');
+        expect(control_roots_for(below_candidate)).not.toContain(candidate);
+
+        // The control is inside userData: probing it would ask the tree under test
+        // itself. This is the opposite argument order and kills a one-sided filter.
+        const above_candidate = path.dirname(candidate);
+        expect(control_roots_for(above_candidate)).not.toContain(candidate);
+    });
+
+    it('keeps an unconditional platform refusal when no unrelated control exists', () => {
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            true,
+            false,
+        )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            false,
+            true,
+        )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
+        expect(desktop_state_durability_refusal_operation(
+            'directory-durability',
+            false,
+            false,
+        )).toBe('directory-durability');
     });
 
     it('requires a location, so the platform/location control is never degenerate', () => {

@@ -25,6 +25,7 @@ import {
     reclaim_stale_sqlite_exclusive_intent,
     recognize_sqlite_initialization_candidate,
     resume_sqlite_basename_preservation,
+    sqlite_directory_durability_is_platform_unsupported,
     type SqliteOpenRecoveryEvent,
 } from '../sqlite-open-recovery';
 
@@ -1490,6 +1491,13 @@ describe('raw preflight and writable rollback-journal recovery', () => {
     });
 
     it('fails closed explicitly on Windows without a proven directory primitive', () => {
+        expect(sqlite_directory_durability_is_platform_unsupported('win32', fs.fsyncSync))
+            .toBe(true);
+        expect(sqlite_directory_durability_is_platform_unsupported('win32', () => {}))
+            .toBe(false);
+        expect(sqlite_directory_durability_is_platform_unsupported('darwin', fs.fsyncSync))
+            .toBe(false);
+
         try {
             assert_sqlite_directory_durability_supported(tempDirectory, fs.fsyncSync, 'win32');
             throw new Error('Windows directory durability unexpectedly succeeded');

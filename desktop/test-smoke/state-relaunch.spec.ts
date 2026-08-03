@@ -234,11 +234,6 @@ test.describe('desktop state relaunch gates', () => {
             // performs — survives a SIGKILL and reaches a painted grid without
             // claiming a recovery it did not perform.
             const page = await viewer_page(second);
-            expect(hot_journal_present(user_data_dir)).toBe(false);
-            expect(recovery_residue(user_data_dir)).toEqual({
-                exclusiveIntent: false,
-                recoveryBlocked: false,
-            });
             // The crashed launch's token is still there and the relaunch opened
             // anyway. That combination is the design, not a leak: a shared reader
             // token never blocks another reader, and reclaiming it would mean
@@ -249,6 +244,13 @@ test.describe('desktop state relaunch gates', () => {
             await expect
                 .poll(() => reader_tokens(user_data_dir).length, { timeout: 30_000 })
                 .toBe(2);
+            // Inspect recovery residue only after the token proves that the database
+            // open settled; a painted page alone can precede that token appearing.
+            expect(hot_journal_present(user_data_dir)).toBe(false);
+            expect(recovery_residue(user_data_dir)).toEqual({
+                exclusiveIntent: false,
+                recoveryBlocked: false,
+            });
             // Committed state survived the kill: the sort was durable before the
             // process died, so it comes back.
             await expect(page.locator('.sort-strip .sort-chip')).toHaveCount(1);
