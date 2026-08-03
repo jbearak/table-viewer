@@ -541,6 +541,53 @@ function replace_private_json(
     flush_directory(path.dirname(filePath), hooks);
 }
 
+/**
+ * The largest a coordination marker may be and still be worth parsing.
+ *
+ * Every marker this module writes has a small fixed shape: a uuid
+ * (`exclusive-intent`, `<uuid>.reader`) or a three-field JSON object
+ * (`recovery-block.json`) whose longest member is a basename plus a uuid. A
+ * kilobyte is orders of magnitude above all of them and still nothing.
+ *
+ * The bound exists because these files are read on the *startup* path, in the main
+ * process, before any window or dialog can appear — `inspect_sqlite_recovery_gate`
+ * runs before the app has painted. Nothing this module writes could produce a large
+ * one, but a marker is a plain file in a user-visible directory: a backup restore, a
+ * file-sync client, a disk-recovery tool, or an unrelated crash can leave something
+ * arbitrary on that name. An unbounded `readFileSync` on it would then hang or OOM
+ * the launch with no UI to explain why, and the whole design of this module is that
+ * a damaged gate produces a *dialog*, never a dead process.
+ */
+const MAX_MARKER_BYTES = 1024;
+
+/**
+ * Read a marker, refusing anything too large to be one.
+ *
+ * `undefined` means "absent"; `oversized` is a distinct answer so callers can class
+ * it as **malformed** rather than absent — an over-large file on a marker's name
+ * still obstructs everything a well-formed marker would, and the quarantine must be
+ * able to move it aside. The size is taken from the same `lstat` the caller already
+ * needs for identity, so this costs no extra syscall on the common path.
+ */
+function read_marker_bounded(filePath: string): string | undefined | 'oversized' {
+    let stat: fs.Stats;
+    try {
+        stat = fs.lstatSync(filePath);
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+    }
+    // Checked before the read, which is the entire point: a size test performed
+    // afterwards has already paid the cost it exists to avoid.
+    if (stat.isFile() && stat.size > MAX_MARKER_BYTES) return 'oversized';
+    try {
+        return fs.readFileSync(filePath, 'utf8');
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+    }
+}
+
 function exact_token_matches(
     filePath: string,
     tokenId: string,
@@ -548,7 +595,10 @@ function exact_token_matches(
 ): boolean {
     assert_managed_directory(parentIdentity, 'managed-token-parent');
     try {
-        return fs.readFileSync(filePath, 'utf8') === tokenId;
+        // Bounded like every other marker read: a token is a uuid, and this is the
+        // enforcer consulted on the startup path. An oversized file is not the token,
+        // which is exactly what `false` says.
+        return read_marker_bounded(filePath) === tokenId;
     } catch {
         return false;
     }
@@ -822,15 +872,18 @@ function classify_reader_tokens(
         // Raced away between the readdir and the stat: a live peer releasing its
         // own token, which is ordinary and not malformed.
         if (identity === undefined) continue;
-        let contents: string;
-        try {
-            contents = fs.readFileSync(entryPath, 'utf8');
-        } catch (error) {
-            // ENOENT is a live peer releasing its own token between the readdir
-            // and the read, which is the ordinary case and not malformed. Any
-            // other errno is a real filesystem condition the caller must see.
-            if (is_node_error(error) && error.code === 'ENOENT') continue;
-            throw error;
+        // ENOENT inside is a live peer releasing its own token between the readdir
+        // and the read, which is ordinary and not malformed; any other errno is a
+        // real filesystem condition and propagates. Bounded because this runs on the
+        // startup path once per entry in the readers directory, so an unbounded read
+        // here is the hang multiplied by however many entries are present.
+        const contents = read_marker_bounded(entryPath);
+        if (contents === undefined) continue;
+        // Too large to be a uuid, so it was never a live token — malformed, and
+        // therefore reported and clearable rather than silently trusted.
+        if (contents === 'oversized') {
+            malformed.push({ name: entry.name, tokenId, identity });
+            continue;
         }
         if (contents === tokenId) tokenIds.push(tokenId);
         else malformed.push({ name: entry.name, tokenId, identity });
@@ -1017,13 +1070,11 @@ function classify_exclusive_intent(
     if (!present.isFile()) return { malformed: true };
     // Captured before the read, so the identity belongs to the bytes classified.
     const identity = capture_marker_identity(paths.exclusiveIntentPath);
-    let value: string;
-    try {
-        value = fs.readFileSync(paths.exclusiveIntentPath, 'utf8');
-    } catch (error) {
-        if (is_node_error(error) && error.code === 'ENOENT') return { malformed: false };
-        throw error;
-    }
+    const value = read_marker_bounded(paths.exclusiveIntentPath);
+    if (value === undefined) return { malformed: false };
+    // Too large to be an intent, so it is not one — malformed, which keeps it
+    // clearable by the attested quarantine instead of an unbounded startup read.
+    if (value === 'oversized') return { malformed: true, identity };
     const tokenId = parse_exclusive_intent(value);
     if (tokenId === undefined) return { malformed: true, identity };
     return { tokenId, malformed: false };
@@ -1083,13 +1134,11 @@ function classify_recovery_block(
     if (!present.isFile()) return { valid: false, malformed: true };
     // Captured before the read, so the identity belongs to the bytes classified.
     const identity = capture_marker_identity(paths.recoveryBlockPath);
-    let raw: string;
-    try {
-        raw = fs.readFileSync(paths.recoveryBlockPath, 'utf8');
-    } catch (error) {
-        if (is_node_error(error) && error.code === 'ENOENT') return { valid: false, malformed: false };
-        throw error;
-    }
+    const raw = read_marker_bounded(paths.recoveryBlockPath);
+    if (raw === undefined) return { valid: false, malformed: false };
+    // Bounded before the `JSON.parse`: this runs on the startup path, and parsing an
+    // arbitrarily large document there is the hang this fence exists to prevent.
+    if (raw === 'oversized') return { valid: false, malformed: true, identity };
     // Present but unacceptable is the *malformed* case, not the absent one: the
     // file still obstructs everything a well-formed blockade would.
     return parse_recovery_block(raw, paths) === undefined
@@ -1336,14 +1385,13 @@ export async function quarantine_malformed_sqlite_gate_markers(
                 || (compare_created_at && actual.createdAt !== expected.createdAt)) {
                 return;
             }
-            let contents: string;
-            try {
-                contents = fs.readFileSync(markerPath, 'utf8');
-            } catch (error) {
-                if (is_node_error(error) && error.code === 'ENOENT') return;
-                throw error;
-            }
-            if (!stillMalformed(contents)) return;
+            const contents = read_marker_bounded(markerPath);
+            if (contents === undefined) return;
+            // An oversized marker cannot have *become* a valid one — every shape this
+            // module writes is far below the bound — so it is still malformed and
+            // still ours to move. Short-circuited rather than passed to
+            // `stillMalformed`, which would have to read the bytes to say so.
+            if (contents !== 'oversized' && !stillMalformed(contents)) return;
             fs.renameSync(
                 markerPath,
                 path.join(generationDirectory.physicalPath, name),

@@ -382,6 +382,87 @@ describe('attested quarantine of malformed gate markers', () => {
     });
 
     it.each([
+        ['exclusive-intent'],
+        ['recovery-block.json'],
+    ] as const)('classifies an oversized %s as malformed without reading it whole', async (name) => {
+        // These markers are read on the *startup* path, in the main process, before
+        // any window or dialog exists. Nothing this module writes could produce a
+        // large one — an intent is a uuid, a blockade is a three-field object — but
+        // they are plain files in a user-visible directory, and a backup restore, a
+        // sync client, or an unrelated tool can leave anything at all on the name. An
+        // unbounded read there hangs or OOMs the launch with no UI to explain it,
+        // which contradicts this module's whole posture: a damaged gate produces a
+        // dialog, never a dead process.
+        //
+        // A *sparse* 8 GiB file: `ftruncate` gives it that apparent size while using
+        // almost no blocks, so the test stays fast and does not need 8 GiB of disk.
+        // It is also the decisive size rather than a merely large one — an unbounded
+        // `readFileSync` on it fails `ERR_STRING_TOO_LONG`, which is not ENOENT and so
+        // propagates out of inspection as `recovery-gate-inspect`: the preflight
+        // refuses the open, the quarantine throws from the same shape, and the dialog
+        // loops with no exit. That is the permanent dead-end this module is built to
+        // never have, and it is what the bound prevents. A merely large file would
+        // parse successfully and prove nothing.
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const markerPath = path.join(gateDirectory(), name);
+        const descriptor = fs.openSync(markerPath, 'w', 0o600);
+        fs.ftruncateSync(descriptor, 8 * 1024 * 1024 * 1024);
+        fs.closeSync(descriptor);
+
+        // Malformed, not valid and not absent: an oversized file obstructs everything
+        // a well-formed marker would, so it must be visible to inspection.
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        if (name === 'exclusive-intent') {
+            expect(inspected.exclusiveIntentMalformed).toBe(true);
+            // Emphatically not reported as a token id: `reclaim_stale_sqlite_exclusive_intent`
+            // *unlinks* what it is given, and its guard is a bare contents comparison.
+            expect('exclusiveIntentTokenId' in inspected).toBe(false);
+        } else {
+            expect(inspected.recoveryBlockMalformed).toBe(true);
+            expect(inspected.recoveryBlocked).toBe(false);
+        }
+
+        // And the escape works: the attested quarantine moves it, so the gate is
+        // usable again rather than permanently blocked by an unparseable file.
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(markerPath)).toBe(false);
+        // Moved, not truncated or deleted: it is still evidence, at its full size.
+        expect(fs.statSync(path.join(soleQuarantineGeneration(), name)).size)
+            .toBe(8 * 1024 * 1024 * 1024);
+    });
+
+    it('treats an oversized reader token as malformed, never as a live reader', async () => {
+        // The same bound on the readers directory, where it matters most: this read
+        // runs once per entry, so an unbounded one is the startup hang multiplied by
+        // however many entries are present. Classifying it as a live token would be
+        // worse than slow — `waitForReaders` would then block forever on a reader
+        // that never existed.
+        const tokenId = '00000000-0000-4000-8000-000000000001';
+        fs.mkdirSync(readersDirectory(), { recursive: true, mode: 0o700 });
+        const tokenPath = path.join(readersDirectory(), `${tokenId}.reader`);
+        // Sparse and past the string limit, for the reason given in the sibling above:
+        // unbounded, this read throws ERR_STRING_TOO_LONG and turns inspection itself
+        // into the dead-end totality exists to prevent.
+        const descriptor = fs.openSync(tokenPath, 'w', 0o600);
+        fs.ftruncateSync(descriptor, 8 * 1024 * 1024 * 1024);
+        fs.closeSync(descriptor);
+
+        const inspected = inspect_sqlite_recovery_gate(databasePath());
+        expect(inspected.readerTokenIds).toEqual([]);
+        expect(inspected.malformedReaderTokenNames).toEqual([`${tokenId}.reader`]);
+
+        const result = await quarantine_malformed_sqlite_gate_markers(databasePath(), attested);
+        expect(result.movedCount).toBe(1);
+        expect(fs.existsSync(tokenPath)).toBe(false);
+        // The enforcer agrees, which is the property that keeps the gate acquirable.
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        expect(exclusive.listReaderTokenIds()).toEqual([]);
+        await exclusive.waitForReaders();
+        await exclusive.release();
+    });
+
+    it.each([
         ['zero-length', ''],
         ['non-UUID text', 'garbage-not-a-token'],
         ['UUID-shaped but not a v4 UUID', '00000000-0000-0000-0000-000000000000'],

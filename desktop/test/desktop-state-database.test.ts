@@ -12,6 +12,7 @@ import {
 import { classify_state_recovery_failure } from '../main/state-recovery-dialog';
 import {
     control_roots_for,
+    nearest_existing_ancestor,
     DESKTOP_STATE_DATABASE_ID,
     DESKTOP_STATE_IDENTITY,
     DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION,
@@ -239,6 +240,39 @@ describe('desktop state platform support', () => {
         // system it fully supports, on its very first launch.
         expect(desktop_state_platform_support(path.join(userDataDir, 'not-created-yet')))
             .toEqual({ supported: true });
+    });
+
+    it('really runs the probe when userData is several levels from existing', () => {
+        // A missing userData must not make the question go *unasked*. `mkdtempSync`
+        // in a nonexistent parent fails ENOENT, which `durability_answer_at`
+        // classifies as `unavailable` — and for the intended location that silently
+        // skipped the platform question entirely. On Windows, where the refusal is
+        // unconditional and comes from the very assertion this probe exists to run,
+        // a first launch would then report `supported`, let the open create the state
+        // tree, and surface the failure later as a fixable *location* error: the
+        // opposite of the up-front, nothing-created platform refusal promised.
+        //
+        // So the probe runs in the nearest existing ancestor, which is on the
+        // filesystem the directory will land on anyway.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-userdata-'));
+        try {
+            const missing = path.join(root, 'a', 'b', 'userData');
+            // The mechanism, asserted directly. On a supported platform both a probe
+            // that ran and a probe that never ran produce `supported: true`, so the
+            // *result* cannot distinguish them and only this can: the location the
+            // probe is created in must be a directory that exists.
+            expect(nearest_existing_ancestor(missing)).toBe(root);
+            expect(fs.existsSync(nearest_existing_ancestor(missing))).toBe(true);
+
+            const answer = desktop_state_platform_support(missing);
+            expect(answer).toEqual({ supported: true });
+            // And still no side effects: the ancestor is where the probe went, so it
+            // is the place a leak would show up, and the missing path stays missing.
+            expect(fs.readdirSync(root)).toEqual([]);
+            expect(fs.existsSync(missing)).toBe(false);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it('keeps a same-volume control rather than being left with none', () => {

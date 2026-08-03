@@ -336,11 +336,20 @@ function run_crashing_child(role, cut_point, user_data_dir) {
             // until it was fixed; this is the sibling defect.
             const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
             if (!aborted) {
+                // The code and the signal, and a *boolean* for the stderr — never the
+                // text. The exit-2 branch above can forward its stderr because the
+                // child wrote it through its own `safe_failure_text`; a child that
+                // died here never reached that handler, so its output is whatever
+                // Node or Electron emitted — a module-load failure or an errno stack,
+                // both of which carry absolute paths. This message is printed
+                // verbatim into a public CI log by the top-level reporter, and this
+                // file's contract is that nothing unsanitized gets there. Same rule
+                // as `windows-durability-probe.mjs`'s `exited-unexpectedly`.
                 reject(new GateAssertionError(
                     `child for ${role}/${cut_point} died without aborting`
                     + ` (code=${typeof code === 'number' ? code : 'none'},`
-                    + ` signal=${signal ?? 'none'})`
-                    + `${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
+                    + ` signal=${signal ?? 'none'},`
+                    + ` stderr=${stderr.trim() ? 'present-but-unsanitized' : 'empty'})`,
                 ));
                 return;
             }

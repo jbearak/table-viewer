@@ -220,7 +220,24 @@ function durability_answer_at(parent_directory: string): DurabilityAnswer {
         // creating the real tree as a side effect of asking the question would
         // break the "nothing has been changed or moved" claim the unsupported
         // dialog goes on to make.
-        probe_directory = fs.mkdtempSync(path.join(parent_directory, '.tableviewer-durability-'));
+        //
+        // Placed in the nearest *existing* ancestor, because on a first launch
+        // `parent_directory` does not exist yet and `mkdtempSync` would fail ENOENT
+        // — which this function classifies as `unavailable`, i.e. "the question went
+        // unasked". For a *control* that is merely a lost vote, but for the intended
+        // location it silently skipped the platform question altogether: on Windows,
+        // where the refusal is unconditional and comes from the production assertion
+        // this probe exists to run, a first launch therefore reported `supported`,
+        // the open went on to create the state tree, and the failure arrived later as
+        // a fixable-location error. That is precisely the up-front, nothing-created
+        // platform refusal the design promises, not delivered.
+        //
+        // The ancestor is the right place to ask: durability is a property of the
+        // filesystem the directory will land on, and the nearest existing ancestor is
+        // on that filesystem by construction.
+        probe_directory = fs.mkdtempSync(
+            path.join(nearest_existing_ancestor(parent_directory), '.tableviewer-durability-'),
+        );
         assert_sqlite_directory_durability_supported(probe_directory);
         return { kind: 'supported' };
     } catch (error) {
@@ -245,6 +262,23 @@ function durability_answer_at(parent_directory: string): DurabilityAnswer {
     }
 }
 
+/**
+ * The deepest ancestor of `directory` that exists, or `directory` itself.
+ *
+ * Falls back to the filesystem root, which is why callers can treat the result as a
+ * path they may `stat` or write a probe into — though both are still attempted
+ * inside a `try`, since existing is not the same as writable.
+ */
+export function nearest_existing_ancestor(directory: string): string {
+    let candidate = path.resolve(directory);
+    for (;;) {
+        if (fs.existsSync(candidate)) return candidate;
+        const parent = path.dirname(candidate);
+        if (parent === candidate) return candidate;
+        candidate = parent;
+    }
+}
+
 /** Whether `directory` is the root itself or lives beneath it. */
 function is_within(directory: string, root: string): boolean {
     const resolved = path.resolve(directory);
@@ -261,15 +295,10 @@ function is_within(directory: string, root: string): boolean {
  * id that might accidentally compare equal to something.
  */
 function device_of(directory: string): bigint | undefined {
-    let candidate = path.resolve(directory);
-    for (;;) {
-        try {
-            return fs.statSync(candidate, { bigint: true }).dev;
-        } catch {
-            const parent = path.dirname(candidate);
-            if (parent === candidate) return undefined;
-            candidate = parent;
-        }
+    try {
+        return fs.statSync(nearest_existing_ancestor(directory), { bigint: true }).dev;
+    } catch {
+        return undefined;
     }
 }
 
