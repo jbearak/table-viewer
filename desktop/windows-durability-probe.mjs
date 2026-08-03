@@ -314,9 +314,21 @@ function survey_primitives(scratch) {
     //    constant that is absent are different findings.
     for (const flag of ['O_DSYNC', 'O_SYNC', 'O_DIRECT']) {
         const value = fs.constants[flag];
-        const exposed = typeof value === 'number';
-        observations.push(exposed
-            ? measure(`open-${flag.toLowerCase()}`, () => {
+        const name = `open-${flag.toLowerCase()}`;
+        if (typeof value !== 'number') {
+            observations.push({ name, reachable: false, constantExposed: false });
+            continue;
+        }
+        // `constantExposed` is merged *outside* `measure`, not returned from inside
+        // it. `measure` builds its own object on the failure path and drops whatever
+        // `action` was going to return, so an exposed constant whose open failed
+        // reported no `constantExposed` at all — collapsing the more interesting of
+        // the three findings ("the constant exists and is rejected anyway", which is
+        // the shape a silently-ignored write-through flag would take) into an absent
+        // key indistinguishable from an oversight. All three shapes are now stated:
+        // absent, exposed-and-reachable, exposed-and-refused.
+        observations.push({
+            ...measure(name, () => {
                 const descriptor = fs.openSync(
                     at(`${flag.toLowerCase()}-probe`),
                     fs.constants.O_WRONLY | fs.constants.O_CREAT | value,
@@ -327,9 +339,9 @@ function survey_primitives(scratch) {
                 } finally {
                     fs.closeSync(descriptor);
                 }
-                return { constantExposed: true };
-            })
-            : { name: `open-${flag.toLowerCase()}`, reachable: false, constantExposed: false });
+            }),
+            constantExposed: true,
+        });
     }
 
     // 6. Rename over an existing target. The storage protocol installs a
@@ -499,18 +511,50 @@ function derive_guarantees(observations, filesystem) {
  * every terminal outcome is classified and returned; only a spawn failure is a
  * malfunction.
  *
- * Nothing waits a fixed delay: the child's death is the observable event.
+ * Nothing waits a fixed delay: the child's death is the observable event. The one
+ * timer here is a stuck-process backstop, orders of magnitude above a healthy
+ * child, and it reports rather than passing.
  */
+
+/** Backstop for a child that neither aborts nor exits; the same limit and the same
+ *  reasoning as `packaged-recovery-gate.mjs`'s. A healthy child dies in
+ *  milliseconds. */
+const CHILD_STUCK_LIMIT_MS = 120_000;
+
 function run_cut_point_child(cut_point, user_data_dir) {
-    const script = process.argv[1];
-    const sandbox_arguments = process.argv.includes('--no-sandbox') ? ['--no-sandbox'] : [];
+    // `__filename`, not `process.argv[1]`. Electron does not reserve argv[1] for
+    // the script: it holds whatever the first argument happened to be, so under the
+    // `--no-sandbox` a headless runner requires, argv[1] is the literal string
+    // `--no-sandbox` and the child was spawned with no script at all. It then died
+    // by a signal having created nothing — and the old classifier, which inferred
+    // an abort from "not 0 and not 2", accepted that as a cut point reached. The
+    // whole survey measured nothing while the report still read as a run that
+    // happened. `packaged-recovery-gate.mjs` hit this exact defect first and records
+    // it at length; this is the same fix.
+    //
+    // `desktop/build.mjs` bundles this to CJS, so `__filename` is the real path of
+    // the bundled file that is executing — which is what the child must re-run.
+    // `import.meta.url` would not work: esbuild replaces `import.meta` with an empty
+    // object in that output.
+    const script = __filename;
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [...sandbox_arguments, script], {
+        // `--no-sandbox` is deliberately *not* forwarded. The parent needs it as a
+        // real Electron app; the child is plain Node (see `ELECTRON_RUN_AS_NODE`),
+        // and Node rejects Chromium flags outright with `bad option: --no-sandbox`.
+        const child = spawn(process.execPath, [script], {
             env: {
                 ...process.env,
                 [ROLE_VARIABLE]: 'initialize-crash',
                 [CUT_POINT_VARIABLE]: cut_point,
                 [USER_DATA_VARIABLE]: user_data_dir,
+                // Run the child as plain Node inside the Electron binary. What is
+                // under test is the *embedded runtime* — its node:sqlite, its fsync,
+                // its rename — surviving a kill at a durable boundary, and none of
+                // that needs Chromium, a window, or a desktop session. Booting the
+                // browser stack anyway made the equivalent gate child hang on a
+                // headless runner with no D-Bus for it to reach, and a hung child
+                // hung the parent with it.
+                ELECTRON_RUN_AS_NODE: '1',
             },
             // The child writes nothing to stdout; its stderr carries its own
             // already-reduced explanation of why it stopped short, which is the
@@ -519,12 +563,31 @@ function run_cut_point_child(cut_point, user_data_dir) {
         });
         let stderr = '';
         child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-        child.on('error', (error) => {
+        // A child that neither aborts nor exits would otherwise hang this promise,
+        // and with it the job, until the runner's own limit killed it with no
+        // diagnosis. Reported as an outcome rather than thrown: a stuck child is a
+        // finding about this runner, and — unlike the old inferred abort — it cannot
+        // be counted toward `complete`.
+        const stuck = setTimeout(() => {
+            child.kill('SIGKILL');
+            resolve({
+                outcome: 'exited-unexpectedly',
+                exitCode: 'none',
+                signal: 'stuck',
+                reportedSomething: stderr.trim().length > 0,
+            });
+        }, CHILD_STUCK_LIMIT_MS);
+        stuck.unref?.();
+        const settle = (finish) => (...args) => {
+            clearTimeout(stuck);
+            finish(...args);
+        };
+        child.on('error', settle((error) => {
             reject(new ProbeMalfunctionError(
                 `cut-point child could not be spawned (code=${error_code(error)})`,
             ));
-        });
-        child.on('exit', (code, signal) => {
+        }));
+        child.on('exit', settle((code, signal) => {
             if (code === 0) {
                 resolve({ outcome: 'completed-without-reaching-cut-point' });
                 return;
@@ -564,7 +627,7 @@ function run_cut_point_child(cut_point, user_data_dir) {
                     // report is a public CI artifact.
                     reportedSomething: stderr.trim().length > 0,
                 });
-        });
+        }));
     });
 }
 
@@ -693,14 +756,18 @@ async function main() {
             await run_child(process.env[CUT_POINT_VARIABLE]);
             // The cut point never fired. Exit 0 so the parent records
             // `completed-without-reaching-cut-point` — a finding, not a failure.
-            app.exit(0);
+            //
+            // `process.exit`, not `app.exit`: the child runs under
+            // ELECTRON_RUN_AS_NODE, where the Electron `app` object does not exist.
+            // Calling into it would throw here, on the path whose whole job is
+            // reporting an outcome accurately.
+            process.exit(0);
         } catch (error) {
             // Reduced before it is forwarded: the parent prints this into a public
             // CI log, and a raw errno message carries the temp path.
             write_output(process.stderr, `${safe_failure_text(error)}\n`);
-            app.exit(2);
+            process.exit(2);
         }
-        return;
     }
 
     let exit_code = 0;

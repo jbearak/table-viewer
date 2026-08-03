@@ -898,10 +898,20 @@ async function platform_gate() {
         // Asked before anything else touches this tree. The declaration is what
         // production consults, and the dialog it drives promises that nothing was
         // changed or moved — so on the declining path the state directory must
-        // still be exactly as `make_user_data_dir` left it: empty. The probe
-        // directory the declaration itself creates is removed before it returns.
+        // still be exactly as `make_user_data_dir` left it: empty.
         invariant(fs.readdirSync(state_directory(user_data_dir)).length === 0,
             'the platform declaration created something while answering');
+        // And the userData *root*, which is a separate claim the assertion above
+        // cannot make. `durability_answer_at` creates its probe with
+        // `mkdtempSync(path.join(user_data_dir, '.tableviewer-durability-'))`, so the
+        // probe lands one level above the state directory: a leaked probe was
+        // invisible here while the comment claimed otherwise. The root holds nothing
+        // but the state directory `make_user_data_dir` created.
+        invariant(
+            fs.readdirSync(user_data_dir)
+                .every((name) => name === path.basename(state_directory(user_data_dir))),
+            'the platform declaration left a probe directory behind',
+        );
 
         let failure;
         let result;
