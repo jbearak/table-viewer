@@ -87,6 +87,10 @@ export interface SqliteOpenRecoveryHooks {
     readonly onEvent?: (event: SqliteOpenRecoveryEvent) => void | Promise<void>;
     /** Observable polling hook. The default yields one event-loop turn, never a fixed delay. */
     readonly yieldControl?: () => void | Promise<void>;
+    /** Test seam immediately before linking a mutable candidate pathname to a unique install snapshot. */
+    readonly beforeCandidateSourceLink?: () => void;
+    /** Test seam after cleanup identity validation and before the atomic rename out of the live name. */
+    readonly beforeCandidateCleanupRename?: () => void;
     /** Injectable only for deterministic directory-durability failure tests. */
     readonly fsyncDirectory?: (descriptor: number) => void;
 }
@@ -1851,13 +1855,18 @@ async function build_candidate(
     expectedApplicationId: number,
     supportedProtocol: number,
     hooks: SqliteOpenRecoveryHooks,
-): Promise<string> {
+): Promise<{ readonly path: string; readonly identity: fs.BigIntStats }> {
     const candidatePath = path.join(paths.parentDirectory, `${paths.basename}${CANDIDATE_MARKER}${randomUUID()}`);
+    let candidateIdentity: fs.BigIntStats | undefined;
     let database: DatabaseSync | undefined;
     try {
         database = new DatabaseSync(candidatePath, {
             enableDoubleQuotedStringLiterals: false,
         });
+        candidateIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        if (!candidateIdentity.isFile()) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-create-identity' });
+        }
         initialize_sqlite_file_state_schema(database, identity, migration);
         await emit(hooks, 'candidate-after-schema');
         database.close();
@@ -1882,7 +1891,7 @@ async function build_candidate(
         if (!recognition.recognized || !recognition.identityMatches) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-validation' });
         }
-        return candidatePath;
+        return { path: candidatePath, identity: candidateIdentity };
     } catch (error) {
         try {
             database?.close();
@@ -1893,16 +1902,41 @@ async function build_candidate(
     }
 }
 
+function create_candidate_install_snapshot(
+    candidatePath: string,
+    expected: { readonly dev: bigint; readonly ino: bigint },
+    hooks?: SqliteOpenRecoveryHooks,
+): { readonly path: string; readonly identity: fs.BigIntStats } {
+    hooks?.beforeCandidateSourceLink?.();
+    const snapshotPath = `${candidatePath}.install-snapshot.${randomUUID()}`;
+    fs.linkSync(candidatePath, snapshotPath);
+    const snapshotIdentity = fs.lstatSync(snapshotPath, { bigint: true });
+    if (!snapshotIdentity.isFile()
+        || snapshotIdentity.dev !== expected.dev
+        || snapshotIdentity.ino !== expected.ino) {
+        throw sqlite_file_state_recovery_error({ operation: 'candidate-install-snapshot-identity' });
+    }
+    return { path: snapshotPath, identity: snapshotIdentity };
+}
+
 function remove_exact_candidate(
     candidatePath: string,
-    expected: fs.BigIntStats,
+    expected: { readonly dev: bigint; readonly ino: bigint },
     hooks?: SqliteOpenRecoveryHooks,
 ): void {
-    const actual = fs.statSync(candidatePath, { bigint: true });
-    if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    const actual = fs.lstatSync(candidatePath, { bigint: true });
+    if (!actual.isFile() || actual.dev !== expected.dev || actual.ino !== expected.ino) {
         throw sqlite_file_state_recovery_error({ operation: 'candidate-cleanup-identity' });
     }
-    fs.unlinkSync(candidatePath);
+    hooks?.beforeCandidateCleanupRename?.();
+    const removedPath = `${candidatePath}.cleanup-preserved.${randomUUID()}`;
+    fs.renameSync(candidatePath, removedPath);
+    flush_directory(path.dirname(candidatePath), hooks);
+    const removed = fs.lstatSync(removedPath, { bigint: true });
+    if (!removed.isFile() || removed.dev !== expected.dev || removed.ino !== expected.ino) {
+        throw sqlite_file_state_recovery_error({ operation: 'candidate-cleanup-rename-identity' });
+    }
+    fs.unlinkSync(removedPath);
     flush_directory(path.dirname(candidatePath), hooks);
 }
 
@@ -1930,13 +1964,18 @@ async function build_custom_candidate(
     paths: GatePaths,
     spec: SqliteCustomDatabaseSpec,
     hooks: SqliteOpenRecoveryHooks,
-): Promise<string> {
+): Promise<{ readonly path: string; readonly identity: fs.BigIntStats }> {
     const candidatePath = path.join(paths.parentDirectory, `${paths.basename}${CANDIDATE_MARKER}${randomUUID()}`);
+    let candidateIdentity: fs.BigIntStats | undefined;
     let database: DatabaseSync | undefined;
     try {
         database = new DatabaseSync(candidatePath, {
             enableDoubleQuotedStringLiterals: false,
         });
+        candidateIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        if (!candidateIdentity.isFile()) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-create-identity' });
+        }
         spec.initialize(database);
         await emit(hooks, 'candidate-after-schema');
         database.close();
@@ -1955,12 +1994,46 @@ async function build_custom_candidate(
         if (!recognize_custom_initialization_candidate(candidatePath, spec)) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-validation' });
         }
-        return candidatePath;
+        return { path: candidatePath, identity: candidateIdentity };
     } catch (error) {
+        const ownedSidecars: { readonly path: string; readonly identity: fs.BigIntStats }[] = [];
+        try {
+            const current = fs.lstatSync(candidatePath, { bigint: true });
+            if (candidateIdentity !== undefined
+                && current.isFile()
+                && current.dev === candidateIdentity.dev
+                && current.ino === candidateIdentity.ino) {
+                for (const suffix of ['-journal', '-wal', '-shm']) {
+                    const sidecarPath = `${candidatePath}${suffix}`;
+                    try {
+                        const identity = fs.lstatSync(sidecarPath, { bigint: true });
+                        if (identity.isFile()) ownedSidecars.push({ path: sidecarPath, identity });
+                    } catch (sidecarError) {
+                        if (!is_node_error(sidecarError) || sidecarError.code !== 'ENOENT') throw sidecarError;
+                    }
+                }
+            }
+        } catch {
+            // Preserve the first failure and any replaced or foreign evidence.
+        }
         try {
             database?.close();
         } catch {
             // Preserve the first failure.
+        }
+        for (const sidecar of ownedSidecars) {
+            try {
+                remove_exact_candidate(sidecar.path, sidecar.identity, hooks);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
+        }
+        if (candidateIdentity !== undefined) {
+            try {
+                remove_exact_candidate(candidatePath, candidateIdentity, hooks);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
         }
         throw safe_error('candidate-build', error);
     }
@@ -1978,6 +2051,9 @@ export async function initialize_custom_sqlite_database_no_clobber(
     const suppliedGate = options.gate;
     const gate = suppliedGate ?? await acquire_sqlite_shared_reader_gate(resolved, options);
     let candidatePath: string | undefined;
+    let candidateIdentity: fs.BigIntStats | undefined;
+    let snapshotPath: string | undefined;
+    let snapshotIdentity: fs.BigIntStats | undefined;
     let openedDatabase: SqliteOpenedDatabase | undefined;
     try {
         if (gate.canonicalPath !== resolved) {
@@ -1999,15 +2075,25 @@ export async function initialize_custom_sqlite_database_no_clobber(
             await emit(options, 'winner-validated');
             return { installed: false, wonInstallation: false, database };
         }
-        candidatePath = await build_custom_candidate(paths, spec, options);
+        const candidate = await build_custom_candidate(paths, spec, options);
+        candidatePath = candidate.path;
+        candidateIdentity = candidate.identity;
         await emit(options, 'candidate-before-install');
         if (!recognize_custom_initialization_candidate(candidatePath, spec)) {
             throw sqlite_file_state_schema_error({ operation: 'candidate-install-validation' });
         }
-        const candidateStat = fs.statSync(candidatePath, { bigint: true });
+        const candidateStat = fs.lstatSync(candidatePath, { bigint: true });
+        if (!candidateStat.isFile()
+            || candidateStat.dev !== candidateIdentity.dev
+            || candidateStat.ino !== candidateIdentity.ino) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-install-identity' });
+        }
+        const snapshot = create_candidate_install_snapshot(candidatePath, candidateIdentity, options);
+        snapshotPath = snapshot.path;
+        snapshotIdentity = snapshot.identity;
         let wonInstallation = false;
         try {
-            fs.linkSync(candidatePath, resolved);
+            fs.linkSync(snapshotPath, resolved);
             wonInstallation = true;
             flush_directory(paths.parentDirectory, options);
             await emit(options, 'candidate-after-install');
@@ -2020,10 +2106,38 @@ export async function initialize_custom_sqlite_database_no_clobber(
             validate: spec.validate,
         }, suppliedGate === undefined);
         await emit(options, 'winner-validated');
-        remove_exact_candidate(candidatePath, candidateStat, options);
+        try {
+            remove_exact_candidate(candidatePath, candidateStat, options);
+        } catch {
+            // The canonical winner is already installed, opened, and validated.
+            // Preserve a replaced or unflushable candidate for later inventory
+            // rather than converting that successful installation into failure.
+        }
+        try {
+            remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+        } catch {
+            // The validated winner remains successful; preserve cleanup evidence.
+        }
         candidatePath = undefined;
+        candidateIdentity = undefined;
+        snapshotPath = undefined;
+        snapshotIdentity = undefined;
         return { installed: wonInstallation, wonInstallation, database };
     } catch (error) {
+        if (snapshotPath !== undefined && snapshotIdentity !== undefined) {
+            try {
+                remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
+        }
+        if (candidatePath !== undefined && candidateIdentity !== undefined) {
+            try {
+                remove_exact_candidate(candidatePath, candidateIdentity, options);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
+        }
         if (openedDatabase) {
             try {
                 await openedDatabase.close();
@@ -2054,6 +2168,9 @@ export async function initialize_sqlite_database_no_clobber(
     const suppliedGate = options.gate;
     const gate = suppliedGate ?? await acquire_sqlite_shared_reader_gate(resolved, options);
     let candidatePath: string | undefined;
+    let candidateIdentity: fs.BigIntStats | undefined;
+    let snapshotPath: string | undefined;
+    let snapshotIdentity: fs.BigIntStats | undefined;
     let openedDatabase: SqliteOpenedDatabase | undefined;
     try {
         if (gate.canonicalPath !== resolved) {
@@ -2077,7 +2194,7 @@ export async function initialize_sqlite_database_no_clobber(
             await emit(options, 'winner-validated');
             return { installed: false, wonInstallation: false, database };
         }
-        candidatePath = await build_candidate(
+        const candidate = await build_candidate(
             paths,
             identity,
             migration,
@@ -2085,6 +2202,8 @@ export async function initialize_sqlite_database_no_clobber(
             supportedProtocol,
             options,
         );
+        candidatePath = candidate.path;
+        candidateIdentity = candidate.identity;
         await emit(options, 'candidate-before-install');
         const recognition = recognize_sqlite_initialization_candidate(
             candidatePath,
@@ -2095,10 +2214,18 @@ export async function initialize_sqlite_database_no_clobber(
         if (!recognition.recognized || !recognition.identityMatches) {
             throw sqlite_file_state_schema_error({ operation: 'candidate-install-validation' });
         }
-        const candidateStat = fs.statSync(candidatePath, { bigint: true });
+        const candidateStat = fs.lstatSync(candidatePath, { bigint: true });
+        if (!candidateStat.isFile()
+            || candidateStat.dev !== candidateIdentity.dev
+            || candidateStat.ino !== candidateIdentity.ino) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-install-identity' });
+        }
+        const snapshot = create_candidate_install_snapshot(candidatePath, candidateIdentity, options);
+        snapshotPath = snapshot.path;
+        snapshotIdentity = snapshot.identity;
         let wonInstallation = false;
         try {
-            fs.linkSync(candidatePath, resolved);
+            fs.linkSync(snapshotPath, resolved);
             wonInstallation = true;
             flush_directory(paths.parentDirectory, options);
             await emit(options, 'candidate-after-install');
@@ -2114,9 +2241,23 @@ export async function initialize_sqlite_database_no_clobber(
         }, suppliedGate === undefined);
         await emit(options, 'winner-validated');
         if (wonInstallation || identity.productKind === 'desktop') {
-            remove_exact_candidate(candidatePath, candidateStat, options);
+            try {
+                remove_exact_candidate(candidatePath, candidateStat, options);
+            } catch {
+                // The canonical winner is already installed, opened, and validated.
+                // Preserve a replaced or unflushable candidate for later inventory
+                // rather than converting that successful installation into failure.
+            }
             candidatePath = undefined;
+            candidateIdentity = undefined;
         }
+        try {
+            remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+        } catch {
+            // The validated winner remains successful; preserve cleanup evidence.
+        }
+        snapshotPath = undefined;
+        snapshotIdentity = undefined;
         return {
             installed: wonInstallation,
             wonInstallation,
@@ -2124,6 +2265,13 @@ export async function initialize_sqlite_database_no_clobber(
             database,
         };
     } catch (error) {
+        if (snapshotPath !== undefined && snapshotIdentity !== undefined) {
+            try {
+                remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
+        }
         if (openedDatabase) {
             try {
                 await openedDatabase.close();
@@ -2152,6 +2300,8 @@ export async function install_recognized_sqlite_candidate_no_clobber(
     const paths = gate_paths(resolved);
     const expectedApplicationId = options.expectedApplicationId ?? SQLITE_FILE_STATE_APPLICATION_ID;
     const supportedProtocol = options.supportedProtocol ?? SQLITE_FILE_STATE_PROTOCOL_VERSION;
+    let snapshotPath: string | undefined;
+    let snapshotIdentity: fs.BigIntStats | undefined;
     let openedDatabase: SqliteOpenedDatabase | undefined;
     try {
         assert_exclusive_gate(paths, options.gate);
@@ -2167,14 +2317,23 @@ export async function install_recognized_sqlite_candidate_no_clobber(
             throw sqlite_file_state_recovery_error({ operation: 'candidate-resume-path' });
         }
         const inventory = await inventory_sqlite_basename(resolved, options);
+        const inventoriedCandidate = inventory.candidates.find(
+            (candidate) => candidate.name === path.basename(resolvedCandidate),
+        );
         if (inventory.recoveryBlocked || inventory.journal || inventory.wal || inventory.shm
             || inventory.incompleteRecoveryDirectories > 0 || inventory.main?.size === 0
-            || !inventory.candidates.some((candidate) => candidate.name === path.basename(resolvedCandidate))) {
+            || inventoriedCandidate === undefined) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-resume-inventory' });
         }
         await emit(options, 'candidate-before-install');
+        const snapshot = create_candidate_install_snapshot(resolvedCandidate, {
+            dev: inventoriedCandidate.device,
+            ino: inventoriedCandidate.inode,
+        }, options);
+        snapshotPath = snapshot.path;
+        snapshotIdentity = snapshot.identity;
         const recognition = recognize_sqlite_initialization_candidate(
-            resolvedCandidate,
+            snapshotPath,
             identity,
             expectedApplicationId,
             supportedProtocol,
@@ -2182,11 +2341,11 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         if (!recognition.recognized || !recognition.identityMatches) {
             throw sqlite_file_state_schema_error({ operation: 'candidate-resume-validation' });
         }
-        const candidateStat = fs.statSync(resolvedCandidate, { bigint: true });
+        const candidateStat = snapshotIdentity;
         let wonInstallation = false;
         if (!inventory.main) {
             try {
-                fs.linkSync(resolvedCandidate, resolved);
+                fs.linkSync(snapshotPath, resolved);
                 wonInstallation = true;
                 flush_directory(paths.parentDirectory, options);
                 await emit(options, 'candidate-after-install');
@@ -2206,8 +2365,19 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         const exactInstalledIncarnation = canonicalStat.dev === candidateStat.dev
             && canonicalStat.ino === candidateStat.ino;
         if (exactInstalledIncarnation || identity.productKind === 'desktop') {
-            remove_exact_candidate(resolvedCandidate, candidateStat, options);
+            try {
+                remove_exact_candidate(resolvedCandidate, candidateStat, options);
+            } catch {
+                // The validated winner remains successful; preserve cleanup evidence.
+            }
         }
+        try {
+            remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+        } catch {
+            // The validated winner remains successful; preserve cleanup evidence.
+        }
+        snapshotPath = undefined;
+        snapshotIdentity = undefined;
         return {
             installed: wonInstallation,
             wonInstallation,
@@ -2217,6 +2387,13 @@ export async function install_recognized_sqlite_candidate_no_clobber(
             database,
         };
     } catch (error) {
+        if (snapshotPath !== undefined && snapshotIdentity !== undefined) {
+            try {
+                remove_exact_candidate(snapshotPath, snapshotIdentity, options);
+            } catch {
+                // Preserve the first failure and any replaced or foreign evidence.
+            }
+        }
         if (openedDatabase) {
             try { await openedDatabase.close(); } catch { /* Preserve the first failure. */ }
         }

@@ -15,6 +15,9 @@ import { CompanionStore } from '../src/companion-store';
 import { activate, COMPANION_COMMANDS, deactivate } from '../src/extension';
 
 const roots: string[] = [];
+const vscodeMock = vscode as unknown as {
+    __hasCommand(command: string): boolean;
+};
 
 function context(): vscode.ExtensionContext {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-companion-ui-'));
@@ -28,6 +31,14 @@ function context(): vscode.ExtensionContext {
         globalStorageUri: vscode.Uri.file(directory),
         subscriptions: [],
     } as unknown as vscode.ExtensionContext;
+}
+
+async function poll_for(predicate: () => boolean, description: string): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}.`);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
 }
 
 function recovery_input(physicalDigest?: string) {
@@ -49,6 +60,60 @@ afterEach(async () => {
     vi.restoreAllMocks();
     await deactivate();
     for (const directory of roots.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
+});
+
+describe('companion activation lifecycle', () => {
+    it('does not complete activation or publish stateful readiness until store validation finishes', async () => {
+        const extensionContext = context();
+        let resolveOpen!: (store: CompanionStore) => void;
+        vi.spyOn(CompanionStore, 'open').mockImplementation(() => new Promise((resolve) => {
+            resolveOpen = resolve;
+        }));
+
+        let settled = false;
+        const activation = activate(extensionContext).then(() => { settled = true; });
+        await poll_for(
+            () => vscodeMock.__hasCommand(COMPANION_COMMANDS.hostCapabilities)
+                && vscodeMock.__hasCommand(COMPANION_COMMANDS.openRecovery),
+            'eager companion command registration',
+        );
+        expect(vscodeMock.__hasCommand(COMPANION_COMMANDS.namespace)).toBe(false);
+        expect(settled).toBe(false);
+
+        resolveOpen({ close: vi.fn(async () => undefined) } as unknown as CompanionStore);
+        await activation;
+        expect(settled).toBe(true);
+        expect(vscodeMock.__hasCommand(COMPANION_COMMANDS.namespace)).toBe(true);
+    });
+
+    it('closes a store whose open completes after deactivation without publishing RPC commands', async () => {
+        const extensionContext = context();
+        let resolveOpen!: (store: CompanionStore) => void;
+        let markOpenStarted!: () => void;
+        const openStarted = new Promise<void>((resolve) => { markOpenStarted = resolve; });
+        const close = vi.fn(async () => undefined);
+        vi.spyOn(CompanionStore, 'open').mockImplementation(() => {
+            markOpenStarted();
+            return new Promise((resolve) => { resolveOpen = resolve; });
+        });
+
+        const activation = activate(extensionContext);
+        await openStarted;
+        let deactivated = false;
+        const deactivation = deactivate().then(() => { deactivated = true; });
+        expect(deactivated).toBe(false);
+        expect(close).not.toHaveBeenCalled();
+
+        resolveOpen({ close } as unknown as CompanionStore);
+        await deactivation;
+        await activation;
+
+        expect(close).toHaveBeenCalledTimes(1);
+        await expect(vscode.commands.executeCommand(
+            COMPANION_COMMANDS.submitCapsuleCandidate,
+            { operationId: randomUUID(), orderedSourceJson: '{}' },
+        )).resolves.toBeUndefined();
+    });
 });
 
 describe('companion-owned basis-aware recovery UI', () => {

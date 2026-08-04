@@ -105,22 +105,50 @@ if [ $EXTENSION -eq 1 ]; then
     # Step 4: Install to editors
     echo "Installing extension to editors..."
     EDITORS=("code" "code-insiders" "codium" "kiro" "antigravity" "cursor" "windsurf")
+    COMPANION_EXTENSION_ID="jbearak.table-viewer-companion"
     INSTALLED=0
+    ROLLBACK_FAILURES=0
 
     for editor in "${EDITORS[@]}"; do
         if command -v "$editor" &> /dev/null; then
             echo -n "  $editor: "
-            if "$editor" --install-extension "$COMPANION_VSIX_FILE" --force &> /dev/null \
-                && "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
+            if ! INSTALLED_EXTENSIONS=$("$editor" --list-extensions --show-versions 2> /dev/null); then
+                echo -e "${YELLOW}could not inventory existing extensions${NC}"
+                continue
+            fi
+            PRIOR_COMPANION=""
+            while IFS= read -r installed_extension; do
+                case "$installed_extension" in
+                    "${COMPANION_EXTENSION_ID}@"*)
+                        PRIOR_COMPANION="$installed_extension"
+                        break
+                        ;;
+                esac
+            done <<< "$INSTALLED_EXTENSIONS"
+
+            if ! "$editor" --install-extension "$COMPANION_VSIX_FILE" --force &> /dev/null; then
+                echo -e "${YELLOW}companion install failed${NC}"
+            elif "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
                 echo -e "${GREEN}✓ companion + main${NC}"
                 INSTALLED=$((INSTALLED + 1))
+            elif { [ -n "$PRIOR_COMPANION" ] \
+                && "$editor" --install-extension "$PRIOR_COMPANION" --force &> /dev/null; } \
+                || { [ -z "$PRIOR_COMPANION" ] \
+                && "$editor" --uninstall-extension "$COMPANION_EXTENSION_ID" &> /dev/null; }; then
+                echo -e "${YELLOW}main install failed; companion restored${NC}"
             else
-                echo -e "${YELLOW}failed${NC}"
+                echo -e "${RED}main install failed; companion rollback failed${NC}"
+                ROLLBACK_FAILURES=$((ROLLBACK_FAILURES + 1))
             fi
         else
             echo -e "  $editor: ${YELLOW}not found${NC}"
         fi
     done
+
+    if [ $ROLLBACK_FAILURES -ne 0 ]; then
+        echo -e "${RED}Error: failed to restore an exact-version extension pair in $ROLLBACK_FAILURES editor(s)${NC}"
+        exit 1
+    fi
 
     if [ $INSTALLED -eq 0 ]; then
         echo -e "${YELLOW}Warning: No editors found to install extension${NC}"

@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn } from 'node:child_process';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     CompanionStore,
@@ -85,6 +86,58 @@ afterEach(() => {
 });
 
 describe('profile-scoped companion SQLite store', () => {
+    it.skipIf(process.platform === 'win32')('hardens every created storage directory independently of umask', async () => {
+        const ancestor = root();
+        const globalStorage = path.join(ancestor, 'profile', 'extension-storage');
+        const previousUmask = process.umask(0o100);
+        let store: CompanionStore | undefined;
+        try {
+            store = await CompanionStore.open(globalStorage, '0.7.0');
+        } finally {
+            process.umask(previousUmask);
+        }
+        try {
+            for (const directory of [
+                path.join(ancestor, 'profile'),
+                globalStorage,
+                path.join(globalStorage, 'state'),
+            ]) {
+                expect(fs.statSync(directory).mode & 0o777).toBe(0o700);
+            }
+        } finally {
+            await store?.close();
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('accepts a directory concurrently created by another companion host', async () => {
+        const ancestor = root();
+        const globalStorage = path.join(ancestor, 'profile', 'extension-storage');
+        const racedDirectory = path.join(ancestor, 'profile');
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof fs;
+        const mkdirSync = mutableFs.mkdirSync;
+        let injectedRace = false;
+        mutableFs.mkdirSync = ((directory, options) => {
+            if (!injectedRace && path.resolve(String(directory)) === racedDirectory) {
+                injectedRace = true;
+                mkdirSync(directory, options as never);
+                throw Object.assign(new Error('created concurrently'), { code: 'EEXIST' });
+            }
+            return mkdirSync(directory, options as never);
+        }) as typeof fs.mkdirSync;
+        syncBuiltinESMExports();
+
+        let store: CompanionStore | undefined;
+        try {
+            store = await CompanionStore.open(globalStorage, '0.7.0');
+        } finally {
+            mutableFs.mkdirSync = mkdirSync;
+            syncBuiltinESMExports();
+        }
+        expect(injectedRace).toBe(true);
+        expect(fs.statSync(racedDirectory).mode & 0o777).toBe(0o700);
+        await store?.close();
+    });
+
     it('decodes frozen envelopes through the live Memento compatibility rules', async () => {
         const store = await CompanionStore.open(root(), '0.7.0');
         const orderedSourceJson = JSON.stringify({
@@ -508,6 +561,72 @@ describe('profile-scoped companion SQLite store', () => {
         await store.close();
     });
 
+    it('creates a fresh recovery record when identical state recurs in a new prepare operation', async () => {
+        const directory = root();
+        const store = await CompanionStore.open(directory, '0.7.0');
+        const input = recovery_input();
+        const first = await store.preparePendingEditRecovery(input);
+        await store.confirmPendingEditRecovery({
+            operationId: randomUUID(),
+            ...first,
+            committedStateRevision: 8,
+        });
+
+        const second = await store.preparePendingEditRecovery({
+            ...input,
+            operationId: randomUUID(),
+        });
+        expect(second.recoveryRecordId).not.toBe(first.recoveryRecordId);
+        await expect(store.confirmPendingEditRecovery({
+            operationId: randomUUID(),
+            ...second,
+            committedStateRevision: 9,
+        })).resolves.toEqual({});
+        expect(await store.listRecoveryRecords()).toEqual(expect.arrayContaining([
+            expect.objectContaining({ ...first, status: 'committed', committedStateRevision: 8 }),
+            expect.objectContaining({ ...second, status: 'committed', committedStateRevision: 9 }),
+        ]));
+        await store.close();
+
+        const reopened = await CompanionStore.open(directory, '0.7.0');
+        expect(await reopened.listRecoveryRecords()).toHaveLength(2);
+        await reopened.close();
+    });
+
+    it('accepts a valid legacy secondary recovery receipt for the same request digest', async () => {
+        const directory = root();
+        const input = recovery_input();
+        const store = await CompanionStore.open(directory, '0.7.0');
+        const prepared = await store.preparePendingEditRecovery(input);
+        await store.close();
+
+        const database = new DatabaseSync(database_path(directory));
+        const row = database.prepare(`SELECT request_digest FROM pending_edit_recovery_records WHERE recovery_record_id=?`).get(prepared.recoveryRecordId) as { request_digest: string };
+        const legacyOperationId = randomUUID();
+        database.prepare(`INSERT INTO companion_rpc_operations(operation_id,operation_kind,request_digest,result_json,completed_at_ms) VALUES(?,'prepare_pending_edit_recovery',?,?,?)`).run(
+            legacyOperationId,
+            row.request_digest,
+            JSON.stringify(prepared),
+            Date.now(),
+        );
+        database.close();
+
+        const reopened = await CompanionStore.open(directory, '0.7.0');
+        await expect(reopened.preparePendingEditRecovery({
+            ...input,
+            operationId: legacyOperationId,
+        })).resolves.toEqual(prepared);
+        await reopened.close();
+
+        const corrupted = new DatabaseSync(database_path(directory));
+        corrupted.prepare(`UPDATE companion_rpc_operations SET result_json=? WHERE operation_id=?`).run(
+            JSON.stringify({ recoveryRecordId: randomUUID() }),
+            legacyOperationId,
+        );
+        corrupted.close();
+        await expect(CompanionStore.open(directory, '0.7.0')).rejects.toThrow(/does not match its domain request/);
+    });
+
     it('rejects malformed/empty snapshots and accepts an explicit clear without a payload', async () => {
         const store = await CompanionStore.open(root(), '0.7.0');
         await expect(store.preparePendingEditRecovery({ ...recovery_input(), pendingEditsJson: '{}' })).rejects.toThrow(/must not be empty/);
@@ -698,7 +817,7 @@ describe('profile-scoped companion SQLite store', () => {
                 secondaryOperationId,
             );
             database.close();
-            await expect(CompanionStore.open(directory, '0.7.0')).rejects.toThrow(/does not match its domain request/);
+            await expect(CompanionStore.open(directory, '0.7.0')).rejects.toThrow(/does not match its domain request|result relationship is invalid/);
         }
     });
 

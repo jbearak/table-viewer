@@ -813,7 +813,7 @@ function get_all_state(medium: FileStatePersistenceMedium): PersistedStateEnvelo
 }
 
 /** Validate a frozen Memento value through the same compatibility adapter used by
- * the live Memento store and return only the source metadata needed by migration. */
+ * the live Memento store and return its envelope entry keys, which are resource paths. */
 export function decode_memento_file_state_resource_keys(value: unknown): readonly string[] {
     const envelope = get_all_state({
         runtime_key: {},
@@ -823,6 +823,8 @@ export function decode_memento_file_state_resource_keys(value: unknown): readonl
     return Object.keys(envelope.entries);
 }
 
+/** Validate a frozen Memento value through the live-store compatibility adapter and
+ * return only the source metadata needed by migration. */
 export function decode_memento_file_state_source(value: unknown): {
     readonly nextRevision: number;
     readonly absenceRevision: number;

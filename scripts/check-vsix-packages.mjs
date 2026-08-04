@@ -81,18 +81,36 @@ export function validate_archived_manifest(actual, expected, label) {
 export function validate_externalized_sqlite(bundle, label = 'companion bundle') {
     assert(bundle.includes('require("node:sqlite")'),
         `${label} does not retain the node:sqlite runtime import`);
-    assert(!bundle.includes('class DatabaseSync'),
-        `${label} appears to contain a bundled SQLite implementation`);
+}
+
+const MAX_ARCHIVE_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+export function unzip_text(args, exec_file = execFileSync) {
+    try {
+        return exec_file('unzip', args, {
+            encoding: 'utf8',
+            maxBuffer: MAX_ARCHIVE_OUTPUT_BYTES,
+            windowsHide: true,
+        });
+    } catch (error) {
+        if (error instanceof Error && error.code === 'ENOENT') {
+            throw new Error(
+                'required `unzip` executable was not found; install unzip and ensure it is on PATH',
+                { cause: error },
+            );
+        }
+        throw error;
+    }
 }
 
 function archive_entries(path) {
-    return execFileSync('unzip', ['-Z1', path], { encoding: 'utf8' })
+    return unzip_text(['-Z1', path])
         .split(/\r?\n/u)
         .filter(Boolean);
 }
 
 function archive_text(path, entry) {
-    return execFileSync('unzip', ['-p', path, entry], { encoding: 'utf8' });
+    return unzip_text(['-p', path, entry]);
 }
 
 export async function check_vsix_packages(root = repo_dir) {

@@ -82,7 +82,7 @@ function assert_safe_target(
     targetPath: string,
     stateRootPath: string,
     originalSourcePaths: readonly string[],
-): FileIdentity[] {
+): { protectedIdentities: FileIdentity[]; targetIdentity?: FileIdentity } {
     const resolvedTarget = path.resolve(targetPath);
     const physicalTarget = physical_destination(resolvedTarget);
     const resolvedStateRoot = path.resolve(stateRootPath);
@@ -111,7 +111,7 @@ function assert_safe_target(
     if (targetIdentity && protectedIdentities.some((value) => same_identity(value, targetIdentity))) {
         throw new UnsafeRecoveryExportTargetError();
     }
-    return protectedIdentities;
+    return { protectedIdentities, targetIdentity };
 }
 
 export function original_file_resource_path(resourceIdentity: Record<string, unknown>): string | undefined {
@@ -136,37 +136,68 @@ export function write_recovery_export_safely(options: {
     readonly originalSourcePaths?: readonly string[];
     readonly contents: string;
     readonly beforeOpen?: () => void;
+    /** Test seams for platforms, notably Windows, without a usable O_NOFOLLOW. */
+    readonly forceNoFollowUnavailable?: boolean;
+    readonly noFollowFlagForTest?: number;
 }): void {
     const originalSourcePaths = [
         ...(options.originalSourcePath === undefined ? [] : [options.originalSourcePath]),
         ...(options.originalSourcePaths ?? []),
     ];
-    const protectedIdentities = assert_safe_target(
+    const { protectedIdentities, targetIdentity } = assert_safe_target(
         options.targetPath,
         options.stateRootPath,
         originalSourcePaths,
     );
-    const targetExisted = existing_file_identity(path.resolve(options.targetPath)) !== undefined;
+    const targetExisted = targetIdentity !== undefined;
+    const noFollowFlag = options.noFollowFlagForTest ?? fs.constants.O_NOFOLLOW;
+    const noFollow = options.forceNoFollowUnavailable
+        || process.platform === 'win32'
+        || noFollowFlag === undefined
+        || noFollowFlag === 0
+        ? undefined
+        : noFollowFlag;
+    if (noFollow === undefined && targetExisted) {
+        // Without a no-follow open, a leaf replacement can redirect the descriptor
+        // after validation. This includes Windows/libuv's zero-valued placeholder.
+        throw new UnsafeRecoveryExportTargetError();
+    }
+    const resolvedTarget = path.resolve(options.targetPath);
     options.beforeOpen?.();
-    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-    const descriptor = fs.openSync(
-        options.targetPath,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | noFollow,
-        0o600,
-    );
+    let descriptor: number;
     try {
-        const opened = fs.fstatSync(descriptor, { bigint: true });
-        if (!opened.isFile()
-            || protectedIdentities.some((value) => same_identity(value, identity(opened)))) {
+        descriptor = fs.openSync(
+            resolvedTarget,
+            fs.constants.O_WRONLY
+                | (targetExisted ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL)
+                | (noFollow ?? 0),
+            0o600,
+        );
+    } catch (error) {
+        if (!targetExisted
+            && error instanceof Error
+            && (error as NodeJS.ErrnoException).code === 'EEXIST') {
             throw new UnsafeRecoveryExportTargetError();
         }
-        // Re-resolve after open to catch a parent-directory alias swap where feasible.
-        const refreshedProtectedIdentities = assert_safe_target(
-            options.targetPath,
+        throw error;
+    }
+    try {
+        const opened = fs.fstatSync(descriptor, { bigint: true });
+        const openedFileIdentity = identity(opened);
+        if (!opened.isFile()
+            || (targetIdentity !== undefined && !same_identity(targetIdentity, openedFileIdentity))
+            || protectedIdentities.some((value) => same_identity(value, openedFileIdentity))) {
+            throw new UnsafeRecoveryExportTargetError();
+        }
+        // Re-resolve after open before mutating the validated or exclusively created inode.
+        const refreshed = assert_safe_target(
+            resolvedTarget,
             options.stateRootPath,
             originalSourcePaths,
         );
-        if (refreshedProtectedIdentities.some((value) => same_identity(value, identity(opened)))) {
+        if (refreshed.targetIdentity === undefined
+            || !same_identity(refreshed.targetIdentity, openedFileIdentity)
+            || refreshed.protectedIdentities.some((value) => same_identity(value, openedFileIdentity))) {
             throw new UnsafeRecoveryExportTargetError();
         }
         if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
@@ -177,7 +208,7 @@ export function write_recovery_export_safely(options: {
         fs.closeSync(descriptor);
     }
     if (!targetExisted && process.platform !== 'win32') {
-        const directoryDescriptor = fs.openSync(path.dirname(path.resolve(options.targetPath)), 'r');
+        const directoryDescriptor = fs.openSync(path.dirname(resolvedTarget), 'r');
         try {
             fs.fsyncSync(directoryDescriptor);
         } finally {

@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
 import {
     MIGRATION_ARMING_STATE_KEY,
     MIGRATION_COMPANION_COMMANDS,
+    MIGRATION_COMPANION_COMMAND_TIMEOUT_MS,
     MIGRATION_COMPANION_EXTENSION_ID,
     migration_companion_directory_durability_supported,
     migration_placement_key_digest,
@@ -48,6 +49,16 @@ beforeEach(() => {
 });
 
 describe('exact-version local UI companion routing', () => {
+    it('resets active editor state with the rest of the VS Code mock', () => {
+        (vscode.window as unknown as { activeTextEditor?: { document: { uri: vscode.Uri } } })
+            .activeTextEditor = { document: { uri: vscode.Uri.file('/workspace/leaked.csv') } };
+
+        (vscode as unknown as { __reset(): void }).__reset();
+
+        expect((vscode.window as unknown as { activeTextEditor?: unknown }).activeTextEditor)
+            .toBeUndefined();
+    });
+
     it('validates companion identity entirely through the cross-host command bridge', async () => {
         expect(vscode.extensions.getExtension(MIGRATION_COMPANION_EXTENSION_ID)).toBeUndefined();
         set_command(MIGRATION_COMPANION_COMMANDS.namespace, () => ({
@@ -127,6 +138,96 @@ describe('exact-version local UI companion routing', () => {
     });
 });
 
+describe('cross-host command deadlines', () => {
+    it('times out an unresponsive host-capability command without exposing inputs', async () => {
+        vi.useFakeTimers();
+        try {
+            set_command(MIGRATION_COMPANION_COMMANDS.hostCapabilities, () => new Promise(() => undefined));
+            const pending = migration_companion_directory_durability_supported(context().value);
+            const rejection = expect(pending).rejects.toThrow(
+                new RegExp(`${MIGRATION_COMPANION_COMMANDS.hostCapabilities}.*did not answer in time`),
+            );
+            await vi.advanceTimersByTimeAsync(MIGRATION_COMPANION_COMMAND_TIMEOUT_MS);
+            await rejection;
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('bounds every stateful companion client call', async () => {
+        vi.useFakeTimers();
+        try {
+            const client = await require_migration_companion(context().value);
+            const cases: readonly [string, () => Promise<unknown>][] = [
+                [MIGRATION_COMPANION_COMMANDS.namespace, () => client.namespace({ placementKeyDigest: 'placement', operationId: 'operation' })],
+                [MIGRATION_COMPANION_COMMANDS.activeCapsule, () => client.activeCapsule()],
+                [MIGRATION_COMPANION_COMMANDS.submitCapsuleCandidate, () => client.submitCapsuleCandidate({ operationId: 'operation', orderedSourceJson: '{}' })],
+                [MIGRATION_COMPANION_COMMANDS.archiveDrift, () => client.archiveDrift({ operationId: 'operation', orderedSourceJson: '{}' })],
+                [MIGRATION_COMPANION_COMMANDS.beginEnvironmentImport, () => client.beginEnvironmentImport({
+                    operationId: 'operation', capsuleId: 'capsule', sourceDigest: 'd'.repeat(64),
+                    storageEnvironmentId: 'environment', databaseId: 'database',
+                })],
+                [MIGRATION_COMPANION_COMMANDS.environmentImportStatus, () => client.environmentImportStatus({
+                    importClaimId: 'claim', capsuleId: 'capsule', storageEnvironmentId: 'environment', databaseId: 'database',
+                })],
+                [MIGRATION_COMPANION_COMMANDS.abandonEnvironmentImport, () => client.abandonEnvironmentImport({
+                    operationId: 'operation', importClaimId: 'claim', capsuleId: 'capsule',
+                    storageEnvironmentId: 'environment', databaseId: 'database', abandonmentEvidenceDigest: 'e'.repeat(64),
+                })],
+                [MIGRATION_COMPANION_COMMANDS.confirmEnvironment, () => client.confirmEnvironment({
+                    operationId: 'operation', importClaimId: 'claim', capsuleId: 'capsule', sourceDigest: 'd'.repeat(64),
+                    storageEnvironmentId: 'environment', databaseId: 'database',
+                })],
+                [MIGRATION_COMPANION_COMMANDS.confirmEnvironmentSourceRetirement, () => client.confirmEnvironmentSourceRetirement({
+                    operationId: 'operation', capsuleId: 'capsule', sourceDigest: 'd'.repeat(64),
+                    storageEnvironmentId: 'environment', databaseId: 'database', retirementKind: 'naturallyComplete',
+                    sourceStateDigest: 's'.repeat(64),
+                })],
+                [MIGRATION_COMPANION_COMMANDS.preparePendingEditRecovery, () => client.preparePendingEditRecovery({
+                    operationId: 'operation', storageEnvironmentId: 'environment', databaseId: 'database',
+                    recoveryEntryId: 'entry', kind: 'clear', resourceIdentityJson: '{}',
+                    authorityRevision: 1, physicalRevision: 1, projectionRevision: 1,
+                })],
+                [MIGRATION_COMPANION_COMMANDS.confirmPendingEditRecovery, () => client.confirmPendingEditRecovery({
+                    operationId: 'operation', recoveryRecordId: 'recovery', committedStateRevision: 2,
+                })],
+            ];
+            for (const [command, invoke] of cases) {
+                set_command(command, () => new Promise(() => undefined));
+                const pending = invoke();
+                const rejection = expect(pending).rejects.toThrow(new RegExp(`${command}.*did not answer in time`));
+                await vi.advanceTimersByTimeAsync(MIGRATION_COMPANION_COMMAND_TIMEOUT_MS);
+                await rejection;
+                expect(vi.getTimerCount()).toBe(0);
+            }
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('returns a valid response before the deadline and clears its timer', async () => {
+        vi.useFakeTimers();
+        try {
+            let resolveNamespace!: (value: unknown) => void;
+            set_command(MIGRATION_COMPANION_COMMANDS.namespace, () => new Promise((resolve) => {
+                resolveNamespace = resolve;
+            }));
+            const client = await require_migration_companion(context().value);
+            const pending = client.namespace({ placementKeyDigest: 'placement', operationId: 'operation' });
+            await vi.advanceTimersByTimeAsync(MIGRATION_COMPANION_COMMAND_TIMEOUT_MS - 1);
+            resolveNamespace({
+                profileDatabaseId: 'profile-a', storageEnvironmentId: 'environment-a', protocolVersion: 1,
+            });
+            await expect(pending).resolves.toMatchObject({ profileDatabaseId: 'profile-a' });
+            expect(vi.getTimerCount()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
 describe('bridge privacy', () => {
     it('returns only schema-limited metadata and discards payloads returned by write commands', async () => {
         const secret = '/private/workspace/secret.csv';
@@ -140,6 +241,7 @@ describe('bridge privacy', () => {
         }));
         set_command(MIGRATION_COMPANION_COMMANDS.submitCapsuleCandidate, () => ({
             capsuleId: 'capsule-a', sourceDigest: 'd'.repeat(64),
+            resourcePath: secret, pendingEdits: { '0:0': 'sensitive' }, orderedSourceJson: '{"sensitive":true}',
         }));
         set_command(MIGRATION_COMPANION_COMMANDS.preparePendingEditRecovery, () => ({
             recoveryRecordId: 'recovery-a',
@@ -147,6 +249,12 @@ describe('bridge privacy', () => {
         set_command(MIGRATION_COMPANION_COMMANDS.confirmPendingEditRecovery, () => ({}));
 
         const client = await require_migration_companion(context().value);
+        await expect(client.submitCapsuleCandidate({
+            operationId: 'sensitive-capsule-op', orderedSourceJson: '{}',
+        })).rejects.toThrow(/response schema/);
+        set_command(MIGRATION_COMPANION_COMMANDS.submitCapsuleCandidate, () => ({
+            capsuleId: 'capsule-a', sourceDigest: 'd'.repeat(64),
+        }));
         const outputs = [
             await client.namespace({ placementKeyDigest: 'placement', operationId: 'namespace-op' }),
             await client.activeCapsule(),

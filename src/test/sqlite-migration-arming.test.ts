@@ -13,6 +13,7 @@ import {
 import {
     evaluate_sqlite_migration_cold_start,
     prepare_sqlite_migration_arming,
+    sqlite_migration_blocks_state_writers_on_activation,
 } from '../sqlite-migration-arming';
 
 interface Fixture {
@@ -22,6 +23,14 @@ interface Fixture {
 
 function digest(value: string): string {
     return createHash('sha256').update(value).digest('hex');
+}
+
+async function poll_for(predicate: () => boolean, description: string): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}.`);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
 }
 
 function fixture(envelope: unknown = {}): Fixture {
@@ -121,7 +130,193 @@ beforeEach(() => {
     vi.restoreAllMocks();
 });
 
+describe('SQLite migration activation preflight', () => {
+    it('permits only an absent arming record and fails closed for every persisted phase or malformed state', () => {
+        const { context, state } = fixture({});
+        expect(sqlite_migration_blocks_state_writers_on_activation(context)).toBe(false);
+
+        state.set(MIGRATION_ARMING_STATE_KEY, { invalid: true });
+        expect(sqlite_migration_blocks_state_writers_on_activation(context)).toBe(true);
+
+        state.set(MIGRATION_ARMING_STATE_KEY, {
+            version: 1, phase: 'armingInProgress', extensionVersion: '0.7.0',
+            placementKeyDigest: 'a'.repeat(64), sourceDigest: 'b'.repeat(64),
+            flushCompleted: false, capsuleMutation: 'submit', namespaceOperationId: 'namespace-op',
+            capsuleOperationId: 'capsule-op', armedAtMs: 1,
+        });
+        expect(sqlite_migration_blocks_state_writers_on_activation(context)).toBe(true);
+
+        const finalized = {
+            version: 1 as const, extensionVersion: '0.7.0', profileDatabaseId: 'profile-a',
+            storageEnvironmentId: 'environment-a', capsuleId: 'capsule-a', sourceFormat: 'format',
+            sourceDigest: 'c'.repeat(64), namespaceOperationId: 'namespace-op', armedAtMs: 1,
+        };
+        state.set(MIGRATION_ARMING_STATE_KEY, { ...finalized, phase: 'awaitingColdStart' });
+        expect(sqlite_migration_blocks_state_writers_on_activation(context)).toBe(true);
+        state.set(MIGRATION_ARMING_STATE_KEY, { ...finalized, phase: 'coldConfirmed', coldConfirmedAtMs: 2 });
+        expect(sqlite_migration_blocks_state_writers_on_activation(context)).toBe(true);
+    });
+});
+
 describe('SQLite migration preparation arming', () => {
+    it('reports a malformed prior checkpoint without fencing or seeding', async () => {
+        const { context, state } = fixture({});
+        const malformed = { invalid: true };
+        state.set(MIGRATION_ARMING_STATE_KEY, malformed);
+        const events: string[] = [];
+        const stopViewers = vi.fn();
+        vi.spyOn(vscode.window, 'showWarningMessage').mockResolvedValue(
+            'I Attest Every Other VS Code Window Is Closed' as never,
+        );
+        const errorMessage = vi.spyOn(vscode.window, 'showErrorMessage').mockResolvedValue(undefined);
+        const update = vi.spyOn(context.globalState, 'update');
+
+        await expect(prepare_sqlite_migration_arming(
+            context,
+            boundary(events),
+            stopViewers,
+        )).resolves.toBe(false);
+
+        expect(errorMessage).toHaveBeenCalledWith(
+            expect.stringMatching(/could not validate the persisted SQLite migration arming state/u),
+            { modal: true },
+        );
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBe(malformed);
+        expect(update).not.toHaveBeenCalled();
+        expect(stopViewers).not.toHaveBeenCalled();
+        expect(events).toEqual([]);
+    });
+
+    it('does not resume a pending arming command after its activation becomes stale', async () => {
+        const { context, state } = fixture({});
+        const events: string[] = [];
+        let resolveWarning!: (value: string) => void;
+        vi.spyOn(vscode.window, 'showWarningMessage').mockImplementation(() => new Promise((resolve) => {
+            resolveWarning = resolve as (value: string) => void;
+        }) as never);
+        const readState = vi.spyOn(context.globalState, 'get');
+        let active = true;
+
+        const arming = prepare_sqlite_migration_arming(
+            context,
+            boundary(events),
+            () => { events.push('stop'); },
+            () => active,
+        );
+        active = false;
+        resolveWarning('I Attest Every Other VS Code Window Is Closed');
+
+        await expect(arming).rejects.toThrow();
+        expect(readState).not.toHaveBeenCalled();
+        expect(events).toEqual([]);
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBeUndefined();
+    });
+
+    it('abandons a pending attestation when its activation is cancelled', async () => {
+        const { context, state } = fixture({});
+        const events: string[] = [];
+        let resolveWarning!: (value: string) => void;
+        const warning = vi.spyOn(vscode.window, 'showWarningMessage').mockImplementation(() => (
+            new Promise((resolve) => { resolveWarning = resolve as (value: string) => void; }) as never
+        ));
+        const cancellation = new AbortController();
+
+        const arming = prepare_sqlite_migration_arming(
+            context,
+            boundary(events),
+            () => { events.push('stop'); },
+            () => !cancellation.signal.aborted,
+            cancellation.signal,
+        );
+        while (warning.mock.calls.length === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        cancellation.abort();
+
+        await expect(arming).rejects.toThrow();
+        expect(events).toEqual([]);
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBeUndefined();
+
+        resolveWarning('I Attest Every Other VS Code Window Is Closed');
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(events).toEqual([]);
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBeUndefined();
+    });
+
+    it('restores the prior state when deactivated during the initial checkpoint write', async () => {
+        const { context, state } = fixture({});
+        vi.spyOn(vscode.window, 'showWarningMessage').mockResolvedValue(
+            'I Attest Every Other VS Code Window Is Closed' as never,
+        );
+        let releaseCheckpoint!: () => void;
+        let checkpointStarted!: () => void;
+        const started = new Promise<void>((resolve) => { checkpointStarted = resolve; });
+        const release = new Promise<void>((resolve) => { releaseCheckpoint = resolve; });
+        (context.globalState as unknown as { update(key: string, value: unknown): Promise<void> }).update =
+            vi.fn(async (key, value) => {
+                if ((value as { phase?: string } | undefined)?.phase === 'armingInProgress') {
+                    checkpointStarted();
+                    await release;
+                }
+                if (value === undefined) state.delete(key);
+                else state.set(key, value);
+            });
+        let active = true;
+
+        const arming = prepare_sqlite_migration_arming(
+            context,
+            boundary([]),
+            () => undefined,
+            () => active,
+        );
+        await started;
+        active = false;
+        releaseCheckpoint();
+
+        await expect(arming).rejects.toThrow();
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBeUndefined();
+    });
+
+    it('restores the prior state when deactivated during the capability wait', async () => {
+        const { context, state } = fixture({});
+        const companion = install_companion({ sourceJson: '{}' });
+        vi.spyOn(vscode.window, 'showWarningMessage').mockResolvedValue(
+            'I Attest Every Other VS Code Window Is Closed' as never,
+        );
+        let resolveCapabilities!: (value: unknown) => void;
+        const hostCapabilities = vi.fn(() => new Promise((resolve) => {
+            resolveCapabilities = resolve;
+        }));
+        (vscode as unknown as {
+            __setCommand(command: string, handler: (...args: unknown[]) => unknown): void;
+        }).__setCommand(MIGRATION_COMPANION_COMMANDS.hostCapabilities, hostCapabilities);
+        let active = true;
+
+        const arming = prepare_sqlite_migration_arming(
+            context,
+            boundary([]),
+            () => undefined,
+            () => active,
+        );
+        await poll_for(
+            () => hostCapabilities.mock.calls.length > 0,
+            'arming capability request',
+        );
+        expect(hostCapabilities).toHaveBeenCalledTimes(1);
+        active = false;
+        resolveCapabilities({
+            extensionId: MIGRATION_COMPANION_EXTENSION_ID,
+            extensionVersion: '0.7.0',
+            extensionKind: 'ui',
+            protocolVersion: 1,
+            directoryDurabilitySupported: true,
+        });
+
+        await expect(arming).rejects.toThrow();
+        expect(state.get(MIGRATION_ARMING_STATE_KEY)).toBeUndefined();
+        expect(companion.submit).not.toHaveBeenCalled();
+    });
+
     it('does not fence or seed when the all-window attestation is declined', async () => {
         const { context } = fixture({});
         const events: string[] = [];
@@ -569,9 +764,9 @@ describe('SQLite migration preparation arming', () => {
                 if (attempts.length === 1) throw new Error('response lost after commit');
                 return result;
             });
-        vi.spyOn(vscode.window, 'showWarningMessage')
+        const warnings = vi.spyOn(vscode.window, 'showWarningMessage')
             .mockResolvedValueOnce('I Attest Every Other VS Code Window Is Closed' as never)
-            .mockResolvedValue(undefined);
+            .mockResolvedValue('I Attest Every VS Code Window Was Closed' as never);
 
         await expect(prepare_sqlite_migration_arming(context, boundary([]), () => undefined))
             .rejects.toThrow(/response lost/);
@@ -583,6 +778,10 @@ describe('SQLite migration preparation arming', () => {
             blocksStateWriters: true,
             phase: 'awaitingColdStart',
         });
+        expect(warnings).toHaveBeenLastCalledWith(
+            expect.stringMatching(/another fresh window/),
+            { modal: true },
+        );
         expect(attempts.map((attempt) => attempt.operationId)).toEqual([
             checkpoint.capsuleOperationId,
             checkpoint.capsuleOperationId,
@@ -775,6 +974,55 @@ describe('cold capsule confirmation', () => {
         } satisfies MigrationArmingState);
         return { ...value, sourceJson };
     }
+
+    it('suppresses stale post-await UI after cold evaluation loses its activation generation', async () => {
+        const seeded = armed_fixture({});
+        install_companion({ sourceJson: seeded.sourceJson, active: true });
+        let resolveCapabilities!: (value: unknown) => void;
+        const hostCapabilities = vi.fn(() => new Promise((resolve) => {
+            resolveCapabilities = resolve;
+        }));
+        const commands = vscode as unknown as {
+            __setCommand(command: string, handler: (...args: unknown[]) => unknown): void;
+        };
+        commands.__setCommand(MIGRATION_COMPANION_COMMANDS.hostCapabilities, hostCapabilities);
+        const showError = vi.spyOn(vscode.window, 'showErrorMessage').mockResolvedValue(undefined);
+        let active = true;
+
+        const staleEvaluation = evaluate_sqlite_migration_cold_start(seeded.context, () => active);
+        await poll_for(
+            () => hostCapabilities.mock.calls.length > 0,
+            'cold-start capability request',
+        );
+        expect(hostCapabilities).toHaveBeenCalledTimes(1);
+        active = false;
+        resolveCapabilities({
+            extensionId: MIGRATION_COMPANION_EXTENSION_ID,
+            extensionVersion: '0.7.0',
+            extensionKind: 'ui',
+            protocolVersion: 1,
+            directoryDurabilitySupported: false,
+        });
+
+        await expect(staleEvaluation).resolves.toEqual({
+            blocksStateWriters: true,
+            phase: 'failedClosed',
+        });
+        expect(showError).not.toHaveBeenCalled();
+
+        commands.__setCommand(MIGRATION_COMPANION_COMMANDS.hostCapabilities, () => ({
+            extensionId: MIGRATION_COMPANION_EXTENSION_ID,
+            extensionVersion: '0.7.0',
+            extensionKind: 'ui',
+            protocolVersion: 1,
+            directoryDurabilitySupported: false,
+        }));
+        await expect(evaluate_sqlite_migration_cold_start(seeded.context)).resolves.toEqual({
+            blocksStateWriters: true,
+            phase: 'failedClosed',
+        });
+        expect(showError).toHaveBeenCalledTimes(1);
+    });
 
     it('restores an established cold fence when a later arming attempt uses an unsupported companion host', async () => {
         const seeded = armed_fixture({});

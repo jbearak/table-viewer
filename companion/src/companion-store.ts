@@ -500,7 +500,7 @@ function validate_companion_contents(database: DatabaseSync): void {
         }
     }
 
-    const recoveryRecordIdsByDigest = new Map<string, string>();
+    const recoveryRecordIdsByDigest = new Map<string, Set<string>>();
     for (const row of statement(database, `SELECT * FROM pending_edit_recovery_records`).all() as Row[]) {
         const recoveryRecordId = bounded_text(row.recovery_record_id, 'recoveryRecordId');
         const storageEnvironmentId = bounded_text(row.storage_environment_id, 'recovery storageEnvironmentId');
@@ -529,7 +529,9 @@ function validate_companion_contents(database: DatabaseSync): void {
         if (row.request_digest !== request_digest(recoveryRequest)) throw new Error('Recovery preparation request digest is invalid.');
         const recoveryRequestDigest = request_digest_text(row.request_digest, 'recovery preparation request digest');
         relate('prepare_pending_edit_recovery', recoveryRequestDigest);
-        recoveryRecordIdsByDigest.set(recoveryRequestDigest, recoveryRecordId);
+        const recoveryRecordIds = recoveryRecordIdsByDigest.get(recoveryRequestDigest) ?? new Set<string>();
+        recoveryRecordIds.add(recoveryRecordId);
+        recoveryRecordIdsByDigest.set(recoveryRequestDigest, recoveryRecordIds);
         const receipt = requireReceipt(row.operation_id, 'prepare_pending_edit_recovery', row.request_digest, 'recovery preparation');
         if ((receipt.result as ReceiptResults['prepare_pending_edit_recovery']).recoveryRecordId !== recoveryRecordId) {
             throw new Error('Recovery preparation receipt result relationship is invalid.');
@@ -568,7 +570,7 @@ function validate_companion_contents(database: DatabaseSync): void {
             }
         } else if (receipt.kind === 'prepare_pending_edit_recovery') {
             const result = receipt.result as ReceiptResults['prepare_pending_edit_recovery'];
-            if (result.recoveryRecordId !== recoveryRecordIdsByDigest.get(receipt.digest)) {
+            if (!recoveryRecordIdsByDigest.get(receipt.digest)?.has(result.recoveryRecordId)) {
                 throw new Error('Recovery receipt result does not match its domain request.');
             }
         }
@@ -595,8 +597,18 @@ function create_directory_durably(directoryPath: string): void {
         throw new Error('Companion storage ancestor is not a directory.');
     }
     assert_sqlite_directory_durability_supported(existingAncestor);
-    fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
     for (const created of missing.reverse()) {
+        try {
+            fs.mkdirSync(created, { mode: 0o700 });
+        } catch (error) {
+            if (!(error instanceof Error)
+                || !('code' in error)
+                || error.code !== 'EEXIST'
+                || !fs.lstatSync(created).isDirectory()) {
+                throw error;
+            }
+        }
+        fs.chmodSync(created, 0o700);
         assert_sqlite_directory_durability_supported(path.dirname(created));
     }
 }
@@ -955,10 +967,6 @@ export class CompanionStore {
         } else if (request.pendingEditsJson !== undefined) throw new TypeError('A recovery clear cannot contain pending edits.');
         return this.#mutate(input.operationId, 'prepare_pending_edit_recovery', request, () => {
             const digest = request_digest(request);
-            const existing = statement(this.#database, `SELECT recovery_record_id FROM pending_edit_recovery_records WHERE request_digest=?`).get(digest) as Row | undefined;
-            if (existing) {
-                return { recoveryRecordId: bounded_text(existing.recovery_record_id, 'recoveryRecordId') };
-            }
             const recoveryRecordId = randomUUID();
             statement(this.#database, `INSERT INTO pending_edit_recovery_records(recovery_record_id,storage_environment_id,database_id,recovery_entry_id,operation_id,request_digest,kind,resource_identity_json,authority_revision,physical_revision,projection_revision,physical_digest,pending_edits_json,status,prepared_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?)`).run(recoveryRecordId, request.storageEnvironmentId, request.databaseId, request.recoveryEntryId, input.operationId, digest, request.kind, request.resourceIdentityJson, request.authorityRevision, request.physicalRevision, request.projectionRevision, request.physicalDigest ?? null, request.pendingEditsJson ?? null, Date.now());
             return { recoveryRecordId };

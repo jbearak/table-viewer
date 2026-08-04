@@ -5,6 +5,7 @@ import type { MigrationCompanionClient } from './state';
 export const MIGRATION_COMPANION_EXTENSION_ID = 'jbearak.table-viewer-companion';
 export const MIGRATION_ARMING_STATE_KEY = 'tableViewer.sqliteMigrationArming.v1';
 export const MIGRATION_CAPSULE_MAX_UTF8_BYTES = 16 * 1_024 * 1_024;
+export const MIGRATION_COMPANION_COMMAND_TIMEOUT_MS = 30_000;
 
 export const MIGRATION_COMPANION_COMMANDS = {
     hostCapabilities: 'tableViewerCompanion.hostCapabilities.v1',
@@ -111,9 +112,22 @@ function response_boolean(value: unknown, name: string): boolean {
 }
 
 async function execute(command: string, input?: unknown): Promise<unknown> {
-    return input === undefined
+    const invocation = input === undefined
         ? vscode.commands.executeCommand(command)
         : vscode.commands.executeCommand(command, input);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            invocation,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                    reject(new Error(`The Table Viewer companion command ${command} did not answer in time.`));
+                }, MIGRATION_COMPANION_COMMAND_TIMEOUT_MS);
+            }),
+        ]);
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+    }
 }
 
 async function migration_companion_host_capabilities(

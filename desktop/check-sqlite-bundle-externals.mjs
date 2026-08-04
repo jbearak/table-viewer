@@ -16,19 +16,14 @@ for (const [label, script_name] of [
 }
 
 /**
- * Both halves of the same assertion, applied to every bundle that must reach
- * node:sqlite through the embedded runtime rather than through a bundled copy:
- * the runtime `require` has to survive, and no SQLite implementation may have
- * been inlined beside it. A bundled shim would hide whether the runtime actually
- * supplies the API, and would make a packaged build depend on node_modules.
+ * Every bundle that uses SQLite must retain the runtime import. The build-script
+ * assertions above independently require esbuild to externalize node:sqlite;
+ * inspecting minified class names cannot reliably identify bundled code.
  */
 async function assert_externalized_sqlite(label, ...segments) {
     const bundle = await readFile(join(repo_dir, ...segments), 'utf8');
     if (!bundle.includes('require("node:sqlite")')) {
         throw new Error(`${label} does not retain the node:sqlite runtime import`);
-    }
-    if (bundle.includes('class DatabaseSync')) {
-        throw new Error(`${label} appears to contain a bundled SQLite implementation`);
     }
 }
 

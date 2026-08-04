@@ -481,6 +481,7 @@ export const window = {
         return { document, revealRange() {} };
     },
     visibleTextEditors: [],
+    activeTextEditor: undefined as unknown,
 };
 
 export class Range {
@@ -561,6 +562,10 @@ export function __setCommand(command: string, handler: (...args: unknown[]) => u
     command_handlers.set(command, handler);
 }
 
+export function __hasCommand(command: string): boolean {
+    return command_handlers.has(command);
+}
+
 export function __reset(): void {
     panels.length = 0;
     watchers.length = 0;
@@ -574,6 +579,7 @@ export function __reset(): void {
     write_file_impl = undefined;
     workspace.workspaceFile = undefined;
     workspace.workspaceFolders = undefined;
+    window.activeTextEditor = undefined;
     watcher_registration_failure = undefined;
     watcher_dispose_failure = false;
 }

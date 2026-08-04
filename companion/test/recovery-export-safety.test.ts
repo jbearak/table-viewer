@@ -45,6 +45,109 @@ describe('real-filesystem recovery export safety', () => {
         expect(fs.readFileSync(source, 'utf8')).toBe('source bytes');
     });
 
+    it('creates a new ordinary export safely when no-follow open is unavailable', () => {
+        const { root, state, source } = fixture();
+        const target = path.join(root, 'windows-style-export.json');
+
+        write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            forceNoFollowUnavailable: true,
+        });
+
+        expect(fs.readFileSync(target, 'utf8')).toBe('{"safe":true}');
+        expect(fs.readFileSync(source, 'utf8')).toBe('source bytes');
+    });
+
+    it('treats a zero-valued no-follow flag as unavailable', () => {
+        const { root, state, source } = fixture();
+        const target = path.join(root, 'zero-no-follow-export.json');
+        fs.writeFileSync(target, 'existing bytes');
+
+        expect(() => write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            noFollowFlagForTest: 0,
+        })).toThrow(UnsafeRecoveryExportTargetError);
+        expect(fs.readFileSync(target, 'utf8')).toBe('existing bytes');
+    });
+
+    it('fails closed on an existing destination when no-follow open is unavailable', () => {
+        const { root, state, source } = fixture();
+        const target = path.join(root, 'existing-windows-style-export.json');
+        fs.writeFileSync(target, 'existing bytes');
+
+        expect(() => write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            forceNoFollowUnavailable: true,
+        })).toThrow(UnsafeRecoveryExportTargetError);
+        expect(fs.readFileSync(target, 'utf8')).toBe('existing bytes');
+    });
+
+    it('does not overwrite an ordinary leaf created after absent-target validation', () => {
+        const { root, state, source } = fixture();
+        const target = path.join(root, 'raced-ordinary-export.json');
+
+        expect(() => write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            beforeOpen: () => fs.writeFileSync(target, 'raced bytes'),
+        })).toThrow(UnsafeRecoveryExportTargetError);
+        expect(fs.readFileSync(target, 'utf8')).toBe('raced bytes');
+        expect(fs.readFileSync(source, 'utf8')).toBe('source bytes');
+    });
+
+    it.runIf(process.platform !== 'win32')('does not overwrite a replacement for the validated existing file', () => {
+        const { root, state, source } = fixture();
+        const selectedDirectory = path.join(root, 'selected');
+        const replacementDirectory = path.join(root, 'replacement');
+        fs.mkdirSync(selectedDirectory);
+        fs.mkdirSync(replacementDirectory);
+        const target = path.join(selectedDirectory, 'bundle.json');
+        const replacement = path.join(replacementDirectory, 'bundle.json');
+        fs.writeFileSync(target, 'selected bytes');
+        fs.writeFileSync(replacement, 'replacement bytes');
+
+        expect(() => write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            beforeOpen: () => {
+                fs.renameSync(selectedDirectory, `${selectedDirectory}-away`);
+                fs.renameSync(replacementDirectory, selectedDirectory);
+            },
+        })).toThrow(UnsafeRecoveryExportTargetError);
+        expect(fs.readFileSync(path.join(selectedDirectory, 'bundle.json'), 'utf8'))
+            .toBe('replacement bytes');
+        expect(fs.readFileSync(path.join(`${selectedDirectory}-away`, 'bundle.json'), 'utf8'))
+            .toBe('selected bytes');
+    });
+
+    it.runIf(process.platform !== 'win32')('does not recreate a validated existing target removed before open', () => {
+        const { root, state, source } = fixture();
+        const target = path.join(root, 'removed-before-open.json');
+        fs.writeFileSync(target, 'selected bytes');
+
+        expect(() => write_recovery_export_safely({
+            targetPath: target,
+            stateRootPath: state,
+            originalSourcePath: source,
+            contents: '{"safe":true}',
+            beforeOpen: () => fs.unlinkSync(target),
+        })).toThrow();
+        expect(fs.existsSync(target)).toBe(false);
+    });
+
     it.runIf(process.platform !== 'win32')('makes an overwritten recovery export private before writing sensitive data', () => {
         const { root, state, source } = fixture();
         const target = path.join(root, 'existing-bundle.json');
@@ -69,11 +172,12 @@ describe('real-filesystem recovery export safety', () => {
         const { state, source } = fixture();
         const target = path.join(state, relative);
         fs.mkdirSync(path.dirname(target), { recursive: true });
-        const before = fs.existsSync(target) ? fs.readFileSync(target) : undefined;
+        fs.writeFileSync(target, 'state evidence');
+        const before = fs.readFileSync(target);
 
         expect(() => write(target, state, source)).toThrow(UnsafeRecoveryExportTargetError);
 
-        expect(fs.existsSync(target) ? fs.readFileSync(target) : undefined).toEqual(before);
+        expect(fs.readFileSync(target)).toEqual(before);
     });
 
     it.runIf(process.platform !== 'win32')('rejects an authority-qualified file URI naming the original POSIX resource', () => {
@@ -123,6 +227,7 @@ describe('real-filesystem recovery export safety', () => {
         const { root, state, source } = fixture();
         const target = path.join(root, 'raced-export.json');
         const protectedFile = path.join(state, 'created-during-open.sqlite3');
+        fs.writeFileSync(target, 'selected bytes');
 
         expect(() => write_recovery_export_safely({
             targetPath: target,
@@ -131,6 +236,7 @@ describe('real-filesystem recovery export safety', () => {
             contents: '{"safe":true}',
             beforeOpen: () => {
                 fs.writeFileSync(protectedFile, 'new protected evidence');
+                fs.unlinkSync(target);
                 fs.linkSync(protectedFile, target);
             },
         })).toThrow(UnsafeRecoveryExportTargetError);
@@ -148,7 +254,7 @@ describe('real-filesystem recovery export safety', () => {
         expect(fs.readFileSync(database, 'utf8')).toBe('database evidence');
     });
 
-    it('rejects a symlinked parent alias into companion state', () => {
+    it.runIf(process.platform !== 'win32')('rejects a symlinked parent alias into companion state', () => {
         const { root, state, source } = fixture();
         const stateAlias = path.join(root, 'state-alias');
         fs.symlinkSync(state, stateAlias, 'dir');
@@ -157,7 +263,7 @@ describe('real-filesystem recovery export safety', () => {
             .toThrow(UnsafeRecoveryExportTargetError);
     });
 
-    it('rejects a symlink alias to the original native resource', () => {
+    it.runIf(process.platform !== 'win32')('rejects a symlink alias to the original native resource', () => {
         const { root, state, source } = fixture();
         const sourceAlias = path.join(root, 'source-alias.json');
         fs.symlinkSync(source, sourceAlias, 'file');

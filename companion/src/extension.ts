@@ -45,7 +45,9 @@ const PRESERVE = 'Set Aside Complete State and Retry…';
 const PRESERVE_ATTESTATION = 'I Closed Every Table Viewer Process — Set Aside Complete State';
 
 let activeStore: CompanionStore | undefined;
+let activeOpening: Promise<CompanionStore | undefined> | undefined;
 let readyRegistrations: vscode.Disposable[] = [];
+let activationGeneration = 0;
 
 function database_path(globalStoragePath: string): string {
     return path.join(globalStoragePath, 'state', DATABASE_BASENAME);
@@ -334,14 +336,10 @@ async function preserve_complete_basename(globalStoragePath: string): Promise<vo
         for (const tokenId of gate.listReaderTokenIds()) {
             await gate.reclaimStaleReaderToken(tokenId, confirmation);
         }
-        if (inspect_sqlite_recovery_gate(databasePath).recoveryBlocked) {
-            await resume_sqlite_basename_preservation(databasePath, { gate });
-        } else {
-            if (before.recoveryBlocked) {
+        if (inspect_sqlite_recovery_gate(databasePath).recoveryBlocked || before.recoveryBlocked) {
             await resume_sqlite_basename_preservation(databasePath, { gate });
         } else {
             await preserve_sqlite_basename_set(databasePath, { gate });
-        }
         }
         completed = true;
     } finally {
@@ -357,6 +355,8 @@ async function preserve_complete_basename(globalStoragePath: string): Promise<vo
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    const generation = ++activationGeneration;
+    const isCurrentActivation = () => activationGeneration === generation;
     const manifestVersion = String(context.extension.packageJSON.version ?? '');
     const globalStoragePath = context.globalStorageUri.fsPath;
     const isUiPlacement = context.extension.extensionKind === vscode.ExtensionKind.UI;
@@ -366,18 +366,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let opening: Promise<CompanionStore | undefined> | undefined;
 
     const tryOpen = (): Promise<CompanionStore | undefined> => {
-        if (!isUiPlacement) return Promise.resolve(undefined);
+        if (!isUiPlacement || !isCurrentActivation()) return Promise.resolve(undefined);
         if (opening) return opening;
-        opening = CompanionStore.open(globalStoragePath, manifestVersion).then((store) => {
+        const currentOpening = CompanionStore.open(globalStoragePath, manifestVersion).then(async (store) => {
+            if (!isCurrentActivation()) {
+                await store.close();
+                return undefined;
+            }
             activeStore = store;
             openFailure = undefined;
             register_ready_commands(context, store);
             return store;
         }, (error: unknown) => {
-            openFailure = error;
+            if (isCurrentActivation()) openFailure = error;
             return undefined;
-        }).finally(() => { opening = undefined; });
-        return opening;
+        }).finally(() => {
+            if (opening === currentOpening) opening = undefined;
+            if (activeOpening === currentOpening) activeOpening = undefined;
+        });
+        opening = currentOpening;
+        activeOpening = currentOpening;
+        return currentOpening;
     };
 
     // These commands must exist even when opening the database fails. No stateful
@@ -438,10 +447,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export async function deactivate(): Promise<void> {
+    activationGeneration += 1;
     const registrations = readyRegistrations;
     readyRegistrations = [];
     for (const registration of registrations) registration.dispose();
+    const opening = activeOpening;
+    activeOpening = undefined;
     const store = activeStore;
     activeStore = undefined;
+    await opening;
     await store?.close();
 }
