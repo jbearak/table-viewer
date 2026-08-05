@@ -76,53 +76,79 @@ npm install
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 echo ""
 
-# Steps 2-4: Build the VSIX and install it to editors
+# Steps 2-4: Build both exact-version VSIXes and install the UI companion
+# before the dependent workspace extension.
 VSIX_FILE=""
+COMPANION_VSIX_FILE=""
 if [ $EXTENSION -eq 1 ]; then
-    # Step 2: Bundle extension and webview
-    echo "Bundling extension..."
-    npm run vscode:prepublish
-    echo -e "${GREEN}✓ Extension bundled${NC}"
+    # Drop any previously built VSIX first (including older versions, which vsce
+    # leaves behind) so the files we install can only be those this run produced.
+    echo "Packaging extensions..."
+    rm -f table-viewer-*.vsix companion/table-viewer-companion-*.vsix
+    npm run package:release
+    echo -e "${GREEN}✓ VSIX packages built and inspected${NC}"
     echo ""
 
-    # Step 3: Package the VSIX. Drop any previously built VSIX first (including
-    # older versions, which vsce leaves behind) so the file we install can only
-    # be the one this run produced.
-    echo "Packaging extension..."
-    rm -f table-viewer-*.vsix
-    npm run package
-    echo -e "${GREEN}✓ VSIX package built${NC}"
-    echo ""
-
-    # The filename is fixed by package.json's version, so there is nothing to glob.
     VERSION=$(node -p "require('./package.json').version")
     VSIX_FILE="table-viewer-${VERSION}.vsix"
+    COMPANION_VSIX_FILE="companion/table-viewer-companion-${VERSION}.vsix"
 
-    if [ ! -f "$VSIX_FILE" ]; then
-        echo -e "${RED}Error: No VSIX file found: $VSIX_FILE${NC}"
-        exit 1
-    fi
-    echo "Found VSIX: $VSIX_FILE"
+    for package_file in "$COMPANION_VSIX_FILE" "$VSIX_FILE"; do
+        if [ ! -f "$package_file" ]; then
+            echo -e "${RED}Error: No VSIX file found: $package_file${NC}"
+            exit 1
+        fi
+        echo "Found VSIX: $package_file"
+    done
     echo ""
 
     # Step 4: Install to editors
     echo "Installing extension to editors..."
     EDITORS=("code" "code-insiders" "codium" "kiro" "antigravity" "cursor" "windsurf")
+    COMPANION_EXTENSION_ID="jbearak.table-viewer-companion"
     INSTALLED=0
+    ROLLBACK_FAILURES=0
 
     for editor in "${EDITORS[@]}"; do
         if command -v "$editor" &> /dev/null; then
             echo -n "  $editor: "
-            if "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
-                echo -e "${GREEN}✓${NC}"
+            if ! INSTALLED_EXTENSIONS=$("$editor" --list-extensions --show-versions 2> /dev/null); then
+                echo -e "${YELLOW}could not inventory existing extensions${NC}"
+                continue
+            fi
+            PRIOR_COMPANION=""
+            while IFS= read -r installed_extension; do
+                case "$installed_extension" in
+                    "${COMPANION_EXTENSION_ID}@"*)
+                        PRIOR_COMPANION="$installed_extension"
+                        break
+                        ;;
+                esac
+            done <<< "$INSTALLED_EXTENSIONS"
+
+            if ! "$editor" --install-extension "$COMPANION_VSIX_FILE" --force &> /dev/null; then
+                echo -e "${YELLOW}companion install failed${NC}"
+            elif "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
+                echo -e "${GREEN}✓ companion + main${NC}"
                 INSTALLED=$((INSTALLED + 1))
+            elif { [ -n "$PRIOR_COMPANION" ] \
+                && "$editor" --install-extension "$PRIOR_COMPANION" --force &> /dev/null; } \
+                || { [ -z "$PRIOR_COMPANION" ] \
+                && "$editor" --uninstall-extension "$COMPANION_EXTENSION_ID" &> /dev/null; }; then
+                echo -e "${YELLOW}main install failed; companion restored${NC}"
             else
-                echo -e "${YELLOW}failed${NC}"
+                echo -e "${RED}main install failed; companion rollback failed${NC}"
+                ROLLBACK_FAILURES=$((ROLLBACK_FAILURES + 1))
             fi
         else
             echo -e "  $editor: ${YELLOW}not found${NC}"
         fi
     done
+
+    if [ $ROLLBACK_FAILURES -ne 0 ]; then
+        echo -e "${RED}Error: failed to restore an exact-version extension pair in $ROLLBACK_FAILURES editor(s)${NC}"
+        exit 1
+    fi
 
     if [ $INSTALLED -eq 0 ]; then
         echo -e "${YELLOW}Warning: No editors found to install extension${NC}"
@@ -182,7 +208,8 @@ fi
 
 echo "=== Setup Complete ==="
 if [ -n "$VSIX_FILE" ]; then
-    echo "Extension: $VSIX_FILE"
+    echo "Companion extension: $COMPANION_VSIX_FILE"
+    echo "Main extension: $VSIX_FILE"
 fi
 if [ -n "$APP_DEST" ]; then
     echo "Desktop app: $APP_DEST"

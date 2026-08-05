@@ -23,11 +23,45 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout tag
+      - name: Resolve immutable tag commit
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$THE_TAG" =~ ^v[0-9][0-9A-Za-z._+-]*$ ]]; then
+            echo "ERROR: invalid release tag: $THE_TAG" >&2
+            exit 1
+          fi
+          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
+          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+          SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          for _ in 1 2 3 4; do
+            [[ "$TYPE" == "commit" ]] && break
+            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag did not resolve to a commit" >&2; exit 1; }
+            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${SHA}")
+            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+            SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          done
+          if [[ "$TYPE" != "commit" || ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: release tag did not peel to a commit" >&2
+            exit 1
+          fi
+          if [[ "$SHA" != "$EVENT_SHA" ]]; then
+            echo "ERROR: release tag does not resolve to the immutable event commit" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -35,10 +69,12 @@ jobs:
           node-version: '26.5.1'
           cache: npm
 
-      - name: Validate tag + version
+      - name: Validate tag + versions
+        id: version
         shell: bash
         env:
           THE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -52,17 +88,23 @@ jobs:
             exit 1
           fi
 
-          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
-            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: checkout does not match the resolved immutable tag commit" >&2
             exit 1
           fi
 
           PKG_VERSION=$(node -p "require('./package.json').version")
+          COMPANION_VERSION=$(node -p "require('./companion/package.json').version")
           EXPECTED_TAG="v${PKG_VERSION}"
           if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
             echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
             exit 1
           fi
+          if [[ "$COMPANION_VERSION" != "$PKG_VERSION" ]]; then
+            echo "ERROR: companion/package.json version $COMPANION_VERSION does not match package.json $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: npm ci
@@ -70,16 +112,27 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Package extension
-        run: npm run package
+      - name: Package and inspect extensions
+        run: npm run package:release
 
-      - name: Calculate checksums
+      - name: Calculate main extension checksum
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          for vsix in table-viewer-*.vsix; do
-            sha256sum "$vsix" > "$vsix.sha256"
-          done
+          MAIN_VSIX="table-viewer-${VERSION}.vsix"
+          sha256sum "$MAIN_VSIX" > "$MAIN_VSIX.sha256"
+
+      - name: Calculate companion checksum
+        shell: bash
+        working-directory: companion
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          COMPANION_VSIX="table-viewer-companion-${VERSION}.vsix"
+          sha256sum "$COMPANION_VSIX" > "$COMPANION_VSIX.sha256"
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -88,8 +141,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: |
-            table-viewer-*.vsix
-            table-viewer-*.vsix.sha256
+            table-viewer-${{ steps.version.outputs.version }}.vsix
+            table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
+            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix
+            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix.sha256
 
   # The standalone macOS app (Apple Silicon), shipped as a dmg that the
   # Homebrew cask in jbearak/homebrew-table-viewer downloads by URL + sha256.
@@ -106,11 +161,45 @@ jobs:
     environment: release
 
     steps:
-      - name: Checkout tag
+      - name: Resolve immutable tag commit
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$THE_TAG" =~ ^v[0-9][0-9A-Za-z._+-]*$ ]]; then
+            echo "ERROR: invalid release tag: $THE_TAG" >&2
+            exit 1
+          fi
+          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
+          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+          SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          for _ in 1 2 3 4; do
+            [[ "$TYPE" == "commit" ]] && break
+            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag did not resolve to a commit" >&2; exit 1; }
+            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${SHA}")
+            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+            SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          done
+          if [[ "$TYPE" != "commit" || ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: release tag did not peel to a commit" >&2
+            exit 1
+          fi
+          if [[ "$SHA" != "$EVENT_SHA" ]]; then
+            echo "ERROR: release tag does not resolve to the immutable event commit" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -122,6 +211,7 @@ jobs:
         shell: bash
         env:
           THE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -130,8 +220,8 @@ jobs:
             exit 1
           fi
 
-          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
-            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: checkout does not match the resolved immutable tag commit" >&2
             exit 1
           fi
 
@@ -210,7 +300,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           for ext in dmg zip; do
-            files=(table-viewer-*.$ext)
+            files=(table-viewer-*."${ext}")
             if [[ "${#files[@]}" -ne 1 ]]; then
               echo "ERROR: expected exactly 1 .$ext, found ${#files[@]}. Did artifactName change?" >&2
               ls -la >&2

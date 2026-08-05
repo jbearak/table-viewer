@@ -14,6 +14,7 @@ import {
     acquire_sqlite_exclusive_recovery_gate,
     acquire_sqlite_shared_reader_gate,
     assert_sqlite_directory_durability_supported,
+    initialize_custom_sqlite_database_no_clobber,
     initialize_sqlite_database_no_clobber,
     inspect_sqlite_recovery_gate,
     install_recognized_sqlite_candidate_no_clobber,
@@ -36,6 +37,25 @@ const identity: SqliteDesktopFileStateIdentity = {
     productKind: 'desktop',
     databaseId: 'desktop-database',
     storageEnvironmentId: 'desktop-environment',
+};
+
+const CUSTOM_APPLICATION_ID = 0x54564354;
+const customSpec = {
+    applicationId: CUSTOM_APPLICATION_ID,
+    initialize(database: DatabaseSync) {
+        database.exec(`
+            PRAGMA journal_mode=DELETE;
+            PRAGMA application_id=${CUSTOM_APPLICATION_ID};
+            PRAGMA user_version=1;
+            CREATE TABLE custom_state (id INTEGER PRIMARY KEY);
+        `);
+    },
+    validate(database: DatabaseSync) {
+        const row = database.prepare(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name='custom_state'",
+        ).get() as { name?: unknown } | undefined;
+        if (row?.name !== 'custom_state') throw new Error('custom schema missing');
+    },
 };
 
 function databasePath(name = 'file-state.sqlite3'): string {
@@ -1927,6 +1947,49 @@ describe('complete candidates and no-clobber installation', () => {
         expect((await inventory_sqlite_basename(databasePath())).candidates).toEqual([]);
     });
 
+    it.runIf(process.platform !== 'win32')('rejects a resumed candidate replaced at the source-link boundary', async () => {
+        await expectCategory(
+            initialize_sqlite_database_no_clobber(
+                databasePath(),
+                identity,
+                { appliedAtMs: 100, appVersion: '0.7.0' },
+                {
+                    onEvent(event) {
+                        if (event === 'candidate-before-install') throw new Error('stop before install');
+                    },
+                },
+            ),
+            'recovery',
+        );
+        const candidate = (await inventory_sqlite_basename(databasePath())).candidates[0];
+        expect(candidate).toBeDefined();
+        const candidatePath = path.join(tempDirectory, candidate!.name);
+        const alternatePath = path.join(tempDirectory, 'alternate-resume.sqlite3');
+        const alternate = await initialize_sqlite_database_no_clobber(
+            alternatePath,
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+        );
+        await alternate.database.close();
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+
+        await expectCategory(install_recognized_sqlite_candidate_no_clobber(
+            databasePath(),
+            candidatePath,
+            identity,
+            {
+                gate: exclusive,
+                beforeCandidateSourceLink() {
+                    fs.unlinkSync(candidatePath);
+                    fs.symlinkSync(alternatePath, candidatePath);
+                },
+            },
+        ), 'recovery');
+        expect(fs.existsSync(databasePath())).toBe(false);
+        expect(fs.lstatSync(candidatePath).isSymbolicLink()).toBe(true);
+        await exclusive.release();
+    });
+
     it('serves only the complete canonical winner after a crash immediately after install', async () => {
         const failure = initialize_sqlite_database_no_clobber(
             databasePath(),
@@ -1990,27 +2053,70 @@ describe('complete candidates and no-clobber installation', () => {
         await exclusive.release();
     });
 
-    it('closes the installed winner before token release when exact candidate cleanup fails', async () => {
-        await expectCategory(initialize_sqlite_database_no_clobber(
+    it.runIf(process.platform !== 'win32')('rejects a symlink replacement for the built candidate before installation', async () => {
+        const alternatePath = path.join(tempDirectory, 'alternate.sqlite3');
+        const alternate = await initialize_sqlite_database_no_clobber(
+            alternatePath,
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+        );
+        await alternate.database.close();
+        let replacedCandidatePath: string | undefined;
+
+        const initialization = initialize_sqlite_database_no_clobber(
             databasePath(),
             identity,
             { appliedAtMs: 100, appVersion: '0.7.0' },
             {
-                onEvent(event) {
-                    if (event !== 'winner-validated') return;
+                beforeCandidateSourceLink() {
                     const candidate = fs.readdirSync(tempDirectory)
-                        .find((name) => name.includes('.init-candidate.'));
+                        .find((name) => name.startsWith('file-state.sqlite3.init-candidate.'));
                     if (!candidate) throw new Error('candidate missing');
-                    const candidatePath = path.join(tempDirectory, candidate);
-                    const replacementPath = path.join(tempDirectory, 'candidate-cleanup-replacement');
-                    fs.writeFileSync(replacementPath, 'replacement');
-                    fs.renameSync(replacementPath, candidatePath);
+                    replacedCandidatePath = path.join(tempDirectory, candidate);
+                    fs.unlinkSync(replacedCandidatePath);
+                    fs.symlinkSync(alternatePath, replacedCandidatePath);
                 },
             },
-        ), 'recovery');
-        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
+        );
+
+        await expectCategory(initialization, 'recovery');
+        expect(fs.existsSync(databasePath())).toBe(false);
+        expect(replacedCandidatePath).toBeDefined();
+        expect(fs.lstatSync(replacedCandidatePath!).isSymbolicLink()).toBe(true);
+    });
+
+    it('keeps the installed winner open and preserves a replacement at the cleanup rename boundary', async () => {
+        let replaced = false;
+        const result = await initialize_sqlite_database_no_clobber(
+            databasePath(),
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+            {
+                beforeCandidateCleanupRename() {
+                    if (replaced) return;
+                    const candidate = fs.readdirSync(tempDirectory)
+                        .find((name) => name.includes('.init-candidate.')
+                            && !name.includes('.install-snapshot.'));
+                    if (!candidate) throw new Error('candidate missing');
+                    const candidatePath = path.join(tempDirectory, candidate);
+                    fs.renameSync(candidatePath, `${candidatePath}.owned-original`);
+                    fs.writeFileSync(candidatePath, 'replacement');
+                    replaced = true;
+                },
+            },
+        );
+
+        expect(result).toMatchObject({ installed: true, wonInstallation: true });
+        expect(replaced).toBe(true);
+        const preservedReplacement = fs.readdirSync(tempDirectory)
+            .find((name) => name.includes('.cleanup-preserved.'));
+        expect(preservedReplacement).toBeDefined();
+        expect(fs.readFileSync(path.join(tempDirectory, preservedReplacement!), 'utf8')).toBe('replacement');
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toHaveLength(1);
         const opened = await open_existing_sqlite_database(databasePath());
         await opened.close();
+        await result.database.close();
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
     });
 
     it('flushes candidates and canonical installation with private modes', async () => {
@@ -2515,6 +2621,87 @@ describe('restartable preserve-as-a-unit recovery', () => {
         );
         await expectCategory(startup, 'recovery');
         expect(fs.readFileSync(databasePath(), 'utf8')).toBe('main-state');
+    });
+
+    it('removes its exact custom initialization candidate after a caught build failure', async () => {
+        let initialized = false;
+        await expectCategory(initialize_custom_sqlite_database_no_clobber(
+            databasePath('custom.sqlite3'),
+            {
+                ...customSpec,
+                initialize(database) {
+                    customSpec.initialize(database);
+                    initialized = true;
+                    throw new Error('injected custom initialization failure');
+                },
+            },
+        ), 'recovery');
+
+        expect(initialized).toBe(true);
+        expect(fs.readdirSync(tempDirectory).filter((name) => name.includes('.init-candidate.'))).toEqual([]);
+        expect(fs.existsSync(databasePath('custom.sqlite3'))).toBe(false);
+    });
+
+    it('preserves a replacement at a custom candidate pathname when cleanup identity no longer matches', async () => {
+        let replacementPath: string | undefined;
+        await expect(initialize_custom_sqlite_database_no_clobber(
+            databasePath('custom.sqlite3'),
+            customSpec,
+            {
+                onEvent(event) {
+                    if (event !== 'candidate-after-schema') return;
+                    const candidateName = fs.readdirSync(tempDirectory)
+                        .find((name) => name.includes('.init-candidate.'));
+                    if (!candidateName) throw new Error('candidate missing');
+                    replacementPath = path.join(tempDirectory, candidateName);
+                    fs.renameSync(replacementPath, `${replacementPath}.owned-original`);
+                    fs.writeFileSync(replacementPath, 'foreign replacement');
+                    throw new Error('injected replacement failure');
+                },
+            },
+        )).rejects.toThrow();
+
+        expect(replacementPath).toBeDefined();
+        expect(fs.readFileSync(replacementPath!, 'utf8')).toBe('foreign replacement');
+        expect(fs.existsSync(databasePath('custom.sqlite3'))).toBe(false);
+    });
+
+    it.runIf(process.platform !== 'win32')('rejects a custom candidate replaced at the source-link boundary', async () => {
+        const alternatePath = databasePath('alternate-custom.sqlite3');
+        const alternate = await initialize_custom_sqlite_database_no_clobber(alternatePath, customSpec);
+        await alternate.database.close();
+        let candidatePath: string | undefined;
+
+        await expect(initialize_custom_sqlite_database_no_clobber(
+            databasePath('custom.sqlite3'),
+            customSpec,
+            {
+                beforeCandidateSourceLink() {
+                    const candidateName = fs.readdirSync(tempDirectory)
+                        .find((name) => name.startsWith('custom.sqlite3.init-candidate.'));
+                    if (!candidateName) throw new Error('candidate missing');
+                    candidatePath = path.join(tempDirectory, candidateName);
+                    fs.unlinkSync(candidatePath);
+                    fs.symlinkSync(alternatePath, candidatePath);
+                },
+            },
+        )).rejects.toThrow();
+
+        expect(fs.existsSync(databasePath('custom.sqlite3'))).toBe(false);
+        expect(candidatePath).toBeDefined();
+        expect(fs.lstatSync(candidatePath!).isSymbolicLink()).toBe(true);
+    });
+
+    it('still installs and opens a valid custom candidate', async () => {
+        const result = await initialize_custom_sqlite_database_no_clobber(
+            databasePath('custom.sqlite3'),
+            customSpec,
+        );
+        expect(result.installed).toBe(true);
+        expect(result.wonInstallation).toBe(true);
+        expect(fs.readdirSync(tempDirectory).filter((name) => name.includes('.init-candidate.'))).toEqual([]);
+        customSpec.validate(result.database.database);
+        await result.database.close();
     });
 
     it('requires exact-token all-processes-closed reclamation for a crashed exclusive intent', async () => {

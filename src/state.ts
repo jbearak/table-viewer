@@ -812,6 +812,38 @@ function get_all_state(medium: FileStatePersistenceMedium): PersistedStateEnvelo
     return { format: STATE_FORMAT, nextRevision: 1, absenceRevision: 0, entries };
 }
 
+/** Validate a frozen Memento value through the same compatibility adapter used by
+ * the live Memento store and return its envelope entry keys, which are resource paths. */
+export function decode_memento_file_state_resource_keys(value: unknown): readonly string[] {
+    const envelope = get_all_state({
+        runtime_key: {},
+        read: () => value,
+        write: async () => undefined,
+    });
+    return Object.keys(envelope.entries);
+}
+
+/** Validate a frozen Memento value through the live-store compatibility adapter and
+ * return only the source metadata needed by migration. */
+export function decode_memento_file_state_source(value: unknown): {
+    readonly nextRevision: number;
+    readonly absenceRevision: number;
+    readonly entryCount: number;
+    readonly updatedAtMs?: number;
+} {
+    const envelope = get_all_state({
+        runtime_key: {},
+        read: () => value,
+        write: async () => undefined,
+    });
+    return {
+        nextRevision: envelope.nextRevision,
+        absenceRevision: envelope.absenceRevision,
+        entryCount: Object.keys(envelope.entries).length,
+        ...(envelope.updatedAt === undefined ? {} : { updatedAtMs: envelope.updatedAt }),
+    };
+}
+
 function authority_for_entry(entry: PersistedEntry | undefined): DurableFileAuthority {
     return structuredClone(entry?.authority ?? empty_authority());
 }
@@ -1868,6 +1900,17 @@ export function create_memento_keyed_file_state_persistence(
     context: ExtensionContext,
 ): KeyedFileStatePersistence {
     return create_keyed_file_state_persistence(memento_medium(context));
+}
+
+/** Drain this host's process-local Memento queue, then serialize the exact
+ * envelope value delivered to this extension host without normalizing key order. */
+export async function ordered_memento_file_state_source(
+    context: ExtensionContext,
+): Promise<string> {
+    await drain_keyed_state_runtime(context.globalState as object);
+    const ordered = JSON.stringify(context.globalState.get<unknown>(STATE_KEY, {}));
+    if (ordered === undefined) throw new TypeError('The Table Viewer Memento source is not serializable.');
+    return ordered;
 }
 
 export function create_file_state_store(
