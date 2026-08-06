@@ -57,8 +57,8 @@ export default async function after_pack(context) {
                 'These come from extraResources in desktop/electron-builder.yml, whose sources ' +
                 'include node_modules/electron/dist/. If the Electron ones are missing, that ' +
                 "install is incomplete — check that node_modules/electron/path.txt exists and " +
-                'dist/ is a full extraction (~270M), then reinstall:\n' +
-                '  rm -rf node_modules/electron && npm ci',
+                'dist/ is a full extraction, then repair it with:\n' +
+                '  npm run desktop:ensure-electron',
         );
     }
 }
