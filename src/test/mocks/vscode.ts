@@ -113,13 +113,6 @@ export const ViewColumn = {
 
 export const env = {
     remoteName: undefined as string | undefined,
-    appName: 'Visual Studio Code',
-    uriScheme: 'vscode',
-};
-
-export const ExtensionKind = {
-    UI: 1,
-    Workspace: 2,
 };
 
 export class RelativePattern {
@@ -465,15 +458,6 @@ export const window = {
     showInformationMessage(..._args: unknown[]): unknown {
         return undefined;
     },
-    showQuickPick(..._args: unknown[]): unknown {
-        return undefined;
-    },
-    showSaveDialog(..._args: unknown[]): unknown {
-        return undefined;
-    },
-    showOpenDialog(..._args: unknown[]): unknown {
-        return undefined;
-    },
     onDidChangeTextEditorVisibleRanges() {
         return disposable();
     },
@@ -481,7 +465,6 @@ export const window = {
         return { document, revealRange() {} };
     },
     visibleTextEditors: [],
-    activeTextEditor: undefined as unknown,
 };
 
 export class Range {
@@ -498,8 +481,6 @@ export const TextEditorRevealType = {
 };
 
 export const workspace = {
-    workspaceFile: undefined as UriLike | undefined,
-    workspaceFolders: undefined as readonly { uri: UriLike }[] | undefined,
     fs: {
         async stat(uri: UriLike): Promise<{ size: number; mtime: number }> {
             if (!stat_impl) return { size: 0, mtime: 0 };
@@ -534,37 +515,11 @@ export const workspace = {
     },
 };
 
-const command_handlers = new Map<string, (...args: unknown[]) => unknown>();
-const extension_registry = new Map<string, unknown>();
-
-export const commands = {
-    registerCommand(command: string, handler: (...args: unknown[]) => unknown) {
-        command_handlers.set(command, handler);
-        return { dispose: () => { command_handlers.delete(command); } };
-    },
-    async executeCommand(command: string, ...args: unknown[]): Promise<unknown> {
-        const handler = command_handlers.get(command);
-        return handler?.(...args);
-    },
-};
-
 export const extensions = {
-    getExtension(id: string) {
-        return extension_registry.get(id);
+    getExtension() {
+        return undefined;
     },
 };
-
-export function __setExtension(id: string, extension: unknown): void {
-    extension_registry.set(id, extension);
-}
-
-export function __setCommand(command: string, handler: (...args: unknown[]) => unknown): void {
-    command_handlers.set(command, handler);
-}
-
-export function __hasCommand(command: string): boolean {
-    return command_handlers.has(command);
-}
 
 export function __reset(): void {
     panels.length = 0;
@@ -572,14 +527,9 @@ export function __reset(): void {
     configuration_change_handlers.length = 0;
     configuration_values.clear();
     custom_editor_registrations.length = 0;
-    command_handlers.clear();
-    extension_registry.clear();
     stat_impl = undefined;
     read_file_impl = undefined;
     write_file_impl = undefined;
-    workspace.workspaceFile = undefined;
-    workspace.workspaceFolders = undefined;
-    window.activeTextEditor = undefined;
     watcher_registration_failure = undefined;
     watcher_dispose_failure = false;
 }

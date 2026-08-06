@@ -32,69 +32,26 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     environment: release
 
     steps:
-      - name: Resolve immutable release commit
-        id: release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$THE_TAG" =~ ^v[0-9][0-9A-Za-z._+-]*$ ]]; then
-            echo "ERROR: invalid release tag: $THE_TAG" >&2
-            exit 1
-          fi
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag did not resolve to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || ! "$TAG_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "ERROR: release tag did not peel to a commit" >&2
-            exit 1
-          fi
-          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            if [[ ! "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ || "$TAG_SHA" != "$RUN_HEAD_SHA" ]]; then
-              echo "ERROR: release tag no longer matches the successful build commit" >&2
-              exit 1
-            fi
-            RELEASE_SHA="$RUN_HEAD_SHA"
-          else
-            RELEASE_SHA="$TAG_SHA"
-          fi
-          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout immutable release commit
+      - name: Checkout tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ steps.release.outputs.sha }}
-          fetch-depth: 1
-          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: '26.5.1'
 
-      - name: Validate tag + versions
-        id: version
+      - name: Validate tag + version
         shell: bash
         env:
           THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -108,23 +65,17 @@ jobs:
             exit 1
           fi
 
-          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: checkout does not match the pinned release commit" >&2
+          if ! git rev-parse -q --verify "refs/tags/$THE_TAG" >/dev/null; then
+            echo "ERROR: tag does not exist in this repository: $THE_TAG" >&2
             exit 1
           fi
 
           PKG_VERSION=$(node -p "require('./package.json').version")
-          COMPANION_VERSION=$(node -p "require('./companion/package.json').version")
           EXPECTED_TAG="v${PKG_VERSION}"
           if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
             echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
             exit 1
           fi
-          if [[ "$COMPANION_VERSION" != "$PKG_VERSION" ]]; then
-            echo "ERROR: companion/package.json version $COMPANION_VERSION does not match package.json $PKG_VERSION" >&2
-            exit 1
-          fi
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
         id: artifacts
@@ -141,76 +92,26 @@ jobs:
           # Only ever true when a human dispatched with it explicitly; the
           # workflow_run trigger has no way to supply it. See the Windows branch.
           ALLOW_MISSING_WINDOWS: ${{ inputs.allow_missing_windows }}
-          VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           set -euo pipefail
 
           ARTIFACT_NAME="release-${THE_TAG}"
 
-          valid_run() {
-            jq -e \
-              --arg sha "$RELEASE_SHA" \
-              --arg tag "$THE_TAG" \
-              --arg trigger "$PUBLISH_TRIGGER" '
-                .name == "Release Build"
-                and .path == ".github/workflows/release-build.yml"
-                and .conclusion == "success"
-                and (
-                  (.event == "push" and .head_sha == $sha and .head_branch == $tag)
-                  or ($trigger == "workflow_dispatch" and .event == "workflow_dispatch"
-                    and .head_sha == $sha)
-                )
-              ' >/dev/null
-          }
-
           if [[ "$PUBLISH_TRIGGER" == "workflow_run" ]]; then
             BUILD_RUN_ID="$WORKFLOW_RUN_ID"
-            RUN_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")
           else
-            BUILD_RUN_ID=""
-            RUN_JSON=""
-            if ! CANDIDATES=$(gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
-              --jq ".artifacts[] | select(.name == \"$ARTIFACT_NAME\" and .expired == false) | .workflow_run.id"); then
-              echo "ERROR: could not list repository artifacts" >&2
-              exit 1
-            fi
-            if [[ -n "$CANDIDATES" ]]; then
-              while IFS= read -r candidate; do
-                candidate_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}")
-                if valid_run <<< "$candidate_json"; then
-                  BUILD_RUN_ID="$candidate"
-                  RUN_JSON="$candidate_json"
-                  break
-                fi
-              done <<< "$CANDIDATES"
-            fi
+            BUILD_RUN_ID=$(gh api --paginate "repos/${{ github.repository }}/actions/artifacts" \
+              --jq ".artifacts[] | select(.name == \"$ARTIFACT_NAME\" and .expired == false) | .workflow_run.id" \
+              | head -1)
           fi
 
           if [[ -z "${BUILD_RUN_ID:-}" ]]; then
-            echo "ERROR: No valid artifact found named '$ARTIFACT_NAME'" >&2
+            echo "ERROR: No artifact found named '$ARTIFACT_NAME'" >&2
             echo "Make sure Release Build completed successfully for $THE_TAG" >&2
             exit 1
           fi
 
-          if ! valid_run <<< "$RUN_JSON"; then
-            echo "ERROR: artifact run is not a successful Release Build for the pinned release commit" >&2
-            exit 1
-          fi
-
           gh run download "$BUILD_RUN_ID" --name "$ARTIFACT_NAME"
-
-          for required in \
-            "table-viewer-${VERSION}.vsix" \
-            "table-viewer-${VERSION}.vsix.sha256" \
-            "companion/table-viewer-companion-${VERSION}.vsix" \
-            "companion/table-viewer-companion-${VERSION}.vsix.sha256"; do
-            if [[ ! -f "$required" ]]; then
-              echo "ERROR: mandatory release artifact is missing: $required" >&2
-              exit 1
-            fi
-          done
 
           # Only an *absent* artifact is tolerable (see below); a download that
           # fails on an artifact the run really has is a transient or permission
@@ -224,9 +125,11 @@ jobs:
             --jq '.artifacts[] | select(.expired == false) | .name')
 
           # The desktop job of the same run produces the macOS app that the
-          # Homebrew cask downloads. Land it in desktop-dist/ rather than beside
-          # the exact main and companion VSIX paths, so desktop downloads cannot
-          # be mistaken for extension packages or their checksums.
+          # Homebrew cask downloads. Land it in desktop-dist/ rather than the
+          # workspace root: `table-viewer-*` would otherwise match both the
+          # .vsix and the dmg/zip, and `vsce publish --packagePath
+          # table-viewer-*.vsix` and the checksum globs expect a flat, .vsix-only
+          # directory.
           #
           # Absent is not fatal: tags built before the desktop job existed, and
           # runs whose artifacts have aged out, have no desktop-* artifact. The
@@ -296,13 +199,11 @@ jobs:
             exit 1
           fi
 
-      - name: Verify main and desktop checksums
+      - name: Verify checksums
         shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          sha256sum -c "table-viewer-${VERSION}.vsix.sha256"
+          sha256sum -c table-viewer-*.vsix.sha256
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
             (cd desktop-dist && sha256sum -c ./*.sha256)
           fi
@@ -310,170 +211,18 @@ jobs:
             (cd windows-dist && sha256sum -c ./*.sha256)
           fi
 
-      - name: Verify companion checksum
-        shell: bash
-        working-directory: companion
+      - name: Install publish tools
+        run: npm install --global @vscode/vsce@3.7.1 ovsx@0.10.9
+
+      - name: Publish to VS Code Marketplace
+        run: vsce publish --packagePath table-viewer-*.vsix --pat "$VSCE_PAT"
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          sha256sum -c "table-viewer-companion-${VERSION}.vsix.sha256"
-
-      - name: Inspect extension packages
-        run: npm run probe:vsix:packages
-
-      - name: Install locked publish tools
-        working-directory: .github/release-tools
-        run: npm ci --ignore-scripts
-
-      - name: Revalidate release tag before registry publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved after immutable build validation" >&2
-            exit 1
-          fi
-
-      - name: Publish companion to VS Code Marketplace
-        run: .github/release-tools/node_modules/.bin/vsce publish --skip-duplicate --packagePath "companion/table-viewer-companion-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      - name: Wait for companion Marketplace availability
-        run: node scripts/wait-extension-version.mjs marketplace jbearak table-viewer-companion "$VERSION"
+      - name: Publish to Open VSX
+        run: ovsx publish table-viewer-*.vsix --pat "$OVSX_PAT"
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-
-      - name: Revalidate release tag before companion Open VSX publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before companion Open VSX publication" >&2
-            exit 1
-          fi
-
-      - name: Publish companion to Open VSX
-        run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "companion/table-viewer-companion-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-
-      - name: Wait for companion Open VSX availability
-        run: node scripts/wait-extension-version.mjs open-vsx jbearak table-viewer-companion "$VERSION"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-
-      - name: Revalidate release tag before main Marketplace publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before main Marketplace publication" >&2
-            exit 1
-          fi
-
-      - name: Publish main extension to VS Code Marketplace
-        run: .github/release-tools/node_modules/.bin/vsce publish --skip-duplicate --packagePath "table-viewer-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
-      - name: Revalidate release tag before main Open VSX publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before main Open VSX publication" >&2
-            exit 1
-          fi
-
-      - name: Publish main extension to Open VSX
-        run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "table-viewer-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-
-      - name: Revalidate release tag before GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved after registry publication" >&2
-            exit 1
-          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -487,10 +236,8 @@ jobs:
           # globs are a no-op when this tag has no desktop artifact (see the
           # download step) rather than failing the release.
           files: |
-            table-viewer-${{ steps.version.outputs.version }}.vsix
-            table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix.sha256
+            table-viewer-*.vsix
+            table-viewer-*.vsix.sha256
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
             desktop-dist/*.sha256
@@ -512,51 +259,11 @@ jobs:
       # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
       # scoped to jbearak/homebrew-table-viewer with Contents:write +
       # Pull requests:write.
-      - name: Revalidate release tag before Homebrew bump
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before the Homebrew bump" >&2
-            exit 1
-          fi
-
-      - name: Resolve Homebrew tap snapshot
-        id: tap
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAP_SHA=$(gh api repos/jbearak/homebrew-table-viewer/commits/main --jq '.sha')
-          if [[ ! "$TAP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "ERROR: Homebrew tap did not resolve to a commit" >&2
-            exit 1
-          fi
-          echo "sha=$TAP_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout Homebrew tap data
+      - name: Checkout Homebrew tap
         if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: jbearak/homebrew-table-viewer
-          ref: ${{ steps.tap.outputs.sha }}
           # Public repo: no token needed to clone, and persist-credentials:false
           # keeps any credential out of tap/.git/config. The tap PAT is supplied
           # only at push time (below), never persisted to disk.
@@ -570,27 +277,8 @@ jobs:
           THE_TAG: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
           DMG=(desktop-dist/table-viewer-*.dmg)
-          if [[ "${#DMG[@]}" -ne 1 ]]; then
-            echo "ERROR: expected exactly one desktop dmg" >&2
-            exit 1
-          fi
-          VERSION="${THE_TAG#v}"
-          SHA256="$(sha256sum "${DMG[0]}" | cut -d' ' -f1)"
-          CASK_PATH="tap/Casks/table-viewer.rb"
-          export VERSION SHA256 CASK_PATH
-          ruby <<'RUBY'
-          path = ENV.fetch('CASK_PATH')
-          text = File.read(path)
-          version = /^([ \t]*)version[ \t]+"[^"]+"[ \t]*$/
-          checksum = /^([ \t]*)sha256[ \t]+"[0-9a-f]+"[ \t]*$/
-          raise 'expected exactly one cask version' unless text.scan(version).length == 1
-          raise 'expected exactly one cask checksum' unless text.scan(checksum).length == 1
-          text.sub!(version) { "#{$1}version \"#{ENV.fetch('VERSION')}\"" }
-          text.sub!(checksum) { "#{$1}sha256 \"#{ENV.fetch('SHA256')}\"" }
-          File.write(path, text)
-          RUBY
+          tap/bin/update-cask.sh "${THE_TAG#v}" "${DMG[0]}"
 
       - name: Open Homebrew bump PR + enable auto-merge
         if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'

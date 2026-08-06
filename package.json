@@ -18,9 +18,6 @@
   "extensionKind": [
     "workspace"
   ],
-  "extensionPack": [
-    "jbearak.table-viewer-companion"
-  ],
   "categories": [
     "Other"
   ],
@@ -72,14 +69,6 @@
       {
         "command": "tableViewer.setupPhysicalEditProtocol",
         "title": "Table Viewer: Arm Physical Edit Protocol"
-      },
-      {
-        "command": "tableViewer.armSqliteMigration",
-        "title": "Table Viewer: Prepare SQLite Migration"
-      },
-      {
-        "command": "tableViewer.upgradeToSqlitePersistence",
-        "title": "Table Viewer: Upgrade to SQLite Persistence"
       }
     ],
     "menus": {
@@ -197,21 +186,19 @@
     "compile:integration": "tsc -p tsconfig.integration.json",
     "typecheck": "tsc -p . --noEmit",
     "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit",
-    "typecheck:all": "npm run typecheck && npm run typecheck:companion && npm run typecheck:desktop && npm run typecheck:integration",
-    "typecheck:companion": "tsc -p companion --noEmit",
-    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run package:companion && npm run compile:integration",
+    "typecheck:all": "npm run typecheck && npm run typecheck:desktop && npm run typecheck:integration",
+    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run compile:integration",
     "test:integration": "vscode-test",
-    "test:integration:minimum": "npm run pretest:integration && vscode-test --label minimum",
-    "test:integration:current": "npm run pretest:integration && vscode-test --label current",
+    "test:integration:minimum": "vscode-test --label minimum",
+    "test:integration:current": "vscode-test --label current",
     "probe:sqlite:host": "node desktop/host-sqlite-runtime-probe.mjs",
     "probe:sqlite:electron": "npm run bundle:desktop && electron dist/runtime-probes/electron-sqlite-runtime-probe.js",
-    "probe:sqlite:bundles": "npm run bundle && npm run bundle:companion && npm run bundle:desktop && node desktop/check-sqlite-bundle-externals.mjs",
+    "probe:sqlite:bundles": "npm run bundle && npm run bundle:desktop && node desktop/check-sqlite-bundle-externals.mjs",
     "probe:sqlite:runtimes": "npm run probe:sqlite:host && npm run probe:sqlite:electron && npm run test:integration",
     "probe:windows:durability": "npm run bundle:desktop && electron dist/runtime-probes/windows-durability-probe.js",
     "gate:sqlite:recovery": "npm run bundle:desktop && electron dist/runtime-probes/packaged-recovery-gate.js",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
-    "bundle:companion": "esbuild companion/src/extension.ts --bundle --outfile=companion/dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
     "bundle:desktop": "node desktop/build.mjs",
     "typecheck:desktop": "tsc -p desktop",
@@ -225,10 +212,7 @@
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --no-dependencies",
-    "package:companion": "npm --prefix companion run package",
-    "probe:vsix:packages": "node scripts/check-vsix-packages.mjs",
-    "package:release": "npm run package && npm run package:companion && npm run probe:vsix:packages"
+    "package": "vsce package --no-dependencies"
   },
   "dependencies": {
     "@glideapps/glide-data-grid": "6.0.3",

@@ -5,7 +5,6 @@ tsconfig.json
 tsconfig.integration.json
 .vscode-test.mjs
 desktop/**
-companion/**
 dist/desktop/**
 dist/desktop-packages/**
 dist/runtime-probes/**

@@ -12,32 +12,13 @@ const manifest = JSON.parse(readFileSync(
     resolve(__dirname, '../../package.json'),
     'utf8',
 )) as {
-    version?: unknown;
-    contributes?: { customEditors?: CustomEditorContribution[]; commands?: Array<{ command?: unknown }> };
+    contributes?: { customEditors?: CustomEditorContribution[] };
     engines?: { node?: unknown; vscode?: unknown };
     extensionKind?: unknown;
-    extensionDependencies?: unknown;
-    extensionPack?: unknown;
-    scripts?: Record<string, unknown>;
     devDependencies?: { electron?: unknown; '@types/node'?: unknown };
-};
-const companion_manifest = JSON.parse(readFileSync(
-    resolve(__dirname, '../../companion/package.json'),
-    'utf8',
-)) as {
-    version?: unknown;
-    engines?: { vscode?: unknown };
-    extensionKind?: unknown;
-    api?: unknown;
-    main?: unknown;
-    activationEvents?: unknown;
-    contributes?: { commands?: Array<{ command?: unknown }> };
 };
 const custom_editors = manifest.contributes?.customEditors ?? [];
 const vscodeignore = readFileSync(resolve(__dirname, '../../.vscodeignore'), 'utf8')
-    .split(/\r?\n/u)
-    .filter((line) => line.length > 0 && !line.startsWith('#'));
-const companion_vscodeignore = readFileSync(resolve(__dirname, '../../companion/.vscodeignore'), 'utf8')
     .split(/\r?\n/u)
     .filter((line) => line.length > 0 && !line.startsWith('#'));
 
@@ -72,61 +53,13 @@ describe('extension runtime manifest', () => {
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
 
-    it('excludes build, integration, and separately packaged companion artifacts from the main VSIX', () => {
+    it('excludes build and integration-only artifacts from the VSIX', () => {
         expect(vscodeignore).toEqual(expect.arrayContaining([
             'out/**',
             'dist/runtime-probes/**',
             '.vscode-test.mjs',
             'tsconfig.integration.json',
-            'companion/**',
         ]));
-    });
-
-    it('offers the separately packaged UI companion without hard-blocking unsupported browser UI hosts', () => {
-        expect(manifest.extensionDependencies).toBeUndefined();
-        expect(manifest.extensionPack).toEqual(['jbearak.table-viewer-companion']);
-        expect(companion_manifest.version).toBe(manifest.version);
-        expect(companion_manifest.engines).toEqual({ vscode: '^1.127.0' });
-        expect(companion_manifest.extensionKind).toEqual(['ui']);
-        expect(companion_manifest.api).toBe('none');
-        expect(companion_manifest.main).toBe('./dist/extension.js');
-        expect(companion_vscodeignore).toEqual(expect.arrayContaining([
-            'src/**',
-            'test/**',
-            'tsconfig.json',
-            'dist-types/**',
-            '*.vsix',
-        ]));
-    });
-
-    it('keeps bridge commands callable but exposes only explicit recovery and retirement UI', () => {
-        const contributed = companion_manifest.contributes?.commands?.map((entry) => entry.command) ?? [];
-        expect(contributed).toEqual([
-            'tableViewerCompanion.openRecovery',
-            'tableViewerCompanion.retireCapsule',
-        ]);
-        const activation = companion_manifest.activationEvents;
-        expect(Array.isArray(activation)).toBe(true);
-        expect(activation).toEqual(expect.arrayContaining([
-            'onCommand:tableViewerCompanion.hostCapabilities.v1',
-            'onCommand:tableViewerCompanion.namespace.v1',
-            'onCommand:tableViewerCompanion.preparePendingEditRecovery.v1',
-            'onCommand:tableViewerCompanion.openRecovery',
-        ]));
-        expect(contributed.some((command) => typeof command === 'string' && command.endsWith('.v1'))).toBe(false);
-    });
-
-    it('builds independent bundles while externalizing the host-provided SQLite runtime', () => {
-        expect(manifest.scripts?.bundle).toContain('--external:node:sqlite');
-        expect(manifest.scripts?.['bundle:companion']).toContain('companion/dist/extension.js');
-        expect(manifest.scripts?.['bundle:companion']).toContain('--external:node:sqlite');
-        expect(manifest.scripts?.package).toBe('vsce package --no-dependencies');
-        expect(manifest.scripts?.['package:companion']).toBe('npm --prefix companion run package');
-        expect(manifest.scripts?.['probe:sqlite:bundles']).toContain('npm run bundle:companion');
-        expect(manifest.scripts?.['probe:vsix:packages']).toBe('node scripts/check-vsix-packages.mjs');
-        expect(manifest.scripts?.['package:release']).toBe(
-            'npm run package && npm run package:companion && npm run probe:vsix:packages',
-        );
     });
 });
 
