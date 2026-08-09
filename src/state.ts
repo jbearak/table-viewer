@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import type { ExtensionContext } from 'vscode';
 import { compare_authority } from './authority-order';
 import {
     decode_stored_per_file_state,
@@ -7,7 +6,6 @@ import {
     type StoredPerFileState,
 } from './types';
 
-const STATE_KEY = 'tableViewer.fileState';
 const STATE_FORMAT = 'tableViewer.fileState.v1';
 const STALE_STAGE_MS = 24 * 60 * 60 * 1000;
 const EXHAUSTION_SENTINEL = Number.MAX_SAFE_INTEGER;
@@ -1763,35 +1761,3 @@ export function create_authority_store(
     return create_keyed_authority_store(persistence, get_max_stored);
 }
 
-function memento_medium(context: ExtensionContext): FileStatePersistenceMedium {
-    const memento = context.globalState;
-    return {
-        runtime_key: memento as object,
-        read: () => memento.get<unknown>(STATE_KEY, {}),
-        write: async (envelope) => {
-            await memento.update(STATE_KEY, envelope);
-        },
-    };
-}
-
-export function create_memento_keyed_file_state_persistence(
-    context: ExtensionContext,
-): KeyedFileStatePersistence {
-    return create_keyed_file_state_persistence(memento_medium(context));
-}
-
-/**
- * The Memento-backed store.
- *
- * SQLite is the extension's normal backend; this remains as the degraded medium
- * for hosts whose SQLite database cannot be opened (see vscode-state-database.ts).
- * It is durable, so a host that falls back here keeps state across reloads — it
- * just keeps it somewhere the desktop product and other windows cannot coordinate
- * on.
- */
-export function create_file_state_store(
-    context: ExtensionContext,
-    get_max_stored?: () => number,
-): AuthorityFileStateStore {
-    return create_authority_store(memento_medium(context), get_max_stored);
-}

@@ -46,13 +46,16 @@ The database is created empty on first run. There is no import from the older
 VS Code Memento store, and no synchronization with the standalone desktop app,
 which keeps its own database under its user-data directory.
 
-When that database cannot be opened — most notably on Windows, where Node
-exposes no proven directory-entry flush and the backend declines SQLite rather
-than treat a skipped flush as durable (see
-`assert_sqlite_directory_durability_supported`) — the extension warns and falls
-back to the Memento-backed store in `src/state.ts`. That mode is still durable;
-it simply cannot coordinate with other Table Viewer products. Nothing in the
-failed database's directory is modified, deleted, or set aside.
+SQLite is the only backend on every platform, Windows included. Where a host has
+no directory-flush primitive at all — NTFS — the flush is skipped rather than
+refused, matching SQLite's own Windows VFS; a filesystem that is asked to flush
+and rejects it is still a refusal, because that one the user can act on by moving
+their storage.
+
+If the database genuinely cannot be opened, activation fails with an error naming
+the database path and the underlying cause, and suggesting the two things that
+help: close other windows using it, or move the file aside to start fresh.
+Nothing in that directory is modified, deleted, or set aside automatically.
 
 ## `scripts/setup.sh`
 

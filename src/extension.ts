@@ -9,11 +9,7 @@ import {
     open_vscode_state_database,
     type OpenedVscodeStateDatabase,
 } from './vscode-state-database';
-import {
-    create_file_state_store,
-    DEFAULT_MAX_STORED_FILES,
-    drain_keyed_state_runtime,
-} from './state';
+import { DEFAULT_MAX_STORED_FILES } from './state';
 
 interface ActiveExtensionRuntime {
     readonly viewers: TableViewerRegistration;
@@ -61,21 +57,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
         await vscode.workspace.fs.createDirectory(state_directory);
     } catch {
-        // The opener below performs the authoritative open and selects the durable
-        // degraded medium when this directory turns out to be unusable.
+        // The open below is authoritative and reports an unusable directory with
+        // the path and cause; a failure here would say strictly less.
     }
-    const database = await open_vscode_state_database({
-        storageDirectory: state_directory.fsPath,
-        appVersion: extension_version(context),
-        getMaxStoredFiles: get_max_stored_files,
-        openFallbackStore: () => ({
-            store: create_file_state_store(context, get_max_stored_files),
-            close: () => drain_keyed_state_runtime(context.globalState as object),
-        }),
-        warn: async (message) => {
-            await vscode.window.showWarningMessage(message);
-        },
-    });
+    let database: OpenedVscodeStateDatabase;
+    try {
+        database = await open_vscode_state_database({
+            storageDirectory: state_directory.fsPath,
+            appVersion: extension_version(context),
+            getMaxStoredFiles: get_max_stored_files,
+        });
+    } catch (error) {
+        // SQLite is the only backend. Fail activation loudly rather than run with
+        // state the user cannot see the loss of, and leave the file untouched so
+        // moving it aside stays their decision.
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(message);
+        throw error;
+    }
 
     let viewers: TableViewerRegistration | undefined;
     const disposables: vscode.Disposable[] = [];

@@ -13,12 +13,6 @@ export const VSCODE_STATE_STORAGE_ENVIRONMENT_ID = 'vscode-global-storage';
 export const VSCODE_STATE_CLIENT_KIND = 'vscode';
 export const VSCODE_STATE_BUSY_TIMEOUT_MS = 5_000;
 
-export const VSCODE_STATE_FALLBACK_WARNING =
-    'Table Viewer could not open its state database and is storing per-file state '
-    + 'in this VS Code profile instead. Editing still works and nothing is lost, but '
-    + 'this window cannot coordinate edits with other Table Viewer products. '
-    + 'Existing database files were left unchanged.';
-
 /**
  * The global-storage directory VS Code hands the extension is already scoped by
  * profile and by remote authority, so the one canonical database beneath each
@@ -42,27 +36,38 @@ type VscodeSqliteOptions = Pick<
 
 export interface VscodeStateDatabaseOptions {
     readonly storageDirectory: string;
-    /** Durable degraded medium used when the SQLite open cannot succeed. */
-    readonly openFallbackStore: () => VscodeStateFallback;
     readonly appVersion: string;
     readonly getMaxStoredFiles?: () => number;
-    readonly warn: (message: string) => void | Promise<void>;
     readonly sqlite?: VscodeSqliteOptions;
     /** Test seam; production callers use the shared SQLite store opener. */
     readonly openStore?: typeof open_sqlite_file_state_store;
 }
 
-export interface VscodeStateFallback {
-    readonly store: AuthorityFileStateStore;
-    /** Settle any queued writes; the degraded medium has its own write queue. */
-    close(): Promise<void>;
-}
-
 export interface OpenedVscodeStateDatabase {
-    readonly mode: 'sqlite' | 'fallback';
     readonly databasePath: string;
     readonly store: AuthorityFileStateStore;
     close(): Promise<void>;
+}
+
+/**
+ * What the user is told, and what they can do about it.
+ *
+ * Names the database so it can be inspected or moved aside by hand, and keeps the
+ * underlying cause verbatim rather than replacing it with a summary — the cause is
+ * what distinguishes a database another window still holds from one that is
+ * genuinely damaged, and those have different remedies.
+ */
+export function vscode_state_open_failure_message(
+    databasePath: string,
+    cause: unknown,
+): string {
+    const detail = cause instanceof Error && cause.message.length > 0
+        ? cause.message
+        : String(cause);
+    return `Table Viewer could not open its state database at ${databasePath}: ${detail}. `
+        + 'Close any other windows using it and reload. If the problem persists, move '
+        + 'that file aside and reload to start with fresh state. Table Viewer will not '
+        + 'modify or delete it for you.';
 }
 
 export function vscode_state_database_path(storageDirectory: string): string {
@@ -75,18 +80,12 @@ export function vscode_state_database_path(storageDirectory: string): string {
 /**
  * Open (creating on first run) the extension's canonical file-state database.
  *
- * An initial open or validation failure selects the caller's durable degraded
- * store and warns the user, without modifying, deleting, or setting aside the
- * failed basename set — a database this host could not read may still be readable
- * by a newer build, and silently discarding it is worse than degrading. Runtime
- * read/write failures after a successful open stay visible to callers, exactly as
- * they do on the desktop.
- *
- * Falling back rather than refusing matters on Windows in particular, where the
- * backend declines SQLite outright because Node exposes no proven directory-entry
- * flush (see assert_sqlite_directory_durability_supported). The desktop can refuse
- * to start there; an editor extension cannot, so it degrades to a durable medium
- * that simply does not participate in cross-product coordination.
+ * There is no second backend. An open or validation failure propagates so
+ * activation fails visibly, carrying the path and the original cause; nothing on
+ * disk is modified, deleted, or set aside, because a database this build cannot
+ * read may still be readable by another and the user is the only one who should
+ * decide to give up on it. Runtime read/write failures after a successful open
+ * stay visible to callers, exactly as they do on the desktop.
  */
 export async function open_vscode_state_database(
     options: VscodeStateDatabaseOptions,
@@ -114,25 +113,15 @@ export async function open_vscode_state_database(
             hooks: options.sqlite?.hooks,
             initialization: options.sqlite?.initialization,
         }, options.getMaxStoredFiles);
-    } catch {
-        const fallback = options.openFallbackStore();
-        try {
-            const warning = options.warn(VSCODE_STATE_FALLBACK_WARNING);
-            void Promise.resolve(warning).catch(() => undefined);
-        } catch {
-            // Warning delivery is best-effort; the degraded store remains usable.
-        }
-        return {
-            mode: 'fallback',
-            databasePath,
-            store: fallback.store,
-            close: () => fallback.close(),
-        };
+    } catch (error) {
+        // Rethrown with the path and the original cause attached, never swallowed
+        // and never replaced: `cause` keeps the backend's own category and stage
+        // available to anything that wants to classify the failure.
+        throw new Error(vscode_state_open_failure_message(databasePath, error), { cause: error });
     }
 
     let closePromise: Promise<void> | undefined;
     return {
-        mode: 'sqlite',
         databasePath,
         store: opened.store,
         close() {

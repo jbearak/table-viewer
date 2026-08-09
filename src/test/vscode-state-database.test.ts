@@ -6,14 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     open_vscode_state_database,
     vscode_state_database_path,
+    vscode_state_open_failure_message,
     VSCODE_STATE_CLIENT_KIND,
     VSCODE_STATE_DATABASE_ID,
     VSCODE_STATE_DATABASE_NAME,
-    VSCODE_STATE_FALLBACK_WARNING,
     VSCODE_STATE_IDENTITY,
     type OpenedVscodeStateDatabase,
 } from '../vscode-state-database';
-import { create_authority_store, type FileStatePersistenceMedium } from '../state';
 import {
     is_direct_vscode_file_state_identity,
     SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
@@ -25,47 +24,19 @@ import { open_sqlite_file_state_store } from '../sqlite-file-state-persistence';
 let storageDirectory: string;
 let opened: OpenedVscodeStateDatabase[];
 
-/** The durable degraded medium a host supplies; an object standing in for Memento. */
-function fallback_fixture() {
-    let envelope: unknown = {};
-    const medium: FileStatePersistenceMedium = {
-        runtime_key: {},
-        read: () => envelope,
-        write: async (next) => { envelope = next; },
-    };
-    let closed = 0;
-    return {
-        openCount: 0,
-        closeCount: () => closed,
-        inspect: () => envelope,
-        open() {
-            this.openCount += 1;
-            return {
-                store: create_authority_store(medium),
-                close: async () => { closed += 1; },
-            };
-        },
-    };
-}
-
 async function open(overrides: {
-    readonly warn?: (message: string) => void | Promise<void>;
     readonly openStore?: typeof open_sqlite_file_state_store;
     readonly storageDirectory?: string;
-    readonly openFallbackStore?: () => { store: any; close(): Promise<void> };
     readonly getMaxStoredFiles?: () => number;
-} = {}, fallback = fallback_fixture()) {
-    const warnings: string[] = [];
+} = {}) {
     const database = await open_vscode_state_database({
         storageDirectory: overrides.storageDirectory ?? storageDirectory,
         appVersion: '0.7.0',
         getMaxStoredFiles: overrides.getMaxStoredFiles,
-        openFallbackStore: overrides.openFallbackStore ?? (() => fallback.open()),
-        warn: overrides.warn ?? ((message) => { warnings.push(message); }),
         ...(overrides.openStore ? { openStore: overrides.openStore } : {}),
     });
     opened.push(database);
-    return { database, warnings, fallback };
+    return { database };
 }
 
 function read_meta(databasePath: string): Record<string, unknown> {
@@ -114,12 +85,9 @@ describe('VS Code state database identity', () => {
 
 describe('VS Code state database open', () => {
     it('creates an empty direct-schema database and reports the SQLite mode', async () => {
-        const { database, warnings, fallback } = await open();
+        const { database } = await open();
 
-        expect(database.mode).toBe('sqlite');
         expect(database.databasePath).toBe(vscode_state_database_path(storageDirectory));
-        expect(warnings).toEqual([]);
-        expect(fallback.openCount).toBe(0);
 
         const meta = read_meta(database.databasePath);
         expect(meta).toMatchObject({
@@ -171,7 +139,6 @@ describe('VS Code state database open', () => {
 
         const second = await open();
 
-        expect(second.database.mode).toBe('sqlite');
         expect((await second.database.store.read('/a.csv')).state)
             .toMatchObject({ activeSheetIndex: 4 });
     });
@@ -219,30 +186,50 @@ describe('VS Code state database open', () => {
     });
 });
 
-describe('VS Code state database degraded fallback', () => {
-    it('selects the durable fallback store and warns when the open fails', async () => {
-        const openStore = vi.fn(async () => {
-            throw new Error('open refused');
-        });
+describe('VS Code state database open failure', () => {
+    it('rejects with the database path and the underlying cause', async () => {
+        const cause = new Error('open refused');
+        const openStore = vi.fn(async () => { throw cause; });
 
-        const { database, warnings, fallback } = await open({ openStore });
+        const failure = await open({ openStore }).catch((error: unknown) => error);
 
-        expect(database.mode).toBe('fallback');
-        expect(database.databasePath).toBe(vscode_state_database_path(storageDirectory));
-        expect(warnings).toEqual([VSCODE_STATE_FALLBACK_WARNING]);
-        expect(fallback.openCount).toBe(1);
+        expect(failure).toBeInstanceOf(Error);
+        const error = failure as Error;
+        expect(error.message).toContain(vscode_state_database_path(storageDirectory));
+        expect(error.message).toContain('open refused');
+        // The cause is attached, not summarized away: whatever classified the
+        // backend failure stays reachable for anything that wants to inspect it.
+        expect(error.cause).toBe(cause);
     });
 
-    it('leaves the failed basename set untouched rather than deleting or setting it aside', async () => {
+    it('tells the user what to do without promising to do it for them', async () => {
+        const message = vscode_state_open_failure_message('/profile/state/file-state.sqlite3', new Error('database is locked'));
+
+        expect(message).toContain('/profile/state/file-state.sqlite3');
+        expect(message).toContain('database is locked');
+        expect(message).toMatch(/Close any other windows/);
+        expect(message).toMatch(/move\s+that file aside/);
+        expect(message).toMatch(/will not\s+modify or delete it/);
+    });
+
+    it('reports a non-Error rejection without losing it', async () => {
+        const openStore = vi.fn(async () => { throw 'refused as a string'; });
+
+        const failure = await open({ openStore }).catch((error: unknown) => error) as Error;
+
+        expect(failure.message).toContain('refused as a string');
+        expect(failure.cause).toBe('refused as a string');
+    });
+
+    it('leaves an unreadable database exactly where the user left it', async () => {
         const databasePath = vscode_state_database_path(storageDirectory);
         // A file that is not a Table Viewer database at all: the open must fail and
         // the bytes must still be exactly where the user left them afterwards.
         await fs.promises.writeFile(databasePath, 'not a database');
 
-        const { database, warnings } = await open();
+        const failure = await open().catch((error: unknown) => error) as Error;
 
-        expect(database.mode).toBe('fallback');
-        expect(warnings).toEqual([VSCODE_STATE_FALLBACK_WARNING]);
+        expect(failure.message).toContain(databasePath);
         expect(await fs.promises.readFile(databasePath, 'utf8')).toBe('not a database');
         // Only the coordination gate directory may appear beside it; no quarantine
         // copy, renamed member, or replacement database.
@@ -251,54 +238,7 @@ describe('VS Code state database degraded fallback', () => {
         )).toEqual([VSCODE_STATE_DATABASE_NAME]);
     });
 
-    it('still reads and writes state through the fallback store', async () => {
-        const openStore = vi.fn(async () => { throw new Error('open refused'); });
-
-        const { database, fallback } = await open({ openStore });
-        const initial = await database.store.read('/a.csv');
-        await database.store.compare_and_set('/a.csv', initial.revision, { activeSheetIndex: 2 });
-
-        expect((await database.store.read('/a.csv')).state)
-            .toMatchObject({ activeSheetIndex: 2 });
-        expect(fallback.inspect()).toMatchObject({ entries: expect.any(Object) });
-    });
-
-    it('closes the fallback store so its queued writes settle', async () => {
-        const openStore = vi.fn(async () => { throw new Error('open refused'); });
-
-        const { database, fallback } = await open({ openStore });
-        await database.close();
-
-        expect(fallback.closeCount()).toBe(1);
-    });
-
-    it('keeps the fallback usable when warning delivery throws', async () => {
-        const openStore = vi.fn(async () => { throw new Error('open refused'); });
-
-        const { database } = await open({
-            openStore,
-            warn: () => { throw new Error('no UI available'); },
-        });
-
-        expect(database.mode).toBe('fallback');
-        const initial = await database.store.read('/a.csv');
-        expect((await database.store.compare_and_set('/a.csv', initial.revision, {})).type)
-            .toBe('committed');
-    });
-
-    it('keeps the fallback usable when an async warning rejects', async () => {
-        const openStore = vi.fn(async () => { throw new Error('open refused'); });
-
-        const { database } = await open({
-            openStore,
-            warn: async () => { throw new Error('dialog dismissed'); },
-        });
-
-        expect(database.mode).toBe('fallback');
-        expect(await database.store.read('/a.csv')).toMatchObject({ revision: expect.any(Number) });
-    });
-
-    it('surfaces a runtime failure after a successful open instead of degrading', async () => {
+    it('surfaces a runtime failure after a successful open', async () => {
         const { database } = await open();
         await database.close();
 

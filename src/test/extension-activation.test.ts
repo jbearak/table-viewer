@@ -9,12 +9,9 @@ const seams = vi.hoisted(() => ({
         storageDirectory: string;
         appVersion: string;
         getMaxStoredFiles?: () => number;
-        openFallbackStore: () => { store: any; close(): Promise<void> };
-        warn: (message: string) => void | Promise<void>;
     } | undefined,
-    mode: 'sqlite' as 'sqlite' | 'fallback',
+    openError: undefined as Error | undefined,
     store: undefined as any,
-    fallbackStore: undefined as any,
     failViewerRegistration: false,
     throwViewerDispose: false,
     throwViewerDrain: false,
@@ -25,8 +22,7 @@ const seams = vi.hoisted(() => ({
 vi.mock('../custom-editor', () => ({
     TABLE_VIEW_TYPE: 'tableViewer.editor',
     register_table_viewer: (_context: unknown, store: unknown) => {
-        const expected = seams.mode === 'sqlite' ? seams.store : seams.fallbackStore;
-        seams.events.push(store === expected ? 'register:viewers' : 'register:wrong-store');
+        seams.events.push(store === seams.store ? 'register:viewers' : 'register:wrong-store');
         if (seams.failViewerRegistration) throw new Error('viewer registration failed');
         return {
             dispose() {
@@ -52,13 +48,14 @@ vi.mock('../csv-preview', () => ({
 vi.mock('../vscode-state-database', () => ({
     open_vscode_state_database: async (options: typeof seams.openedOptions) => {
         seams.openedOptions = options;
-        seams.events.push(`open:${seams.mode}`);
-        if (seams.mode === 'fallback') seams.fallbackStore = options!.openFallbackStore().store;
-        const store = seams.mode === 'sqlite' ? seams.store : seams.fallbackStore;
+        if (seams.openError) {
+            seams.events.push('open:failed');
+            throw seams.openError;
+        }
+        seams.events.push('open:sqlite');
         return {
-            mode: seams.mode,
             databasePath: `${options!.storageDirectory}/file-state.sqlite3`,
-            store,
+            store: seams.store,
             async close() {
                 seams.events.push('close:database');
                 if (seams.throwDatabaseClose) throw new Error('database close failed');
@@ -93,9 +90,8 @@ beforeEach(async () => {
     vscode_mock.__reset();
     seams.events.length = 0;
     seams.openedOptions = undefined;
-    seams.mode = 'sqlite';
+    seams.openError = undefined;
     seams.store = versioned_state_store().store;
-    seams.fallbackStore = undefined;
     seams.failViewerRegistration = false;
     seams.throwViewerDispose = false;
     seams.throwViewerDrain = false;
@@ -159,33 +155,57 @@ describe('VS Code activation', () => {
         expect(get_max?.()).toBe(10_000);
     });
 
-    it('keeps every viewer and command live on the degraded fallback store', async () => {
-        seams.mode = 'fallback';
+    it('fails activation loudly when the database cannot be opened', async () => {
+        // SQLite is the only backend, so there is nothing to degrade to. Activation
+        // must fail where VS Code will show it rather than come up with authority
+        // the user cannot see the loss of.
+        seams.openError = new Error(
+            'Table Viewer could not open its state database at /global-storage/state/'
+            + 'file-state.sqlite3: database is locked.',
+        );
+        const shown: unknown[] = [];
+        vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockImplementation((...args: unknown[]) => {
+                shown.push(args[0]);
+                return undefined as never;
+            });
 
-        await activate(context());
+        await expect(activate(context())).rejects.toBe(seams.openError);
 
-        expect(seams.events).toEqual(['open:fallback', 'register:viewers']);
-        expect(vscode_mock.__getRegisteredCommands())
-            .toContain('tableViewer.openCsvTable');
+        expect(shown).toEqual([seams.openError.message]);
+        // Nothing was registered, and no store was ever handed out.
+        expect(seams.events).toEqual(['open:failed']);
+        expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
     });
 
-    it('offers a durable Memento-backed fallback store that survives a reload', async () => {
-        seams.mode = 'fallback';
-        const shared = context();
+    it('rethrows a non-Error open failure and still tells the user something', async () => {
+        seams.openError = 'refused' as unknown as Error;
+        const shown: unknown[] = [];
+        vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockImplementation((...args: unknown[]) => {
+                shown.push(args[0]);
+                return undefined as never;
+            });
 
-        await activate(shared);
-        const first = seams.openedOptions!.openFallbackStore();
-        const initial = await first.store.read('/a.csv');
-        await first.store.compare_and_set('/a.csv', initial.revision, { activeSheetIndex: 3 });
-        await first.close();
+        await expect(activate(context())).rejects.toBe('refused');
 
+        expect(shown).toEqual(['refused']);
+    });
 
-        // A second activation against the same ExtensionContext is what a window
-        // reload looks like: the degraded medium must still have the state.
+    it('fails activation rather than deactivating a runtime it never built', async () => {
+        seams.openError = new Error('open refused');
+        vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockImplementation(() => undefined as never);
+
+        await expect(activate(context())).rejects.toThrow('open refused');
+        seams.events.length = 0;
+
+        // VS Code does not call deactivate for an activation that threw, but a
+        // teardown that arrived anyway must not touch a database that was never
+        // opened or dispose registrations that were never made.
         await deactivate();
-        await activate(shared);
-        const second = seams.openedOptions!.openFallbackStore();
-        expect((await second.store.read('/a.csv')).state).toMatchObject({ activeSheetIndex: 3 });
+
+        expect(seams.events).toEqual([]);
     });
 
     it('closes the database when viewer registration fails during activation', async () => {

@@ -595,16 +595,6 @@ export const SQLITE_FILE_STATE_V1_INDEX_SQL = {
     ON legacy_entry_claims(capsule_id, source_ordinal, destination_path)`,
 } as const;
 
-export const SQLITE_FILE_STATE_V1_SCHEMA_SQL = [
-    ...Object.values(SQLITE_FILE_STATE_V1_TABLE_SQL),
-    ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
-] as const;
-
-export const SQLITE_DIRECT_VSCODE_FILE_STATE_SCHEMA_SQL = [
-    ...Object.values(SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL),
-    ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
-] as const;
-
 export interface SqliteFileStateSchemaIdentity {
     readonly userVersion: number;
     readonly format: string;

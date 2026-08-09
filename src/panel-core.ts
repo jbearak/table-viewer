@@ -39,7 +39,7 @@ import {
  */
 export interface PanelLike {
     webview: {
-        postMessage(message: unknown): Thenable<boolean> | Promise<boolean> | boolean;
+        postMessage(message: unknown): PromiseLike<boolean> | boolean;
     };
 }
 

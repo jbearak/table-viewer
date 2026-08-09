@@ -69,7 +69,7 @@ type SnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
 export interface PanelSessionOptions<Handle = ReturnType<typeof setTimeout>> {
     readonly postMessage: (
         message: SnapshotMessage,
-    ) => boolean | Thenable<boolean> | Promise<boolean>;
+    ) => boolean | PromiseLike<boolean>;
     readonly scheduler?: PanelSessionScheduler<Handle>;
     readonly backoffMs?: readonly number[];
     readonly ackTimeoutMs?: number;
@@ -668,7 +668,7 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         const snapshot = issued.snapshot;
         issued.attempted = true;
         this.arm_attempt_timeout(issued, token);
-        let posted: boolean | Thenable<boolean> | Promise<boolean>;
+        let posted: boolean | PromiseLike<boolean>;
         try {
             posted = this.post_message({ type: 'workbookSnapshot', snapshot });
         } catch {
