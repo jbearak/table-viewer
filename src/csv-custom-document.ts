@@ -2009,7 +2009,6 @@ export class CsvCustomDocument {
     async notify_external_change(): Promise<void> {
         return this.admitted(async () => {
             this.assert_not_disposed();
-            this.close_gesture();
             try {
                 const stable = await read_csv_target_stably(
                     this.fs,
@@ -2023,6 +2022,7 @@ export class CsvCustomDocument {
                     }
                     return;
                 }
+                this.close_gesture();
                 if (
                     this.dirty.size > 0
                     || this.native_history_may_reference_source
@@ -2046,6 +2046,7 @@ export class CsvCustomDocument {
                     'revert',
                 );
             } catch (error) {
+                this.close_gesture();
                 this.pending_external_target = undefined;
                 this.set_conflict({ type: 'externalChange' });
                 throw error;

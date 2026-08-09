@@ -1853,6 +1853,43 @@ describe('CsvCustomDocument save, Save As, revert, and disposal', () => {
         await document.dispose();
     });
 
+    it('preserves one logical gesture across a same-digest watcher notification', async () => {
+        const fs = new MemoryFileSystem();
+        fs.set('/table.csv', 'h1\na\n');
+        const document = await open_document(fs);
+        const edits: CsvDocumentEditEvent[] = [];
+        document.on_did_change((event) => edits.push(event));
+        await document.apply_cell_input({
+            mutationEpoch: document.mutationEpoch,
+            ...view_authority(document, 'view-1'), key: '0:0', value: 'first', revision: 0,
+        });
+        fs.set('/table.csv', 'h1\na\n', { mtime: 99 });
+        await document.notify_external_change();
+        await document.apply_cell_input({
+            mutationEpoch: document.mutationEpoch,
+            ...view_authority(document, 'view-1'), key: '0:0', value: 'second', revision: 1,
+        });
+        let cursor = edits.length;
+        const native_history = vi.fn(async () => {
+            cursor -= 1;
+            await edits[cursor].undo();
+        });
+
+        await expect(document.cancel_gesture({
+            mutationEpoch: document.mutationEpoch,
+            ...view_authority(document, 'view-1'),
+            revision: 2,
+        }, native_history)).resolves.toEqual({
+            type: 'accepted', revision: 4, sourceGeneration: 1, changed: true,
+        });
+
+        expect(native_history).toHaveBeenCalledTimes(2);
+        expect(cursor).toBe(0);
+        expect(document.cell_value('0:0')).toBe('a');
+        expect(document.isDirty).toBe(false);
+        await document.dispose();
+    });
+
     it('clears a dirty external-change conflict when the target returns to the source digest', async () => {
         const fs = new MemoryFileSystem();
         fs.set('/table.csv', 'h1\na\n');
