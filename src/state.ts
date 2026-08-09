@@ -464,96 +464,6 @@ export interface CoordinatedKeyedFileStatePersistence extends KeyedFileStatePers
     ): Promise<boolean>;
 }
 
-export interface FrozenLegacyStateSource {
-    readonly capsuleId: string;
-    readonly sourceFormat: string;
-    readonly profileDatabaseId: string;
-    readonly sourceDigest: string;
-    readonly meta: KeyedStateStoreMetadata;
-    readonly entryCount: number;
-    completeEntry(path: string): PersistedCompleteKeyedStateEntry | undefined;
-    entryOrdinal(path: string): number | undefined;
-    sourceKind(path: string): 'exactIdentity' | 'pathOnlyCompatibility';
-    entryPaths(): readonly string[];
-}
-
-export interface MigrationCompanionClient {
-    namespace(input: { placementKeyDigest: string; operationId: string }): Promise<{
-        profileDatabaseId: string;
-        storageEnvironmentId: string;
-        protocolVersion: number;
-    }>;
-    activeCapsule(): Promise<{
-        capsuleId: string;
-        sourceFormat: string;
-        sourceDigest: string;
-        meta: KeyedStateStoreMetadata;
-        entryCount: number;
-        status: 'armed' | 'cutover';
-    }>;
-    submitCapsuleCandidate(input: {
-        operationId: string;
-        orderedSourceJson: string;
-    }): Promise<{ capsuleId: string; sourceDigest: string }>;
-    archiveDrift(input: { operationId: string; orderedSourceJson: string }): Promise<void>;
-    beginEnvironmentImport(input: {
-        operationId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<{ importClaimId: string }>;
-    environmentImportStatus(input: {
-        importClaimId: string;
-        capsuleId: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<'preparing' | 'confirmed' | 'abandoned'>;
-    abandonEnvironmentImport(input: {
-        operationId: string;
-        importClaimId: string;
-        capsuleId: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-        abandonmentEvidenceDigest: string;
-    }): Promise<void>;
-    confirmEnvironment(input: {
-        operationId: string;
-        importClaimId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<void>;
-    confirmEnvironmentSourceRetirement(input: {
-        operationId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-        retirementKind: 'naturallyComplete' | 'userRetired';
-        sourceStateDigest: string;
-    }): Promise<void>;
-    preparePendingEditRecovery(input: {
-        storageEnvironmentId: string;
-        databaseId: string;
-        recoveryEntryId: string;
-        operationId: string;
-        kind: 'snapshot' | 'clear';
-        pendingEditsJson?: string;
-        resourceIdentityJson: string;
-        authorityRevision: number;
-        physicalRevision: number;
-        projectionRevision: number;
-        physicalDigest?: string;
-    }): Promise<{ recoveryRecordId: string }>;
-    confirmPendingEditRecovery(input: {
-        operationId: string;
-        recoveryRecordId: string;
-        committedStateRevision: number;
-    }): Promise<void>;
-}
-
 export function require_synchronous_transaction_result<T>(result: T): T {
     if (is_thenable(result)) {
         throw new TypeError('Keyed persistence transaction callbacks must be synchronous.');
@@ -810,38 +720,6 @@ function get_all_state(medium: FileStatePersistenceMedium): PersistedStateEnvelo
         }
     }
     return { format: STATE_FORMAT, nextRevision: 1, absenceRevision: 0, entries };
-}
-
-/** Validate a frozen Memento value through the same compatibility adapter used by
- * the live Memento store and return its envelope entry keys, which are resource paths. */
-export function decode_memento_file_state_resource_keys(value: unknown): readonly string[] {
-    const envelope = get_all_state({
-        runtime_key: {},
-        read: () => value,
-        write: async () => undefined,
-    });
-    return Object.keys(envelope.entries);
-}
-
-/** Validate a frozen Memento value through the live-store compatibility adapter and
- * return only the source metadata needed by migration. */
-export function decode_memento_file_state_source(value: unknown): {
-    readonly nextRevision: number;
-    readonly absenceRevision: number;
-    readonly entryCount: number;
-    readonly updatedAtMs?: number;
-} {
-    const envelope = get_all_state({
-        runtime_key: {},
-        read: () => value,
-        write: async () => undefined,
-    });
-    return {
-        nextRevision: envelope.nextRevision,
-        absenceRevision: envelope.absenceRevision,
-        entryCount: Object.keys(envelope.entries).length,
-        ...(envelope.updatedAt === undefined ? {} : { updatedAtMs: envelope.updatedAt }),
-    };
 }
 
 function authority_for_entry(entry: PersistedEntry | undefined): DurableFileAuthority {

@@ -68,7 +68,7 @@ function instrument_payload_io(persistence: KeyedFileStatePersistence) {
     return { counts, wrapped, reset: () => { counts.reads = 0; counts.writes = 0; } };
 }
 
-file_state_store_contract('Memento compatibility backend', () => {
+file_state_store_contract('Memento degraded-fallback backend', () => {
     const backing = context_with({});
     return {
         create: (max = 10_000) => create_file_state_store(backing.context, () => max),

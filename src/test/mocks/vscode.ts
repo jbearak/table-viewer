@@ -179,6 +179,7 @@ const custom_editor_registrations: {
 let stat_impl: ((uri: UriLike) => Promise<{ size: number; mtime: number }>) | undefined;
 let read_file_impl: ((uri: UriLike) => Promise<Uint8Array>) | undefined;
 let write_file_impl: ((uri: UriLike, content: Uint8Array) => Promise<void>) | undefined;
+let create_directory_impl: ((uri: UriLike) => Promise<void>) | undefined;
 let watcher_registration_failure: 'change' | 'create' | 'delete' | undefined;
 let watcher_dispose_failure = false;
 
@@ -512,6 +513,9 @@ export const workspace = {
         async writeFile(uri: UriLike, content: Uint8Array): Promise<void> {
             await write_file_impl?.(uri, content);
         },
+        async createDirectory(uri: UriLike): Promise<void> {
+            await create_directory_impl?.(uri);
+        },
     },
     createFileSystemWatcher(pattern?: unknown): MockWatcher {
         const watcher = make_watcher(pattern);
@@ -575,6 +579,7 @@ export function __reset(): void {
     command_handlers.clear();
     extension_registry.clear();
     stat_impl = undefined;
+    create_directory_impl = undefined;
     read_file_impl = undefined;
     write_file_impl = undefined;
     workspace.workspaceFile = undefined;
@@ -582,6 +587,16 @@ export function __reset(): void {
     window.activeTextEditor = undefined;
     watcher_registration_failure = undefined;
     watcher_dispose_failure = false;
+}
+
+export function __setCreateDirectoryImplementation(
+    impl: (uri: UriLike) => Promise<void>,
+): void {
+    create_directory_impl = impl;
+}
+
+export function __getRegisteredCommands(): string[] {
+    return [...command_handlers.keys()];
 }
 
 export function __setStatImplementation(

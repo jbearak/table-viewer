@@ -46,17 +46,12 @@ describe('register_table_viewer', () => {
 
     async function csv_capabilities(
         uri: vscode.Uri,
-        view_only = false,
     ): Promise<{ csvEditingSupported?: boolean; csvEditable?: boolean }> {
         const bytes = Buffer.from('a,b\n1,2\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.length, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => bytes);
 
-        const registration = register_table_viewer(
-            context(),
-            state_store(),
-            () => view_only,
-        );
+        const registration = register_table_viewer(context(), state_store());
         const registered = vscode_mock.__getCustomEditorRegistrations()
             .find((candidate) => candidate.viewType === 'tableViewer.editor');
         const provider = registered?.provider as {
@@ -168,34 +163,29 @@ describe('register_table_viewer', () => {
         vi.useRealTimers();
     });
 
-    it('keeps pre-marker native-local CSV editing on the legacy Memento path', async () => {
+    it('edits native-local CSV resources', async () => {
         expect(await csv_capabilities(native_csv_uri())).toMatchObject({
             csvEditingSupported: true,
             csvEditable: true,
         });
     });
 
-    it('makes native-local CSV view-only after the activation marker is armed', async () => {
-        expect(await csv_capabilities(native_csv_uri(), true)).toMatchObject({
-            csvEditingSupported: false,
-            csvEditable: false,
-        });
-    });
-
-    it('keeps remote-host CSV resources view-only before marker activation', async () => {
+    it('edits CSV resources reached through a remote extension host', async () => {
+        // Editing goes through vscode.workspace.fs, which the host resolves for
+        // remote authorities too. Nothing about the resource's locality gates it.
         vscode_mock.env.remoteName = 'ssh-remote';
         expect(await csv_capabilities(native_csv_uri())).toMatchObject({
-            csvEditingSupported: false,
-            csvEditable: false,
+            csvEditingSupported: true,
+            csvEditable: true,
         });
     });
 
-    it('keeps non-file CSV resources view-only before marker activation', async () => {
+    it('edits CSV resources on a non-file scheme', async () => {
         const native_uri = native_csv_uri();
         const remote_uri = native_uri.with({ scheme: 'vscode-remote' }) as vscode.Uri;
         expect(await csv_capabilities(remote_uri)).toMatchObject({
-            csvEditingSupported: false,
-            csvEditable: false,
+            csvEditingSupported: true,
+            csvEditable: true,
         });
     });
 });
