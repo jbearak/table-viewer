@@ -21,7 +21,7 @@ import {
 } from './window-geometry';
 import { MONO_FONT, font_family_with_fallback } from './theme-palette';
 
-export const SETTINGS_FILE_NAME = 'settings.v1.json';
+export const SETTINGS_FILE_NAME = 'settings.json';
 
 export function settings_file_path(user_data_dir: string): string {
     return path.join(user_data_dir, SETTINGS_FILE_NAME);

@@ -21,7 +21,7 @@ export type ThemeKind = 'light' | 'dark';
  * not `light-solarized`), because `kind` is an explicit field below — a prefix
  * would be a second, desyncable copy of it.
  *
- * Persisted in settings.v1.json, so treat these as a stable wire format:
+ * Persisted in settings.json, so treat these as a stable wire format:
  * renaming one silently resets a user's choice (`sanitize_theme_id` rejects the
  * unknown value).
  */

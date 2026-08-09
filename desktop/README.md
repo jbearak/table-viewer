@@ -84,7 +84,7 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
   sibling `file-state.sqlite3.recovery.<uuid>/` directory rather than deleted.
   Physically separate from the VS Code extension's database; no state is shared
   or synchronized between the two.
-- Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
+- Preferences: `userData/settings.json`, edited via the Preferences window (**Cmd+,**).
 
 The app declines a *location* whose reachable directory handle rejects fsync,
 and says so before creating anything. It no longer declines a whole platform: on

@@ -213,7 +213,7 @@ test('windows are separately sized and positioned', async () => {
     // Under the default `match-last`, that resize is what the next window will
     // open at — tracked from the resize itself, without waiting for a close.
     await expect.poll(() => {
-        const file = path.join(user_data_dir, 'settings.v1.json');
+        const file = path.join(user_data_dir, 'settings.json');
         if (!fs.existsSync(file)) return null;
         const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
         return [settings.windowWidth, settings.windowHeight];
@@ -425,7 +425,7 @@ test('the appearance preference pins light/dark, and System restores OS followin
 /** One setting as it is on disk — the only place a preference is really saved.
  *  `null` until the app has had reason to write the file at all. */
 function stored_setting(key: string): unknown {
-    const file = path.join(user_data_dir, 'settings.v1.json');
+    const file = path.join(user_data_dir, 'settings.json');
     if (!fs.existsSync(file)) return null;
     return JSON.parse(fs.readFileSync(file, 'utf8'))[key];
 }
@@ -436,7 +436,7 @@ function stored_setting(key: string): unknown {
 // the switch would still use it.
 test('switching to Match last window adopts the current window size', async () => {
     const settings = () => {
-        const file = path.join(user_data_dir, 'settings.v1.json');
+        const file = path.join(user_data_dir, 'settings.json');
         if (!fs.existsSync(file)) return null;
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
         return [parsed.newWindowSize, parsed.windowWidth, parsed.windowHeight];

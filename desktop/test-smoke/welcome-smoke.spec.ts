@@ -97,7 +97,7 @@ test('the new-window-size mode enables the size fields and persists', async () =
     await expect(page.locator('#windowHeight')).toHaveValue('320');
 
     await expect.poll(() => {
-        const file = path.join(user_data_dir, 'settings.v1.json');
+        const file = path.join(user_data_dir, 'settings.json');
         if (!fs.existsSync(file)) return null;
         const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
         return [settings.newWindowSize, settings.windowWidth, settings.windowHeight];
