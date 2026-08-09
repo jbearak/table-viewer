@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import type { BrowserWindow as ElectronBrowserWindow } from 'electron';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import {
@@ -218,6 +219,7 @@ vi.mock('../../src/viewer-controller', () => ({
 }));
 
 import {
+    close_desktop_windows,
     create_app_quit_coordinator,
     decide_desktop_editing,
     desktop_conditional_install_fence_available,
@@ -1470,6 +1472,76 @@ describe('viewer window close protocol', () => {
 });
 
 describe('application quit coordinator', () => {
+    // Regression for the macOS double-Quit bug. The resumed app.quit() used to
+    // leave Electron in charge of closing the remaining app-chrome windows. The
+    // observed result was a first Quit that destroyed the launcher but left the
+    // process alive. The resumed quit must instead see an empty WindowList.
+    it('closes every BrowserWindow before resuming the first quit', async () => {
+        const calls: string[] = [];
+        const launcher = new electron_mock.BrowserWindow({});
+        launcher.closeAsync = true;
+        launcher.on('close', () => { calls.push('launcher:close'); });
+        launcher.on('closed', () => { calls.push('launcher:closed'); });
+
+        const close_viewers = vi.fn(async () => {
+            calls.push('viewers:closed');
+            return true;
+        });
+        const shutdown = shutdown_port(async () => {
+            calls.push('drain');
+            return { type: 'closed' };
+        });
+        const resume_quit = vi.fn(() => {
+            calls.push('resume');
+            // This is the invariant Electron itself needs: no close event can now
+            // cancel the resumed quit and consume the user's first Cmd-Q.
+            expect(electron_mock.BrowserWindow.instances
+                .filter((window) => !window.isDestroyed())).toEqual([]);
+        });
+        const before_quit = create_app_quit_coordinator(
+            () => close_desktop_windows(
+                close_viewers,
+                () => electron_mock.BrowserWindow.instances as unknown as ElectronBrowserWindow[],
+            ),
+            resume_quit,
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+
+        await vi.waitFor(() => expect(resume_quit).toHaveBeenCalledOnce());
+        expect(calls).toEqual([
+            'viewers:closed',
+            'launcher:close',
+            'launcher:closed',
+            'drain',
+            'resume',
+        ]);
+    });
+
+    it('keeps quitting retryable when an app-chrome window refuses to close', async () => {
+        const launcher = new electron_mock.BrowserWindow({});
+        launcher.on('close', (event: { preventDefault(): void }) => event.preventDefault());
+        const shutdown = shutdown_port(async () => ({ type: 'closed' }));
+        const resume_quit = vi.fn();
+        const close_windows = () => close_desktop_windows(
+            async () => true,
+            () => electron_mock.BrowserWindow.instances as unknown as ElectronBrowserWindow[],
+        );
+        const before_quit = create_app_quit_coordinator(
+            close_windows,
+            resume_quit,
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+
+        await vi.waitFor(() => expect(shutdown.abandon).toHaveBeenCalledOnce());
+        expect(launcher.destroyed).toBe(false);
+        expect(shutdown.drain).not.toHaveBeenCalled();
+        expect(resume_quit).not.toHaveBeenCalled();
+    });
+
     it('settles a quit close barrier when a renderer becomes unresponsive', async () => {
         const viewer_manager = manager();
         viewer_manager.open_file('/tmp/unresponsive-during-quit.csv');

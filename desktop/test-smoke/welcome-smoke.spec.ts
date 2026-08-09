@@ -161,10 +161,20 @@ test('quitting drains and releases the state database reader token', async () =>
 
         // The real quit path (before-quit → close fence → drain), not a window
         // close: `app.close()` alone would not exercise the guarded quit.
+        const own_process = own_app.process();
         await own_app.evaluate(({ app }) => app.quit()).catch(() => {
             // The quit can tear the harness connection down before the call
-            // resolves; the token assertion below is the real signal.
+            // resolves; the process and token assertions below are the signals.
         });
+        // A released reader token alone is insufficient: the macOS double-Quit
+        // regression drained successfully and closed its windows, but left a
+        // windowless Electron process alive until the user chose Quit again.
+        await expect
+            .poll(
+                () => own_process.exitCode !== null || own_process.signalCode !== null,
+                { timeout: 30_000 },
+            )
+            .toBe(true);
         await expect
             .poll(() => reader_tokens(own_user_data), { timeout: 30_000 })
             .toEqual([]);

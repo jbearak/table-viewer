@@ -252,10 +252,91 @@ export interface AppQuitShutdownPort {
 }
 
 /**
+ * Close the viewer windows through their durability fences, then close every
+ * remaining BrowserWindow before Electron is asked to resume quitting.
+ *
+ * This ordering is load-bearing on macOS. Electron's native window-close phase
+ * is stateful: a cancelled close clears its internal `is_quitting` flag, and the
+ * observed failure mode was a first Cmd-Q that destroyed the launcher but left
+ * the process alive until a second Cmd-Q. There is no reason to leave that final
+ * close phase to Electron after the app has already taken ownership of an
+ * asynchronous shutdown barrier.
+ *
+ * The first before-quit is therefore only the admission signal. We close and
+ * observe every window ourselves, drain the backend, and resume `app.quit()`
+ * only when Electron's WindowList is already empty.
+ */
+export async function close_desktop_windows(
+    close_viewer_windows: () => Promise<boolean>,
+    remaining_windows: () => readonly BrowserWindow[],
+): Promise<boolean> {
+    if (!await close_viewer_windows()) return false;
+
+    const windows = remaining_windows().filter((window) => !window.isDestroyed());
+    const closed = await Promise.all(windows.map((window) => close_plain_window(window)));
+    return closed.every(Boolean);
+}
+
+/** Close an app-chrome window and settle from observed Electron events. */
+function close_plain_window(window: BrowserWindow): Promise<boolean> {
+    if (window.isDestroyed()) return Promise.resolve(true);
+    return new Promise<boolean>((resolve, reject) => {
+        let settled = false;
+        let dispatched: Electron.Event | undefined;
+        const web_contents = window.webContents;
+
+        const capture_event = (event: Electron.Event) => { dispatched = event; };
+        const on_closed = () => settle(true);
+        const on_prevent_unload = () => settle(false);
+
+        function stop_observing(): void {
+            window.removeListener('close', capture_event);
+            window.removeListener('closed', on_closed);
+            if (!web_contents.isDestroyed()) {
+                web_contents.removeListener('will-prevent-unload', on_prevent_unload);
+            }
+        }
+
+        function settle(closed: boolean): void {
+            if (settled) return;
+            settled = true;
+            stop_observing();
+            resolve(closed);
+        }
+
+        window.on('close', capture_event);
+        window.once('closed', on_closed);
+        if (!web_contents.isDestroyed()) {
+            web_contents.on('will-prevent-unload', on_prevent_unload);
+        }
+
+        try {
+            window.close();
+        } catch (error) {
+            if (window.isDestroyed()) settle(true);
+            else {
+                stop_observing();
+                settled = true;
+                reject(error);
+            }
+            return;
+        }
+        if (settled) return;
+        if (window.isDestroyed()) {
+            settle(true);
+            return;
+        }
+        if (dispatched === undefined || dispatched.defaultPrevented) settle(false);
+        // Otherwise destruction is asynchronous; `closed` settles the promise.
+    });
+}
+
+/**
  * Coordinate Electron's synchronous before-quit event with the asynchronous
- * shutdown barrier: admission stops, then viewer close fences, then the state
- * backend drain. The resumed app.quit() call is admitted exactly once after all
- * three; a vetoed window close leaves quitting retryable *and* puts admission
+ * shutdown barrier: admission stops, then every app window closes (viewer
+ * windows through their durability fences), then the state backend drains. The
+ * resumed app.quit() call is admitted exactly once after all three; a vetoed
+ * window close leaves quitting retryable *and* puts admission
  * back, because the app is staying up and one that has silently stopped opening
  * files is a worse outcome than the quit the user cancelled.
  *
@@ -279,14 +360,13 @@ export interface AppQuitShutdownPort {
  * leaves those rows claimed by a process that no longer exists and can leave a
  * hot journal behind for the next launch to recover.
  *
- * So the barrier always runs both stages. `close_viewer_windows` over an empty
- * window list already resolves true having done nothing, which is exactly what a
- * "there is nothing to close" branch would have computed — a separate
- * has-windows port was only a second way to reach that answer, and a second way
- * to get it wrong.
+ * So the barrier always runs both stages. Closing an empty window list already
+ * resolves true having done nothing, which is exactly what a "there is nothing
+ * to close" branch would have computed — a separate has-windows port was only a
+ * second way to reach that answer, and a second way to get it wrong.
  */
 export function create_app_quit_coordinator(
-    close_viewer_windows: () => Promise<boolean>,
+    close_windows: () => Promise<boolean>,
     resume_quit: () => void,
     shutdown: AppQuitShutdownPort = {
         begin: () => {},
@@ -307,10 +387,10 @@ export function create_app_quit_coordinator(
         if (quit_barrier) return;
         // First, and synchronously with the event: everything after this point is
         // asynchronous, and the OS can deliver an `open-file` between any two
-        // ticks of it. A window admitted after `close_viewer_windows` snapshots
-        // its list is never fenced.
+        // ticks of it. A window admitted after `close_windows` snapshots its list
+        // is never fenced.
         shutdown.begin();
-        quit_barrier = close_viewer_windows()
+        quit_barrier = close_windows()
             // Scoped to the close fence alone, and deliberately not to the whole
             // chain: the fence is the one stage where a rejection means the same
             // thing as a veto (nothing has been closed, the app is staying up), so
@@ -323,8 +403,9 @@ export function create_app_quit_coordinator(
             .catch(() => false)
             .then((closed) => {
                 // A viewer vetoed its close (unacknowledged edits, lost renderer),
-                // or the fence itself rejected. The app is staying up, so the
-                // backend must stay open — draining it would strand a window that
+                // an app-chrome window refused, or the close stage rejected. The
+                // app is staying up, so the backend must stay open — draining it
+                // would strand a window that
                 // still holds an attached controller — and admission goes back,
                 // because refusing to open files in an app the user just chose to
                 // keep running is a bug of its own.
@@ -333,7 +414,9 @@ export function create_app_quit_coordinator(
                     return;
                 }
                 // Only after every viewer has finished its own flush/drain/ack
-                // fence, so no controller can still admit work into the backend.
+                // fence and every BrowserWindow is gone, so no controller can
+                // still admit work and Electron's resumed quit has no close phase
+                // left that could cancel it.
                 return shutdown.drain().then((outcome) => {
                     // A failed close is terminal, not retryable: see the module
                     // comment above. Report it and quit anyway rather than trap
