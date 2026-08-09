@@ -1509,30 +1509,31 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         expect(fs.existsSync(path.join(tempDirectory, '.file-state.sqlite3.recovery-gate'))).toBe(false);
     });
 
-    it('skips only when the default Windows directory-open primitive is unavailable', () => {
-        const opened: string[] = [];
-        const closed: number[] = [];
-        const unavailable = Object.assign(new Error('directories cannot be opened'), {
-            code: 'EISDIR',
-        });
+    it.each(['EISDIR', 'EPERM'])(
+        'skips when the default Windows directory-open primitive reports %s',
+        (code) => {
+            const opened: string[] = [];
+            const closed: number[] = [];
+            const unavailable = Object.assign(new Error('directories cannot be opened'), { code });
 
-        expect(() => assert_sqlite_directory_durability_supported(
-            tempDirectory,
-            fs.fsyncSync,
-            'win32',
-            {
-                openDirectory(directoryPath) {
-                    opened.push(directoryPath);
-                    throw unavailable;
+            expect(() => assert_sqlite_directory_durability_supported(
+                tempDirectory,
+                fs.fsyncSync,
+                'win32',
+                {
+                    openDirectory(directoryPath) {
+                        opened.push(directoryPath);
+                        throw unavailable;
+                    },
+                    closeDirectory(descriptor) {
+                        closed.push(descriptor);
+                    },
                 },
-                closeDirectory(descriptor) {
-                    closed.push(descriptor);
-                },
-            },
-        )).not.toThrow();
-        expect(opened).toEqual([tempDirectory]);
-        expect(closed).toEqual([]);
-    });
+            )).not.toThrow();
+            expect(opened).toEqual([tempDirectory]);
+            expect(closed).toEqual([]);
+        },
+    );
 
     it('flushes and closes a reachable Windows directory handle', () => {
         const events: string[] = [];

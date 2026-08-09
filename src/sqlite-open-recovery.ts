@@ -33,7 +33,11 @@ const CANDIDATE_MARKER = '.init-candidate.';
 const RECOVERY_MARKER = '.recovery.';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF']);
-const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR']);
+// Node has reported both shapes for `open(directory, O_RDONLY)` on Windows:
+// EISDIR when libuv identifies the target as a directory, and EPERM when the
+// Windows handle request itself is refused. Neither produces a descriptor that
+// could be passed to fsync, so both mean that the default primitive is absent.
+const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR', 'EPERM']);
 
 export const SQLITE_INITIALIZATION_DURABLE_CUT_POINTS = [
     'candidate-after-schema',
@@ -501,10 +505,10 @@ const DEFAULT_DIRECTORY_DURABILITY_FILE_SYSTEM: DirectoryDurabilityFileSystem = 
  * Flush a directory when Node exposes a usable primitive for it.
  *
  * Windows is not skipped by platform. The default Node primitive is attempted so
- * future runtime support is used automatically. Only an `EISDIR` from the default
- * directory open is treated as proof that this Node build cannot obtain a
- * directory handle at all; once a handle exists, an unsupported fsync result is a
- * filesystem durability refusal just as it is on POSIX.
+ * future runtime support is used automatically. Only the Windows errors produced
+ * when the default directory open cannot return a handle are treated as proof that
+ * this Node build has no primitive to use; once a handle exists, an unsupported
+ * fsync result is a filesystem durability refusal just as it is on POSIX.
  *
  * The filesystem seam is deliberately narrower than `fs`: tests can distinguish
  * open, fsync, and close phases without replacing process-wide Node functions.
