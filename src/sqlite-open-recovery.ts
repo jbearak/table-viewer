@@ -482,9 +482,21 @@ function flush_file(filePath: string): void {
     }
 }
 
-export function sqlite_directory_durability_is_platform_unsupported(
-    platform: NodeJS.Platform = process.platform,
-    fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
+/**
+ * Whether this host has no directory-flush primitive to call at all.
+ *
+ * NTFS exposes none: a directory handle is not something `fs.fsyncSync` can act
+ * on, and no Node API stands in for it. SQLite's own Windows VFS reaches the same
+ * conclusion and simply omits the directory sync, so a flush skipped here leaves
+ * us exactly as durable as the engine we are storing through — which is the
+ * standard the rest of this module's protocols are written against.
+ *
+ * A test that injects its own capability is asking for the flush path to run, so
+ * the skip is conditioned on the default implementation still being in place.
+ */
+function directory_flush_is_unavailable(
+    platform: NodeJS.Platform,
+    fsyncDirectory: (descriptor: number) => void,
 ): boolean {
     return platform === 'win32' && fsyncDirectory === fs.fsyncSync;
 }
@@ -494,13 +506,11 @@ export function assert_sqlite_directory_durability_supported(
     fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
     platform: NodeJS.Platform = process.platform,
 ): void {
-    // Node exposes no proven Windows primitive for durably flushing directory-entry
-    // changes. Refuse the backend explicitly instead of treating a skipped flush as
-    // durable success. Tests may inject a capability implementation at the operation
-    // boundary, but production never assumes one exists.
-    if (sqlite_directory_durability_is_platform_unsupported(platform, fsyncDirectory)) {
-        throw sqlite_file_state_error('unsupported', { operation: 'directory-durability' });
-    }
+    // Best-effort where no primitive exists, refusal where one exists and the
+    // filesystem rejects it. The distinction matters: an exotic mount that answers
+    // ENOTSUP is a location the user can move off, while an absent platform
+    // primitive is not something any location on that machine can fix.
+    if (directory_flush_is_unavailable(platform, fsyncDirectory)) return;
     let descriptor: number | undefined;
     try {
         descriptor = fs.openSync(directoryPath, 'r');

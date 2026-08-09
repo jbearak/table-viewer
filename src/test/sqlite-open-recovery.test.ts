@@ -26,7 +26,6 @@ import {
     reclaim_stale_sqlite_exclusive_intent,
     recognize_sqlite_initialization_candidate,
     resume_sqlite_basename_preservation,
-    sqlite_directory_durability_is_platform_unsupported,
     type SqliteOpenRecoveryEvent,
 } from '../sqlite-open-recovery';
 
@@ -1510,27 +1509,44 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         expect(fs.existsSync(path.join(tempDirectory, '.file-state.sqlite3.recovery-gate'))).toBe(false);
     });
 
-    it('fails closed explicitly on Windows without a proven directory primitive', () => {
-        expect(sqlite_directory_durability_is_platform_unsupported('win32', fs.fsyncSync))
-            .toBe(true);
-        expect(sqlite_directory_durability_is_platform_unsupported('win32', () => {}))
-            .toBe(false);
-        expect(sqlite_directory_durability_is_platform_unsupported('darwin', fs.fsyncSync))
-            .toBe(false);
+    it('skips the flush where no directory primitive exists rather than refusing', () => {
+        // Windows has no directory-flush primitive to call at all, and SQLite's own
+        // VFS omits the sync there for the same reason. Skipping keeps this backend
+        // exactly as durable as the engine it stores through; refusing would take
+        // the whole platform out over a call that was never available to make.
+        expect(() => assert_sqlite_directory_durability_supported(
+            tempDirectory,
+            fs.fsyncSync,
+            'win32',
+        )).not.toThrow();
 
+        // A test that injects its own primitive is asking for the flush to happen,
+        // so the skip must not swallow it.
+        const flushed: number[] = [];
+        assert_sqlite_directory_durability_supported(
+            tempDirectory,
+            (descriptor) => { flushed.push(descriptor); },
+            'win32',
+        );
+        expect(flushed).toHaveLength(1);
+    });
+
+    it('still refuses a filesystem that rejects a flush it was asked to perform', () => {
+        // The distinction the skip above must not erase: an exotic mount answering
+        // ENOTSUP is a location the user can move off, and that stays a refusal.
+        const rejected = Object.assign(new Error('not supported'), { code: 'ENOTSUP' });
         try {
-            assert_sqlite_directory_durability_supported(tempDirectory, fs.fsyncSync, 'win32');
-            throw new Error('Windows directory durability unexpectedly succeeded');
+            assert_sqlite_directory_durability_supported(
+                tempDirectory,
+                () => { throw rejected; },
+                'darwin',
+            );
+            throw new Error('directory durability unexpectedly succeeded');
         } catch (error) {
             expect(error).toBeInstanceOf(SqliteFileStateError);
             expect((error as SqliteFileStateError).category).toBe('unsupported');
             expect((error as SqliteFileStateError).metadata.operation).toBe('directory-durability');
         }
-        expect(() => assert_sqlite_directory_durability_supported(
-            tempDirectory,
-            () => {},
-            'win32',
-        )).not.toThrow();
     });
 
     it('sanitizes spoofed SqliteFileStateError names instead of trusting attacker fields', async () => {

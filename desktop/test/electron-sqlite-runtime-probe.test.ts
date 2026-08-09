@@ -35,19 +35,14 @@ beforeAll(async () => {
 const refusal = () => new SqliteFileStateError('unsupported', { operation: 'directory-durability' });
 
 describe('electron sqlite runtime probe v1 contract', () => {
-    it('requires an installed database everywhere a directory flush is proven', () => {
-        for (const platform of ['darwin', 'linux', 'freebsd']) {
+    it('requires an installed database on every platform, win32 included', () => {
+        // win32 is in this list deliberately. It used to be the fail-closed case,
+        // and the assertion below is driven through the real production enforcer —
+        // so if the platform were refused again this would fail here rather than
+        // letting the probe assert a stale contract in CI.
+        for (const platform of ['darwin', 'linux', 'freebsd', 'win32']) {
             expect(v1_contract_for_platform(platform)).toBe('installed');
         }
-    });
-
-    it('requires the fail-closed refusal on win32', () => {
-        // The real production assertion, driven with win32 — not a re-test of the
-        // platform string. This is the whole reason the probe calls the enforcer:
-        // if production ever stopped refusing on win32, this expectation would
-        // fail here rather than silently letting the probe assert a stale
-        // contract in CI.
-        expect(v1_contract_for_platform('win32')).toBe('fail-closed');
     });
 
     it('follows the production rule rather than a copy of its platform test', () => {
@@ -116,7 +111,7 @@ describe('electron sqlite runtime probe fail-closed assertion', () => {
     });
 
     it('fails when initialization succeeded instead of refusing', () => {
-        expect(() => assert_v1_refusal(undefined, true)).toThrow(/no proven directory-flush/);
+        expect(() => assert_v1_refusal(undefined, true)).toThrow(/directory flush was refused/);
     });
 
     it('fails when the refusal is not a SqliteFileStateError', () => {

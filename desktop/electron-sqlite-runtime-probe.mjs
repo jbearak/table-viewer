@@ -36,25 +36,22 @@ function write_output(stream, text) {
 /**
  * Which v1 contract this platform is required to satisfy.
  *
- * Windows has no proven Node primitive for durably flushing a directory entry, so
- * production refuses the SQLite backend there outright. The probe must therefore
- * assert a *different* contract per platform rather than assuming installation
- * succeeds everywhere: on Windows the observable guarantee is the refusal itself,
- * and a silent success there would be the actual regression.
+ * Every platform is required to install today, Windows included: where no
+ * directory-flush primitive exists the flush is skipped rather than refused. But
+ * the refusal has not gone away — a *location* whose filesystem rejects a flush it
+ * was asked to perform still fails closed — so the probe must still assert per
+ * outcome rather than assuming installation succeeds unconditionally, and on that
+ * path the observable guarantee is the refusal itself.
  *
  * Derived by *running* the production rule against a throwaway directory rather
  * than by re-testing `platform === 'win32'`. The second copy of a predicate is
  * the bug: it keeps answering confidently after the original has changed, and the
- * probe would then assert a stale contract — asserting an install on a platform
- * production had just started refusing, or a refusal on one it had just started
- * supporting, with nothing to catch either. Calling the enforcer makes the two
- * unable to disagree, and picks up a *location* that cannot be flushed on the
- * same evidence.
+ * probe would then assert a stale contract — asserting an install where production
+ * had started refusing, or a refusal where it had started installing, with nothing
+ * to catch either. Calling the enforcer makes the two unable to disagree.
  *
- * `platform` is still a parameter, and the injected `assert` still takes one, so
- * the win32 branch stays reachable from a unit test on any host: production's
- * assertion accepts the platform explicitly, which is what makes it drivable
- * without being duplicated.
+ * `platform` and the injected `assert` are still parameters, so every branch stays
+ * reachable from a unit test on any host.
  */
 export function v1_contract_for_platform(
     platform = process.platform,
@@ -89,7 +86,7 @@ export function v1_contract_for_platform(
  */
 export function assert_v1_refusal(error, database_created) {
     invariant(error !== undefined,
-        'v1 initialization succeeded on a platform with no proven directory-flush primitive');
+        'v1 initialization succeeded at a location whose directory flush was refused');
     invariant(error instanceof SqliteFileStateError,
         `v1 refusal is ${error?.constructor?.name ?? typeof error}, not SqliteFileStateError`);
     invariant(error.category === 'unsupported',

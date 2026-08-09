@@ -86,11 +86,12 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
   or synchronized between the two.
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
 
-The desktop app requires a platform on which a directory flush can be proven
-durable. Windows currently has no such primitive available without a native
-addon, so the app declines the platform up front rather than running with view
-state it cannot persist; `desktop/packaged-recovery-gate.mjs` asserts that
-refusal on Windows and the full recovery matrix elsewhere.
+The app declines a *location* whose filesystem rejects a directory flush it was
+asked to perform, and says so before creating anything. It no longer declines a
+whole platform: where no directory-flush primitive exists at all — NTFS — the
+flush is skipped, matching SQLite's own Windows VFS, so Windows runs the same
+recovery matrix as every other platform in
+`desktop/packaged-recovery-gate.mjs`.
 
 ### Windows durability verification
 
@@ -106,13 +107,17 @@ those observations rather than written down.
 
 The decision tree the verdict feeds, both branches of which are explicit:
 
-- **The gate verifies.** Windows ships the SQLite state backend on exactly the
-  evidence standard macOS ships on — a documented durability contract plus
-  kill-crash verification against the packaged runtime, which is the same trust
-  basis `fsync` gives on POSIX. Only then is
-  `assert_sqlite_directory_durability_supported` revisited.
-- **The gate cannot verify.** Windows ships view-only, exactly as it does today:
-  files open and display, and the persistent state backend is declined up front.
+- **The gate verifies.** Windows's durability rests on the same evidence standard
+  macOS's does — a documented contract plus kill-crash verification against the
+  packaged runtime.
+- **The gate cannot verify.** Windows still ships the state backend, on SQLite's
+  own Windows durability posture (no directory sync, because the platform has no
+  primitive for one), and the outstanding cut points stay recorded as pending.
+
+Note that the shipping decision no longer waits on this probe:
+`assert_sqlite_directory_durability_supported` skips the flush where no primitive
+exists rather than refusing the platform. What the probe still decides is what the
+durability claim in this document is allowed to say.
 
 Neither branch permits silent weakening. A `not-verified` verdict is a result and
 does **not** fail CI — a job that failed on an unproven primitive would only

@@ -166,17 +166,19 @@ jobs:
           .\node_modules\.bin\electron.cmd dist\runtime-probes\electron-sqlite-runtime-probe.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The same driver as the Linux job, asserting the opposite contract. Here
-      # there is no recovery to prove: the build declines the platform before any
-      # open, so what must hold is that the declaration is the platform one (not
-      # the fixable-location one), that no database and no coordination state were
-      # created while discovering it, and that a real initialization attempt still
-      # refuses. The explicit expectation is what stops this from passing by
-      # accidentally declaring itself supported and skipping everything.
-      - name: Packaged SQLite platform refusal gate
+      # The same driver and the same contract as the Linux job. Windows is no
+      # longer declined: NTFS exposes no directory-flush primitive to call, so the
+      # flush is skipped there exactly as SQLite's own Windows VFS skips it, and
+      # only a filesystem that rejects a flush it was asked to perform still
+      # refuses. The expectation is stated explicitly so this can never pass by
+      # declaring itself unsupported and skipping every gate.
+      #
+      # This is the first Windows run of the full recovery matrix; before the
+      # refusal was relaxed the job asserted `unsupported` and skipped it.
+      - name: Packaged SQLite recovery gates
         shell: pwsh
         env:
-          TABLE_VIEWER_GATE_EXPECT_PLATFORM: unsupported
+          TABLE_VIEWER_GATE_EXPECT_PLATFORM: supported
         run: |
           $ErrorActionPreference = 'Stop'
           # Builds its own bundle rather than inheriting the previous step's. A
