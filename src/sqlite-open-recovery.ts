@@ -1934,16 +1934,32 @@ async function build_candidate(
     let candidateIdentity: fs.BigIntStats | undefined;
     let database: DatabaseSync | undefined;
     try {
-        database = new DatabaseSync(candidatePath, {
-            enableDoubleQuotedStringLiterals: false,
-        });
-        candidateIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        try {
+            database = new DatabaseSync(candidatePath, {
+                enableDoubleQuotedStringLiterals: false,
+            });
+        } catch (error) {
+            throw safe_error('candidate-create', error);
+        }
+        try {
+            candidateIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        } catch (error) {
+            throw safe_error('candidate-create-identity', error);
+        }
         if (!candidateIdentity.isFile()) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-create-identity' });
         }
-        initialize_sqlite_file_state_schema(database, identity, migration);
+        try {
+            initialize_sqlite_file_state_schema(database, identity, migration);
+        } catch (error) {
+            throw safe_error('candidate-schema', error);
+        }
         await emit(hooks, 'candidate-after-schema');
-        database.close();
+        try {
+            database.close();
+        } catch (error) {
+            throw safe_error('candidate-close', error);
+        }
         database = undefined;
         await emit(hooks, 'candidate-after-close');
         for (const suffix of ['-journal', '-wal', '-shm']) {
@@ -1951,10 +1967,22 @@ async function build_candidate(
                 throw sqlite_file_state_recovery_error({ operation: 'candidate-sidecar' });
             }
         }
-        fs.chmodSync(candidatePath, PRIVATE_FILE_MODE);
-        flush_file(candidatePath);
+        try {
+            fs.chmodSync(candidatePath, PRIVATE_FILE_MODE);
+        } catch (error) {
+            throw safe_error('candidate-permissions', error);
+        }
+        try {
+            flush_file(candidatePath);
+        } catch (error) {
+            throw safe_error('candidate-file-flush', error);
+        }
         await emit(hooks, 'candidate-after-file-flush');
-        flush_directory(paths.parentDirectory, hooks);
+        try {
+            flush_directory(paths.parentDirectory, hooks);
+        } catch (error) {
+            throw safe_error('candidate-directory-flush', error);
+        }
         await emit(hooks, 'candidate-after-directory-flush');
         const recognition = recognize_sqlite_initialization_candidate(
             candidatePath,
