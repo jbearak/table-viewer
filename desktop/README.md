@@ -66,7 +66,7 @@ The config lives in `desktop/electron-builder.yml`:
 npm run test:desktop-smoke
 ```
 
-Three Playwright Electron specs (`desktop/test-smoke/`) drive the built dev bundle. `desktop-smoke.spec.ts` launches it with a writable csv copy and an xlsx fixture and asserts each file opened in its own titled window with its grid rendered, that CSV editing saves through to the opened file, that the windows are independently sized and zoomed, that a column sort applies and clears, that the Edit menu's Copy and Select All reach the grid, and that the Appearance and Color theme preferences repaint the open windows (asserted against CSS custom properties, never rendered pixels — the Glide canvas is not drivable headlessly), and that the About window opens with its version and notice links. `welcome-smoke.spec.ts` launches it with no file and covers the launcher plus File → New Window. `state-relaunch.spec.ts` asserts the plan's relaunch gate: that a clean quit-and-relaunch restores view state from the same `userData` directory, and that a forced termination recovers under the rollback journal on the next launch.
+Three Playwright Electron specs (`desktop/test-smoke/`) drive the built development bundle. They cover the main viewer and CSV save workflow, the launcher and new-window flow, and state recovery across clean relaunches and forced termination.
 
 **Only one of the three runs in CI, and the split is a property of how they are written.** The `desktop-relaunch` job in `.github/workflows/ci.yml` runs `npm run test:desktop-smoke:relaunch` on `macos-latest` — `state-relaunch.spec.ts` alone. It is CI-safe because it drives no menu commands and makes no focus assertions: everything it checks it reads back through the grid's accessibility cell and the state database, neither of which depends on the app being frontmost. **Keep it that way.** A focus assertion or a menu-routed command added to that spec makes the CI job flaky on a shared runner, and it will fail intermittently rather than plainly. Its focus-dependent siblings stay out of CI for exactly that reason (the Linux runner would also need xvfb plus Electron sandbox flags); run the full `npm run test:desktop-smoke` locally on a desktop OS instead.
 
@@ -152,7 +152,7 @@ The display name in the markup is hardcoded, because `app.name` is the package n
 
 ## CSV and TSV editing
 
-CSV and TSV files use the same shared editing profile as the VS Code extension. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel.
+CSV and TSV files support the same editing workflow as the VS Code extension. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel. Desktop state is stored separately from the VS Code extension, as described above.
 
 Unsaved edits are durable: the shared controller persists `pendingEdits` per file in the state store and hands them back when the file is reopened, so closing a window does not lose a draft — it comes back where you left it (hot-exit semantics, the same as the VS Code extension). Closing therefore does not prompt.
 
