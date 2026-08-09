@@ -1509,7 +1509,7 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         expect(fs.existsSync(path.join(tempDirectory, '.file-state.sqlite3.recovery-gate'))).toBe(false);
     });
 
-    it.each(['EISDIR', 'EPERM'])(
+    it.each(['EISDIR', 'EACCES', 'EPERM'])(
         'skips when the default Windows directory-open primitive reports %s',
         (code) => {
             const opened: string[] = [];
@@ -1558,10 +1558,12 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         ]);
     });
 
-    it('skips when the default Windows fsync cannot use an opened directory handle', () => {
+    it.each(['EACCES', 'EPERM'])(
+        'skips when the default Windows fsync reports %s for an opened directory handle',
+        (code) => {
         const events: string[] = [];
         const unavailable = Object.assign(new Error('directory handles cannot be flushed'), {
-            code: 'EPERM',
+            code,
         });
 
         expect(() => assert_sqlite_directory_durability_supported(
@@ -1587,7 +1589,8 @@ describe('raw preflight and writable rollback-journal recovery', () => {
             'fsync:39',
             'close:39',
         ]);
-    });
+        },
+    );
 
     it('fails closed when a reachable Windows filesystem rejects fsync', () => {
         const rejected = Object.assign(new Error('not supported'), { code: 'ENOTSUP' });

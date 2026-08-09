@@ -34,11 +34,11 @@ const RECOVERY_MARKER = '.recovery.';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF']);
 // Node has reported both shapes for `open(directory, O_RDONLY)` on Windows:
-// EISDIR when libuv identifies the target as a directory, and EPERM when the
-// Windows handle request itself is refused. Neither produces a descriptor that
-// could be passed to fsync, so both mean that the default primitive is absent.
-const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR', 'EPERM']);
-const WINDOWS_UNAVAILABLE_DIRECTORY_FSYNC_CODES = new Set(['EPERM']);
+// EISDIR when libuv identifies the target as a directory, and EACCES/EPERM when
+// the Windows handle request itself is refused. None produces a descriptor that
+// could be passed to fsync, so all mean that the default primitive is absent.
+const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR', 'EACCES', 'EPERM']);
+const WINDOWS_UNAVAILABLE_DIRECTORY_FSYNC_CODES = new Set(['EACCES', 'EPERM']);
 
 export const SQLITE_INITIALIZATION_DURABLE_CUT_POINTS = [
     'candidate-after-schema',
