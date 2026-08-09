@@ -128,7 +128,6 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
-                csvEditingMode: 'selfManaged' as const,
                 csvSaveLifecycle: { revision: 0, state: 'idle' as const },
             },
         }),
@@ -1198,7 +1197,6 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 capabilities: {
                     csvEditable: editable,
                     csvEditingSupported: true,
-                    csvEditingMode: 'selfManaged' as const,
                     csvSaveLifecycle: { revision: 0, state: 'idle' },
                 },
             }),
@@ -1246,7 +1244,6 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
-                csvEditingMode: 'selfManaged' as const,
                 csvSaveLifecycle: { revision: 0, state: 'idle' as const },
             },
         };

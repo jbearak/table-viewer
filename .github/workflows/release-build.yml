@@ -19,8 +19,12 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # Validate the immutable release commit on Windows before the VSIX can be
+  # packaged or uploaded. Keeping these gates in the tag workflow prevents a
+  # successful independent CI run for some other commit from vouching for the
+  # release, and prevents release-publish from racing ahead of a Windows failure.
+  windows-validation:
+    runs-on: windows-latest
 
     steps:
       - name: Resolve immutable tag commit
@@ -28,9 +32,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF_TYPE: ${{ github.ref_type }}
-          EVENT_REF_NAME: ${{ github.ref_name }}
           THE_TAG: ${{ inputs.tag || github.ref_name }}
           EVENT_SHA: ${{ github.sha }}
         run: |
@@ -53,18 +54,102 @@ jobs:
             echo "ERROR: release tag did not peel to a commit" >&2
             exit 1
           fi
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$EVENT_REF_TYPE" != "tag" || "$EVENT_REF_NAME" != "$THE_TAG" ]]; then
-              echo "ERROR: manual release builds must run from the requested tag ref" >&2
-              echo "Run: gh workflow run release-build.yml --ref $THE_TAG -f tag=$THE_TAG" >&2
-              exit 1
-            fi
-          elif [[ "$EVENT_NAME" != "push" ]]; then
-            echo "ERROR: unsupported release build event: $EVENT_NAME" >&2
+          if [[ "$SHA" != "$EVENT_SHA" ]]; then
+            echo "ERROR: release tag does not resolve to the immutable event commit" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checkout matches tag commit
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: checkout does not match the resolved immutable tag commit" >&2
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: SQLite public-open contract test
+        run: npm run test:sqlite:public-open
+
+      - name: Host Node SQLite runtime probe
+        run: npm run probe:sqlite:host
+
+      - name: Server bundle SQLite externalization probe
+        run: npm run probe:sqlite:bundles
+
+      - name: Electron SQLite runtime probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\electron-sqlite-runtime-probe.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Packaged SQLite recovery gates
+        shell: pwsh
+        env:
+          TABLE_VIEWER_GATE_EXPECT_PLATFORM: supported
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run bundle:desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\node_modules\.bin\electron.cmd dist\runtime-probes\packaged-recovery-gate.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build:
+    needs: windows-validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve immutable tag commit
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$THE_TAG" =~ ^v[0-9][0-9A-Za-z._+-]*$ ]]; then
+            echo "ERROR: invalid release tag: $THE_TAG" >&2
+            exit 1
+          fi
+          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
+          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+          SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          for _ in 1 2 3 4; do
+            [[ "$TYPE" == "commit" ]] && break
+            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag did not resolve to a commit" >&2; exit 1; }
+            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${SHA}")
+            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+            SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          done
+          if [[ "$TYPE" != "commit" || ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: release tag did not peel to a commit" >&2
             exit 1
           fi
           if [[ "$SHA" != "$EVENT_SHA" ]]; then
-            echo "ERROR: release tag does not resolve to the immutable triggering commit" >&2
+            echo "ERROR: release tag does not resolve to the immutable event commit" >&2
             exit 1
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
@@ -82,7 +167,7 @@ jobs:
           node-version: '26.5.1'
           cache: npm
 
-      - name: Validate tag + version
+      - name: Validate tag + versions
         id: version
         shell: bash
         env:
@@ -162,9 +247,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF_TYPE: ${{ github.ref_type }}
-          EVENT_REF_NAME: ${{ github.ref_name }}
           THE_TAG: ${{ inputs.tag || github.ref_name }}
           EVENT_SHA: ${{ github.sha }}
         run: |
@@ -187,18 +269,8 @@ jobs:
             echo "ERROR: release tag did not peel to a commit" >&2
             exit 1
           fi
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$EVENT_REF_TYPE" != "tag" || "$EVENT_REF_NAME" != "$THE_TAG" ]]; then
-              echo "ERROR: manual release builds must run from the requested tag ref" >&2
-              echo "Run: gh workflow run release-build.yml --ref $THE_TAG -f tag=$THE_TAG" >&2
-              exit 1
-            fi
-          elif [[ "$EVENT_NAME" != "push" ]]; then
-            echo "ERROR: unsupported release build event: $EVENT_NAME" >&2
-            exit 1
-          fi
           if [[ "$SHA" != "$EVENT_SHA" ]]; then
-            echo "ERROR: release tag does not resolve to the immutable triggering commit" >&2
+            echo "ERROR: release tag does not resolve to the immutable event commit" >&2
             exit 1
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
@@ -335,26 +407,29 @@ jobs:
   # arm64. It packages nothing today, on purpose — but it no longer fails, and
   # that distinction is the whole of this block.
   #
-  # The desktop's state authority is SQLite, and this build cannot open a SQLite
-  # state database on Windows. Every durable step of the storage protocol —
-  # candidate install, marker creation, member move — is made durable by flushing
-  # the containing directory, and Node exposes no *verified* win32 primitive for
-  # that: `fs.openSync` on a directory fails, and `FlushFileBuffers` on a file
-  # handle says nothing about rename and unlink ordering. So
-  # `desktop_state_platform_support` declines the platform up front and the app
-  # reports one honest, non-looping refusal rather than running with an authority
-  # it cannot persist. The failure policy forbids the alternative outright: no
-  # empty and no read-only authority.
+  # The desktop's state authority is SQLite, and it does now open on Windows: every
+  # durable step of the storage protocol — candidate install, marker creation,
+  # member move — attempts to flush the containing directory. The default Node
+  # primitive is tried so future runtime support is used; only a directory-open
+  # result proving no handle can be obtained is skipped, in line with SQLite's own
+  # Windows posture. `desktop_state_platform_support` no longer declines Windows.
+  #
+  # What is still missing is *crash* evidence, and that is what fences this job.
+  # `fs.openSync` on a directory fails and `FlushFileBuffers` on a file handle says
+  # nothing about rename and unlink ordering, so what a kill at each durable cut
+  # point leaves behind on NTFS has not been established from the packaged runtime.
+  # Shipping an installer before it is would put real users' view state on an
+  # unverified recovery path, which is the one thing the failure policy will not
+  # trade away.
   #
   # An earlier revision of this job failed hard, which stopped the *entire*
-  # release run — `release-publish.yml` triggers only on
-  # `workflow_run.conclusion == 'success'`, so a fenced Windows job also withheld
-  # the macOS build. That coupling is withdrawn. Windows being unproven is not a
-  # reason to stop shipping the platform that is proven, and the missing-artifact
-  # hole that once justified it is closed at the publish side instead:
-  # release-publish.yml now *fails* on an absent `windows-<tag>` artifact unless
-  # dispatched with `allow_missing_windows`, so a release cannot silently drop its
-  # Windows downloads. This job therefore skips loudly and lets the run proceed.
+  # release run — `release-publish.yml` triggers only on a successful Release Build,
+  # so a fenced Windows packaging job also withheld the macOS build. That coupling
+  # is withdrawn. Windows being unproven is not a reason to stop shipping the
+  # platform that is proven. A pushed-tag publish warns and proceeds when the
+  # expected fenced `windows-<tag>` artifact is absent; a hand-dispatched publish
+  # requires `allow_missing_windows=true` to acknowledge that omission explicitly.
+  # This job therefore skips loudly and lets the run proceed.
   #
   # Windows is not withdrawn as a target. The open question is empirical — which
   # write-through and flush primitives the packaged runtime can actually reach on
@@ -366,8 +441,9 @@ jobs:
   #     standard as macOS: a documented durability contract plus kill-crash
   #     verification, which is exactly the trust basis fsync gives us on POSIX.
   #     Replace this job with the real packaging steps.
-  #   * the gate cannot verify        -> Windows ships view-only, per the plan's
-  #     existing posture for a platform without a proven primitive.
+  #   * the gate cannot verify        -> this fence stays, and the reason stays
+  #     stated: the backend runs on Windows, but its crash recovery there is not
+  #     verified, so the desktop app is not published for it.
   #
   # Neither branch permits a silent weakening: shipping requires the evidence, and
   # not shipping requires saying so. `npm run desktop:package:win` remains
@@ -381,10 +457,9 @@ jobs:
       # install would change the answer today, and a job that built anything at
       # all would leave something for a future step to pick up and upload.
       #
-      # Exits 0. The release run continues and the macOS artifact publishes; the
-      # guarantee that a release cannot silently omit Windows lives in
-      # release-publish.yml, which fails on a missing `windows-<tag>` artifact
-      # unless explicitly dispatched with `allow_missing_windows`.
+      # Exits 0. The release run continues and the macOS artifact publishes.
+      # release-publish.yml warns and proceeds for a successful pushed-tag build;
+      # only a hand-dispatched publish requires `allow_missing_windows=true`.
       - name: Report that Windows desktop packaging is pending durability verification
         shell: bash
         run: |
@@ -392,24 +467,28 @@ jobs:
           cat >&2 <<'MESSAGE'
           NOTE: no Windows desktop artifact is produced by this release.
 
-          The desktop app stores its view settings in SQLite, and this build cannot
-          open that database on Windows: every durable step of the storage protocol
-          flushes the containing directory, and no win32 primitive for that has been
-          verified from the packaged runtime. The app declines the platform up front
-          rather than running with an authority it cannot persist, so a Windows exe
-          built today would be a viewer whose settings never survive a restart.
+          The desktop app stores its view settings in SQLite, and it does open that
+          database on Windows. Every durable step attempts the default Node directory
+          flush so future runtime support is used; only a directory-open result proving
+          that no handle can be obtained is skipped, in line with SQLite's own Windows
+          posture.
+
+          What has NOT been established is what a crash at each of those durable
+          steps leaves behind on NTFS, measured from the packaged runtime. Publishing
+          an installer today would put real users' view state on a recovery path
+          nobody has verified, so the fence stays until the evidence exists.
 
           Windows is NOT withdrawn as a target. Which primitives are actually
           reachable, and what they guarantee across a kill, is being established
           empirically by the `windows-durability` job in ci.yml. When that gate
           verifies, Windows ships on the same evidence standard as macOS — a
           documented durability contract plus kill-crash verification — and this job
-          is replaced with the real packaging steps. If it cannot verify, Windows
-          ships view-only.
+          is replaced with the real packaging steps. If it cannot verify, this fence
+          and this message stay exactly as they are.
 
           This job no longer fails the release run: Windows being unproven is not a
-          reason to withhold the platform that is proven. A release that omits the
-          Windows assets is still caught at publish time.
+          reason to withhold the platform that is proven. A pushed-tag publish reports
+          the omitted Windows assets; a manual publish requires an explicit override.
 
           Developers can still build locally with: npm run desktop:package:win
           MESSAGE

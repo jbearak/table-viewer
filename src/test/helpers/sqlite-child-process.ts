@@ -16,11 +16,10 @@ type WorkerMessage =
     | { readonly type: 'error'; readonly id: number; readonly error: WorkerError };
 
 export interface SqliteWorkerOptions {
-    readonly mode?: 'store' | 'raw' | 'recovery' | 'vscode-cosmetic';
+    readonly mode?: 'store' | 'raw' | 'recovery';
     readonly maxStoredFiles?: number;
     readonly timeoutMs?: number;
     readonly readyEventName?: string;
-    readonly observeRuntimeEvents?: readonly string[];
     readonly ambiguousCommit?: {
         readonly reconciliationReleasePath: string;
     };

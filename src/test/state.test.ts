@@ -1,18 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ExtensionContext } from 'vscode';
 import { compare_authority } from '../authority-order';
-import { create_cosmetic_file_state_store } from '../cosmetic-file-state-store';
-import { with_in_memory_authority_transactions } from '../state-authority';
 import {
-    create_file_state_store,
     create_keyed_authority_store,
-    create_memento_keyed_file_state_persistence,
     supports_coordinated_file_state,
     type KeyedFileStatePersistence,
     type KeyedStateReadTransaction,
     type KeyedStateWriteTransaction,
 } from '../state';
 import { file_state_store_contract } from './file-state-store-contract';
+import {
+    create_memento_file_state_store,
+    create_memento_keyed_file_state_persistence,
+} from './helpers/memento-file-state';
 
 function context_with(initial: unknown) {
     let stored: unknown = initial;
@@ -70,11 +70,11 @@ function instrument_payload_io(persistence: KeyedFileStatePersistence) {
     return { counts, wrapped, reset: () => { counts.reads = 0; counts.writes = 0; } };
 }
 
-file_state_store_contract('Memento compatibility backend', () => {
+file_state_store_contract('Memento test-fixture medium', () => {
     const backing = context_with({});
     return {
-        create: (max = 10_000) => create_file_state_store(backing.context, () => max),
-        createIndependent: (max = 10_000) => create_file_state_store(backing.context, () => max),
+        create: (max = 10_000) => create_memento_file_state_store(backing.context, () => max),
+        createIndependent: (max = 10_000) => create_memento_file_state_store(backing.context, () => max),
         seedEnvelope: (envelope) => backing.set(envelope),
         inspect: () => backing.value(),
         failNextWrite: async () => {
@@ -86,7 +86,7 @@ file_state_store_contract('Memento compatibility backend', () => {
 
 describe('FileStateStore versioned state', () => {
     it('requires the complete coordinated file-state surface', () => {
-        const base = create_file_state_store(context_with({}).context);
+        const base = create_memento_file_state_store(context_with({}).context);
         const coordinated = {
             ...base,
             acquire_edit_session: vi.fn(),
@@ -101,7 +101,6 @@ describe('FileStateStore versioned state', () => {
             'read',
             'compare_and_set',
             'touch',
-            'copy_cosmetic_entry_if_absent',
             'read_authority',
             'stage_authority_transaction',
             'finalize_authority_transaction',
@@ -122,7 +121,7 @@ describe('FileStateStore versioned state', () => {
 
     it('commits an exact revision and rejects a stale compare-and-set', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         const initial = await store.read('/a');
 
         const committed = await store.compare_and_set(
@@ -148,7 +147,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('checks a synchronous authority fence at the CAS commit point', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         const initial = await store.read('/a');
         const result = await store.compare_and_set(
             '/a',
@@ -171,7 +170,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('invokes CAS validation exactly once before every stale guard', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         await store.stage_authority_transaction('/a', {
             id: 'physical', kind: 'physical', ordinal: 1,
             expectedStateRevision: 0, expectedCommitSequence: 0,
@@ -216,7 +215,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('gives validator throws precedence and conflicts every non-pass value', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         const thrown = new Error('validator failed');
         await expect(store.compare_and_set(
             '/a',
@@ -240,7 +239,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('returns the current snapshot and authority on every CAS outcome', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         const committed = await store.compare_and_set('/a', 0, { activeSheetIndex: 1 });
         expect(committed).toEqual({
             type: 'committed',
@@ -581,7 +580,7 @@ describe('FileStateStore versioned state', () => {
 
     it('derives pending-edit metadata and protects pending rows from retention', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 1);
+        const store = create_memento_file_state_store(backing.context, () => 1);
         await store.compare_and_set('/pending', 0, {
             pendingEdits: { '0:0': { value: 'next', base: 'old' } },
         });
@@ -634,7 +633,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         await store.canonicalize_path!(canonical, (path) => path.toLowerCase());
         const keyed = create_memento_keyed_file_state_persistence(backing.context);
         await expect(keyed.read_transaction((tx) => tx.read_entry_metadata(canonical)))
@@ -674,7 +673,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         } as unknown as ExtensionContext;
-        const store = create_file_state_store(context);
+        const store = create_memento_file_state_store(context);
 
         await expect(store.compare_and_set(
             '/a',
@@ -686,7 +685,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('atomically canonicalizes aliases without overwriting canonical state', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         await store.compare_and_set('C:\\Data\\Book.xlsx', 0, { activeSheetIndex: 1 });
         await store.compare_and_set('c:\\data\\book.xlsx', 0, { activeSheetIndex: 2 });
 
@@ -730,7 +729,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         await store.canonicalize_path!(
             'c:\\data\\pair.xlsx',
             (key) => key.toLowerCase(),
@@ -775,7 +774,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
 
         await expect(store.canonicalize_path!(canonical, (key) => key.toLowerCase()))
             .rejects.toThrow('Cannot canonicalize divergent durable file authority.');
@@ -822,7 +821,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         await expect(store.copy_entry_if_absent!(legacy, provider, 'provider-copy'))
             .resolves.toMatchObject({
                 type: 'copied',
@@ -894,152 +893,6 @@ describe('FileStateStore versioned state', () => {
         await lease.release();
     });
 
-    it('atomically copies only cosmetic state without pending edits or authority', async () => {
-        const source = '/legacy-authority.csv';
-        const destination = '/provider-cosmetic.csv';
-        const backing = context_with({
-            format: 'tableViewer.fileState.v1',
-            nextRevision: 6,
-            absenceRevision: 0,
-            entries: {
-                [source]: {
-                    revision: 4,
-                    state: {
-                        activeSheetIndex: 3,
-                        pendingEdits: { '0:0': { value: 'forged', base: 'original' } },
-                    },
-                    authority: {
-                        commitSequence: 2,
-                        authorityRevision: 1,
-                        physicalRevision: 1,
-                        projectionRevision: 0,
-                        physicalDigest: 'physical-digest',
-                    },
-                    stages: {
-                        projection: {
-                            id: 'projection',
-                            kind: 'projection',
-                            ordinal: 1,
-                            expectedStateRevision: 4,
-                            expectedCommitSequence: 2,
-                            nextState: { activeSheetIndex: 9 },
-                            createdAt: Date.now(),
-                        },
-                    },
-                },
-            },
-        });
-        const backingStore = create_file_state_store(backing.context);
-        const store = create_cosmetic_file_state_store(backingStore);
-
-        await expect(store.compare_and_set(source, 3, { activeSheetIndex: 8 }))
-            .resolves.toMatchObject({
-                type: 'conflict',
-                snapshot: { state: { activeSheetIndex: 3 }, revision: 4 },
-                authority: {
-                    commitSequence: 0,
-                    authorityRevision: 0,
-                    physicalRevision: 0,
-                    projectionRevision: 0,
-                },
-            });
-        await expect(store.copy_entry_if_absent!(
-            source,
-            destination,
-            'cosmetic-copy',
-        )).resolves.toMatchObject({
-            type: 'copied',
-            source: { state: { activeSheetIndex: 3 }, revision: 4 },
-            destination: { state: { activeSheetIndex: 3 }, revision: 6 },
-        });
-
-        expect(backing.value().entries[destination]).toMatchObject({
-            revision: 6,
-            state: { activeSheetIndex: 3 },
-            copyProvenance: {
-                id: 'cosmetic-copy',
-                sourcePath: source,
-                sourceRevision: 4,
-            },
-        });
-        expect(backing.value().entries[destination]).not.toHaveProperty('authority');
-        expect(backing.value().entries[destination]).not.toHaveProperty('stages');
-        expect(backing.value().entries[destination].state).not.toHaveProperty('pendingEdits');
-        expect(await backingStore.read_authority(destination)).toEqual({
-            commitSequence: 0,
-            authorityRevision: 0,
-            physicalRevision: 0,
-            projectionRevision: 0,
-        });
-    });
-
-    it('preserves cosmetic copy semantics through the in-memory authority wrapper', async () => {
-        const source = '/cosmetic-source.csv';
-        const destination = 'provider:memfs:/cosmetic-destination.csv';
-        const backing = context_with({});
-        const cosmetic = create_cosmetic_file_state_store(
-            create_file_state_store(backing.context),
-        );
-        const store = with_in_memory_authority_transactions(cosmetic);
-        const initial = await store.compare_and_set(source, 0, { activeSheetIndex: 3 });
-        expect(initial.type).toBe('committed');
-        await store.stage_authority_transaction(source, {
-            id: 'installed-projection',
-            kind: 'projection',
-            ordinal: 1,
-            expectedStateRevision: initial.snapshot.revision,
-            expectedCommitSequence: 0,
-        });
-        const installed = await store.finalize_authority_transaction(
-            source,
-            'installed-projection',
-        );
-        expect(installed.type).toBe('finalized');
-        if (installed.type !== 'finalized') throw new Error('Expected installed projection.');
-        await store.stage_authority_transaction(source, {
-            id: 'pending-projection',
-            kind: 'projection',
-            ordinal: 2,
-            expectedStateRevision: initial.snapshot.revision,
-            expectedCommitSequence: installed.authority.commitSequence,
-            nextState: { activeSheetIndex: 7 },
-        });
-        expect(await store.read_authority(source)).toMatchObject({
-            commitSequence: 1,
-            authorityRevision: 1,
-            projectionRevision: 1,
-        });
-        expect((await store.inspect_authority_transaction(
-            source,
-            'pending-projection',
-        )).stagePresent).toBe(true);
-
-        await expect(store.copy_entry_if_absent!(
-            source,
-            destination,
-            'composed-cosmetic-copy',
-        )).resolves.toMatchObject({
-            type: 'copied',
-            source: { state: { activeSheetIndex: 3 } },
-            destination: { state: { activeSheetIndex: 3 } },
-        });
-
-        expect(await store.read_authority(destination)).toEqual({
-            commitSequence: 0,
-            authorityRevision: 0,
-            physicalRevision: 0,
-            projectionRevision: 0,
-        });
-        expect((await store.inspect_authority_transaction(
-            destination,
-            'pending-projection',
-        )).stagePresent).toBe(false);
-        expect((await store.inspect_authority_transaction(
-            source,
-            'pending-projection',
-        )).stagePresent).toBe(true);
-    });
-
     it('allocates a destination revision that fences pre-copy absence CAS', async () => {
         const source = '/legacy-revision-zero.xlsx';
         const destination = '/provider-revision-fence.xlsx';
@@ -1054,7 +907,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         const stale_destination = await store.read(destination);
         expect(stale_destination.revision).toBe(0);
 
@@ -1079,7 +932,7 @@ describe('FileStateStore versioned state', () => {
 
     it('does not materialize a destination when an atomic copy source is absent', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
 
         await expect(store.copy_entry_if_absent!(
             '/absent-source.xlsx',
@@ -1103,7 +956,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('discovers a lone legacy alias during canonicalization', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         await store.compare_and_set('C:\\Data\\Legacy.xlsx', 0, { activeSheetIndex: 4 });
 
         await store.canonicalize_path!(
@@ -1118,7 +971,7 @@ describe('FileStateStore versioned state', () => {
 
     it('keeps staged authority state invisible and finalizes state plus authority atomically', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         const initial = await store.read('/book');
         await expect(store.stage_authority_transaction!('/book', {
             id: 'physical:1',
@@ -1131,7 +984,7 @@ describe('FileStateStore versioned state', () => {
         })).resolves.toEqual({ type: 'staged' });
 
         expect(await store.read('/book')).toEqual(initial);
-        const reconstructed = create_file_state_store(backing.context);
+        const reconstructed = create_memento_file_state_store(backing.context);
         expect(await reconstructed.read('/book')).toEqual(initial);
         expect(await reconstructed.read_authority!('/book')).toMatchObject({
             commitSequence: 0,
@@ -1157,13 +1010,13 @@ describe('FileStateStore versioned state', () => {
             state: { activeSheetIndex: 2 },
             revision: 1,
         });
-        const reopened = create_file_state_store(backing.context);
+        const reopened = create_memento_file_state_store(backing.context);
         expect(await reopened.read_authority!('/book')).toEqual(finalized.authority);
     });
 
     it('keeps fresh invisible stages and cleans them without semantic revision changes', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
         for (let index = 0; index < 10; index++) {
             await store.stage_authority_transaction!('/book', {
                 id: `stage:${index}`,
@@ -1185,7 +1038,7 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('does not bump physical or state revision for a same-digest state-less commit', async () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         await store.stage_authority_transaction!('/book', {
             id: 'first', kind: 'physical', ordinal: 1,
             expectedStateRevision: 0, expectedCommitSequence: 0,
@@ -1233,7 +1086,7 @@ describe('FileStateStore versioned state', () => {
 
     it('keeps live leased entries through LRU churn and evicts them after release', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 1);
+        const store = create_memento_file_state_store(backing.context, () => 1);
         const lease = await store.lease_entry!('/live', (key) => key);
         await store.compare_and_set('/live', 0, { activeSheetIndex: 1 });
         await store.compare_and_set('/old', 0, { activeSheetIndex: 2 });
@@ -1248,7 +1101,7 @@ describe('FileStateStore versioned state', () => {
 
     it('keeps a fresh recovery stage non-evictable through LRU churn', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 1);
+        const store = create_memento_file_state_store(backing.context, () => 1);
         await store.stage_authority_transaction('/recovery', {
             id: 'recovery-stage',
             kind: 'physical',
@@ -1281,7 +1134,7 @@ describe('FileStateStore versioned state', () => {
                 },
             },
         } as unknown as ExtensionContext;
-        const store = create_file_state_store(context);
+        const store = create_memento_file_state_store(context);
         await store.stage_authority_transaction!('/book', {
             id: 'staged', kind: 'projection', ordinal: 1,
             expectedStateRevision: 0, expectedCommitSequence: 0,
@@ -1304,7 +1157,7 @@ describe('FileStateStore versioned state', () => {
                 '/b': { revision: 2, state: { activeSheetIndex: 1 } },
             },
         });
-        const store = create_file_state_store(backing.context, () => 2);
+        const store = create_memento_file_state_store(backing.context, () => 2);
 
         const before = await store.read('/a');
         await store.touch('/a');
@@ -1323,7 +1176,7 @@ describe('FileStateStore versioned state', () => {
 
     it('decodes legacy bare records as revision zero and lazily envelopes them', async () => {
         const backing = context_with({ '/a': { activeSheetIndex: 3 } });
-        const store = create_file_state_store(backing.context);
+        const store = create_memento_file_state_store(backing.context);
 
         expect(await store.read('/a')).toEqual({
             state: { activeSheetIndex: 3 },
@@ -1349,7 +1202,7 @@ describe('FileStateStore versioned state', () => {
 
     it('rejects a stale absent revision after create and eviction', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 1);
+        const store = create_memento_file_state_store(backing.context, () => 1);
         const stale = await store.read('/a');
         await store.compare_and_set('/a', stale.revision, { activeSheetIndex: 1 });
         await store.compare_and_set('/b', 0, { activeSheetIndex: 2 });
@@ -1366,7 +1219,7 @@ describe('FileStateStore versioned state', () => {
 
     it('rejects old absence bases across create, evict, and recreate cycles', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 1);
+        const store = create_memento_file_state_store(backing.context, () => 1);
         const original_absence = await store.read('/a');
         await store.compare_and_set('/a', original_absence.revision, { activeSheetIndex: 1 });
         const b = await store.read('/b');
@@ -1388,7 +1241,7 @@ describe('FileStateStore versioned state', () => {
 
     it('keeps persisted eviction metadata bounded under path churn', async () => {
         const backing = context_with({});
-        const store = create_file_state_store(backing.context, () => 3);
+        const store = create_memento_file_state_store(backing.context, () => 3);
         for (let index = 0; index < 200; index++) {
             const path = `/file-${index}`;
             const basis = await store.read(path);
@@ -1413,8 +1266,8 @@ describe('FileStateStore versioned state', () => {
 
     it('shares serialization across stores backed by the same memento', async () => {
         const backing = context_with({});
-        const first = create_file_state_store(backing.context);
-        const second = create_file_state_store(backing.context);
+        const first = create_memento_file_state_store(backing.context);
+        const second = create_memento_file_state_store(backing.context);
         const [left, right] = await Promise.all([
             first.compare_and_set('/a', 0, { activeSheetIndex: 1 }),
             second.compare_and_set('/a', 0, { activeSheetIndex: 2 }),
@@ -1424,12 +1277,11 @@ describe('FileStateStore versioned state', () => {
     });
 
     it('exposes no callback-based asynchronous reducer API', () => {
-        const store = create_file_state_store(context_with({}).context);
+        const store = create_memento_file_state_store(context_with({}).context);
         expect(Object.keys(store).sort()).toEqual([
             'canonicalize_path',
             'cleanup_authority_transactions',
             'compare_and_set',
-            'copy_cosmetic_entry_if_absent',
             'copy_entry_if_absent',
             'discard_authority_transaction',
             'finalize_authority_transaction',
@@ -1457,7 +1309,7 @@ describe('FileStateStore versioned state', () => {
                 }),
             },
         } as unknown as ExtensionContext;
-        const store = create_file_state_store(context);
+        const store = create_memento_file_state_store(context);
 
         await expect(store.compare_and_set('/a', 0, { activeSheetIndex: 1 }))
             .rejects.toThrow('write failed');

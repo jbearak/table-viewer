@@ -27,7 +27,6 @@ import { app } from 'electron';
 import {
     SQLITE_INITIALIZATION_DURABLE_CUT_POINTS,
     SQLITE_PRESERVATION_DURABLE_CUT_POINTS,
-    acquire_sqlite_exclusive_recovery_gate,
     initialize_sqlite_database_no_clobber,
     open_existing_sqlite_database,
 } from '../src/sqlite-open-recovery';
@@ -320,8 +319,9 @@ function run_crashing_child(role, cut_point, user_data_dir) {
             }
             // An abort is *positively* identified, never inferred from "not 0 and
             // not 2". `process.abort()` raises SIGABRT, which arrives as the signal
-            // on POSIX and as the CRT's abort code (3) or STATUS_FATAL_APP_EXIT
-            // (0xC0000409) on Windows.
+            // on POSIX and as the CRT's abort code (3), the conventional
+            // 128+SIGABRT code (134), or STATUS_FATAL_APP_EXIT (0xC0000409) on
+            // Windows, depending on the embedded runtime's abort path.
             //
             // Anything else — SIGSEGV, an OOM kill, a launch failure, a plain exit 1
             // from somewhere that never reached the classified exit(2) — is an
@@ -335,7 +335,9 @@ function run_crashing_child(role, cut_point, user_data_dir) {
             // Same reasoning, and now the same rule, as
             // `windows-durability-probe.mjs`'s classifier. That one inferred aborts
             // until it was fixed; this is the sibling defect.
-            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            const aborted = signal === 'SIGABRT'
+                || (process.platform === 'win32'
+                    && (code === 3 || code === 134 || code === 0xC0000409));
             if (!aborted) {
                 // The code and the signal, and a *boolean* for the stderr — never the
                 // text. The exit-2 branch above can forward its stderr because the
@@ -452,46 +454,6 @@ async function initialization_crash_gate() {
 }
 
 /**
- * Remove the one shared-reader token left by the rollback fixture's aborted child.
- *
- * This is an attested fixture cleanup, not stale-reader inference in production:
- * `run_crashing_child` resolves only after positively identifying the child's abort
- * and receiving its exit event, the parent closed its own initializing connection,
- * and `make_user_data_dir` gave this case an isolated root that no other process is
- * allowed to use. Those facts establish `allProcessesClosed` without a PID lookup,
- * token age, TTL, or timeout-based reclamation.
- *
- * Only the public exclusive-gate exact-token API is used. The database and hot
- * journal are snapshotted around the cleanup so the gate also proves that clearing
- * coordination residue neither recovers nor otherwise changes source evidence.
- */
-async function reclaim_exited_crash_child_reader(database_path) {
-    const journal_path = `${database_path}-journal`;
-    const main_before = fs.readFileSync(database_path);
-    const journal_before = fs.readFileSync(journal_path);
-    const exclusive = await acquire_sqlite_exclusive_recovery_gate(database_path);
-    try {
-        const stale_reader_ids = exclusive.listReaderTokenIds();
-        invariant(stale_reader_ids.length === 1,
-            `the aborted writer left ${stale_reader_ids.length} reader tokens, not exactly one`);
-        await exclusive.reclaimStaleReaderToken(
-            stale_reader_ids[0],
-            { allProcessesClosed: true },
-        );
-        invariant(exclusive.listReaderTokenIds().length === 0,
-            'the aborted writer reader token survived exact attested reclamation');
-        await exclusive.waitForReaders({ timeoutMs: 0 });
-    } finally {
-        await exclusive.release();
-    }
-    invariant(fs.readFileSync(database_path).equals(main_before),
-        'reader-token cleanup changed the crashed database');
-    invariant(fs.existsSync(journal_path)
-        && fs.readFileSync(journal_path).equals(journal_before),
-        'reader-token cleanup changed or removed the hot journal');
-}
-
-/**
  * Gate 2 — a hot rollback journal is replayed by the production open.
  *
  * The child commits one value, opens a second `BEGIN IMMEDIATE`, writes a
@@ -538,13 +500,6 @@ async function rollback_journal_gate() {
         const crashed_size = fs.statSync(database_path).size;
         invariant(crashed_size > settled_size,
             'the crashed writer never spilled dirty pages, so nothing needed undoing');
-
-        // Production opens now have a finite default gate deadline. The crashed
-        // child's durable shared token is therefore deliberately reclaimed under
-        // the fixture's positive all-processes-closed attestation before asking the
-        // production hot-journal path to escalate; waiting for the known-dead token
-        // would test timeout behavior rather than rollback recovery.
-        await reclaim_exited_crash_child_reader(database_path);
 
         const opened = await open_complete_v1(database_path);
         try {
@@ -1021,10 +976,9 @@ async function platform_gate() {
         // the database, and the gate's *interior* must be empty — no reader token,
         // no exclusive intent, no blockade. A refusal that stranded coordination
         // state would make every later launch report a recovery that never
-        // happened, and on Windows this is the only substantive assertion the CI
-        // job makes. Mirrors the pinned expectation in
-        // src/test/sqlite-windows-fail-closed.test.ts, which allows the empty gate
-        // scaffolding and nothing else.
+        // happened. This arm now covers an unsupported storage location rather than
+        // Windows itself; the platform-independent public-open test pins that a
+        // supported location installs cleanly on every platform.
         const gate_directory = path.join(
             path.dirname(database_path),
             `.${path.basename(database_path)}.recovery-gate`,

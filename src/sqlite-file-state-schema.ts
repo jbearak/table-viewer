@@ -5,7 +5,8 @@ export const SQLITE_FILE_STATE_APPLICATION_ID = 1_414_940_243;
 export const SQLITE_FILE_STATE_USER_VERSION = 1;
 export const SQLITE_FILE_STATE_FORMAT = 'tableViewer.fileState.sqlite.v1';
 /**
- * Fresh, migration-free schema identity used only by direct VS Code cosmetic state.
+ * Fresh, migration-free schema identity used by the VS Code extension's own
+ * database, which has no Memento import lineage of any kind.
  *
  * This shares the single `PRAGMA user_version` number space with
  * `SQLITE_FILE_STATE_USER_VERSION`, so 2 is reserved: a future canonical desktop
@@ -23,7 +24,7 @@ export const SQLITE_FILE_STATE_MAX_COUNTER = SQLITE_FILE_STATE_EXHAUSTION_SENTIN
 // it because that field always denotes the next ownership generation to allocate.
 export const SQLITE_FILE_STATE_V1_MIGRATION_NAME = 'canonical-file-state-v1';
 export const SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME =
-    'direct-vscode-cosmetic-file-state-v1';
+    'direct-vscode-file-state-v1';
 
 export type SqliteFileStateProductKind = 'desktop' | 'vscode';
 export type SqliteFileStateAuthorityMode = 'sqlite_importing_memento' | 'sqlite';
@@ -77,9 +78,9 @@ export interface SqliteVscodeFileStateIdentity extends SqliteFileStateIdentityBa
 }
 
 /**
- * Direct VS Code-owned state with no Memento import lineage. The schemaKind
- * discriminant selects a fresh schema identity; it is not persisted as fake
- * legacy metadata and never projects to the desktop identity.
+ * VS Code-owned state with no Memento import lineage. The schemaKind discriminant
+ * selects a fresh schema identity; it is not persisted as fake legacy metadata and
+ * never projects to the desktop identity.
  */
 export interface SqliteDirectVscodeFileStateIdentity extends SqliteFileStateIdentityBase {
     readonly productKind: 'vscode';
@@ -513,9 +514,9 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
 } as const;
 
 /**
- * Direct VS Code reuses the shared backend tables verbatim. Only state_meta has
- * a fresh format/identity constraint, so desktop v1 DDL remains byte-for-byte
- * unchanged and no parallel cosmetic data model is introduced.
+ * The VS Code extension's own database reuses the shared backend tables verbatim.
+ * Only state_meta has a fresh format/identity constraint, so desktop v1 DDL remains
+ * byte-for-byte unchanged and no parallel data model is introduced.
  */
 export const SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL = {
     ...SQLITE_FILE_STATE_V1_TABLE_SQL,
@@ -593,16 +594,6 @@ export const SQLITE_FILE_STATE_V1_INDEX_SQL = {
     legacy_entry_claims_by_ordinal: `CREATE INDEX legacy_entry_claims_by_ordinal
     ON legacy_entry_claims(capsule_id, source_ordinal, destination_path)`,
 } as const;
-
-export const SQLITE_FILE_STATE_V1_SCHEMA_SQL = [
-    ...Object.values(SQLITE_FILE_STATE_V1_TABLE_SQL),
-    ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
-] as const;
-
-export const SQLITE_DIRECT_VSCODE_FILE_STATE_SCHEMA_SQL = [
-    ...Object.values(SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL),
-    ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
-] as const;
 
 export interface SqliteFileStateSchemaIdentity {
     readonly userVersion: number;
@@ -837,21 +828,26 @@ function insert_schema_identity(database: DatabaseSync, identity: SqliteFileStat
 function apply_schema_installation(
     database: DatabaseSync,
     identity: SqliteFileStateIdentity,
+    schema: SqliteFileStateSchemaIdentity,
     options: SqliteFileStateMigrationOptions,
 ): void {
-    const schema = sqlite_file_state_schema_identity(identity);
     for (const sql of Object.values(schema.tableSql)) database.exec(sql);
     for (const sql of Object.values(schema.indexSql)) database.exec(sql);
     database.prepare(`INSERT INTO schema_migrations (
         version, name, applied_at_ms, app_version
     ) VALUES (?, ?, ?, ?)`)
-        .run(schema.userVersion, schema.migrationName, options.appliedAtMs, options.appVersion);
+        .run(
+            schema.userVersion,
+            schema.migrationName,
+            options.appliedAtMs,
+            options.appVersion,
+        );
     insert_schema_identity(database, identity);
 }
 
 /**
- * Install the exact schema selected by the supplied identity into an empty
- * candidate. Existing nonzero schema versions are never migrated or rebranded.
+ * Apply all ordered canonical migrations. V1 only initializes an empty candidate;
+ * it never adopts or brands an existing unrecognized schema.
  */
 export function migrate_sqlite_file_state_schema(
     database: DatabaseSync,
@@ -862,9 +858,9 @@ export function migrate_sqlite_file_state_schema(
     assert_safe_integer(options.appliedAtMs, 'appliedAtMs');
     assert_nonempty(options.appVersion, 'appVersion');
 
-    const schema = sqlite_file_state_schema_identity(identity);
     const applicationId = scalar_number(database, 'PRAGMA application_id', 'application_id');
     const userVersion = scalar_number(database, 'PRAGMA user_version', 'user_version');
+    const schema = sqlite_file_state_schema_identity(identity);
     if (userVersion === schema.userVersion) {
         if (applicationId !== SQLITE_FILE_STATE_APPLICATION_ID) {
             throw new Error('SQLite file-state application identity does not match.');
@@ -879,7 +875,7 @@ export function migrate_sqlite_file_state_schema(
         return;
     }
     if (userVersion !== 0 || applicationId !== 0) {
-        throw new Error('SQLite file-state database has an unsupported schema identity.');
+        throw new Error('SQLite file-state database has an unsupported partial identity.');
     }
     const userObjects = scalar_number(
         database,
@@ -900,7 +896,7 @@ export function migrate_sqlite_file_state_schema(
     database.exec('BEGIN IMMEDIATE');
     try {
         database.exec(`PRAGMA application_id = ${SQLITE_FILE_STATE_APPLICATION_ID}`);
-        apply_schema_installation(database, identity, options);
+        apply_schema_installation(database, identity, schema, options);
         options.beforeSetUserVersion?.();
         database.exec(`PRAGMA user_version = ${schema.userVersion}`);
         database.exec('COMMIT');
@@ -914,5 +910,5 @@ export function migrate_sqlite_file_state_schema(
     }
 }
 
-/** Alias emphasizing direct initialization rather than cross-version migration. */
+/** Alias emphasizing that v1 initialization is the only currently ordered migration. */
 export const initialize_sqlite_file_state_schema = migrate_sqlite_file_state_schema;

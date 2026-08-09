@@ -168,7 +168,6 @@
           "type": "number",
           "default": 256,
           "minimum": 1,
-          "maximum": 256,
           "description": "Maximum file size in MiB for all file types (xlsx, xls, csv, tsv)."
         }
       }
@@ -178,8 +177,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:sqlite:multiprocess": "vitest run src/test/sqlite-multiprocess.test.ts",
-    "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts src/test/vscode-cosmetic-state-database.test.ts",
-    "test:sqlite:windows-fail-closed": "node -e \"if (process.platform !== 'win32') { console.error('Windows SQLite test requires win32'); process.exit(1); }\" && vitest run src/test/sqlite-windows-fail-closed.test.ts",
+    "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts src/test/vscode-state-database.test.ts",
+    "test:sqlite:public-open": "vitest run src/test/sqlite-platform-public-open.test.ts",
     "test:sqlite:performance": "vitest run --no-file-parallelism src/test/sqlite-performance.test.ts",
     "compile:integration": "tsc -p tsconfig.integration.json",
     "typecheck": "tsc -p . --noEmit",

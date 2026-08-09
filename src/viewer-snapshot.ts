@@ -74,9 +74,6 @@ export interface WorkbookSnapshotConfiguration {
 export interface WorkbookSnapshotCapabilities {
     readonly csvEditable: boolean;
     readonly csvEditingSupported: boolean;
-    /** Desktop retains renderer-owned sessions; VS Code delegates content to CustomDocument. */
-    readonly csvEditingMode: 'selfManaged' | 'vscodeDocument';
-    readonly csvDocumentViewId?: string;
     readonly csvEditSessionId?: string;
     /** Monotonic host projection for the complete panel save lifecycle. */
     readonly csvSaveLifecycle: CsvSaveLifecycle;

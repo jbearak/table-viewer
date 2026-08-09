@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       allow_missing_windows:
-        description: 'Publish even though the Windows desktop artifact is absent. Only consulted for a hand-dispatched publish; the selected build run must still be successful, and this flag explicitly acknowledges the intended omission.'
+        description: 'Publish even though the Windows desktop artifact is absent. Only consulted for a hand-dispatched publish; set it to acknowledge that the omission is intentional.'
         required: false
         default: false
         type: boolean
@@ -89,7 +89,7 @@ jobs:
         with:
           node-version: '26.5.1'
 
-      - name: Validate tag + version
+      - name: Validate tag + versions
         id: version
         shell: bash
         env:
@@ -218,8 +218,8 @@ jobs:
 
           # The desktop job of the same run produces the macOS app that the
           # Homebrew cask downloads. Land it in desktop-dist/ rather than beside
-          # the exact extension package and checksum paths, so desktop downloads
-          # cannot be mistaken for extension release artifacts.
+          # the exact extension VSIX path, so desktop downloads cannot
+          # be mistaken for extension packages or their checksums.
           #
           # Absent is not fatal: tags built before the desktop job existed, and
           # runs whose artifacts have aged out, have no desktop-* artifact. The
@@ -238,26 +238,21 @@ jobs:
           # trigger fired — and getting that wrong once made every tag-triggered
           # publish impossible, so the two cases are spelled out.
           #
-          # release-build.yml's `desktop-windows` job packages nothing today: this
-          # build cannot open its SQLite state database on Windows, so there is no
-          # correct Windows artifact to publish. It reports that and exits 0 — it
-          # does NOT fail — because Windows being unproven must never withhold the
-          # macOS release. See the long comment on that job.
+          # release-build.yml's `desktop-windows` job packages nothing today. The
+          # SQLite backend runs on Windows, but complete packaged-runtime NTFS
+          # kill-crash evidence is still pending, so the release fence intentionally
+          # emits no Windows artifact. See the long comment on that job.
           #
-          # `workflow_run` — a pushed tag. The build run's own conclusion is the
-          # fence: this job's `if` requires `conclusion == 'success'`, so a build
-          # that genuinely broke never gets here at all. Reaching here with no
-          # `windows-<tag>` artifact is therefore the expected state of the fence,
-          # not a lost artifact, and failing on it would block the macOS dmg, the
-          # .vsix, the GitHub Release, and the Homebrew bump for a platform that was
-          # never being shipped. Warn and continue.
+          # `workflow_run` — a pushed tag. A successful Release Build is the policy
+          # signal that the known fence, including its absent Windows artifact, was
+          # evaluated for this commit. Warn and continue so it cannot withhold the
+          # macOS dmg, the .vsix, the GitHub Release, or the Homebrew bump.
           #
-          # `workflow_dispatch` — a human. Artifact selection above still requires
-          # a successful Release Build at the peeled tag commit, but this recovery
-          # path is intentionally more explicit than the automatic tag flow: a human
-          # must acknowledge the missing Windows download rather than inherit the
-          # automatic trigger's expected-fence policy. Dispatch with
-          # allow_missing_windows=true to say that omission is intended.
+          # `workflow_dispatch` — a human. Artifact selection still requires a
+          # successful Release Build for the pinned commit, but a manual publish is
+          # an exceptional action rather than the automatic continuation of that
+          # build. Require allow_missing_windows=true as an explicit, auditable
+          # acknowledgement that the omission is intended.
           if grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
             gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
             echo "windows=true" >> "$GITHUB_OUTPUT"
@@ -270,12 +265,13 @@ jobs:
           else
             echo "windows=false" >> "$GITHUB_OUTPUT"
             cat >&2 <<MESSAGE
-          ERROR: no windows-${THE_TAG} artifact, and this hand-dispatched publish would
-          ship a release without the Windows downloads.
+          ERROR: no windows-${THE_TAG} artifact, and this hand-dispatched publish has
+          not acknowledged that the Windows downloads are intentionally omitted.
 
-          The selected artifact is from a successful Release Build at the peeled tag
-          commit, but hand-dispatched publishes require explicit acknowledgement of the
-          omission rather than inheriting the automatic tag flow's expected-fence policy.
+          Artifact selection already proved that a successful Release Build produced the
+          required VSIX for this pinned commit. A pushed-tag publish treats the absent
+          Windows artifact as the expected state of the release fence. A manual publish is
+          exceptional, so it requires the operator to acknowledge that same omission.
 
           Re-run the build for this tag, or, if Windows is meant to be omitted from the
           release page, say so explicitly:
@@ -285,7 +281,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify extension and desktop checksums
+      - name: Verify main and desktop checksums
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -303,7 +299,7 @@ jobs:
         working-directory: .github/release-tools
         run: npm ci --ignore-scripts
 
-      - name: Revalidate release tag before Marketplace publication
+      - name: Revalidate release tag before registry publication
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -322,17 +318,40 @@ jobs:
             CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
           done
           if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before Marketplace publication" >&2
+            echo "ERROR: release tag moved after immutable build validation" >&2
             exit 1
           fi
 
-      - name: Publish to VS Code Marketplace
-        run: .github/release-tools/node_modules/.bin/vsce publish --skip-duplicate --packagePath "table-viewer-${VERSION}.vsix" --pat "$VSCE_PAT"
+      - name: Revalidate release tag before main Marketplace publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THE_TAG: ${{ env.RELEASE_TAG }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
+          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          for _ in 1 2 3 4; do
+            [[ "$TYPE" == "commit" ]] && break
+            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
+            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
+            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
+            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
+          done
+          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release tag moved before main Marketplace publication" >&2
+            exit 1
+          fi
+
+      - name: Publish main extension to VS Code Marketplace
+        run: .github/release-tools/node_modules/.bin/vsce publish --skip-duplicate --packagePath "table-viewer-${VERSION}.vsix"
         env:
           VERSION: ${{ steps.version.outputs.version }}
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      - name: Revalidate release tag before Open VSX publication
+      - name: Revalidate release tag before main Open VSX publication
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -351,12 +370,12 @@ jobs:
             CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
           done
           if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before Open VSX publication" >&2
+            echo "ERROR: release tag moved before main Open VSX publication" >&2
             exit 1
           fi
 
-      - name: Publish to Open VSX
-        run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "table-viewer-${VERSION}.vsix" --pat "$OVSX_PAT"
+      - name: Publish main extension to Open VSX
+        run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "table-viewer-${VERSION}.vsix"
         env:
           VERSION: ${{ steps.version.outputs.version }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
@@ -380,7 +399,7 @@ jobs:
             CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
           done
           if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before GitHub Release" >&2
+            echo "ERROR: release tag moved after registry publication" >&2
             exit 1
           fi
 
@@ -487,51 +506,17 @@ jobs:
           SHA256="$(sha256sum "${DMG[0]}" | cut -d' ' -f1)"
           CASK_PATH="tap/Casks/table-viewer.rb"
           export VERSION SHA256 CASK_PATH
-          node <<'NODE'
-          const fs = require('node:fs');
-          const semver = require('./.github/release-tools/node_modules/semver');
-
-          const path = process.env.CASK_PATH;
-          const targetVersion = process.env.VERSION;
-          const targetChecksum = process.env.SHA256;
-          const text = fs.readFileSync(path, 'utf8');
-          const versionPattern = /^([ \t]*)version[ \t]+"([^"]+)"[ \t]*$/gm;
-          const checksumPattern = /^([ \t]*)sha256[ \t]+"([0-9a-f]+)"[ \t]*$/gm;
-          const versions = [...text.matchAll(versionPattern)];
-          const checksums = [...text.matchAll(checksumPattern)];
-          if (versions.length !== 1) throw new Error('expected exactly one cask version');
-          if (checksums.length !== 1) throw new Error('expected exactly one cask checksum');
-          const currentVersion = versions[0][2];
-          if (!semver.valid(currentVersion) || !semver.valid(targetVersion)) {
-              throw new Error(`invalid cask version transition ${currentVersion} -> ${targetVersion}`);
-          }
-          const comparison = semver.compare(currentVersion, targetVersion);
-          if (comparison === 0 && currentVersion !== targetVersion) {
-              throw new Error(
-                  `ambiguous equal-precedence cask transition ${currentVersion} -> ${targetVersion}`,
-              );
-          }
-          if (comparison > 0) {
-              console.log(
-                  `Homebrew cask ${currentVersion} is newer than ${targetVersion}; skipping downgrade.`,
-              );
-              process.exit(0);
-          }
-          let updated = text;
-          if (comparison < 0) {
-              updated = updated.replace(
-                  versionPattern,
-                  (_match, indent) => `${indent}version "${targetVersion}"`,
-              );
-          }
-          if (comparison < 0 || checksums[0][2] !== targetChecksum) {
-              updated = updated.replace(
-                  checksumPattern,
-                  (_match, indent) => `${indent}sha256 "${targetChecksum}"`,
-              );
-          }
-          fs.writeFileSync(path, updated);
-          NODE
+          ruby <<'RUBY'
+          path = ENV.fetch('CASK_PATH')
+          text = File.read(path)
+          version = /^([ \t]*)version[ \t]+"[^"]+"[ \t]*$/
+          checksum = /^([ \t]*)sha256[ \t]+"[0-9a-f]+"[ \t]*$/
+          raise 'expected exactly one cask version' unless text.scan(version).length == 1
+          raise 'expected exactly one cask checksum' unless text.scan(checksum).length == 1
+          text.sub!(version) { "#{$1}version \"#{ENV.fetch('VERSION')}\"" }
+          text.sub!(checksum) { "#{$1}sha256 \"#{ENV.fetch('SHA256')}\"" }
+          File.write(path, text)
+          RUBY
 
       - name: Open Homebrew bump PR + enable auto-merge
         if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'

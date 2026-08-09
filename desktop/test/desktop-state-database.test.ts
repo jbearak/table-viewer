@@ -337,20 +337,16 @@ describe('desktop state platform support', () => {
         expect(control_roots_for(above_candidate)).not.toContain(candidate);
     });
 
-    it('keeps an unconditional platform refusal when no unrelated control exists', () => {
+    it('promotes to the platform story only when an unrelated control agrees', () => {
+        // An agreeing control is now the whole discriminator: no platform is refused
+        // outright any more, so two unrelated locations refusing is the only evidence
+        // that the operating system rather than one mount is the problem.
         expect(desktop_state_durability_refusal_operation(
             'directory-durability',
             true,
-            false,
         )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
         expect(desktop_state_durability_refusal_operation(
             'directory-durability',
-            false,
-            true,
-        )).toBe(DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION);
-        expect(desktop_state_durability_refusal_operation(
-            'directory-durability',
-            false,
             false,
         )).toBe('directory-durability');
     });

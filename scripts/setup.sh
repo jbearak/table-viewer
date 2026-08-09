@@ -49,9 +49,13 @@ if ! command -v node &> /dev/null; then
 fi
 
 # Check Node version (matches engines.node in package.json)
-NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
-if [ "$NODE_MAJOR" -lt 24 ]; then
-    echo "Error: Node >= 24 is required (found $(node -v))."
+if ! node -e '
+    const [major, minor, patch] = process.versions.node.split(".").map(Number);
+    const supported = major > 26
+        || (major === 26 && (minor > 5 || (minor === 5 && patch >= 1)));
+    process.exit(supported ? 0 : 1);
+'; then
+    echo "Error: Node >= 26.5.1 is required (found $(node -v))."
     exit 1
 fi
 

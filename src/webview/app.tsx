@@ -31,7 +31,6 @@ import {
     type ViewBasis,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
-import type { CsvDocumentConflictState } from '../csv-custom-document';
 import {
     classify_snapshot,
     normalize_complete_per_file_state,
@@ -383,29 +382,6 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
-    const [csv_editing_mode, set_csv_editing_mode_state] = useState<
-        'selfManaged' | 'vscodeDocument'
-    >('selfManaged');
-    const csv_editing_mode_ref = useRef<'selfManaged' | 'vscodeDocument'>(
-        'selfManaged',
-    );
-    const set_csv_editing_mode = useCallback((next: 'selfManaged' | 'vscodeDocument') => {
-        csv_editing_mode_ref.current = next;
-        set_csv_editing_mode_state(next);
-    }, []);
-    const csv_document_view_id_ref = useRef<string>();
-    const document_confirmed_revision_ref = useRef(0);
-    const document_outbound_revision_ref = useRef(0);
-    const document_source_generation_ref = useRef(0);
-    const document_mutation_epoch_ref = useRef(0);
-    const document_view_mutation_epoch_ref = useRef(0);
-    const document_publication_admitted_ref = useRef(false);
-    const document_projection_epoch_ref = useRef(0);
-    const [document_projection_epoch, set_document_projection_epoch] = useState(0);
-    const [csv_document_synced, set_csv_document_synced] = useState(false);
-    const [document_conflict, set_document_conflict] = useState<
-        CsvDocumentConflictState
-    >({ type: 'none' });
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     const renderer_publication_fenced_session_ref = useRef<string>();
@@ -536,17 +512,6 @@ export function App(): React.JSX.Element {
     // GridShell populates this with imperative save/discard actions (the dirty map
     // lives next to the loader); App calls them from the toolbar + conflict banner.
     const editing_ref = useRef<EditingHandle | null>(null);
-    const advance_document_projection_epoch = useCallback(() => {
-        const next = document_projection_epoch_ref.current + 1;
-        document_projection_epoch_ref.current = next;
-        set_document_projection_epoch(next);
-    }, []);
-    const fence_document_projection = useCallback(() => {
-        document_publication_admitted_ref.current = false;
-        advance_document_projection_epoch();
-        editing_ref.current?.stop_edit_admission();
-        set_csv_document_synced(false);
-    }, [advance_document_projection_epoch]);
     // GridShell populates this with a measure function returning fitted column
     // widths (null when nothing is loaded); App calls it from the auto-fit toggle.
     const auto_fit_ref = useRef<(() => Record<number, number> | null) | null>(null);
@@ -678,9 +643,6 @@ export function App(): React.JSX.Element {
     );
 
     useLayoutEffect(() => install_pending_edit_flush_responder(async () => {
-        if (csv_editing_mode_ref.current === 'vscodeDocument') {
-            return { highestProducedSequence: 0 };
-        }
         const edit_session_id = csv_edit_session_id_ref.current;
         if (!edit_session_id) return { highestProducedSequence: 0 };
 
@@ -980,89 +942,6 @@ export function App(): React.JSX.Element {
         set_pending_preview_scroll(pending);
     }, []);
 
-    const request_document_resync = useCallback(() => {
-        const view_id = csv_document_view_id_ref.current;
-        const view_mutation_epoch = document_view_mutation_epoch_ref.current;
-        if (
-            !view_id
-            || view_mutation_epoch === 0
-            || csv_editing_mode_ref.current !== 'vscodeDocument'
-            || !document_publication_admitted_ref.current
-        ) return;
-        fence_document_projection();
-        host_bridge.postMessage({
-            type: 'csvDocumentResyncRequest',
-            viewId: view_id,
-            viewMutationEpoch: view_mutation_epoch,
-            mutationEpoch: document_mutation_epoch_ref.current,
-        });
-    }, [fence_document_projection]);
-
-    const install_document_projection = useCallback((projection: {
-        readonly revision: number;
-        readonly sourceGeneration: number;
-        readonly mutationEpoch: number;
-        readonly viewMutationEpoch: number;
-        readonly dirtyEntries: CsvDirtyMap;
-        readonly conflict: CsvDocumentConflictState;
-    }) => {
-        document_publication_admitted_ref.current = false;
-        editing_ref.current?.stop_edit_admission();
-        advance_document_projection_epoch();
-        document_confirmed_revision_ref.current = projection.revision;
-        document_outbound_revision_ref.current = projection.revision;
-        document_source_generation_ref.current = projection.sourceGeneration;
-        document_mutation_epoch_ref.current = projection.mutationEpoch;
-        document_view_mutation_epoch_ref.current = projection.viewMutationEpoch;
-        install_edit_session(projection.dirtyEntries, undefined);
-        set_document_conflict(projection.conflict);
-        set_csv_document_synced(true);
-        document_publication_admitted_ref.current = true;
-    }, [advance_document_projection_epoch, install_edit_session]);
-
-    const apply_document_patch = useCallback((patch: Extract<
-        HostMessage,
-        { readonly type: 'csvDocumentPatch' }
-    >) => {
-        if (csv_editing_mode_ref.current !== 'vscodeDocument') return;
-        if (
-            patch.sourceGeneration !== document_source_generation_ref.current
-            || patch.mutationEpoch !== document_mutation_epoch_ref.current
-        ) {
-            request_document_resync();
-            return;
-        }
-        const confirmed = document_confirmed_revision_ref.current;
-        if (patch.revision <= confirmed) return;
-        if (patch.revision !== confirmed + 1) {
-            request_document_resync();
-            return;
-        }
-        document_confirmed_revision_ref.current = patch.revision;
-        document_outbound_revision_ref.current = Math.max(
-            document_outbound_revision_ref.current,
-            patch.revision,
-        );
-        const store = edit_session_ref.current!;
-        if (patch.dirtyEntry) {
-            store.commit(undefined, patch.key, patch.dirtyEntry);
-        } else {
-            store.remove(undefined, patch.key);
-        }
-        // An older acknowledgment from this view must not roll the focused editor
-        // back over newer optimistic input. Sibling edits and native history are
-        // external authority and reconcile immediately; the latest self echo does
-        // too, ensuring a later commit cannot repaint stale browser-local text.
-        const has_newer_local_input = patch.selfOriginated
-            && patch.revision < document_outbound_revision_ref.current;
-        if (!has_newer_local_input) {
-            editing_ref.current?.apply_authoritative_cell_value(
-                patch.key,
-                patch.value,
-            );
-        }
-    }, [request_document_resync]);
-
     useEffect(() => {
         preview_mode_ref.current = preview_mode;
         if (!preview_mode) {
@@ -1074,34 +953,6 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
-
-            if (msg.type === 'csvDocumentSync') {
-                if (csv_editing_mode_ref.current === 'vscodeDocument') {
-                    install_document_projection(msg);
-                }
-                return;
-            }
-            if (msg.type === 'csvDocumentPatch') {
-                apply_document_patch(msg);
-                return;
-            }
-            if (msg.type === 'csvDocumentSourceReplaced') {
-                if (csv_editing_mode_ref.current === 'vscodeDocument') {
-                    // Fence the old projection synchronously before installing any
-                    // replacement authority. The controller publishes a fresh document
-                    // sync only after the replacement workbook snapshot is adopted.
-                    fence_document_projection();
-                    document_confirmed_revision_ref.current = msg.revision;
-                    document_outbound_revision_ref.current = msg.revision;
-                    document_source_generation_ref.current = msg.sourceGeneration;
-                    document_mutation_epoch_ref.current = msg.mutationEpoch;
-                    install_edit_session({}, undefined);
-                    set_document_conflict({ type: 'none' });
-                    set_csv_editable(false);
-                    set_load_epoch((epoch) => epoch + 1);
-                }
-                return;
-            }
 
             if (msg.type === 'cellHighlightsChanged') {
                 const identity = snapshot_identity_ref.current;
@@ -1360,18 +1211,13 @@ export function App(): React.JSX.Element {
                         last_highlight_state_revision_ref.current = snapshot.identity.stateRevision;
                         set_cell_highlights(snapshot_highlights);
                     }
-                    const snapshot_editing_mode =
-                        snapshot.capabilities.csvEditingMode;
-                    const snapshot_edit_session_id = snapshot_editing_mode === 'selfManaged'
-                        ? snapshot.capabilities.csvEditSessionId
-                        : undefined;
+                    const snapshot_edit_session_id =
+                        snapshot.capabilities.csvEditSessionId;
                     const refresh_editing_current_session =
-                        snapshot_editing_mode === 'selfManaged'
-                        && snapshot.presentation === 'refresh'
+                        snapshot.presentation === 'refresh'
                         && edit_mode_ref.current
                         && csv_edit_session_id_ref.current === snapshot_edit_session_id;
                     const refresh_edits = snapshot.presentation === 'refresh'
-                        && snapshot_editing_mode === 'selfManaged'
                         ? resolve_csv_save_hydration(
                             applied_save_transition.next,
                             snapshot_edit_session_id,
@@ -1524,44 +1370,30 @@ export function App(): React.JSX.Element {
                                 : snapshot.configuration.defaultTabOrientation === 'vertical',
                         );
                         state_ref.current = normalized;
-                        const restored_edits = snapshot_editing_mode === 'selfManaged'
-                            ? resolve_csv_save_hydration(
-                                applied_save_transition.next,
-                                snapshot_edit_session_id,
-                                normalized.pendingEdits,
-                            )
-                            : undefined;
+                        const restored_edits = resolve_csv_save_hydration(
+                            applied_save_transition.next,
+                            snapshot_edit_session_id,
+                            normalized.pendingEdits,
+                        );
                         const exact_session_succeeded =
-                            snapshot_editing_mode === 'selfManaged'
-                            && applied_save_transition.next.authoritative.state === 'succeeded'
+                            applied_save_transition.next.authoritative.state === 'succeeded'
                             && applied_save_transition.next.authoritative.operation.editSessionId
                                 === snapshot_edit_session_id;
                         const owns_clean_or_dirty_session =
-                            snapshot_editing_mode === 'selfManaged'
-                            && snapshot_edit_session_id !== undefined
+                            snapshot_edit_session_id !== undefined
                             && snapshot.capabilities.csvEditable
                             && !exact_session_succeeded;
-                        if (snapshot_editing_mode === 'selfManaged') {
-                            const hydrated_edits = owns_clean_or_dirty_session
-                                ? restored_edits ?? {}
-                                : restored_edits;
-                            install_edit_session(
-                                hydrated_edits,
-                                snapshot_edit_session_id,
-                            );
-                            set_edit_mode(
-                                owns_clean_or_dirty_session
-                                || restored_edits !== undefined,
-                            );
-                        } else {
-                            // A fresh document starts fenced and empty until the
-                            // controller's revisioned document sync arrives immediately
-                            // after this workbook snapshot. Never hydrate VS Code edits
-                            // from cosmetic per-file state.
-                            fence_document_projection();
-                            install_edit_session({}, undefined);
-                            set_edit_mode(false);
-                        }
+                        const hydrated_edits = owns_clean_or_dirty_session
+                            ? restored_edits ?? {}
+                            : restored_edits;
+                        install_edit_session(
+                            hydrated_edits,
+                            snapshot_edit_session_id,
+                        );
+                        set_edit_mode(
+                            owns_clean_or_dirty_session
+                            || restored_edits !== undefined,
+                        );
                         set_editing_status(null);
                         // A fresh document: the rejection and the dismissal go
                         // together. The install above deliberately does not clear the
@@ -1826,16 +1658,7 @@ export function App(): React.JSX.Element {
                     });
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
-                    set_csv_editing_mode(snapshot_editing_mode);
-                    csv_document_view_id_ref.current =
-                        snapshot_editing_mode === 'vscodeDocument'
-                            ? snapshot.capabilities.csvDocumentViewId
-                            : undefined;
-                    if (snapshot_editing_mode === 'selfManaged') {
-                        set_csv_document_synced(false);
-                        set_document_conflict({ type: 'none' });
-                    }
-                    set_csv_edit_session_id(snapshot_edit_session_id);
+                    set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
                     set_csv_editing_supported(
                         snapshot.capabilities.csvEditingSupported,
                     );
@@ -2189,12 +2012,8 @@ export function App(): React.JSX.Element {
         return () => window.removeEventListener('message', handler);
     }, [
         active_sheet_index,
-        apply_document_patch,
         apply_save_lifecycle,
         clear_pending_preview_scroll,
-        fence_document_projection,
-        install_document_projection,
-        install_edit_session,
         persist_immediate,
         queue_preview_scroll,
         reset_save_projection,
@@ -2571,103 +2390,6 @@ export function App(): React.JSX.Element {
         request_excel_header(true, false, display_row);
     }, [request_excel_header]);
 
-    const post_native_document_command = useCallback((
-        command: 'save' | 'undo' | 'redo',
-    ): boolean => {
-        if (
-            csv_editing_mode_ref.current !== 'vscodeDocument'
-            || !document_publication_admitted_ref.current
-            || document_projection_epoch !== document_projection_epoch_ref.current
-        ) return false;
-        host_bridge.postMessage({ type: 'csvDocumentNativeCommand', command });
-        return true;
-    }, [document_projection_epoch]);
-
-    const handle_document_cell_input = useCallback((key: string, value: string) => {
-        const view_id = csv_document_view_id_ref.current;
-        if (
-            !view_id
-            || csv_editing_mode_ref.current !== 'vscodeDocument'
-            || document_source_generation_ref.current === 0
-            || document_mutation_epoch_ref.current === 0
-            || document_view_mutation_epoch_ref.current === 0
-            || !document_publication_admitted_ref.current
-            || document_projection_epoch !== document_projection_epoch_ref.current
-        ) return;
-        const revision = document_outbound_revision_ref.current;
-        document_outbound_revision_ref.current = revision + 1;
-        host_bridge.postMessage({
-            type: 'csvDocumentCellInput',
-            viewId: view_id,
-            viewMutationEpoch: document_view_mutation_epoch_ref.current,
-            key,
-            value,
-            revision,
-            mutationEpoch: document_mutation_epoch_ref.current,
-        });
-    }, [document_projection_epoch]);
-
-    const finish_document_gesture = useCallback((cancelled: boolean) => {
-        const view_id = csv_document_view_id_ref.current;
-        if (
-            !view_id
-            || document_view_mutation_epoch_ref.current === 0
-            || csv_editing_mode_ref.current !== 'vscodeDocument'
-            || !document_publication_admitted_ref.current
-            || document_projection_epoch !== document_projection_epoch_ref.current
-        ) return;
-        host_bridge.postMessage({
-            type: cancelled
-                ? 'csvDocumentGestureCancel'
-                : 'csvDocumentGestureComplete',
-            viewId: view_id,
-            viewMutationEpoch: document_view_mutation_epoch_ref.current,
-            revision: document_outbound_revision_ref.current,
-            mutationEpoch: document_mutation_epoch_ref.current,
-        });
-    }, [document_projection_epoch]);
-    const handle_document_gesture_complete = useCallback(() => {
-        finish_document_gesture(false);
-    }, [finish_document_gesture]);
-    const handle_document_gesture_cancel = useCallback(() => {
-        finish_document_gesture(true);
-    }, [finish_document_gesture]);
-
-    useEffect(() => {
-        if (csv_editing_mode !== 'vscodeDocument') return;
-        const handler = (event: KeyboardEvent) => {
-            if (event.defaultPrevented || !(event.metaKey || event.ctrlKey) || event.altKey) {
-                return;
-            }
-            const active = document.activeElement;
-            if (active instanceof HTMLElement && active.matches('.cell-editor-input')) {
-                // The focused cell editor must commit and close its optimistic overlay
-                // before routing Save or history. Its target-level handler runs after
-                // this capture listener; Save As then bubbles untouched to VS Code.
-                return;
-            }
-            const key = event.key.toLowerCase();
-            let command: 'save' | 'undo' | 'redo' | undefined;
-            if (key === 's' && !event.shiftKey) command = 'save';
-            else if (key === 'z') command = event.shiftKey ? 'redo' : 'undo';
-            else if (key === 'y' && !event.shiftKey) command = 'redo';
-            if (!command) return;
-            if (command !== 'save' && edit_command_target(active) === 'text') return;
-            // VS Code installs its webview keybinding bridge on the bubbling phase
-            // before extension scripts run. Capture document commands first so that
-            // bridge cannot preempt the document-targeted lifecycle/history request.
-            // Consume the keystroke only once the command is actually routed: an
-            // unadmitted projection or a stale epoch posts nothing, and swallowing
-            // the gesture there would lose Save/Undo/Redo silently. Propagation
-            // resumes after this handler returns, so posting first is equivalent.
-            if (!post_native_document_command(command)) return;
-            event.preventDefault();
-            event.stopImmediatePropagation();
-        };
-        window.addEventListener('keydown', handler, { capture: true });
-        return () => window.removeEventListener('keydown', handler, { capture: true });
-    }, [csv_editing_mode, post_native_document_command]);
-
     const handle_toggle_edit_mode = useCallback(() => {
         if (!edit_mode) {
             if (edit_session_pending) return;
@@ -2680,11 +2402,6 @@ export function App(): React.JSX.Element {
                     type: 'showWarning',
                     message: 'Wait for sorting and filtering to finish before entering edit mode.',
                 });
-                return;
-            }
-            if (csv_editing_mode === 'vscodeDocument') {
-                if (!csv_document_synced) return;
-                set_edit_mode(true);
                 return;
             }
             set_edit_session_pending(true);
@@ -2700,14 +2417,8 @@ export function App(): React.JSX.Element {
             });
             return;
         }
-        if (csv_editing_mode === 'vscodeDocument') {
-            // Content remains owned (and, when changed, dirty) in the native custom
-            // document. This toggle only controls whether the grid accepts input.
-            set_edit_mode(false);
-            return;
-        }
-        // Leaving self-managed edit mode with unsaved work: defer to a host
-        // Save/Discard/Cancel dialog (handled below); otherwise exit immediately.
+        // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
+        // dialog (handled below); otherwise exit immediately.
         if (editing_ref.current?.has_uncommitted_changes()) {
             if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
             const request = {
@@ -2730,9 +2441,6 @@ export function App(): React.JSX.Element {
         edit_session_pending,
         active_sheet_index,
         csv_edit_session_id,
-        csv_editing_mode,
-        csv_document_synced,
-        set_edit_mode,
     ]);
 
     /**
@@ -3895,22 +3603,10 @@ export function App(): React.JSX.Element {
         && overlay_for_active_sheet.generation === generation
             ? overlay_for_active_sheet.layers
             : undefined;
-    const document_conflict_message = csv_editing_mode !== 'vscodeDocument'
-        || document_conflict.type === 'none'
-        ? null
-        : document_conflict.type === 'externalChange'
-        ? 'The file changed externally. Save is blocked; revert the file or use Save As.'
-        : document_conflict.type === 'dirtyBases'
-        ? document_conflict.reason === 'rowsRemoved'
-            ? 'Edited rows no longer exist in the file. Revert the file or use Save As.'
-            : 'Edited cells no longer match the file. Revert the file or use Save As.'
-        : document_conflict.type === 'truncated'
-        ? 'This truncated file cannot be edited safely.'
-        : 'The last file write could not be verified. Your edits remain in the document.';
 
     const grid = (
         <GridShell
-            key={`${active_sheet_index}:${load_epoch}:${generation}:${document_projection_epoch}`}
+            key={`${active_sheet_index}:${load_epoch}:${generation}`}
             sheet_meta={current_sheet}
             sheet_index={active_sheet_index}
             generation={generation}
@@ -3930,15 +3626,8 @@ export function App(): React.JSX.Element {
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode}
-            csv_editable={csv_editable && (
-                csv_editing_mode !== 'vscodeDocument' || csv_document_synced
-            )}
-            editing_mode={csv_editing_mode}
+            csv_editable={csv_editable}
             edit_session_id={csv_edit_session_id}
-            on_document_cell_input={handle_document_cell_input}
-            on_document_gesture_complete={handle_document_gesture_complete}
-            on_document_gesture_cancel={handle_document_gesture_cancel}
-            on_native_document_command={post_native_document_command}
             save_operation={save_operation}
             save_lifecycle={save_lifecycle}
             on_save_request={begin_save_operation}
@@ -4061,22 +3750,14 @@ export function App(): React.JSX.Element {
                     || (!edit_mode && (
                         edit_session_pending
                         || transform_pending
-                        || (
-                            csv_editing_mode === 'vscodeDocument'
-                            && !csv_document_synced
-                        )
                     ))
                 }
                 edit_disabled_reason={
                     editing_status?.save_in_flight
                         ? 'Saving changes.'
-                        : csv_editing_mode === 'vscodeDocument'
-                            && !csv_document_synced
-                        ? 'Waiting for the document to synchronize.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'
-                        // Transform work in flight is the only remaining
-                        // self-managed disabler.
+                        // Transform work in flight is the only disabler left.
                         : 'Wait for sorting and filtering to finish.'
                 }
             />
@@ -4100,11 +3781,6 @@ export function App(): React.JSX.Element {
             )}
             {truncation_message && (
                 <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
-            )}
-            {document_conflict_message && (
-                <div className="truncation-banner" role="status">
-                    {document_conflict_message}
-                </div>
             )}
             {show_stale_view_banner && (
                 // Informational only. Deliberately no "Resort"/"Refilter"/"Refresh"

@@ -1,11 +1,11 @@
 // Windows durability verification probe: an *investigation*, not a gate.
 //
-// Production declines Windows for the SQLite backend
-// (`assert_sqlite_directory_durability_supported` in src/sqlite-open-recovery.ts)
-// because Node exposes no primitive there that has been shown to make a
-// directory-entry change durable. That refusal is a statement about evidence, not
-// about Windows, and until now nobody had gathered the evidence. This probe
-// gathers it: it runs on the CI Windows runners inside the packaged Electron
+// Production ships the SQLite backend on Windows, and
+// `assert_sqlite_directory_durability_supported` (src/sqlite-open-recovery.ts)
+// skips the directory flush there rather than refusing, because Node exposes no
+// primitive on NTFS to make a directory-entry change durable — the same posture
+// SQLite's own Windows VFS takes. That skip is an assumption, and this probe is
+// what tests it: it runs on the CI Windows runners inside the packaged Electron
 // runtime and reports what that runtime can actually do on the volume it is
 // standing on.
 //
@@ -20,23 +20,21 @@
 // THE DECISION TREE THIS PROBE FEEDS
 // ---------------------------------------------------------------------------
 //
-// Windows is *not* a dropped target. Which of two ways it ships is decided by
-// what this probe (and the kill-crash matrix it is the skeleton of) establishes:
+// Windows ships the state backend either way. What this probe (and the kill-crash
+// matrix it is the skeleton of) decides is what the durability claim in
+// desktop/README.md is allowed to say:
 //
 //   Gate VERIFIES  — a reachable primitive is documented to make directory-entry
 //                    changes durable, *and* the kill-crash matrix passes over
-//                    every durable cut point on NTFS. Windows then ships the
-//                    SQLite state backend on exactly the evidence standard macOS
-//                    ships on: a written durability contract plus crash
-//                    verification against the packaged runtime. Nothing weaker.
-//                    `assert_sqlite_directory_durability_supported` is only
-//                    relaxed once that evidence exists and is recorded.
+//                    every durable cut point on NTFS. The Windows durability
+//                    claim then rests on exactly the evidence macOS's rests on: a
+//                    written contract plus crash verification against the packaged
+//                    runtime.
 //
-//   Gate CANNOT VERIFY — Windows ships view-only, per the plan's existing
-//                    posture: the app opens and displays files, and declines the
-//                    persistent state backend up front rather than running with
-//                    view state it cannot promise to keep. The refusal stays
-//                    exactly where it is.
+//   Gate CANNOT VERIFY — the claim stays where it is: no directory sync on a
+//                    platform with no primitive for one, matching SQLite itself,
+//                    with the uncovered cut points recorded as pending rather
+//                    than assumed to pass.
 //
 // Neither branch permits silent weakening. In particular: a `verified` verdict
 // from a *partial* run is not verification. The report names which cut points
@@ -401,10 +399,9 @@ function survey_primitives(scratch) {
  *
  * Not a re-test of `platform === 'win32'`. A second copy of the predicate keeps
  * answering confidently after the original changes, and this probe exists to
- * inform a decision about that original — so it asks it directly. The point of
- * recording it is that the report states, in the same breath as the survey, that
- * the shipped build still declines: a reader who finds an encouraging primitive
- * list must not be able to infer that anything changed.
+ * inform a decision about that original — so it asks it directly. Recording it
+ * keeps the report honest about what the shipped build actually does with this
+ * directory, so a reader cannot infer the answer from the primitive survey alone.
  */
 function production_rule(scratch) {
     try {
@@ -506,10 +503,10 @@ function derive_guarantees(observations, filesystem) {
  * The methodology is `packaged-recovery-gate.mjs`'s, with one deliberate
  * difference: there, a child that exits instead of aborting fails the gate,
  * because a cut point that was never reached means the gate proved nothing. Here
- * it is a *finding* — on a platform the build declines, initialization fails
- * closed long before any cut point, and reporting that honestly is the job. So
- * every terminal outcome is classified and returned; only a spawn failure is a
- * malfunction.
+ * it is a *finding* — initialization can fail closed long before any cut point,
+ * for example on a filesystem that rejects a flush it was asked to perform, and
+ * reporting that honestly is the job. So every terminal outcome is classified and
+ * returned; only a spawn failure is a malfunction.
  *
  * Nothing waits a fixed delay: the child's death is the observable event. The one
  * timer here is a stuck-process backstop, orders of magnitude above a healthy
@@ -599,8 +596,9 @@ function run_cut_point_child(cut_point, user_data_dir) {
             // An abort is *positively* identified, never inferred from "not one of
             // the codes above". `process.abort()` raises SIGABRT, which on POSIX
             // arrives as the signal and on Windows surfaces as the CRT's abort exit
-            // code (3) or as STATUS_FATAL_APP_EXIT (0xC0000409) when the runtime
-            // takes the fast-fail path instead.
+            // code (3), the conventional 128+SIGABRT code (134), or
+            // STATUS_FATAL_APP_EXIT (0xC0000409), depending on the runtime's abort
+            // path.
             //
             // Everything else is an unexplained death — an Electron launch failure,
             // an OOM kill, a crash before the cut point that never reached the
@@ -611,7 +609,9 @@ function run_cut_point_child(cut_point, user_data_dir) {
             // a claim that Windows durability was verified. Harmless only while
             // `pending` is non-empty; the moment REPRESENTATIVE_CUT_POINTS becomes
             // the full matrix it is not, and that extension is the stated next step.
-            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            const aborted = signal === 'SIGABRT'
+                || (process.platform === 'win32'
+                    && (code === 3 || code === 134 || code === 0xC0000409));
             resolve(aborted
                 ? { outcome: 'aborted-at-cut-point', signal: signal ?? 'none' }
                 : {
@@ -679,15 +679,15 @@ async function survey_cut_points() {
  * Three outcomes, and two of them are fine:
  *
  *  - `not-verified` — a primitive the protocol requires was observed to be out of
- *    reach. This is a *result*. It keeps Windows on the view-only branch and it
- *    does not fail the job.
+ *    reach. This is a *result*. The Windows durability claim stays at SQLite's own
+ *    posture and the job does not fail.
  *  - `inconclusive` — nothing ruled it out, but the evidence is not complete:
  *    typically because the cut-point matrix is still partial, which it is by
  *    design in this scope. Also not a failure.
  *  - `verified` — every required primitive is reachable *and* the kill-crash
- *    matrix is complete and every cut point aborted where it should. Only then
- *    may the Windows refusal be revisited, and only together with a written
- *    durability contract, exactly as on macOS.
+ *    matrix is complete and every cut point aborted where it should. Only then may
+ *    the Windows durability claim be raised to macOS's, and only together with a
+ *    written durability contract.
  *
  * Note what `verified` costs: `cutPoints.complete` is false whenever anything is
  * pending, so a partial run cannot reach it however encouraging the survey looks.

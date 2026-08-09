@@ -848,7 +848,7 @@ export async function recover_stale_sqlite_coordination(
     }
 }
 
-/** Unwired coordinated owner used by backend tests; products deliberately do not call this yet. */
+/** Coordinated owner of one canonical database; both products open through here. */
 export async function open_sqlite_file_state_store(
     databasePath: string,
     options: SqliteFileStatePersistenceOptions,

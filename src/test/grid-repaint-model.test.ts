@@ -1,72 +1,35 @@
 import { describe, it, expect } from 'vitest';
 import {
-    changed_edit_keys,
     changed_highlight_keys,
+    changed_tint_keys,
     visible_source_key_damage,
 } from '../webview/grid-repaint-model';
 
 const s = (...keys: string[]): Set<string> => new Set(keys);
-const m = (...entries: Array<[string, string]>): Map<string, { value: string }> =>
-    new Map(entries.map(([key, value]) => [key, { value }]));
 
-describe('changed_edit_keys', () => {
-    it('returns keys added to the dirty map', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'one']),
-            m(['1:1', 'one'], ['2:2', 'two']),
-            s(),
-            s(),
-        );
+describe('changed_tint_keys', () => {
+    it('returns keys added to the dirty set', () => {
+        const out = changed_tint_keys(s('1:1'), s('1:1', '2:2'), s(), s());
         expect([...out]).toEqual(['2:2']);
     });
 
-    it('returns keys removed from the dirty map (bulk discard / save-clear)', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'one'], ['2:2', 'two'], ['3:3', 'three']),
-            m(['1:1', 'one']),
-            s(),
-            s(),
-        );
+    it('returns keys removed from the dirty set (bulk discard / save-clear)', () => {
+        const out = changed_tint_keys(s('1:1', '2:2', '3:3'), s('1:1'), s(), s());
         expect([...out].sort()).toEqual(['2:2', '3:3']);
     });
 
-    it('returns an already-dirty key whose displayed value changed', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'before']),
-            m(['1:1', 'after']),
-            s(),
-            s(),
-        );
-        expect([...out]).toEqual(['1:1']);
-    });
-
     it('returns keys whose conflict status changed (reload drift)', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'one']),
-            m(['1:1', 'one']),
-            s(),
-            s('1:1'),
-        );
+        const out = changed_tint_keys(s('1:1'), s('1:1'), s(), s('1:1'));
         expect([...out]).toEqual(['1:1']);
     });
 
-    it('unions edit and conflict changes without duplicates', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'one']),
-            m(['2:2', 'two']),
-            s(),
-            s('2:2'),
-        );
+    it('unions dirty and conflict changes without duplicates', () => {
+        const out = changed_tint_keys(s('1:1'), s('2:2'), s(), s('2:2'));
         expect([...out].sort()).toEqual(['1:1', '2:2']);
     });
 
-    it('returns an empty set when displayed values and membership are unchanged', () => {
-        const out = changed_edit_keys(
-            m(['1:1', 'one']),
-            m(['1:1', 'one']),
-            s('3:3'),
-            s('3:3'),
-        );
+    it('returns an empty set when nothing changed', () => {
+        const out = changed_tint_keys(s('1:1'), s('1:1'), s('3:3'), s('3:3'));
         expect(out.size).toBe(0);
     });
 });

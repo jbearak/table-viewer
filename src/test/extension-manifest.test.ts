@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CSV_DOCUMENT_BACKUP_V2_MAX_SOURCE_BYTES } from '../csv-document-backup';
 
 interface CustomEditorContribution {
     viewType?: unknown;
@@ -13,9 +12,10 @@ const manifest = JSON.parse(readFileSync(
     resolve(__dirname, '../../package.json'),
     'utf8',
 )) as {
+    version?: unknown;
     contributes?: {
-        commands?: Array<{ command?: unknown }>;
         customEditors?: CustomEditorContribution[];
+        commands?: Array<{ command?: unknown }>;
         configuration?: {
             properties?: Record<string, {
                 type?: unknown;
@@ -27,14 +27,15 @@ const manifest = JSON.parse(readFileSync(
     };
     engines?: { node?: unknown; vscode?: unknown };
     extensionKind?: unknown;
+    extensionDependencies?: unknown;
     extensionPack?: unknown;
+    scripts?: Record<string, unknown>;
     devDependencies?: { electron?: unknown; '@types/node'?: unknown };
 };
 const custom_editors = manifest.contributes?.customEditors ?? [];
 const vscodeignore = readFileSync(resolve(__dirname, '../../.vscodeignore'), 'utf8')
     .split(/\r?\n/u)
     .filter((line) => line.length > 0 && !line.startsWith('#'));
-
 function contribution(view_type: string): CustomEditorContribution {
     const matches = custom_editors.filter((editor) => editor.viewType === view_type);
     expect(matches).toHaveLength(1);
@@ -66,17 +67,14 @@ describe('extension runtime manifest', () => {
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
 
-    it('caps the public file-size setting at the immutable CSV backup ceiling', () => {
-        const maximum_mib = CSV_DOCUMENT_BACKUP_V2_MAX_SOURCE_BYTES / (1024 * 1024);
-        expect(maximum_mib).toBe(256);
-        expect(manifest.contributes?.configuration?.properties?.[
-            'tableViewer.maxFileSizeMiB'
-        ]).toMatchObject({
-            type: 'number',
-            default: maximum_mib,
-            minimum: 1,
-            maximum: maximum_mib,
-        });
+    it('excludes build and integration artifacts from the VSIX', () => {
+        expect(vscodeignore).toEqual(expect.arrayContaining([
+            'out/**',
+            'dist/runtime-probes/**',
+            '.vscode-test.mjs',
+            'tsconfig.integration.json',
+        ]));
+        expect(vscodeignore).not.toContain('companion/**');
     });
 
     it('bounds the retention setting so a large value cannot disable eviction', () => {
@@ -90,7 +88,8 @@ describe('extension runtime manifest', () => {
         });
     });
 
-    it('packages one extension without retired coordination artifacts', () => {
+    it('packages one extension with no companion or retired coordination commands', () => {
+        expect(manifest.extensionDependencies).toBeUndefined();
         expect(manifest.extensionPack).toBeUndefined();
         expect(manifest.contributes?.commands?.map(({ command }) => command)).toEqual([
             'tableViewer.showCsvPreviewToSide',
@@ -98,13 +97,23 @@ describe('extension runtime manifest', () => {
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
         ]);
-        expect(vscodeignore).toEqual(expect.arrayContaining([
-            'out/**',
-            'dist/runtime-probes/**',
-            '.vscode-test.mjs',
-            'tsconfig.integration.json',
-            'docs/**',
-        ]));
+    });
+
+    it('externalizes the host-provided SQLite runtime from the one bundle it builds', () => {
+        expect(manifest.scripts?.bundle).toContain('--external:node:sqlite');
+        expect(manifest.scripts?.package).toBe('vsce package --no-dependencies');
+        for (const retired of [
+            'bundle:companion',
+            'package:companion',
+            'package:release',
+            'probe:vsix:packages',
+            'typecheck:companion',
+        ]) {
+            expect(manifest.scripts?.[retired]).toBeUndefined();
+        }
+        for (const script of ['typecheck:all', 'pretest:integration', 'probe:sqlite:bundles']) {
+            expect(manifest.scripts?.[script]).not.toContain('companion');
+        }
     });
 });
 

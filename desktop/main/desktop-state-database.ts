@@ -29,7 +29,6 @@ import {
     quarantine_malformed_sqlite_gate_markers,
     reclaim_stale_sqlite_exclusive_intent,
     resume_sqlite_basename_preservation,
-    sqlite_directory_durability_is_platform_unsupported,
     type SqliteExclusiveRecoveryGate,
     type SqliteOpenRecoveryHooks,
 } from '../../src/sqlite-open-recovery';
@@ -46,14 +45,16 @@ export const DESKTOP_STATE_DATABASE_NAME = 'file-state.sqlite3';
  * compatibility error rather than something the app can repair. A random
  * `databaseId` therefore only works if it is durably remembered somewhere else,
  * and the desktop has nowhere to remember it: there is exactly one canonical
- * database per userData directory and no companion registry to preallocate an
- * id against. The sidecar we would have to invent would become a second point
- * of failure whose loss turns a perfectly healthy database into a permanently
+ * database per userData directory, and nothing outside it to preallocate an id
+ * against. The sidecar we would have to invent would become a second point of
+ * failure whose loss turns a perfectly healthy database into a permanently
  * unopenable one.
  *
- * Only VS Code needs a preallocated random `databaseId`, because there it is
- * the import-claim key that ties a database to the memento it was imported
- * from; the desktop imports from nothing and claims nothing.
+ * Both products land here. The VS Code extension's `direct-vscode` identity is
+ * deterministic for the same reason — one canonical database beneath a
+ * global-storage root VS Code already scopes per profile and per authority — and
+ * neither product imports from anything or claims anything, so no identity has an
+ * import-claim key to carry.
  */
 export const DESKTOP_STATE_DATABASE_ID = 'tableViewer.desktop.fileState.v1';
 export const DESKTOP_STATE_STORAGE_ENVIRONMENT_ID = 'desktop';
@@ -193,10 +194,9 @@ export const DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION = 'platform-durability
 
 export function desktop_state_durability_refusal_operation(
     intended_operation: string | undefined,
-    platform_refused: boolean,
     control_refused: boolean,
 ): string | undefined {
-    return platform_refused || control_refused
+    return control_refused
         ? DESKTOP_STATE_PLATFORM_DECLARATION_OPERATION
         : intended_operation;
 }
@@ -236,12 +236,10 @@ function durability_answer_at(parent_directory: string): DurabilityAnswer {
         // `parent_directory` does not exist yet and `mkdtempSync` would fail ENOENT
         // — which this function classifies as `unavailable`, i.e. "the question went
         // unasked". For a *control* that is merely a lost vote, but for the intended
-        // location it silently skipped the platform question altogether: on Windows,
-        // where the refusal is unconditional and comes from the production assertion
-        // this probe exists to run, a first launch therefore reported `supported`,
-        // the open went on to create the state tree, and the failure arrived later as
-        // a fixable-location error. That is precisely the up-front, nothing-created
-        // platform refusal the design promises, not delivered.
+        // location it means the durability question was never asked at all, so a
+        // filesystem that would have refused reported `supported`, the open went on
+        // to create the state tree, and the failure arrived later as a mid-open
+        // error rather than the up-front, nothing-created refusal promised here.
         //
         // The ancestor is the right place to ask: durability is a property of the
         // filesystem the directory will land on, and the nearest existing ancestor is
@@ -329,13 +327,10 @@ function device_of(directory: string): bigint | undefined {
  * identity was tried and is wrong: on a stock Windows install userData,
  * `os.tmpdir()`, and `os.homedir()` are all on `C:` — and userData is beneath the
  * home directory, so containment removes that one too. Filtering by device then
- * leaves *no control at all*, `control_refused` stays false, and win32 — where the
- * refusal is unconditional and the most platform-wide refusal there is — gets
- * reported under the backend's location stage. The dialog would tell every Windows
- * user to move their settings to an ordinary local disk, advice that cannot help
- * anywhere on that machine, and `packaged-recovery-gate.mjs` asserts
- * `platform-durability-unsupported` on exactly that path, so the Windows CI gate
- * fails too. Reproduced against the real layout before this was written.
+ * leaves *no control at all*, `control_refused` stays false, and a refusal that
+ * really is platform-wide gets reported under the backend's location stage. The
+ * dialog would then tell the user to move their settings to an ordinary local
+ * disk, advice that cannot help anywhere on that machine.
  *
  * Ordering still buys the thing device identity was reached for: where a different
  * volume *is* available — the usual macOS and Linux install, with userData under
@@ -376,37 +371,22 @@ export function control_roots_for(user_data_dir: string): readonly string[] {
  * Whether this build is willing to keep a SQLite state database here at all,
  * decided *before* any open is attempted.
  *
- * The desktop's durability contract is unconditional: every marker, candidate,
- * member move, and install is made durable by flushing the containing directory,
- * and `assert_sqlite_directory_durability_supported` refuses rather than treat a
- * skipped flush as a successful one. Node exposes no proven win32 primitive for
- * that — `fs.openSync` on a directory fails outright, and `FlushFileBuffers` on a
- * file handle says nothing about the ordering of the rename and unlink operations
- * the install and preserve protocols are built from. A real primitive needs a
- * native addon, and the packaging contract forbids one (see
- * desktop/check-sqlite-bundle-externals.mjs, desktop/after-pack.mjs, and
- * desktop/README.md, all of which assert no native addon and no runtime
- * node_modules in the app bundle). So on Windows this build cannot open its state
- * database, and the failure policy forbids shipping with empty or read-only
- * authority in its place.
+ * Every marker, candidate, member move, and install is made durable by flushing
+ * the containing directory, and `assert_sqlite_directory_durability_supported`
+ * refuses when a filesystem is asked to flush and says it cannot. No platform is
+ * refused outright any more: where no directory-flush primitive exists at all
+ * (win32) the flush is skipped, matching SQLite's own VFS on that platform, so the
+ * only refusals left come from a filesystem that rejected a flush it was asked to
+ * perform.
  *
  * Consulted up front rather than diagnosed from a failed open. The alternative
- * reaches the same conclusion by a longer route and reaches it worse in three
- * ways: it creates the coordination gate before refusing, it makes the story the
- * user is told depend on which internal stage happened to notice first, and it
- * leaves the platform decision implicit in a predicate two modules away. Stating
- * it here makes the refusal one fixed, non-looping story with nothing created and
- * nothing touched — which is what the failure policy asks of a platform whose
- * durability primitive is missing.
+ * reaches the same conclusion by a longer route and reaches it worse in two ways:
+ * it creates the coordination gate before refusing, and it makes the story the
+ * user is told depend on which internal stage happened to notice first. Stating it
+ * here makes the refusal one fixed, non-looping story with nothing created and
+ * nothing touched.
  *
- * Derived from the production assertion's own exported capability predicate, never
- * from a second `win32` literal. A duplicated platform predicate can drift from its
- * enforcer, and the drift is silent by construction: the copy keeps answering
- * confidently after the original has changed. An unconditional platform refusal is
- * therefore classified directly even when a production userData override contains
- * every candidate control root.
- *
- * Other refusals are told apart by *where* they occur. The intended location is
+ * Refusals are told apart by *where* they occur. The intended location is
  * asked first; if it refuses, unrelated control locations are asked. A control that
  * also refuses makes this a property of the platform, since the two locations have
  * nothing in common but the operating system. A control that answers normally makes
@@ -435,7 +415,6 @@ export function desktop_state_platform_support(
 ): { readonly supported: true } | { readonly supported: false; readonly failure: DesktopStateOpenFailure } {
     const intended = durability_answer_at(user_data_dir);
     if (intended.kind !== 'refused') return { supported: true };
-    const platform_refused = sqlite_directory_durability_is_platform_unsupported();
     // The first control that can actually answer decides; an unavailable one is
     // skipped rather than counted as agreement.
     let control_refused = false;
@@ -449,13 +428,12 @@ export function desktop_state_platform_support(
         supported: false,
         failure: {
             category: intended.error.category,
-            // An unconditional platform refusal or two unrelated refusals: the
-            // platform itself. Only the intended location refused, or no control
-            // could be reached: this filesystem, reported under the backend's own
-            // stage so the dialog tells the fixable story.
+            // Two unrelated locations refusing: the platform itself. Only the
+            // intended location refused, or no control could be reached: this
+            // filesystem, reported under the backend's own stage so the dialog
+            // tells the fixable story.
             operation: desktop_state_durability_refusal_operation(
                 intended.error.metadata.operation,
-                platform_refused,
                 control_refused,
             ),
         },

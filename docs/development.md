@@ -1,6 +1,6 @@
 # Development
 
-Clone the repo and run `npm install`. Node >= 24 is required (`engines.node` in `package.json`, and what CI runs).
+Clone the repo and run `npm install`. Node >= 26.5.1 is required by `engines.node` in `package.json`; CI and release workflows pin exactly Node 26.5.1.
 
 ## npm scripts
 
@@ -29,29 +29,34 @@ is the only thing that does — CI runs it):
 
 See [desktop/README.md](../desktop/README.md) for more on the desktop shell.
 
-## VS Code editor and state architecture
+## VS Code state storage
 
 The VS Code product is one extension and one `.vsix`; it has no companion
-extension or cross-extension migration protocol. CSV and TSV use VS Code's
-editable custom-document lifecycle, so VS Code owns dirty state, undo/redo,
-Save, Save As, Revert, close prompts, Auto Save, and hot-exit backup. Excel uses
-a separate read-only custom editor.
+extension and no cross-extension migration protocol.
 
-The extension stores only disposable view state—such as widths, scroll
-positions, sorts, filters, and highlights—in SQLite at
-`<globalStorageUri>/state/file-state.sqlite3`. Windows and extension-host
-processes with the same VS Code profile and local or remote authority storage
-root share that database. Different profiles, remote authorities, containers,
-WSL environments, or other storage roots naturally use separate databases.
-CSV/TSV unsaved edits are owned by the custom document and are never written to
-this cosmetic database. There is no import from VS Code Memento and no
-synchronization with the standalone desktop app.
+Per-file state — column widths, row heights, scroll positions, sorts, filters,
+highlights, and unsaved CSV/TSV edits — lives in SQLite at
+`<globalStorageUri>/state/file-state.sqlite3`. VS Code already scopes
+`globalStorageUri` by profile and by local or remote authority, so windows and
+extension-host processes sharing that storage root share one database, while
+different profiles, remote authorities, containers, or WSL environments
+naturally get their own.
 
-Excel source files remain read-only. CSV/TSV source bytes are written only
-through the custom-document Save or Save As lifecycle. Highlights are
-positional annotations in cosmetic state and are removed only by an explicit
-user clear action; content changes, saves, reloads, and source replacement do
-not clear them.
+The database is created empty on first run. There is no import from the older
+VS Code Memento store, and no synchronization with the standalone desktop app,
+which keeps its own database under its user-data directory.
+
+SQLite is the only backend on every platform, Windows included. The default Node
+directory primitive is attempted on Windows, so future runtime support is used
+automatically; only a directory-open result proving that Node cannot obtain a
+handle is skipped, matching SQLite's own Windows posture. Once a directory handle
+is reachable, a filesystem that rejects fsync is still a refusal, because that one
+the user can act on by moving their storage.
+
+If the database genuinely cannot be opened, activation fails with an error naming
+the database path and the underlying cause, and suggesting the two things that
+help: close other windows using it, or move the file aside to start fresh.
+Nothing in that directory is modified, deleted, or set aside automatically.
 
 ## `scripts/setup.sh`
 
@@ -68,7 +73,7 @@ Passing both `--no-` flags is an error (nothing left to install), as is any unre
 
 What it does, in order:
 
-1. **Preflight** — requires `node` and `npm` on `PATH`, and Node >= 24 (matching `engines.node`). Anything missing is a hard error.
+1. **Preflight** — requires `node` and `npm` on `PATH`, and Node >= 26.5.1 (matching `engines.node`). Anything missing is a hard error.
 2. **`npm install`** — always runs, regardless of flags.
 3. **Extension** (skipped with `--no-extension`):
    - `npm run vscode:prepublish` to build the extension and webview bundles.
@@ -103,16 +108,12 @@ What it does, in order:
 1. **Preconditions** — the working tree must be clean (`git status --porcelain` empty), and the computed tag `v<version>` must not already exist. Either violation is a hard error before anything is modified.
 2. **Computes the new version** — reads the current version out of `package.json`. For a bump type, any pre-release suffix is stripped first, so `patch` on `1.0.0-beta.1` yields `1.0.1`, not `1.0.0-beta.2`; `major` and `minor` zero out the components below them. An explicit version is used as given.
 3. **Writes `package.json`** via Node (not `npm version`, so no lifecycle scripts run), then syncs `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
-4. **Commits and tags** — stages just those two files, commits as `chore: bump version to <version>`, and creates an annotated tag `v<version>`.
+4. **Commits and tags** — stages just those files, commits as `chore: bump version to <version>`, and creates an annotated tag `v<version>`.
 5. **Prints the push command.** It deliberately does not push.
 
-Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that tag ref, not the default branch, so the run's immutable head SHA remains the release commit:
+Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that same tag ref (for example, `gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3`), so its run SHA and artifacts remain bound to the immutable release commit.
 
-```sh
-gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3
-```
-
-`release-build.yml` has three jobs: `build` packages the `.vsix` on Linux, `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner, and `desktop-windows` packages the unsigned Windows exes (setup + portable, x64 + arm64) on a Windows runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
+`release-build.yml` first runs the Windows SQLite public-open and packaged/runtime recovery gates against the immutable tag commit. Only after they pass does `build` package and upload the `.vsix` on Linux. The `desktop` job packages the standalone macOS app (arm64 dmg + zip), while `desktop-windows` currently reports the Windows release fence and packages nothing pending complete NTFS crash-recovery evidence. `release-publish.yml` publishes the extension to both marketplaces, attaches the required VSIX plus any available desktop artifacts to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
 
 ```sh
 git push && git push --tags

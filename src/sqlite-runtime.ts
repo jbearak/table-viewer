@@ -16,7 +16,6 @@ import {
 import {
     is_direct_vscode_file_state_identity,
     SQLITE_FILE_STATE_PROTOCOL_VERSION,
-    sqlite_file_state_schema_identity,
     type SqliteFileStateIdentity,
 } from './sqlite-file-state-schema';
 import {
@@ -276,7 +275,6 @@ function normalize_options(options: SqliteRuntimeOptions): NormalizedOptions {
             databasePath,
             {
                 timeoutMs: options.timeoutMs,
-                expectedUserVersion: sqlite_file_state_schema_identity(options.identity).userVersion,
                 validate(database) {
                     validate_sqlite_file_state_database(database, {
                         identity: options.identity,
@@ -301,14 +299,11 @@ function identities_equal(left: SqliteFileStateIdentity, right: SqliteFileStateI
     if (left.productKind === 'desktop' || right.productKind === 'desktop') {
         return left.productKind === right.productKind;
     }
-    const leftIsDirect = is_direct_vscode_file_state_identity(left);
-    const rightIsDirect = is_direct_vscode_file_state_identity(right);
-    if (leftIsDirect || rightIsDirect) {
-        return leftIsDirect && rightIsDirect
-            && left.clientProfileId === right.clientProfileId;
-    }
-    if (left.clientProfileId !== right.clientProfileId
-        || left.legacy.capsuleId !== right.legacy.capsuleId
+    if (left.clientProfileId !== right.clientProfileId) return false;
+    const leftDirect = is_direct_vscode_file_state_identity(left);
+    const rightDirect = is_direct_vscode_file_state_identity(right);
+    if (leftDirect || rightDirect) return leftDirect && rightDirect;
+    if (left.legacy.capsuleId !== right.legacy.capsuleId
         || left.legacy.sourceFormat !== right.legacy.sourceFormat
         || left.legacy.sourceDigest !== right.legacy.sourceDigest
         || left.legacy.importClaimId !== right.legacy.importClaimId
@@ -686,7 +681,6 @@ async function reconcile_ambiguous_commit<T>(
         if (!retired) throw sqlite_file_state_commit_error({ operation: 'commit-reconcile-connection' });
         fresh = await retired.replaceConnection({
             timeoutMs: runtime.options.timeoutMs,
-            expectedUserVersion: sqlite_file_state_schema_identity(runtime.options.identity).userVersion,
             validate(database) {
                 validate_sqlite_file_state_database(database, {
                     identity: runtime.options.identity,

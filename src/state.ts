@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import type { ExtensionContext } from 'vscode';
 import { compare_authority } from './authority-order';
 import {
     decode_stored_per_file_state,
@@ -7,7 +6,6 @@ import {
     type StoredPerFileState,
 } from './types';
 
-const STATE_KEY = 'tableViewer.fileState';
 const STATE_FORMAT = 'tableViewer.fileState.v1';
 const STALE_STAGE_MS = 24 * 60 * 60 * 1000;
 const EXHAUSTION_SENTINEL = Number.MAX_SAFE_INTEGER;
@@ -117,12 +115,6 @@ export interface FileStateStore {
 }
 
 export interface AuthorityFileStateStore extends FileStateStore {
-    /** Atomically copy only cosmetic state, resetting all physical/projection authority. */
-    copy_cosmetic_entry_if_absent(
-        source_path: string,
-        destination_path: string,
-        copy_id: string,
-    ): Promise<FileStateCopyResult>;
     read_authority(file_path: string): Promise<DurableFileAuthority>;
     stage_authority_transaction(
         file_path: string,
@@ -282,7 +274,6 @@ export function supports_coordinated_file_state(
     return typeof candidate.read === 'function'
         && typeof candidate.compare_and_set === 'function'
         && typeof candidate.touch === 'function'
-        && typeof candidate.copy_cosmetic_entry_if_absent === 'function'
         && typeof candidate.read_authority === 'function'
         && typeof candidate.stage_authority_transaction === 'function'
         && typeof candidate.finalize_authority_transaction === 'function'
@@ -469,96 +460,6 @@ export interface CoordinatedKeyedFileStatePersistence extends KeyedFileStatePers
     complete_prepared_install_cleanup(
         observation: PreparedInstallCleanupObservation,
     ): Promise<boolean>;
-}
-
-export interface FrozenLegacyStateSource {
-    readonly capsuleId: string;
-    readonly sourceFormat: string;
-    readonly profileDatabaseId: string;
-    readonly sourceDigest: string;
-    readonly meta: KeyedStateStoreMetadata;
-    readonly entryCount: number;
-    completeEntry(path: string): PersistedCompleteKeyedStateEntry | undefined;
-    entryOrdinal(path: string): number | undefined;
-    sourceKind(path: string): 'exactIdentity' | 'pathOnlyCompatibility';
-    entryPaths(): readonly string[];
-}
-
-export interface MigrationCompanionClient {
-    namespace(input: { placementKeyDigest: string; operationId: string }): Promise<{
-        profileDatabaseId: string;
-        storageEnvironmentId: string;
-        protocolVersion: number;
-    }>;
-    activeCapsule(): Promise<{
-        capsuleId: string;
-        sourceFormat: string;
-        sourceDigest: string;
-        meta: KeyedStateStoreMetadata;
-        entryCount: number;
-        status: 'armed' | 'cutover';
-    }>;
-    submitCapsuleCandidate(input: {
-        operationId: string;
-        orderedSourceJson: string;
-    }): Promise<{ capsuleId: string; sourceDigest: string }>;
-    archiveDrift(input: { operationId: string; orderedSourceJson: string }): Promise<void>;
-    beginEnvironmentImport(input: {
-        operationId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<{ importClaimId: string }>;
-    environmentImportStatus(input: {
-        importClaimId: string;
-        capsuleId: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<'preparing' | 'confirmed' | 'abandoned'>;
-    abandonEnvironmentImport(input: {
-        operationId: string;
-        importClaimId: string;
-        capsuleId: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-        abandonmentEvidenceDigest: string;
-    }): Promise<void>;
-    confirmEnvironment(input: {
-        operationId: string;
-        importClaimId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-    }): Promise<void>;
-    confirmEnvironmentSourceRetirement(input: {
-        operationId: string;
-        capsuleId: string;
-        sourceDigest: string;
-        storageEnvironmentId: string;
-        databaseId: string;
-        retirementKind: 'naturallyComplete' | 'userRetired';
-        sourceStateDigest: string;
-    }): Promise<void>;
-    preparePendingEditRecovery(input: {
-        storageEnvironmentId: string;
-        databaseId: string;
-        recoveryEntryId: string;
-        operationId: string;
-        kind: 'snapshot' | 'clear';
-        pendingEditsJson?: string;
-        resourceIdentityJson: string;
-        authorityRevision: number;
-        physicalRevision: number;
-        projectionRevision: number;
-        physicalDigest?: string;
-    }): Promise<{ recoveryRecordId: string }>;
-    confirmPendingEditRecovery(input: {
-        operationId: string;
-        recoveryRecordId: string;
-        committedStateRevision: number;
-    }): Promise<void>;
 }
 
 export function require_synchronous_transaction_result<T>(result: T): T {
@@ -1193,20 +1094,6 @@ function pending_json(state: StoredPerFileState): string | undefined {
     return pending && Object.keys(pending).length > 0 ? JSON.stringify(pending) : undefined;
 }
 
-/**
- * Project a already-validated stored state onto its cosmetic fields for a
- * cosmetic copy. Deliberately not the same helper as `cosmetic_state` in
- * `cosmetic-file-state-store.ts`: that one projects an *untrusted* value read
- * back from a backing store, so it decodes first and rejects a malformed
- * `pendingEdits` instead of stripping it, and it additionally removes the
- * prepared-install key that never appears in a durable copy source here.
- */
-function cosmetic_state(state: StoredPerFileState): StoredPerFileState {
-    const cosmetic = structuredClone(state) as PerFileState;
-    delete cosmetic.pendingEdits;
-    return decode_stored_per_file_state(cosmetic);
-}
-
 function edit_sessions_equal(
     left: DurableEditSession | undefined,
     right: PersistedEditSessionRecord | undefined,
@@ -1346,7 +1233,6 @@ function copy_in_transaction(
     capturedAt: number,
     max: number,
     pendingBasis?: PendingEditCopyBasis,
-    copyKind: 'complete' | 'cosmetic' = 'complete',
 ): FileStateCopyResult {
     const metadata = tx.metadata();
     const destination = tx.read_entry(destinationPath);
@@ -1355,15 +1241,11 @@ function copy_in_transaction(
         && destination.entry.copyProvenance.sourcePath === sourcePath
     ) {
         const sourceRevision = destination.entry.copyProvenance.sourceRevision;
-        const storedState = decode_complete_state(destination);
-        const state = copyKind === 'cosmetic' ? cosmetic_state(storedState) : storedState;
+        const state = decode_complete_state(destination);
         const result: FileStateCopyResult = {
             type: 'copied',
             source: { state: structuredClone(state), revision: sourceRevision },
-            destination: {
-                state: structuredClone(state),
-                revision: destination.entry.stateRevision,
-            },
+            destination: snapshot_from_complete(destination, metadata.absenceRevision),
         };
         const changed = run_retention(
             tx,
@@ -1375,12 +1257,9 @@ function copy_in_transaction(
         return result;
     }
     if (destination) {
-        const destinationSnapshot = snapshot_from_complete(destination, metadata.absenceRevision);
         const result: FileStateCopyResult = {
             type: 'destinationExists',
-            destination: copyKind === 'cosmetic'
-                ? { ...destinationSnapshot, state: cosmetic_state(destinationSnapshot.state) }
-                : destinationSnapshot,
+            destination: snapshot_from_complete(destination, metadata.absenceRevision),
         };
         const changed = run_retention(tx, max, new Set([sourcePath, destinationPath]), capturedAt);
         if (changed) tx.set_updated_at(capturedAt);
@@ -1417,59 +1296,35 @@ function copy_in_transaction(
     cleanup_stale_stages(tx, capturedAt);
     const source = tx.read_entry(sourcePath);
     if (!source) throw new Error('Copy source disappeared inside its transaction.');
-    const storedState = decode_complete_state(source);
-    const state = copyKind === 'cosmetic' ? cosmetic_state(storedState) : storedState;
-    const sourceSnapshot: FileStateSnapshot = {
-        state: structuredClone(state),
-        revision: source.entry.stateRevision,
-    };
+    const sourceSnapshot = snapshot_from_complete(source, metadata.absenceRevision);
     const revision = tx.allocate_revision();
-    const provenance = {
-        id: copyId,
-        sourcePath,
-        sourceRevision: source.entry.stateRevision,
+    const state = decode_complete_state(source);
+    const copied: PersistedCompleteKeyedStateEntry = {
+        entry: {
+            ...source.entry,
+            path: destinationPath,
+            stateRevision: revision,
+            stateJson: JSON.stringify(state),
+            hasPendingEdits: state_has_pending_edits(state),
+            recencyOrder: tx.allocate_recency_order(),
+            updatedAtMs: capturedAt,
+            recoveryEntryId: pendingBasis?.destinationRecoveryEntryId ?? destinationPath,
+            ...(pendingBasis?.destinationRecoveryRecordId === undefined
+                ? {}
+                : { recoveryRecordId: pendingBasis.destinationRecoveryRecordId }),
+            copyProvenance: {
+                id: copyId,
+                sourcePath,
+                sourceRevision: source.entry.stateRevision,
+            },
+        },
+        stages: source.stages.map((stage) => ({
+            ...stage,
+            expectedStateRevision: stage.expectedStateRevision === source.entry.stateRevision
+                ? revision
+                : stage.expectedStateRevision,
+        })),
     };
-    const copied: PersistedCompleteKeyedStateEntry = copyKind === 'cosmetic'
-        ? {
-            entry: {
-                path: destinationPath,
-                stateRevision: revision,
-                stateJson: JSON.stringify(state),
-                hasPendingEdits: false,
-                authority: empty_authority(),
-                recencyOrder: tx.allocate_recency_order(),
-                updatedAtMs: capturedAt,
-                ...(source.entry.touchedAtMs === undefined
-                    ? {}
-                    : { touchedAtMs: source.entry.touchedAtMs }),
-                recoveryEntryId: destinationPath,
-                copyProvenance: provenance,
-                authorityStageCount: 0,
-            },
-            stages: [],
-        }
-        : {
-            entry: {
-                ...source.entry,
-                path: destinationPath,
-                stateRevision: revision,
-                stateJson: JSON.stringify(state),
-                hasPendingEdits: state_has_pending_edits(state),
-                recencyOrder: tx.allocate_recency_order(),
-                updatedAtMs: capturedAt,
-                recoveryEntryId: pendingBasis?.destinationRecoveryEntryId ?? destinationPath,
-                ...(pendingBasis?.destinationRecoveryRecordId === undefined
-                    ? {}
-                    : { recoveryRecordId: pendingBasis.destinationRecoveryRecordId }),
-                copyProvenance: provenance,
-            },
-            stages: source.stages.map((stage) => ({
-                ...stage,
-                expectedStateRevision: stage.expectedStateRevision === source.entry.stateRevision
-                    ? revision
-                    : stage.expectedStateRevision,
-            })),
-        };
     write_complete(tx, copied);
     evict_entries(tx, max, new Set([sourcePath, destinationPath]));
     tx.set_updated_at(capturedAt);
@@ -1810,20 +1665,6 @@ export function create_keyed_authority_store(
             }).then(() => lease);
         },
 
-        copy_cosmetic_entry_if_absent(sourcePath, destinationPath, copyId) {
-            const capturedAt = Date.now();
-            return writeTransaction('copy', (tx) => copy_in_transaction(
-                tx,
-                sourcePath,
-                destinationPath,
-                copyId,
-                capturedAt,
-                getMax(),
-                undefined,
-                'cosmetic',
-            ));
-        },
-
         copy_entry_if_absent(sourcePath, destinationPath, copyId, pendingBasis) {
             const capturedAt = Date.now();
             return writeTransaction('copy', (tx) => copy_in_transaction(
@@ -1920,26 +1761,3 @@ export function create_authority_store(
     return create_keyed_authority_store(persistence, get_max_stored);
 }
 
-function memento_medium(context: ExtensionContext): FileStatePersistenceMedium {
-    const memento = context.globalState;
-    return {
-        runtime_key: memento as object,
-        read: () => memento.get<unknown>(STATE_KEY, {}),
-        write: async (envelope) => {
-            await memento.update(STATE_KEY, envelope);
-        },
-    };
-}
-
-export function create_memento_keyed_file_state_persistence(
-    context: ExtensionContext,
-): KeyedFileStatePersistence {
-    return create_keyed_file_state_persistence(memento_medium(context));
-}
-
-export function create_file_state_store(
-    context: ExtensionContext,
-    get_max_stored?: () => number,
-): AuthorityFileStateStore {
-    return create_authority_store(memento_medium(context), get_max_stored);
-}

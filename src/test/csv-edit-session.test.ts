@@ -5,11 +5,11 @@ import type { ExtensionContext } from 'vscode';
 import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
 import {
     create_authority_store,
-    create_file_state_store,
     type DurableFileAuthority,
     type FileStateSnapshot,
     type FileStateStore,
 } from '../state';
+import { create_memento_file_state_store } from './helpers/memento-file-state';
 import type { HostMessage, PerFileState, SheetViewRecord } from '../types';
 import type { DataSource, RowWindow, WorkbookMeta } from '../data-source/interface';
 import { versioned_state_store } from './helpers/versioned-state-store';
@@ -3910,7 +3910,7 @@ describe('CSV edit sessions', () => {
                 },
             },
         } as unknown as ExtensionContext;
-        const store = create_file_state_store(context);
+        const store = create_memento_file_state_store(context);
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
         vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
         const panel = open_csv_table(uri(file_path), store);
@@ -4016,7 +4016,7 @@ describe('CSV edit sessions', () => {
                 },
             },
         } as unknown as ExtensionContext;
-        const store = create_file_state_store(context);
+        const store = create_memento_file_state_store(context);
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
         vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
         const panel = open_csv_table(uri(file_path), store);

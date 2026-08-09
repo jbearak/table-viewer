@@ -266,28 +266,9 @@ describe('Excel workbook snapshot controller', () => {
         expect(initial.capabilities).toEqual({
             csvEditable: false,
             csvEditingSupported: false,
-            csvEditingMode: 'selfManaged',
             csvSaveLifecycle: { revision: 0, state: 'idle' },
         });
         expect(builds.count).toBe(1);
-    });
-
-    it('does not block initial workbook delivery when the cosmetic touch fails', async () => {
-        const state = mutable_state_store({
-            excelFirstRowHeaders: { People: 'off' },
-        });
-        const store: FileStateStore = {
-            ...state.store,
-            async touch() {
-                throw new Error('cosmetic touch failed');
-            },
-        };
-        const panel = open_excel('/touch-failure.xlsx', store, excel_profile({ count: 0 }));
-
-        const initial = await ready(panel);
-
-        expect(initial.meta.sheets[0]?.name).toBe('People');
-        expect(initial.state.excelFirstRowHeaders).toEqual({ People: 'off' });
     });
 
     it('applies a direct header projection with one adoption and one result snapshot', async () => {

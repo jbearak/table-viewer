@@ -10,18 +10,19 @@ import {
     drain_csv_previews,
 } from './csv-preview';
 import {
-    open_vscode_cosmetic_state_database,
-    type OpenedVscodeCosmeticStateDatabase,
-} from './vscode-cosmetic-state-database';
+    open_vscode_state_database,
+    type OpenedVscodeStateDatabase,
+} from './vscode-state-database';
 import { DEFAULT_MAX_STORED_FILES } from './state';
 
 interface ActiveExtensionRuntime {
     readonly viewers: TableViewerRegistration;
-    readonly commands: vscode.Disposable[];
-    readonly database: OpenedVscodeCosmeticStateDatabase;
+    readonly disposables: vscode.Disposable[];
+    readonly database: OpenedVscodeStateDatabase;
 }
 
 let active_runtime: ActiveExtensionRuntime | undefined;
+let active_teardown: Promise<void> | undefined;
 
 function active_custom_tab_uri(): vscode.Uri | undefined {
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
@@ -29,7 +30,7 @@ function active_custom_tab_uri(): vscode.Uri | undefined {
 }
 
 function extension_version(context: vscode.ExtensionContext): string {
-    const version = (context.extension.packageJSON as { version?: unknown }).version;
+    const version = (context.extension?.packageJSON as { version?: unknown } | undefined)?.version;
     return typeof version === 'string' && version.length > 0 ? version : '0.0.0';
 }
 
@@ -51,7 +52,7 @@ function dispose_best_effort(disposable: vscode.Disposable | undefined): void {
     try {
         disposable?.dispose();
     } catch {
-        // Teardown continues so queues can drain and SQLite can always close.
+        // Teardown continues so persistence queues can still be drained.
     }
 }
 
@@ -60,120 +61,120 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
         await vscode.workspace.fs.createDirectory(state_directory);
     } catch {
-        // The database opener below performs the authoritative open and selects its
-        // in-memory cosmetic fallback when the directory is unusable.
+        // The open below is authoritative and reports an unusable directory with
+        // the path and cause; a failure here would say strictly less.
     }
-    const database = await open_vscode_cosmetic_state_database({
-        storageDirectory: state_directory.fsPath,
-        appVersion: extension_version(context),
-        getMaxStoredFiles: get_max_stored_files,
-        warn: async (message) => {
-            await vscode.window.showWarningMessage(message);
-        },
-    });
+    let database: OpenedVscodeStateDatabase;
+    try {
+        database = await open_vscode_state_database({
+            storageDirectory: state_directory.fsPath,
+            appVersion: extension_version(context),
+            getMaxStoredFiles: get_max_stored_files,
+        });
+    } catch (error) {
+        // SQLite is the only backend. Fail activation loudly rather than run with
+        // state the user cannot see the loss of, and leave the file untouched so
+        // moving it aside stays their decision.
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(message);
+        throw error;
+    }
 
     let viewers: TableViewerRegistration | undefined;
-    const commands: vscode.Disposable[] = [];
+    const disposables: vscode.Disposable[] = [];
     try {
         viewers = register_table_viewer(context, database.store);
-        commands.push(vscode.commands.registerCommand(
-            'tableViewer.showCsvPreviewToSide',
+        disposables.push({ dispose: dispose_csv_preview });
+        // Each registration is pushed as soon as it exists. A single
+        // push(a, b, c) evaluates every argument before the array is touched, so
+        // a failure registering the second command would leak the first past the
+        // rollback below.
+        const register = (
+            command: string,
+            handler: (uri?: vscode.Uri) => void,
+        ): void => {
+            disposables.push(vscode.commands.registerCommand(command, handler));
+        };
+        const preview_in = (column: number) => (uri?: vscode.Uri) => {
+            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+            if (!target) return;
+            show_csv_preview(target, context.extensionUri, database.store, column);
+        };
+        const open_with = (view_type: string, fallback: () => vscode.Uri | undefined) => (
             (uri?: vscode.Uri) => {
-                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+                const target = uri ?? fallback();
                 if (!target) return;
-                show_csv_preview(
-                    target,
-                    context.extensionUri,
-                    database.store,
-                    vscode.ViewColumn.Beside,
-                );
-            },
-        ));
-        commands.push(vscode.commands.registerCommand(
-            'tableViewer.showCsvPreview',
-            (uri?: vscode.Uri) => {
-                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-                if (!target) return;
-                show_csv_preview(
-                    target,
-                    context.extensionUri,
-                    database.store,
-                    vscode.ViewColumn.Active,
-                );
-            },
-        ));
-        commands.push(vscode.commands.registerCommand(
-            'tableViewer.openCsvTable',
-            (uri?: vscode.Uri) => {
-                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-                if (!target) return;
-                void vscode.commands.executeCommand(
-                    'vscode.openWith',
-                    target,
-                    TABLE_VIEW_TYPE,
-                );
-            },
-        ));
-        commands.push(vscode.commands.registerCommand(
-            'tableViewer.openAsText',
-            (uri?: vscode.Uri) => {
-                const target = uri ?? active_custom_tab_uri();
-                if (!target) return;
-                void vscode.commands.executeCommand('vscode.openWith', target, 'default');
-            },
-        ));
-        context.subscriptions.push(...commands);
-        active_runtime = { viewers, commands, database };
-    } catch (error) {
-        for (const command of commands.reverse()) dispose_best_effort(command);
-        if (viewers) {
-            try {
-                viewers.stop_admissions();
-            } catch {
-                // Continue rollback through disposal and drain.
+                void vscode.commands.executeCommand('vscode.openWith', target, view_type);
             }
-            dispose_best_effort(viewers);
-            await Promise.allSettled([viewers.drain()]);
-        }
+        );
+        register('tableViewer.showCsvPreviewToSide', preview_in(vscode.ViewColumn.Beside));
+        register('tableViewer.showCsvPreview', preview_in(vscode.ViewColumn.Active));
+        register('tableViewer.openCsvTable', open_with(
+            TABLE_VIEW_TYPE,
+            () => vscode.window.activeTextEditor?.document.uri,
+        ));
+        register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
+        context.subscriptions.push(...disposables);
+        active_runtime = { viewers, disposables, database };
+    } catch (error) {
+        // Nothing may keep the database open after a failed activation: VS Code
+        // will not call deactivate for an activation that threw, and a retained
+        // handle would block the coordination gate for the next attempt.
+        for (const disposable of [...disposables].reverse()) dispose_best_effort(disposable);
+        if (viewers) dispose_best_effort(viewers);
+        const drains: Promise<void>[] = [];
+        if (viewers) drains.push(viewers.drain());
+        drains.push(drain_csv_previews());
+        await Promise.allSettled(drains);
         try {
             await database.close();
         } catch {
-            // Preserve the activation failure that triggered rollback.
+            // Preserve the activation failure that triggered this rollback.
         }
         throw error;
     }
 }
 
-export async function deactivate(): Promise<void> {
+async function drain_runtime(runtime: ActiveExtensionRuntime): Promise<void> {
+    let viewer_failure: { error: unknown } | undefined;
+    try {
+        await runtime.viewers.drain();
+    } catch (error) {
+        viewer_failure = { error };
+    }
+    try {
+        await drain_csv_previews();
+    } catch (preview_failure) {
+        if (viewer_failure) {
+            throw new AggregateError(
+                [viewer_failure.error, preview_failure],
+                'Viewer and CSV preview drains failed during deactivation.',
+            );
+        }
+        throw preview_failure;
+    }
+    if (viewer_failure) throw viewer_failure.error;
+}
+
+export function deactivate(): Promise<void> {
+    if (active_teardown) return active_teardown;
     const runtime = active_runtime;
-    active_runtime = undefined;
-    if (!runtime) return;
-
-    // First stop admissions and begin viewer/preview teardown so no new document
-    // or controller work can begin. Viewer provider registration stays alive only
-    // long enough for already-admitted native edit events to drain below.
-    try {
-        runtime.viewers.stop_admissions();
-    } catch {
-        // Continue ordered teardown; close must not be skipped by a host callback.
-    }
-    try {
-        dispose_csv_preview();
-    } catch {
-        // Continue through controller drain.
-    }
-    for (const command of runtime.commands) dispose_best_effort(command);
-    dispose_best_effort(runtime.viewers);
-
-    try {
-        // Then settle all document and controller queues, finalize the viewer
-        // provider bridge, and only then close the direct SQLite handle. close()
-        // is idempotent and is invoked exactly once here.
-        await Promise.allSettled([
-            runtime.viewers.drain(),
-            drain_csv_previews(),
-        ]);
-    } finally {
+    if (!runtime) return Promise.resolve();
+    const teardown = (async () => {
+        // Dispose first so no new panel or preview work can begin, then let the
+        // already-admitted controller writes settle, and only then close SQLite.
+        // dispose_viewers() fences edit admission before its first await, so the
+        // drains below observe closed sets. A failed viewer or preview drain retains
+        // the runtime and database so a later deactivation can retry the flush.
+        for (const disposable of runtime.disposables) dispose_best_effort(disposable);
+        dispose_best_effort(runtime.viewers);
+        await drain_runtime(runtime);
         await runtime.database.close();
-    }
+        if (active_runtime === runtime) active_runtime = undefined;
+    })();
+    active_teardown = teardown;
+    void teardown.finally(() => {
+        if (active_teardown === teardown) active_teardown = undefined;
+    }).catch(() => {});
+    return teardown;
 }

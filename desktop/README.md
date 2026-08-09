@@ -15,7 +15,7 @@ New windows are placed by `desktop/main/window-geometry.ts`: the first is center
 
 ## Prerequisites
 
-- Node.js >= 24 and `npm install` at the repo root.
+- Node.js >= 26.5.1 and `npm install` at the repo root.
 
 ## Run in development
 
@@ -44,7 +44,7 @@ npm run desktop:package:win   # setup + portable exe, x64 + arm64
 
 Must be run on Windows — electron-builder's NSIS and portable targets shell out to Windows tooling.
 
-**This script is developer-only; no release publishes its output.** The desktop's view state lives in SQLite, and this build cannot open that database on Windows (see [State and settings](#state-and-settings) below), so a Windows exe built today would be a viewer whose settings never survive a restart. `release-build.yml`'s `desktop-windows` job therefore packages nothing. It reports that and **exits 0**: the macOS release still ships, because Windows being unproven must not withhold the platform that is proven. The missing-artifact guarantee lives in `release-publish.yml`, and which way it falls depends on the trigger — a publish from a pushed tag warns and continues, since the build run's own `success` conclusion is what vouches for it, while a hand-dispatched publish bypasses that conclusion check and therefore fails on an absent `windows-<tag>` artifact unless dispatched with `allow_missing_windows=true`. The rest of this section documents what the script produces locally and what a future unfenced Windows release would ship.
+**This script is developer-only; no release publishes its output.** The local build uses the same SQLite state backend as every other platform and persists settings on Windows. `release-build.yml`'s `desktop-windows` job packages nothing because complete packaged-runtime NTFS kill-crash evidence is still pending, not because the database cannot open. It reports that and **exits 0**: the macOS release still ships, because Windows being unproven must not withhold the platform that is proven. The missing-artifact policy lives in `release-publish.yml`, and depends on the trigger — a publish from a successful pushed-tag build warns and continues, while a hand-dispatched publish requires `allow_missing_windows=true` to acknowledge the intentional omission explicitly. The rest of this section documents what the script produces locally and what a future unfenced Windows release would ship.
 
 Four exes land in `dist/desktop-packages/`: `table-viewer-<version>-<arch>-setup.exe` and `table-viewer-<version>-<arch>-portable.exe` for each of `x64` and `arm64`. The per-target `artifactName` overrides in `electron-builder.yml` exist because both targets emit `.exe` and would otherwise collide on the shared name, and `nsis.buildUniversalInstaller: false` is what splits the installer per architecture instead of shipping one that carries both payloads.
 
@@ -86,11 +86,13 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
   or synchronized between the two.
 - Preferences: `userData/settings.v1.json`, edited via the Preferences window (**Cmd+,**).
 
-The desktop app requires a platform on which a directory flush can be proven
-durable. Windows currently has no such primitive available without a native
-addon, so the app declines the platform up front rather than running with view
-state it cannot persist; `desktop/packaged-recovery-gate.mjs` asserts that
-refusal on Windows and the full recovery matrix elsewhere.
+The app declines a *location* whose reachable directory handle rejects fsync,
+and says so before creating anything. It no longer declines a whole platform: on
+Windows the default Node primitive is attempted, so future runtime support is
+used automatically; only a directory-open result proving that Node cannot obtain
+a handle is skipped, matching SQLite's own Windows posture. Windows therefore
+runs the same recovery matrix as every other platform in
+`desktop/packaged-recovery-gate.mjs`.
 
 ### Windows durability verification
 
@@ -106,13 +108,19 @@ those observations rather than written down.
 
 The decision tree the verdict feeds, both branches of which are explicit:
 
-- **The gate verifies.** Windows ships the SQLite state backend on exactly the
-  evidence standard macOS ships on — a documented durability contract plus
-  kill-crash verification against the packaged runtime, which is the same trust
-  basis `fsync` gives on POSIX. Only then is
-  `assert_sqlite_directory_durability_supported` revisited.
-- **The gate cannot verify.** Windows ships view-only, exactly as it does today:
-  files open and display, and the persistent state backend is declined up front.
+- **The gate verifies.** Windows's durability rests on the same evidence standard
+  macOS's does — a documented contract plus kill-crash verification against the
+  packaged runtime.
+- **The gate cannot verify.** Windows still ships the state backend on SQLite's
+  own Windows durability posture: use a reachable directory flush, but omit it
+  when the default Node directory open proves no handle can be obtained. The
+  outstanding cut points stay recorded as pending.
+
+Note that the shipping decision no longer waits on this probe:
+`assert_sqlite_directory_durability_supported` attempts the default primitive and
+skips only that proven-unavailable directory-open case rather than refusing the
+platform. What the probe still decides is what the durability claim in this
+document is allowed to say.
 
 Neither branch permits silent weakening. A `not-verified` verdict is a result and
 does **not** fail CI — a job that failed on an unproven primitive would only

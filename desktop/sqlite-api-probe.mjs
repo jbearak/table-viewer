@@ -133,21 +133,26 @@ export function run_sqlite_api_probe(runtime) {
             } catch (error) {
                 directory_error = error;
             }
-            if (process.platform === 'win32') {
-                // Production deliberately refuses Windows directory durability until
-                // Node exposes a proven primitive. A native success here is not enough
-                // to weaken that fail-closed policy.
-                directory_fsync = 'fail-closed';
-            } else {
-                invariant(directory_error === undefined,
-                    `directory fsync failed: ${directory_error?.code ?? 'unknown'}`);
-                directory_fsync = 'supported';
-            }
+            // Reported as an observation, never as a policy. This module is plain
+            // `.mjs` run directly by `host-sqlite-runtime-probe.mjs`, so it cannot
+            // import the production rule the way the Electron and durability probes
+            // do — and a hardcoded platform verdict here is exactly the second copy
+            // of a predicate that keeps answering after the original changes. It used
+            // to say `fail-closed` on win32 and threw the observed error away, which
+            // survived the removal of that refusal by construction.
+            //
+            // A platform with no reachable primitive is a *result*, not a probe
+            // malfunction: production skips the flush there (see
+            // `assert_sqlite_directory_durability_supported`), so the honest report is
+            // what this runtime could actually do, with the error code that says why.
+            directory_fsync = directory_error === undefined
+                ? { outcome: 'supported', errorCode: null }
+                : { outcome: 'unavailable', errorCode: directory_error.code ?? null };
         } finally {
             rmSync(probe_directory, { recursive: true, force: true });
         }
 
-        invariant(directory_fsync === 'supported' || directory_fsync === 'fail-closed',
+        invariant(directory_fsync !== undefined,
             'directory durability capability was not resolved');
 
         let representative_error;

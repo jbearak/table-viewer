@@ -232,12 +232,12 @@ function validate_schema_objects(
 }
 
 function validate_pragmas(database: DatabaseSync, identity: SqliteFileStateIdentity): void {
-    const schema = sqlite_file_state_schema_identity(identity);
+    const expectedUserVersion = sqlite_file_state_schema_identity(identity).userVersion;
     if (safe_number(row(database, 'PRAGMA application_id')?.application_id)
         !== SQLITE_FILE_STATE_APPLICATION_ID
         || safe_number(row(database, 'PRAGMA user_version')?.user_version)
-        !== schema.userVersion) {
-        throw sqlite_file_state_schema_error({ schemaVersion: schema.userVersion });
+        !== expectedUserVersion) {
+        throw sqlite_file_state_schema_error({ schemaVersion: expectedUserVersion });
     }
     if (text(row(database, 'PRAGMA journal_mode')?.journal_mode) !== 'delete') {
         throw sqlite_file_state_schema_error();
@@ -262,7 +262,6 @@ function validate_integer_storage(database: DatabaseSync): void {
 
 function decode_state_json(value: unknown): {
     readonly state: StoredPerFileState;
-    readonly hasTopLevelPendingEdits: boolean;
     readonly lifecycle?: PersistedPreparedInstallLifecycleRecord;
 } {
     if (typeof value !== 'string') throw sqlite_file_state_malformed_error();
@@ -272,14 +271,12 @@ function decode_state_json(value: unknown): {
             throw sqlite_file_state_malformed_error();
         }
         const logical = { ...(parsed as Record<string, unknown>) };
-        const hasTopLevelPendingEdits = Object.hasOwn(logical, 'pendingEdits');
         const lifecycle = decode_prepared_install_lifecycle(
             logical[SQLITE_PREPARED_INSTALL_STATE_KEY],
         );
         delete logical[SQLITE_PREPARED_INSTALL_STATE_KEY];
         return {
             state: decode_stored_per_file_state(logical),
-            hasTopLevelPendingEdits,
             ...(lifecycle === undefined ? {} : { lifecycle }),
         };
     } catch {
@@ -356,9 +353,8 @@ function validate_identity_and_counters(
     if (metaRows.length !== 1) throw sqlite_file_state_schema_error({ rowCount: metaRows.length });
     const meta = metaRows[0];
     const identity = options.identity;
-    const schema = sqlite_file_state_schema_identity(identity);
     if (safe_number(meta.singleton) !== 1
-        || text(meta.format) !== schema.format
+        || text(meta.format) !== sqlite_file_state_schema_identity(identity).format
         || text(meta.database_id) !== identity.databaseId
         || text(meta.storage_environment_id) !== identity.storageEnvironmentId
         || text(meta.product_kind) !== identity.productKind
@@ -548,50 +544,6 @@ function validate_coordination(
     }
 }
 
-function validate_direct_vscode_cosmetic_state(
-    database: DatabaseSync,
-    identity: SqliteFileStateIdentity,
-    meta: SqliteRow,
-): void {
-    if (!is_direct_vscode_file_state_identity(identity)) return;
-
-    if (safe_number(meta.next_ownership_generation) !== 1) {
-        throw sqlite_file_state_malformed_error();
-    }
-    const entryRows = rows(database, `SELECT path, state_json, has_pending_edits,
-        authority_commit_sequence, authority_revision, physical_revision,
-        projection_revision, physical_digest, recovery_entry_id, recovery_record_id
-        FROM entries ORDER BY path`);
-    for (const entry of entryRows) {
-        const path = text(entry.path);
-        const recoveryEntryId = text(entry.recovery_entry_id);
-        const decoded = decode_state_json(entry.state_json);
-        if (path.length === 0
-            || recoveryEntryId.length === 0
-            || decoded.hasTopLevelPendingEdits
-            || decoded.lifecycle !== undefined
-            || safe_number(entry.has_pending_edits) !== 0
-            || safe_number(entry.authority_commit_sequence) !== 0
-            || safe_number(entry.authority_revision) !== 0
-            || safe_number(entry.physical_revision) !== 0
-            || safe_number(entry.projection_revision) !== 0
-            || entry.physical_digest !== null
-            || recoveryEntryId !== path
-            || entry.recovery_record_id !== null) {
-            throw sqlite_file_state_malformed_error({ rowCount: entryRows.length });
-        }
-    }
-    for (const table of [
-        'authority_stages',
-        'entry_leases',
-        'edit_sessions',
-        'file_write_reservations',
-    ]) {
-        const rowCount = count(database, `SELECT count(*) AS count FROM ${table}`);
-        if (rowCount !== 0) throw sqlite_file_state_malformed_error({ rowCount });
-    }
-}
-
 function validate_legacy_source(
     actual: SqliteRow,
     expected: SqliteLegacySourceIdentity,
@@ -622,6 +574,8 @@ function validate_legacy(
         return;
     }
     if (is_direct_vscode_file_state_identity(identity)) {
+        // A direct VS Code database never imports a memento, so it must carry a
+        // client profile but no legacy import metadata at all.
         if (text(meta.client_profile_id) !== identity.clientProfileId
             || text(meta.authority_mode) !== 'sqlite'
             || meta.legacy_capsule_id !== null
@@ -717,7 +671,7 @@ function validate_migration_history(
     }
 }
 
-/** Validate the exact schema selected by the supplied on-disk identity. */
+/** Validate a canonical v1 database without repairing, deleting, or defaulting any state. */
 export function validate_sqlite_file_state_database(
     database: DatabaseSync,
     options: SqliteFileStateValidationOptions,
@@ -734,7 +688,6 @@ export function validate_sqlite_file_state_database(
     validate_stages(database, nextRevision);
     validate_coordination(database, meta, pending, requiresPendingEditRecovery);
     validate_legacy(database, options.identity, meta, pending);
-    validate_direct_vscode_cosmetic_state(database, options.identity, meta);
 
     return {
         databaseId: text(meta.database_id),
