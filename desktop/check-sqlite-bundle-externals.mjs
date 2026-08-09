@@ -5,14 +5,10 @@ import { fileURLToPath } from 'node:url';
 
 const repo_dir = fileURLToPath(new URL('..', import.meta.url));
 const package_json = JSON.parse(await readFile(join(repo_dir, 'package.json'), 'utf8'));
-for (const [label, script_name] of [
-    ['extension server bundle', 'bundle'],
-    ['companion extension bundle', 'bundle:companion'],
-]) {
-    const command = package_json.scripts?.[script_name];
-    if (typeof command !== 'string' || !command.includes('--external:node:sqlite')) {
-        throw new Error(`${label} does not explicitly externalize node:sqlite`);
-    }
+const extension_bundle = package_json.scripts?.bundle;
+if (typeof extension_bundle !== 'string'
+    || !extension_bundle.includes('--external:node:sqlite')) {
+    throw new Error('extension server bundle does not explicitly externalize node:sqlite');
 }
 
 /**
@@ -27,10 +23,9 @@ async function assert_externalized_sqlite(label, ...segments) {
     }
 }
 
-await assert_externalized_sqlite(
-    'companion extension bundle',
-    'companion', 'dist', 'extension.js',
-);
+// The VS Code extension keeps its whole file-state authority in SQLite, so the
+// shipped bundle must reach the host's embedded runtime rather than a bundled copy.
+await assert_externalized_sqlite('extension bundle', 'dist', 'extension.js');
 await assert_externalized_sqlite(
     'desktop runtime probe bundle',
     'dist', 'runtime-probes', 'electron-sqlite-runtime-probe.js',
@@ -73,7 +68,7 @@ for (const name of [
 }
 
 process.stdout.write(
-    'extension and companion bundle scripts, companion bundle, desktop main bundle,'
+    'extension bundle script, extension bundle, desktop main bundle,'
     + ' desktop runtime probe bundle, packaged recovery gate bundle, and windows durability probe bundle externalize'
     + ' node:sqlite; runtime-only bundles are outside the packaged desktop directory\n',
 );

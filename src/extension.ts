@@ -81,45 +81,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const disposables: vscode.Disposable[] = [];
     try {
         viewers = register_table_viewer(context, database.store);
-        disposables.push(
-            vscode.commands.registerCommand(
-                'tableViewer.showCsvPreviewToSide',
-                (uri?: vscode.Uri) => {
-                    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-                    if (!target) return;
-                    show_csv_preview(
-                        target,
-                        context.extensionUri,
-                        database.store,
-                        vscode.ViewColumn.Beside,
-                    );
-                },
-            ),
-            vscode.commands.registerCommand(
-                'tableViewer.showCsvPreview',
-                (uri?: vscode.Uri) => {
-                    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-                    if (!target) return;
-                    show_csv_preview(
-                        target,
-                        context.extensionUri,
-                        database.store,
-                        vscode.ViewColumn.Active,
-                    );
-                },
-            ),
-            vscode.commands.registerCommand('tableViewer.openCsvTable', (uri?: vscode.Uri) => {
-                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+        // Each registration is pushed as soon as it exists. A single
+        // push(a, b, c) evaluates every argument before the array is touched, so
+        // a failure registering the second command would leak the first past the
+        // rollback below.
+        const register = (
+            command: string,
+            handler: (uri?: vscode.Uri) => void,
+        ): void => {
+            disposables.push(vscode.commands.registerCommand(command, handler));
+        };
+        const preview_in = (column: number) => (uri?: vscode.Uri) => {
+            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+            if (!target) return;
+            show_csv_preview(target, context.extensionUri, database.store, column);
+        };
+        const open_with = (view_type: string, fallback: () => vscode.Uri | undefined) => (
+            (uri?: vscode.Uri) => {
+                const target = uri ?? fallback();
                 if (!target) return;
-                void vscode.commands.executeCommand('vscode.openWith', target, TABLE_VIEW_TYPE);
-            }),
-            vscode.commands.registerCommand('tableViewer.openAsText', (uri?: vscode.Uri) => {
-                const target = uri ?? active_custom_tab_uri();
-                if (!target) return;
-                void vscode.commands.executeCommand('vscode.openWith', target, 'default');
-            }),
-            { dispose: dispose_csv_preview },
+                void vscode.commands.executeCommand('vscode.openWith', target, view_type);
+            }
         );
+        register('tableViewer.showCsvPreviewToSide', preview_in(vscode.ViewColumn.Beside));
+        register('tableViewer.showCsvPreview', preview_in(vscode.ViewColumn.Active));
+        register('tableViewer.openCsvTable', open_with(
+            TABLE_VIEW_TYPE,
+            () => vscode.window.activeTextEditor?.document.uri,
+        ));
+        register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
+        disposables.push({ dispose: dispose_csv_preview });
         context.subscriptions.push(...disposables);
         active_runtime = { viewers, disposables, database };
     } catch (error) {
