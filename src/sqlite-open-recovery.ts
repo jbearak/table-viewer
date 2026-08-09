@@ -499,7 +499,10 @@ function ensure_private_gate(
 }
 
 function flush_file(filePath: string): void {
-    const descriptor = fs.openSync(filePath, 'r');
+    // FlushFileBuffers on Windows requires a handle opened for writing. `r+`
+    // remains non-creating, so a raced-away file still fails closed while the
+    // descriptor is usable by fsync on every supported platform.
+    const descriptor = fs.openSync(filePath, 'r+');
     try {
         fs.fsyncSync(descriptor);
     } finally {
