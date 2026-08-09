@@ -1542,6 +1542,46 @@ describe('application quit coordinator', () => {
         expect(resume_quit).not.toHaveBeenCalled();
     });
 
+    it('waits for every app-chrome close before abandoning after one throws', async () => {
+        const throwing = new electron_mock.BrowserWindow({});
+        throwing.closeThrows = true;
+        const slow = new electron_mock.BrowserWindow({});
+        const slow_close = vi.fn(() => {
+            const event = {
+                defaultPrevented: false,
+                preventDefault() { this.defaultPrevented = true; },
+            };
+            slow.emit('close', event);
+            // The close is now in flight. The test emits `closed` explicitly after
+            // proving the first failure did not make Promise.all abandon early.
+        });
+        slow.close = slow_close;
+
+        const shutdown = shutdown_port(async () => ({ type: 'closed' }));
+        const before_quit = create_app_quit_coordinator(
+            () => close_desktop_windows(
+                async () => true,
+                () => electron_mock.BrowserWindow.instances as unknown as ElectronBrowserWindow[],
+            ),
+            vi.fn(),
+            shutdown,
+        );
+
+        before_quit({ preventDefault: vi.fn() });
+        await vi.waitFor(() => expect(slow_close).toHaveBeenCalledOnce());
+        // The throwing window has already failed, but the other close operation
+        // still owns part of the barrier. Admission must not reopen underneath it.
+        expect(shutdown.abandon).not.toHaveBeenCalled();
+
+        slow.destroyed = true;
+        slow.webContents.destroyed = true;
+        slow.webContents.emit('destroyed');
+        slow.emit('closed');
+
+        await vi.waitFor(() => expect(shutdown.abandon).toHaveBeenCalledOnce());
+        expect(shutdown.drain).not.toHaveBeenCalled();
+    });
+
     it('settles a quit close barrier when a renderer becomes unresponsive', async () => {
         const viewer_manager = manager();
         viewer_manager.open_file('/tmp/unresponsive-during-quit.csv');

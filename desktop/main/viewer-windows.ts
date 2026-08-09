@@ -273,7 +273,9 @@ export async function close_desktop_windows(
     if (!await close_viewer_windows()) return false;
 
     const windows = remaining_windows().filter((window) => !window.isDestroyed());
-    const closed = await Promise.all(windows.map((window) => close_plain_window(window)));
+    const closed = await Promise.all(
+        windows.map((window) => close_plain_window(window).catch(() => false)),
+    );
     return closed.every(Boolean);
 }
 
