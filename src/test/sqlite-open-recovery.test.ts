@@ -1558,6 +1558,37 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         ]);
     });
 
+    it('skips when the default Windows fsync cannot use an opened directory handle', () => {
+        const events: string[] = [];
+        const unavailable = Object.assign(new Error('directory handles cannot be flushed'), {
+            code: 'EPERM',
+        });
+
+        expect(() => assert_sqlite_directory_durability_supported(
+            tempDirectory,
+            fs.fsyncSync,
+            'win32',
+            {
+                openDirectory(directoryPath) {
+                    events.push(`open:${directoryPath}`);
+                    return 39;
+                },
+                syncDirectory(descriptor) {
+                    events.push(`fsync:${descriptor}`);
+                    throw unavailable;
+                },
+                closeDirectory(descriptor) {
+                    events.push(`close:${descriptor}`);
+                },
+            },
+        )).not.toThrow();
+        expect(events).toEqual([
+            `open:${tempDirectory}`,
+            'fsync:39',
+            'close:39',
+        ]);
+    });
+
     it('fails closed when a reachable Windows filesystem rejects fsync', () => {
         const rejected = Object.assign(new Error('not supported'), { code: 'ENOTSUP' });
         const closed: number[] = [];

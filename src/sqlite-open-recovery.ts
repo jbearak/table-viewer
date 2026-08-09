@@ -38,6 +38,7 @@ const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTS
 // Windows handle request itself is refused. Neither produces a descriptor that
 // could be passed to fsync, so both mean that the default primitive is absent.
 const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR', 'EPERM']);
+const WINDOWS_UNAVAILABLE_DIRECTORY_FSYNC_CODES = new Set(['EPERM']);
 
 export const SQLITE_INITIALIZATION_DURABLE_CUT_POINTS = [
     'candidate-after-schema',
@@ -489,12 +490,16 @@ function flush_file(filePath: string): void {
 
 interface DirectoryDurabilityFileSystem {
     openDirectory(directoryPath: string): number;
+    syncDirectory?(descriptor: number): void;
     closeDirectory(descriptor: number): void;
 }
 
 const DEFAULT_DIRECTORY_DURABILITY_FILE_SYSTEM: DirectoryDurabilityFileSystem = {
     openDirectory(directoryPath) {
         return fs.openSync(directoryPath, 'r');
+    },
+    syncDirectory(descriptor) {
+        fs.fsyncSync(descriptor);
     },
     closeDirectory(descriptor) {
         fs.closeSync(descriptor);
@@ -533,8 +538,19 @@ export function assert_sqlite_directory_durability_supported(
             }
             throw error;
         }
-        fsyncDirectory(descriptor);
+        if (fsyncDirectory === fs.fsyncSync && fileSystem.syncDirectory) {
+            fileSystem.syncDirectory(descriptor);
+        } else {
+            fsyncDirectory(descriptor);
+        }
     } catch (error) {
+        if (descriptor !== undefined
+            && platform === 'win32'
+            && fsyncDirectory === fs.fsyncSync
+            && is_node_error(error)
+            && WINDOWS_UNAVAILABLE_DIRECTORY_FSYNC_CODES.has(error.code ?? '')) {
+            return;
+        }
         if (is_node_error(error) && UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error.code ?? '')) {
             throw sqlite_file_state_error('unsupported', { operation: 'directory-durability' });
         }
