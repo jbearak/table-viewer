@@ -117,7 +117,6 @@ describe('canonical SQLite file-state schema', () => {
             next_revision: 1,
             absence_revision: 0,
             next_recency_order: 1,
-            next_ownership_generation: 1,
         });
         expect(database.prepare('SELECT * FROM schema_migrations').get()).toMatchObject({
             version: 1,
@@ -149,7 +148,6 @@ describe('canonical SQLite file-state schema', () => {
             next_revision: 9,
             absence_revision: 3,
             next_recency_order: 3,
-            next_ownership_generation: 1,
             store_updated_at_ms: 1234,
         });
         expect(database.prepare('SELECT * FROM legacy_imports').get()).toMatchObject({

@@ -140,7 +140,6 @@ describe('SQLite file-state structural validation', () => {
             nextRevision: 2,
             absenceRevision: 0,
             nextRecencyOrder: 2n,
-            nextOwnershipGeneration: 1,
             entryCount: 1,
         });
     });

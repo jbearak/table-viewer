@@ -27,8 +27,6 @@ function inspect_fixture(fixture: FileStateStoreContractFixture): FileStateStore
 }
 
 export interface FileStateStoreContractCapabilities {
-    /** Later coordinated backends override this when durable ownership is implemented. */
-    readonly editOwner?: boolean;
     /** Later remote backends override this when recovery records are implemented. */
     readonly recoveryRecord?: boolean;
     /** Backends that allocate a fresh revision when canonicalizing an absent target. */
@@ -131,20 +129,6 @@ export function file_state_store_contract(
             expect(stale.type).toBe('conflict');
             expect(validate).toHaveBeenCalledOnce();
 
-            if (!capabilities.editOwner) {
-                const unsupported = vi.fn(() => true);
-                await expect(store.compare_and_set(
-                    '/guarded',
-                    1,
-                    { activeSheetIndex: 3 },
-                    unsupported,
-                    {
-                        expectedAuthorityRevision: 0,
-                        editOwner: { editSessionId: 'unsupported', ownershipGeneration: 1 },
-                    },
-                )).resolves.toMatchObject({ type: 'conflict' });
-                expect(unsupported).toHaveBeenCalledOnce();
-            }
             if (!capabilities.recoveryRecord) {
                 for (const recoveryRecordId of ['unsupported', '']) {
                     await expect(store.compare_and_set(

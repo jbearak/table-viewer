@@ -5,7 +5,6 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     create_keyed_authority_store,
-    supports_coordinated_file_state,
     type AuthorityFileStateStore,
     type KeyedFileStatePersistence,
     type KeyedStateReadTransaction,
@@ -116,14 +115,12 @@ file_state_store_contract('SQLite backend', () => {
 });
 
 describe('SQLite file-state persistence', () => {
-    it('opens through no-clobber initialization and exposes edit coordination only for SQLite', async () => {
+    it('opens through no-clobber initialization and exposes keyed authority', async () => {
         const database = freshDatabase();
         const opened = await open_sqlite_file_state_store(database.databasePath, database.options);
         expect(opened.persistence.canonicalization_revision_policy)
             .toBe('allocate-revision-when-target-absent');
-        expect(supports_coordinated_file_state(opened.store)).toBe(true);
         expect(Object.keys(opened.store).sort()).toEqual([
-            'acquire_edit_session',
             'canonicalize_path',
             'cleanup_authority_transactions',
             'compare_and_set',
@@ -134,7 +131,6 @@ describe('SQLite file-state persistence', () => {
             'lease_entry',
             'read',
             'read_authority',
-            'release_edit_session',
             'stage_authority_transaction',
             'touch',
         ]);
@@ -165,107 +161,6 @@ describe('SQLite file-state persistence', () => {
             category: 'protocol',
             metadata: { operation: 'supported-protocol-configuration', protocol: 7 },
         });
-    });
-
-    it('reverifies the host lock inside the owner transaction without partial state', async () => {
-        const database = freshDatabase();
-        const opened = await open_sqlite_file_state_store(database.databasePath, database.options);
-        const verify = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-        await expect(opened.store.acquire_edit_session('/released.csv', (value) => value, {
-            hostLockId: 'released-host-lock',
-            physicalResourceLockKey: 'released-resource-lock',
-            verify,
-            release: async () => undefined,
-        })).resolves.toEqual({ type: 'busy' });
-
-        const direct = new DatabaseSync(database.databasePath, { readOnly: true });
-        expect(direct.prepare('SELECT count(*) AS count FROM entries').get()?.count).toBe(0);
-        expect(direct.prepare('SELECT count(*) AS count FROM edit_sessions').get()?.count).toBe(0);
-        direct.close();
-        await opened.close();
-    });
-
-    it('shares and releases edit-session references across stores', async () => {
-        const database = freshDatabase();
-        const first = await open_sqlite_file_state_store(database.databasePath, database.options);
-        const second = await open_sqlite_file_state_store(database.databasePath, database.options);
-        const hostLock = {
-            hostLockId: 'shared-host-lock',
-            physicalResourceLockKey: 'shared-resource-lock',
-            verify: async () => true,
-            release: async () => undefined,
-        };
-        const acquired = await first.store.acquire_edit_session('/shared.csv', (value) => value, hostLock);
-        if (acquired.type !== 'acquired') throw new Error('expected first owner');
-        await expect(second.store.acquire_edit_session('/shared.csv', (value) => value, hostLock))
-            .resolves.toEqual(acquired);
-
-        await first.store.release_edit_session('/shared.csv', acquired.session);
-        await second.store.release_edit_session('/shared.csv', acquired.session);
-        const direct = new DatabaseSync(database.databasePath, { readOnly: true });
-        expect(direct.prepare('SELECT count(*) AS count FROM edit_sessions').get()?.count).toBe(0);
-        direct.close();
-        await first.close();
-        await second.close();
-    });
-
-    it('releases a canonicalized owner by durable session identity rather than its stale path', async () => {
-        const database = freshDatabase();
-        const opened = await open_sqlite_file_state_store(database.databasePath, database.options);
-        await opened.store.compare_and_set('/alias.csv', 0, { pendingEdits: { '0:0': 'pending' } });
-        const acquired = await opened.store.acquire_edit_session('/alias.csv', (value) => value, {
-            hostLockId: 'canonical-host',
-            physicalResourceLockKey: 'canonical-resource',
-            verify: async () => true,
-            release: async () => undefined,
-        });
-        if (acquired.type !== 'acquired') throw new Error('expected canonical owner');
-        await opened.store.canonicalize_path?.('/canonical.csv', () => '/canonical.csv');
-
-        const moved = new DatabaseSync(database.databasePath, { readOnly: true });
-        expect(moved.prepare('SELECT entry_path FROM edit_sessions').get()?.entry_path)
-            .toBe('/canonical.csv');
-        moved.close();
-
-        await opened.store.release_edit_session('/alias.csv', acquired.session);
-        const released = new DatabaseSync(database.databasePath, { readOnly: true });
-        expect(released.prepare('SELECT count(*) AS count FROM edit_sessions').get()?.count).toBe(0);
-        released.close();
-        await opened.close();
-    });
-
-    it('moves one edit owner when canonicalization supplies a duplicate source path', async () => {
-        const database = freshDatabase();
-        const opened = await open_sqlite_file_state_store(database.databasePath, database.options);
-        await opened.store.compare_and_set('/duplicate-owner.csv', 0, {});
-        await opened.store.compare_and_set('/duplicate-destination.csv', 0, {});
-        const acquired = await opened.store.acquire_edit_session(
-            '/duplicate-owner.csv',
-            (value) => value,
-            {
-                hostLockId: 'duplicate-owner-host',
-                physicalResourceLockKey: 'duplicate-owner-resource',
-                verify: async () => true,
-                release: async () => undefined,
-            },
-        );
-        if (acquired.type !== 'acquired') throw new Error('expected duplicate-path owner');
-
-        await opened.persistence.write_transaction('canonicalize', (tx) => {
-            tx.move_edit_session(
-                ['/duplicate-owner.csv', '/duplicate-owner.csv'],
-                '/duplicate-destination.csv',
-            );
-        });
-        await expect(opened.persistence.read_transaction((tx) => (
-            tx.read_edit_session('/duplicate-destination.csv')
-        ))).resolves.toMatchObject({
-            editSessionId: acquired.session.editSessionId,
-            ownershipGeneration: acquired.session.ownershipGeneration,
-        });
-
-        await opened.store.release_edit_session('/duplicate-owner.csv', acquired.session);
-        await opened.close();
     });
 
     it('transfers one continuous shared gate token into the interned runtime', async () => {

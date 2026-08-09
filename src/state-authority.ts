@@ -305,12 +305,11 @@ export function with_in_memory_authority_transactions(
             const current = await store.read(path);
             const authority = structuredClone(entry(store, path).authority);
             // Match the durable store's literal, exact-once validator contract. An
-            // unsupported ownership/recovery fence cannot be represented by this
+            // An unsupported recovery fence cannot be represented by this
             // fallback authority, so refuse it rather than silently weakening it.
             const validator_result = validate?.();
             const valid = validator_result === undefined || validator_result === true;
-            const supported_basis = basis?.editOwner === undefined
-                && basis?.recoveryRecordId === undefined;
+            const supported_basis = basis?.recoveryRecordId === undefined;
             const basis_matches = !basis || (
                 supported_basis
                 && authority.authorityRevision === basis.expectedAuthorityRevision

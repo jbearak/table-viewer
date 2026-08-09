@@ -35,7 +35,6 @@ export interface ValidatedSqliteFileStateMetadata {
     readonly nextRevision: number;
     readonly absenceRevision: number;
     readonly nextRecencyOrder: bigint;
-    readonly nextOwnershipGeneration: number;
     readonly entryCount: number;
 }
 
@@ -46,7 +45,7 @@ const EXPECTED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
         'legacy_source_format', 'legacy_source_digest', 'legacy_import_claim_id',
         'min_reader_protocol', 'max_reader_protocol', 'min_writer_protocol',
         'max_writer_protocol', 'coordination_generation', 'next_revision',
-        'absence_revision', 'next_recency_order', 'next_ownership_generation',
+        'absence_revision', 'next_recency_order',
         'store_updated_at_ms',
     ],
     entries: [
@@ -68,11 +67,6 @@ const EXPECTED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     entry_leases: [
         'lease_id', 'writer_session_id', 'current_entry_path', 'acquired_at_ms',
         'acquired_generation',
-    ],
-    edit_sessions: [
-        'entry_path', 'physical_resource_lock_key', 'host_lock_id', 'edit_session_id',
-        'owner_writer_session_id', 'ownership_generation', 'acquired_at_ms',
-        'last_confirmed_at_ms',
     ],
     legacy_imports: [
         'capsule_id', 'source_format', 'source_digest', 'source_entry_count',
@@ -96,7 +90,7 @@ const INTEGER_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     state_meta: [
         'singleton', 'min_reader_protocol', 'max_reader_protocol', 'min_writer_protocol',
         'max_writer_protocol', 'coordination_generation', 'next_revision',
-        'absence_revision', 'next_recency_order', 'next_ownership_generation',
+        'absence_revision', 'next_recency_order',
         'store_updated_at_ms',
     ],
     entries: [
@@ -112,7 +106,6 @@ const INTEGER_COLUMNS: Readonly<Record<string, readonly string[]>> = {
         'opened_generation', 'last_committed_sequence',
     ],
     entry_leases: ['acquired_at_ms', 'acquired_generation'],
-    edit_sessions: ['ownership_generation', 'acquired_at_ms', 'last_confirmed_at_ms'],
     legacy_imports: [
         'source_entry_count', 'source_next_revision', 'source_absence_revision',
         'source_updated_at_ms', 'imported_at_ms',
@@ -373,22 +366,12 @@ function validate_identity_and_counters(
     ) ?? 0n;
     const nextRecency = bigint_value(meta.next_recency_order) as bigint;
     if (nextRecency <= maxRecency) throw sqlite_file_state_counter_error();
-    const maxOwnership = safe_number(
-        row(database, 'SELECT max(ownership_generation) AS value FROM edit_sessions')?.value,
-        true,
-    ) ?? 0;
-    const nextOwnership = safe_number(meta.next_ownership_generation) as number;
-    if (nextOwnership >= SQLITE_FILE_STATE_EXHAUSTION_SENTINEL || nextOwnership <= maxOwnership) {
-        throw sqlite_file_state_counter_error();
-    }
     return { meta, entryCount };
 }
 
 function validate_coordination(
     database: DatabaseSync,
     meta: SqliteRow,
-    pending: Map<string, boolean>,
-    requiresPendingEditRecovery: boolean,
 ): void {
     const generation = safe_number(meta.coordination_generation) as number;
     const minReader = safe_number(meta.min_reader_protocol) as number;
@@ -409,23 +392,6 @@ function validate_coordination(
             throw sqlite_file_state_protocol_error({ coordinationGeneration: generation });
         }
     }
-    const editRows = rows(database, 'SELECT * FROM edit_sessions');
-    const ownerships = new Set<number>();
-    for (const edit of editRows) {
-        const ownership = safe_number(edit.ownership_generation) as number;
-        if (text(edit.entry_path).length === 0
-            || text(edit.physical_resource_lock_key).length === 0
-            || text(edit.host_lock_id).length === 0
-            || text(edit.edit_session_id).length === 0
-            || text(edit.owner_writer_session_id).length === 0
-            || ownerships.has(ownership) || !pending.has(text(edit.entry_path))
-            || (safe_number(edit.last_confirmed_at_ms) as number)
-                < (safe_number(edit.acquired_at_ms) as number)) {
-            throw sqlite_file_state_malformed_error({ rowCount: editRows.length });
-        }
-        ownerships.add(ownership);
-    }
-
 }
 
 function validate_legacy_source(
@@ -570,7 +536,7 @@ export function validate_sqlite_file_state_database(
     const requiresPendingEditRecovery = options.requiresPendingEditRecovery ?? false;
     const pending = validate_entries(database, requiresPendingEditRecovery, nextRevision);
     validate_stages(database, nextRevision);
-    validate_coordination(database, meta, pending, requiresPendingEditRecovery);
+    validate_coordination(database, meta);
     validate_legacy(database, options.identity, meta, pending);
 
     return {
@@ -581,7 +547,6 @@ export function validate_sqlite_file_state_database(
         nextRevision: safe_number(meta.next_revision) as number,
         absenceRevision: safe_number(meta.absence_revision) as number,
         nextRecencyOrder: bigint_value(meta.next_recency_order) as bigint,
-        nextOwnershipGeneration: safe_number(meta.next_ownership_generation) as number,
         entryCount,
     };
 }

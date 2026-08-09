@@ -58,17 +58,10 @@ export interface FileStateWriteBasis {
     readonly expectedAuthorityRevision: number;
     readonly expectedPhysicalRevision?: number;
     readonly expectedProjectionRevision?: number;
-    readonly editOwner?: DurableEditSession;
     readonly recoveryRecordId?: string;
 }
 
-export interface DurableEditSession {
-    readonly editSessionId: string;
-    readonly ownershipGeneration: number;
-}
-
 export interface PendingEditCopyBasis {
-    readonly sourceEditOwner?: DurableEditSession;
     readonly destinationRecoveryEntryId?: string;
     readonly destinationRecoveryRecordId?: string;
 }
@@ -132,43 +125,6 @@ export interface AuthorityFileStateStore extends FileStateStore {
     cleanup_authority_transactions(file_path: string, now?: number): Promise<void>;
 }
 
-export interface HostPhysicalResourceLock {
-    readonly hostLockId: string;
-    readonly physicalResourceLockKey: string;
-    verify(): Promise<boolean>;
-    release(): Promise<void>;
-}
-
-export interface CoordinatedAuthorityFileStateStore extends AuthorityFileStateStore {
-    acquire_edit_session(
-        canonicalPath: string,
-        canonicalKey: (filePath: string) => string,
-        hostLock: HostPhysicalResourceLock,
-    ): Promise<
-        | { type: 'acquired'; session: DurableEditSession }
-        | { type: 'busy' }
-        | { type: 'unsupportedIdentity' }
-    >;
-    release_edit_session(filePath: string, session: DurableEditSession): Promise<void>;
-}
-
-export function supports_coordinated_file_state(
-    store: FileStateStore,
-): store is CoordinatedAuthorityFileStateStore {
-    const candidate = store as Partial<CoordinatedAuthorityFileStateStore>;
-    return typeof candidate.read === 'function'
-        && typeof candidate.compare_and_set === 'function'
-        && typeof candidate.touch === 'function'
-        && typeof candidate.read_authority === 'function'
-        && typeof candidate.stage_authority_transaction === 'function'
-        && typeof candidate.finalize_authority_transaction === 'function'
-        && typeof candidate.inspect_authority_transaction === 'function'
-        && typeof candidate.discard_authority_transaction === 'function'
-        && typeof candidate.cleanup_authority_transactions === 'function'
-        && typeof candidate.acquire_edit_session === 'function'
-        && typeof candidate.release_edit_session === 'function';
-}
-
 /** Compatibility port for the existing whole-envelope Memento/JSON backends. */
 export interface FileStatePersistenceMedium {
     readonly runtime_key: object;
@@ -219,15 +175,6 @@ export interface KeyedStateStoreMetadata {
     readonly updatedAtMs?: number;
 }
 
-export interface PersistedEditSessionRecord extends DurableEditSession {
-    readonly entryPath: string;
-    readonly physicalResourceLockKey: string;
-    readonly hostLockId: string;
-    readonly ownerWriterSessionId: string;
-    readonly acquiredAtMs: number;
-    readonly lastConfirmedAtMs: number;
-}
-
 export interface KeyedStateReadTransaction {
     metadata(): KeyedStateStoreMetadata;
     read_entry_metadata(path: string): PersistedKeyedStateEntryMetadata | undefined;
@@ -235,7 +182,6 @@ export interface KeyedStateReadTransaction {
     read_authority_stages(path: string): readonly PersistedAuthorityStageRecord[];
     scan_entry_metadata(): readonly PersistedKeyedStateEntryMetadata[];
     entry_is_leased(path: string): boolean;
-    read_edit_session(path: string): PersistedEditSessionRecord | undefined;
 }
 
 export interface KeyedStateWriteTransaction extends KeyedStateReadTransaction {
@@ -255,7 +201,6 @@ export interface KeyedStateWriteTransaction extends KeyedStateReadTransaction {
     insert_lease(lease_id: string, path: string): void;
     move_leases(source_paths: readonly string[], destination_path: string): void;
     delete_lease(lease_id: string): boolean;
-    move_edit_session(source_paths: readonly string[], destination_path: string): void;
 }
 
 export type KeyedStateMutationKind =
@@ -281,18 +226,6 @@ export interface KeyedFileStatePersistence {
         body: (tx: KeyedStateWriteTransaction) => T,
     ): Promise<T>;
     close(): Promise<void>;
-}
-
-export interface CoordinatedKeyedFileStatePersistence extends KeyedFileStatePersistence {
-    acquire_edit_session(
-        canonicalPath: string,
-        canonicalKey: (filePath: string) => string,
-        hostLock: HostPhysicalResourceLock,
-    ): ReturnType<CoordinatedAuthorityFileStateStore['acquire_edit_session']>;
-    release_edit_session(
-        filePath: string,
-        session: DurableEditSession,
-    ): Promise<void>;
 }
 
 export function require_synchronous_transaction_result<T>(result: T): T {
@@ -328,7 +261,6 @@ interface PersistedStateEnvelope {
 interface StateRuntime {
     pending: Promise<unknown>;
     readonly leases: Map<string, string>;
-    readonly editReferences: Map<string, number>;
     closed: boolean;
     closePromise?: Promise<void>;
 }
@@ -342,7 +274,6 @@ function runtime_for(runtime_key: object): StateRuntime {
         runtime = {
             pending: Promise.resolve(),
             leases: new Map(),
-            editReferences: new Map(),
             closed: false,
         };
         runtime_by_key.set(runtime_key, runtime);
@@ -657,7 +588,6 @@ export function create_keyed_file_state_persistence(
                 }
                 return false;
             },
-            read_edit_session: () => undefined,
             allocate_revision() {
                 if (all.nextRevision >= EXHAUSTION_SENTINEL) {
                     throw new RangeError('File-state revision space is exhausted.');
@@ -800,7 +730,6 @@ export function create_keyed_file_state_persistence(
                 leasesChanged = leasesChanged || deleted;
                 return deleted;
             },
-            move_edit_session: () => undefined,
         };
         const result = require_synchronous_transaction_result(body(tx));
         if (writable && changed) {
@@ -883,7 +812,6 @@ function evict_entries(
     const ordinary = tx.scan_entry_metadata().filter((entry) => (
         !protectedPaths.has(entry.path)
         && !tx.entry_is_leased(entry.path)
-        && !tx.read_edit_session(entry.path)
         && !entry.hasPendingEdits
         && entry.authorityStageCount === 0
     ));
@@ -921,15 +849,6 @@ function serialized_states_equal(left: StoredPerFileState, right: StoredPerFileS
 function pending_json(state: StoredPerFileState): string | undefined {
     const pending = (state as PerFileState).pendingEdits;
     return pending && Object.keys(pending).length > 0 ? JSON.stringify(pending) : undefined;
-}
-
-function edit_sessions_equal(
-    left: DurableEditSession | undefined,
-    right: PersistedEditSessionRecord | undefined,
-): boolean {
-    return left !== undefined && right !== undefined
-        && left.editSessionId === right.editSessionId
-        && left.ownershipGeneration === right.ownershipGeneration;
 }
 
 function authorities_exactly_equal(left: DurableFileAuthority, right: DurableFileAuthority): boolean {
@@ -995,13 +914,6 @@ function canonicalize_in_transaction(
     ));
     if (matches.length <= 1 && matches[0]?.path === canonicalPath) return undefined;
     if (matches.length === 0) return undefined;
-    const owners = matches.map((metadata) => tx.read_edit_session(metadata.path)).filter((owner) => owner !== undefined);
-    if (owners.length > 1 && owners.some((owner) => (
-        owner.physicalResourceLockKey !== owners[0].physicalResourceLockKey
-        || owner.hostLockId !== owners[0].hostLockId
-        || owner.editSessionId !== owners[0].editSessionId
-        || owner.ownershipGeneration !== owners[0].ownershipGeneration
-    ))) throw new Error('Cannot canonicalize incompatible durable edit owners.');
     const candidates = matches.map((metadata) => {
         const complete = tx.read_entry(metadata.path);
         if (!complete) throw new Error('Canonicalization candidate disappeared inside its transaction.');
@@ -1037,7 +949,6 @@ function canonicalize_in_transaction(
     }
     const candidatePaths = candidates.map((candidate) => candidate.entry.path);
     tx.move_leases(candidatePaths, canonicalPath);
-    tx.move_edit_session(candidatePaths, canonicalPath);
     for (const candidate of candidates) tx.delete_entry(candidate.entry.path);
     write_complete(tx, next);
     const deletedAliases = candidates.some((candidate) => candidate.entry.path !== canonicalPath);
@@ -1097,16 +1008,8 @@ function copy_in_transaction(
         if (changed) tx.set_updated_at(capturedAt);
         return result;
     }
-    const sourceOwner = tx.read_edit_session(sourcePath);
-    if ((sourceOwner !== undefined || pendingBasis?.sourceEditOwner !== undefined)
-        && !edit_sessions_equal(pendingBasis?.sourceEditOwner, sourceOwner)) {
-        return { type: 'sourceBusy' };
-    }
     const sourceState = decode_complete_state(sourceBeforeCleanup);
     if (state_has_pending_edits(sourceState)) {
-        if (sourceOwner && !edit_sessions_equal(pendingBasis?.sourceEditOwner, sourceOwner)) {
-            return { type: 'sourceBusy' };
-        }
         if (
             pendingBasis?.destinationRecoveryRecordId !== undefined
             || pendingBasis?.destinationRecoveryEntryId !== undefined
@@ -1188,13 +1091,9 @@ export function create_keyed_authority_store(
                 // Exact once, and before every stale/unsupported guard.
                 const validation = validate?.();
                 const validationPasses = validation === undefined || validation === true;
-                const owner = tx.read_edit_session(filePath);
                 const basisMatches = basis === undefined
-                    ? owner === undefined
-                    : ((basis.editOwner === undefined
-                        ? owner === undefined
-                        : edit_sessions_equal(basis.editOwner, owner))
-                    && (basis.recoveryRecordId === undefined
+                    ? true
+                    : ((basis.recoveryRecordId === undefined
                         || (persistence.supports_recovery_records === true
                             && basis.recoveryRecordId.length > 0))
                     && authority.authorityRevision === basis.expectedAuthorityRevision
@@ -1510,45 +1409,6 @@ export function create_keyed_authority_store(
                 if (changed) tx.set_updated_at(capturedAt);
             });
         },
-    };
-}
-
-/** SQLite-only coordinated capability layered over the shared semantic core and queue. */
-export function create_coordinated_keyed_authority_store(
-    persistence: CoordinatedKeyedFileStatePersistence,
-    get_max_stored?: () => number,
-): CoordinatedAuthorityFileStateStore {
-    const runtime = runtime_for(persistence.runtime_key);
-    const base = create_keyed_authority_store(persistence, get_max_stored);
-    const editKey = (session: DurableEditSession): string => (
-        `${session.editSessionId}:${session.ownershipGeneration}`
-    );
-    return {
-        ...base,
-        acquire_edit_session: (canonicalPath, canonicalKey, hostLock) => enqueue(
-            runtime,
-            async () => {
-                const result = await persistence.acquire_edit_session(canonicalPath, canonicalKey, hostLock);
-                if (result.type === 'acquired') {
-                    const key = editKey(result.session);
-                    runtime.editReferences.set(key, (runtime.editReferences.get(key) ?? 0) + 1);
-                }
-                return result;
-            },
-        ),
-        release_edit_session: (filePath, session) => enqueue(
-            runtime,
-            async () => {
-                const key = editKey(session);
-                const count = runtime.editReferences.get(key) ?? 1;
-                if (count > 1) {
-                    runtime.editReferences.set(key, count - 1);
-                    return;
-                }
-                await persistence.release_edit_session(filePath, session);
-                runtime.editReferences.delete(key);
-            },
-        ),
     };
 }
 

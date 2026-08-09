@@ -15,7 +15,6 @@ import type {
     PersistedCompleteKeyedStateEntry,
     PersistedKeyedStateEntry,
     PersistedKeyedStateEntryMetadata,
-    PersistedEditSessionRecord,
 } from './state';
 import type {
     SqliteReadTransactionContext,
@@ -363,42 +362,6 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
             WHERE current_entry_path = ? LIMIT 1`).get(path) !== undefined;
     }
 
-    #edit_session_from_row(row: Record<string, unknown>): PersistedEditSessionRecord {
-        return {
-            entryPath: text(row.entry_path),
-            physicalResourceLockKey: text(row.physical_resource_lock_key),
-            hostLockId: text(row.host_lock_id),
-            editSessionId: text(row.edit_session_id),
-            ownerWriterSessionId: text(row.owner_writer_session_id),
-            ownershipGeneration: integer(this.#tx, row.ownership_generation, 'ownership generation', 1),
-            acquiredAtMs: integer(this.#tx, row.acquired_at_ms, 'edit acquired timestamp', 0, Number.MAX_SAFE_INTEGER),
-            lastConfirmedAtMs: integer(this.#tx, row.last_confirmed_at_ms, 'edit confirmed timestamp', 0, Number.MAX_SAFE_INTEGER),
-        };
-    }
-
-    read_edit_session(path: string): PersistedEditSessionRecord | undefined {
-        const row = this.#tx.prepare(`SELECT entry_path, physical_resource_lock_key,
-            host_lock_id, edit_session_id, owner_writer_session_id,
-            ownership_generation, acquired_at_ms, last_confirmed_at_ms
-            FROM edit_sessions WHERE entry_path = ?`).get(path);
-        return row === undefined ? undefined : this.#edit_session_from_row(row);
-    }
-
-    read_edit_session_by_identity(
-        sessionId: string,
-        ownershipGeneration: number,
-    ): PersistedEditSessionRecord | undefined {
-        const row = this.#tx.prepare(`SELECT entry_path, physical_resource_lock_key,
-            host_lock_id, edit_session_id, owner_writer_session_id,
-            ownership_generation, acquired_at_ms, last_confirmed_at_ms
-            FROM edit_sessions
-            WHERE edit_session_id = ? AND ownership_generation = ?`).get(
-            sessionId,
-            ownershipGeneration,
-        );
-        return row === undefined ? undefined : this.#edit_session_from_row(row);
-    }
-
     allocate_revision(): number {
         const tx = this.#write_tx();
         const row = tx.prepare('SELECT next_revision FROM state_meta WHERE singleton = 1').get();
@@ -651,57 +614,6 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
         this.#write_tx().prepare('DELETE FROM entries WHERE path = ?').run(path);
     }
 
-    allocate_ownership_generation(): number {
-        const tx = this.#write_tx();
-        const row = tx.prepare(`SELECT next_ownership_generation FROM state_meta
-            WHERE singleton = 1`).get();
-        if (!row) return malformed();
-        const generation = integer(
-            tx,
-            row.next_ownership_generation,
-            'next ownership generation',
-            1,
-            SQLITE_FILE_STATE_EXHAUSTION_SENTINEL,
-        );
-        if (generation >= SQLITE_FILE_STATE_EXHAUSTION_SENTINEL) {
-            throw sqlite_file_state_counter_error();
-        }
-        const result = tx.prepare(`UPDATE state_meta SET next_ownership_generation = ?
-            WHERE singleton = 1 AND next_ownership_generation = ?`).run(generation + 1, generation);
-        if (tx.safe_integer(result.changes, 'ownership allocation changes') !== 1) malformed();
-        return generation;
-    }
-
-    insert_edit_session(value: PersistedEditSessionRecord): void {
-        const result = this.#write_tx().prepare(`INSERT INTO edit_sessions (
-            entry_path, physical_resource_lock_key, host_lock_id, edit_session_id,
-            owner_writer_session_id, ownership_generation, acquired_at_ms,
-            last_confirmed_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-            value.entryPath,
-            value.physicalResourceLockKey,
-            value.hostLockId,
-            value.editSessionId,
-            value.ownerWriterSessionId,
-            value.ownershipGeneration,
-            value.acquiredAtMs,
-            value.lastConfirmedAtMs,
-        );
-        if (this.#tx.safe_integer(result.changes, 'edit session insert changes') !== 1) malformed();
-    }
-
-    delete_edit_session(path: string, sessionId: string, generation: number): boolean {
-        const result = this.#write_tx().prepare(`DELETE FROM edit_sessions
-            WHERE entry_path = ? AND edit_session_id = ? AND ownership_generation = ?
-              AND owner_writer_session_id = ?`).run(
-            path,
-            sessionId,
-            generation,
-            this.#writerSessionId,
-        );
-        return this.#tx.safe_integer(result.changes, 'edit session delete changes') === 1;
-    }
-
     insert_lease(lease_id: string, path: string): void {
         if (typeof lease_id !== 'string' || lease_id.length === 0) malformed();
         const tx = this.#write_tx();
@@ -732,25 +644,6 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
         }
     }
 
-    move_edit_session(source_paths: readonly string[], destination_path: string): void {
-        const tx = this.#write_tx();
-        const owners = [...new Set(source_paths)]
-            .map((path) => this.read_edit_session(path))
-            .filter((owner): owner is PersistedEditSessionRecord => owner !== undefined);
-        const owner = owners[0];
-        if (owner && owners.some((candidate) => (
-            candidate.physicalResourceLockKey !== owner.physicalResourceLockKey
-            || candidate.hostLockId !== owner.hostLockId
-            || candidate.editSessionId !== owner.editSessionId
-            || candidate.ownerWriterSessionId !== owner.ownerWriterSessionId
-            || candidate.ownershipGeneration !== owner.ownershipGeneration
-        ))) malformed();
-        if (!owner || owner.entryPath === destination_path) return;
-        const result = tx.prepare('UPDATE edit_sessions SET entry_path = ? WHERE entry_path = ?')
-            .run(destination_path, owner.entryPath);
-        if (tx.safe_integer(result.changes, 'edit session move changes') !== 1) malformed();
-    }
-
     delete_lease(lease_id: string): boolean {
         const tx = this.#write_tx();
         const result = tx.prepare(`DELETE FROM entry_leases
@@ -774,7 +667,6 @@ export function create_sqlite_file_state_read_repository(
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
         entry_is_leased: (path) => repository.entry_is_leased(path),
-        read_edit_session: (path) => repository.read_edit_session(path),
     };
 }
 
@@ -790,7 +682,6 @@ export function create_sqlite_file_state_write_repository(
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
         entry_is_leased: (path) => repository.entry_is_leased(path),
-        read_edit_session: (path) => repository.read_edit_session(path),
         allocate_revision: () => repository.allocate_revision(),
         allocate_recency_order: () => repository.allocate_recency_order(),
         set_absence_revision: (revision) => repository.set_absence_revision(revision),
@@ -804,8 +695,5 @@ export function create_sqlite_file_state_write_repository(
         insert_lease: (leaseId, path) => repository.insert_lease(leaseId, path),
         move_leases: (sourcePaths, destinationPath) => repository.move_leases(sourcePaths, destinationPath),
         delete_lease: (leaseId) => repository.delete_lease(leaseId),
-        move_edit_session: (sourcePaths, destinationPath) => (
-            repository.move_edit_session(sourcePaths, destinationPath)
-        ),
     };
 }

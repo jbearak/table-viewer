@@ -41,8 +41,7 @@ export function versioned_state_store(initial: StoredPerFileState = {}) {
             const current = snapshot(file_path);
             const valid = validate === undefined || validate() === true;
             const basis_matches = !basis || (
-                basis.editOwner === undefined
-                && basis.recoveryRecordId === undefined
+                basis.recoveryRecordId === undefined
                 && basis.expectedAuthorityRevision === authority.authorityRevision
                 && (
                     basis.expectedPhysicalRevision === undefined

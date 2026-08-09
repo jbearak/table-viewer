@@ -20,8 +20,7 @@ export const SQLITE_FILE_STATE_PROTOCOL_VERSION = 1;
 export const SQLITE_FILE_STATE_EXHAUSTION_SENTINEL = 9_007_199_254_740_991;
 export const SQLITE_FILE_STATE_MAX_COUNTER = SQLITE_FILE_STATE_EXHAUSTION_SENTINEL - 1;
 // Structural validation intentionally permits next_revision to equal the sentinel
-// as a representable exhausted state. next_ownership_generation must remain below
-// it because that field always denotes the next ownership generation to allocate.
+// as a representable exhausted state.
 export const SQLITE_FILE_STATE_V1_MIGRATION_NAME = 'canonical-file-state-v1';
 export const SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME =
     'direct-vscode-file-state-v1';
@@ -141,8 +140,6 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
     absence_revision           INTEGER NOT NULL
                                CHECK (absence_revision BETWEEN 0 AND 9007199254740990),
     next_recency_order         INTEGER NOT NULL CHECK (next_recency_order >= 1),
-    next_ownership_generation  INTEGER NOT NULL
-                               CHECK (next_ownership_generation BETWEEN 1 AND 9007199254740991),
     store_updated_at_ms        INTEGER
                                CHECK (store_updated_at_ms IS NULL OR store_updated_at_ms >= 0),
 
@@ -287,24 +284,6 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
     acquired_generation        INTEGER NOT NULL CHECK (acquired_generation >= 1)
     -- No FK to entries: absent paths may be leased.
     -- No FK to writer_sessions: session removal must not release safety leases.
-) STRICT, WITHOUT ROWID`,
-    edit_sessions: `CREATE TABLE edit_sessions (
-    entry_path                 TEXT NOT NULL COLLATE BINARY PRIMARY KEY,
-    physical_resource_lock_key TEXT NOT NULL COLLATE BINARY UNIQUE,
-    host_lock_id               TEXT NOT NULL COLLATE BINARY UNIQUE,
-    edit_session_id            TEXT NOT NULL COLLATE BINARY UNIQUE,
-    owner_writer_session_id    TEXT NOT NULL COLLATE BINARY,
-    ownership_generation       INTEGER NOT NULL CHECK (ownership_generation >= 1),
-    acquired_at_ms             INTEGER NOT NULL CHECK (acquired_at_ms >= 0),
-    last_confirmed_at_ms       INTEGER NOT NULL CHECK (last_confirmed_at_ms >= 0),
-    UNIQUE (
-        entry_path,
-        edit_session_id,
-        physical_resource_lock_key,
-        host_lock_id,
-        ownership_generation
-    )
-    -- Deliberately no cascading FK to writer_sessions.
 ) STRICT, WITHOUT ROWID`,
     legacy_imports: `CREATE TABLE legacy_imports (
     capsule_id                 TEXT NOT NULL COLLATE BINARY PRIMARY KEY,
@@ -502,8 +481,6 @@ export const SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL = {
     absence_revision           INTEGER NOT NULL
                                CHECK (absence_revision BETWEEN 0 AND 9007199254740990),
     next_recency_order         INTEGER NOT NULL CHECK (next_recency_order >= 1),
-    next_ownership_generation  INTEGER NOT NULL
-                               CHECK (next_ownership_generation BETWEEN 1 AND 9007199254740991),
     store_updated_at_ms        INTEGER
                                CHECK (store_updated_at_ms IS NULL OR store_updated_at_ms >= 0),
 
@@ -542,8 +519,6 @@ export const SQLITE_FILE_STATE_V1_INDEX_SQL = {
     ON entry_leases(current_entry_path, lease_id)`,
     entry_leases_by_session: `CREATE INDEX entry_leases_by_session
     ON entry_leases(writer_session_id, lease_id)`,
-    edit_sessions_by_owner: `CREATE INDEX edit_sessions_by_owner
-    ON edit_sessions(owner_writer_session_id, entry_path)`,
     legacy_sources_by_status: `CREATE INDEX legacy_sources_by_status
     ON legacy_sources(capsule_id, status, source_kind, source_ordinal)`,
     legacy_entry_claims_by_ordinal: `CREATE INDEX legacy_entry_claims_by_ordinal
@@ -674,10 +649,9 @@ function insert_schema_identity(database: DatabaseSync, identity: SqliteFileStat
             legacy_capsule_id, legacy_source_format, legacy_source_digest,
             legacy_import_claim_id, min_reader_protocol, max_reader_protocol,
             min_writer_protocol, max_writer_protocol, coordination_generation,
-            next_revision, absence_revision, next_recency_order,
-            next_ownership_generation, store_updated_at_ms
+            next_revision, absence_revision, next_recency_order, store_updated_at_ms
         ) VALUES (1, ?, ?, ?, ?, 'vscode', 'delete', 'sqlite',
-            NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1, 0, 1, 1, NULL)`)
+            NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1, 0, 1, NULL)`)
             .run(
                 SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
                 identity.databaseId,
@@ -732,10 +706,9 @@ function insert_schema_identity(database: DatabaseSync, identity: SqliteFileStat
             legacy_capsule_id, legacy_source_format, legacy_source_digest,
             legacy_import_claim_id, min_reader_protocol, max_reader_protocol,
             min_writer_protocol, max_writer_protocol, coordination_generation,
-            next_revision, absence_revision, next_recency_order,
-            next_ownership_generation, store_updated_at_ms
+            next_revision, absence_revision, next_recency_order, store_updated_at_ms
         ) VALUES (1, ?, ?, ?, ?, 'vscode', 'delete', 'sqlite_importing_memento',
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`)
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
             .run(
                 SQLITE_FILE_STATE_FORMAT,
                 identity.databaseId,
@@ -764,10 +737,9 @@ function insert_schema_identity(database: DatabaseSync, identity: SqliteFileStat
         legacy_capsule_id, legacy_source_format, legacy_source_digest,
         legacy_import_claim_id, min_reader_protocol, max_reader_protocol,
         min_writer_protocol, max_writer_protocol, coordination_generation,
-        next_revision, absence_revision, next_recency_order,
-        next_ownership_generation, store_updated_at_ms
+        next_revision, absence_revision, next_recency_order, store_updated_at_ms
     ) VALUES (1, ?, ?, NULL, ?, 'desktop', 'delete', 'sqlite',
-        NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1, 0, 1, 1, NULL)`)
+        NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1, 0, 1, NULL)`)
         .run(
             SQLITE_FILE_STATE_FORMAT,
             identity.databaseId,

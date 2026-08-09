@@ -19,10 +19,9 @@ import {
     type SqliteSharedReaderGate,
 } from '../../sqlite-open-recovery';
 import type {
-    CoordinatedAuthorityFileStateStore,
-    CoordinatedKeyedFileStatePersistence,
-    DurableEditSession,
+    AuthorityFileStateStore,
     FileStateLease,
+    KeyedFileStatePersistence,
 } from '../../state';
 import type { SqliteRuntimeEvent, SqliteRuntimeHooks } from '../../sqlite-runtime';
 
@@ -47,8 +46,8 @@ const options = JSON.parse(process.env.TABLE_VIEWER_SQLITE_WORKER_OPTIONS ?? '{}
 const leases = new Map<string, FileStateLease>();
 const runtimeEvents: SqliteRuntimeEvent[] = [];
 const barriers = new Map<string, () => void>();
-let store: CoordinatedAuthorityFileStateStore | undefined;
-let persistence: CoordinatedKeyedFileStatePersistence | undefined;
+let store: AuthorityFileStateStore | undefined;
+let persistence: KeyedFileStatePersistence | undefined;
 let closeStore: (() => Promise<void>) | undefined;
 let rawDatabase: DatabaseSync | undefined;
 let recoveryGate: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate | undefined;
@@ -178,7 +177,7 @@ async function initialize(): Promise<void> {
     closeStore = opened.close;
 }
 
-function requireStore(): CoordinatedAuthorityFileStateStore {
+function requireStore(): AuthorityFileStateStore {
     if (!store) throw new Error('This worker was not opened in store mode.');
     return store;
 }
@@ -194,23 +193,6 @@ async function handle(command: string, payload: any): Promise<unknown> {
             return requireStore().read(payload.path);
         case 'readAuthority':
             return requireStore().read_authority(payload.path);
-        case 'acquireEdit':
-            return requireStore().acquire_edit_session(
-                payload.path,
-                canonicalKey(payload.keyKind),
-                {
-                    hostLockId: payload.hostLockId,
-                    physicalResourceLockKey: payload.physicalResourceLockKey,
-                    verify: async () => true,
-                    release: async () => undefined,
-                },
-            );
-        case 'releaseEdit':
-            await requireStore().release_edit_session(
-                payload.path,
-                payload.session as DurableEditSession,
-            );
-            return null;
         case 'cas':
             if (typeof payload.barrierId === 'string') {
                 await crossBarrier(payload.barrierId, payload.barrierName ?? 'before-cas');

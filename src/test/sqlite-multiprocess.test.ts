@@ -363,36 +363,6 @@ describe('SQLite real multi-process behavior', () => {
         expect(rows.every((row) => row.last_operation_kind === 'compareAndSet')).toBe(true);
     }, 15_000);
 
-    it('allows exactly one durable edit owner across competing processes', async () => {
-        await seed('/owned.csv', { activeSheetIndex: 1 });
-        const first = await spawn();
-        const second = await spawn();
-        const [left, right] = await Promise.all([
-            first.request<any>('acquireEdit', {
-                path: '/owned.csv', hostLockId: 'host-left', physicalResourceLockKey: 'shared-resource',
-            }),
-            second.request<any>('acquireEdit', {
-                path: '/owned.csv', hostLockId: 'host-right', physicalResourceLockKey: 'shared-resource',
-            }),
-        ]);
-        expect([left.type, right.type].sort()).toEqual(['acquired', 'busy']);
-        const owner = left.type === 'acquired' ? first : second;
-        const session = left.type === 'acquired' ? left.session : right.session;
-        const other = owner === first ? second : first;
-        await owner.crash();
-        await expect(other.request('acquireEdit', {
-            path: '/owned.csv', hostLockId: 'host-third', physicalResourceLockKey: 'shared-resource',
-        })).resolves.toEqual({ type: 'busy' });
-        const direct = inspectionDatabase();
-        const row = direct.prepare(`SELECT edit_session_id, ownership_generation
-            FROM edit_sessions WHERE entry_path = ?`).get('/owned.csv');
-        direct.close();
-        expect(row).toMatchObject({
-            edit_session_id: session.editSessionId,
-            ownership_generation: session.ownershipGeneration,
-        });
-    });
-
     it('moves durable leases cross-process and exact release deletes the original handle', async () => {
         await seed('/Alias.csv', { activeSheetIndex: 1 });
         const owner = await spawn();
