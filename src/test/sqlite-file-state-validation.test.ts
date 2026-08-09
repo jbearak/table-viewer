@@ -11,6 +11,8 @@ import {
 import {
     initialize_sqlite_file_state_schema,
     type SqliteDesktopFileStateIdentity,
+    type SqliteDirectVscodeFileStateIdentity,
+    type SqliteFileStateIdentity,
     type SqliteVscodeFileStateIdentity,
 } from '../sqlite-file-state-schema';
 import { validate_sqlite_file_state_database } from '../sqlite-file-state-validation';
@@ -24,6 +26,14 @@ const desktopIdentity: SqliteDesktopFileStateIdentity = {
     productKind: 'desktop',
     databaseId: 'desktop-database',
     storageEnvironmentId: 'desktop-environment',
+};
+
+const directVscodeIdentity: SqliteDirectVscodeFileStateIdentity = {
+    productKind: 'vscode',
+    schemaKind: 'direct-vscode',
+    databaseId: 'direct-vscode-database',
+    clientProfileId: 'direct-profile-id',
+    storageEnvironmentId: 'direct-environment',
 };
 
 const vscodeIdentity: SqliteVscodeFileStateIdentity = {
@@ -52,7 +62,7 @@ const vscodeIdentity: SqliteVscodeFileStateIdentity = {
 };
 
 function createDatabase(
-    identity: SqliteDesktopFileStateIdentity | SqliteVscodeFileStateIdentity = desktopIdentity,
+    identity: SqliteFileStateIdentity = desktopIdentity,
 ): DatabaseSync {
     const database = new DatabaseSync(path.join(tempDirectory, `state-${counter++}.sqlite3`), {
         enableDoubleQuotedStringLiterals: false,
@@ -68,7 +78,7 @@ function createDatabase(
 function expectValidationCategory(
     database: DatabaseSync,
     category: SqliteFileStateErrorCategory,
-    identity: SqliteDesktopFileStateIdentity | SqliteVscodeFileStateIdentity = desktopIdentity,
+    identity: SqliteFileStateIdentity = desktopIdentity,
 ): void {
     try {
         validate_sqlite_file_state_database(database, { identity });
@@ -87,6 +97,7 @@ function insertEntry(
         revision?: number;
         recency?: number;
         hasPending?: boolean;
+        recoveryEntryId?: string;
         recoveryRecordId?: string;
     } = {},
 ): void {
@@ -106,7 +117,7 @@ function insertEntry(
             JSON.stringify(state),
             options.hasPending ? 1 : 0,
             recency,
-            `recovery-entry-${recency}`,
+            options.recoveryEntryId ?? `recovery-entry-${recency}`,
             options.recoveryRecordId ?? null,
         );
     database.prepare(`UPDATE state_meta SET
@@ -156,6 +167,204 @@ describe('SQLite file-state structural validation', () => {
             nextRevision: 4,
             nextRecencyOrder: 2n,
         });
+    });
+
+    it('accepts the exact direct VS Code identity without import lineage', () => {
+        const database = createDatabase(directVscodeIdentity);
+
+        expect(validate_sqlite_file_state_database(database, {
+            identity: directVscodeIdentity,
+        })).toMatchObject({
+            databaseId: 'direct-vscode-database',
+            productKind: 'vscode',
+            authorityMode: 'sqlite',
+            nextRevision: 1,
+            absenceRevision: 0,
+        });
+        expect(() => validate_sqlite_file_state_database(database, {
+            identity: vscodeIdentity,
+        })).toThrow(SqliteFileStateError);
+    });
+
+    it('accepts direct cosmetic entries and live runtime writer sessions', () => {
+        const database = createDatabase(directVscodeIdentity);
+        const entryPath = 'file:///cosmetic.csv';
+        insertEntry(database, { activeSheetIndex: 2 }, { path: entryPath, recoveryEntryId: entryPath });
+        database.prepare(`INSERT INTO writer_sessions (
+            writer_session_id, client_kind, client_version, negotiated_protocol,
+            process_id, opened_at_ms, last_activity_at_ms, opened_generation,
+            last_committed_sequence, last_operation_id, last_operation_kind
+        ) VALUES ('writer', 'vscode-cosmetic', '0.7.0', 1, 123, 10, 11, 1,
+            1, 'operation', 'compareAndSet')`).run();
+
+        expect(() => validate_sqlite_file_state_database(database, {
+            identity: directVscodeIdentity,
+        })).not.toThrow();
+    });
+
+    it('rejects direct VS Code top-level pending edits and recovery references', () => {
+        const pending = createDatabase(directVscodeIdentity);
+        const pendingPath = 'file:///pending.csv';
+        insertEntry(pending, {
+            pendingEdits: { '0:0': { value: 'changed', base: 'original' } },
+        }, {
+            path: pendingPath,
+            hasPending: true,
+            recoveryEntryId: pendingPath,
+        });
+        expectValidationCategory(pending, 'malformed-state', directVscodeIdentity);
+
+        const recovery = createDatabase(directVscodeIdentity);
+        const recoveryPath = 'file:///recovery.csv';
+        insertEntry(recovery, { activeSheetIndex: 1 }, {
+            path: recoveryPath,
+            recoveryEntryId: recoveryPath,
+            recoveryRecordId: 'recovery-record',
+        });
+        expectValidationCategory(recovery, 'malformed-state', directVscodeIdentity);
+    });
+
+    it('rejects empty direct VS Code entry and recovery identities', () => {
+        const database = createDatabase(directVscodeIdentity);
+        insertEntry(database, { activeSheetIndex: 1 }, {
+            path: '',
+            recoveryEntryId: '',
+        });
+
+        expectValidationCategory(database, 'malformed-state', directVscodeIdentity);
+    });
+
+    it('rejects direct VS Code physical/projection authority and stages', () => {
+        // One forged column per database. Forging all five at once would keep the
+        // test green even if a rule for any single column stopped being validated,
+        // because the remaining four still trigger the same category.
+        const forgeries = [
+            'authority_commit_sequence = 1',
+            'authority_revision = 1',
+            'physical_revision = 1',
+            'projection_revision = 1',
+            "physical_digest = 'forged-digest'",
+        ];
+        for (const forgery of forgeries) {
+            const authority = createDatabase(directVscodeIdentity);
+            const authorityPath = 'file:///authority.csv';
+            insertEntry(authority, { activeSheetIndex: 1 }, {
+                path: authorityPath,
+                recoveryEntryId: authorityPath,
+            });
+            authority.exec(`UPDATE entries SET ${forgery}`);
+            expectValidationCategory(authority, 'malformed-state', directVscodeIdentity);
+        }
+
+        const stage = createDatabase(directVscodeIdentity);
+        const stagePath = 'file:///stage.csv';
+        insertEntry(stage, { activeSheetIndex: 1 }, {
+            path: stagePath,
+            recoveryEntryId: stagePath,
+        });
+        stage.prepare(`INSERT INTO authority_stages (
+            entry_path, stage_id, kind, ordinal, expected_state_revision,
+            expected_commit_sequence, next_state_json, physical_digest, created_at_ms
+        ) VALUES (?, 'forged-stage', 'projection', 0, 1, 0, '{}', NULL, 10)`)
+            .run(stagePath);
+        expectValidationCategory(stage, 'malformed-state', directVscodeIdentity);
+    });
+
+    it('rejects direct VS Code entry leases, edit sessions, and ownership history', () => {
+        const lease = createDatabase(directVscodeIdentity);
+        lease.prepare(`INSERT INTO entry_leases (
+            lease_id, writer_session_id, current_entry_path, acquired_at_ms,
+            acquired_generation
+        ) VALUES ('lease', 'writer', 'file:///lease.csv', 10, 1)`).run();
+        expectValidationCategory(lease, 'malformed-state', directVscodeIdentity);
+
+        const edit = createDatabase(directVscodeIdentity);
+        const editPath = 'file:///edit.csv';
+        insertEntry(edit, { activeSheetIndex: 1 }, {
+            path: editPath,
+            recoveryEntryId: editPath,
+        });
+        edit.prepare(`INSERT INTO edit_sessions (
+            entry_path, physical_resource_lock_key, host_lock_id, edit_session_id,
+            owner_writer_session_id, ownership_generation, acquired_at_ms,
+            last_confirmed_at_ms
+        ) VALUES (?, 'resource', 'host', 'edit', 'writer', 1, 10, 10)`)
+            .run(editPath);
+        edit.exec('UPDATE state_meta SET next_ownership_generation = 2');
+        expectValidationCategory(edit, 'malformed-state', directVscodeIdentity);
+
+        const ownership = createDatabase(directVscodeIdentity);
+        ownership.exec('UPDATE state_meta SET next_ownership_generation = 2');
+        expectValidationCategory(ownership, 'malformed-state', directVscodeIdentity);
+    });
+
+    it('rejects direct VS Code prepared-install lifecycle and reservation state', () => {
+        const cleanup = createDatabase(directVscodeIdentity);
+        const cleanupPath = 'file:///cleanup.csv';
+        insertEntry(cleanup, {
+            activeSheetIndex: 3,
+            [SQLITE_PREPARED_INSTALL_STATE_KEY]: {
+                version: 1,
+                phase: 'cleanupPending',
+                reservationId: 'cleanup-reservation',
+                saveOperationId: 'cleanup-operation',
+                stageId: 'cleanup-stage',
+                preparedInstallId: 'cleanup-install',
+                hostLockId: 'cleanup-host',
+                previousPhysicalResourceLockKey: 'cleanup-previous-resource',
+                physicalResourceLockKey: 'cleanup-resource',
+                expectedPhysicalDigest: 'cleanup-expected',
+                intendedPhysicalDigest: 'cleanup-intended',
+                recordedAtMs: 20,
+            },
+        }, { path: cleanupPath, recoveryEntryId: cleanupPath });
+        expectValidationCategory(cleanup, 'malformed-state', directVscodeIdentity);
+
+        const reserved = createDatabase(directVscodeIdentity);
+        const reservedPath = 'file:///reserved.csv';
+        insertEntry(reserved, {
+            activeSheetIndex: 1,
+            [SQLITE_PREPARED_INSTALL_STATE_KEY]: {
+                version: 1,
+                phase: 'reserved',
+                reservationId: 'reservation',
+                saveOperationId: 'save-operation',
+                stageId: 'save-stage',
+                preparedInstallId: 'prepared-install',
+                hostLockId: 'host-lock',
+                previousPhysicalResourceLockKey: 'previous-resource-lock',
+                physicalResourceLockKey: 'resource-lock',
+                expectedPhysicalDigest: 'expected-digest',
+                intendedPhysicalDigest: 'intended-digest',
+                recordedAtMs: 10,
+            },
+        }, { path: reservedPath, recoveryEntryId: reservedPath });
+        reserved.exec("UPDATE entries SET physical_digest = 'expected-digest'");
+        reserved.prepare(`INSERT INTO edit_sessions (
+            entry_path, physical_resource_lock_key, host_lock_id, edit_session_id,
+            owner_writer_session_id, ownership_generation, acquired_at_ms,
+            last_confirmed_at_ms
+        ) VALUES (?, 'resource-lock', 'host-lock', 'edit-session',
+            'writer-session', 1, 10, 10)`).run(reservedPath);
+        reserved.exec('UPDATE state_meta SET next_ownership_generation = 2');
+        reserved.prepare(`INSERT INTO authority_stages (
+            entry_path, stage_id, kind, ordinal, expected_state_revision,
+            expected_commit_sequence, next_state_json, physical_digest, created_at_ms
+        ) VALUES (?, 'save-stage', 'physical', 0, 1, 0,
+            '{}', 'intended-digest', 10)`).run(reservedPath);
+        reserved.prepare(`INSERT INTO file_write_reservations (
+            reservation_id, save_operation_id, entry_path, physical_resource_lock_key,
+            host_lock_id, edit_session_id, ownership_generation, reserved_generation,
+            stage_id, prepared_install_id, expected_state_revision,
+            expected_commit_sequence, expected_authority_revision,
+            expected_physical_revision, expected_projection_revision,
+            expected_physical_digest, intended_physical_digest, recovery_record_id,
+            acquired_at_ms
+        ) VALUES ('reservation', 'save-operation', ?, 'resource-lock',
+            'host-lock', 'edit-session', 1, 1, 'save-stage', 'prepared-install',
+            1, 0, 0, 0, 0, 'expected-digest', 'intended-digest', NULL, 10)`)
+            .run(reservedPath);
+        expectValidationCategory(reserved, 'malformed-state', directVscodeIdentity);
     });
 
     it('rejects exact schema/index SQL drift', () => {

@@ -10,6 +10,7 @@ import type {
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
+import { create_edit_session_store } from '../webview/edit-session-store';
 import {
     MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
@@ -251,7 +252,11 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
 // coordinates and our hook's editing_cell stays null). A separate React root
 // stands in for the portal; the component still closes over this GridShell's
 // refs, which is all the capture needs.
-async function open_tracking_overlay(cell: [number, number], text: string) {
+async function open_tracking_overlay(
+    cell: [number, number],
+    text: string,
+    on_finished_editing: (value?: { kind: string; data?: string }) => void = () => {},
+) {
     const on_selection_change = grid_mock.props!.onGridSelectionChange as
         (selection: unknown) => void;
     await act(async () => on_selection_change({
@@ -276,7 +281,7 @@ async function open_tracking_overlay(cell: [number, number], text: string) {
         overlay_root.render(React.createElement(provided.editor, {
             value,
             onChange: () => {},
-            onFinishedEditing: () => {},
+            onFinishedEditing: on_finished_editing,
         }));
     });
     return async function close_overlay() {
@@ -2111,6 +2116,340 @@ describe('GridShell source-row edit identity', () => {
         expect(save!.operation!.edits).toEqual({ '5:0': 'live text' });
     });
 
+    it('publishes live document input and closes document gestures without pending-edit persistence', async () => {
+        const on_input = vi.fn();
+        const on_complete = vi.fn();
+        const on_cancel = vi.fn();
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+            on_document_gesture_cancel: on_cancel,
+        }));
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        await act(async () => {
+            const value_setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!;
+            value_setter.call(input, 'live');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        expect(on_input).toHaveBeenCalledWith('0:0', 'live');
+
+        await act(async () => {
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter', bubbles: true, cancelable: true,
+            }));
+        });
+        expect(on_complete).toHaveBeenCalledTimes(1);
+        expect(on_cancel).not.toHaveBeenCalled();
+        expect(grid_mock.post_message.mock.calls.some(([message]) => (
+            message?.type === 'pendingEditsChanged'
+        ))).toBe(false);
+        await close_overlay();
+    });
+
+    it('reconciles a focused overlay before an authoritative gesture completes', async () => {
+        const edit_session = create_edit_session_store();
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_input = vi.fn();
+        const on_complete = vi.fn();
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            edit_session,
+            editing_ref,
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+        }));
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data?: string }) => void;
+        const close_overlay = await open_tracking_overlay(
+            [0, 0],
+            'source-a',
+            (next) => {
+                if (next) on_cell_edited([0, 0], next);
+            },
+        );
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        await act(async () => {
+            const value_setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!;
+            value_setter.call(input, 'stale local');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        expect(on_input).toHaveBeenCalledWith('0:0', 'stale local');
+
+        await act(async () => {
+            // App installs the accepted patch in the shared store before invoking
+            // the imperative overlay reconciliation path.
+            edit_session.commit(undefined, '0:0', {
+                value: 'authoritative',
+                base: 'source-a',
+            });
+            editing_ref.current!.apply_authoritative_cell_value(
+                '0:0',
+                'authoritative',
+            );
+        });
+        expect(input.value).toBe('authoritative');
+        expect(document.activeElement).toBe(input);
+        expect(on_input).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter', bubbles: true, cancelable: true,
+            }));
+        });
+        expect(edit_session.get('0:0')).toEqual({
+            value: 'authoritative',
+            base: 'source-a',
+        });
+        expect(on_input).toHaveBeenCalledTimes(1);
+        expect(on_complete).toHaveBeenCalledOnce();
+        await close_overlay();
+    });
+
+    it('routes document-mode Escape only as gesture cancellation after live input', async () => {
+        const on_input = vi.fn();
+        const on_complete = vi.fn();
+        const on_cancel = vi.fn();
+        const on_command = vi.fn();
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+            on_document_gesture_cancel: on_cancel,
+            on_native_document_command: on_command,
+        }));
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        await act(async () => {
+            const value_setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!;
+            value_setter.call(input, 'live');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Escape', bubbles: true, cancelable: true,
+            }));
+        });
+
+        expect(on_input).toHaveBeenCalledWith('0:0', 'live');
+        expect(on_cancel).toHaveBeenCalledOnce();
+        expect(on_complete).not.toHaveBeenCalled();
+        expect(on_command).not.toHaveBeenCalled();
+        await close_overlay();
+    });
+
+    it('closes a focused document overlay before routing native Save', async () => {
+        const events: string[] = [];
+        const on_complete = vi.fn(() => { events.push('complete'); });
+        const on_command = vi.fn((command: 'save' | 'undo' | 'redo') => {
+            events.push(command);
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_gesture_complete: on_complete,
+            on_native_document_command: on_command,
+        }));
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        const save = new KeyboardEvent('keydown', {
+            key: 's', ctrlKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => { input.dispatchEvent(save); });
+
+        expect(save.defaultPrevented).toBe(true);
+        expect(on_complete).toHaveBeenCalledTimes(1);
+        expect(on_command).toHaveBeenCalledWith('save');
+        expect(events).toEqual(['complete', 'save']);
+        await close_overlay();
+    });
+
+    it('leaves a focused document overlay untouched for native Save As', async () => {
+        const on_complete = vi.fn();
+        const on_command = vi.fn();
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_gesture_complete: on_complete,
+            on_native_document_command: on_command,
+        }));
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        const save_as = new KeyboardEvent('keydown', {
+            key: 's',
+            ctrlKey: true,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+        });
+        const bubbled = vi.fn();
+        window.addEventListener('keydown', bubbled);
+        await act(async () => { input.dispatchEvent(save_as); });
+        window.removeEventListener('keydown', bubbled);
+
+        expect(save_as.defaultPrevented).toBe(false);
+        expect(bubbled).toHaveBeenCalledWith(save_as);
+        expect(on_complete).not.toHaveBeenCalled();
+        expect(on_command).not.toHaveBeenCalled();
+        expect(document.querySelector('.cell-editor-input')).toBe(input);
+        await close_overlay();
+    });
+
+    it('closes a focused document overlay before routing native Undo and Redo', async () => {
+        const events: string[] = [];
+        const on_input = vi.fn();
+        const on_complete = vi.fn(() => { events.push('complete'); });
+        const on_command = vi.fn((command: 'save' | 'undo' | 'redo') => {
+            events.push(command);
+        });
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+            on_native_document_command: on_command,
+        }));
+
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        await act(async () => {
+            const value_setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!;
+            value_setter.call(input, 'live');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+
+        const undo = new KeyboardEvent('keydown', {
+            key: 'z', ctrlKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => { input.dispatchEvent(undo); });
+
+        expect(undo.defaultPrevented).toBe(true);
+        expect(on_input).toHaveBeenCalledWith('0:0', 'live');
+        expect(on_complete).toHaveBeenCalledTimes(1);
+        expect(on_command).toHaveBeenLastCalledWith('undo');
+        expect(events).toEqual(['complete', 'undo']);
+
+        const redo = new KeyboardEvent('keydown', {
+            key: 'z', metaKey: true, shiftKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => { input.dispatchEvent(redo); });
+        expect(redo.defaultPrevented).toBe(true);
+        expect(on_command).toHaveBeenLastCalledWith('redo');
+        expect(events.slice(-2)).toEqual(['complete', 'redo']);
+        await close_overlay();
+    });
+
+    it('publishes direct paste/delete commits as complete native document gestures', async () => {
+        const on_input = vi.fn();
+        const on_complete = vi.fn();
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+        }));
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+
+        await act(async () => on_cell_edited(
+            [0, 0],
+            { kind: 'text', data: 'pasted' },
+        ));
+
+        expect(on_input).toHaveBeenCalledWith('0:0', 'pasted');
+        expect(on_complete).toHaveBeenCalledTimes(1);
+        expect(grid_mock.post_message.mock.calls.some(([message]) => (
+            message?.type === 'pendingEditsChanged'
+        ))).toBe(false);
+    });
+
+    it('fences document input, direct commits, and terminal gestures until a fresh mount', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const on_input = vi.fn();
+        const on_complete = vi.fn();
+        const on_cancel = vi.fn();
+        const document_props = props({
+            edit_mode: true,
+            csv_editable: true,
+            editing_mode: 'vscodeDocument',
+            editing_ref,
+            on_document_cell_input: on_input,
+            on_document_gesture_complete: on_complete,
+            on_document_gesture_cancel: on_cancel,
+        });
+        const GridShell = await render_grid(document_props);
+        const close_overlay = await open_tracking_overlay([0, 0], 'base');
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await act(async () => {
+            const value_setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!;
+            value_setter.call(input, 'blocked live');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter', bubbles: true, cancelable: true,
+            }));
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Escape', bubbles: true, cancelable: true,
+            }));
+            const on_cell_edited = grid_mock.props!.onCellEdited as
+                (cell: [number, number], value: { kind: string; data: string }) => void;
+            on_cell_edited([0, 0], { kind: 'text', data: 'blocked direct' });
+        });
+
+        expect(on_input).not.toHaveBeenCalled();
+        expect(on_complete).not.toHaveBeenCalled();
+        expect(on_cancel).not.toHaveBeenCalled();
+        await close_overlay();
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...document_props,
+                key: 'fresh-document-projection',
+            }));
+        });
+        const on_cell_edited = grid_mock.props!.onCellEdited as
+            (cell: [number, number], value: { kind: string; data: string }) => void;
+        await act(async () => on_cell_edited(
+            [0, 0],
+            { kind: 'text', data: 'accepted direct' },
+        ));
+
+        expect(on_input).toHaveBeenCalledWith('0:0', 'accepted direct');
+        expect(on_complete).toHaveBeenCalledOnce();
+        expect(on_cancel).not.toHaveBeenCalled();
+        expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
     it('commits nothing when onCellEdited fires on an unresolved row', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         grid_mock.source_row_for_display = unresolved_row_1;
@@ -2227,6 +2566,36 @@ describe('GridShell source-row edit identity', () => {
 
         // Source column 2 is display column 1; source row 7 is display row 1.
         expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+    });
+
+    it('damages an already-dirty cell when its authoritative value changes', async () => {
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? 7 : display_row
+        );
+        const edit_session = create_edit_session_store(undefined, {
+            '7:2': { value: 'first dirty value', base: 'source-c' },
+        });
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session,
+        }));
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (region: { x: number; y: number; width: number; height: number }) => void;
+        act(() => on_visible_region_changed({ x: 0, y: 0, width: 2, height: 3 }));
+        grid_mock.update_cells.mockClear();
+
+        await act(async () => edit_session.commit(undefined, '7:2', {
+            value: 'second dirty value',
+            base: 'source-c',
+        }));
+
+        expect(grid_mock.update_cells).toHaveBeenCalledWith([{ cell: [1, 1] }]);
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data: string };
+        expect(get_cell_content([1, 1]).data).toBe('second dirty value');
     });
 
     it('repaints a cell the host named on a rejected save', async () => {

@@ -29,6 +29,30 @@ is the only thing that does — CI runs it):
 
 See [desktop/README.md](../desktop/README.md) for more on the desktop shell.
 
+## VS Code editor and state architecture
+
+The VS Code product is one extension and one `.vsix`; it has no companion
+extension or cross-extension migration protocol. CSV and TSV use VS Code's
+editable custom-document lifecycle, so VS Code owns dirty state, undo/redo,
+Save, Save As, Revert, close prompts, Auto Save, and hot-exit backup. Excel uses
+a separate read-only custom editor.
+
+The extension stores only disposable view state—such as widths, scroll
+positions, sorts, filters, and highlights—in SQLite at
+`<globalStorageUri>/state/file-state.sqlite3`. Windows and extension-host
+processes with the same VS Code profile and local or remote authority storage
+root share that database. Different profiles, remote authorities, containers,
+WSL environments, or other storage roots naturally use separate databases.
+CSV/TSV unsaved edits are owned by the custom document and are never written to
+this cosmetic database. There is no import from VS Code Memento and no
+synchronization with the standalone desktop app.
+
+Excel source files remain read-only. CSV/TSV source bytes are written only
+through the custom-document Save or Save As lifecycle. Highlights are
+positional annotations in cosmetic state and are removed only by an explicit
+user clear action; content changes, saves, reloads, and source replacement do
+not clear them.
+
 ## `scripts/setup.sh`
 
 A maintainer convenience script: it does a full local install of both front ends from a working tree, so you can use your own build the way an end user would. It is not part of CI or the release pipeline — releases go through the GitHub Actions workflows in `.github/workflows/`, kicked off by [`scripts/bump-version.sh`](#scriptsbump-versionsh).
@@ -82,7 +106,11 @@ What it does, in order:
 4. **Commits and tags** — stages just those two files, commits as `chore: bump version to <version>`, and creates an annotated tag `v<version>`.
 5. **Prints the push command.** It deliberately does not push.
 
-Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that same tag ref (for example, `gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3`), so its run SHA and artifacts remain bound to the immutable release commit.
+Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that tag ref, not the default branch, so the run's immutable head SHA remains the release commit:
+
+```sh
+gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3
+```
 
 `release-build.yml` has three jobs: `build` packages the `.vsix` on Linux, `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner, and `desktop-windows` packages the unsigned Windows exes (setup + portable, x64 + arm64) on a Windows runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
 

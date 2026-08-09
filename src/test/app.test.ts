@@ -29,6 +29,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     discard_keys: vi.fn((_keys: readonly string[]) => {}),
     commit_live_edit: vi.fn(),
+    apply_authoritative_cell_value: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
     select_all: vi.fn(),
@@ -104,6 +105,7 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_keys: (keys: readonly string[]) => void;
                 stop_edit_admission: () => void;
                 commit_live_edit: () => void;
+                apply_authoritative_cell_value: (key: string, value: string) => void;
                 has_uncommitted_changes: () => boolean;
             } | null;
         };
@@ -254,6 +256,8 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_keys: grid_shell_mock.discard_keys,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
+                apply_authoritative_cell_value:
+                    grid_shell_mock.apply_authoritative_cell_value,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
         }
@@ -782,6 +786,7 @@ function workbook_snapshot_message(
                 csvEditable: false,
                 csvEditingSupported: false,
                 ...capabilities,
+                csvEditingMode: capabilities?.csvEditingMode ?? 'selfManaged',
                 csvSaveLifecycle: capabilities?.csvSaveLifecycle
                     ?? { revision: 0, state: 'idle' },
             },
@@ -840,6 +845,7 @@ function cleanup() {
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.discard_keys.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
+    grid_shell_mock.apply_authoritative_cell_value.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.select_all.mockReset();
@@ -5394,10 +5400,11 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2 }),
         );
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitFor(() => {
+            expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
+            expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        });
 
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
-        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
         expect(toolbar_focus).not.toHaveBeenCalled();
     });
 
@@ -5411,12 +5418,13 @@ describe('sorting and filtering', () => {
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
         const request = latest_transform_request(post_message);
+        vi.useFakeTimers();
         await acknowledge_transform(request, 2);
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await act(async () => { await vi.runOnlyPendingTimersAsync(); });
 
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
         has_focus.mockReturnValue(true);
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 160)));
+        await act(async () => { await vi.runAllTimersAsync(); });
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
     });
 
@@ -5450,8 +5458,9 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2 }),
         );
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
-        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        await vi.waitFor(() => {
+            expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        });
     });
 
     it('restores grid focus when a grid transform fails without a generation bump', async () => {
@@ -5473,10 +5482,11 @@ describe('sorting and filtering', () => {
             reason: 'failed',
             terminal: true,
         });
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitFor(() => {
+            expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        });
 
         expect(grid_stub().getAttribute('data-mount-id')).toBe(previous_mount);
-        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
     it('restores filter focus only for Escape and explicit Cancel', async () => {
@@ -8855,5 +8865,684 @@ describe('per-sheet view records', () => {
         expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
         expect(view()).toEqual({ sheet: '0', rows: '3' });
+    });
+});
+
+describe('VS Code custom document protocol', () => {
+    type DocumentGridProps = {
+        csv_editable?: boolean;
+        on_document_cell_input(key: string, value: string): void;
+        on_document_gesture_complete(): void;
+        on_document_gesture_cancel(): void;
+        on_native_document_command(command: 'save' | 'undo' | 'redo'): void;
+    };
+
+    function document_grid_props(): DocumentGridProps {
+        return grid_shell_mock.latest_props as DocumentGridProps;
+    }
+
+    async function load_document_mode(
+        post_message: ReturnType<typeof vi.fn>,
+        revision = 3,
+    ) {
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditingMode: 'vscodeDocument',
+                csvDocumentViewId: 'view:1',
+            },
+            state: {
+                // Native-document mode must not hydrate its content from cosmetic state.
+                pendingEdits: { '9:9': { value: 'stale', base: 'stale' } },
+            },
+        }));
+        expect(get_button('Edit').disabled).toBe(true);
+        await dispatch_host_message({
+            type: 'csvDocumentSync',
+            mutationEpoch: 1,
+            viewMutationEpoch: 11,
+            revision,
+            sourceGeneration: 1,
+            dirtyEntries: { '0:0': { value: 'draft', base: 'base' } },
+            conflict: { type: 'none' },
+        });
+        expect(get_button('Edit').disabled).toBe(false);
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'draft', base: 'base' },
+        });
+        post_message.mockClear();
+    }
+
+    it('rejects pre-sync callbacks and keeps them stale after the initial authoritative sync', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditingMode: 'vscodeDocument',
+                csvDocumentViewId: 'view:1',
+            },
+        }));
+        const unsynced = document_grid_props();
+        const unsynced_mount = grid_stub().getAttribute('data-mount-id');
+        expect(unsynced.csv_editable).toBe(false);
+        post_message.mockClear();
+
+        await act(async () => {
+            unsynced.on_document_cell_input('0:0', 'before sync');
+            unsynced.on_document_gesture_complete();
+            unsynced.on_document_gesture_cancel();
+            unsynced.on_native_document_command('undo');
+        });
+        expect(post_message).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'csvDocumentSync',
+            mutationEpoch: 1,
+            viewMutationEpoch: 11,
+            revision: 3,
+            sourceGeneration: 1,
+            dirtyEntries: {},
+            conflict: { type: 'none' },
+        });
+        const synced = document_grid_props();
+        expect(synced.csv_editable).toBe(true);
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(unsynced_mount);
+        post_message.mockClear();
+
+        await act(async () => {
+            unsynced.on_document_cell_input('0:0', 'stale before-sync callback');
+            unsynced.on_document_gesture_complete();
+            unsynced.on_native_document_command('redo');
+        });
+        expect(post_message).not.toHaveBeenCalled();
+
+        await act(async () => {
+            synced.on_document_cell_input('0:0', 'current');
+            synced.on_document_gesture_complete();
+            synced.on_native_document_command('save');
+        });
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([
+            {
+                type: 'csvDocumentCellInput',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                key: '0:0',
+                value: 'current',
+                revision: 3,
+            },
+            {
+                type: 'csvDocumentGestureComplete',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                revision: 4,
+            },
+            { type: 'csvDocumentNativeCommand', command: 'save' },
+        ]);
+    });
+
+    it.each([
+        {
+            boundary: 'revision gap',
+            patch: {
+                type: 'csvDocumentPatch' as const,
+                revision: 5,
+                sourceGeneration: 1,
+                key: '0:0',
+                value: 'gap',
+                dirtyEntry: { value: 'gap', base: 'base' },
+                origin: 'redo' as const,
+                selfOriginated: false,
+            },
+        },
+        {
+            boundary: 'source-generation mismatch',
+            patch: {
+                type: 'csvDocumentPatch' as const,
+                revision: 4,
+                sourceGeneration: 2,
+                key: '0:0',
+                value: 'other source',
+                dirtyEntry: { value: 'other source', base: 'base' },
+                origin: 'redo' as const,
+                selfOriginated: false,
+            },
+        },
+    ])('fences $boundary callbacks synchronously and keeps them stale after resync', async ({ patch }) => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        await click_button('Edit');
+        const stale = document_grid_props();
+        const stale_mount = grid_stub().getAttribute('data-mount-id');
+        grid_shell_mock.stop_edit_admission.mockClear();
+        post_message.mockClear();
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: patch }));
+            stale.on_document_cell_input('0:0', 'same-turn stale input');
+            stale.on_document_gesture_complete();
+            stale.on_document_gesture_cancel();
+            stale.on_native_document_command('undo');
+        });
+
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([{
+            type: 'csvDocumentResyncRequest',
+            mutationEpoch: 1,
+            viewMutationEpoch: 11,
+            viewId: 'view:1',
+        }]);
+        expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledOnce();
+        expect(document_grid_props().csv_editable).toBe(false);
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(stale_mount);
+
+        await dispatch_host_message({
+            type: 'csvDocumentSync',
+            mutationEpoch: 1,
+            viewMutationEpoch: 12,
+            revision: patch.revision,
+            sourceGeneration: patch.sourceGeneration,
+            dirtyEntries: { '0:0': { value: 'authoritative', base: 'base' } },
+            conflict: { type: 'none' },
+        });
+        const current = document_grid_props();
+        expect(current.csv_editable).toBe(true);
+        post_message.mockClear();
+
+        await act(async () => {
+            stale.on_document_cell_input('0:0', 'stale after resync');
+            stale.on_document_gesture_complete();
+            stale.on_native_document_command('redo');
+        });
+        expect(post_message).not.toHaveBeenCalled();
+
+        await act(async () => {
+            current.on_document_cell_input('0:0', 'current after resync');
+            current.on_document_gesture_complete();
+        });
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([
+            {
+                type: 'csvDocumentCellInput',
+                mutationEpoch: 1,
+                viewMutationEpoch: 12,
+                viewId: 'view:1',
+                key: '0:0',
+                value: 'current after resync',
+                revision: patch.revision,
+            },
+            {
+                type: 'csvDocumentGestureComplete',
+                mutationEpoch: 1,
+                viewMutationEpoch: 12,
+                viewId: 'view:1',
+                revision: patch.revision + 1,
+            },
+        ]);
+    });
+
+    it('fences old-epoch callbacks synchronously through unsafe replacement and sync', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        await click_button('Edit');
+        const stale = document_grid_props();
+        grid_shell_mock.stop_edit_admission.mockClear();
+        post_message.mockClear();
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'csvDocumentSourceReplaced',
+                mutationEpoch: 2,
+                revision: 3,
+                sourceGeneration: 2,
+                reason: 'revert',
+            } }));
+            stale.on_document_cell_input('0:0', 'old source');
+            stale.on_document_gesture_complete();
+            stale.on_document_gesture_cancel();
+            stale.on_native_document_command('undo');
+        });
+        expect(post_message).not.toHaveBeenCalled();
+        expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledOnce();
+        expect(document_grid_props().csv_editable).toBe(false);
+
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditingMode: 'vscodeDocument',
+                csvDocumentViewId: 'view:1',
+            },
+        }));
+        expect(document_grid_props().csv_editable).toBe(false);
+        await dispatch_host_message({
+            type: 'csvDocumentSync',
+            mutationEpoch: 2,
+            viewMutationEpoch: 12,
+            revision: 3,
+            sourceGeneration: 2,
+            dirtyEntries: {},
+            conflict: { type: 'none' },
+        });
+        const current = document_grid_props();
+        expect(current.csv_editable).toBe(true);
+        post_message.mockClear();
+
+        await act(async () => {
+            stale.on_document_cell_input('0:0', 'old source after sync');
+            stale.on_document_gesture_complete();
+            stale.on_native_document_command('redo');
+        });
+        expect(post_message).not.toHaveBeenCalled();
+
+        await act(async () => current.on_document_cell_input('0:0', 'new source'));
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'csvDocumentCellInput',
+            mutationEpoch: 2,
+            viewMutationEpoch: 12,
+            viewId: 'view:1',
+            key: '0:0',
+            value: 'new source',
+            revision: 3,
+        });
+    });
+
+    it('publishes rapid live input against optimistic revisions without self-managed state', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
+
+        const props = grid_shell_mock.latest_props as {
+            on_document_cell_input(key: string, value: string): void;
+            on_document_gesture_complete(): void;
+            on_document_gesture_cancel(): void;
+        };
+        await act(async () => {
+            props.on_document_cell_input('0:0', 'd');
+            props.on_document_cell_input('0:0', 'dr');
+            props.on_document_gesture_complete();
+            props.on_document_gesture_cancel();
+        });
+
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([
+            {
+                type: 'csvDocumentCellInput',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                key: '0:0',
+                value: 'd',
+                revision: 3,
+            },
+            {
+                type: 'csvDocumentCellInput',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                key: '0:0',
+                value: 'dr',
+                revision: 4,
+            },
+            {
+                type: 'csvDocumentGestureComplete',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                revision: 5,
+            },
+            {
+                type: 'csvDocumentGestureCancel',
+                mutationEpoch: 1,
+                viewMutationEpoch: 11,
+                viewId: 'view:1',
+                revision: 5,
+            },
+        ]);
+        expect(post_message.mock.calls.some((call) => (
+            call[0]?.type === 'pendingEditsChanged'
+        ))).toBe(false);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(post_message.mock.calls.some((call) => (
+            call[0]?.type === 'showSaveDialog'
+            || call[0]?.type === 'releaseEditSession'
+            || call[0]?.type === 'discardEditSession'
+        ))).toBe(false);
+    });
+
+    it('does not roll newer optimistic text back on an older self acknowledgment', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        await click_button('Edit');
+        const props = document_grid_props();
+
+        await act(async () => {
+            props.on_document_cell_input('0:0', 'd');
+            props.on_document_cell_input('0:0', 'dr');
+        });
+        grid_shell_mock.apply_authoritative_cell_value.mockClear();
+
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 4,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'd',
+            dirtyEntry: { value: 'd', base: 'base' },
+            origin: 'input',
+            selfOriginated: true,
+        });
+        expect(grid_shell_mock.apply_authoritative_cell_value).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 5,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'dr',
+            dirtyEntry: { value: 'dr', base: 'base' },
+            origin: 'input',
+            selfOriginated: true,
+        });
+        expect(grid_shell_mock.apply_authoritative_cell_value)
+            .toHaveBeenLastCalledWith('0:0', 'dr');
+
+        // A sibling can win the next document revision while this view has another
+        // optimistic input in flight. External authority must replace the overlay
+        // immediately; the rejected local message will be fenced by the host resync.
+        await act(async () => props.on_document_cell_input('0:0', 'draft'));
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 6,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'sibling',
+            dirtyEntry: { value: 'sibling', base: 'base' },
+            origin: 'input',
+            selfOriginated: false,
+        });
+        expect(grid_shell_mock.apply_authoritative_cell_value)
+            .toHaveBeenLastCalledWith('0:0', 'sibling');
+    });
+
+    it('applies contiguous patches, ignores duplicates, and requests resync on a gap', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 4,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'next',
+            dirtyEntry: { value: 'next', base: 'base' },
+            origin: 'input',
+            selfOriginated: false,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'next', base: 'base' },
+        });
+        expect(grid_shell_mock.apply_authoritative_cell_value)
+            .toHaveBeenCalledWith('0:0', 'next');
+
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 4,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'duplicate',
+            dirtyEntry: { value: 'duplicate', base: 'base' },
+            origin: 'input',
+            selfOriginated: false,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'next', base: 'base' },
+        });
+        expect(grid_shell_mock.apply_authoritative_cell_value).toHaveBeenCalledOnce();
+        expect(post_message).not.toHaveBeenCalled();
+
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 6,
+            sourceGeneration: 1,
+            key: '0:0',
+            value: 'gap',
+            dirtyEntry: { value: 'gap', base: 'base' },
+            origin: 'redo',
+            selfOriginated: false,
+        });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'csvDocumentResyncRequest',
+            mutationEpoch: 1,
+            viewMutationEpoch: 11,
+            viewId: 'view:1',
+        });
+
+        await dispatch_host_message({
+            type: 'csvDocumentSync',
+            mutationEpoch: 1,
+            viewMutationEpoch: 12,
+            revision: 6,
+            sourceGeneration: 1,
+            dirtyEntries: { '0:0': { value: 'authoritative', base: 'base' } },
+            conflict: { type: 'externalChange' },
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'authoritative', base: 'base' },
+        });
+        expect(container!.querySelector('.truncation-banner[role="status"]')?.textContent)
+            .toContain('changed externally');
+    });
+
+    it('replaces the document source without retaining dirty content or positional highlights', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            sheetIndex: 0,
+            requestId: 'highlight:1',
+            stateRevision: 2,
+            physicalRevision: 1,
+            sourceGeneration: 1,
+            state: {
+                sourceDigest: 'old-digest',
+                sheets: [{
+                    schema: 'old-schema',
+                    cells: { '0:0': 'yellow' },
+                }],
+            },
+        });
+        expect((grid_shell_mock.latest_props as {
+            cell_highlights?: { cells: Record<string, string> };
+        }).cell_highlights?.cells).toEqual({ '0:0': 'yellow' });
+        post_message.mockClear();
+
+        await dispatch_host_message({
+            type: 'csvDocumentSourceReplaced',
+            mutationEpoch: 1,
+            revision: 5,
+            sourceGeneration: 2,
+            reason: 'save',
+        });
+
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+        expect((grid_shell_mock.latest_props as { csv_editable?: boolean }).csv_editable)
+            .toBe(false);
+        expect(container!.querySelector('.truncation-banner[role="status"]')).toBeNull();
+        expect((grid_shell_mock.latest_props as {
+            cell_highlights?: { cells: Record<string, string> };
+        }).cell_highlights?.cells).toEqual({ '0:0': 'yellow' });
+
+        // An edit already admitted while Save was writing arrives after the source
+        // replacement and must remain dirty for the next native savepoint.
+        await dispatch_host_message({
+            type: 'csvDocumentPatch',
+            mutationEpoch: 1,
+            revision: 6,
+            sourceGeneration: 2,
+            key: '0:0',
+            value: 'typed-during-save',
+            dirtyEntry: { value: 'typed-during-save', base: 'saved' },
+            origin: 'input',
+            selfOriginated: true,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'typed-during-save', base: 'saved' },
+        });
+        expect(post_message.mock.calls.some((call) => (
+            call[0]?.type === 'stateChanged'
+            && call[0]?.state?.cellHighlights === undefined
+        ))).toBe(false);
+    });
+
+    it('leaves Undo and Redo with focused non-cell text controls while keeping Save global', async () => {
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+        const native_commands = () => post_message.mock.calls
+            .map((call) => call[0])
+            .filter((message) => message?.type === 'csvDocumentNativeCommand');
+        const expect_local_text_history = async (target: HTMLElement) => {
+            await act(async () => target.focus());
+            expect(document.activeElement).toBe(target);
+            for (const init of [
+                { key: 'z', ctrlKey: true },
+                { key: 'z', metaKey: true, shiftKey: true },
+            ]) {
+                const event = new KeyboardEvent('keydown', {
+                    ...init,
+                    bubbles: true,
+                    cancelable: true,
+                });
+                await act(async () => target.dispatchEvent(event));
+                expect(event.defaultPrevented).toBe(false);
+            }
+            expect(native_commands()).toEqual([]);
+        };
+
+        await open_columns();
+        const column_search = document.querySelector(
+            '.column-visibility-search',
+        ) as HTMLInputElement;
+        await expect_local_text_history(column_search);
+        await act(async () => columns_trigger().click());
+
+        await open_grid_filter();
+        const filter_value = document.querySelector(
+            'input[aria-label="Filter value"]',
+        ) as HTMLInputElement;
+        await expect_local_text_history(filter_value);
+
+        const editable = document.createElement('div');
+        editable.contentEditable = 'true';
+        editable.tabIndex = 0;
+        // jsdom does not derive isContentEditable from the attribute.
+        Object.defineProperty(editable, 'isContentEditable', { value: true });
+        document.body.appendChild(editable);
+        await expect_local_text_history(editable);
+
+        await act(async () => filter_value.focus());
+        const save = new KeyboardEvent('keydown', {
+            key: 's', ctrlKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => filter_value.dispatchEvent(save));
+        expect(save.defaultPrevented).toBe(true);
+        expect(native_commands()).toEqual([
+            { type: 'csvDocumentNativeCommand', command: 'save' },
+        ]);
+    });
+
+    it('leaves the keystroke for VS Code when the projection is not yet admitted', async () => {
+        const forwarded_by_vscode: KeyboardEvent[] = [];
+        const vscode_key_bridge = (event: KeyboardEvent) => {
+            if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+            forwarded_by_vscode.push(event);
+        };
+        window.addEventListener('keydown', vscode_key_bridge);
+        const { post_message } = await render_app();
+        // Native-document mode is announced, but the authoritative csvDocumentSync
+        // has not arrived, so no command can be routed to the host yet.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditingMode: 'vscodeDocument',
+                csvDocumentViewId: 'view:1',
+            },
+        }));
+        post_message.mockClear();
+
+        const save = new KeyboardEvent('keydown', {
+            key: 's', ctrlKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => { window.dispatchEvent(save); });
+        window.removeEventListener('keydown', vscode_key_bridge);
+
+        // Nothing was posted, so the gesture must remain available to VS Code
+        // rather than being swallowed into a silent no-op.
+        expect(post_message.mock.calls.some(
+            (call) => call[0]?.type === 'csvDocumentNativeCommand',
+        )).toBe(false);
+        expect(save.defaultPrevented).toBe(false);
+        expect(forwarded_by_vscode).toEqual([save]);
+    });
+
+    it('captures native Save, Undo, and Redo before the VS Code key bridge', async () => {
+        const forwarded_by_vscode: KeyboardEvent[] = [];
+        const vscode_key_bridge = (event: KeyboardEvent) => {
+            if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+            event.preventDefault();
+            forwarded_by_vscode.push(event);
+        };
+        window.addEventListener('keydown', vscode_key_bridge);
+        const { post_message } = await render_app();
+        await load_document_mode(post_message);
+
+        for (const init of [
+            { key: 's', ctrlKey: true },
+            { key: 'z', ctrlKey: true },
+            { key: 'z', ctrlKey: true, shiftKey: true },
+            { key: 'y', ctrlKey: true },
+        ]) {
+            await act(async () => {
+                window.dispatchEvent(new KeyboardEvent('keydown', {
+                    ...init,
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            });
+        }
+        const save_as = new KeyboardEvent('keydown', {
+            key: 's',
+            ctrlKey: true,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+        });
+        await act(async () => { window.dispatchEvent(save_as); });
+        window.removeEventListener('keydown', vscode_key_bridge);
+
+        expect(save_as.defaultPrevented).toBe(true);
+        expect(forwarded_by_vscode).toEqual([save_as]);
+        expect(post_message.mock.calls.map((call) => call[0])).toEqual([
+            { type: 'csvDocumentNativeCommand', command: 'save' },
+            { type: 'csvDocumentNativeCommand', command: 'undo' },
+            { type: 'csvDocumentNativeCommand', command: 'redo' },
+            { type: 'csvDocumentNativeCommand', command: 'redo' },
+        ]);
+        expect(post_message.mock.calls.some((call) => call[0]?.type === 'saveCsv'))
+            .toBe(false);
     });
 });

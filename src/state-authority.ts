@@ -89,7 +89,8 @@ function entry(store: FileStateStore, path: string): FallbackEntry {
 
 function is_authority_store(store: FileStateStore): store is AuthorityFileStateStore {
     const candidate = store as Partial<AuthorityFileStateStore>;
-    return typeof candidate.read_authority === 'function'
+    return typeof candidate.copy_cosmetic_entry_if_absent === 'function'
+        && typeof candidate.read_authority === 'function'
         && typeof candidate.stage_authority_transaction === 'function'
         && typeof candidate.finalize_authority_transaction === 'function'
         && typeof candidate.inspect_authority_transaction === 'function'
@@ -299,8 +300,41 @@ export function with_in_memory_authority_transactions(
         });
         return result;
     };
+    const candidate = store as FileStateStore & {
+        copy_cosmetic_entry_if_absent?: AuthorityFileStateStore['copy_cosmetic_entry_if_absent'];
+    };
+    // Unlike copy_complete_entry this deliberately omits the single retry and the
+    // in-memory copyProvenance memo: copy_in_transaction in state.ts writes
+    // copyProvenance for cosmetic copies and performs the idempotent replay
+    // durably, so a second attempt would replay from the transaction, not here.
+    const copy_cosmetic_entry = async (
+        source: string,
+        destination: string,
+        copyId: string,
+    ): Promise<FileStateCopyResult> => {
+        if (!candidate.copy_cosmetic_entry_if_absent) return { type: 'unsupported' };
+        const result = await candidate.copy_cosmetic_entry_if_absent(
+            source,
+            destination,
+            copyId,
+        );
+        if (result.type === 'copied') {
+            entries_for(store).set(destination, {
+                authority: empty(),
+                stages: new Map(),
+                materialized: true,
+            });
+        }
+        return result;
+    };
+    const copy_entry = candidate.copy_cosmetic_entry_if_absent
+        ? copy_cosmetic_entry
+        : copy_complete_entry;
     const wrapped: AuthorityFileStateStore = {
         ...store,
+        copy_cosmetic_entry_if_absent: (source, destination, copyId) => enqueue(
+            () => copy_cosmetic_entry(source, destination, copyId),
+        ),
         compare_and_set: (path, expected, state, validate, basis) => enqueue(async () => {
             const current = await store.read(path);
             const authority = structuredClone(entry(store, path).authority);
@@ -366,7 +400,7 @@ export function with_in_memory_authority_transactions(
                     destination_lease = { release: async () => {} };
                 }
                 if (copy_from_if_absent) {
-                    await copy_complete_entry(
+                    await copy_entry(
                         copy_from_if_absent,
                         path,
                         copy_id ?? `lease:${copy_from_if_absent}:${path}`,
@@ -383,7 +417,7 @@ export function with_in_memory_authority_transactions(
             }
         }),
         copy_entry_if_absent: (source, destination, copy_id) => enqueue(
-            () => copy_complete_entry(source, destination, copy_id),
+            () => copy_entry(source, destination, copy_id),
         ),
     };
     fallback_owner.set(wrapped, store);

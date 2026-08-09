@@ -81,6 +81,19 @@ function make_uri(components: UriComponents): UriLike {
 }
 
 export const Uri = {
+    parse(value: string): UriLike {
+        if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) {
+            return this.file(value);
+        }
+        const parsed = new URL(value);
+        return make_uri({
+            scheme: parsed.protocol.slice(0, -1),
+            authority: parsed.host,
+            path: parsed.pathname,
+            query: parsed.search.slice(1),
+            fragment: parsed.hash.slice(1),
+        });
+    },
     joinPath(base: UriLike, ...segments: string[]): UriLike {
         const joined = [base.path.replace(/\/$/, ''), ...segments].join('/');
         if (typeof base.with === 'function') return base.with({ path: joined });
@@ -111,15 +124,31 @@ export const ViewColumn = {
     Beside: 2,
 };
 
+export class CancellationError extends Error {
+    constructor() {
+        super('Cancelled');
+        this.name = 'Canceled';
+    }
+}
+
+export class EventEmitter<T> {
+    private readonly listeners: ((event: T) => unknown)[] = [];
+    readonly event = (listener: (event: T) => unknown): { dispose(): void } => {
+        this.listeners.push(listener);
+        return disposable(this.listeners, listener);
+    };
+
+    fire(event: T): void {
+        for (const listener of [...this.listeners]) listener(event);
+    }
+
+    dispose(): void {
+        this.listeners.length = 0;
+    }
+}
+
 export const env = {
     remoteName: undefined as string | undefined,
-    appName: 'Visual Studio Code',
-    uriScheme: 'vscode',
-};
-
-export const ExtensionKind = {
-    UI: 1,
-    Workspace: 2,
 };
 
 export class RelativePattern {
@@ -140,6 +169,8 @@ type ConfigurationChangeHandler = (
 
 interface MockWebviewPanel {
     title: string;
+    readonly active: boolean;
+    readonly visible: boolean;
     webview: {
         html: string;
         asWebviewUri(uri: UriLike): UriLike;
@@ -147,11 +178,15 @@ interface MockWebviewPanel {
         onDidReceiveMessage(handler: MessageHandler): { dispose(): void };
     };
     onDidDispose(handler: () => unknown): { dispose(): void };
+    onDidChangeViewState(
+        handler: (event: { readonly webviewPanel: MockWebviewPanel }) => unknown,
+    ): { dispose(): void };
     reveal(): void;
     dispose(): void;
     __messages: unknown[];
     __autoAckSnapshots: boolean;
     __receive(message: unknown): Promise<void>;
+    __setActive(active: boolean): void;
 }
 
 export interface MockWatcher {
@@ -177,10 +212,18 @@ const custom_editor_registrations: {
 }[] = [];
 
 let stat_impl: ((uri: UriLike) => Promise<{ size: number; mtime: number }>) | undefined;
+let save_impl: ((uri: UriLike) => Promise<UriLike | undefined>) | undefined;
 let read_file_impl: ((uri: UriLike) => Promise<Uint8Array>) | undefined;
 let write_file_impl: ((uri: UriLike, content: Uint8Array) => Promise<void>) | undefined;
+let delete_impl: ((uri: UriLike) => Promise<void>) | undefined;
+let create_directory_impl: ((uri: UriLike) => Promise<void>) | undefined;
 let watcher_registration_failure: 'change' | 'create' | 'delete' | undefined;
 let watcher_dispose_failure = false;
+const executed_commands: { command: string; args: unknown[] }[] = [];
+const registered_commands = new Map<string, (...args: unknown[]) => unknown>();
+const warning_messages: string[] = [];
+const error_messages: string[] = [];
+const information_messages: string[] = [];
 
 function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
     return {
@@ -195,10 +238,18 @@ function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
 function make_panel(title: string): MockWebviewPanel {
     const message_handlers: MessageHandler[] = [];
     const dispose_handlers: (() => unknown)[] = [];
+    const view_state_handlers: ((event: {
+        readonly webviewPanel: MockWebviewPanel;
+    }) => unknown)[] = [];
     let protocol_sequence = 0;
+    let active = false;
+    let visible = true;
+    let disposed = false;
     const pending_edit_sequences = new Map<string, number>();
     const panel: MockWebviewPanel = {
         title,
+        get active() { return active; },
+        get visible() { return visible; },
         webview: {
             html: '',
             asWebviewUri(uri: UriLike): UriLike {
@@ -234,9 +285,34 @@ function make_panel(title: string): MockWebviewPanel {
             dispose_handlers.push(handler);
             return disposable(dispose_handlers, handler);
         },
-        reveal() {},
+        onDidChangeViewState(
+            handler: (event: { readonly webviewPanel: MockWebviewPanel }) => unknown,
+        ): { dispose(): void } {
+            view_state_handlers.push(handler);
+            return disposable(view_state_handlers, handler);
+        },
+        reveal() {
+            if (disposed) return;
+            const visibility_changed = !visible;
+            const activity_changed = !active;
+            visible = true;
+            panel.__setActive(true);
+            if (visibility_changed && !activity_changed) {
+                const event = { webviewPanel: panel };
+                for (const handler of [...view_state_handlers]) handler(event);
+            }
+        },
         dispose() {
-            for (const handler of dispose_handlers) handler();
+            if (disposed) return;
+            disposed = true;
+            const view_state_changed = active || visible;
+            active = false;
+            visible = false;
+            if (view_state_changed) {
+                const event = { webviewPanel: panel };
+                for (const handler of [...view_state_handlers]) handler(event);
+            }
+            for (const handler of [...dispose_handlers]) handler();
         },
         __messages: [],
         __autoAckSnapshots: true,
@@ -377,6 +453,17 @@ function make_panel(title: string): MockWebviewPanel {
             }
             await Promise.all(message_handlers.map((handler) => handler(forwarded)));
         },
+        __setActive(next_active: boolean): void {
+            if (disposed || active === next_active) return;
+            if (next_active) {
+                for (const other of panels) {
+                    if (other !== panel) other.__setActive(false);
+                }
+            }
+            active = next_active;
+            const event = { webviewPanel: panel };
+            for (const handler of [...view_state_handlers]) handler(event);
+        },
     };
     return panel;
 }
@@ -454,24 +541,19 @@ export const window = {
     createWebviewPanel(_viewType: string, title: string): MockWebviewPanel {
         const panel = make_panel(title);
         panels.push(panel);
+        panel.__setActive(true);
         return panel;
     },
-    showErrorMessage(..._args: unknown[]): unknown {
+    showErrorMessage(message: string, ..._args: unknown[]): unknown {
+        error_messages.push(message);
         return undefined;
     },
-    showWarningMessage(..._args: unknown[]): unknown {
+    showWarningMessage(message: string, ..._args: unknown[]): unknown {
+        warning_messages.push(message);
         return undefined;
     },
-    showInformationMessage(..._args: unknown[]): unknown {
-        return undefined;
-    },
-    showQuickPick(..._args: unknown[]): unknown {
-        return undefined;
-    },
-    showSaveDialog(..._args: unknown[]): unknown {
-        return undefined;
-    },
-    showOpenDialog(..._args: unknown[]): unknown {
+    showInformationMessage(message: string, ..._args: unknown[]): unknown {
+        information_messages.push(message);
         return undefined;
     },
     onDidChangeTextEditorVisibleRanges() {
@@ -481,8 +563,17 @@ export const window = {
         return { document, revealRange() {} };
     },
     visibleTextEditors: [],
-    activeTextEditor: undefined as unknown,
+    activeTextEditor: undefined as { document: { uri: UriLike } } | undefined,
+    tabGroups: {
+        activeTabGroup: {
+            activeTab: undefined as { input: unknown } | undefined,
+        },
+    },
 };
+
+export class TabInputCustom {
+    constructor(readonly uri: UriLike, readonly viewType = '') {}
+}
 
 export class Range {
     constructor(
@@ -498,8 +589,9 @@ export const TextEditorRevealType = {
 };
 
 export const workspace = {
-    workspaceFile: undefined as UriLike | undefined,
-    workspaceFolders: undefined as readonly { uri: UriLike }[] | undefined,
+    async save(uri: UriLike): Promise<UriLike | undefined> {
+        return save_impl ? save_impl(uri) : uri;
+    },
     fs: {
         async stat(uri: UriLike): Promise<{ size: number; mtime: number }> {
             if (!stat_impl) return { size: 0, mtime: 0 };
@@ -511,6 +603,12 @@ export const workspace = {
         },
         async writeFile(uri: UriLike, content: Uint8Array): Promise<void> {
             await write_file_impl?.(uri, content);
+        },
+        async delete(uri: UriLike): Promise<void> {
+            await delete_impl?.(uri);
+        },
+        async createDirectory(uri: UriLike): Promise<void> {
+            await create_directory_impl?.(uri);
         },
     },
     createFileSystemWatcher(pattern?: unknown): MockWatcher {
@@ -534,37 +632,33 @@ export const workspace = {
     },
 };
 
-const command_handlers = new Map<string, (...args: unknown[]) => unknown>();
-const extension_registry = new Map<string, unknown>();
-
 export const commands = {
     registerCommand(command: string, handler: (...args: unknown[]) => unknown) {
-        command_handlers.set(command, handler);
-        return { dispose: () => { command_handlers.delete(command); } };
+        // The real API rejects a second registration of the same id. Without this a
+        // production double-registration bug would pass the activation tests.
+        if (registered_commands.has(command)) {
+            throw new Error(`command '${command}' already exists`);
+        }
+        registered_commands.set(command, handler);
+        return {
+            dispose() {
+                if (registered_commands.get(command) === handler) {
+                    registered_commands.delete(command);
+                }
+            },
+        };
     },
     async executeCommand(command: string, ...args: unknown[]): Promise<unknown> {
-        const handler = command_handlers.get(command);
-        return handler?.(...args);
+        executed_commands.push({ command, args });
+        return registered_commands.get(command)?.(...args);
     },
 };
 
 export const extensions = {
-    getExtension(id: string) {
-        return extension_registry.get(id);
+    getExtension() {
+        return undefined;
     },
 };
-
-export function __setExtension(id: string, extension: unknown): void {
-    extension_registry.set(id, extension);
-}
-
-export function __setCommand(command: string, handler: (...args: unknown[]) => unknown): void {
-    command_handlers.set(command, handler);
-}
-
-export function __hasCommand(command: string): boolean {
-    return command_handlers.has(command);
-}
 
 export function __reset(): void {
     panels.length = 0;
@@ -572,22 +666,33 @@ export function __reset(): void {
     configuration_change_handlers.length = 0;
     configuration_values.clear();
     custom_editor_registrations.length = 0;
-    command_handlers.clear();
-    extension_registry.clear();
     stat_impl = undefined;
+    save_impl = undefined;
     read_file_impl = undefined;
     write_file_impl = undefined;
-    workspace.workspaceFile = undefined;
-    workspace.workspaceFolders = undefined;
-    window.activeTextEditor = undefined;
+    delete_impl = undefined;
+    create_directory_impl = undefined;
     watcher_registration_failure = undefined;
     watcher_dispose_failure = false;
+    executed_commands.length = 0;
+    registered_commands.clear();
+    warning_messages.length = 0;
+    error_messages.length = 0;
+    information_messages.length = 0;
+    window.activeTextEditor = undefined;
+    window.tabGroups.activeTabGroup.activeTab = undefined;
 }
 
 export function __setStatImplementation(
     impl: (uri: UriLike) => Promise<{ size: number; mtime: number }>,
 ): void {
     stat_impl = impl;
+}
+
+export function __setSaveImplementation(
+    impl: (uri: UriLike) => Promise<UriLike | undefined>,
+): void {
+    save_impl = impl;
 }
 
 export function __setReadFileImplementation(
@@ -600,6 +705,18 @@ export function __setWriteFileImplementation(
     impl: (uri: UriLike, content: Uint8Array) => Promise<void>,
 ): void {
     write_file_impl = impl;
+}
+
+export function __setDeleteImplementation(
+    impl: (uri: UriLike) => Promise<void>,
+): void {
+    delete_impl = impl;
+}
+
+export function __setCreateDirectoryImplementation(
+    impl: (uri: UriLike) => Promise<void>,
+): void {
+    create_directory_impl = impl;
 }
 
 export function __setConfigurationValue(key: string, value: unknown): void {
@@ -642,4 +759,24 @@ export function __getActiveWatchers(): MockWatcher[] {
 
 export function __getCustomEditorRegistrations() {
     return custom_editor_registrations;
+}
+
+export function __getExecutedCommands() {
+    return executed_commands;
+}
+
+export function __getRegisteredCommands(): string[] {
+    return [...registered_commands.keys()];
+}
+
+export function __getWarningMessages(): string[] {
+    return warning_messages;
+}
+
+export function __getErrorMessages(): string[] {
+    return error_messages;
+}
+
+export function __getInformationMessages(): string[] {
+    return information_messages;
 }

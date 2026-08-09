@@ -6,16 +6,10 @@ import type {
     ConfigPort,
     FileSystemPort,
     HostUiPort,
-    PhysicalCoordinationPort,
     SaveDialogChoice,
     ViewerHost,
 } from './host-ports';
 import type { ResourceUriLike } from './resource-identity';
-import { prepare_physical_install } from './prepared-physical-install';
-import {
-    native_physical_edit_eligibility,
-    PhysicalResourceLockManager,
-} from './physical-resource-lock';
 import {
     get_csv_max_rows,
     get_default_orientation,
@@ -89,52 +83,11 @@ export const vscode_config_port: ConfigPort = {
     },
 };
 
-const physical_lock_managers = new Map<string, PhysicalResourceLockManager>();
-
-function vscode_physical_eligibility(resource: ResourceUriLike) {
-    return native_physical_edit_eligibility({
-        scheme: resource.scheme,
-        filePath: resource.fsPath,
-        remoteHost: Boolean(vscode.env.remoteName),
-    });
-}
-
-export const vscode_physical_coordination_port: PhysicalCoordinationPort = {
-    availability(resource) {
-        const eligibility = vscode_physical_eligibility(resource);
-        if (!eligibility.eligible) return { type: 'viewOnly', reason: eligibility.reason };
-        // vscode.workspace.fs has no platform-enforced conditional install fence.
-        return { type: 'viewOnly', reason: 'conditional-install-unsupported' };
-    },
-    async acquire(resource) {
-        const availability = this.availability(resource);
-        if (availability.type === 'viewOnly') return availability;
-        const eligibility = vscode_physical_eligibility(resource);
-        if (!eligibility.eligible) return { type: 'viewOnly', reason: eligibility.reason };
-        let manager = physical_lock_managers.get(eligibility.lockRoot);
-        if (!manager) {
-            manager = new PhysicalResourceLockManager({ lockRoot: eligibility.lockRoot });
-            physical_lock_managers.set(eligibility.lockRoot, manager);
-        }
-        const lock = await manager.acquire(resource.fsPath);
-        return lock ? { type: 'acquired', lock } : { type: 'busy' };
-    },
-    prepare(resource, expectedOriginal, intended, lock) {
-        return prepare_physical_install({
-            targetPath: resource.fsPath,
-            expectedOriginal,
-            intended,
-            hostLock: lock,
-        });
-    },
-};
-
 export const vscode_viewer_host: ViewerHost = {
     fs: vscode_file_system_port,
     ui: vscode_host_ui_port,
     config: vscode_config_port,
     refreshWatcherFactory: vscode_file_refresh_watcher_factory,
-    physicalCoordination: vscode_physical_coordination_port,
 };
 
 /** Build the viewer HTML from a vscode webview + extension uri (asWebviewUri

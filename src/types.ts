@@ -8,6 +8,7 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
+import type { CsvDocumentConflictState } from './csv-custom-document';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -795,6 +796,9 @@ export type HostMessage =
     // before the page sees them, so it forwards the intent instead.
     | { type: 'editCommand'; command: 'copy' | 'selectAll' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
+    | { type: 'csvDocumentSync'; revision: number; sourceGeneration: number; mutationEpoch: number; viewMutationEpoch: number; dirtyEntries: CsvDirtyMap; conflict: CsvDocumentConflictState }
+    | { type: 'csvDocumentPatch'; revision: number; sourceGeneration: number; mutationEpoch: number; key: string; value: string; dirtyEntry?: CsvDirtyEntry; origin: 'input' | 'undo' | 'redo'; selfOriginated: boolean }
+    | { type: 'csvDocumentSourceReplaced'; revision: number; sourceGeneration: number; mutationEpoch: number; reason: 'save' | 'revert' }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
@@ -888,6 +892,11 @@ export type WebviewMessage =
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
+    | { type: 'csvDocumentCellInput'; viewId: string; viewMutationEpoch: number; key: string; value: string; revision: number; mutationEpoch: number }
+    | { type: 'csvDocumentGestureComplete'; viewId: string; viewMutationEpoch: number; revision: number; mutationEpoch: number }
+    | { type: 'csvDocumentGestureCancel'; viewId: string; viewMutationEpoch: number; revision: number; mutationEpoch: number }
+    | { type: 'csvDocumentResyncRequest'; viewId: string; viewMutationEpoch: number; mutationEpoch: number }
+    | { type: 'csvDocumentNativeCommand'; command: 'save' | 'undo' | 'redo' }
     | { type: 'requestEditSession'; requestId: string }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
