@@ -148,8 +148,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck:all
 
-      - name: SQLite Windows public-open fail-closed test
-        run: npm run test:sqlite:windows-fail-closed
+      # Windows used to refuse the backend, and this step used to assert that
+      # refusal. It now pins the opposite contract — a complete, valid v1 database
+      # installed through the public entry point — so the platform cannot silently
+      # start declining again.
+      - name: SQLite public-open contract test
+        run: npm run test:sqlite:public-open
 
       - name: Host Node SQLite runtime probe
         run: npm run probe:sqlite:host
@@ -195,10 +199,14 @@ jobs:
   # at the top of desktop/windows-durability-probe.mjs and the "Windows durability
   # verification" section of desktop/README.md):
   #
-  #   verifies       -> Windows ships the SQLite state backend on the same evidence
-  #                     standard as macOS: a written durability contract plus
+  #   verifies       -> the Windows durability claim rests on the same evidence
+  #                     standard as macOS's: a written durability contract plus
   #                     kill-crash verification against the packaged runtime.
-  #   cannot verify  -> Windows ships view-only, exactly as it does today.
+  #   cannot verify  -> the Windows durability claim stays at SQLite's own posture
+  #                     (no directory sync where the platform has no primitive for
+  #                     one), with the uncovered cut points recorded as pending. The
+  #                     backend ships either way; this job decides what the
+  #                     durability claim is allowed to say, not whether it runs.
   #
   # Neither branch is a silent weakening, and *this job must not push the answer*.
   # A verdict of `not-verified` is information about the platform, not a broken

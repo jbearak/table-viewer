@@ -131,12 +131,14 @@ brew install --cask jbearak/table-viewer/table-viewer
 Builds are not yet signed or notarized, so macOS blocks the first launch; the cask prints how to approve it. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
 
 **Windows desktop builds are paused.** The desktop app keeps its per-file view
-state in a SQLite database, and storing it safely requires durably flushing a
-directory entry — an operation Node exposes no proven primitive for on Windows,
-and which cannot be added without a native addon the packaging deliberately
-excludes. Rather than ship a build whose sorts, filters, and layouts might not
-survive a restart, the app declines the platform up front and no Windows artifact
-is published. The VS Code extension is unaffected and works normally on Windows.
+state in a SQLite database. It now opens that database on Windows — every durable
+step of the storage protocol flushes the containing directory, and where no
+directory-flush primitive is reachable at all, as on NTFS, the flush is skipped
+exactly as SQLite's own Windows engine skips it. What is not yet established is
+what a crash at each of those steps actually leaves behind on NTFS; that evidence
+is being gathered in CI. Until it is complete, no Windows desktop artifact is
+published, so nobody's sorts, filters, and layouts depend on an unverified
+recovery path. The VS Code extension is unaffected and works normally on Windows.
 
 **In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
 

@@ -309,16 +309,20 @@ jobs:
   # arm64. It packages nothing today, on purpose — but it no longer fails, and
   # that distinction is the whole of this block.
   #
-  # The desktop's state authority is SQLite, and this build cannot open a SQLite
-  # state database on Windows. Every durable step of the storage protocol —
-  # candidate install, marker creation, member move — is made durable by flushing
-  # the containing directory, and Node exposes no *verified* win32 primitive for
-  # that: `fs.openSync` on a directory fails, and `FlushFileBuffers` on a file
-  # handle says nothing about rename and unlink ordering. So
-  # `desktop_state_platform_support` declines the platform up front and the app
-  # reports one honest, non-looping refusal rather than running with an authority
-  # it cannot persist. The failure policy forbids the alternative outright: no
-  # empty and no read-only authority.
+  # The desktop's state authority is SQLite, and it does now open on Windows: every
+  # durable step of the storage protocol — candidate install, marker creation,
+  # member move — flushes the containing directory, and where no directory-flush
+  # primitive is reachable at all, as on NTFS, the flush is skipped exactly as
+  # SQLite's own Windows VFS skips it. `desktop_state_platform_support` no longer
+  # declines the platform.
+  #
+  # What is still missing is *crash* evidence, and that is what fences this job.
+  # `fs.openSync` on a directory fails and `FlushFileBuffers` on a file handle says
+  # nothing about rename and unlink ordering, so what a kill at each durable cut
+  # point leaves behind on NTFS has not been established from the packaged runtime.
+  # Shipping an installer before it is would put real users' view state on an
+  # unverified recovery path, which is the one thing the failure policy will not
+  # trade away.
   #
   # An earlier revision of this job failed hard, which stopped the *entire*
   # release run — `release-publish.yml` triggers only on
@@ -340,8 +344,9 @@ jobs:
   #     standard as macOS: a documented durability contract plus kill-crash
   #     verification, which is exactly the trust basis fsync gives us on POSIX.
   #     Replace this job with the real packaging steps.
-  #   * the gate cannot verify        -> Windows ships view-only, per the plan's
-  #     existing posture for a platform without a proven primitive.
+  #   * the gate cannot verify        -> this fence stays, and the reason stays
+  #     stated: the backend runs on Windows, but its crash recovery there is not
+  #     verified, so the desktop app is not published for it.
   #
   # Neither branch permits a silent weakening: shipping requires the evidence, and
   # not shipping requires saying so. `npm run desktop:package:win` remains
@@ -366,20 +371,24 @@ jobs:
           cat >&2 <<'MESSAGE'
           NOTE: no Windows desktop artifact is produced by this release.
 
-          The desktop app stores its view settings in SQLite, and this build cannot
-          open that database on Windows: every durable step of the storage protocol
-          flushes the containing directory, and no win32 primitive for that has been
-          verified from the packaged runtime. The app declines the platform up front
-          rather than running with an authority it cannot persist, so a Windows exe
-          built today would be a viewer whose settings never survive a restart.
+          The desktop app stores its view settings in SQLite, and it does open that
+          database on Windows: every durable step of the storage protocol flushes the
+          containing directory, and where no directory-flush primitive is reachable
+          at all, as on NTFS, the flush is skipped exactly as SQLite's own Windows
+          engine skips it.
+
+          What has NOT been established is what a crash at each of those durable
+          steps leaves behind on NTFS, measured from the packaged runtime. Publishing
+          an installer today would put real users' view state on a recovery path
+          nobody has verified, so the fence stays until the evidence exists.
 
           Windows is NOT withdrawn as a target. Which primitives are actually
           reachable, and what they guarantee across a kill, is being established
           empirically by the `windows-durability` job in ci.yml. When that gate
           verifies, Windows ships on the same evidence standard as macOS — a
           documented durability contract plus kill-crash verification — and this job
-          is replaced with the real packaging steps. If it cannot verify, Windows
-          ships view-only.
+          is replaced with the real packaging steps. If it cannot verify, this fence
+          and this message stay exactly as they are.
 
           This job no longer fails the release run: Windows being unproven is not a
           reason to withhold the platform that is proven. A release that omits the

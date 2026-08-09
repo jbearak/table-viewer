@@ -107,15 +107,31 @@ describe('embedded node:sqlite runtime', () => {
                 } catch (error) {
                     directoryError = error as NodeJS.ErrnoException;
                 }
-                const directoryDurability = process.platform === 'win32'
-                    ? 'fail-closed'
-                    : directoryError === undefined ? 'supported' : 'failed';
-                // Match production: Windows is explicitly fail-closed until a
-                // proven directory durability primitive is available.
-                assert.strictEqual(
-                    directoryDurability,
-                    process.platform === 'win32' ? 'fail-closed' : 'supported',
-                );
+                // What this runtime can actually do, asserted as such. The old form
+                // computed 'fail-closed' from `platform === 'win32'` and then compared
+                // it against `platform === 'win32'`, so it asserted nothing and
+                // discarded `directoryError` — and it outlived the refusal it was
+                // describing. Production no longer refuses a platform: where no
+                // directory-flush primitive is reachable the flush is skipped, as
+                // SQLite's own Windows VFS skips it.
+                //
+                // A skipped flush is therefore a permitted outcome here, but only for
+                // the reason that permits it — a directory handle Node cannot open or
+                // sync. Any other error is a real finding about this runtime.
+                if (process.platform === 'win32') {
+                    assert.ok(
+                        directoryError === undefined
+                        || ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF', 'EISDIR', 'EACCES']
+                            .includes(String(directoryError.code)),
+                        `unexpected directory fsync failure: ${String(directoryError?.code)}`,
+                    );
+                } else {
+                    assert.strictEqual(
+                        directoryError,
+                        undefined,
+                        `directory fsync failed: ${String(directoryError?.code)}`,
+                    );
+                }
             } finally {
                 fs.rmSync(probeDirectory, { recursive: true, force: true });
             }

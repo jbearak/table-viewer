@@ -973,10 +973,9 @@ async function platform_gate() {
         // the database, and the gate's *interior* must be empty — no reader token,
         // no exclusive intent, no blockade. A refusal that stranded coordination
         // state would make every later launch report a recovery that never
-        // happened, and on Windows this is the only substantive assertion the CI
-        // job makes. Mirrors the pinned expectation in
-        // src/test/sqlite-windows-fail-closed.test.ts, which allows the empty gate
-        // scaffolding and nothing else.
+        // happened. This arm now covers an unsupported storage location rather than
+        // Windows itself; the platform-independent public-open test pins that a
+        // supported location installs cleanly on every platform.
         const gate_directory = path.join(
             path.dirname(database_path),
             `.${path.basename(database_path)}.recovery-gate`,
