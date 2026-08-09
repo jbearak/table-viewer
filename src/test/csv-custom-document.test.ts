@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CsvCustomDocument, type CsvDocumentEditEvent } from '../csv-custom-document';
+import {
+    CsvCustomDocument,
+    MAX_SETTLEMENT_DRAIN_PASSES,
+    type CsvDocumentEditEvent,
+} from '../csv-custom-document';
 import {
     CSV_DOCUMENT_BACKUP_V2_MAX_SOURCE_BYTES,
     encode_csv_document_backup,
@@ -873,6 +877,78 @@ describe('CsvCustomDocument gestures and revisions', () => {
         expect(document.dirty_entry('0:0')).toEqual({
             value: 'a', base: 'saved',
         });
+        await document.dispose();
+    });
+
+    it('bounds the settlement drain and admits no callback past the bound', async () => {
+        const rearm_target = MAX_SETTLEMENT_DRAIN_PASSES + 8;
+        const fs = new MemoryFileSystem();
+        // One row per re-arm so every history callback targets a distinct cell and
+        // always changes a value; re-arming one cell degrades into no-ops, which emit
+        // no content event and would end the chain long before the bound.
+        fs.set('/table.csv', `h1\n${Array.from(
+            { length: rearm_target + 2 }, (_unused, row) => `r${row}`,
+        ).join('\n')}\n`);
+        const document = await open_document(fs, '/table.csv', { maxRows: 5_000 });
+        const edits: CsvDocumentEditEvent[] = [];
+        document.on_did_change((event) => edits.push(event));
+        for (let row = 0; row < rearm_target + 1; row += 1) {
+            await document.apply_cell_input({
+                mutationEpoch: document.mutationEpoch,
+                ...view_authority(document, 'view-1'),
+                key: `${row}:0`,
+                value: `edited-${row}`,
+                revision: document.revision,
+            });
+            await document.complete_gesture({
+                mutationEpoch: document.mutationEpoch,
+                ...view_authority(document, 'view-1'),
+                revision: document.revision,
+            });
+        }
+        expect(edits.length).toBeGreaterThan(rearm_target);
+
+        const write_started = deferred();
+        const release_write = deferred();
+        fs.onWrite = async () => {
+            write_started.resolve();
+            await release_write.promise;
+        };
+
+        const saving = document.save_for_host();
+        await write_started.promise;
+        // Queued behind the settlement gate; it must still complete once the drain
+        // gives up re-arming and releases.
+        const queued_backup = document.backup();
+        release_write.resolve();
+        await saving;
+
+        // Re-arm from *inside* each running callback, so the settlement tail is
+        // already re-armed at the instant the drain loop observes it. Without the
+        // bound this parks the operation queue behind the gate forever.
+        let rearms = 0;
+        const pending: Array<Promise<unknown>> = [];
+        const mutations = document.on_did_change_content((event) => {
+            if (event.type !== 'cell' || event.origin === 'input') return;
+            if (rearms >= rearm_target) return;
+            const edit = edits[rearms % edits.length];
+            rearms += 1;
+            pending.push(edit.undo().catch(() => undefined));
+        });
+        rearms += 1;
+        pending.push(edits[0].undo().catch(() => undefined));
+        for (let guard = 0; guard < rearm_target * 4 && pending.length > 0; guard += 1) {
+            await pending.shift();
+        }
+        mutations.dispose();
+
+        expect(rearms).toBeGreaterThan(MAX_SETTLEMENT_DRAIN_PASSES);
+        // The gate released despite unbounded re-arming, so queued work ran.
+        await expect(queued_backup).resolves.toBeInstanceOf(Uint8Array);
+        // And the document is still usable afterwards — the gate was removed, not
+        // merely bypassed.
+        await document.when_idle();
+        await expect(document.attach_view('view-2')).resolves.toBeDefined();
         await document.dispose();
     });
 

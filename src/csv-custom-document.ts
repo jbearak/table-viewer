@@ -41,7 +41,7 @@ import type { CsvDirtyEntry, CsvDirtyMap } from './types';
  * drain stops waiting. A cooperative host re-arms at most once or twice; the bound
  * only exists so a misbehaving one cannot park the document's operation queue.
  */
-const MAX_SETTLEMENT_DRAIN_PASSES = 64;
+export const MAX_SETTLEMENT_DRAIN_PASSES = 64;
 
 export interface CsvDocumentRefreshSubscription extends CsvPostSaveRefresh, Disposable {}
 
@@ -1758,10 +1758,16 @@ export class CsvCustomDocument {
                         for (let drained = 0; ; drained += 1) {
                             const history_tail = settlement.historyTail;
                             await history_tail;
-                            if (
-                                history_tail !== settlement.historyTail
-                                && drained < MAX_SETTLEMENT_DRAIN_PASSES
-                            ) continue;
+                            if (history_tail !== settlement.historyTail) {
+                                if (drained < MAX_SETTLEMENT_DRAIN_PASSES) continue;
+                                // At the bound the newest callback is still in flight.
+                                // Close admission first so no further re-arming is
+                                // possible, then await that last accepted callback:
+                                // releasing here would let queued renderer work publish
+                                // an edit the older absolute callback then overwrote.
+                                settlement.acceptingHistory = false;
+                                await settlement.historyTail;
+                            }
                             settlement.acceptingHistory = false;
                             const index = this.host_settlement_gates.indexOf(settlement);
                             if (index >= 0) this.host_settlement_gates.splice(index, 1);
