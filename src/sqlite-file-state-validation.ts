@@ -16,14 +16,7 @@ import {
     sqlite_file_state_schema_error,
 } from './sqlite-file-state-errors';
 import { decode_stored_per_file_state, type StoredPerFileState } from './types';
-import {
-    decode_prepared_install_lifecycle,
-    SQLITE_PREPARED_INSTALL_STATE_KEY,
-} from './sqlite-file-state-repository';
-import {
-    state_has_pending_edits,
-    type PersistedPreparedInstallLifecycleRecord,
-} from './state';
+import { state_has_pending_edits } from './state';
 
 type SqliteRow = Record<string, unknown>;
 
@@ -81,15 +74,6 @@ const EXPECTED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
         'owner_writer_session_id', 'ownership_generation', 'acquired_at_ms',
         'last_confirmed_at_ms',
     ],
-    file_write_reservations: [
-        'reservation_id', 'save_operation_id', 'entry_path', 'physical_resource_lock_key',
-        'host_lock_id', 'edit_session_id', 'ownership_generation', 'reserved_generation',
-        'stage_id', 'prepared_install_id', 'expected_state_revision',
-        'expected_commit_sequence', 'expected_authority_revision',
-        'expected_physical_revision', 'expected_projection_revision',
-        'expected_physical_digest', 'intended_physical_digest', 'recovery_record_id',
-        'acquired_at_ms',
-    ],
     legacy_imports: [
         'capsule_id', 'source_format', 'source_digest', 'source_entry_count',
         'source_next_revision', 'source_absence_revision', 'source_updated_at_ms',
@@ -129,11 +113,6 @@ const INTEGER_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     ],
     entry_leases: ['acquired_at_ms', 'acquired_generation'],
     edit_sessions: ['ownership_generation', 'acquired_at_ms', 'last_confirmed_at_ms'],
-    file_write_reservations: [
-        'ownership_generation', 'reserved_generation', 'expected_state_revision',
-        'expected_commit_sequence', 'expected_authority_revision',
-        'expected_physical_revision', 'expected_projection_revision', 'acquired_at_ms',
-    ],
     legacy_imports: [
         'source_entry_count', 'source_next_revision', 'source_absence_revision',
         'source_updated_at_ms', 'imported_at_ms',
@@ -260,25 +239,14 @@ function validate_integer_storage(database: DatabaseSync): void {
     }
 }
 
-function decode_state_json(value: unknown): {
-    readonly state: StoredPerFileState;
-    readonly lifecycle?: PersistedPreparedInstallLifecycleRecord;
-} {
+function decode_state_json(value: unknown): { readonly state: StoredPerFileState } {
     if (typeof value !== 'string') throw sqlite_file_state_malformed_error();
     try {
         const parsed = JSON.parse(value);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             throw sqlite_file_state_malformed_error();
         }
-        const logical = { ...(parsed as Record<string, unknown>) };
-        const lifecycle = decode_prepared_install_lifecycle(
-            logical[SQLITE_PREPARED_INSTALL_STATE_KEY],
-        );
-        delete logical[SQLITE_PREPARED_INSTALL_STATE_KEY];
-        return {
-            state: decode_stored_per_file_state(logical),
-            ...(lifecycle === undefined ? {} : { lifecycle }),
-        };
+        return { state: decode_stored_per_file_state(parsed) };
     } catch {
         throw sqlite_file_state_malformed_error();
     }
@@ -458,90 +426,6 @@ function validate_coordination(
         ownerships.add(ownership);
     }
 
-    const reservations = rows(database, `SELECT
-        r.*, e.state_json, e.state_revision, e.authority_commit_sequence, e.authority_revision,
-        e.physical_revision, e.projection_revision, e.physical_digest AS current_physical_digest,
-        s.kind AS stage_kind, s.expected_state_revision AS stage_state_revision,
-        s.expected_commit_sequence AS stage_commit_sequence,
-        s.physical_digest AS stage_physical_digest,
-        s.next_state_json
-        FROM file_write_reservations r
-        JOIN entries e ON e.path = r.entry_path
-        JOIN authority_stages s ON s.entry_path = r.entry_path AND s.stage_id = r.stage_id`);
-    if (reservations.length !== count(database, 'SELECT count(*) AS count FROM file_write_reservations')) {
-        throw sqlite_file_state_foreign_key_error({ rowCount: reservations.length });
-    }
-    for (const reservation of reservations) {
-        const lifecycle = decode_state_json(reservation.state_json).lifecycle;
-        const exactNumbers = [
-            ['expected_state_revision', 'state_revision'],
-            ['expected_commit_sequence', 'authority_commit_sequence'],
-            ['expected_authority_revision', 'authority_revision'],
-            ['expected_physical_revision', 'physical_revision'],
-            ['expected_projection_revision', 'projection_revision'],
-            ['expected_state_revision', 'stage_state_revision'],
-            ['expected_commit_sequence', 'stage_commit_sequence'],
-        ] as const;
-        if (exactNumbers.some(([left, right]) => safe_number(reservation[left]) !== safe_number(reservation[right]))) {
-            throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-        }
-        if (!lifecycle || lifecycle.phase !== 'reserved'
-            || lifecycle.reservationId !== text(reservation.reservation_id)
-            || lifecycle.saveOperationId !== text(reservation.save_operation_id)
-            || lifecycle.stageId !== text(reservation.stage_id)
-            || lifecycle.preparedInstallId !== text(reservation.prepared_install_id)
-            || lifecycle.hostLockId !== text(reservation.host_lock_id)
-            || lifecycle.physicalResourceLockKey
-                !== text(reservation.physical_resource_lock_key)
-            || lifecycle.expectedPhysicalDigest !== text(reservation.expected_physical_digest)
-            || lifecycle.intendedPhysicalDigest !== text(reservation.intended_physical_digest)
-            || lifecycle.recoveryRecordId !== nullable_text(reservation.recovery_record_id)
-            || text(reservation.reservation_id).length === 0
-            || text(reservation.save_operation_id).length === 0
-            || text(reservation.entry_path).length === 0
-            || text(reservation.physical_resource_lock_key).length === 0
-            || text(reservation.host_lock_id).length === 0
-            || text(reservation.edit_session_id).length === 0
-            || text(reservation.stage_id).length === 0
-            || text(reservation.prepared_install_id).length === 0
-            || nullable_text(reservation.expected_physical_digest) === undefined
-            || nullable_text(reservation.expected_physical_digest)?.length === 0
-            || nullable_text(reservation.expected_physical_digest)
-                !== nullable_text(reservation.current_physical_digest)
-            || text(reservation.intended_physical_digest).length === 0
-            || text(reservation.stage_kind) !== 'physical'
-            || nullable_text(reservation.stage_physical_digest)
-                !== text(reservation.intended_physical_digest)
-            || (safe_number(reservation.reserved_generation) as number) !== generation) {
-            throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-        }
-        if (requiresPendingEditRecovery
-            && pending.get(text(reservation.entry_path))
-            && reservation.next_state_json !== null) {
-            const next = state_from_json(reservation.next_state_json);
-            if (!state_has_pending_edits(next) && reservation.recovery_record_id === null) {
-                throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-            }
-        }
-    }
-
-    const lifecycleIds = new Set<string>();
-    for (const entry of rows(database, 'SELECT path, state_json FROM entries')) {
-        const lifecycle = decode_state_json(entry.state_json).lifecycle;
-        if (!lifecycle) continue;
-        if (lifecycleIds.has(lifecycle.reservationId)) {
-            throw sqlite_file_state_malformed_error();
-        }
-        lifecycleIds.add(lifecycle.reservationId);
-        const reservation = reservations.find((candidate) => (
-            text(candidate.entry_path) === text(entry.path)
-        ));
-        if ((lifecycle.phase === 'reserved') !== (reservation !== undefined)
-            || (reservation !== undefined
-                && text(reservation.reservation_id) !== lifecycle.reservationId)) {
-            throw sqlite_file_state_malformed_error();
-        }
-    }
 }
 
 function validate_legacy_source(

@@ -306,51 +306,6 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
     )
     -- Deliberately no cascading FK to writer_sessions.
 ) STRICT, WITHOUT ROWID`,
-    file_write_reservations: `CREATE TABLE file_write_reservations (
-    reservation_id             TEXT NOT NULL COLLATE BINARY PRIMARY KEY,
-    save_operation_id          TEXT NOT NULL COLLATE BINARY UNIQUE,
-    entry_path                 TEXT NOT NULL COLLATE BINARY UNIQUE,
-    physical_resource_lock_key TEXT NOT NULL COLLATE BINARY UNIQUE,
-    host_lock_id               TEXT NOT NULL COLLATE BINARY UNIQUE,
-    edit_session_id            TEXT NOT NULL COLLATE BINARY,
-    ownership_generation       INTEGER NOT NULL CHECK (ownership_generation >= 1),
-    reserved_generation        INTEGER NOT NULL CHECK (reserved_generation >= 1),
-    stage_id                   TEXT NOT NULL COLLATE BINARY,
-    prepared_install_id        TEXT NOT NULL COLLATE BINARY UNIQUE,
-    expected_state_revision    INTEGER NOT NULL
-                               CHECK (expected_state_revision BETWEEN 0 AND 9007199254740990),
-    expected_commit_sequence   INTEGER NOT NULL
-                               CHECK (expected_commit_sequence BETWEEN 0 AND 9007199254740990),
-    expected_authority_revision INTEGER NOT NULL
-                                CHECK (expected_authority_revision BETWEEN 0 AND 9007199254740990),
-    expected_physical_revision INTEGER NOT NULL
-                               CHECK (expected_physical_revision BETWEEN 0 AND 9007199254740990),
-    expected_projection_revision INTEGER NOT NULL
-                                 CHECK (expected_projection_revision BETWEEN 0 AND 9007199254740990),
-    expected_physical_digest   TEXT,
-    intended_physical_digest   TEXT NOT NULL,
-    recovery_record_id         TEXT COLLATE BINARY,
-    acquired_at_ms             INTEGER NOT NULL CHECK (acquired_at_ms >= 0),
-    FOREIGN KEY (
-        entry_path,
-        edit_session_id,
-        physical_resource_lock_key,
-        host_lock_id,
-        ownership_generation
-    ) REFERENCES edit_sessions(
-        entry_path,
-        edit_session_id,
-        physical_resource_lock_key,
-        host_lock_id,
-        ownership_generation
-    )
-        ON UPDATE RESTRICT
-        ON DELETE RESTRICT,
-    FOREIGN KEY (entry_path, stage_id)
-        REFERENCES authority_stages(entry_path, stage_id)
-        ON UPDATE RESTRICT
-        ON DELETE RESTRICT
-) STRICT, WITHOUT ROWID`,
     legacy_imports: `CREATE TABLE legacy_imports (
     capsule_id                 TEXT NOT NULL COLLATE BINARY PRIMARY KEY,
     source_format              TEXT NOT NULL,

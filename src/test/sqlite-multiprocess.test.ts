@@ -4,7 +4,6 @@ import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { open_sqlite_file_state_store } from '../sqlite-file-state-persistence';
-import { SQLITE_PREPARED_INSTALL_STATE_KEY } from '../sqlite-file-state-repository';
 import {
     SQLITE_INITIALIZATION_DURABLE_CUT_POINTS,
     SQLITE_PRESERVATION_DURABLE_CUT_POINTS,
@@ -392,44 +391,6 @@ describe('SQLite real multi-process behavior', () => {
             edit_session_id: session.editSessionId,
             ownership_generation: session.ownershipGeneration,
         });
-    });
-
-    it('reconstructs and reconciles a crashed physical reservation in a fresh process', async () => {
-        const targetPath = path.join(testDirectory, 'process-restart.csv');
-        const lockRoot = path.join(testDirectory, 'process-restart-locks');
-        const owner = await spawn();
-        const prepared = await owner.request<{ reservationId: string }>('prepareRestartReservation', {
-            targetPath,
-            lockRoot,
-            expected: 'before process crash\n',
-            intended: 'after process crash\n',
-        });
-        await owner.crash();
-
-        const recovery = await spawn();
-        await expect(recovery.request('reconcileRestartReservation', {
-            targetPath,
-            lockRoot,
-            reservationId: prepared.reservationId,
-        })).resolves.toMatchObject({
-            type: 'finalized',
-            cleanupPhysicalState: 'pending',
-            cleanupRecordRetained: true,
-        });
-        expect(fs.readFileSync(targetPath, 'utf8')).toBe('after process crash\n');
-
-        const direct = inspectionDatabase();
-        expect(number(direct.prepare(`SELECT count(*) AS count FROM file_write_reservations
-            WHERE entry_path = ?`).get(targetPath)?.count)).toBe(0);
-        const persisted = direct.prepare('SELECT state_json FROM entries WHERE path = ?')
-            .get(targetPath) as { state_json: string };
-        const state = JSON.parse(persisted.state_json);
-        expect(state.activeSheetIndex).toBe(5);
-        expect(state[SQLITE_PREPARED_INSTALL_STATE_KEY]).toMatchObject({
-            phase: 'cleanupPending',
-            reservationId: prepared.reservationId,
-        });
-        direct.close();
     });
 
     it('moves durable leases cross-process and exact release deletes the original handle', async () => {

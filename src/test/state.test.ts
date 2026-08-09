@@ -85,15 +85,12 @@ file_state_store_contract('Memento test-fixture medium', () => {
 });
 
 describe('FileStateStore versioned state', () => {
-    it('requires the complete coordinated file-state surface', () => {
+    it('requires the complete edit-coordinated file-state surface', () => {
         const base = create_memento_file_state_store(context_with({}).context);
         const coordinated = {
             ...base,
             acquire_edit_session: vi.fn(),
             release_edit_session: vi.fn(),
-            reserve_physical_write: vi.fn(),
-            execute_reserved_physical_write: vi.fn(),
-            reconcile_reserved_physical_write: vi.fn(),
         };
         expect(supports_coordinated_file_state(coordinated)).toBe(true);
 
@@ -109,9 +106,6 @@ describe('FileStateStore versioned state', () => {
             'cleanup_authority_transactions',
             'acquire_edit_session',
             'release_edit_session',
-            'reserve_physical_write',
-            'execute_reserved_physical_write',
-            'reconcile_reserved_physical_write',
         ] as const) {
             const incomplete = { ...coordinated } as Record<string, unknown>;
             delete incomplete[method];
