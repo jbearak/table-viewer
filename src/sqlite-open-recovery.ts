@@ -448,11 +448,22 @@ function ensure_managed_directory(
     try {
         fs.mkdirSync(directoryPath, { mode: PRIVATE_DIRECTORY_MODE });
     } catch (error) {
-        if (!is_node_error(error) || error.code !== 'EEXIST') throw error;
+        if (!is_node_error(error) || error.code !== 'EEXIST') {
+            throw safe_error(`${operation}-create`, error);
+        }
     }
-    const identity = capture_managed_directory(directoryPath, physicalParentPath, operation);
+    let identity: ManagedDirectoryIdentity;
+    try {
+        identity = capture_managed_directory(directoryPath, physicalParentPath, operation);
+    } catch (error) {
+        throw safe_error(`${operation}-capture`, error);
+    }
     assert_managed_directory(identity, operation);
-    fs.chmodSync(directoryPath, PRIVATE_DIRECTORY_MODE);
+    try {
+        fs.chmodSync(directoryPath, PRIVATE_DIRECTORY_MODE);
+    } catch (error) {
+        throw safe_error(`${operation}-chmod`, error);
+    }
     assert_managed_directory(identity, operation);
     return identity;
 }
@@ -472,10 +483,18 @@ function ensure_private_gate(
         'readers-directory-verify',
     );
     assert_managed_directory(gate, 'gate-directory-flush');
-    flush_directory(paths.parentDirectory, hooks);
+    try {
+        flush_directory(paths.parentDirectory, hooks);
+    } catch (error) {
+        throw safe_error('gate-parent-directory-flush', error);
+    }
     assert_managed_directory(readers, 'readers-directory-flush');
     assert_managed_directory(gate, 'gate-directory-flush');
-    flush_directory(paths.gateDirectory, hooks);
+    try {
+        flush_directory(paths.gateDirectory, hooks);
+    } catch (error) {
+        throw safe_error('gate-directory-flush', error);
+    }
     return { gate, readers };
 }
 
