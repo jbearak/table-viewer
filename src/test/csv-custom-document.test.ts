@@ -927,16 +927,33 @@ describe('CsvCustomDocument gestures and revisions', () => {
         // already re-armed at the instant the drain loop observes it. Without the
         // bound this parks the operation queue behind the gate forever.
         let rearms = 0;
+        // Callbacks that have started mutating (their history content event landed)
+        // but have not finished. A callback the gate refuses after admission closes
+        // parks behind the gate without mutating, so it never counts here. The drain
+        // must not release while any accepted callback is still mid-transaction.
+        const outstanding = new Set<CsvDocumentEditEvent>();
+        let outstanding_at_release: CsvDocumentEditEvent[] = [];
+        const mark_release = (): void => {
+            outstanding_at_release = [...outstanding];
+        };
+        void queued_backup.then(mark_release, mark_release);
         const pending: Array<Promise<unknown>> = [];
+        let armed: CsvDocumentEditEvent | undefined;
+        const arm = (edit: CsvDocumentEditEvent): void => {
+            rearms += 1;
+            armed = edit;
+            pending.push(edit.undo().then(
+                () => { outstanding.delete(edit); },
+                () => { outstanding.delete(edit); },
+            ));
+        };
         const mutations = document.on_did_change_content((event) => {
             if (event.type !== 'cell' || event.origin === 'input') return;
+            if (armed) outstanding.add(armed);
             if (rearms >= rearm_target) return;
-            const edit = edits[rearms % edits.length];
-            rearms += 1;
-            pending.push(edit.undo().catch(() => undefined));
+            arm(edits[rearms % edits.length]);
         });
-        rearms += 1;
-        pending.push(edits[0].undo().catch(() => undefined));
+        arm(edits[0]);
         for (let guard = 0; guard < rearm_target * 4 && pending.length > 0; guard += 1) {
             await pending.shift();
         }
@@ -945,6 +962,15 @@ describe('CsvCustomDocument gestures and revisions', () => {
         expect(rearms).toBeGreaterThan(MAX_SETTLEMENT_DRAIN_PASSES);
         // The gate released despite unbounded re-arming, so queued work ran.
         await expect(queued_backup).resolves.toBeInstanceOf(Uint8Array);
+        // The core guarantee: at the bound the drain closed admission and waited for
+        // the last accepted callback, so nothing it accepted was still running when
+        // queued work was let through.
+        // The core guarantee. Exactly one callback may still be outstanding when the
+        // gate releases: the straggler armed after the drain closed admission, which
+        // parks behind the gate without mutating. Releasing before awaiting the last
+        // *accepted* callback leaves a second one outstanding — one the gate admitted
+        // and then abandoned mid-transaction, free to overwrite the queued work.
+        expect(outstanding_at_release.length).toBeLessThanOrEqual(1);
         // And the document is still usable afterwards — the gate was removed, not
         // merely bypassed.
         await document.when_idle();
