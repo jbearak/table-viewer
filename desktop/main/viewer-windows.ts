@@ -23,13 +23,6 @@ import type { AuthorityFileStateStore } from '../../src/state';
 import type { ViewerHost } from '../../src/host-ports';
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
-import type { PhysicalEditViewOnlyReason } from '../../src/host-ports';
-import {
-    native_physical_edit_eligibility,
-    physical_lock_root,
-    PhysicalResourceLockManager,
-    type PhysicalEditEligibility,
-} from '../../src/physical-resource-lock';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
@@ -94,132 +87,6 @@ const RESIZE_SETTLE_MS = 250;
 /** Feeds the per-window viewer host (see `viewer_url`); never reused, so a
  *  closed window's zoom level is not inherited by the next one. */
 let next_window_id = 1;
-
-/**
- * Why a viewer window is view-only, or that it may edit.
- *
- * A reason rather than a bare boolean because the decision has to be auditable:
- * "editing is off" is the same observable outcome whether the platform has no
- * install fence, the protocol was never armed, or the file lives on a share, and
- * those are three different stories to tell a user and three different things to
- * fix. `PhysicalEditViewOnlyReason` is the shared vocabulary the host port
- * already answers in (src/host-ports.ts), so nothing here invents a second one.
- */
-export type DesktopEditingDecision =
-    | { readonly editing: true }
-    | { readonly editing: false; readonly reason: PhysicalEditViewOnlyReason | 'protocol-unarmed' };
-
-/**
- * Everything the decision consults, injected so it stays electron-free and
- * testable on every platform from any platform.
- *
- * `conditional_install_fence_available` is a function rather than a constant
- * because it is the arm that will one day change: the day a platform gains a
- * real `PlatformConditionalInstaller`, that implementation is what answers here,
- * and the test below starts failing until this gate is updated with it.
- */
-export interface DesktopEditingGatePorts {
-    /** Is the durable `physical-edit-protocol.v1` marker installed and valid? */
-    activation_marker_armed(): boolean;
-    /** Native/local/lock-root eligibility for this exact resource. */
-    eligibility(file_path: string): PhysicalEditEligibility;
-    /**
-     * Does this platform have a *platform-enforced* conditional install fence —
-     * an atomic compare/exchange or detach/no-clobber primitive that returns the
-     * exact displaced version?
-     *
-     * There is none. `unsupported_conditional_installer` is the only
-     * `PlatformConditionalInstaller` value in the repository outside test
-     * doubles, and it answers `unsupported` for every acquisition. A pre-check
-     * plus unconditional rename is explicitly forbidden, so no platform may be
-     * excepted here until a real primitive exists.
-     */
-    conditional_install_fence_available(platform: NodeJS.Platform): boolean;
-}
-
-/**
- * The one production answer for "does this platform have a conditional install
- * fence?", and it is `false` everywhere.
- *
- * Stated as a function of the platform, and consulted per platform, so that the
- * shape of the eventual per-platform rollout already exists: a platform that
- * proves the primitive is added here, and only here. Until then this is the arm
- * that keeps every desktop build view-only, which is exactly what the release
- * gates require — a platform exposing only unconditional replacement ships
- * view-only rather than bypassing the gate.
- */
-export function desktop_conditional_install_fence_available(
-    _platform: NodeJS.Platform,
-): boolean {
-    return false;
-}
-
-function default_activation_marker_armed(): boolean {
-    const root = physical_lock_root();
-    if (!root) return false;
-    try {
-        return new PhysicalResourceLockManager({ lockRoot: root })
-            .inspect_activation_marker().status === 'active';
-    } catch {
-        // An unreadable, replaced, or otherwise unverifiable marker is not an
-        // armed one. Same fail-closed reading as PhysicalEditProtocolMarker.
-        return false;
-    }
-}
-
-export const desktop_editing_gate_ports: DesktopEditingGatePorts = {
-    activation_marker_armed: default_activation_marker_armed,
-    eligibility: (file_path) => native_physical_edit_eligibility({
-        scheme: 'file',
-        filePath: file_path,
-    }),
-    conditional_install_fence_available: desktop_conditional_install_fence_available,
-};
-
-/**
- * Decide whether one desktop viewer window may edit its file.
- *
- * Replaces what used to be `profile.editing = false` with a comment. The
- * constant was honest about the outcome but said nothing about *why*, so it was
- * indistinguishable from an oversight and would have been deleted by the first
- * person who added an installer. This is the same outcome, arrived at by asking
- * the three questions the plan requires, in the order that makes the failing one
- * nameable:
- *
- * 1. the `physical-edit-protocol.v1` activation marker is armed (PR 3's cold
- *    attestation actually happened on this host);
- * 2. this exact resource is natively eligible — a local `file:` object on a
- *    proven-local filesystem with a proven-local host-wide lock root, not a
- *    share, a WSL `/mnt` path, or a remote host; and
- * 3. the platform has a real conditional-install fence.
- *
- * Every arm fails closed, including the ones that throw: an eligibility probe is
- * filesystem I/O and may fail for reasons that have nothing to do with safety,
- * and "we could not tell" is never "yes". Editing is returned from exactly one
- * place, reached only when all three questions answered yes.
- */
-export function decide_desktop_editing(
-    file_path: string,
-    ports: DesktopEditingGatePorts = desktop_editing_gate_ports,
-    platform: NodeJS.Platform = process.platform,
-): DesktopEditingDecision {
-    try {
-        if (!ports.activation_marker_armed()) {
-            return { editing: false, reason: 'protocol-unarmed' };
-        }
-        const eligibility = ports.eligibility(file_path);
-        if (!eligibility.eligible) return { editing: false, reason: eligibility.reason };
-        if (!ports.conditional_install_fence_available(platform)) {
-            return { editing: false, reason: 'conditional-install-unsupported' };
-        }
-        return { editing: true };
-    } catch {
-        // A gate that could not be evaluated is a closed gate. Reported as the
-        // filesystem answer it is rather than as a fourth pseudo-reason, so the
-        // user-facing vocabulary stays the shared one.
-        return { editing: false, reason: 'unverifiable-filesystem' };
-    }
-}
 
 /**
  * The state backend as the quit barrier sees it: admission it can close and
@@ -473,11 +340,6 @@ export class ViewerWindowManager {
         private readonly config_store: DesktopConfigStore,
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
-        /** Injectable only so the gate can be exercised per platform from a
-         *  unit test; production always uses the real ports. */
-        private readonly editing_decision: (
-            file_path: string,
-        ) => DesktopEditingDecision = (file_path) => decide_desktop_editing(file_path),
     ) {}
 
     /**
@@ -668,23 +530,13 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
-        // The single source of truth for desktop editing, and now a decision
-        // rather than a constant: `decide_desktop_editing` asks for the armed
-        // activation marker, this resource's native eligibility, and a
-        // platform-enforced conditional-install fence, and fails closed on each.
-        //
-        // In this release the answer is view-only on every platform, because no
-        // platform has that fence — but it is view-only *for a stated reason*,
-        // which is what makes it a gate. Adding an installer without extending
-        // `desktop_conditional_install_fence_available` changes nothing here and
-        // fails the platform matrix test in desktop/test/viewer-windows.test.ts.
-        const profile = profile_for(file_path, this.config_store.config_port());
-        profile.editing = this.editing_decision(file_path).editing;
+        // Format capabilities come from the same shared profile factory as the
+        // VS Code extension: CSV/TSV are editable, while Excel remains read-only.
         const controller = attach_viewer(
             panel,
             file_path,
             this.state_store,
-            profile,
+            profile_for(file_path, this.config_store.config_port()),
             this.viewer_host(window),
         );
 
