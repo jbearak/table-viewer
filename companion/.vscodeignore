@@ -1,5 +1,0 @@
-src/**
-test/**
-tsconfig.json
-dist-types/**
-*.vsix

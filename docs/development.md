@@ -29,6 +29,31 @@ is the only thing that does — CI runs it):
 
 See [desktop/README.md](../desktop/README.md) for more on the desktop shell.
 
+## VS Code state storage
+
+The VS Code product is one extension and one `.vsix`; it has no companion
+extension and no cross-extension migration protocol.
+
+Per-file state — column widths, row heights, scroll positions, sorts, filters,
+highlights, and unsaved CSV/TSV edits — lives in SQLite at
+`<globalStorageUri>/state/file-state.sqlite3`. VS Code already scopes
+`globalStorageUri` by profile and by local or remote authority, so windows and
+extension-host processes sharing that storage root share one database, while
+different profiles, remote authorities, containers, or WSL environments
+naturally get their own.
+
+The database is created empty on first run. There is no import from the older
+VS Code Memento store, and no synchronization with the standalone desktop app,
+which keeps its own database under its user-data directory.
+
+When that database cannot be opened — most notably on Windows, where Node
+exposes no proven directory-entry flush and the backend declines SQLite rather
+than treat a skipped flush as durable (see
+`assert_sqlite_directory_durability_supported`) — the extension warns and falls
+back to the Memento-backed store in `src/state.ts`. That mode is still durable;
+it simply cannot coordinate with other Table Viewer products. Nothing in the
+failed database's directory is modified, deleted, or set aside.
+
 ## `scripts/setup.sh`
 
 A maintainer convenience script: it does a full local install of both front ends from a working tree, so you can use your own build the way an end user would. It is not part of CI or the release pipeline — releases go through the GitHub Actions workflows in `.github/workflows/`, kicked off by [`scripts/bump-version.sh`](#scriptsbump-versionsh).
@@ -79,7 +104,7 @@ What it does, in order:
 1. **Preconditions** — the working tree must be clean (`git status --porcelain` empty), and the computed tag `v<version>` must not already exist. Either violation is a hard error before anything is modified.
 2. **Computes the new version** — reads the current version out of `package.json`. For a bump type, any pre-release suffix is stripped first, so `patch` on `1.0.0-beta.1` yields `1.0.1`, not `1.0.0-beta.2`; `major` and `minor` zero out the components below them. An explicit version is used as given.
 3. **Writes `package.json`** via Node (not `npm version`, so no lifecycle scripts run), then syncs `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
-4. **Commits and tags** — stages just those two files, commits as `chore: bump version to <version>`, and creates an annotated tag `v<version>`.
+4. **Commits and tags** — stages just those files, commits as `chore: bump version to <version>`, and creates an annotated tag `v<version>`.
 5. **Prints the push command.** It deliberately does not push.
 
 Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that same tag ref (for example, `gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3`), so its run SHA and artifacts remain bound to the immutable release commit.

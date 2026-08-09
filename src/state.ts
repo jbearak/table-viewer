@@ -1902,17 +1902,15 @@ export function create_memento_keyed_file_state_persistence(
     return create_keyed_file_state_persistence(memento_medium(context));
 }
 
-/** Drain this host's process-local Memento queue, then serialize the exact
- * envelope value delivered to this extension host without normalizing key order. */
-export async function ordered_memento_file_state_source(
-    context: ExtensionContext,
-): Promise<string> {
-    await drain_keyed_state_runtime(context.globalState as object);
-    const ordered = JSON.stringify(context.globalState.get<unknown>(STATE_KEY, {}));
-    if (ordered === undefined) throw new TypeError('The Table Viewer Memento source is not serializable.');
-    return ordered;
-}
-
+/**
+ * The Memento-backed store.
+ *
+ * SQLite is the extension's normal backend; this remains as the degraded medium
+ * for hosts whose SQLite database cannot be opened (see vscode-state-database.ts).
+ * It is durable, so a host that falls back here keeps state across reloads — it
+ * just keeps it somewhere the desktop product and other windows cannot coordinate
+ * on.
+ */
 export function create_file_state_store(
     context: ExtensionContext,
     get_max_stored?: () => number,

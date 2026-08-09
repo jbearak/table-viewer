@@ -114,14 +114,9 @@ jobs:
           fi
 
           PKG_VERSION=$(node -p "require('./package.json').version")
-          COMPANION_VERSION=$(node -p "require('./companion/package.json').version")
           EXPECTED_TAG="v${PKG_VERSION}"
           if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
             echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
-            exit 1
-          fi
-          if [[ "$COMPANION_VERSION" != "$PKG_VERSION" ]]; then
-            echo "ERROR: companion/package.json version $COMPANION_VERSION does not match package.json $PKG_VERSION" >&2
             exit 1
           fi
           echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
@@ -203,9 +198,7 @@ jobs:
 
           for required in \
             "table-viewer-${VERSION}.vsix" \
-            "table-viewer-${VERSION}.vsix.sha256" \
-            "companion/table-viewer-companion-${VERSION}.vsix" \
-            "companion/table-viewer-companion-${VERSION}.vsix.sha256"; do
+            "table-viewer-${VERSION}.vsix.sha256"; do
             if [[ ! -f "$required" ]]; then
               echo "ERROR: mandatory release artifact is missing: $required" >&2
               exit 1
@@ -225,7 +218,7 @@ jobs:
 
           # The desktop job of the same run produces the macOS app that the
           # Homebrew cask downloads. Land it in desktop-dist/ rather than beside
-          # the exact main and companion VSIX paths, so desktop downloads cannot
+          # the exact extension VSIX path, so desktop downloads cannot
           # be mistaken for extension packages or their checksums.
           #
           # Absent is not fatal: tags built before the desktop job existed, and
@@ -310,18 +303,6 @@ jobs:
             (cd windows-dist && sha256sum -c ./*.sha256)
           fi
 
-      - name: Verify companion checksum
-        shell: bash
-        working-directory: companion
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          sha256sum -c "table-viewer-companion-${VERSION}.vsix.sha256"
-
-      - name: Inspect extension packages
-        run: npm run probe:vsix:packages
-
       - name: Install locked publish tools
         working-directory: .github/release-tools
         run: npm ci --ignore-scripts
@@ -348,51 +329,6 @@ jobs:
             echo "ERROR: release tag moved after immutable build validation" >&2
             exit 1
           fi
-
-      - name: Publish companion to VS Code Marketplace
-        run: .github/release-tools/node_modules/.bin/vsce publish --skip-duplicate --packagePath "companion/table-viewer-companion-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
-      - name: Wait for companion Marketplace availability
-        run: node scripts/wait-extension-version.mjs marketplace jbearak table-viewer-companion "$VERSION"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-
-      - name: Revalidate release tag before companion Open VSX publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          THE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -euo pipefail
-          OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${THE_TAG}")
-          TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-          CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          for _ in 1 2 3 4; do
-            [[ "$TYPE" == "commit" ]] && break
-            [[ "$TYPE" == "tag" ]] || { echo "ERROR: release tag no longer resolves to a commit" >&2; exit 1; }
-            OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_SHA}")
-            TYPE=$(jq -r '.object.type' <<<"$OBJECT")
-            CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
-          done
-          if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before companion Open VSX publication" >&2
-            exit 1
-          fi
-
-      - name: Publish companion to Open VSX
-        run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "companion/table-viewer-companion-${VERSION}.vsix"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-
-      - name: Wait for companion Open VSX availability
-        run: node scripts/wait-extension-version.mjs open-vsx jbearak table-viewer-companion "$VERSION"
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
 
       - name: Revalidate release tag before main Marketplace publication
         shell: bash
@@ -489,8 +425,6 @@ jobs:
           files: |
             table-viewer-${{ steps.version.outputs.version }}.vsix
             table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix.sha256
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
             desktop-dist/*.sha256

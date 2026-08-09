@@ -3,7 +3,6 @@ import { attach_viewer, profile_for, type ViewerController } from './viewer-cont
 import type { AuthorityFileStateStore } from './state';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
-import { native_physical_edit_eligibility } from './physical-resource-lock';
 
 const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
@@ -21,12 +20,10 @@ export class TableViewerEditorProvider
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
-    #edit_admission_open = true;
 
     constructor(
         private readonly extension_uri: vscode.Uri,
         private readonly state_store: AuthorityFileStateStore,
-        private readonly view_only: () => boolean,
     ) {}
 
     #dispose_controller(controller: ViewerController): void {
@@ -39,7 +36,6 @@ export class TableViewerEditorProvider
     }
 
     stop_edit_admission(): void {
-        this.#edit_admission_open = false;
         for (const controller of this.#controllers) controller.stop_edit_admission();
     }
 
@@ -96,26 +92,11 @@ export class TableViewerEditorProvider
         webview_panel.webview.html = build_vscode_webview_html(
             webview_panel.webview, this.extension_uri, generate_nonce());
 
-        const profile = profile_for(document.uri.fsPath, vscode_viewer_host.config);
-        const edit_eligibility = native_physical_edit_eligibility({
-            scheme: document.uri.scheme,
-            filePath: document.uri.fsPath,
-            remoteHost: Boolean(vscode.env.remoteName),
-        });
-        // Before the activation marker is armed, eligible native-local CSV files
-        // continue through the established Memento editing path. Physical lock
-        // availability belongs to the later SQLite cutover; requiring it here would
-        // disable legacy editing in the preparation release. The marker is the cold
-        // boundary: once armed, this Memento host stays view-only until cutover.
-        profile.editing = profile.editing
-            && edit_eligibility.eligible
-            && this.#edit_admission_open
-            && !this.view_only();
         const controller = attach_viewer(
             webview_panel,
             document.uri,
             this.state_store,
-            profile,
+            profile_for(document.uri.fsPath, vscode_viewer_host.config),
             vscode_viewer_host,
         );
         this.#controllers.add(controller);
@@ -131,9 +112,8 @@ export interface TableViewerRegistration extends vscode.Disposable {
 export function register_table_viewer(
     context: vscode.ExtensionContext,
     state_store: AuthorityFileStateStore,
-    view_only: () => boolean = () => false,
 ): TableViewerRegistration {
-    const provider = new TableViewerEditorProvider(context.extensionUri, state_store, view_only);
+    const provider = new TableViewerEditorProvider(context.extensionUri, state_store);
     // Both editors deliberately allow multiple tabs per document. The CSV/TSV
     // editor could have set this to false to dodge the cross-tab pending-edits
     // race (#22), but we keep multi-viewer support and serialize editing with

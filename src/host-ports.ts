@@ -60,7 +60,15 @@ export type PhysicalEditAvailability =
     | { readonly type: 'available' }
     | { readonly type: 'viewOnly'; readonly reason: PhysicalEditViewOnlyReason };
 
-/** Host-owned physical coordination; unsupported resources stay view-only. */
+/**
+ * Host-owned physical coordination; unsupported resources stay view-only.
+ *
+ * No viewer host is wired to a port today — the shared controller saves through
+ * `FileSystemPort` — and the extension has no platform-enforced conditional
+ * install fence to implement one with. The desktop keeps its implementation and
+ * its test because that is where a real fence can exist; the port stays here as
+ * the shared shape it must satisfy.
+ */
 export interface PhysicalCoordinationPort {
     availability(resource: ResourceUriLike): PhysicalEditAvailability;
     acquire(resource: ResourceUriLike): Promise<
@@ -82,7 +90,6 @@ export interface ViewerHost {
     readonly ui: HostUiPort;
     readonly config: ConfigPort;
     readonly refreshWatcherFactory: FileRefreshWatcherFactory;
-    readonly physicalCoordination?: PhysicalCoordinationPort;
 }
 
 /** ',' for .csv (and anything else), '\t' for .tsv — chosen by extension. */

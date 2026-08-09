@@ -94,14 +94,9 @@ jobs:
           fi
 
           PKG_VERSION=$(node -p "require('./package.json').version")
-          COMPANION_VERSION=$(node -p "require('./companion/package.json').version")
           EXPECTED_TAG="v${PKG_VERSION}"
           if [[ "$THE_TAG" != "$EXPECTED_TAG" ]]; then
             echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION (expected tag $EXPECTED_TAG)" >&2
-            exit 1
-          fi
-          if [[ "$COMPANION_VERSION" != "$PKG_VERSION" ]]; then
-            echo "ERROR: companion/package.json version $COMPANION_VERSION does not match package.json $PKG_VERSION" >&2
             exit 1
           fi
           echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
@@ -112,27 +107,17 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Package and inspect extensions
-        run: npm run package:release
+      - name: Package extension
+        run: npm run package
 
-      - name: Calculate main extension checksum
+      - name: Calculate extension checksum
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          MAIN_VSIX="table-viewer-${VERSION}.vsix"
-          sha256sum "$MAIN_VSIX" > "$MAIN_VSIX.sha256"
-
-      - name: Calculate companion checksum
-        shell: bash
-        working-directory: companion
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          COMPANION_VSIX="table-viewer-companion-${VERSION}.vsix"
-          sha256sum "$COMPANION_VSIX" > "$COMPANION_VSIX.sha256"
+          VSIX="table-viewer-${VERSION}.vsix"
+          sha256sum "$VSIX" > "$VSIX.sha256"
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -143,8 +128,6 @@ jobs:
           path: |
             table-viewer-${{ steps.version.outputs.version }}.vsix
             table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix
-            companion/table-viewer-companion-${{ steps.version.outputs.version }}.vsix.sha256
 
   # The standalone macOS app (Apple Silicon), shipped as a dmg that the
   # Homebrew cask in jbearak/homebrew-table-viewer downloads by URL + sha256.
