@@ -22,6 +22,8 @@ export interface EditorKeyEvent {
  *  - `commit-down`   Enter — commit, move to the next row.
  *  - `newline`       Shift/Alt+Enter — insert a newline, grow to multiline.
  *  - `save`          Cmd/Ctrl+S — let it bubble to the window save handler.
+ *  - `save-as`       Cmd/Ctrl+Shift+S — bubble untouched for native Save As.
+ *  - `undo`/`redo`   native history shortcuts; document mode routes these to VS Code.
  *  - `default`       everything else — the input handles it normally.
  */
 export type EditorKeyIntent =
@@ -31,6 +33,9 @@ export type EditorKeyIntent =
     | 'commit-down'
     | 'newline'
     | 'save'
+    | 'save-as'
+    | 'undo'
+    | 'redo'
     | 'default';
 
 export function editor_key_intent(e: EditorKeyEvent): EditorKeyIntent {
@@ -38,7 +43,12 @@ export function editor_key_intent(e: EditorKeyEvent): EditorKeyIntent {
     if (e.key === 'Tab') return e.shiftKey ? 'commit-left' : 'commit-right';
     if (e.key === 'Enter' && (e.shiftKey || e.altKey)) return 'newline';
     if (e.key === 'Enter') return 'commit-down';
-    if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) return 'save';
+    if ((e.metaKey || e.ctrlKey) && !e.altKey) {
+        const key = e.key.toLowerCase();
+        if (key === 's') return e.shiftKey ? 'save-as' : 'save';
+        if (key === 'z') return e.shiftKey ? 'redo' : 'undo';
+        if (key === 'y' && !e.shiftKey) return 'redo';
+    }
     return 'default';
 }
 

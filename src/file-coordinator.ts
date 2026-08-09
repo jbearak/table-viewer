@@ -184,6 +184,10 @@ export interface FileRefreshEvent {
     readonly episode: number;
     readonly reason: FileRefreshReason;
     readonly priority: 'normal' | 'high';
+    /** The post-save episode consumed watcher evidence already queued for this file. */
+    readonly absorbedWatcherSignal?: true;
+    /** Present only when this subscription initiated this exact refresh request. */
+    readonly requestedByThisSubscription?: true;
 }
 
 export type FileRefreshSubscriberResult =
@@ -212,11 +216,13 @@ interface RefreshRequestState {
     dispose(): void;
 }
 
+interface PostSaveReservationState {}
+
 interface RefreshSubscriberState {
     readonly listener: FileRefreshSubscriber;
     readonly requests: Set<RefreshRequestState>;
+    readonly postSaveReservations: Set<PostSaveReservationState>;
     disposed: boolean;
-    postSaveReservations: number;
 }
 
 interface PendingRefreshBatch {
@@ -330,7 +336,11 @@ function invoke_refresh_subscribers(
 ): Promise<void> | undefined {
     let requester_completion: Promise<void> | undefined;
     for (const subscriber of [...entry.refreshSubscribers]) {
-        const delivered = deep_clone_and_freeze(event);
+        const delivered = deep_clone_and_freeze(
+            subscriber === requester
+                ? { ...event, requestedByThisSubscription: true as const }
+                : event,
+        );
         let completion: Promise<void>;
         try {
             completion = Promise.resolve(subscriber.listener(delivered)).then(() => undefined);
@@ -353,12 +363,14 @@ function dispatch_refresh(
     reason: FileRefreshReason,
     priority: 'normal' | 'high',
     requester?: RefreshSubscriberState,
+    absorbed_watcher_signal?: true,
 ): { event: FileRefreshEvent; completion?: Promise<void> } {
     const event = deep_clone_and_freeze({
         refreshRevision: revision,
         episode: ++entry.refreshEpisode,
         reason,
         priority,
+        ...(absorbed_watcher_signal ? { absorbedWatcherSignal: true as const } : {}),
     });
     return {
         event,
@@ -1403,14 +1415,16 @@ export function acquire_file_coordinator(
             const subscriber: RefreshSubscriberState = {
                 listener,
                 requests: new Set(),
+                postSaveReservations: new Set(),
                 disposed: false,
-                postSaveReservations: 0,
             };
             entry.refreshSubscribers.add(subscriber);
 
-            const release_reservation = (flush: boolean): void => {
-                if (subscriber.postSaveReservations === 0) return;
-                subscriber.postSaveReservations -= 1;
+            const release_reservation = (
+                reservation: PostSaveReservationState,
+                flush: boolean,
+            ): void => {
+                if (!subscriber.postSaveReservations.delete(reservation)) return;
                 entry.refreshReservations -= 1;
                 if (flush && entry.refreshReservations === 0 && entry.pendingRefresh) {
                     schedule_pending_refresh(entry, entry.pendingRefresh);
@@ -1423,14 +1437,12 @@ export function acquire_file_coordinator(
                     if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
                         return { cancel() {} };
                     }
-                    subscriber.postSaveReservations += 1;
+                    const reservation: PostSaveReservationState = {};
+                    subscriber.postSaveReservations.add(reservation);
                     entry.refreshReservations += 1;
-                    let active = true;
                     return {
                         cancel() {
-                            if (!active) return;
-                            active = false;
-                            release_reservation(true);
+                            release_reservation(reservation, true);
                         },
                     };
                 },
@@ -1438,9 +1450,14 @@ export function acquire_file_coordinator(
                     if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
                         return Promise.resolve({ type: 'disposed' });
                     }
-                    // Consume this subscriber's checked-write reservation without
+                    // Consume this subscriber's oldest checked-write reservation without
                     // flushing its watcher batch: postSave absorbs that revision.
-                    release_reservation(false);
+                    const oldest_reservation = subscriber.postSaveReservations
+                        .values()
+                        .next();
+                    if (!oldest_reservation.done) {
+                        release_reservation(oldest_reservation.value, false);
+                    }
                     let resolve_request!: (result: FileRefreshRequestResult) => void;
                     let reject_request!: (error: unknown) => void;
                     const result = new Promise<FileRefreshRequestResult>((resolve, reject) => {
@@ -1465,6 +1482,9 @@ export function acquire_file_coordinator(
                     entry.refreshRequests += 1;
                     try {
                         const revision = ++entry.refreshRevision;
+                        const absorbed_watcher_signal = entry.pendingRefresh
+                            ? true as const
+                            : undefined;
                         entry.pendingRefresh = undefined;
                         const dispatched = dispatch_refresh(
                             entry,
@@ -1472,6 +1492,7 @@ export function acquire_file_coordinator(
                             reason,
                             'high',
                             subscriber,
+                            absorbed_watcher_signal,
                         );
                         void Promise.resolve(dispatched.completion).then(
                             () => {
@@ -1495,8 +1516,8 @@ export function acquire_file_coordinator(
                     if (subscriber.disposed) return;
                     subscriber.disposed = true;
                     entry.refreshSubscribers.delete(subscriber);
-                    while (subscriber.postSaveReservations > 0) {
-                        release_reservation(true);
+                    for (const reservation of [...subscriber.postSaveReservations]) {
+                        release_reservation(reservation, true);
                     }
                     for (const request of [...subscriber.requests]) request.dispose();
                     cleanup(entry);

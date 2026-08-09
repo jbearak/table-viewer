@@ -36,6 +36,8 @@ export class CsvDataSource implements DataSource {
     /** Verbatim header line (terminator stripped) when row 0 was consumed as the
      *  column names; undefined otherwise. The save path re-prepends it. */
     readonly headerLine?: string;
+    /** Exact parsed header fields before display padding to the widest data row. */
+    readonly headerFields?: readonly string[];
     private readonly index: LineIndex;
     private readonly _rowCount: number;
     private readonly _colCount: number;
@@ -128,6 +130,7 @@ export class CsvDataSource implements DataSource {
             while (end > start && (this.buf[end - 1] === LF || this.buf[end - 1] === CR)) end--;
             this.headerLine = this.decoder.decode(this.buf.subarray(start, end));
             const fields = split_csv_rows(this.headerLine, delimiter)[0] ?? [];
+            this.headerFields = Object.freeze([...fields]);
             columnNames = new Array(colCount);
             for (let c = 0; c < colCount; c++) columnNames[c] = c < fields.length ? fields[c] : '';
         }

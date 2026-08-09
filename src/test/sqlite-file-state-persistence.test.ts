@@ -160,6 +160,7 @@ describe('SQLite file-state persistence', () => {
             'canonicalize_path',
             'cleanup_authority_transactions',
             'compare_and_set',
+            'copy_cosmetic_entry_if_absent',
             'copy_entry_if_absent',
             'discard_authority_transaction',
             'execute_reserved_physical_write',

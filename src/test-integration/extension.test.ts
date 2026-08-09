@@ -25,9 +25,12 @@ describe('extension activation', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
-            'tableViewer.setupPhysicalEditProtocol',
         ]) {
             assert.ok(commands.includes(id), `command ${id} not registered`);
         }
+        assert.ok(
+            !commands.includes('tableViewer.setupPhysicalEditProtocol'),
+            'retired physical-edit setup command must not be registered',
+        );
     });
 });

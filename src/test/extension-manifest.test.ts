@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { CSV_DOCUMENT_BACKUP_V2_MAX_SOURCE_BYTES } from '../csv-document-backup';
 
 interface CustomEditorContribution {
     viewType?: unknown;
@@ -12,9 +13,21 @@ const manifest = JSON.parse(readFileSync(
     resolve(__dirname, '../../package.json'),
     'utf8',
 )) as {
-    contributes?: { customEditors?: CustomEditorContribution[] };
+    contributes?: {
+        commands?: Array<{ command?: unknown }>;
+        customEditors?: CustomEditorContribution[];
+        configuration?: {
+            properties?: Record<string, {
+                type?: unknown;
+                default?: unknown;
+                minimum?: unknown;
+                maximum?: unknown;
+            }>;
+        };
+    };
     engines?: { node?: unknown; vscode?: unknown };
     extensionKind?: unknown;
+    extensionPack?: unknown;
     devDependencies?: { electron?: unknown; '@types/node'?: unknown };
 };
 const custom_editors = manifest.contributes?.customEditors ?? [];
@@ -53,12 +66,33 @@ describe('extension runtime manifest', () => {
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
 
-    it('excludes build and integration-only artifacts from the VSIX', () => {
+    it('caps the public file-size setting at the immutable CSV backup ceiling', () => {
+        const maximum_mib = CSV_DOCUMENT_BACKUP_V2_MAX_SOURCE_BYTES / (1024 * 1024);
+        expect(maximum_mib).toBe(256);
+        expect(manifest.contributes?.configuration?.properties?.[
+            'tableViewer.maxFileSizeMiB'
+        ]).toMatchObject({
+            type: 'number',
+            default: maximum_mib,
+            minimum: 1,
+            maximum: maximum_mib,
+        });
+    });
+
+    it('packages one extension without retired coordination artifacts', () => {
+        expect(manifest.extensionPack).toBeUndefined();
+        expect(manifest.contributes?.commands?.map(({ command }) => command)).toEqual([
+            'tableViewer.showCsvPreviewToSide',
+            'tableViewer.showCsvPreview',
+            'tableViewer.openCsvTable',
+            'tableViewer.openAsText',
+        ]);
         expect(vscodeignore).toEqual(expect.arrayContaining([
             'out/**',
             'dist/runtime-probes/**',
             '.vscode-test.mjs',
             'tsconfig.integration.json',
+            'docs/**',
         ]));
     });
 });

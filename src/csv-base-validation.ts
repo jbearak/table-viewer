@@ -31,7 +31,16 @@
  * `row-loader.ts`'s ingest validation and deliberately so.
  */
 
-import type { CsvDirtyMap } from './types';
+import type { CsvDirtyEntry, CsvDirtyMap } from './types';
+
+/** A durable record in the desktop path or the document core's sparse map. */
+export type CsvDirtyEntries = CsvDirtyMap | ReadonlyMap<string, CsvDirtyEntry>;
+
+function is_dirty_map(
+    dirty: CsvDirtyEntries,
+): dirty is ReadonlyMap<string, CsvDirtyEntry> {
+    return typeof (dirty as ReadonlyMap<string, CsvDirtyEntry>).get === 'function';
+}
 
 export type BaseValidationOutcome =
     | { readonly type: 'valid' }
@@ -39,14 +48,17 @@ export type BaseValidationOutcome =
     | { readonly type: 'removedRows'; readonly keys: readonly string[] };
 
 export function validate_dirty_bases(
-    dirty_edits: CsvDirtyMap,
+    dirty_edits: CsvDirtyEntries,
     source_row_count: number,
     read_raw: (source_row: number, col: number) => string | undefined,
 ): BaseValidationOutcome {
     const removed_keys: string[] = [];
     const conflicted_keys: string[] = [];
+    const entries = is_dirty_map(dirty_edits)
+        ? dirty_edits.entries()
+        : Object.entries(dirty_edits);
 
-    for (const [key, entry] of Object.entries(dirty_edits)) {
+    for (const [key, entry] of entries) {
         const [source_row, col] = key.split(':').map(Number);
         // Fail closed on a key that is not a pair of non-negative integers. Without
         // this the arithmetic silently absorbs the garbage rather than rejecting it:

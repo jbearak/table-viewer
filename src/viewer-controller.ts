@@ -1,11 +1,8 @@
-import { createHash } from 'crypto';
 import { XlsxDataSource } from './data-source/xlsx-source';
 import { XlsDataSource } from './data-source/xls-source';
-import { CsvDataSource } from './data-source/csv-source';
 import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
-    RenderedCell,
     WorkbookMeta,
 } from './data-source/interface';
 import {
@@ -26,12 +23,17 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
-import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
-import { serialize_csv } from './serialize-csv';
-import { validate_dirty_bases } from './csv-base-validation';
+import { assert_safe_file_size } from './spreadsheet-safety';
+import { build_csv_source } from './csv-source-builder';
+export { build_csv_source } from './csv-source-builder';
+import {
+    csv_content_digest,
+    prepare_csv_save_content,
+    type PreparedCsvContent,
+} from './csv-save-service';
 import type {
-    AuthorityFileStateStore,
     FileStateSnapshot,
+    FileStateStore,
     FileStateWriteBasis,
 } from './state';
 import { compare_authority, same_authority } from './authority-order';
@@ -39,7 +41,19 @@ import {
     discard_authority,
     finalize_authority,
     stage_authority,
+    with_in_memory_authority_transactions,
 } from './state-authority';
+import type {
+    CsvDocumentConflictEvent,
+    CsvDocumentContentEvent,
+    CsvDocumentMutationResult,
+    CsvDocumentResyncEvent,
+    CsvDocumentResyncSnapshot,
+    CsvDocumentViewerSnapshot,
+    CsvDocumentViewResyncSnapshot,
+    CsvNativeHistoryDirection,
+    CsvNativeHistoryRequest,
+} from './csv-custom-document';
 import {
     normalize_host_state,
     plan_excel_candidate_state,
@@ -64,6 +78,7 @@ import {
     transform_is_active,
     transform_schema_for_sheet,
     type ActiveCsvSaveLifecycle,
+    type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveRejection,
@@ -115,9 +130,71 @@ export interface ViewerControllerScheduler {
     clearTimeout(handle: unknown): void;
 }
 
+export interface CsvDocumentPort {
+    attach_view(viewId: string): Promise<{
+        readonly type: 'attached';
+        readonly viewMutationEpoch: number;
+    }>;
+    detach_view(viewId: string): Promise<void>;
+    apply_cell_input(input: {
+        readonly viewId: string;
+        readonly viewMutationEpoch: number;
+        readonly key: string;
+        readonly value: string;
+        readonly revision: number;
+        readonly mutationEpoch: number;
+    }): Promise<CsvDocumentMutationResult>;
+    complete_gesture(
+        input: {
+            readonly viewId: string;
+            readonly viewMutationEpoch: number;
+            readonly revision: number;
+            readonly mutationEpoch: number;
+        },
+        request: CsvNativeHistoryRequest,
+    ): Promise<CsvDocumentMutationResult>;
+    cancel_gesture(
+        input: {
+            readonly viewId: string;
+            readonly viewMutationEpoch: number;
+            readonly revision: number;
+            readonly mutationEpoch: number;
+        },
+        request: CsvNativeHistoryRequest,
+    ): Promise<CsvDocumentMutationResult>;
+    run_native_history_command(
+        direction: CsvNativeHistoryDirection,
+        request: CsvNativeHistoryRequest,
+    ): Promise<void>;
+    resync_view(
+        viewId: string,
+        mutationEpoch?: number,
+        viewMutationEpoch?: number,
+    ): Promise<CsvDocumentViewResyncSnapshot>;
+    resync_snapshot(): Promise<CsvDocumentResyncSnapshot>;
+    viewer_snapshot(): Promise<CsvDocumentViewerSnapshot>;
+    when_idle(): Promise<void>;
+    on_did_change_content(listener: (event: CsvDocumentContentEvent) => void): Disposable;
+    on_did_request_resync(listener: (event: CsvDocumentResyncEvent) => void): Disposable;
+    on_did_change_conflict(listener: (event: CsvDocumentConflictEvent) => void): Disposable;
+}
+
+export type ViewerEditingMode =
+    | { readonly type: 'selfManaged' }
+    | {
+        readonly type: 'vscodeDocument';
+        readonly document: CsvDocumentPort;
+        readonly viewId: string;
+        readonly viewMutationEpoch: number;
+        readonly requestNativeCommand: (
+            command: 'save' | 'undo' | 'redo',
+        ) => void | Promise<void>;
+    };
+
 export interface ViewerControllerOptions {
     readonly pendingEditFlushTimeoutMs?: number;
     readonly scheduler?: ViewerControllerScheduler;
+    readonly editingMode?: ViewerEditingMode;
 }
 
 export interface ViewerController extends Disposable {
@@ -214,8 +291,12 @@ const ROW_HEIGHT_LIMIT_WARNING =
     'Too many resized rows to persist: a sheet may keep at most '
     + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
 
+const CSV_NATIVE_HISTORY_WARNING =
+    'Table Viewer could not complete the document history operation. '
+    + 'The table was resynchronized.';
+
 function content_digest(bytes: Uint8Array): string {
-    return createHash('sha256').update(bytes).digest('hex');
+    return csv_content_digest(bytes);
 }
 
 /**
@@ -344,26 +425,6 @@ function excel_profile(): ViewerProfile {
     };
 }
 
-/** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
- *  `csv_max_rows` comes from the host's ConfigPort; it is normalized to a
- *  finite non-negative integer and clamped to the hard safety cap either way,
- *  since CsvDataSource uses it as an array length. */
-export function build_csv_source(
-    raw: Uint8Array,
-    file_path: string,
-    csv_max_rows: number = MAX_CSV_ROWS,
-): Promise<CsvDataSource> {
-    const requested_max_rows = Number.isFinite(csv_max_rows)
-        ? Math.floor(csv_max_rows)
-        : MAX_CSV_ROWS;
-    const max_rows = Math.max(0, Math.min(requested_max_rows, MAX_CSV_ROWS));
-    // CSV/TSV files conventionally carry column names in their first row, so the
-    // grid promotes it to the column header rather than showing letters.
-    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
-        firstRowIsHeader: true,
-    });
-}
-
 export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
@@ -391,13 +452,19 @@ export function profile_for(file_path: string, config?: ConfigPort): ViewerProfi
 export function attach_viewer(
     panel: ViewerHostPanel,
     resource: ResourceUriLike | string,
-    state_store: AuthorityFileStateStore,
+    state_store: FileStateStore,
     profile: ViewerProfile,
     host: ViewerHost,
     options: ViewerControllerOptions = {},
 ): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const editing_mode = options.editingMode ?? { type: 'selfManaged' as const };
+    const document_mode = profile.editing && editing_mode.type === 'vscodeDocument'
+        ? editing_mode
+        : undefined;
+    let document_view_mutation_epoch = document_mode?.viewMutationEpoch ?? 0;
+    const self_managed_editing = profile.editing && document_mode === undefined;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -410,14 +477,14 @@ export function attach_viewer(
     // Capture the live transport once; every later post is liveness-gated below.
     const webview = panel.webview;
     const disposables: Disposable[] = [];
-    const durable_state_store = state_store;
+    const durable_state_store = with_in_memory_authority_transactions(state_store);
     const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
-    let file_edit_state = profile.editing
+    let file_edit_state = self_managed_editing
         ? csv_edit_file_states.get(file_key)
         : undefined;
-    if (profile.editing && !file_edit_state) {
+    if (self_managed_editing && !file_edit_state) {
         file_edit_state = {
             attachments: 0,
             phase: { type: 'free' },
@@ -435,6 +502,11 @@ export function attach_viewer(
     let core: ViewerPanelCore | undefined;
     let source: DataSource | undefined;
     let source_authority = file_coordinator.authority();
+    let document_projection: CsvDocumentResyncSnapshot | undefined;
+    const document_candidate_basis = new WeakMap<SourceCandidate, {
+        readonly revision: number;
+        readonly sourceGeneration: number;
+    }>();
     const transform_authorities = new Map<
         Extract<WebviewMessage, { type: 'setTransform' }>,
         TransformAuthority
@@ -515,6 +587,15 @@ export function attach_viewer(
     let header_refresh_scheduled = false;
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
+    const controller_operations = new Set<Promise<unknown>>();
+
+    function track_controller_operation<T>(operation: Promise<T>): Promise<T> {
+        controller_operations.add(operation);
+        void operation.finally(() => {
+            controller_operations.delete(operation);
+        }).catch(() => undefined);
+        return operation;
+    }
 
     function reject_pending_edit_protocol(error: Error): void {
         for (const waiter of pending_edit_flush_waiters.values()) waiter.reject(error);
@@ -613,6 +694,56 @@ export function attach_viewer(
         },
     });
 
+    function clone_document_dirty_entries(entries: CsvDirtyMap): CsvDirtyMap {
+        return Object.freeze(Object.fromEntries(
+            Object.entries(entries).map(([key, entry]) => [
+                key,
+                Object.freeze({ value: entry.value, base: entry.base }),
+            ]),
+        ));
+    }
+
+    function install_document_projection(snapshot: CsvDocumentResyncSnapshot): void {
+        document_projection = Object.freeze({
+            ...snapshot,
+            dirtyEntries: clone_document_dirty_entries(snapshot.dirtyEntries),
+        });
+    }
+
+    function post_document_sync(options: {
+        readonly receiverEpoch?: number;
+        readonly closeViewGesture?: boolean;
+        readonly mutationEpoch?: number;
+        readonly viewMutationEpoch?: number;
+    } = {}): Promise<void> {
+        return track_controller_operation((async () => {
+            if (!document_mode) return;
+            let snapshot: CsvDocumentResyncSnapshot;
+            if (options.closeViewGesture) {
+                const view_snapshot = await document_mode.document.resync_view(
+                    document_mode.viewId,
+                    options.mutationEpoch,
+                    options.viewMutationEpoch,
+                );
+                document_view_mutation_epoch = view_snapshot.viewMutationEpoch;
+                snapshot = view_snapshot;
+            } else {
+                snapshot = await document_mode.document.resync_snapshot();
+            }
+            if (disposed) return;
+            install_document_projection(snapshot);
+            await post_to_receiver({
+                type: 'csvDocumentSync',
+                revision: snapshot.revision,
+                sourceGeneration: snapshot.sourceGeneration,
+                mutationEpoch: snapshot.mutationEpoch,
+                viewMutationEpoch: document_view_mutation_epoch,
+                dirtyEntries: clone_document_dirty_entries(snapshot.dirtyEntries),
+                conflict: snapshot.conflict,
+            }, options.receiverEpoch);
+        })());
+    }
+
     const abort_setup = (error: unknown): never => {
         disposed = true;
         const cleanup = (action: () => void) => {
@@ -649,6 +780,76 @@ export function attach_viewer(
         return abort_setup(error);
     }
 
+    if (document_mode) {
+        try {
+            disposables.push(document_mode.document.on_did_change_content((event) => {
+                if (disposed) return;
+                if (event.type === 'cell') {
+                    const current = document_projection;
+                    if (
+                        current
+                        && current.sourceGeneration === event.sourceGeneration
+                        && current.mutationEpoch === event.mutationEpoch
+                        && event.revision >= current.revision
+                    ) {
+                        const dirty = { ...current.dirtyEntries };
+                        if (event.dirtyEntry) dirty[event.key] = event.dirtyEntry;
+                        else delete dirty[event.key];
+                        install_document_projection(Object.freeze({
+                            ...current,
+                            revision: event.revision,
+                            dirtyEntries: Object.freeze(dirty),
+                        }));
+                    }
+                    void post_to_receiver({
+                        type: 'csvDocumentPatch',
+                        revision: event.revision,
+                        sourceGeneration: event.sourceGeneration,
+                        mutationEpoch: event.mutationEpoch,
+                        key: event.key,
+                        value: event.value,
+                        ...(event.dirtyEntry ? { dirtyEntry: event.dirtyEntry } : {}),
+                        origin: event.origin,
+                        selfOriginated: event.viewId === document_mode.viewId,
+                    });
+                    return;
+                }
+                document_projection = undefined;
+                void post_to_receiver({
+                    type: 'csvDocumentSourceReplaced',
+                    revision: event.revision,
+                    sourceGeneration: event.sourceGeneration,
+                    mutationEpoch: event.mutationEpoch,
+                    reason: event.reason,
+                });
+                void refresh_panel_source(true, 'recovery');
+            }));
+            disposables.push(document_mode.document.on_did_request_resync((event) => {
+                if (disposed || event.viewId !== document_mode.viewId) return;
+                document_view_mutation_epoch = event.viewMutationEpoch;
+                void post_document_sync();
+            }));
+            disposables.push(document_mode.document.on_did_change_conflict((event) => {
+                const current = document_projection;
+                if (
+                    current
+                    && current.sourceGeneration === event.sourceGeneration
+                    && current.mutationEpoch === event.mutationEpoch
+                    && event.revision >= current.revision
+                ) {
+                    install_document_projection(Object.freeze({
+                        ...current,
+                        revision: event.revision,
+                        conflict: event.state,
+                    }));
+                }
+                void post_document_sync();
+            }));
+        } catch (error) {
+            return abort_setup(error);
+        }
+    }
+
     if (file_edit_state) {
         const edit_state_subscriber: CsvEditStateSubscriber = (snapshot) => {
             if (disposed) return;
@@ -666,6 +867,13 @@ export function attach_viewer(
     // Subscribe before the panel can become ready. Coordinator events may build
     // and install a panel-local source pre-ready; PanelSession defers delivery.
     const refresh_subscription = (() => {
+        if (document_mode) {
+            return {
+                reserve_post_save: () => ({ cancel() {} }),
+                request: async () => ({ type: 'completed' as const }),
+                dispose() {},
+            };
+        }
         try {
             return file_coordinator.subscribe_refresh(
                 refresh_from_event,
@@ -1027,13 +1235,11 @@ export function attach_viewer(
 
     /**
      * Which edit phases admit transform work, and why the rest do not. The
-     * trailing `never` assignment is what makes adding a phase to
+     * `never` assignment in the refusing default makes adding a phase to
      * `CsvEditFilePhase` a compile error here rather than a silent admit: this
-     * project does not set `noImplicitReturns`, so a bare `switch` with no
-     * `default` would let a new phase fall through and return `undefined` —
-     * which means "admit". The unreachable branch still refuses, so even a
-     * compile run that someone forces through cannot admit under an unknown
-     * phase.
+     * project does not set `noImplicitReturns`, so a switch with no default
+     * could let a new phase fall through and return `undefined`, which means
+     * "admit".
      *
      * `owned` admits only the panel holding the session. A sibling's sort would
      * recompute the permutation and publish it to durable state, moving the
@@ -1070,11 +1276,13 @@ export function attach_viewer(
                 // Durable pending-edit state may or may not exist. Never admit
                 // under unknown durable state.
                 return 'Finishing edit-session work; try again in a moment.';
+            default: {
+                const exhaustive: never = phase;
+                void exhaustive;
+                console.error('Unhandled CSV edit phase in transform admission');
+                return 'Finishing edit-session work; try again in a moment.';
+            }
         }
-        const exhaustive: never = phase;
-        void exhaustive;
-        console.error('Unhandled CSV edit phase in transform admission');
-        return 'Finishing edit-session work; try again in a moment.';
     }
 
     function begin_transform_admission(): TransformAdmission {
@@ -1139,6 +1347,21 @@ export function attach_viewer(
 
     function projected_save_lifecycle(): CsvSaveLifecycle {
         return save_lifecycle;
+    }
+
+    function projected_edit_capabilities(next_source: DataSource) {
+        return {
+            csvEditingSupported: profile.editing,
+            csvEditable: profile.editing
+                && !next_source.truncationMessage
+                && (document_mode !== undefined || may_retain_capability()),
+            csvEditingMode: document_mode ? 'vscodeDocument' as const : 'selfManaged' as const,
+            ...(document_mode ? { csvDocumentViewId: document_mode.viewId } : {}),
+            csvSaveLifecycle: projected_save_lifecycle(),
+            ...(self_managed_editing && owns_edit_session() && active_edit_session_id
+                ? { csvEditSessionId: active_edit_session_id }
+                : {}),
+        };
     }
 
     function begin_save_lifecycle(
@@ -1421,7 +1644,7 @@ export function attach_viewer(
                     active_edit_session_id = undefined;
                     file_edit_state.phase = { type: 'free' };
                     notify_edit_state();
-                    void ensure_failed_save_cleanup();
+                    void track_controller_operation(ensure_failed_save_cleanup());
                     delete_shared_edit_state_if_unused();
                 }
                 if (active_edit_release?.release === release) {
@@ -1614,7 +1837,7 @@ export function attach_viewer(
         // durable user work reaches the panel at all.
         const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
-            && profile.editing
+            && self_managed_editing
             && (
                 owns_edit_session()
                 || (
@@ -1648,7 +1871,7 @@ export function attach_viewer(
         // `may_rehydrate_session()` is written to make impossible.
         if (
             allow_claim
-            && profile.editing
+            && self_managed_editing
             && !!file_edit_state
             && !predates_completed_clear
             && edit_phase().type === 'free'
@@ -1677,10 +1900,16 @@ export function attach_viewer(
 
     async function read_file_state(touch = true): Promise<FileStateSnapshot> {
         await file_coordinator.state_ready();
-        const snapshot = await state_store.read(state_path);
+        const snapshot = await durable_state_store.read(state_path);
         observe_durable_state(snapshot);
-        if (touch) await state_store.touch(state_path);
+        if (touch) await durable_state_store.touch(state_path);
         return snapshot;
+    }
+
+    function touch_file_state_best_effort(): void {
+        // Touch is recency-only cosmetic bookkeeping. Start it only after the
+        // workbook has been adopted so writer contention cannot gate table load.
+        void durable_state_store.touch(state_path).catch(() => undefined);
     }
 
     async function update_file_state(
@@ -1697,7 +1926,7 @@ export function attach_viewer(
             const current = normalize_host_state(snapshot.state, sheet_names);
             const next = updater(current);
             if (next === current) return undefined;
-            const result = await state_store.compare_and_set(
+            const result = await durable_state_store.compare_and_set(
                 state_path,
                 snapshot.revision,
                 next,
@@ -1872,7 +2101,7 @@ export function attach_viewer(
                 if (!disposed) update_session_state_material(snapshot);
                 return { type: 'unchanged', snapshot };
             }
-            const result = await state_store.compare_and_set(
+            const result = await durable_state_store.compare_and_set(
                 state_path,
                 snapshot.revision,
                 next,
@@ -2012,7 +2241,7 @@ export function attach_viewer(
                         : {}),
                 }
                 : undefined;
-            const result = await state_store.compare_and_set(
+            const result = await durable_state_store.compare_and_set(
                 state_path,
                 snapshot.revision,
                 { ...current, transforms },
@@ -2175,7 +2404,20 @@ export function attach_viewer(
     }
 
     async function build_source(): Promise<SourceCandidate> {
-        const state = (await read_file_state()).state as PerFileState;
+        if (document_mode) {
+            const snapshot = await document_mode.document.viewer_snapshot();
+            install_document_projection(snapshot);
+            const candidate = new SourceCandidate(snapshot.source, {
+                fingerprint: `document:${snapshot.sourceGeneration}:${snapshot.revision}`,
+                digest: snapshot.sourceDigest,
+            });
+            document_candidate_basis.set(candidate, {
+                revision: snapshot.revision,
+                sourceGeneration: snapshot.sourceGeneration,
+            });
+            return candidate;
+        }
+        const state = (await read_file_state(false)).state as PerFileState;
         const stat = await host.fs.stat(uri);
         const max_mib = host.config.max_file_size_mib();
         assert_safe_file_size(stat.size, max_mib);
@@ -2197,6 +2439,14 @@ export function attach_viewer(
         refresh_event?: FileRefreshEvent,
     ): Promise<boolean> {
         if (!load_is_current(seq, refresh_event)) return false;
+        if (document_mode) {
+            const basis = document_candidate_basis.get(candidate);
+            if (!basis) return false;
+            const snapshot = await document_mode.document.resync_snapshot();
+            if (!load_is_current(seq, refresh_event)) return false;
+            install_document_projection(snapshot);
+            return snapshot.sourceGeneration === basis.sourceGeneration;
+        }
         const { fingerprint, digest } = candidate.observation;
         const stat = await host.fs.stat(uri);
         if (
@@ -2358,7 +2608,9 @@ export function attach_viewer(
                         return { type: 'rejected' };
                     }
                     file_coordinator.release_commit_turn(requested.turn);
-                    void discard_authority(durable_state_store, state_path, token.id);
+                    void track_controller_operation(
+                        discard_authority(durable_state_store, state_path, token.id),
+                    );
                     throw error;
                 }
                 if (finalized.type === 'conflict') {
@@ -2424,7 +2676,9 @@ export function attach_viewer(
             }
         } finally {
             file_coordinator.cancel(token);
-            void discard_authority(durable_state_store, state_path, token.id);
+            void track_controller_operation(
+                        discard_authority(durable_state_store, state_path, token.id),
+                    );
         }
     }
 
@@ -2491,16 +2745,7 @@ export function attach_viewer(
                                 defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
                             },
-                            capabilities: {
-                                csvEditingSupported: profile.editing,
-                                csvEditable: profile.editing
-                                    && may_retain_capability()
-                                    && !next.truncationMessage,
-                                csvSaveLifecycle: projected_save_lifecycle(),
-                                ...(owns_edit_session() && active_edit_session_id
-                                    ? { csvEditSessionId: active_edit_session_id }
-                                    : {}),
-                            },
+                            capabilities: projected_edit_capabilities(next),
                             stateSnapshot: adoption_state,
                         }),
                     };
@@ -2639,16 +2884,7 @@ export function attach_viewer(
                                         defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
                                     },
-                                    capabilities: {
-                                        csvEditingSupported: profile.editing,
-                                        csvEditable: profile.editing
-                                            && may_retain_capability()
-                                            && !source!.truncationMessage,
-                                        csvSaveLifecycle: projected_save_lifecycle(),
-                                        ...(owns_edit_session() && active_edit_session_id
-                                            ? { csvEditSessionId: active_edit_session_id }
-                                            : {}),
-                                    },
+                                    capabilities: projected_edit_capabilities(source!),
                                     stateSnapshot: project_state_for_panel(
                                         receipt.stateSnapshot,
                                         true,
@@ -2755,7 +2991,7 @@ export function attach_viewer(
         }
         if (!file_edit_state.recovery) {
             const operation = phase.operation;
-            const recovery = (async () => {
+            const recovery = track_controller_operation((async () => {
                 try {
                     const snapshot = await clear_pending_edits();
                     // Recovery only restores file availability. A live request waiter
@@ -2767,7 +3003,7 @@ export function attach_viewer(
                     log_sanitized_failure('Failed to recover CSV pending-edit cleanup', error);
                     return false;
                 }
-            })();
+            })());
             file_edit_state.recovery = recovery;
             void recovery.finally(() => {
                 if (file_edit_state?.recovery === recovery) {
@@ -2910,6 +3146,7 @@ export function attach_viewer(
                             deduplicated.receipt.stateSnapshot,
                             true,
                         );
+                        touch_file_state_best_effort();
                         return { type: 'completed' };
                     }
                     last_error = new Error('The file authority changed while it was refreshed.');
@@ -2930,13 +3167,16 @@ export function attach_viewer(
                             committed,
                             request.seq,
                             reason,
-                            profile.editing ? await read_file_state() : undefined,
+                            self_managed_editing ? await read_file_state(false) : undefined,
                             request.refreshEvent,
                         );
                         if (!load_is_current(request.seq, request.refreshEvent)) {
                             return inactive_refresh_result();
                         }
-                        if (adopted) return { type: 'completed' };
+                        if (adopted) {
+                            touch_file_state_best_effort();
+                            return { type: 'completed' };
+                        }
                     }
                     last_error = new Error('The file authority changed while it was refreshed.');
                 }
@@ -2964,6 +3204,16 @@ export function attach_viewer(
                 return inactive_refresh_result();
             }
         }
+    }
+
+    async function complete_local_refresh(
+        reason: 'ready' | 'fileReload' | 'recovery',
+    ): Promise<void> {
+        reset_reload_retry();
+        // A timer retry outlives the promise returned for the first attempt, so the
+        // successful recovery path itself must publish the sync that reopens editing.
+        if (document_mode && reason === 'recovery') await post_document_sync();
+        touch_file_state_best_effort();
     }
 
     async function run_local_refresh_attempt(
@@ -3000,7 +3250,7 @@ export function attach_viewer(
                 if (deduplicated.type === 'committed' && load_is_current(request.seq)) {
                     source_authority = deduplicated.receipt.resultingBasis;
                     update_session_state_material(deduplicated.receipt.stateSnapshot, true);
-                    reset_reload_retry();
+                    await complete_local_refresh(reason);
                     return true;
                 }
                 if (
@@ -3034,10 +3284,10 @@ export function attach_viewer(
                 committed,
                 request.seq,
                 reason,
-                profile.editing ? await read_file_state() : undefined,
+                self_managed_editing ? await read_file_state(false) : undefined,
             );
             if (!adopted) return false;
-            reset_reload_retry();
+            await complete_local_refresh(reason);
             return true;
         } catch (error) {
             if (!load_is_current(request.seq)) return false;
@@ -3057,7 +3307,9 @@ export function attach_viewer(
     ): Promise<boolean> {
         if (disposed) return Promise.resolve(false);
         const request = { seq: supersede_panel_load() };
-        return run_local_refresh_attempt(request, force, reason, initial);
+        return track_controller_operation(
+            run_local_refresh_attempt(request, force, reason, initial),
+        );
     }
 
     function refresh_from_event(
@@ -3071,11 +3323,11 @@ export function attach_viewer(
             refreshEvent: event,
         };
         const projection_recovery = event.reason === 'projectionRecovery';
-        return run_physical_refresh(
+        return track_controller_operation(run_physical_refresh(
             request,
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
-        );
+        ));
     }
 
     async function send_initial_data(): Promise<void> {
@@ -3107,7 +3359,9 @@ export function attach_viewer(
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
             if (load_is_current(request.seq)) {
-                void run_local_refresh_attempt(request, force, reason, initial);
+                void track_controller_operation(
+                    run_local_refresh_attempt(request, force, reason, initial),
+                );
             }
         }, RELOAD_RETRY_MS);
         return true;
@@ -3145,7 +3399,7 @@ export function attach_viewer(
                 || !session.ready_epoch_is_current(receiver_epoch)
             ) return undefined;
             try {
-                return await read_file_state();
+                return await read_file_state(false);
             } catch (error) {
                 if (
                     disposed
@@ -3289,7 +3543,7 @@ export function attach_viewer(
         if (
             edit_cleanup_blocked()
             || transform_work_in_flight()
-            || !profile.editing
+            || !self_managed_editing
             || !src
             || !!src.truncationMessage
             || expected_digest === undefined
@@ -3309,65 +3563,35 @@ export function attach_viewer(
             return;
         }
 
-        // Raw text of exactly the cells the dirty map names, harvested from the
-        // serialization walk below so the source is traversed once. Keys are
-        // source-keyed, like the dirty map itself.
-        const observed_bases = new Map<string, string>();
-        const wanted_columns = new Map<number, number[]>();
-        for (const key of Object.keys(identity.dirtyEdits)) {
-            const [source_row, col] = key.split(':').map(Number);
-            const columns = wanted_columns.get(source_row);
-            if (columns) columns.push(col);
-            else wanted_columns.set(source_row, [col]);
-        }
-
-        const wants_bases = wanted_columns.size > 0;
-
-        let content: string;
+        // Content preparation is shared with the custom-document core, but this
+        // controller retains every desktop/self-managed lifecycle, authority,
+        // reservation, highlight, and cleanup decision below this boundary.
+        let prepared: PreparedCsvContent;
         try {
-            const SAVE_WINDOW = 10_000;
-            const row_count = src.meta().sheets[0].rowCount;
-            function* row_windows(): Generator<(RenderedCell | null)[]> {
-                let absolute_row = 0;
-                for (let start = 0; start < row_count; start += SAVE_WINDOW) {
-                    const { rows } = src!.read_rows(0, start, SAVE_WINDOW);
-                    for (const row of rows) {
-                        // `wants_bases` short-circuits the per-row Map probe. The
-                        // walk visits every row of the file (1M+ is a real case) but
-                        // the map is empty whenever there is nothing to harvest, so
-                        // without this a save with no dirty edits pays a million
-                        // lookups on an empty Map for no possible hit.
-                        const columns = wants_bases
-                            ? wanted_columns.get(absolute_row)
-                            : undefined;
-                        if (columns) {
-                            for (const col of columns) {
-                                // A column past this row's field count is left
-                                // unrecorded, so the reader below reports
-                                // `undefined` and validate_dirty_bases coalesces it
-                                // to '' — matching the webview's get_cell_raw,
-                                // where a loaded blank cell is ''.
-                                const cell = row[col];
-                                if (cell === undefined) continue;
-                                observed_bases.set(
-                                    `${absolute_row}:${col}`,
-                                    cell === null ? '' : String(cell.raw ?? ''),
-                                );
-                            }
-                        }
-                        absolute_row++;
-                        yield row;
-                    }
-                }
+            const result = prepare_csv_save_content({
+                source: src,
+                delimiter: get_delimiter(file_path),
+                edits: identity.edits,
+                dirtyEntries: identity.dirtyEdits,
+            });
+            if (result.type === 'rejected') {
+                const active = begin_save_lifecycle(identity);
+                const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+                const rejection: CsvSaveRejection = result.rejection;
+                show_owner_warning(
+                    rejection.reason === 'rowsRemoved'
+                        ? 'File shrank externally. Some edited rows no longer exist, so the save was cancelled.'
+                        : 'File was modified externally. Some edits no longer match the file, so the save was cancelled.',
+                );
+                void post_to_receiver({
+                    type: 'saveResult',
+                    success: false,
+                    lifecycle,
+                    rejection,
+                });
+                return;
             }
-            content = serialize_csv(
-                row_windows(),
-                get_delimiter(file_path),
-                identity.edits,
-                src.originalColumnCounts,
-                src.lineEnding,
-                src.headerLine,
-            );
+            prepared = result;
         } catch (error) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
@@ -3375,50 +3599,6 @@ export function attach_viewer(
                 `Failed to save: ${error instanceof Error ? error.message : String(error)}`,
             );
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
-            return;
-        }
-
-        // Validate every edit's base against the raw source before a single byte
-        // is written. This is NOT redundant with the TOCTOU digest check further
-        // down, which stays exactly where it is: that one asks "did the file change
-        // since the snapshot we acknowledged?", comparing bytes against the
-        // acknowledged digest. This asks the different question "was this edit's
-        // base ever true?", which is also false for an edit created *before* an
-        // acknowledged refresh — a case the digest check reports as clean because
-        // the file matches the snapshot we did acknowledge. Neither subsumes the
-        // other.
-        //
-        // The webview cannot answer this alone: its conflict detection is
-        // residency-gated (see csv-base-validation.ts's header), so a filtered,
-        // evicted, or shrunk-away row is never flagged there.
-        const validation = validate_dirty_bases(
-            identity.dirtyEdits,
-            src.meta().sheets[0].sourceRowCount,
-            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
-        );
-        if (validation.type !== 'valid') {
-            // Same shape as the sibling early-returns above: a begin/finish pair so
-            // the webview sees a terminal 'failed' lifecycle for this exact
-            // operation and restores the precise dirty map it submitted.
-            const active = begin_save_lifecycle(identity);
-            const lifecycle = finish_save_lifecycle(active.operation, 'failed');
-            const rejection: CsvSaveRejection = validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', keys: validation.keys }
-                : { reason: 'baseMismatch', keys: validation.keys };
-            // Warning, not error, matching the digest-check path: an externally
-            // changed file is an expected condition the user resolves, not a
-            // failure of ours.
-            show_owner_warning(
-                rejection.reason === 'rowsRemoved'
-                    ? 'File shrank externally. Some edited rows no longer exist, so the save was cancelled.'
-                    : 'File was modified externally. Some edits no longer match the file, so the save was cancelled.',
-            );
-            void post_to_receiver({
-                type: 'saveResult',
-                success: false,
-                lifecycle,
-                rejection,
-            });
             return;
         }
 
@@ -3433,8 +3613,8 @@ export function attach_viewer(
             lifecycle: active_lifecycle,
         }, receiver_epoch);
 
-        const saved_bytes = new TextEncoder().encode(content);
-        const saved_digest = content_digest(saved_bytes);
+        const saved_bytes = prepared.bytes;
+        const saved_digest = prepared.digest;
         let post_save_reservation: { cancel(): void } | undefined;
         try {
             await pending_edit_writes.catch(() => {});
@@ -3618,15 +3798,23 @@ export function attach_viewer(
         });
         notify_edit_state();
 
-        void refresh_subscription.request('postSave').catch((error) => {
-            if (disposed) return;
-            log_sanitized_failure('Post-save refresh request failed (file was written)', error);
-            show_owner_warning(
-                'The file was saved, but Table Viewer could not refresh the table view.',
-            );
-        });
+        void track_controller_operation(
+            refresh_subscription.request('postSave').then(
+                () => undefined,
+                (error) => {
+                    if (disposed) return;
+                    log_sanitized_failure(
+                        'Post-save refresh request failed (file was written)',
+                        error,
+                    );
+                    show_owner_warning(
+                        'The file was saved, but Table Viewer could not refresh the table view.',
+                    );
+                },
+            ),
+        );
 
-        void clear_pending_edits().then((snapshot) => {
+        void track_controller_operation(clear_pending_edits().then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
@@ -3636,7 +3824,7 @@ export function attach_viewer(
             show_owner_warning(
                 'The file was saved, but Table Viewer could not clear its saved edit state. Editing remains disabled for this file.',
             );
-        });
+        }));
     }
 
     async function handle_transform_message(
@@ -3696,7 +3884,7 @@ export function attach_viewer(
                 return;
             }
         }
-        const transform_admission: TransformAdmission = profile.editing
+        const transform_admission: TransformAdmission = self_managed_editing
             ? begin_transform_admission()
             : { operation: Symbol(file_key) };
         if ('refusal' in transform_admission) {
@@ -3745,14 +3933,15 @@ export function attach_viewer(
             ) latest_transform_authority_by_sheet.delete(message.sheetIndex);
             transform_commit_barriers.delete(transform_authority);
             transform_authority.resolveCompletion();
-            if (profile.editing) {
+            if (self_managed_editing) {
                 finish_transform_admission(transform_admission.operation);
             }
         }
     }
 
     try {
-        disposables.push(webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
+        disposables.push(webview.onDidReceiveMessage((msg: WebviewMessage) => (
+            track_controller_operation((async () => {
         if (disposed) return;
         if (
             msg.type !== 'ready'
@@ -3822,7 +4011,7 @@ export function attach_viewer(
                             || ready_core.source_generation !== ready_source_generation
                         ) continue;
 
-                        const transform_admission: TransformAdmission = profile.editing
+                        const transform_admission: TransformAdmission = self_managed_editing
                             ? begin_transform_admission()
                             : { operation: Symbol(file_key) };
                         if ('refusal' in transform_admission) {
@@ -3963,7 +4152,7 @@ export function attach_viewer(
                             update_session_state_material(confirmed, false);
                             break;
                         } finally {
-                            if (profile.editing) {
+                            if (self_managed_editing) {
                                 finish_transform_admission(transform_admission.operation);
                             }
                         }
@@ -4005,6 +4194,9 @@ export function attach_viewer(
                     needs_initial_source = ready.type === 'needsInitialSource';
                 }
                 if (needs_initial_source) await send_initial_data();
+                if (document_mode) {
+                    await post_document_sync({ receiverEpoch: begun.receiverEpoch });
+                }
                 return;
             }
             case 'snapshotApplied':
@@ -4311,6 +4503,96 @@ export function attach_viewer(
                 }
                 return;
             }
+            case 'csvDocumentCellInput': {
+                if (!document_mode || msg.viewId !== document_mode.viewId) return;
+                try {
+                    await document_mode.document.apply_cell_input({
+                        viewId: msg.viewId,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                        key: msg.key,
+                        value: msg.value,
+                        revision: msg.revision,
+                        mutationEpoch: msg.mutationEpoch,
+                    });
+                } catch (error) {
+                    log_sanitized_failure('Failed to apply CSV document input', error);
+                    await post_document_sync({
+                        closeViewGesture: true,
+                        mutationEpoch: msg.mutationEpoch,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                    });
+                }
+                return;
+            }
+            case 'csvDocumentGestureComplete': {
+                if (!document_mode || msg.viewId !== document_mode.viewId) return;
+                try {
+                    await document_mode.document.complete_gesture({
+                        viewId: msg.viewId,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                        revision: msg.revision,
+                        mutationEpoch: msg.mutationEpoch,
+                    }, (direction) => document_mode.requestNativeCommand(direction));
+                } catch (error) {
+                    log_sanitized_failure('Failed to complete CSV document gesture', error);
+                    show_owner_warning(CSV_NATIVE_HISTORY_WARNING);
+                    await post_document_sync({
+                        closeViewGesture: true,
+                        mutationEpoch: msg.mutationEpoch,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                    });
+                }
+                return;
+            }
+            case 'csvDocumentGestureCancel': {
+                if (!document_mode || msg.viewId !== document_mode.viewId) return;
+                try {
+                    await document_mode.document.cancel_gesture({
+                        viewId: msg.viewId,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                        revision: msg.revision,
+                        mutationEpoch: msg.mutationEpoch,
+                    }, (direction) => document_mode.requestNativeCommand(direction));
+                } catch (error) {
+                    log_sanitized_failure('Failed to cancel CSV document gesture', error);
+                    show_owner_warning(CSV_NATIVE_HISTORY_WARNING);
+                    await post_document_sync({
+                        closeViewGesture: true,
+                        mutationEpoch: msg.mutationEpoch,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                    });
+                }
+                return;
+            }
+            case 'csvDocumentResyncRequest':
+                if (document_mode && msg.viewId === document_mode.viewId) {
+                    await post_document_sync({
+                        closeViewGesture: true,
+                        mutationEpoch: msg.mutationEpoch,
+                        viewMutationEpoch: msg.viewMutationEpoch,
+                    });
+                }
+                return;
+            case 'csvDocumentNativeCommand':
+                if (document_mode) {
+                    try {
+                        if (msg.command === 'save') {
+                            await document_mode.requestNativeCommand('save');
+                        } else {
+                            await document_mode.document.run_native_history_command(
+                                msg.command,
+                                (direction) => document_mode.requestNativeCommand(direction),
+                            );
+                        }
+                    } catch (error) {
+                        log_sanitized_failure('Failed to run native CSV document command', error);
+                        if (msg.command !== 'save') {
+                            show_owner_warning(CSV_NATIVE_HISTORY_WARNING);
+                            await post_document_sync({ closeViewGesture: true });
+                        }
+                    }
+                }
+                return;
             case 'requestEditSession': {
                 if (edit_admission_closed) {
                     void post_to_receiver({
@@ -4356,7 +4638,7 @@ export function attach_viewer(
                 const already_owned = phase.type === 'owned'
                     && phase.token === edit_session_token;
                 let can_edit = recovery_authorized
-                    && profile.editing
+                    && self_managed_editing
                     && !cleanup_blocked
                     && active_save_operation === undefined
                     && !!source
@@ -4397,7 +4679,7 @@ export function attach_viewer(
                 cleanup_blocked = phase.type === 'cleanupPending'
                     || phase.type === 'uncertain';
                 can_edit = recovery_authorized
-                    && profile.editing
+                    && self_managed_editing
                     && !cleanup_blocked
                     && active_save_operation === undefined
                     && !!source
@@ -4424,7 +4706,7 @@ export function attach_viewer(
                 // sort or filter is not a denial, because editing under one is
                 // supported and the rows stay exactly where they are. Only work in
                 // flight refuses, and it refuses transiently.
-                const denied_by_transform = profile.editing
+                const denied_by_transform = self_managed_editing
                     && !!source
                     && !source.truncationMessage
                     && !may_begin_editing();
@@ -4873,14 +5155,14 @@ export function attach_viewer(
                 return;
             }
             case 'releaseEditSession':
-                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                if (self_managed_editing && edit_message_is_current(msg.editSessionId)) {
                     active_save_dialog_request = undefined;
                     await release_edit_session(msg.editSessionId);
                     if (!disposed) await refresh_session_state_material(false);
                 }
                 return;
             case 'discardEditSession':
-                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                if (self_managed_editing && edit_message_is_current(msg.editSessionId)) {
                     const writing = active_save_operation?.phase === 'writing'
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
@@ -4904,7 +5186,7 @@ export function attach_viewer(
                 host.ui.show_warning(msg.message);
                 return;
             case 'saveCsv':
-                if (profile.editing) {
+                if (self_managed_editing) {
                     const save = handle_save(msg.operation);
                     active_save_drain = save;
                     try {
@@ -4917,7 +5199,7 @@ export function attach_viewer(
                 }
                 return;
             case 'pendingEditsChanged': {
-                if (!profile.editing || active_save_operation) return;
+                if (!self_managed_editing || active_save_operation) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
                 if (pending_edit_sequence_session_id !== msg.editSessionId) {
                     pending_edit_sequence_session_id = msg.editSessionId;
@@ -5063,7 +5345,7 @@ export function attach_viewer(
                 return;
             }
             case 'showSaveDialog': {
-                if (!profile.editing || !edit_message_is_current(msg.editSessionId)) return;
+                if (!self_managed_editing || !edit_message_is_current(msg.editSessionId)) return;
                 const request = {
                     requestId: msg.requestId,
                     receiverEpoch: session.current_receiver_epoch,
@@ -5093,7 +5375,8 @@ export function attach_viewer(
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
         }
-        }));
+            })())
+        )));
     } catch (error) {
         return abort_setup(error);
     }
@@ -5107,7 +5390,7 @@ export function attach_viewer(
 
     async function flush_pending_edits(): Promise<void> {
         stop_edit_admission();
-        if (!profile.editing || !renderer_ready) {
+        if (!self_managed_editing || !renderer_ready) {
             await drain_controller();
             return;
         }
@@ -5170,14 +5453,18 @@ export function attach_viewer(
             const save_tail = active_save_drain;
             const disposal_release_tail = disposal_edit_release_drain;
             const layout_tail = layout_write_tail;
+            const document_tail = document_mode?.document.when_idle() ?? Promise.resolve();
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
-            await Promise.all([
+            const operation_tails = [...controller_operations];
+            await Promise.allSettled([
                 edit_tail,
                 save_tail,
                 disposal_release_tail,
                 layout_tail,
+                document_tail,
                 ...transform_tails,
+                ...operation_tails,
             ]);
             if (
                 edit_tail === pending_edit_writes
@@ -5185,6 +5472,7 @@ export function attach_viewer(
                 && disposal_release_tail === disposal_edit_release_drain
                 && layout_tail === layout_write_tail
                 && transform_commit_barriers.size === 0
+                && controller_operations.size === 0
             ) return;
         }
     }

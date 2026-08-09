@@ -78,6 +78,41 @@ async function initialize(name = 'file-state.sqlite3'): Promise<void> {
     await result.database.close();
 }
 
+async function createHotRollbackJournal(file = databasePath()): Promise<void> {
+    const script = `
+        const { DatabaseSync } = require('node:sqlite');
+        const database = new DatabaseSync(process.argv[1]);
+        database.exec(\`PRAGMA cache_size = 1;
+            BEGIN IMMEDIATE;
+            UPDATE state_meta SET next_revision = 2 WHERE singleton = 1;
+            CREATE TABLE hot_journal_spill (value BLOB);
+            INSERT INTO hot_journal_spill VALUES (zeroblob(1048576))\`);
+        if (process.send) process.send('ready');
+        setInterval(() => {}, 1000);
+    `;
+    const child = spawn(process.execPath, ['-e', script, file], {
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    childProcesses.push(child);
+    await childReady(child);
+    await pollFor(() => fs.existsSync(`${file}-journal`), 'hot journal exists');
+    child.kill('SIGKILL');
+    await childExit(child);
+}
+
+function writeInPlace(file: string, bytes: Buffer): void {
+    const descriptor = fs.openSync(file, 'r+');
+    try {
+        let written = 0;
+        while (written < bytes.length) {
+            written += fs.writeSync(descriptor, bytes, written, bytes.length - written, written);
+        }
+        fs.fsyncSync(descriptor);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+}
+
 function publicOpen() {
     return open_sqlite_file_state_store(databasePath(), {
         identity,
@@ -150,6 +185,144 @@ describe('basename-scoped recovery gate', () => {
         await reader.release();
     });
 
+    it('times out on stale exclusive intent without stealing it or leaving a retry loop', async () => {
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let monotonicMs = 100;
+        let yieldCount = 0;
+
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath(), {
+            timeoutMs: 10,
+            monotonicNow: () => monotonicMs,
+            yieldControl() {
+                yieldCount += 1;
+                monotonicMs += 5;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('reader-gate-timeout');
+        expect(error.message).not.toContain(databasePath());
+        expect(yieldCount).toBe(2);
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: exclusive.tokenId,
+            readerTokenIds: [],
+        });
+        await Promise.resolve();
+        expect(yieldCount).toBe(2);
+
+        await reclaim_stale_sqlite_exclusive_intent(
+            databasePath(),
+            exclusive.tokenId,
+            { allProcessesClosed: true },
+        );
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+        await reader.release();
+    });
+
+    it('uses a finite default deadline when an omitted-timeout reader is blocked by intent', async () => {
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let monotonicMs = 0;
+        let yieldCount = 0;
+
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath(), {
+            monotonicNow: () => monotonicMs,
+            yieldControl() {
+                yieldCount += 1;
+                monotonicMs = 1_000_000;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('reader-gate-timeout');
+        expect(yieldCount).toBe(1);
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: exclusive.tokenId,
+            readerTokenIds: [],
+        });
+        await exclusive.release();
+    });
+
+    it('removes its exact raced reader token before a post-intent timeout', async () => {
+        let monotonicMs = 0;
+        let yieldCount = 0;
+        let cleanupObserved = false;
+        let exclusiveTokenId: string | undefined;
+
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath(), {
+            timeoutMs: 5,
+            monotonicNow: () => monotonicMs,
+            async onEvent(event) {
+                if (event !== 'reader-after-token-flush' || exclusiveTokenId) return;
+                const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+                exclusiveTokenId = exclusive.tokenId;
+            },
+            yieldControl() {
+                yieldCount += 1;
+                const inventory = inspect_sqlite_recovery_gate(databasePath());
+                expect(inventory.exclusiveIntentTokenId).toBe(exclusiveTokenId);
+                expect(inventory.readerTokenIds).toEqual([]);
+                cleanupObserved = true;
+                monotonicMs = 5;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('reader-gate-timeout');
+        expect(yieldCount).toBe(1);
+        expect(cleanupObserved).toBe(true);
+        expect(exclusiveTokenId).toBeDefined();
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: exclusiveTokenId,
+            readerTokenIds: [],
+        });
+        await reclaim_stale_sqlite_exclusive_intent(
+            databasePath(),
+            exclusiveTokenId!,
+            { allProcessesClosed: true },
+        );
+    });
+
+    it.each([
+        ['invalid timeout', { timeoutMs: -1 }],
+        ['invalid clock', { timeoutMs: 5, monotonicNow: () => Number.NaN }],
+    ] as const)('rejects %s before creating managed gate directories', async (_label, options) => {
+        await expectCategory(
+            acquire_sqlite_shared_reader_gate(databasePath(), options),
+            'recovery',
+        );
+        expect(fs.existsSync(path.join(
+            tempDirectory,
+            '.file-state.sqlite3.recovery-gate',
+        ))).toBe(false);
+    });
+
+    it('exact-cleans a shared token when its post-flush acquisition hook fails', async () => {
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath(), {
+            onEvent(event) {
+                if (event === 'reader-after-token-flush') {
+                    throw new Error('injected post-flush reader failure');
+                }
+            },
+        }), 'recovery');
+
+        expect(error.metadata.operation).toBe('reader-gate-acquire');
+        const gate = inspect_sqlite_recovery_gate(databasePath());
+        expect(gate.readerTokenIds).toEqual([]);
+        expect(gate.exclusiveIntentTokenId).toBeUndefined();
+    });
+
+    it('exact-cleans exclusive intent when its post-flush acquisition hook fails', async () => {
+        const error = await expectCategory(acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            onEvent(event) {
+                if (event === 'exclusive-after-intent-flush') {
+                    throw new Error('injected post-flush exclusive failure');
+                }
+            },
+        }), 'recovery');
+
+        expect(error.metadata.operation).toBe('exclusive-gate-acquire');
+        const gate = inspect_sqlite_recovery_gate(databasePath());
+        expect(gate.readerTokenIds).toEqual([]);
+        expect(gate.exclusiveIntentTokenId).toBeUndefined();
+    });
+
     it('holds exclusive intent while live readers drain', async () => {
         const reader = await acquire_sqlite_shared_reader_gate(databasePath());
         const waiting = deferred();
@@ -166,6 +339,207 @@ describe('basename-scoped recovery gate', () => {
         await wait;
         expect(exclusive.listReaderTokenIds()).toEqual([]);
         await exclusive.release();
+    });
+
+    it('bounds exclusive reader drain with the shared-gate monotonic deadline', async () => {
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let monotonicMs = 0;
+        let yieldCount = 0;
+
+        const error = await expectCategory(exclusive.waitForReaders({
+            timeoutMs: 5,
+            monotonicNow: () => monotonicMs,
+            yieldControl() {
+                yieldCount += 1;
+                monotonicMs = 5;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('exclusive-gate-timeout');
+        expect(yieldCount).toBe(1);
+        expect(exclusive.listReaderTokenIds()).toEqual([reader.tokenId]);
+        await reader.release();
+        await exclusive.release();
+    });
+
+    it('uses a finite default deadline when omitted-timeout exclusive drain is blocked', async () => {
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        let monotonicMs = 0;
+        let yieldCount = 0;
+
+        const error = await expectCategory(exclusive.waitForReaders({
+            monotonicNow: () => monotonicMs,
+            yieldControl() {
+                yieldCount += 1;
+                monotonicMs = 1_000_000;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('exclusive-gate-timeout');
+        expect(yieldCount).toBe(1);
+        expect(exclusive.listReaderTokenIds()).toEqual([reader.tokenId]);
+        await reader.release();
+        await exclusive.release();
+    });
+
+    it('forwards initialization and preservation deadlines to caller-owned exclusive waits', async () => {
+        await initialize();
+        for (const operation of ['initialize', 'preserve'] as const) {
+            const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+            const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+            let monotonicMs = 0;
+            let yieldCount = 0;
+            const waitOptions = {
+                timeoutMs: 5,
+                monotonicNow: () => monotonicMs,
+                yieldControl() {
+                    yieldCount += 1;
+                    monotonicMs = 5;
+                },
+            };
+
+            const promise = operation === 'initialize'
+                ? initialize_sqlite_database_no_clobber(
+                    databasePath(),
+                    identity,
+                    { appliedAtMs: 100, appVersion: '0.7.0' },
+                    { gate: exclusive, ...waitOptions },
+                )
+                : preserve_sqlite_basename_set(databasePath(), {
+                    gate: exclusive,
+                    ...waitOptions,
+                });
+            const error = await expectCategory(promise, 'contention');
+
+            expect(error.metadata.operation).toBe('exclusive-gate-timeout');
+            expect(yieldCount).toBe(1);
+            expect(exclusive.listReaderTokenIds()).toEqual([reader.tokenId]);
+            await reader.release();
+            await exclusive.release();
+        }
+    });
+
+    it('downgrades without exposing a no-token/no-intent gap and releases the new token once', async () => {
+        let exclusiveTokenId: string | undefined;
+        let downgradedTokenId: string | undefined;
+        let readerDurableBeforeIntentRemoval = false;
+        let readerRetainedAfterIntentRemoval = false;
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            onEvent(event) {
+                const inventory = inspect_sqlite_recovery_gate(databasePath());
+                if (event === 'exclusive-downgrade-after-reader-flush') {
+                    expect(inventory.exclusiveIntentTokenId).toBe(exclusiveTokenId);
+                    expect(inventory.readerTokenIds).toHaveLength(1);
+                    [downgradedTokenId] = inventory.readerTokenIds;
+                    readerDurableBeforeIntentRemoval = true;
+                }
+                if (event === 'exclusive-downgrade-after-intent-flush') {
+                    expect(inventory.exclusiveIntentTokenId).toBeUndefined();
+                    expect(inventory.readerTokenIds).toEqual([downgradedTokenId]);
+                    readerRetainedAfterIntentRemoval = true;
+                }
+            },
+        });
+        exclusiveTokenId = exclusive.tokenId;
+
+        const reader = await exclusive.downgradeToSharedReader();
+
+        expect(reader.tokenId).toBe(downgradedTokenId);
+        expect(readerDurableBeforeIntentRemoval).toBe(true);
+        expect(readerRetainedAfterIntentRemoval).toBe(true);
+        await reader.release();
+        await reader.release();
+        const releasedGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(releasedGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(releasedGate.readerTokenIds).toEqual([]);
+    });
+
+    it('restores exclusive intent and removes the reader token when downgrade fails after unlink', async () => {
+        let failAfterIntentRemoval = true;
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            onEvent(event) {
+                if (event === 'exclusive-downgrade-after-intent-flush'
+                    && failAfterIntentRemoval) {
+                    failAfterIntentRemoval = false;
+                    throw new Error('injected post-intent-removal failure');
+                }
+            },
+        });
+
+        await expectCategory(exclusive.downgradeToSharedReader(), 'recovery');
+
+        const gate = inspect_sqlite_recovery_gate(databasePath());
+        expect(gate.exclusiveIntentTokenId).toBe(exclusive.tokenId);
+        expect(gate.readerTokenIds).toEqual([]);
+        await exclusive.release();
+    });
+
+    it('exact-cleans a failed downgrade reader when a peer occupies the removed intent path', async () => {
+        let peer: Awaited<ReturnType<typeof acquire_sqlite_exclusive_recovery_gate>> | undefined;
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            async onEvent(event) {
+                if (event !== 'exclusive-downgrade-after-intent-flush' || peer) return;
+                peer = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+                throw new Error('injected failure after peer intent publication');
+            },
+        });
+
+        await expectCategory(exclusive.downgradeToSharedReader(), 'contention');
+
+        expect(peer).toBeDefined();
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: peer!.tokenId,
+            readerTokenIds: [],
+        });
+        // The failed old gate no longer owns the intent and must not remove its peer.
+        await exclusive.release();
+        expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentTokenId)
+            .toBe(peer!.tokenId);
+        await peer!.waitForReaders();
+        await peer!.release();
+    });
+
+    it('surfaces failed provisional-reader cleanup without disturbing a peer intent', async () => {
+        const gateDirectory = path.join(
+            fs.realpathSync.native(tempDirectory),
+            '.file-state.sqlite3.recovery-gate',
+        );
+        const readersDirectory = path.join(gateDirectory, 'readers');
+        const displaced = path.join(gateDirectory, 'readers-displaced');
+        let peer: Awaited<ReturnType<typeof acquire_sqlite_exclusive_recovery_gate>> | undefined;
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            async onEvent(event) {
+                if (event !== 'exclusive-downgrade-after-intent-flush' || peer) return;
+                peer = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+                fs.renameSync(readersDirectory, displaced);
+                fs.mkdirSync(readersDirectory, { mode: 0o700 });
+                throw new Error('injected failure after peer intent and readers replacement');
+            },
+        });
+
+        const error = await expectCategory(exclusive.downgradeToSharedReader(), 'recovery');
+
+        expect(error.metadata.operation).toBe('managed-token-parent');
+        expect(peer).toBeDefined();
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            exclusiveIntentTokenId: peer!.tokenId,
+            readerTokenIds: [],
+        });
+        fs.rmdirSync(readersDirectory);
+        fs.renameSync(displaced, readersDirectory);
+        const [provisionalToken] = peer!.listReaderTokenIds();
+        expect(provisionalToken).toBeDefined();
+        expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentTokenId)
+            .toBe(peer!.tokenId);
+        await exclusive.release();
+        await peer!.reclaimStaleReaderToken(
+            provisionalToken,
+            { allProcessesClosed: true },
+        );
+        await peer!.waitForReaders();
+        await peer!.release();
     });
 
     it('reclaims only an exact stale reader token after explicit all-processes-closed confirmation', async () => {
@@ -269,6 +643,160 @@ describe('basename-scoped recovery gate', () => {
         const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath()), 'recovery');
         expect(error.message).not.toContain(tempDirectory);
         expect(fs.readdirSync(target)).toEqual([]);
+    });
+
+    it('identity-binds the gate-directory descriptor before durability fsync', async () => {
+        const physicalTempDirectory = fs.realpathSync.native(tempDirectory);
+        const gateDirectory = path.join(physicalTempDirectory, '.file-state.sqlite3.recovery-gate');
+        const displaced = path.join(physicalTempDirectory, '.file-state.sqlite3.recovery-gate.displaced');
+        let swapped = false;
+        let replacement: fs.BigIntStats | undefined;
+        let wrongDescriptorFsync = false;
+
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(databasePath(), {
+            beforeDirectoryFsyncOpen(directoryPath) {
+                if (swapped || directoryPath !== gateDirectory) return;
+                fs.renameSync(gateDirectory, displaced);
+                fs.mkdirSync(gateDirectory, { mode: 0o700 });
+                replacement = fs.lstatSync(gateDirectory, { bigint: true });
+                swapped = true;
+            },
+            fsyncDirectory(descriptor) {
+                const opened = fs.fstatSync(descriptor, { bigint: true });
+                if (replacement && opened.dev === replacement.dev && opened.ino === replacement.ino) {
+                    wrongDescriptorFsync = true;
+                }
+                fs.fsyncSync(descriptor);
+            },
+        }), 'recovery');
+
+        expect(error.metadata.operation).toBe('gate-directory-flush');
+        expect(swapped).toBe(true);
+        expect(wrongDescriptorFsync).toBe(false);
+        fs.rmdirSync(gateDirectory);
+        fs.renameSync(displaced, gateDirectory);
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
+    });
+
+    it('identity-binds the readers descriptor when releasing a durable token', async () => {
+        const gateDirectory = path.join(
+            fs.realpathSync.native(tempDirectory),
+            '.file-state.sqlite3.recovery-gate',
+        );
+        const readersDirectory = path.join(gateDirectory, 'readers');
+        const displaced = path.join(gateDirectory, 'readers-displaced');
+        let releasePhase = false;
+        let swapped = false;
+        let replacement: fs.BigIntStats | undefined;
+        let wrongDescriptorFsync = false;
+        const hooks = {
+            beforeDirectoryFsyncOpen(directoryPath: string) {
+                if (!releasePhase || swapped || directoryPath !== readersDirectory) return;
+                fs.renameSync(readersDirectory, displaced);
+                fs.mkdirSync(readersDirectory, { mode: 0o700 });
+                replacement = fs.lstatSync(readersDirectory, { bigint: true });
+                swapped = true;
+            },
+            fsyncDirectory(descriptor: number) {
+                const opened = fs.fstatSync(descriptor, { bigint: true });
+                if (replacement && opened.dev === replacement.dev && opened.ino === replacement.ino) {
+                    wrongDescriptorFsync = true;
+                }
+                fs.fsyncSync(descriptor);
+            },
+        };
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath(), hooks);
+        releasePhase = true;
+
+        const error = await expectCategory(reader.release(), 'recovery');
+
+        expect(error.metadata.operation).toBe('reader-token-release-flush');
+        expect(swapped).toBe(true);
+        expect(wrongDescriptorFsync).toBe(false);
+        fs.rmdirSync(readersDirectory);
+        fs.renameSync(displaced, readersDirectory);
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
+    });
+
+    it('does not let best-effort durability suppress a pathname swap during fsync', async () => {
+        const gateDirectory = path.join(
+            fs.realpathSync.native(tempDirectory),
+            '.file-state.sqlite3.recovery-gate',
+        );
+        const readersDirectory = path.join(gateDirectory, 'readers');
+        const displaced = path.join(gateDirectory, 'readers-displaced');
+        let releasePhase = false;
+        let swapped = false;
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath(), {
+            directoryDurabilityPolicy: 'best-effort',
+            fsyncDirectory(descriptor) {
+                if (!releasePhase || swapped) {
+                    fs.fsyncSync(descriptor);
+                    return;
+                }
+                fs.renameSync(readersDirectory, displaced);
+                fs.mkdirSync(readersDirectory, { mode: 0o700 });
+                swapped = true;
+                const unsupported = new Error(
+                    'simulated unsupported directory fsync',
+                ) as NodeJS.ErrnoException;
+                unsupported.code = 'EINVAL';
+                throw unsupported;
+            },
+        });
+        releasePhase = true;
+
+        const error = await expectCategory(reader.release(), 'recovery');
+
+        expect(error.metadata.operation).toBe('reader-token-release-flush');
+        expect(swapped).toBe(true);
+        fs.rmdirSync(readersDirectory);
+        fs.renameSync(displaced, readersDirectory);
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
+    });
+
+    it('identity-binds downgrade durability and preserves its exact provisional token on refusal', async () => {
+        const gateDirectory = path.join(
+            fs.realpathSync.native(tempDirectory),
+            '.file-state.sqlite3.recovery-gate',
+        );
+        const readersDirectory = path.join(gateDirectory, 'readers');
+        const displaced = path.join(gateDirectory, 'readers-displaced');
+        let downgradePhase = false;
+        let swapped = false;
+        let replacement: fs.BigIntStats | undefined;
+        let wrongDescriptorFsync = false;
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath(), {
+            beforeDirectoryFsyncOpen(directoryPath) {
+                if (!downgradePhase || swapped || directoryPath !== readersDirectory) return;
+                fs.renameSync(readersDirectory, displaced);
+                fs.mkdirSync(readersDirectory, { mode: 0o700 });
+                replacement = fs.lstatSync(readersDirectory, { bigint: true });
+                swapped = true;
+            },
+            fsyncDirectory(descriptor) {
+                const opened = fs.fstatSync(descriptor, { bigint: true });
+                if (replacement && opened.dev === replacement.dev && opened.ino === replacement.ino) {
+                    wrongDescriptorFsync = true;
+                }
+                fs.fsyncSync(descriptor);
+            },
+        });
+        downgradePhase = true;
+
+        await expectCategory(exclusive.downgradeToSharedReader(), 'recovery');
+
+        expect(swapped).toBe(true);
+        expect(wrongDescriptorFsync).toBe(false);
+        fs.rmdirSync(readersDirectory);
+        fs.renameSync(displaced, readersDirectory);
+        const [provisionalToken] = exclusive.listReaderTokenIds();
+        expect(provisionalToken).toBeDefined();
+        await exclusive.reclaimStaleReaderToken(
+            provisionalToken,
+            { allProcessesClosed: true },
+        );
+        await exclusive.release();
     });
 
     it('refuses to mutate a replaced readers directory when releasing an exact token', async () => {
@@ -1464,9 +1992,51 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         await initialize();
         const header = read_sqlite_raw_header(databasePath(), SQLITE_FILE_STATE_APPLICATION_ID);
         expect(header.applicationId).toBe(SQLITE_FILE_STATE_APPLICATION_ID);
+        expect(header.userVersion).toBe(1);
         expect(header.pageSize).toBeGreaterThanOrEqual(512);
         expect(header.writeVersion).toBe(1);
         expect(header.readVersion).toBe(1);
+    });
+
+    it('retries raw preflight when the inventoried main incarnation is replaced', async () => {
+        await initialize();
+        const originalPath = databasePath('inventoried-main.sqlite3');
+        const replacementPath = databasePath('replacement-main.sqlite3');
+        fs.copyFileSync(databasePath(), replacementPath);
+        const replacementDatabase = new DatabaseSync(replacementPath);
+        replacementDatabase.exec('PRAGMA application_id = 12345');
+        replacementDatabase.close();
+        expect(fs.statSync(replacementPath).size).toBe(fs.statSync(databasePath()).size);
+        const replacementBefore = fs.readFileSync(replacementPath);
+        let swapped = false;
+        let restored = false;
+        let retryCount = 0;
+
+        const opened = await open_existing_sqlite_database(databasePath(), {
+            onEvent(event) {
+                if (event === 'inventory-complete' && !swapped) {
+                    fs.renameSync(databasePath(), originalPath);
+                    fs.renameSync(replacementPath, databasePath());
+                    swapped = true;
+                }
+                if (event === 'hot-journal-copy-retrying' && swapped && !restored) {
+                    retryCount += 1;
+                    fs.renameSync(databasePath(), replacementPath);
+                    fs.renameSync(originalPath, databasePath());
+                    restored = true;
+                }
+            },
+        });
+        await opened.close();
+
+        expect(swapped).toBe(true);
+        expect(restored).toBe(true);
+        expect(retryCount).toBe(1);
+        expect(read_sqlite_raw_header(
+            databasePath(),
+            SQLITE_FILE_STATE_APPLICATION_ID,
+        ).applicationId).toBe(SQLITE_FILE_STATE_APPLICATION_ID);
+        expect(fs.readFileSync(replacementPath)).toEqual(replacementBefore);
     });
 
     it('rejects non-rollback journal header versions before SQLite open', async () => {
@@ -1547,6 +2117,888 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         }), 'unsupported');
         expect(unsupported.message).not.toContain(nativePath);
         expect((unsupported as Error & { cause?: unknown }).cause).toBeUndefined();
+    });
+
+    it('permits only categorized unsupported directory durability in best-effort mode', async () => {
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath(), {
+            directoryDurabilityPolicy: 'best-effort',
+            fsyncDirectory() {
+                const error = new Error('simulated unsupported directory fsync') as NodeJS.ErrnoException;
+                error.code = 'EINVAL';
+                throw error;
+            },
+        });
+        await reader.release();
+
+        const unrelated = await expectCategory(acquire_sqlite_shared_reader_gate(
+            databasePath('unrelated.sqlite3'),
+            {
+                directoryDurabilityPolicy: 'best-effort',
+                fsyncDirectory() {
+                    throw new SqliteFileStateError('unsupported', {
+                        operation: 'unrelated-durability',
+                    });
+                },
+            },
+        ), 'unsupported');
+        expect(unrelated.metadata.operation).toBe('unrelated-durability');
+    });
+
+    it.each([
+        ['EACCES', 'inaccessible'],
+        ['ENOSPC', 'full'],
+        ['EIO', 'io'],
+    ] as const)('does not suppress %s directory failures in best-effort mode', async (code, category) => {
+        const error = await expectCategory(acquire_sqlite_shared_reader_gate(
+            databasePath(`${code}.sqlite3`),
+            {
+                directoryDurabilityPolicy: 'best-effort',
+                fsyncDirectory() {
+                    const native = new Error(`simulated ${code}`) as NodeJS.ErrnoException;
+                    native.code = code;
+                    throw native;
+                },
+            },
+        ), category);
+        expect(error.cause).toBeUndefined();
+    });
+
+    it.each([
+        {
+            label: 'wrong application ID',
+            configure(database: DatabaseSync) { database.exec('PRAGMA application_id = 12345'); },
+            options: {},
+        },
+        {
+            label: 'wrong user version',
+            configure(database: DatabaseSync) { database.exec('PRAGMA user_version = 2'); },
+            options: { expectedUserVersion: 1 },
+        },
+    ])('rejects a hot-journal database with $label before canonical recovery', async ({
+        configure,
+        options,
+    }) => {
+        await initialize();
+        const database = new DatabaseSync(databasePath());
+        configure(database);
+        database.close();
+        await createHotRollbackJournal();
+        const journalPath = `${databasePath()}-journal`;
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalBefore = fs.readFileSync(journalPath);
+        let writableOpenObserved = false;
+
+        await expectCategory(open_existing_sqlite_database(databasePath(), {
+            ...options,
+            onEvent(event) {
+                if (event === 'hot-journal-before-writable-open') writableOpenObserved = true;
+            },
+        }), 'schema');
+
+        expect(writableOpenObserved).toBe(false);
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+    });
+
+    it('returns a stable cold-journal schema failure without waiting on unrelated readers', async () => {
+        await initialize();
+        const database = new DatabaseSync(databasePath());
+        database.exec('PRAGMA user_version = 2');
+        database.close();
+        const journalPath = `${databasePath()}-journal`;
+        fs.writeFileSync(journalPath, 'cold-journal-evidence');
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalBefore = fs.readFileSync(journalPath);
+        const competingReader = await acquire_sqlite_shared_reader_gate(databasePath());
+        let exclusiveIntentPublished = false;
+
+        const error = await expectCategory(open_existing_sqlite_database(databasePath(), {
+            expectedUserVersion: 1,
+            onEvent(event) {
+                if (event === 'exclusive-after-intent-flush') exclusiveIntentPublished = true;
+            },
+        }), 'schema');
+
+        expect(error.metadata.operation).toBe('exact-user-version');
+        expect(exclusiveIntentPublished).toBe(false);
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds)
+            .toEqual([competingReader.tokenId]);
+        await competingReader.release();
+    });
+
+    it('raw-rejects a WAL-mode main with journal evidence without creating sidecars', async () => {
+        await initialize();
+        const database = new DatabaseSync(databasePath());
+        expect(database.prepare('PRAGMA journal_mode = WAL').get()?.journal_mode).toBe('wal');
+        database.close();
+        expect(fs.existsSync(`${databasePath()}-wal`)).toBe(false);
+        expect(fs.existsSync(`${databasePath()}-shm`)).toBe(false);
+        const journalPath = `${databasePath()}-journal`;
+        fs.writeFileSync(journalPath, 'rollback-journal-evidence');
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalBefore = fs.readFileSync(journalPath);
+
+        await expectCategory(open_existing_sqlite_database(databasePath()), 'schema');
+
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        expect(fs.existsSync(`${databasePath()}-wal`)).toBe(false);
+        expect(fs.existsSync(`${databasePath()}-shm`)).toBe(false);
+    });
+
+    it('escalates hot-journal recovery, drains competing readers, and downgrades the returned open', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const competingReader = await acquire_sqlite_shared_reader_gate(databasePath());
+        const waiting = deferred();
+        const events: SqliteOpenRecoveryEvent[] = [];
+        let exclusiveHeldAtWritableOpen = false;
+
+        const openPromise = open_existing_sqlite_database(databasePath(), {
+            expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+            expectedUserVersion: 1,
+            timeoutMs: 10_000,
+            onEvent(event) {
+                events.push(event);
+                if (event === 'exclusive-waiting-for-readers') waiting.resolve();
+                if (event === 'hot-journal-before-writable-open') {
+                    const gate = inspect_sqlite_recovery_gate(databasePath());
+                    exclusiveHeldAtWritableOpen = gate.exclusiveIntentTokenId !== undefined
+                        && gate.readerTokenIds.length === 0;
+                }
+            },
+            validate(database) {
+                expect(database.prepare(
+                    'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                ).get()?.next_revision).toBe(1);
+            },
+        });
+
+        await waiting.promise;
+        expect(events).toContain('hot-journal-copy-after-main');
+        expect(events).not.toContain('hot-journal-before-writable-open');
+        expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+            readerTokenIds: [competingReader.tokenId],
+        });
+        await competingReader.release();
+
+        const opened = await openPromise;
+        try {
+            expect(exclusiveHeldAtWritableOpen).toBe(true);
+            expect(events.indexOf('exclusive-readers-drained')).toBeLessThan(
+                events.lastIndexOf('hot-journal-copy-after-main'),
+            );
+            const gate = inspect_sqlite_recovery_gate(databasePath());
+            expect(gate.exclusiveIntentTokenId).toBeUndefined();
+            expect(gate.readerTokenIds).toHaveLength(1);
+        } finally {
+            await opened.close();
+            await opened.close();
+        }
+        const releasedGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(releasedGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(releasedGate.readerTokenIds).toEqual([]);
+    });
+
+    it('coordinates two simultaneous shared escalators behind one exclusive intent', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const bothCopied = deferred();
+        let copiedSnapshots = 0;
+        let exclusiveIntentPublications = 0;
+        const options = {
+            timeoutMs: 10_000,
+            async onEvent(event: SqliteOpenRecoveryEvent) {
+                if (event === 'hot-journal-copy-after-journal' && copiedSnapshots < 2) {
+                    copiedSnapshots += 1;
+                    if (copiedSnapshots === 2) bothCopied.resolve();
+                    await bothCopied.promise;
+                }
+                if (event === 'exclusive-after-intent-flush') {
+                    exclusiveIntentPublications += 1;
+                }
+            },
+        };
+
+        const [first, second] = await Promise.all([
+            open_existing_sqlite_database(databasePath(), options),
+            open_existing_sqlite_database(databasePath(), options),
+        ]);
+        try {
+            expect(copiedSnapshots).toBe(2);
+            expect(exclusiveIntentPublications).toBe(1);
+            expect(fs.existsSync(`${databasePath()}-journal`)).toBe(false);
+            expect(inspect_sqlite_recovery_gate(databasePath())).toMatchObject({
+                readerTokenIds: expect.arrayContaining([
+                    expect.any(String),
+                    expect.any(String),
+                ]),
+            });
+            expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toHaveLength(2);
+        } finally {
+            await first.close();
+            await second.close();
+        }
+        const releasedGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(releasedGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(releasedGate.readerTokenIds).toEqual([]);
+    });
+
+    it.each([
+        ['no identity options', {}],
+        ['expected version without validator', { expectedUserVersion: 1 }],
+    ] as const)('serializes hot recovery with competing readers using %s', async (_label, identityOptions) => {
+        await initialize();
+        await createHotRollbackJournal();
+        const competingReader = await acquire_sqlite_shared_reader_gate(databasePath());
+        const waiting = deferred();
+        let canonicalWritableOpenObserved = false;
+
+        const openPromise = open_existing_sqlite_database(databasePath(), {
+            ...identityOptions,
+            timeoutMs: 10_000,
+            onEvent(event) {
+                if (event === 'exclusive-waiting-for-readers') waiting.resolve();
+                if (event === 'hot-journal-before-writable-open') {
+                    canonicalWritableOpenObserved = true;
+                }
+            },
+        });
+
+        await waiting.promise;
+        expect(canonicalWritableOpenObserved).toBe(false);
+        await competingReader.release();
+        const opened = await openPromise;
+        try {
+            expect(opened.database.prepare(
+                'SELECT next_revision FROM state_meta WHERE singleton = 1',
+            ).get()?.next_revision).toBe(1);
+        } finally {
+            await opened.close();
+        }
+    });
+
+    it('times out reader drain before canonical recovery and leaves hot-journal evidence untouched', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalPath = `${databasePath()}-journal`;
+        const journalBefore = fs.readFileSync(journalPath);
+        const competingReader = await acquire_sqlite_shared_reader_gate(databasePath());
+        let monotonicMs = 0;
+        let writableOpenObserved = false;
+        let privateCopyObserved = false;
+
+        const error = await expectCategory(open_existing_sqlite_database(databasePath(), {
+            expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+            expectedUserVersion: 1,
+            timeoutMs: 5,
+            monotonicNow: () => monotonicMs,
+            onEvent(event) {
+                if (event === 'hot-journal-copy-after-main') privateCopyObserved = true;
+                if (event === 'hot-journal-before-writable-open') writableOpenObserved = true;
+            },
+            yieldControl() {
+                monotonicMs = 5;
+            },
+            validate(database) {
+                database.prepare('SELECT next_revision FROM state_meta WHERE singleton = 1').get();
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('exclusive-gate-timeout');
+        expect(privateCopyObserved).toBe(true);
+        expect(writableOpenObserved).toBe(false);
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        const timedOutGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(timedOutGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(timedOutGate.readerTokenIds).toEqual([competingReader.tokenId]);
+        await competingReader.release();
+    });
+
+    it('uses a finite default deadline for omitted-timeout hot-journal escalation', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalPath = `${databasePath()}-journal`;
+        const journalBefore = fs.readFileSync(journalPath);
+        const competingReader = await acquire_sqlite_shared_reader_gate(databasePath());
+        let monotonicMs = 0;
+        let yieldCount = 0;
+
+        const error = await expectCategory(open_existing_sqlite_database(databasePath(), {
+            monotonicNow: () => monotonicMs,
+            yieldControl() {
+                yieldCount += 1;
+                monotonicMs = 1_000_000;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('exclusive-gate-timeout');
+        expect(yieldCount).toBe(1);
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        const timedOutGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(timedOutGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(timedOutGate.readerTokenIds).toEqual([competingReader.tokenId]);
+        await competingReader.release();
+    });
+
+    it('refuses hot recovery under a caller-owned shared gate without changing its ownership', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const mainBefore = fs.readFileSync(databasePath());
+        const journalPath = `${databasePath()}-journal`;
+        const journalBefore = fs.readFileSync(journalPath);
+        const reader = await acquire_sqlite_shared_reader_gate(databasePath());
+
+        const error = await expectCategory(initialize_sqlite_database_no_clobber(
+            databasePath(),
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+            { gate: reader, timeoutMs: 1_000 },
+        ), 'recovery');
+
+        expect(error.metadata.operation).toBe('hot-journal-exclusive-required');
+        expect(fs.readFileSync(databasePath())).toEqual(mainBefore);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        const retainedGate = inspect_sqlite_recovery_gate(databasePath());
+        expect(retainedGate.exclusiveIntentTokenId).toBeUndefined();
+        expect(retainedGate.readerTokenIds).toEqual([reader.tokenId]);
+        await reader.release();
+    });
+
+    it('keeps a caller-owned exclusive gate exclusive after hot recovery', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        await exclusive.waitForReaders();
+
+        const result = await initialize_sqlite_database_no_clobber(
+            databasePath(),
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+            { gate: exclusive, timeoutMs: 1_000 },
+        );
+        try {
+            const retainedGate = inspect_sqlite_recovery_gate(databasePath());
+            expect(retainedGate.exclusiveIntentTokenId).toBe(exclusive.tokenId);
+            expect(retainedGate.readerTokenIds).toEqual([]);
+        } finally {
+            await result.database.close();
+        }
+        expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentTokenId)
+            .toBe(exclusive.tokenId);
+        await exclusive.release();
+    });
+
+    it('applies an explicit zero deadline to caller-owned exclusive cold-journal retries', async () => {
+        await initialize();
+        const journalPath = `${databasePath()}-journal`;
+        const originalJournalPath = `${journalPath}.original`;
+        fs.writeFileSync(journalPath, 'cold-journal-evidence');
+        const journalBefore = fs.readFileSync(journalPath);
+        const exclusive = await acquire_sqlite_exclusive_recovery_gate(databasePath());
+        await exclusive.waitForReaders();
+        let replaced = false;
+        let retryEvents = 0;
+
+        const error = await expectCategory(initialize_sqlite_database_no_clobber(
+            databasePath(),
+            identity,
+            { appliedAtMs: 100, appVersion: '0.7.0' },
+            {
+                gate: exclusive,
+                timeoutMs: 0,
+                monotonicNow: () => 0,
+                onEvent(event) {
+                    if (event === 'hot-journal-copy-after-main' && !replaced) {
+                        fs.renameSync(journalPath, originalJournalPath);
+                        fs.writeFileSync(journalPath, 'replacement-evidence');
+                        replaced = true;
+                    }
+                    if (event === 'hot-journal-copy-retrying') retryEvents += 1;
+                },
+            },
+        ), 'contention');
+
+        expect(error.metadata.operation).toBe('hot-journal-copy-timeout');
+        expect(replaced).toBe(true);
+        expect(retryEvents).toBe(0);
+        expect(inspect_sqlite_recovery_gate(databasePath()).exclusiveIntentTokenId)
+            .toBe(exclusive.tokenId);
+        fs.unlinkSync(journalPath);
+        fs.renameSync(originalJournalPath, journalPath);
+        expect(fs.readFileSync(journalPath)).toEqual(journalBefore);
+        await exclusive.release();
+    });
+
+    it.skipIf(process.platform === 'win32')(
+        'restarts from fresh inventory when the journal is removed after the main copy',
+        async () => {
+            await initialize();
+            await createHotRollbackJournal();
+            const journalPath = `${databasePath()}-journal`;
+            const validatedRevisions: number[] = [];
+            let removedAfterMain = false;
+            let retryCount = 0;
+            let validationsAtRetry = -1;
+            let recoveredMain: Buffer | undefined;
+
+            const opened = await open_existing_sqlite_database(databasePath(), {
+                expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+                expectedUserVersion: 1,
+                timeoutMs: 1_000,
+                monotonicNow: () => 0,
+                onEvent(event) {
+                    if (event === 'hot-journal-copy-after-main' && !removedAfterMain) {
+                        removedAfterMain = true;
+                        const writer = new DatabaseSync(databasePath());
+                        writer.prepare('SELECT next_revision FROM state_meta WHERE singleton = 1').get();
+                        writer.close();
+                        if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath);
+                        recoveredMain = fs.readFileSync(databasePath());
+                    }
+                    if (event === 'hot-journal-copy-retrying') {
+                        retryCount += 1;
+                        validationsAtRetry = validatedRevisions.length;
+                    }
+                },
+                validate(database) {
+                    validatedRevisions.push(Number(database.prepare(
+                        'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                    ).get()?.next_revision));
+                },
+            });
+            try {
+                expect(removedAfterMain).toBe(true);
+                expect(retryCount).toBe(1);
+                expect(validationsAtRetry).toBe(0);
+                expect(validatedRevisions.length).toBeGreaterThan(0);
+                expect(validatedRevisions.every((revision) => revision === 1)).toBe(true);
+                expect(fs.readFileSync(databasePath())).toEqual(recoveredMain);
+                expect(opened.inventory.journal).toBeUndefined();
+            } finally {
+                await opened.close();
+            }
+        },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+        'rejects a replacement journal and new transaction between descriptor copies',
+        async () => {
+            await initialize();
+            await createHotRollbackJournal();
+            const journalPath = `${databasePath()}-journal`;
+            const originalJournalIdentity = fs.lstatSync(journalPath, { bigint: true });
+            const validatedRevisions: number[] = [];
+            let replacementWriter: DatabaseSync | undefined;
+            let replacementJournal: Buffer | undefined;
+            let replacementJournalIdentity: fs.BigIntStats | undefined;
+            let replacementObservedIntact = false;
+            let retryCount = 0;
+            let validationsAtRetry = -1;
+
+            let opened: Awaited<ReturnType<typeof open_existing_sqlite_database>> | undefined;
+            try {
+                opened = await open_existing_sqlite_database(databasePath(), {
+                    expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+                    expectedUserVersion: 1,
+                    timeoutMs: 1_000,
+                    monotonicNow: () => 0,
+                    onEvent(event) {
+                        if (event === 'hot-journal-copy-after-main' && !replacementWriter) {
+                            replacementWriter = new DatabaseSync(databasePath());
+                            replacementWriter.exec(`BEGIN IMMEDIATE;
+                                UPDATE state_meta SET next_revision = 3 WHERE singleton = 1`);
+                            replacementJournal = fs.readFileSync(journalPath);
+                            replacementJournalIdentity = fs.lstatSync(journalPath, { bigint: true });
+                            return;
+                        }
+                        if (event === 'hot-journal-copy-retrying' && replacementWriter) {
+                            retryCount += 1;
+                            validationsAtRetry = validatedRevisions.length;
+                            const current = fs.lstatSync(journalPath, { bigint: true });
+                            replacementObservedIntact = current.dev === replacementJournalIdentity?.dev
+                                && current.ino === replacementJournalIdentity.ino
+                                && fs.readFileSync(journalPath).equals(replacementJournal!);
+                            replacementWriter.exec('ROLLBACK');
+                            replacementWriter.close();
+                            replacementWriter = undefined;
+                        }
+                    },
+                    validate(database) {
+                        validatedRevisions.push(Number(database.prepare(
+                            'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                        ).get()?.next_revision));
+                    },
+                });
+
+                expect(replacementJournal).toBeDefined();
+                expect(replacementJournalIdentity).toBeDefined();
+                expect(replacementJournalIdentity?.ino).not.toBe(originalJournalIdentity.ino);
+                expect(retryCount).toBe(1);
+                expect(validationsAtRetry).toBe(0);
+                expect(replacementObservedIntact).toBe(true);
+                expect(validatedRevisions.length).toBeGreaterThan(0);
+                expect(validatedRevisions.every((revision) => revision === 1)).toBe(true);
+            } finally {
+                if (replacementWriter) {
+                    try { replacementWriter.exec('ROLLBACK'); } catch { /* Preserve the test failure. */ }
+                    replacementWriter.close();
+                }
+                await opened?.close();
+            }
+        },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+        'retries a constructor failure when its retained source fence changed',
+        async () => {
+            await initialize();
+            await createHotRollbackJournal();
+            const journalPath = `${databasePath()}-journal`;
+            const displacedJournalPath = `${journalPath}.constructor-displaced`;
+            const originalJournal = fs.readFileSync(journalPath);
+            const replacementJournal = Buffer.alloc(originalJournal.length, 0x5a);
+            let constructorCalls = 0;
+            let replacementObservedIntact = false;
+            let retryCount = 0;
+            let validationCount = 0;
+
+            const opened = await open_existing_sqlite_database(databasePath(), {
+                expectedUserVersion: 1,
+                timeoutMs: 1_000,
+                monotonicNow: () => 0,
+                openWritableDatabase(location, databaseOptions) {
+                    constructorCalls += 1;
+                    if (constructorCalls === 1) {
+                        fs.renameSync(journalPath, displacedJournalPath);
+                        fs.writeFileSync(journalPath, replacementJournal);
+                        throw new Error('injected constructor failure');
+                    }
+                    return new DatabaseSync(location, databaseOptions);
+                },
+                onEvent(event) {
+                    if (event === 'hot-journal-copy-retrying'
+                        && fs.existsSync(displacedJournalPath)) {
+                        retryCount += 1;
+                        replacementObservedIntact = fs.readFileSync(journalPath)
+                            .equals(replacementJournal);
+                        fs.unlinkSync(journalPath);
+                        fs.renameSync(displacedJournalPath, journalPath);
+                    }
+                },
+                validate(database) {
+                    validationCount += 1;
+                    expect(database.prepare(
+                        'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                    ).get()?.next_revision).toBe(1);
+                },
+            });
+            try {
+                expect(constructorCalls).toBe(2);
+                expect(retryCount).toBe(1);
+                expect(replacementObservedIntact).toBe(true);
+                expect(validationCount).toBe(4);
+            } finally {
+                await opened.close();
+            }
+        },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+        'rejects a journal replacement immediately before the canonical writable open',
+        async () => {
+            await initialize();
+            await createHotRollbackJournal();
+            const journalPath = `${databasePath()}-journal`;
+            const displacedJournalPath = `${journalPath}.displaced`;
+            const originalJournal = fs.readFileSync(journalPath);
+            const replacementJournal = Buffer.alloc(originalJournal.length, 0x5a);
+            let replacementInstalled = false;
+            let replacementObservedIntact = false;
+            let retryCount = 0;
+            let writableConstructorsBeforeRetry = -1;
+            let writableConstructorCount = 0;
+            let validationCount = 0;
+
+            const opened = await open_existing_sqlite_database(databasePath(), {
+                expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+                expectedUserVersion: 1,
+                timeoutMs: 1_000,
+                monotonicNow: () => 0,
+                onEvent(event) {
+                    if (event === 'hot-journal-before-writable-open' && !replacementInstalled) {
+                        replacementInstalled = true;
+                        fs.renameSync(journalPath, displacedJournalPath);
+                        fs.writeFileSync(journalPath, replacementJournal);
+                        return;
+                    }
+                    if (event === 'hot-journal-after-writable-open') {
+                        writableConstructorCount += 1;
+                    }
+                    if (event === 'hot-journal-copy-retrying' && replacementInstalled) {
+                        retryCount += 1;
+                        writableConstructorsBeforeRetry = writableConstructorCount;
+                        replacementObservedIntact = fs.readFileSync(journalPath)
+                            .equals(replacementJournal);
+                        fs.unlinkSync(journalPath);
+                        fs.renameSync(displacedJournalPath, journalPath);
+                    }
+                },
+                validate(database) {
+                    validationCount += 1;
+                    expect(database.prepare(
+                        'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                    ).get()?.next_revision).toBe(1);
+                },
+            });
+            try {
+                expect(replacementInstalled).toBe(true);
+                expect(replacementObservedIntact).toBe(true);
+                expect(retryCount).toBe(1);
+                expect(writableConstructorsBeforeRetry).toBe(0);
+                expect(validationCount).toBe(4);
+            } finally {
+                await opened.close();
+            }
+        },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+        'closes an unqueried canonical connection when the main is replaced after construction',
+        async () => {
+            await initialize();
+            await createHotRollbackJournal();
+            const displacedMainPath = `${databasePath()}.displaced`;
+            const originalMain = fs.readFileSync(databasePath());
+            const journalPath = `${databasePath()}-journal`;
+            const originalJournal = fs.readFileSync(journalPath);
+            const replacementMain = Buffer.alloc(originalMain.length, 0x5a);
+            let replacementInstalled = false;
+            let replacementObservedIntact = false;
+            let journalObservedIntact = false;
+            let retryCount = 0;
+            let validationCount = 0;
+
+            const opened = await open_existing_sqlite_database(databasePath(), {
+                expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+                expectedUserVersion: 1,
+                timeoutMs: 1_000,
+                monotonicNow: () => 0,
+                onEvent(event) {
+                    if (event === 'hot-journal-after-writable-open' && !replacementInstalled) {
+                        replacementInstalled = true;
+                        fs.renameSync(databasePath(), displacedMainPath);
+                        fs.writeFileSync(databasePath(), replacementMain);
+                        return;
+                    }
+                    if (event === 'hot-journal-copy-retrying' && replacementInstalled) {
+                        retryCount += 1;
+                        replacementObservedIntact = fs.readFileSync(databasePath())
+                            .equals(replacementMain);
+                        journalObservedIntact = fs.readFileSync(journalPath)
+                            .equals(originalJournal);
+                        fs.unlinkSync(databasePath());
+                        fs.renameSync(displacedMainPath, databasePath());
+                    }
+                },
+                validate(database) {
+                    validationCount += 1;
+                    expect(database.prepare(
+                        'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                    ).get()?.next_revision).toBe(1);
+                },
+            });
+            try {
+                expect(replacementInstalled).toBe(true);
+                expect(replacementObservedIntact).toBe(true);
+                expect(journalObservedIntact).toBe(true);
+                expect(retryCount).toBe(1);
+                expect(validationCount).toBe(4);
+            } finally {
+                await opened.close();
+            }
+        },
+    );
+
+    it('detects a same-inode, same-size journal rewrite by content and retries fresh validation', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const journalPath = `${databasePath()}-journal`;
+        const originalJournal = fs.readFileSync(journalPath);
+        const mutatedJournal = Buffer.from(originalJournal);
+        mutatedJournal[Math.min(100, mutatedJournal.length - 1)] ^= 0xff;
+        const originalIdentity = fs.lstatSync(journalPath, { bigint: true });
+        const validatedRevisions: number[] = [];
+        let mutated = false;
+        let mutationObservedIntact = false;
+        let retryCount = 0;
+        let validationsAtRetry = -1;
+
+        const opened = await open_existing_sqlite_database(databasePath(), {
+            expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+            expectedUserVersion: 1,
+            timeoutMs: 1_000,
+            monotonicNow: () => 0,
+            onEvent(event) {
+                if (event === 'hot-journal-copy-after-main' && !mutated) {
+                    mutated = true;
+                    writeInPlace(journalPath, mutatedJournal);
+                    return;
+                }
+                if (event === 'hot-journal-copy-retrying' && mutated) {
+                    retryCount += 1;
+                    validationsAtRetry = validatedRevisions.length;
+                    const currentIdentity = fs.lstatSync(journalPath, { bigint: true });
+                    mutationObservedIntact = currentIdentity.dev === originalIdentity.dev
+                        && currentIdentity.ino === originalIdentity.ino
+                        && currentIdentity.size === originalIdentity.size
+                        && fs.readFileSync(journalPath).equals(mutatedJournal);
+                    writeInPlace(journalPath, originalJournal);
+                }
+            },
+            validate(database) {
+                validatedRevisions.push(Number(database.prepare(
+                    'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                ).get()?.next_revision));
+            },
+        });
+        try {
+            expect(mutated).toBe(true);
+            expect(retryCount).toBe(1);
+            expect(validationsAtRetry).toBe(0);
+            expect(mutationObservedIntact).toBe(true);
+            expect(validatedRevisions).toEqual([1, 1, 1]);
+        } finally {
+            await opened.close();
+        }
+    });
+
+    it('retries when the source changes while private exact validation is failing', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const journalPath = `${databasePath()}-journal`;
+        const originalJournal = fs.readFileSync(journalPath);
+        const mutatedJournal = Buffer.from(originalJournal);
+        mutatedJournal[Math.min(200, mutatedJournal.length - 1)] ^= 0xff;
+        let validationAttempts = 0;
+        let retryCount = 0;
+        let mutationObservedAtRetry = false;
+
+        const opened = await open_existing_sqlite_database(databasePath(), {
+            expectedApplicationId: SQLITE_FILE_STATE_APPLICATION_ID,
+            expectedUserVersion: 1,
+            timeoutMs: 1_000,
+            monotonicNow: () => 0,
+            onEvent(event) {
+                if (event !== 'hot-journal-copy-retrying') return;
+                retryCount += 1;
+                mutationObservedAtRetry = fs.readFileSync(journalPath).equals(mutatedJournal);
+                writeInPlace(journalPath, originalJournal);
+            },
+            validate(database) {
+                validationAttempts += 1;
+                if (validationAttempts === 1) {
+                    writeInPlace(journalPath, mutatedJournal);
+                    throw new SqliteFileStateError('schema', {
+                        operation: 'injected-private-validation',
+                    });
+                }
+                expect(database.prepare(
+                    'SELECT next_revision FROM state_meta WHERE singleton = 1',
+                ).get()?.next_revision).toBe(1);
+            },
+        });
+        try {
+            expect(retryCount).toBe(1);
+            expect(mutationObservedAtRetry).toBe(true);
+            expect(validationAttempts).toBe(4);
+        } finally {
+            await opened.close();
+        }
+    });
+
+    it('emits one retry event per attempted retry and none for exhaustion', async () => {
+        await initialize();
+        await createHotRollbackJournal();
+        const journalPath = `${databasePath()}-journal`;
+        const firstJournal = fs.readFileSync(journalPath);
+        const secondJournal = Buffer.from(firstJournal);
+        secondJournal[Math.min(300, secondJournal.length - 1)] ^= 0xff;
+        let useSecondJournal = true;
+        let copyAttempts = 0;
+        let retryEvents = 0;
+
+        const error = await expectCategory(open_existing_sqlite_database(databasePath(), {
+            expectedUserVersion: 1,
+            timeoutMs: 1_000,
+            monotonicNow: () => 0,
+            onEvent(event) {
+                if (event === 'hot-journal-copy-after-main') {
+                    copyAttempts += 1;
+                    writeInPlace(journalPath, useSecondJournal ? secondJournal : firstJournal);
+                    useSecondJournal = !useSecondJournal;
+                }
+                if (event === 'hot-journal-copy-retrying') retryEvents += 1;
+            },
+        }), 'contention');
+
+        expect(error.metadata.operation).toBe('hot-journal-copy-timeout');
+        expect(copyAttempts).toBe(9);
+        expect(retryEvents).toBe(8);
+        writeInPlace(journalPath, firstJournal);
+    });
+
+    it('retains recovery durability hooks across replacement connection opens', async () => {
+        await initialize();
+        let fsyncCalls = 0;
+        const fsyncDirectory = () => {
+            fsyncCalls += 1;
+            const error = new Error('simulated unsupported directory fsync') as NodeJS.ErrnoException;
+            error.code = 'EINVAL';
+            throw error;
+        };
+        const opened = await open_existing_sqlite_database(databasePath(), {
+            directoryDurabilityPolicy: 'best-effort',
+            fsyncDirectory,
+        });
+        const callsBeforeReplacement = fsyncCalls;
+        const replacement = await opened.replaceConnection();
+        try {
+            expect(fsyncCalls).toBeGreaterThan(callsBeforeReplacement);
+            expect(replacement.database.prepare('PRAGMA user_version').get()?.user_version).toBe(1);
+        } finally {
+            await replacement.close();
+        }
+    });
+
+    it('reserves replacement connection token transfer before concurrent callers can race', async () => {
+        await initialize();
+        const opened = await open_existing_sqlite_database(databasePath());
+
+        const replacements = await Promise.allSettled([
+            opened.replaceConnection(),
+            opened.replaceConnection(),
+        ]);
+
+        const fulfilled = replacements.filter((result) => result.status === 'fulfilled');
+        const rejected = replacements.filter((result) => result.status === 'rejected');
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+        expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(SqliteFileStateError);
+        expect(((rejected[0] as PromiseRejectedResult).reason as SqliteFileStateError).metadata.operation)
+            .toBe('sqlite-replace-connection');
+        const replacement = (fulfilled[0] as PromiseFulfilledResult<
+            Awaited<ReturnType<typeof open_existing_sqlite_database>>
+        >).value;
+        expect(replacement.database.prepare('PRAGMA user_version').get()?.user_version).toBe(1);
+        await replacement.close();
+        expect(inspect_sqlite_recovery_gate(databasePath()).readerTokenIds).toEqual([]);
     });
 
     it('uses a non-creating read-write open to recover a branded hot rollback journal', async () => {

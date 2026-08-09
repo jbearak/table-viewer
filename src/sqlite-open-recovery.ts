@@ -1,12 +1,16 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import * as os from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import {
     initialize_sqlite_file_state_schema,
+    is_direct_vscode_file_state_identity,
     SQLITE_FILE_STATE_APPLICATION_ID,
     SQLITE_FILE_STATE_PROTOCOL_VERSION,
+    sqlite_file_state_schema_identity,
     type SqliteFileStateIdentity,
     type SqliteFileStateMigrationOptions,
 } from './sqlite-file-state-schema';
@@ -21,6 +25,7 @@ import { validate_sqlite_file_state_database } from './sqlite-file-state-validat
 
 const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
 const SQLITE_HEADER_BYTES = 100;
+const USER_VERSION_OFFSET = 60;
 const APPLICATION_ID_OFFSET = 68;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -32,6 +37,7 @@ const CANDIDATE_MARKER = '.init-candidate.';
 const RECOVERY_MARKER = '.recovery.';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF']);
+const DEFAULT_READER_GATE_TIMEOUT_MS = 5_000;
 
 export const SQLITE_INITIALIZATION_DURABLE_CUT_POINTS = [
     'candidate-after-schema',
@@ -66,6 +72,8 @@ export type SqliteOpenRecoveryEvent =
     | 'exclusive-after-intent-flush'
     | 'exclusive-waiting-for-readers'
     | 'exclusive-readers-drained'
+    | 'exclusive-downgrade-after-reader-flush'
+    | 'exclusive-downgrade-after-intent-flush'
     | 'inventory-complete'
     | 'candidate-after-schema'
     | 'candidate-after-close'
@@ -74,6 +82,11 @@ export type SqliteOpenRecoveryEvent =
     | 'candidate-before-install'
     | 'candidate-after-install'
     | 'winner-validated'
+    | 'hot-journal-copy-after-main'
+    | 'hot-journal-copy-after-journal'
+    | 'hot-journal-before-writable-open'
+    | 'hot-journal-after-writable-open'
+    | 'hot-journal-copy-retrying'
     | 'preserve-after-recovery-directory-flush'
     | 'preserve-after-manifest-flush'
     | 'preserve-after-blockade-flush'
@@ -83,12 +96,24 @@ export type SqliteOpenRecoveryEvent =
     | 'preserve-after-complete-flush'
     | 'preserve-after-blockade-removal';
 
+export type SqliteDirectoryDurabilityPolicy = 'required' | 'best-effort';
+
 export interface SqliteOpenRecoveryHooks {
     readonly onEvent?: (event: SqliteOpenRecoveryEvent) => void | Promise<void>;
     /** Observable polling hook. The default yields one event-loop turn, never a fixed delay. */
     readonly yieldControl?: () => void | Promise<void>;
     /** Injectable only for deterministic directory-durability failure tests. */
     readonly fsyncDirectory?: (descriptor: number) => void;
+    /** Injectable only for deterministic pathname-swap tests immediately before directory open. */
+    readonly beforeDirectoryFsyncOpen?: (directoryPath: string) => void;
+    /** Required by default; disposable callers may explicitly accept unsupported directory flushes. */
+    readonly directoryDurabilityPolicy?: SqliteDirectoryDurabilityPolicy;
+}
+
+export interface SqliteSharedReaderGateOptions extends SqliteOpenRecoveryHooks {
+    readonly timeoutMs?: number;
+    /** Injectable monotonic clock used only for deterministic retry-deadline tests. */
+    readonly monotonicNow?: () => number;
 }
 
 export interface SqliteBasenameMember {
@@ -112,6 +137,7 @@ export interface SqliteBasenameInventory {
 
 export interface SqliteRawHeader {
     readonly applicationId: number;
+    readonly userVersion: number;
     readonly pageSize: number;
     readonly readVersion: number;
     readonly writeVersion: number;
@@ -136,6 +162,7 @@ export interface ManagedDirectoryIdentity {
 }
 
 interface GateDirectoryIdentities {
+    readonly parent: ManagedDirectoryIdentity;
     readonly gate: ManagedDirectoryIdentity;
     readonly readers: ManagedDirectoryIdentity;
 }
@@ -153,11 +180,21 @@ export interface SqliteExclusiveRecoveryGate {
     readonly tokenId: string;
     listReaderTokenIds(): readonly string[];
     reclaimStaleReaderToken(tokenId: string, confirmation: SqliteAllProcessesClosedConfirmation): Promise<void>;
-    waitForReaders(): Promise<void>;
+    waitForReaders(options?: SqliteSharedReaderGateOptions): Promise<void>;
+    downgradeToSharedReader(): Promise<SqliteSharedReaderGate>;
     release(): Promise<void>;
 }
 
 const exclusiveGateIdentities = new WeakMap<SqliteExclusiveRecoveryGate, GateDirectoryIdentities>();
+
+interface ExclusiveGateControl {
+    waitForReaders(
+        options: SqliteSharedReaderGateOptions | undefined,
+        deadline: ReaderGateDeadline | undefined,
+    ): Promise<void>;
+}
+
+const exclusiveGateControls = new WeakMap<SqliteExclusiveRecoveryGate, ExclusiveGateControl>();
 
 export interface SqliteAllProcessesClosedConfirmation {
     readonly allProcessesClosed: true;
@@ -271,28 +308,36 @@ export interface SqlitePreservationResult {
     readonly memberCount: number;
 }
 
-export interface SqliteOpenExistingOptions extends SqliteOpenRecoveryHooks {
+export interface SqliteOpenExistingOptions extends SqliteSharedReaderGateOptions {
     readonly expectedApplicationId?: number;
+    readonly expectedUserVersion?: number;
     readonly validate?: (database: DatabaseSync) => void;
-    readonly timeoutMs?: number;
+    /** Injectable only for deterministic constructor-handoff race tests. */
+    readonly openWritableDatabase?: (
+        location: string,
+        options: {
+            readonly enableDoubleQuotedStringLiterals: false;
+            readonly timeout: number;
+        },
+    ) => DatabaseSync;
 }
 
-export interface SqliteInitializeOptions extends SqliteOpenRecoveryHooks {
+export interface SqliteInitializeOptions extends SqliteSharedReaderGateOptions {
     readonly expectedApplicationId?: number;
     readonly supportedProtocol?: number;
-    readonly timeoutMs?: number;
     readonly gate?: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate;
+    /** Injectable only for deterministic candidate-install failure tests. */
+    readonly linkCandidate?: (candidatePath: string, canonicalPath: string) => void;
 }
 
-export interface SqlitePreserveOptions extends SqliteOpenRecoveryHooks {
+export interface SqlitePreserveOptions extends SqliteSharedReaderGateOptions {
     readonly gate: SqliteExclusiveRecoveryGate;
 }
 
-export interface SqliteResumeCandidateOptions extends SqliteOpenRecoveryHooks {
+export interface SqliteResumeCandidateOptions extends SqliteSharedReaderGateOptions {
     readonly gate: SqliteExclusiveRecoveryGate;
     readonly expectedApplicationId?: number;
     readonly supportedProtocol?: number;
-    readonly timeoutMs?: number;
 }
 
 export function resolve_sqlite_canonical_path(databasePath: string): string {
@@ -341,6 +386,52 @@ async function yield_control(hooks: SqliteOpenRecoveryHooks | undefined): Promis
         return;
     }
     await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+interface ReaderGateDeadline {
+    readonly deadlineMs: number;
+    readonly now: () => number;
+    lastObservedMs: number;
+}
+
+function create_reader_gate_deadline(
+    options: SqliteSharedReaderGateOptions | undefined,
+): ReaderGateDeadline {
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_READER_GATE_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        throw sqlite_file_state_recovery_error({ operation: 'reader-gate-timeout-config' });
+    }
+    const now = options?.monotonicNow ?? (() => performance.now());
+    const startedAtMs = now();
+    const deadlineMs = startedAtMs + timeoutMs;
+    if (!Number.isFinite(startedAtMs) || !Number.isFinite(deadlineMs)) {
+        throw sqlite_file_state_recovery_error({ operation: 'reader-gate-clock' });
+    }
+    return { deadlineMs, now, lastObservedMs: startedAtMs };
+}
+
+function reader_gate_deadline_expired(deadline: ReaderGateDeadline | undefined): boolean {
+    if (!deadline) return false;
+    const observedMs = deadline.now();
+    if (!Number.isFinite(observedMs) || observedMs < deadline.lastObservedMs) {
+        throw sqlite_file_state_recovery_error({ operation: 'reader-gate-clock' });
+    }
+    deadline.lastObservedMs = observedMs;
+    return observedMs >= deadline.deadlineMs;
+}
+
+async function retry_sqlite_shared_reader_gate(
+    options: SqliteSharedReaderGateOptions | undefined,
+    deadline: ReaderGateDeadline | undefined,
+): Promise<void> {
+    await emit(options, 'reader-retrying');
+    if (reader_gate_deadline_expired(deadline)) {
+        throw sqlite_file_state_error('contention', { operation: 'reader-gate-timeout' });
+    }
+    await yield_control(options);
+    if (reader_gate_deadline_expired(deadline)) {
+        throw sqlite_file_state_error('contention', { operation: 'reader-gate-timeout' });
+    }
 }
 
 function is_node_error(error: unknown): error is NodeJS.ErrnoException {
@@ -404,6 +495,18 @@ function capture_managed_directory(
     };
 }
 
+function capture_managed_directory_at_path(
+    directoryPath: string,
+    operation: string,
+): ManagedDirectoryIdentity {
+    const resolved = path.resolve(directoryPath);
+    return capture_managed_directory(
+        resolved,
+        fs.realpathSync.native(path.dirname(resolved)),
+        operation,
+    );
+}
+
 function assert_managed_directory(identity: ManagedDirectoryIdentity, operation: string): void {
     const actual = capture_managed_directory(
         identity.directoryPath,
@@ -437,6 +540,11 @@ function ensure_private_gate(
     paths: GatePaths,
     hooks?: SqliteOpenRecoveryHooks,
 ): GateDirectoryIdentities {
+    const parent = capture_managed_directory(
+        paths.parentDirectory,
+        path.dirname(paths.parentDirectory),
+        'gate-parent-directory-verify',
+    );
     const gate = ensure_managed_directory(
         paths.gateDirectory,
         paths.parentDirectory,
@@ -447,12 +555,10 @@ function ensure_private_gate(
         gate.physicalPath,
         'readers-directory-verify',
     );
-    assert_managed_directory(gate, 'gate-directory-flush');
-    flush_directory(paths.parentDirectory, hooks);
+    flush_managed_directory(parent, hooks, 'gate-parent-directory-flush');
     assert_managed_directory(readers, 'readers-directory-flush');
-    assert_managed_directory(gate, 'gate-directory-flush');
-    flush_directory(paths.gateDirectory, hooks);
-    return { gate, readers };
+    flush_managed_directory(gate, hooks, 'gate-directory-flush');
+    return { parent, gate, readers };
 }
 
 function flush_file(filePath: string): void {
@@ -471,22 +577,53 @@ export function sqlite_directory_durability_is_platform_unsupported(
     return platform === 'win32' && fsyncDirectory === fs.fsyncSync;
 }
 
+function readonly_directory_flags(platform: NodeJS.Platform): number {
+    const noFollow = platform === 'win32'
+        ? 0
+        : (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
+    const directory = platform === 'win32'
+        ? 0
+        : (typeof fs.constants.O_DIRECTORY === 'number' ? fs.constants.O_DIRECTORY : 0);
+    return fs.constants.O_RDONLY
+        | noFollow
+        | directory
+        | (typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0);
+}
+
 export function assert_sqlite_directory_durability_supported(
     directoryPath: string,
     fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
     platform: NodeJS.Platform = process.platform,
+    expectedIdentity?: ManagedDirectoryIdentity,
+    identityOperation = 'directory-durability-identity',
 ): void {
     // Node exposes no proven Windows primitive for durably flushing directory-entry
     // changes. Refuse the backend explicitly instead of treating a skipped flush as
     // durable success. Tests may inject a capability implementation at the operation
-    // boundary, but production never assumes one exists.
+    // boundary, but production never assumes one exists. Windows also exposes no
+    // O_NOFOLLOW through Node; an injected implementation still gets descriptor
+    // dev/inode verification, but cannot distinguish a symlink to that same directory.
     if (sqlite_directory_durability_is_platform_unsupported(platform, fsyncDirectory)) {
         throw sqlite_file_state_error('unsupported', { operation: 'directory-durability' });
     }
     let descriptor: number | undefined;
     try {
-        descriptor = fs.openSync(directoryPath, 'r');
+        descriptor = fs.openSync(directoryPath, readonly_directory_flags(platform));
+        const opened = fs.fstatSync(descriptor, { bigint: true });
+        if (!opened.isDirectory()
+            || (expectedIdentity !== undefined
+                && (opened.dev !== expectedIdentity.device
+                    || opened.ino !== expectedIdentity.inode))) {
+            throw sqlite_file_state_recovery_error({ operation: identityOperation });
+        }
         fsyncDirectory(descriptor);
+        const flushed = fs.fstatSync(descriptor, { bigint: true });
+        if (!flushed.isDirectory()
+            || (expectedIdentity !== undefined
+                && (flushed.dev !== expectedIdentity.device
+                    || flushed.ino !== expectedIdentity.inode))) {
+            throw sqlite_file_state_recovery_error({ operation: identityOperation });
+        }
     } catch (error) {
         if (is_node_error(error) && UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error.code ?? '')) {
             throw sqlite_file_state_error('unsupported', { operation: 'directory-durability' });
@@ -497,11 +634,41 @@ export function assert_sqlite_directory_durability_supported(
     }
 }
 
-function flush_directory(directoryPath: string, hooks?: SqliteOpenRecoveryHooks): void {
-    assert_sqlite_directory_durability_supported(
-        directoryPath,
-        hooks?.fsyncDirectory ?? fs.fsyncSync,
-    );
+function flush_directory(
+    directoryPath: string,
+    hooks?: SqliteOpenRecoveryHooks,
+    expectedIdentity?: ManagedDirectoryIdentity,
+    identityOperation = 'directory-durability-identity',
+): void {
+    if (expectedIdentity) assert_managed_directory(expectedIdentity, identityOperation);
+    hooks?.beforeDirectoryFsyncOpen?.(directoryPath);
+    try {
+        assert_sqlite_directory_durability_supported(
+            directoryPath,
+            hooks?.fsyncDirectory ?? fs.fsyncSync,
+            process.platform,
+            expectedIdentity,
+            identityOperation,
+        );
+    } catch (error) {
+        if (!(hooks?.directoryDurabilityPolicy === 'best-effort'
+            && error instanceof SqliteFileStateError
+            && error.category === 'unsupported'
+            && error.metadata.operation === 'directory-durability')) {
+            throw error;
+        }
+    }
+    // Best-effort may waive only an unsupported flush primitive. It never waives
+    // the pathname-to-descriptor identity fence around that attempted operation.
+    if (expectedIdentity) assert_managed_directory(expectedIdentity, identityOperation);
+}
+
+function flush_managed_directory(
+    identity: ManagedDirectoryIdentity,
+    hooks: SqliteOpenRecoveryHooks | undefined,
+    operation: string,
+): void {
+    flush_directory(identity.directoryPath, hooks, identity, operation);
 }
 
 function write_private_file_exclusive(filePath: string, data: string): void {
@@ -527,6 +694,10 @@ function replace_private_json(
     value: unknown,
     hooks?: SqliteOpenRecoveryHooks,
 ): void {
+    const parent = capture_managed_directory_at_path(
+        path.dirname(filePath),
+        'private-json-parent',
+    );
     const temporaryPath = `${filePath}.tmp.${randomUUID()}`;
     let renamed = false;
     try {
@@ -545,7 +716,7 @@ function replace_private_json(
     }
     // Once rename succeeds the temporary pathname no longer exists; a later
     // directory-flush failure must leave the installed replacement as evidence.
-    flush_directory(path.dirname(filePath), hooks);
+    flush_managed_directory(parent, hooks, 'private-json-parent-flush');
 }
 
 /**
@@ -904,70 +1075,119 @@ function classify_reader_tokens(
     };
 }
 
-export async function acquire_sqlite_shared_reader_gate(
+function retained_shared_reader_gate(
+    paths: GatePaths,
+    identities: GateDirectoryIdentities,
+    tokenId: string,
+    hooks: SqliteOpenRecoveryHooks | undefined,
+): SqliteSharedReaderGate {
+    const tokenPath = path.join(paths.readersDirectory, `${tokenId}.reader`);
+    let released = false;
+    return {
+        kind: 'shared-reader',
+        canonicalPath: paths.canonicalPath,
+        tokenId,
+        async release(): Promise<void> {
+            if (released) return;
+            if (!exact_token_matches(tokenPath, tokenId, identities.readers)) {
+                throw sqlite_file_state_recovery_error({ operation: 'reader-token-release' });
+            }
+            assert_managed_directory(identities.readers, 'reader-token-release');
+            fs.unlinkSync(tokenPath);
+            flush_managed_directory(
+                identities.readers,
+                hooks,
+                'reader-token-release-flush',
+            );
+            released = true;
+        },
+    };
+}
+
+async function acquire_sqlite_shared_reader_gate_under_deadline(
     canonicalPath: string,
-    hooks?: SqliteOpenRecoveryHooks,
+    options: SqliteSharedReaderGateOptions | undefined,
+    deadline: ReaderGateDeadline | undefined,
 ): Promise<SqliteSharedReaderGate> {
     const paths = gate_paths(canonicalPath);
     try {
-        const identities = ensure_private_gate(paths, hooks);
+        const identities = ensure_private_gate(paths, options);
         for (;;) {
-            await emit(hooks, 'reader-before-intent-check');
+            await emit(options, 'reader-before-intent-check');
             assert_managed_directory(identities.gate, 'reader-intent-check');
             if (fs.existsSync(paths.exclusiveIntentPath)) {
-                await emit(hooks, 'reader-retrying');
-                await yield_control(hooks);
+                await retry_sqlite_shared_reader_gate(options, deadline);
                 continue;
             }
             const tokenId = randomUUID();
             const tokenPath = path.join(paths.readersDirectory, `${tokenId}.reader`);
-            await emit(hooks, 'reader-before-token-create');
+            let tokenCreated = false;
             try {
+                await emit(options, 'reader-before-token-create');
                 assert_managed_directory(identities.readers, 'reader-token-create');
                 write_private_file_exclusive(tokenPath, tokenId);
+                tokenCreated = true;
+                flush_managed_directory(identities.readers, options, 'reader-token-flush');
+                await emit(options, 'reader-after-token-flush');
+                assert_managed_directory(identities.gate, 'reader-intent-recheck');
+                const intentAppeared = fs.existsSync(paths.exclusiveIntentPath);
+                await emit(options, 'reader-after-intent-recheck');
+                if (intentAppeared) {
+                    if (!exact_token_matches(tokenPath, tokenId, identities.readers)) {
+                        throw sqlite_file_state_recovery_error({ operation: 'reader-token-verify' });
+                    }
+                    assert_managed_directory(identities.readers, 'reader-token-remove');
+                    fs.unlinkSync(tokenPath);
+                    tokenCreated = false;
+                    flush_managed_directory(
+                        identities.readers,
+                        options,
+                        'reader-token-remove-flush',
+                    );
+                    await retry_sqlite_shared_reader_gate(options, deadline);
+                    continue;
+                }
+                tokenCreated = false;
+                return retained_shared_reader_gate(paths, identities, tokenId, options);
             } catch (error) {
-                if (is_node_error(error) && error.code === 'EEXIST') continue;
+                if (tokenCreated) {
+                    try {
+                        if (!exact_token_matches(tokenPath, tokenId, identities.readers)) {
+                            throw sqlite_file_state_recovery_error({
+                                operation: 'reader-token-acquire-cleanup-verify',
+                            });
+                        }
+                        assert_managed_directory(identities.readers, 'reader-token-acquire-cleanup');
+                        fs.unlinkSync(tokenPath);
+                        flush_managed_directory(
+                            identities.readers,
+                            options,
+                            'reader-token-acquire-cleanup-flush',
+                        );
+                    } catch (cleanupError) {
+                        throw safe_error('reader-gate-acquire-cleanup', cleanupError);
+                    }
+                }
+                if (is_node_error(error) && error.code === 'EEXIST') {
+                    await retry_sqlite_shared_reader_gate(options, deadline);
+                    continue;
+                }
                 throw error;
             }
-            assert_managed_directory(identities.readers, 'reader-token-flush');
-            flush_directory(paths.readersDirectory, hooks);
-            await emit(hooks, 'reader-after-token-flush');
-            assert_managed_directory(identities.gate, 'reader-intent-recheck');
-            const intentAppeared = fs.existsSync(paths.exclusiveIntentPath);
-            await emit(hooks, 'reader-after-intent-recheck');
-            if (intentAppeared) {
-                if (!exact_token_matches(tokenPath, tokenId, identities.readers)) {
-                    throw sqlite_file_state_recovery_error({ operation: 'reader-token-verify' });
-                }
-                assert_managed_directory(identities.readers, 'reader-token-remove');
-                fs.unlinkSync(tokenPath);
-                assert_managed_directory(identities.readers, 'reader-token-remove-flush');
-                flush_directory(paths.readersDirectory, hooks);
-                await emit(hooks, 'reader-retrying');
-                await yield_control(hooks);
-                continue;
-            }
-            let released = false;
-            return {
-                kind: 'shared-reader',
-                canonicalPath: paths.canonicalPath,
-                tokenId,
-                async release(): Promise<void> {
-                    if (released) return;
-                    if (!exact_token_matches(tokenPath, tokenId, identities.readers)) {
-                        throw sqlite_file_state_recovery_error({ operation: 'reader-token-release' });
-                    }
-                    assert_managed_directory(identities.readers, 'reader-token-release');
-                    fs.unlinkSync(tokenPath);
-                    assert_managed_directory(identities.readers, 'reader-token-release-flush');
-                    flush_directory(paths.readersDirectory, hooks);
-                    released = true;
-                },
-            };
         }
     } catch (error) {
         throw safe_error('reader-gate-acquire', error);
     }
+}
+
+export async function acquire_sqlite_shared_reader_gate(
+    canonicalPath: string,
+    options?: SqliteSharedReaderGateOptions,
+): Promise<SqliteSharedReaderGate> {
+    // Configuration and the first monotonic sample are validated before creating
+    // the managed gate directories, so an invalid deadline cannot leave artifacts.
+    const deadline = create_reader_gate_deadline(options);
+    return acquire_sqlite_shared_reader_gate_under_deadline(canonicalPath, options, deadline);
 }
 
 export async function acquire_sqlite_exclusive_recovery_gate(
@@ -976,14 +1196,46 @@ export async function acquire_sqlite_exclusive_recovery_gate(
 ): Promise<SqliteExclusiveRecoveryGate> {
     const paths = gate_paths(canonicalPath);
     const tokenId = randomUUID();
+    let acquiredIdentities: GateDirectoryIdentities | undefined;
+    let intentCreated = false;
     try {
         const identities = ensure_private_gate(paths, hooks);
+        acquiredIdentities = identities;
         assert_managed_directory(identities.gate, 'exclusive-intent-create');
         write_private_file_exclusive(paths.exclusiveIntentPath, tokenId);
-        assert_managed_directory(identities.gate, 'exclusive-intent-flush');
-        flush_directory(paths.gateDirectory, hooks);
+        intentCreated = true;
+        flush_managed_directory(identities.gate, hooks, 'exclusive-intent-flush');
         await emit(hooks, 'exclusive-after-intent-flush');
         let released = false;
+        const waitForReadersUntil = async (
+            waitOptions: SqliteSharedReaderGateOptions | undefined,
+            deadline: ReaderGateDeadline | undefined,
+        ): Promise<void> => {
+            if (released) {
+                throw sqlite_file_state_recovery_error({ operation: 'exclusive-gate-wait' });
+            }
+            for (;;) {
+                if (!exact_token_matches(paths.exclusiveIntentPath, tokenId, identities.gate)) {
+                    throw sqlite_file_state_recovery_error({ operation: 'exclusive-gate-wait' });
+                }
+                if (existing_reader_token_ids(paths, identities).length === 0) {
+                    await emit(waitOptions, 'exclusive-readers-drained');
+                    return;
+                }
+                await emit(waitOptions, 'exclusive-waiting-for-readers');
+                if (reader_gate_deadline_expired(deadline)) {
+                    throw sqlite_file_state_error('contention', {
+                        operation: 'exclusive-gate-timeout',
+                    });
+                }
+                await yield_control(waitOptions);
+                if (reader_gate_deadline_expired(deadline)) {
+                    throw sqlite_file_state_error('contention', {
+                        operation: 'exclusive-gate-timeout',
+                    });
+                }
+            }
+        };
         const gate: SqliteExclusiveRecoveryGate = {
             kind: 'exclusive-recovery',
             canonicalPath: paths.canonicalPath,
@@ -1009,18 +1261,146 @@ export async function acquire_sqlite_exclusive_recovery_gate(
                 }
                 assert_managed_directory(identities.readers, 'reader-token-reclaim');
                 fs.unlinkSync(tokenPath);
-                assert_managed_directory(identities.readers, 'reader-token-reclaim-flush');
-                flush_directory(paths.readersDirectory, hooks);
+                flush_managed_directory(
+                    identities.readers,
+                    hooks,
+                    'reader-token-reclaim-flush',
+                );
             },
-            async waitForReaders(): Promise<void> {
-                if (released) throw sqlite_file_state_recovery_error({ operation: 'exclusive-gate-wait' });
-                for (;;) {
-                    if (existing_reader_token_ids(paths, identities).length === 0) {
-                        await emit(hooks, 'exclusive-readers-drained');
-                        return;
+            async waitForReaders(options?: SqliteSharedReaderGateOptions): Promise<void> {
+                const waitOptions: SqliteSharedReaderGateOptions = { ...hooks, ...options };
+                await waitForReadersUntil(
+                    waitOptions,
+                    create_reader_gate_deadline(waitOptions),
+                );
+            },
+            async downgradeToSharedReader(): Promise<SqliteSharedReaderGate> {
+                if (released) {
+                    throw sqlite_file_state_recovery_error({
+                        operation: 'exclusive-gate-downgrade',
+                    });
+                }
+                const readerTokenId = randomUUID();
+                const readerTokenPath = path.join(
+                    paths.readersDirectory,
+                    `${readerTokenId}.reader`,
+                );
+                let readerTokenCreated = false;
+                let intentRemoved = false;
+                try {
+                    assert_managed_directory(identities.readers, 'exclusive-downgrade-reader-create');
+                    write_private_file_exclusive(readerTokenPath, readerTokenId);
+                    readerTokenCreated = true;
+                    flush_managed_directory(
+                        identities.readers,
+                        hooks,
+                        'exclusive-downgrade-reader-flush',
+                    );
+                    await emit(hooks, 'exclusive-downgrade-after-reader-flush');
+                    if (!exact_token_matches(readerTokenPath, readerTokenId, identities.readers)) {
+                        throw sqlite_file_state_recovery_error({
+                            operation: 'exclusive-downgrade-reader-verify',
+                        });
                     }
-                    await emit(hooks, 'exclusive-waiting-for-readers');
-                    await yield_control(hooks);
+                    assert_managed_directory(identities.gate, 'exclusive-downgrade-intent-check');
+                    if (fs.existsSync(paths.recoveryBlockPath)) {
+                        throw sqlite_file_state_recovery_error({
+                            operation: 'exclusive-downgrade-blocked',
+                        });
+                    }
+                    if (!exact_token_matches(paths.exclusiveIntentPath, tokenId, identities.gate)) {
+                        throw sqlite_file_state_recovery_error({
+                            operation: 'exclusive-downgrade-intent-verify',
+                        });
+                    }
+                    assert_managed_directory(identities.gate, 'exclusive-downgrade-intent-remove');
+                    fs.unlinkSync(paths.exclusiveIntentPath);
+                    intentRemoved = true;
+                    flush_managed_directory(
+                        identities.gate,
+                        hooks,
+                        'exclusive-downgrade-intent-flush',
+                    );
+                    await emit(hooks, 'exclusive-downgrade-after-intent-flush');
+                    released = true;
+                    return retained_shared_reader_gate(
+                        paths,
+                        identities,
+                        readerTokenId,
+                        hooks,
+                    );
+                } catch (error) {
+                    let intentRestoreFailure: unknown;
+                    let readerCleanupFailure: unknown;
+                    if (intentRemoved) {
+                        try {
+                            assert_managed_directory(
+                                identities.gate,
+                                'exclusive-downgrade-intent-restore',
+                            );
+                            write_private_file_exclusive(paths.exclusiveIntentPath, tokenId);
+                            flush_managed_directory(
+                                identities.gate,
+                                hooks,
+                                'exclusive-downgrade-intent-restore-flush',
+                            );
+                            intentRemoved = false;
+                        } catch (restoreError) {
+                            intentRestoreFailure = restoreError;
+                            // Even when the durability hook failed, an exact restored
+                            // marker is sufficient to keep this live process exclusive
+                            // while it removes the not-yet-transferred reader token.
+                            intentRemoved = !exact_token_matches(
+                                paths.exclusiveIntentPath,
+                                tokenId,
+                                identities.gate,
+                            );
+                        }
+                    }
+                    if (readerTokenCreated) {
+                        try {
+                            if (!exact_token_matches(
+                                readerTokenPath,
+                                readerTokenId,
+                                identities.readers,
+                            )) {
+                                throw sqlite_file_state_recovery_error({
+                                    operation: 'exclusive-downgrade-reader-cleanup-verify',
+                                });
+                            }
+                            assert_managed_directory(
+                                identities.readers,
+                                'exclusive-downgrade-reader-cleanup',
+                            );
+                            fs.unlinkSync(readerTokenPath);
+                            flush_managed_directory(
+                                identities.readers,
+                                hooks,
+                                'exclusive-downgrade-reader-cleanup-flush',
+                            );
+                            readerTokenCreated = false;
+                        } catch (cleanupError) {
+                            readerCleanupFailure = cleanupError;
+                        }
+                    }
+                    // A peer may have published its own intent after this gate unlinked
+                    // its marker. In that case restoration correctly gets EEXIST: this
+                    // gate no longer owns exclusivity, but its provisional reader token
+                    // must still be removed so the peer can drain readers.
+                    if (intentRemoved) released = true;
+                    // Restoration EEXIST is expected coordination. If mandatory exact
+                    // reader cleanup also failed, surface that failure instead: masking it
+                    // as contention would strand a token that blocks the peer indefinitely.
+                    if (readerCleanupFailure) {
+                        throw safe_error(
+                            'exclusive-gate-downgrade-reader-cleanup',
+                            readerCleanupFailure,
+                        );
+                    }
+                    if (intentRestoreFailure) {
+                        throw safe_error('exclusive-gate-downgrade-cleanup', intentRestoreFailure);
+                    }
+                    throw safe_error('exclusive-gate-downgrade', error);
                 }
             },
             async release(): Promise<void> {
@@ -1034,14 +1414,44 @@ export async function acquire_sqlite_exclusive_recovery_gate(
                 }
                 assert_managed_directory(identities.gate, 'exclusive-gate-release');
                 fs.unlinkSync(paths.exclusiveIntentPath);
-                assert_managed_directory(identities.gate, 'exclusive-gate-release-flush');
-                flush_directory(paths.gateDirectory, hooks);
+                flush_managed_directory(
+                    identities.gate,
+                    hooks,
+                    'exclusive-gate-release-flush',
+                );
                 released = true;
             },
         };
         exclusiveGateIdentities.set(gate, identities);
+        exclusiveGateControls.set(gate, { waitForReaders: waitForReadersUntil });
+        intentCreated = false;
         return gate;
     } catch (error) {
+        if (intentCreated && acquiredIdentities) {
+            try {
+                if (!exact_token_matches(
+                    paths.exclusiveIntentPath,
+                    tokenId,
+                    acquiredIdentities.gate,
+                )) {
+                    throw sqlite_file_state_recovery_error({
+                        operation: 'exclusive-intent-acquire-cleanup-verify',
+                    });
+                }
+                assert_managed_directory(
+                    acquiredIdentities.gate,
+                    'exclusive-intent-acquire-cleanup',
+                );
+                fs.unlinkSync(paths.exclusiveIntentPath);
+                flush_managed_directory(
+                    acquiredIdentities.gate,
+                    hooks,
+                    'exclusive-intent-acquire-cleanup-flush',
+                );
+            } catch (cleanupError) {
+                throw safe_error('exclusive-gate-acquire-cleanup', cleanupError);
+            }
+        }
         throw safe_error('exclusive-gate-acquire', error);
     }
 }
@@ -1187,8 +1597,11 @@ export async function reclaim_stale_sqlite_exclusive_intent(
         }
         assert_managed_directory(identities.gate, 'exclusive-intent-reclaim');
         fs.unlinkSync(paths.exclusiveIntentPath);
-        assert_managed_directory(identities.gate, 'exclusive-intent-reclaim-flush');
-        flush_directory(paths.gateDirectory);
+        flush_managed_directory(
+            identities.gate,
+            undefined,
+            'exclusive-intent-reclaim-flush',
+        );
     } catch (error) {
         throw safe_error('exclusive-intent-reclaim', error);
     }
@@ -1234,8 +1647,7 @@ function create_managed_child_directory(
     const identity = capture_managed_directory(childPath, parent.physicalPath, operation);
     // Flushed before anything is written inside, so a crash cannot leave a moved
     // marker in a directory whose own entry never reached the disk.
-    assert_managed_directory(parent, operation);
-    flush_directory(parent.physicalPath, hooks);
+    flush_managed_directory(parent, hooks, operation);
     return identity;
 }
 
@@ -1458,19 +1870,15 @@ export async function quarantine_malformed_sqlite_gate_markers(
             fs.rmdirSync(generationDirectory.physicalPath);
             // The removal is the directory-entry change that has to be made durable
             // now, and it is the *root's* entry that changed.
-            assert_managed_directory(quarantineRoot, 'gate-quarantine-flush');
-            flush_directory(quarantineRoot.physicalPath, options);
+            flush_managed_directory(quarantineRoot, options, 'gate-quarantine-flush');
             return { movedCount: 0 };
         }
-        assert_managed_directory(generationDirectory, 'gate-quarantine-flush');
-        flush_directory(generationDirectory.physicalPath, options);
+        flush_managed_directory(generationDirectory, options, 'gate-quarantine-flush');
         if (movedFromReaders) {
-            assert_managed_directory(identities.readers, 'gate-quarantine-flush');
-            flush_directory(identities.readers.physicalPath, options);
+            flush_managed_directory(identities.readers, options, 'gate-quarantine-flush');
         }
         if (movedFromGate) {
-            assert_managed_directory(identities.gate, 'gate-quarantine-flush');
-            flush_directory(identities.gate.physicalPath, options);
+            flush_managed_directory(identities.gate, options, 'gate-quarantine-flush');
         }
         return { movedCount, generation };
     } catch (error) {
@@ -1601,42 +2009,89 @@ export async function inventory_sqlite_basename(
     }
 }
 
+function parse_sqlite_raw_header(
+    header: Buffer,
+    expectedApplicationId: number,
+): SqliteRawHeader {
+    if (header.length !== SQLITE_HEADER_BYTES
+        || !header.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)) {
+        throw sqlite_file_state_schema_error({ operation: 'raw-header' });
+    }
+    const applicationId = header.readUInt32BE(APPLICATION_ID_OFFSET);
+    if (applicationId === 0 || applicationId !== expectedApplicationId) {
+        throw sqlite_file_state_schema_error({ operation: 'raw-application-id' });
+    }
+    const writeVersion = header[18];
+    const readVersion = header[19];
+    if (writeVersion !== 1 || readVersion !== 1) {
+        throw sqlite_file_state_schema_error({ operation: 'raw-journal-version' });
+    }
+    const encodedPageSize = header.readUInt16BE(16);
+    return {
+        applicationId,
+        userVersion: header.readUInt32BE(USER_VERSION_OFFSET),
+        pageSize: encodedPageSize === 1 ? 65_536 : encodedPageSize,
+        writeVersion,
+        readVersion,
+    };
+}
+
+function read_sqlite_raw_header_descriptor(
+    descriptor: number,
+    expectedApplicationId: number,
+): SqliteRawHeader {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size < SQLITE_HEADER_BYTES) {
+        throw sqlite_file_state_schema_error({ operation: 'raw-header' });
+    }
+    const header = Buffer.alloc(SQLITE_HEADER_BYTES);
+    const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+    if (bytesRead !== SQLITE_HEADER_BYTES) {
+        throw sqlite_file_state_schema_error({ operation: 'raw-header' });
+    }
+    return parse_sqlite_raw_header(header, expectedApplicationId);
+}
+
 export function read_sqlite_raw_header(
     databasePath: string,
     expectedApplicationId: number,
 ): SqliteRawHeader {
     let descriptor: number | undefined;
     try {
-        const stat = fs.statSync(databasePath);
-        if (!stat.isFile() || stat.size < SQLITE_HEADER_BYTES) {
-            throw sqlite_file_state_schema_error({ operation: 'raw-header' });
-        }
-        descriptor = fs.openSync(databasePath, 'r');
-        const header = Buffer.alloc(SQLITE_HEADER_BYTES);
-        const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
-        if (bytesRead !== SQLITE_HEADER_BYTES || !header.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)) {
-            throw sqlite_file_state_schema_error({ operation: 'raw-header' });
-        }
-        const applicationId = header.readUInt32BE(APPLICATION_ID_OFFSET);
-        if (applicationId === 0 || applicationId !== expectedApplicationId) {
-            throw sqlite_file_state_schema_error({ operation: 'raw-application-id' });
-        }
-        const writeVersion = header[18];
-        const readVersion = header[19];
-        if (writeVersion !== 1 || readVersion !== 1) {
-            throw sqlite_file_state_schema_error({ operation: 'raw-journal-version' });
-        }
-        const encodedPageSize = header.readUInt16BE(16);
-        return {
-            applicationId,
-            pageSize: encodedPageSize === 1 ? 65_536 : encodedPageSize,
-            writeVersion,
-            readVersion,
-        };
+        descriptor = fs.openSync(databasePath, readonly_nonfollowing_flags());
+        return read_sqlite_raw_header_descriptor(descriptor, expectedApplicationId);
     } catch (error) {
         throw safe_error('raw-header', error);
     } finally {
         if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+}
+
+function read_inventory_bound_sqlite_raw_header(
+    databasePath: string,
+    inventoryMain: SqliteBasenameMember,
+    expectedApplicationId: number,
+): SqliteRawHeader | undefined {
+    const opened = open_hot_journal_source(databasePath, inventoryMain);
+    if (!opened) return undefined;
+    try {
+        const header = Buffer.alloc(SQLITE_HEADER_BYTES);
+        const bytesRead = fs.readSync(opened.descriptor, header, 0, header.length, 0);
+        if (!hot_journal_identity_matches(
+            descriptor_hot_journal_identity(opened.descriptor),
+            opened.identity,
+        ) || !hot_journal_identity_matches(
+            capture_hot_journal_file_identity(databasePath),
+            opened.identity,
+        )) {
+            return undefined;
+        }
+        if (bytesRead !== SQLITE_HEADER_BYTES) {
+            throw sqlite_file_state_schema_error({ operation: 'raw-header' });
+        }
+        return parse_sqlite_raw_header(header, expectedApplicationId);
+    } finally {
+        fs.closeSync(opened.descriptor);
     }
 }
 
@@ -1681,6 +2136,466 @@ function apply_connection_policy(database: DatabaseSync): void {
     }
 }
 
+function validate_expected_open_identity(
+    database: DatabaseSync,
+    options: SqliteOpenExistingOptions,
+): void {
+    const expectedApplicationId = options.expectedApplicationId
+        ?? SQLITE_FILE_STATE_APPLICATION_ID;
+    const applicationId = database.prepare('PRAGMA application_id').get()?.application_id;
+    if (typeof applicationId !== 'number' || !Number.isSafeInteger(applicationId)
+        || applicationId !== expectedApplicationId) {
+        throw sqlite_file_state_schema_error({ operation: 'exact-application-id' });
+    }
+    if (options.expectedUserVersion !== undefined) {
+        const userVersion = database.prepare('PRAGMA user_version').get()?.user_version;
+        if (typeof userVersion !== 'number' || !Number.isSafeInteger(userVersion)
+            || userVersion !== options.expectedUserVersion) {
+            throw sqlite_file_state_schema_error({
+                operation: 'exact-user-version',
+                schemaVersion: options.expectedUserVersion,
+            });
+        }
+    }
+    options.validate?.(database);
+}
+
+function validate_readonly_identity(
+    canonicalPath: string,
+    timeoutMs: number | undefined,
+    validate: (database: DatabaseSync) => void,
+): void {
+    let database: DatabaseSync | undefined;
+    let failure: unknown;
+    try {
+        database = new DatabaseSync(path.resolve(canonicalPath), {
+            open: true,
+            readOnly: true,
+            enableDoubleQuotedStringLiterals: false,
+            timeout: timeoutMs ?? 0,
+        });
+        apply_connection_policy(database);
+        validate(database);
+    } catch (error) {
+        failure = error;
+    }
+    try {
+        database?.close();
+    } catch (error) {
+        failure ??= error;
+    }
+    if (failure) throw failure;
+}
+
+interface HotJournalFileIdentity {
+    readonly device: bigint;
+    readonly inode: bigint;
+    readonly size: number;
+    readonly createdAt: bigint;
+}
+
+interface OpenedHotJournalSource {
+    readonly descriptor: number;
+    readonly identity: HotJournalFileIdentity;
+}
+
+interface HotJournalSource extends OpenedHotJournalSource {
+    readonly filePath: string;
+    readonly digest: Buffer;
+}
+
+interface HotJournalValidationFence {
+    stillMatches(): boolean;
+    close(): void;
+}
+
+const HOT_JOURNAL_COPY_BUFFER_BYTES = 64 * 1024;
+// Retry count is an unconditional bound. The monotonic deadline is observed at
+// retry and reader-drain boundaries; Node's synchronous descriptor hashing,
+// copying, and SQLite validation cannot be preempted mid-call, so this is not a
+// hard wall-clock interrupt for one in-flight validation attempt.
+const HOT_JOURNAL_COPY_MAX_RETRIES = 8;
+
+class HotJournalSnapshotChanged extends Error {}
+
+function capture_hot_journal_file_identity(filePath: string): HotJournalFileIdentity | undefined {
+    let stat: fs.BigIntStats;
+    try {
+        stat = fs.lstatSync(filePath, { bigint: true });
+    } catch (error) {
+        if (is_node_error(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return undefined;
+    }
+    return {
+        device: stat.dev,
+        inode: stat.ino,
+        size: Number(stat.size),
+        createdAt: stat.birthtimeNs,
+    };
+}
+
+function hot_journal_identity_matches(
+    actual: HotJournalFileIdentity | undefined,
+    expected: HotJournalFileIdentity,
+): boolean {
+    return actual !== undefined
+        && actual.device === expected.device
+        && actual.inode === expected.inode
+        && actual.size === expected.size
+        && actual.createdAt === expected.createdAt;
+}
+
+function hot_journal_inventory_matches(
+    identity: HotJournalFileIdentity | undefined,
+    member: SqliteBasenameMember,
+): identity is HotJournalFileIdentity {
+    return identity !== undefined
+        && identity.device === member.device
+        && identity.inode === member.inode
+        && identity.size === member.size;
+}
+
+function readonly_nonfollowing_flags(): number {
+    // O_NOFOLLOW is available on the supported POSIX runtimes and makes the open
+    // itself reject a raced symlink. Windows does not expose that primitive through
+    // Node; there we use a read-only descriptor and prove its fstat identity against
+    // lstat before and after the descriptor reads instead of silently pretending
+    // no-follow was applied. O_NONBLOCK prevents a raced FIFO from hanging startup.
+    const noFollow = process.platform === 'win32'
+        ? 0
+        : (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
+    return fs.constants.O_RDONLY
+        | noFollow
+        | (typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0);
+}
+
+function descriptor_hot_journal_identity(descriptor: number): HotJournalFileIdentity | undefined {
+    const stat = fs.fstatSync(descriptor, { bigint: true });
+    if (!stat.isFile() || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+    return {
+        device: stat.dev,
+        inode: stat.ino,
+        size: Number(stat.size),
+        createdAt: stat.birthtimeNs,
+    };
+}
+
+function open_hot_journal_source(
+    filePath: string,
+    member: SqliteBasenameMember,
+): OpenedHotJournalSource | undefined {
+    let descriptor: number;
+    try {
+        descriptor = fs.openSync(filePath, readonly_nonfollowing_flags());
+    } catch (error) {
+        if (is_node_error(error)
+            && (error.code === 'ENOENT' || error.code === 'ELOOP' || error.code === 'ENOTDIR')) {
+            return undefined;
+        }
+        throw error;
+    }
+    try {
+        const identity = descriptor_hot_journal_identity(descriptor);
+        if (!hot_journal_inventory_matches(identity, member)
+            || !hot_journal_identity_matches(capture_hot_journal_file_identity(filePath), identity)) {
+            fs.closeSync(descriptor);
+            return undefined;
+        }
+        return { descriptor, identity };
+    } catch (error) {
+        try { fs.closeSync(descriptor); } catch { /* Preserve the identity failure. */ }
+        throw error;
+    }
+}
+
+function digest_hot_journal_descriptor(
+    descriptor: number,
+    size: number,
+): Buffer | undefined {
+    const digest = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(Math.min(HOT_JOURNAL_COPY_BUFFER_BYTES, Math.max(size, 1)));
+    let position = 0;
+    while (position < size) {
+        const bytesRead = fs.readSync(
+            descriptor,
+            buffer,
+            0,
+            Math.min(buffer.length, size - position),
+            position,
+        );
+        if (bytesRead === 0) return undefined;
+        digest.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+    }
+    return digest.digest();
+}
+
+function copy_hot_journal_descriptor(
+    source: HotJournalSource,
+    destinationPath: string,
+): Buffer | undefined {
+    const destination = fs.openSync(destinationPath, 'wx', PRIVATE_FILE_MODE);
+    const digest = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(
+        Math.min(HOT_JOURNAL_COPY_BUFFER_BYTES, Math.max(source.identity.size, 1)),
+    );
+    let readPosition = 0;
+    try {
+        fs.fchmodSync(destination, PRIVATE_FILE_MODE);
+        while (readPosition < source.identity.size) {
+            const bytesRead = fs.readSync(
+                source.descriptor,
+                buffer,
+                0,
+                Math.min(buffer.length, source.identity.size - readPosition),
+                readPosition,
+            );
+            if (bytesRead === 0) return undefined;
+            digest.update(buffer.subarray(0, bytesRead));
+            let written = 0;
+            while (written < bytesRead) {
+                const bytesWritten = fs.writeSync(
+                    destination,
+                    buffer,
+                    written,
+                    bytesRead - written,
+                    readPosition + written,
+                );
+                if (bytesWritten === 0) {
+                    throw sqlite_file_state_recovery_error({ operation: 'hot-journal-copy-write' });
+                }
+                written += bytesWritten;
+            }
+            readPosition += bytesRead;
+        }
+        return digest.digest();
+    } finally {
+        fs.closeSync(destination);
+    }
+}
+
+function hot_journal_source_still_matches(source: HotJournalSource): boolean {
+    const digest = digest_hot_journal_descriptor(source.descriptor, source.identity.size);
+    return digest !== undefined
+        && digest.equals(source.digest)
+        && hot_journal_identity_matches(
+            descriptor_hot_journal_identity(source.descriptor),
+            source.identity,
+        )
+        && hot_journal_identity_matches(
+            capture_hot_journal_file_identity(source.filePath),
+            source.identity,
+        );
+}
+
+function close_hot_journal_descriptors(
+    journalDescriptor: number | undefined,
+    mainDescriptor: number | undefined,
+): void {
+    let failure: unknown;
+    for (const descriptor of [journalDescriptor, mainDescriptor]) {
+        if (descriptor === undefined) continue;
+        try {
+            fs.closeSync(descriptor);
+        } catch (error) {
+            failure ??= error;
+        }
+    }
+    if (failure) throw failure;
+}
+
+/**
+ * A writable SQLite open may recover a hot rollback journal before exact identity
+ * validation runs. Recover and validate a private descriptor snapshot first so a
+ * rejected basename set remains byte-for-byte untouched.
+ *
+ * Merely comparing inode and size is not a snapshot fence: a live writer may rewrite
+ * either file in place without changing either. Both source descriptors therefore
+ * remain open from before the first copied byte through exact private validation, and
+ * each file's pre-copy digest, copied digest, post-copy digest, descriptor identity,
+ * and pathname identity must all agree. A removal, replacement, or rewrite returns
+ * no fence so the caller can discard the copy and restart from fresh inventory.
+ * A successful result retains both descriptors through the live SQLite constructor;
+ * the caller releases them only after a post-constructor identity recheck.
+ */
+async function validate_recoverable_hot_journal_copy(
+    canonicalPath: string,
+    inventory: SqliteBasenameInventory,
+    options: SqliteOpenExistingOptions,
+    validate: (database: DatabaseSync) => void,
+): Promise<HotJournalValidationFence | undefined> {
+    if (!inventory.main || !inventory.journal) return undefined;
+    const journalPath = `${canonicalPath}-journal`;
+    let mainDescriptor: number | undefined;
+    let journalDescriptor: number | undefined;
+    let directory: string | undefined;
+    let database: DatabaseSync | undefined;
+    let mainSource: HotJournalSource | undefined;
+    let journalSource: HotJournalSource | undefined;
+    let privateValidationStarted = false;
+    let failure: unknown;
+    let stable = false;
+    try {
+        const openedMain = open_hot_journal_source(canonicalPath, inventory.main);
+        if (openedMain === undefined) throw new HotJournalSnapshotChanged();
+        mainDescriptor = openedMain.descriptor;
+        const openedJournal = open_hot_journal_source(journalPath, inventory.journal);
+        if (openedJournal === undefined) throw new HotJournalSnapshotChanged();
+        journalDescriptor = openedJournal.descriptor;
+
+        const mainDigest = digest_hot_journal_descriptor(
+            mainDescriptor,
+            openedMain.identity.size,
+        );
+        const journalDigest = digest_hot_journal_descriptor(
+            journalDescriptor,
+            openedJournal.identity.size,
+        );
+        if (mainDigest === undefined || journalDigest === undefined) {
+            throw new HotJournalSnapshotChanged();
+        }
+        const main: HotJournalSource = mainSource = {
+            filePath: canonicalPath,
+            descriptor: mainDescriptor,
+            identity: openedMain.identity,
+            digest: mainDigest,
+        };
+        const journal: HotJournalSource = journalSource = {
+            filePath: journalPath,
+            descriptor: journalDescriptor,
+            identity: openedJournal.identity,
+            digest: journalDigest,
+        };
+        if (!hot_journal_source_still_matches(main)
+            || !hot_journal_source_still_matches(journal)) {
+            throw new HotJournalSnapshotChanged();
+        }
+
+        directory = fs.mkdtempSync(path.join(os.tmpdir(), 'table-viewer-sqlite-validation-'));
+        fs.chmodSync(directory, PRIVATE_DIRECTORY_MODE);
+        const copiedPath = path.join(directory, path.basename(canonicalPath));
+        const copiedMainDigest = copy_hot_journal_descriptor(main, copiedPath);
+        await emit(options, 'hot-journal-copy-after-main');
+        const copiedJournalDigest = copy_hot_journal_descriptor(journal, `${copiedPath}-journal`);
+        await emit(options, 'hot-journal-copy-after-journal');
+        if (copiedMainDigest === undefined || !copiedMainDigest.equals(main.digest)
+            || copiedJournalDigest === undefined || !copiedJournalDigest.equals(journal.digest)
+            || !hot_journal_source_still_matches(main)
+            || !hot_journal_source_still_matches(journal)) {
+            throw new HotJournalSnapshotChanged();
+        }
+
+        privateValidationStarted = true;
+        database = new DatabaseSync(copiedPath, {
+            enableDoubleQuotedStringLiterals: false,
+            timeout: options.timeoutMs ?? 0,
+        });
+        apply_connection_policy(database);
+        validate(database);
+        database.close();
+        database = undefined;
+        // Exact validation can be arbitrarily more expensive than copying. Re-check
+        // the held descriptors and both pathnames afterwards so a writer that changed
+        // the source during validation cannot authorize a later writable original open.
+        stable = hot_journal_source_still_matches(main)
+            && hot_journal_source_still_matches(journal);
+    } catch (error) {
+        if (!(error instanceof HotJournalSnapshotChanged)) {
+            if (privateValidationStarted && mainSource && journalSource) {
+                // A validation failure describes only this private snapshot. If a
+                // writer changed either live member while validation ran, discard
+                // the stale verdict and let the caller inventory and validate fresh.
+                try {
+                    const snapshotRemainedStable = hot_journal_source_still_matches(mainSource)
+                        && hot_journal_source_still_matches(journalSource);
+                    if (snapshotRemainedStable) failure = error;
+                } catch (verificationError) {
+                    failure = verificationError;
+                }
+            } else {
+                failure = error;
+            }
+        }
+    } finally {
+        try {
+            database?.close();
+        } catch (error) {
+            failure ??= error;
+        }
+        if (directory !== undefined) {
+            try {
+                fs.rmSync(directory, { recursive: true, force: true });
+            } catch (error) {
+                failure ??= error;
+            }
+        }
+        if (!stable || failure) {
+            try {
+                close_hot_journal_descriptors(journalDescriptor, mainDescriptor);
+            } catch (error) {
+                failure ??= error;
+            }
+        }
+    }
+    if (failure) throw failure;
+    if (!stable || !mainSource || !journalSource) return undefined;
+    let closed = false;
+    return {
+        stillMatches(): boolean {
+            if (closed) {
+                throw sqlite_file_state_recovery_error({ operation: 'hot-journal-fence-closed' });
+            }
+            return hot_journal_source_still_matches(mainSource)
+                && hot_journal_source_still_matches(journalSource);
+        },
+        close(): void {
+            if (closed) return;
+            try {
+                close_hot_journal_descriptors(journalDescriptor, mainDescriptor);
+            } finally {
+                closed = true;
+            }
+        },
+    };
+}
+
+async function retry_hot_journal_copy(
+    options: SqliteOpenExistingOptions,
+    deadline: ReaderGateDeadline,
+    completedRetries: number,
+): Promise<number> {
+    if (completedRetries >= HOT_JOURNAL_COPY_MAX_RETRIES
+        || reader_gate_deadline_expired(deadline)) {
+        throw sqlite_file_state_error('contention', { operation: 'hot-journal-copy-timeout' });
+    }
+    // This event means a retry will actually be attempted; exhaustion does not
+    // emit a misleading extra cut point.
+    await emit(options, 'hot-journal-copy-retrying');
+    if (reader_gate_deadline_expired(deadline)) {
+        throw sqlite_file_state_error('contention', { operation: 'hot-journal-copy-timeout' });
+    }
+    await yield_control(options);
+    if (reader_gate_deadline_expired(deadline)) {
+        throw sqlite_file_state_error('contention', { operation: 'hot-journal-copy-timeout' });
+    }
+    return completedRetries + 1;
+}
+
+async function wait_for_exclusive_readers_under_deadline(
+    gate: SqliteExclusiveRecoveryGate,
+    options: SqliteOpenExistingOptions,
+    deadline: ReaderGateDeadline | undefined,
+): Promise<void> {
+    const control = exclusiveGateControls.get(gate);
+    if (!control) {
+        throw sqlite_file_state_recovery_error({ operation: 'exclusive-gate-wait-control' });
+    }
+    await control.waitForReaders(options, deadline);
+}
+
 async function open_existing_under_gate(
     canonicalPath: string,
     gate: SqliteSharedReaderGate | SqliteExclusiveRecoveryGate,
@@ -1688,19 +2603,250 @@ async function open_existing_under_gate(
     releaseGateOnClose: boolean,
 ): Promise<SqliteOpenedDatabase> {
     let database: DatabaseSync | undefined;
+    let validationFence: HotJournalValidationFence | undefined;
+    let activeGate = gate;
+    let downgradeAutoEscalatedGate = false;
     try {
-        const inventory = await inventory_sqlite_basename(canonicalPath, options);
-        assert_preflight_inventory(inventory);
-        if (!inventory.main || inventory.main.size === 0) {
-            throw sqlite_file_state_recovery_error({ operation: 'open-missing-main' });
+        const validateExpectedIdentity = (candidate: DatabaseSync): void => {
+            validate_expected_open_identity(candidate, options);
+        };
+        let inventory: SqliteBasenameInventory;
+        let hotJournalRetryCount = 0;
+        let hotJournalDeadline: ReaderGateDeadline | undefined;
+        const ensureHotJournalDeadline = (): ReaderGateDeadline => {
+            hotJournalDeadline ??= create_reader_gate_deadline(options);
+            return hotJournalDeadline;
+        };
+        for (;;) {
+            validationFence = undefined;
+            inventory = await inventory_sqlite_basename(canonicalPath, options);
+            assert_preflight_inventory(inventory);
+            if (!inventory.main || inventory.main.size === 0) {
+                throw sqlite_file_state_recovery_error({ operation: 'open-missing-main' });
+            }
+            // Raw preflight is mandatory before every SQLite open. In particular,
+            // a rollback-journal pathname beside a WAL-mode main must not let the
+            // read-only policy probe create canonical -wal/-shm sidecars.
+            const header = read_inventory_bound_sqlite_raw_header(
+                canonicalPath,
+                inventory.main,
+                options.expectedApplicationId ?? SQLITE_FILE_STATE_APPLICATION_ID,
+            );
+            if (!header) {
+                hotJournalRetryCount = await retry_hot_journal_copy(
+                    options,
+                    ensureHotJournalDeadline(),
+                    hotJournalRetryCount,
+                );
+                continue;
+            }
+            if (!inventory.journal && options.expectedUserVersion !== undefined
+                && header.userVersion !== options.expectedUserVersion) {
+                throw sqlite_file_state_schema_error({
+                    operation: 'raw-user-version',
+                    schemaVersion: options.expectedUserVersion,
+                });
+            }
+            if (inventory.journal) {
+                let readonlySnapshotValidated = false;
+                try {
+                    validate_readonly_identity(
+                        canonicalPath,
+                        options.timeoutMs,
+                        validateExpectedIdentity,
+                    );
+                    readonlySnapshotValidated = true;
+                } catch (error) {
+                    const categorized = categorize_sqlite_file_state_error(error, {
+                        operation: 'readonly-identity-validation',
+                    });
+                    if (categorized.category === 'contention') throw categorized;
+                    const deadline = ensureHotJournalDeadline();
+                    validationFence = await validate_recoverable_hot_journal_copy(
+                        canonicalPath,
+                        inventory,
+                        options,
+                        validateExpectedIdentity,
+                    );
+                    if (!validationFence) {
+                        hotJournalRetryCount = await retry_hot_journal_copy(
+                            options,
+                            deadline,
+                            hotJournalRetryCount,
+                        );
+                        continue;
+                    }
+                }
+                if (!readonlySnapshotValidated && !validationFence) {
+                    throw sqlite_file_state_recovery_error({
+                        operation: 'hot-journal-validation-verdict',
+                    });
+                }
+                if (activeGate.kind === 'shared-reader') {
+                    // Private validation may identify a stable schema failure while
+                    // shared and propagate it without waiting on unrelated readers.
+                    // A valid journal-bearing snapshot, however, is never opened
+                    // canonically until exclusive intent is published and drained.
+                    validationFence?.close();
+                    validationFence = undefined;
+                    if (!releaseGateOnClose) {
+                        throw sqlite_file_state_recovery_error({
+                            operation: 'hot-journal-exclusive-required',
+                        });
+                    }
+                    const deadline = ensureHotJournalDeadline();
+                    const sharedGate = activeGate;
+                    let exclusiveGate: SqliteExclusiveRecoveryGate;
+                    try {
+                        exclusiveGate = await acquire_sqlite_exclusive_recovery_gate(
+                            canonicalPath,
+                            options,
+                        );
+                    } catch (error) {
+                        const categorized = safe_error('hot-journal-exclusive-acquire', error);
+                        if (categorized.category !== 'contention') throw categorized;
+                        // Another shared opener won escalation and cannot drain while
+                        // this token remains. Relinquish it, then wait behind the peer's
+                        // intent by reacquiring shared ownership under this same deadline.
+                        // No marker is reclaimed or judged by age.
+                        await sharedGate.release();
+                        activeGate = await acquire_sqlite_shared_reader_gate_under_deadline(
+                            canonicalPath,
+                            options,
+                            deadline,
+                        );
+                        continue;
+                    }
+                    try {
+                        await sharedGate.release();
+                    } catch (releaseError) {
+                        try {
+                            await exclusiveGate.release();
+                        } catch {
+                            // Preserve the shared-token release failure.
+                        }
+                        throw releaseError;
+                    }
+                    activeGate = exclusiveGate;
+                    downgradeAutoEscalatedGate = true;
+                    await wait_for_exclusive_readers_under_deadline(
+                        exclusiveGate,
+                        options,
+                        deadline,
+                    );
+                    // Both the inventory and validation verdict preceded exclusive
+                    // ownership; repeat them before any canonical writable open.
+                    continue;
+                }
+                if (readonlySnapshotValidated) {
+                    // Even a cold journal gets a descriptor-pinned private snapshot
+                    // once exclusive. This prevents a pathname replacement between
+                    // the successful read-only probe and the canonical constructor
+                    // from bypassing the same handoff fence used for a hot journal.
+                    const deadline = ensureHotJournalDeadline();
+                    validationFence = await validate_recoverable_hot_journal_copy(
+                        canonicalPath,
+                        inventory,
+                        options,
+                        validateExpectedIdentity,
+                    );
+                    if (!validationFence) {
+                        hotJournalRetryCount = await retry_hot_journal_copy(
+                            options,
+                            deadline,
+                            hotJournalRetryCount,
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            if (validationFence) {
+                await emit(options, 'hot-journal-before-writable-open');
+                if (!validationFence.stillMatches()) {
+                    validationFence.close();
+                    validationFence = undefined;
+                    hotJournalRetryCount = await retry_hot_journal_copy(
+                        options,
+                        ensureHotJournalDeadline(),
+                        hotJournalRetryCount,
+                    );
+                    continue;
+                }
+            }
+            // node:sqlite cannot open DatabaseSync from our descriptors, request
+            // SQLITE_OPEN_NOFOLLOW, or expose the VFS's internal file identities.
+            // The strongest supported handoff is therefore to retain both verified
+            // descriptors through sqlite3_open_v2, run no SQL, and immediately check
+            // descriptor bytes plus both pathnames again. Only then are the descriptors
+            // released and SQLite allowed to acquire its ordinary locks and recover.
+            // A noncooperating same-user POSIX rename/ABA during DatabaseSync's
+            // pathname-based constructor, or after the final synchronous check, is
+            // not fenceable by node:sqlite. Cooperative Table Viewer writers remain
+            // excluded here by the exclusive recovery intent.
+            try {
+                const location = sqlite_rw_uri(path.resolve(canonicalPath));
+                const databaseOptions = {
+                    enableDoubleQuotedStringLiterals: false as const,
+                    timeout: options.timeoutMs ?? 0,
+                };
+                database = options.openWritableDatabase
+                    ? options.openWritableDatabase(location, databaseOptions)
+                    : new DatabaseSync(location, databaseOptions);
+            } catch (constructorError) {
+                if (!validationFence) throw constructorError;
+                let snapshotRemainedStable: boolean;
+                try {
+                    snapshotRemainedStable = validationFence.stillMatches();
+                } catch (verificationError) {
+                    validationFence.close();
+                    validationFence = undefined;
+                    throw verificationError;
+                }
+                validationFence.close();
+                validationFence = undefined;
+                if (snapshotRemainedStable) throw constructorError;
+                hotJournalRetryCount = await retry_hot_journal_copy(
+                    options,
+                    ensureHotJournalDeadline(),
+                    hotJournalRetryCount,
+                );
+                continue;
+            }
+            if (validationFence) {
+                await emit(options, 'hot-journal-after-writable-open');
+                if (!validationFence.stillMatches()) {
+                    try {
+                        database.close();
+                    } finally {
+                        database = undefined;
+                        validationFence.close();
+                        validationFence = undefined;
+                    }
+                    hotJournalRetryCount = await retry_hot_journal_copy(
+                        options,
+                        ensureHotJournalDeadline(),
+                        hotJournalRetryCount,
+                    );
+                    continue;
+                }
+                validationFence.close();
+                validationFence = undefined;
+            }
+            apply_connection_policy(database);
+            validateExpectedIdentity(database);
+            if (downgradeAutoEscalatedGate) {
+                if (activeGate.kind !== 'exclusive-recovery') {
+                    throw sqlite_file_state_recovery_error({
+                        operation: 'hot-journal-downgrade-gate',
+                    });
+                }
+                activeGate = await activeGate.downgradeToSharedReader();
+                downgradeAutoEscalatedGate = false;
+            }
+            break;
         }
-        read_sqlite_raw_header(canonicalPath, options.expectedApplicationId ?? SQLITE_FILE_STATE_APPLICATION_ID);
-        database = new DatabaseSync(sqlite_rw_uri(path.resolve(canonicalPath)), {
-            enableDoubleQuotedStringLiterals: false,
-            timeout: options.timeoutMs ?? 0,
-        });
-        apply_connection_policy(database);
-        options.validate?.(database);
+        const retainedGate = activeGate;
         let databaseClosed = false;
         let gateReleased = !releaseGateOnClose;
         const closeDatabase = async (): Promise<void> => {
@@ -1723,12 +2869,24 @@ async function open_existing_under_gate(
                 if (gateReleased) {
                     throw sqlite_file_state_recovery_error({ operation: 'sqlite-replace-connection' });
                 }
-                await closeDatabase();
+                // Reserve the exact token synchronously. Two callers can otherwise
+                // both pass the guard before the first continuation resumes after
+                // closing SQLite and then open concurrently under one token.
                 gateReleased = true;
+                try {
+                    await closeDatabase();
+                } catch (error) {
+                    try {
+                        await retainedGate.release();
+                    } catch {
+                        // Preserve the database-close failure.
+                    }
+                    throw error;
+                }
                 return open_existing_under_gate(
                     canonicalPath,
-                    gate,
-                    replacementOptions,
+                    retainedGate,
+                    { ...options, ...replacementOptions },
                     true,
                 );
             },
@@ -1742,7 +2900,7 @@ async function open_existing_under_gate(
                 }
                 if (!gateReleased) {
                     try {
-                        await gate.release();
+                        await retainedGate.release();
                         gateReleased = true;
                     } catch (error) {
                         closeError ??= error;
@@ -1753,13 +2911,18 @@ async function open_existing_under_gate(
         };
     } catch (error) {
         try {
+            validationFence?.close();
+        } catch {
+            // Preserve the first failure.
+        }
+        try {
             database?.close();
         } catch {
             // Preserve the first failure.
         }
         if (releaseGateOnClose) {
             try {
-                await gate.release();
+                await activeGate.release();
             } catch {
                 // Preserve the first failure.
             }
@@ -1784,13 +2947,18 @@ function scalar_bigint(database: DatabaseSync, sql: string, column: string): big
     return typeof value === 'bigint' ? value : undefined;
 }
 
-function validate_exact_v1_database(
+function validate_exact_file_state_database(
     database: DatabaseSync,
     identity: SqliteFileStateIdentity,
     supportedProtocol: number,
 ): void {
     apply_connection_policy(database);
     validate_sqlite_file_state_database(database, { identity, supportedProtocol });
+}
+
+function retains_losing_candidate(identity: SqliteFileStateIdentity): boolean {
+    return identity.productKind === 'vscode'
+        && !is_direct_vscode_file_state_identity(identity);
 }
 
 export function recognize_sqlite_initialization_candidate(
@@ -1812,7 +2980,7 @@ export function recognize_sqlite_initialization_candidate(
             enableDoubleQuotedStringLiterals: false,
         });
         userVersion = scalar_bigint(database, 'PRAGMA user_version', 'user_version');
-        validate_exact_v1_database(database, identity, supportedProtocol);
+        validate_exact_file_state_database(database, identity, supportedProtocol);
         return {
             recognized: true,
             identityMatches: true,
@@ -1831,6 +2999,11 @@ export function recognize_sqlite_initialization_candidate(
     }
 }
 
+interface BuiltInitializationCandidate {
+    readonly path: string;
+    readonly identity: fs.BigIntStats;
+}
+
 async function build_candidate(
     paths: GatePaths,
     identity: SqliteFileStateIdentity,
@@ -1838,13 +3011,21 @@ async function build_candidate(
     expectedApplicationId: number,
     supportedProtocol: number,
     hooks: SqliteOpenRecoveryHooks,
-): Promise<string> {
+): Promise<BuiltInitializationCandidate> {
+    const parentIdentity = capture_managed_directory_at_path(
+        paths.parentDirectory,
+        'candidate-parent',
+    );
     const candidatePath = path.join(paths.parentDirectory, `${paths.basename}${CANDIDATE_MARKER}${randomUUID()}`);
     let database: DatabaseSync | undefined;
     try {
         database = new DatabaseSync(candidatePath, {
             enableDoubleQuotedStringLiterals: false,
         });
+        const candidateIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        if (!candidateIdentity.isFile() || candidateIdentity.isSymbolicLink()) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-build-identity' });
+        }
         initialize_sqlite_file_state_schema(database, identity, migration);
         await emit(hooks, 'candidate-after-schema');
         database.close();
@@ -1858,7 +3039,7 @@ async function build_candidate(
         fs.chmodSync(candidatePath, PRIVATE_FILE_MODE);
         flush_file(candidatePath);
         await emit(hooks, 'candidate-after-file-flush');
-        flush_directory(paths.parentDirectory, hooks);
+        flush_managed_directory(parentIdentity, hooks, 'candidate-parent-flush');
         await emit(hooks, 'candidate-after-directory-flush');
         const recognition = recognize_sqlite_initialization_candidate(
             candidatePath,
@@ -1869,7 +3050,13 @@ async function build_candidate(
         if (!recognition.recognized || !recognition.identityMatches) {
             throw sqlite_file_state_recovery_error({ operation: 'candidate-validation' });
         }
-        return candidatePath;
+        const validatedIdentity = fs.lstatSync(candidatePath, { bigint: true });
+        if (!validatedIdentity.isFile() || validatedIdentity.isSymbolicLink()
+            || validatedIdentity.dev !== candidateIdentity.dev
+            || validatedIdentity.ino !== candidateIdentity.ino) {
+            throw sqlite_file_state_recovery_error({ operation: 'candidate-validation-identity' });
+        }
+        return { path: candidatePath, identity: candidateIdentity };
     } catch (error) {
         try {
             database?.close();
@@ -1885,12 +3072,37 @@ function remove_exact_candidate(
     expected: fs.BigIntStats,
     hooks?: SqliteOpenRecoveryHooks,
 ): void {
-    const actual = fs.statSync(candidatePath, { bigint: true });
-    if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    const parentIdentity = capture_managed_directory_at_path(
+        path.dirname(candidatePath),
+        'candidate-cleanup-parent',
+    );
+    const actual = fs.lstatSync(candidatePath, { bigint: true });
+    if (!actual.isFile() || actual.isSymbolicLink()
+        || actual.dev !== expected.dev || actual.ino !== expected.ino) {
         throw sqlite_file_state_recovery_error({ operation: 'candidate-cleanup-identity' });
     }
     fs.unlinkSync(candidatePath);
-    flush_directory(path.dirname(candidatePath), hooks);
+    flush_managed_directory(parentIdentity, hooks, 'candidate-cleanup-parent-flush');
+}
+
+/**
+ * Roll back only the exact candidate this live attempt was about to install.
+ * A canonical entry means link may have succeeded despite the reported failure,
+ * so keep the candidate as crash-recovery evidence and leave the main untouched.
+ */
+function cleanup_uninstalled_initialization_candidate(
+    paths: GatePaths,
+    candidatePath: string,
+    expected: fs.BigIntStats,
+    hooks?: SqliteOpenRecoveryHooks,
+): boolean {
+    const canonicalMain = fs.lstatSync(paths.canonicalPath, {
+        bigint: true,
+        throwIfNoEntry: false,
+    });
+    if (canonicalMain !== undefined) return false;
+    remove_exact_candidate(candidatePath, expected, hooks);
+    return true;
 }
 
 export async function initialize_sqlite_database_no_clobber(
@@ -1902,6 +3114,7 @@ export async function initialize_sqlite_database_no_clobber(
     const resolved = resolve_sqlite_canonical_path(canonicalPath);
     const paths = gate_paths(resolved);
     const expectedApplicationId = options.expectedApplicationId ?? SQLITE_FILE_STATE_APPLICATION_ID;
+    const expectedUserVersion = sqlite_file_state_schema_identity(identity).userVersion;
     const supportedProtocol = options.supportedProtocol ?? SQLITE_FILE_STATE_PROTOCOL_VERSION;
     const suppliedGate = options.gate;
     const gate = suppliedGate ?? await acquire_sqlite_shared_reader_gate(resolved, options);
@@ -1913,7 +3126,7 @@ export async function initialize_sqlite_database_no_clobber(
         }
         if (gate.kind === 'exclusive-recovery') {
             assert_exclusive_gate(paths, gate);
-            await gate.waitForReaders();
+            await gate.waitForReaders(options);
             assert_exclusive_gate(paths, gate);
         }
         const inventory = await inventory_sqlite_basename(resolved, options);
@@ -1922,14 +3135,15 @@ export async function initialize_sqlite_database_no_clobber(
             const database = openedDatabase = await open_existing_under_gate(resolved, gate, {
                 ...options,
                 expectedApplicationId,
+                expectedUserVersion,
                 validate(db) {
-                    validate_exact_v1_database(db, identity, supportedProtocol);
+                    validate_exact_file_state_database(db, identity, supportedProtocol);
                 },
             }, suppliedGate === undefined);
             await emit(options, 'winner-validated');
             return { installed: false, wonInstallation: false, database };
         }
-        candidatePath = await build_candidate(
+        const candidate = await build_candidate(
             paths,
             identity,
             migration,
@@ -1937,6 +3151,8 @@ export async function initialize_sqlite_database_no_clobber(
             supportedProtocol,
             options,
         );
+        candidatePath = candidate.path;
+        const candidateStat = candidate.identity;
         await emit(options, 'candidate-before-install');
         const recognition = recognize_sqlite_initialization_candidate(
             candidatePath,
@@ -1947,25 +3163,46 @@ export async function initialize_sqlite_database_no_clobber(
         if (!recognition.recognized || !recognition.identityMatches) {
             throw sqlite_file_state_schema_error({ operation: 'candidate-install-validation' });
         }
-        const candidateStat = fs.statSync(candidatePath, { bigint: true });
         let wonInstallation = false;
         try {
-            fs.linkSync(candidatePath, resolved);
+            const installIdentity = fs.lstatSync(candidatePath, { bigint: true });
+            if (!installIdentity.isFile() || installIdentity.isSymbolicLink()
+                || installIdentity.dev !== candidateStat.dev
+                || installIdentity.ino !== candidateStat.ino) {
+                throw sqlite_file_state_recovery_error({ operation: 'candidate-install-identity' });
+            }
+            const parentIdentity = capture_managed_directory_at_path(
+                paths.parentDirectory,
+                'candidate-install-parent',
+            );
+            assert_managed_directory(parentIdentity, 'candidate-install-parent');
+            (options.linkCandidate ?? fs.linkSync)(candidatePath, resolved);
             wonInstallation = true;
-            flush_directory(paths.parentDirectory, options);
+            flush_managed_directory(parentIdentity, options, 'candidate-install-parent-flush');
             await emit(options, 'candidate-after-install');
         } catch (error) {
-            if (!is_node_error(error) || error.code !== 'EEXIST') throw error;
+            if (!is_node_error(error) || error.code !== 'EEXIST') {
+                if (cleanup_uninstalled_initialization_candidate(
+                    paths,
+                    candidatePath,
+                    candidateStat,
+                    options,
+                )) {
+                    candidatePath = undefined;
+                }
+                throw error;
+            }
         }
         const database = openedDatabase = await open_existing_under_gate(resolved, gate, {
             ...options,
             expectedApplicationId,
+            expectedUserVersion,
             validate(db) {
-                validate_exact_v1_database(db, identity, supportedProtocol);
+                validate_exact_file_state_database(db, identity, supportedProtocol);
             },
         }, suppliedGate === undefined);
         await emit(options, 'winner-validated');
-        if (wonInstallation || identity.productKind === 'desktop') {
+        if (wonInstallation || !retains_losing_candidate(identity)) {
             remove_exact_candidate(candidatePath, candidateStat, options);
             candidatePath = undefined;
         }
@@ -2003,11 +3240,12 @@ export async function install_recognized_sqlite_candidate_no_clobber(
     const resolvedCandidate = resolve_sqlite_canonical_path(candidatePath);
     const paths = gate_paths(resolved);
     const expectedApplicationId = options.expectedApplicationId ?? SQLITE_FILE_STATE_APPLICATION_ID;
+    const expectedUserVersion = sqlite_file_state_schema_identity(identity).userVersion;
     const supportedProtocol = options.supportedProtocol ?? SQLITE_FILE_STATE_PROTOCOL_VERSION;
     let openedDatabase: SqliteOpenedDatabase | undefined;
     try {
         assert_exclusive_gate(paths, options.gate);
-        await options.gate.waitForReaders();
+        await options.gate.waitForReaders(options);
         assert_exclusive_gate(paths, options.gate);
         // Same namespace predicate as the inventory and `expected_member_kind`.
         // The stronger question — is this a candidate *we* built — is answered
@@ -2035,12 +3273,21 @@ export async function install_recognized_sqlite_candidate_no_clobber(
             throw sqlite_file_state_schema_error({ operation: 'candidate-resume-validation' });
         }
         const candidateStat = fs.statSync(resolvedCandidate, { bigint: true });
+        const parentIdentity = capture_managed_directory_at_path(
+            paths.parentDirectory,
+            'candidate-resume-install-parent',
+        );
         let wonInstallation = false;
         if (!inventory.main) {
             try {
+                assert_managed_directory(parentIdentity, 'candidate-resume-install-parent');
                 fs.linkSync(resolvedCandidate, resolved);
                 wonInstallation = true;
-                flush_directory(paths.parentDirectory, options);
+                flush_managed_directory(
+                    parentIdentity,
+                    options,
+                    'candidate-resume-install-parent-flush',
+                );
                 await emit(options, 'candidate-after-install');
             } catch (error) {
                 if (!is_node_error(error) || error.code !== 'EEXIST') throw error;
@@ -2049,21 +3296,22 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         const database = openedDatabase = await open_existing_under_gate(resolved, options.gate, {
             ...options,
             expectedApplicationId,
+            expectedUserVersion,
             validate(db) {
-                validate_exact_v1_database(db, identity, supportedProtocol);
+                validate_exact_file_state_database(db, identity, supportedProtocol);
             },
         }, false);
         await emit(options, 'winner-validated');
         const canonicalStat = fs.statSync(resolved, { bigint: true });
         const exactInstalledIncarnation = canonicalStat.dev === candidateStat.dev
             && canonicalStat.ino === candidateStat.ino;
-        if (exactInstalledIncarnation || identity.productKind === 'desktop') {
+        if (exactInstalledIncarnation || !retains_losing_candidate(identity)) {
             remove_exact_candidate(resolvedCandidate, candidateStat, options);
         }
         return {
             installed: wonInstallation,
             wonInstallation,
-            candidatePath: exactInstalledIncarnation || identity.productKind === 'desktop'
+            candidatePath: exactInstalledIncarnation || !retains_losing_candidate(identity)
                 ? undefined
                 : resolvedCandidate,
             database,
@@ -2337,14 +3585,14 @@ function remove_recovery_block(
 ): void {
     assert_managed_directory(gateIdentity, 'recovery-block-remove');
     fs.unlinkSync(paths.recoveryBlockPath);
-    assert_managed_directory(gateIdentity, 'recovery-block-remove-flush');
-    flush_directory(paths.gateDirectory, hooks);
+    flush_managed_directory(gateIdentity, hooks, 'recovery-block-remove-flush');
 }
 
 async function advance_preservation(
     paths: GatePaths,
     recoveryDirectory: string,
     recoveryIdentity: ManagedDirectoryIdentity,
+    parentIdentity: ManagedDirectoryIdentity,
     gateIdentity: ManagedDirectoryIdentity,
     initialManifest: RecoveryManifest,
     hooks: SqliteOpenRecoveryHooks,
@@ -2366,7 +3614,7 @@ async function advance_preservation(
                 fs.linkSync(sourcePath, targetPath);
                 assert_managed_directory(recoveryIdentity, 'preserve-target-flush');
                 flush_file(targetPath);
-                flush_directory(recoveryDirectory, hooks);
+                flush_managed_directory(recoveryIdentity, hooks, 'preserve-target-flush');
                 await emit(hooks, 'preserve-after-member-install');
             }
             member = { ...member, installed: true };
@@ -2384,7 +3632,7 @@ async function advance_preservation(
             if (!targetMatches) throw sqlite_file_state_recovery_error({ operation: 'preserve-target-missing' });
             if (sourceMatches) {
                 fs.unlinkSync(sourcePath);
-                flush_directory(paths.parentDirectory, hooks);
+                flush_managed_directory(parentIdentity, hooks, 'preserve-source-remove-flush');
                 await emit(hooks, 'preserve-after-member-source-removal');
             } else if (!path_entry_is_absent(sourcePath)) {
                 throw sqlite_file_state_recovery_error({ operation: 'preserve-source-changed' });
@@ -2418,8 +3666,7 @@ async function advance_preservation(
     manifest = { ...manifest, state: 'complete' };
     assert_managed_directory(recoveryIdentity, 'preserve-complete-manifest');
     replace_private_json(manifestPath, manifest, hooks);
-    assert_managed_directory(recoveryIdentity, 'preserve-complete-flush');
-    flush_directory(recoveryDirectory, hooks);
+    flush_managed_directory(recoveryIdentity, hooks, 'preserve-complete-flush');
     await emit(hooks, 'preserve-after-complete-flush');
     assert_managed_directory(recoveryIdentity, 'preserve-before-unblock');
     remove_recovery_block(paths, gateIdentity, hooks);
@@ -2448,7 +3695,7 @@ export async function preserve_sqlite_basename_set(
     const paths = gate_paths(canonicalPath);
     try {
         let gateIdentities = assert_exclusive_gate(paths, options.gate);
-        await options.gate.waitForReaders();
+        await options.gate.waitForReaders(options);
         gateIdentities = assert_exclusive_gate(paths, options.gate);
         const existingBlock = read_recovery_block(paths, gateIdentities.gate);
         if (existingBlock) return resume_sqlite_basename_preservation(canonicalPath, options);
@@ -2471,8 +3718,11 @@ export async function preserve_sqlite_basename_set(
                         path.join(preManifest.recoveryDirectory, MANIFEST_NAME),
                         JSON.stringify(manifest),
                     );
-                    assert_managed_directory(preManifest.recoveryIdentity, 'pre-manifest-recovery-flush');
-                    flush_directory(preManifest.recoveryDirectory, options);
+                    flush_managed_directory(
+                        preManifest.recoveryIdentity,
+                        options,
+                        'pre-manifest-recovery-flush',
+                    );
                     await emit(options, 'preserve-after-manifest-flush');
                     orphan = { ...preManifest, manifest };
                 }
@@ -2487,13 +3737,17 @@ export async function preserve_sqlite_basename_set(
             };
             assert_managed_directory(gateIdentities.gate, 'orphan-recovery-block-create');
             write_private_file_exclusive(paths.recoveryBlockPath, JSON.stringify(block));
-            assert_managed_directory(gateIdentities.gate, 'orphan-recovery-block-flush');
-            flush_directory(paths.gateDirectory, options);
+            flush_managed_directory(
+                gateIdentities.gate,
+                options,
+                'orphan-recovery-block-flush',
+            );
             await emit(options, 'preserve-after-blockade-flush');
             const completed = await advance_preservation(
                 paths,
                 orphan.recoveryDirectory,
                 orphan.recoveryIdentity,
+                gateIdentities.parent,
                 gateIdentities.gate,
                 orphan.manifest,
                 options,
@@ -2514,13 +3768,16 @@ export async function preserve_sqlite_basename_set(
         fs.mkdirSync(recoveryDirectory, { mode: PRIVATE_DIRECTORY_MODE });
         const recoveryIdentity = capture_recovery_directory(paths, recoveryDirectoryName);
         assert_managed_directory(recoveryIdentity, 'recovery-directory-create-flush');
-        flush_directory(paths.parentDirectory, options);
+        flush_managed_directory(
+            gateIdentities.parent,
+            options,
+            'recovery-directory-create-flush',
+        );
         await emit(options, 'preserve-after-recovery-directory-flush');
         const manifest = initial_recovery_manifest(generation, members);
         assert_managed_directory(recoveryIdentity, 'recovery-manifest-create');
         write_private_file_exclusive(path.join(recoveryDirectory, MANIFEST_NAME), JSON.stringify(manifest));
-        assert_managed_directory(recoveryIdentity, 'recovery-manifest-flush');
-        flush_directory(recoveryDirectory, options);
+        flush_managed_directory(recoveryIdentity, options, 'recovery-manifest-flush');
         await emit(options, 'preserve-after-manifest-flush');
         const block: RecoveryBlock = {
             format: 'tableViewer.sqliteRecoveryBlock.v1',
@@ -2529,13 +3786,17 @@ export async function preserve_sqlite_basename_set(
         };
         assert_managed_directory(gateIdentities.gate, 'recovery-block-create');
         write_private_file_exclusive(paths.recoveryBlockPath, JSON.stringify(block));
-        assert_managed_directory(gateIdentities.gate, 'recovery-block-flush');
-        flush_directory(paths.gateDirectory, options);
+        flush_managed_directory(
+            gateIdentities.gate,
+            options,
+            'recovery-block-flush',
+        );
         await emit(options, 'preserve-after-blockade-flush');
         const completed = await advance_preservation(
             paths,
             recoveryDirectory,
             recoveryIdentity,
+            gateIdentities.parent,
             gateIdentities.gate,
             manifest,
             options,
@@ -2553,7 +3814,7 @@ export async function resume_sqlite_basename_preservation(
     const paths = gate_paths(canonicalPath);
     try {
         let gateIdentities = assert_exclusive_gate(paths, options.gate);
-        await options.gate.waitForReaders();
+        await options.gate.waitForReaders(options);
         gateIdentities = assert_exclusive_gate(paths, options.gate);
         const block = read_recovery_block(paths, gateIdentities.gate);
         if (!block) throw sqlite_file_state_recovery_error({ operation: 'resume-no-block' });
@@ -2580,6 +3841,7 @@ export async function resume_sqlite_basename_preservation(
             paths,
             recoveryDirectory,
             recoveryIdentity,
+            gateIdentities.parent,
             gateIdentities.gate,
             manifest,
             options,

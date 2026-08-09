@@ -8,6 +8,7 @@ import {
     reopen_reserved_physical_write,
 } from '../../sqlite-file-state-persistence';
 import { PhysicalResourceLockManager } from '../../physical-resource-lock';
+import { open_vscode_cosmetic_state_database } from '../../vscode-cosmetic-state-database';
 import { prepare_physical_install, type PlatformConditionalInstaller } from '../../prepared-physical-install';
 import {
     acquire_sqlite_exclusive_recovery_gate,
@@ -29,13 +30,15 @@ import type {
     CoordinatedKeyedFileStatePersistence,
     DurableEditSession,
     FileStateLease,
+    FileStateStore,
 } from '../../state';
 import type { SqliteRuntimeEvent, SqliteRuntimeHooks } from '../../sqlite-runtime';
 
 interface WorkerOptions {
-    readonly mode?: 'store' | 'raw' | 'recovery';
+    readonly mode?: 'store' | 'raw' | 'recovery' | 'vscode-cosmetic';
     readonly maxStoredFiles?: number;
     readonly readyEventName?: string;
+    readonly observeRuntimeEvents?: readonly SqliteRuntimeEvent[];
     readonly ambiguousCommit?: {
         readonly reconciliationReleasePath: string;
     };
@@ -54,6 +57,7 @@ const leases = new Map<string, FileStateLease>();
 const runtimeEvents: SqliteRuntimeEvent[] = [];
 const barriers = new Map<string, () => void>();
 let store: CoordinatedAuthorityFileStateStore | undefined;
+let cosmeticStore: FileStateStore | undefined;
 let persistence: CoordinatedKeyedFileStatePersistence | undefined;
 let closeStore: (() => Promise<void>) | undefined;
 let rawDatabase: DatabaseSync | undefined;
@@ -151,10 +155,14 @@ function waitForObservableFile(filePath: string): void {
 }
 
 function runtimeHooks(): SqliteRuntimeHooks | undefined {
-    if (!options.ambiguousCommit) return undefined;
+    const observedEvents = new Set(options.observeRuntimeEvents ?? []);
+    if (!options.ambiguousCommit && observedEvents.size === 0) return undefined;
     return {
         onEvent(event) {
             runtimeEvents.push(event);
+            if (observedEvents.has(event)) {
+                send({ type: 'event', name: `runtime-${event}` });
+            }
             if (event !== 'before-reconcile-open' || reconciliationReadySent) return;
             reconciliationReadySent = true;
             send({ type: 'event', name: 'reconciliation-ready' });
@@ -170,7 +178,24 @@ function runtimeHooks(): SqliteRuntimeHooks | undefined {
 }
 
 async function initialize(): Promise<void> {
-    if ((options.mode ?? 'store') !== 'store') return;
+    const mode = options.mode ?? 'store';
+    if (mode === 'vscode-cosmetic') {
+        const opened = await open_vscode_cosmetic_state_database({
+            storageDirectory: path.dirname(databasePath as string),
+            appVersion: 'sqlite-multiprocess-test',
+            getMaxStoredFiles: () => options.maxStoredFiles ?? 10_000,
+            warn: () => { throw new Error('VS Code cosmetic worker unexpectedly fell back to memory.'); },
+            sqlite: { hooks: runtimeHooks() },
+        });
+        if (opened.mode !== 'sqlite' || opened.databasePath !== databasePath) {
+            await opened.close();
+            throw new Error('VS Code cosmetic worker did not open the expected SQLite database.');
+        }
+        cosmeticStore = opened.store;
+        closeStore = opened.close;
+        return;
+    }
+    if (mode !== 'store') return;
     const opened = await open_sqlite_file_state_store(databasePath as string, {
         identity: {
             productKind: 'desktop',
@@ -189,8 +214,14 @@ async function initialize(): Promise<void> {
 }
 
 function requireStore(): CoordinatedAuthorityFileStateStore {
-    if (!store) throw new Error('This worker was not opened in store mode.');
+    if (!store) throw new Error('This worker was not opened in coordinated store mode.');
     return store;
+}
+
+function requireFileStateStore(): FileStateStore {
+    const available = cosmeticStore ?? store;
+    if (!available) throw new Error('This worker was not opened in file-state store mode.');
+    return available;
 }
 
 function canonicalKey(kind: string | undefined): (filePath: string) => string {
@@ -201,7 +232,7 @@ function canonicalKey(kind: string | undefined): (filePath: string) => string {
 async function handle(command: string, payload: any): Promise<unknown> {
     switch (command) {
         case 'read':
-            return requireStore().read(payload.path);
+            return requireFileStateStore().read(payload.path);
         case 'readAuthority':
             return requireStore().read_authority(payload.path);
         case 'acquireEdit':
@@ -389,13 +420,21 @@ async function handle(command: string, payload: any): Promise<unknown> {
             if (typeof payload.barrierId === 'string') {
                 await crossBarrier(payload.barrierId, payload.barrierName ?? 'before-cas');
             }
-            return requireStore().compare_and_set(
+            return requireFileStateStore().compare_and_set(
                 payload.path,
                 payload.expectedRevision,
                 payload.state,
                 undefined,
                 payload.basis,
             );
+        case 'copy': {
+            const copy = requireFileStateStore().copy_entry_if_absent;
+            if (!copy) throw new Error('Copy API is unavailable.');
+            return copy(payload.sourcePath, payload.destinationPath, payload.copyId);
+        }
+        case 'touch':
+            await requireFileStateStore().touch(payload.path);
+            return null;
         case 'stage':
             return requireStore().stage_authority_transaction(payload.path, payload.stage);
         case 'finalize':
@@ -607,6 +646,7 @@ async function handle(command: string, payload: any): Promise<unknown> {
             }
             await closeStore?.();
             closeStore = undefined;
+            cosmeticStore = undefined;
             await recoveryDatabase?.close();
             recoveryDatabase = undefined;
             await recoveryGate?.release();

@@ -1,98 +1,169 @@
 import * as vscode from 'vscode';
-import { register_table_viewer, TABLE_VIEW_TYPE } from './custom-editor';
-import { show_csv_preview, dispose_csv_preview } from './csv-preview';
 import {
-    create_physical_edit_activation_boundary,
-    PhysicalEditProtocolMarker,
-    run_physical_edit_protocol_setup,
-    type PhysicalEditActivationBoundary,
-} from './physical-edit-activation';
+    register_table_viewer,
+    TABLE_VIEW_TYPE,
+    type TableViewerRegistration,
+} from './custom-editor';
+import {
+    show_csv_preview,
+    dispose_csv_preview,
+    drain_csv_previews,
+} from './csv-preview';
+import {
+    open_vscode_cosmetic_state_database,
+    type OpenedVscodeCosmeticStateDatabase,
+} from './vscode-cosmetic-state-database';
 
-let active_boundary: PhysicalEditActivationBoundary | undefined;
-let active_disposables: vscode.Disposable[] = [];
-let drain_active_viewers: (() => Promise<void>) | undefined;
+interface ActiveExtensionRuntime {
+    readonly viewers: TableViewerRegistration;
+    readonly commands: vscode.Disposable[];
+    readonly database: OpenedVscodeCosmeticStateDatabase;
+}
+
+let active_runtime: ActiveExtensionRuntime | undefined;
 
 function active_custom_tab_uri(): vscode.Uri | undefined {
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
     return input instanceof vscode.TabInputCustom ? input.uri : undefined;
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    const marker = new PhysicalEditProtocolMarker();
-    const boundary = await create_physical_edit_activation_boundary(context, marker);
-    active_boundary = boundary;
+function extension_version(context: vscode.ExtensionContext): string {
+    const version = (context.extension.packageJSON as { version?: unknown }).version;
+    return typeof version === 'string' && version.length > 0 ? version : '0.0.0';
+}
 
-    const viewer_registration = register_table_viewer(
-        context,
-        boundary.store,
-        () => boundary.viewOnly,
-    );
-    if (boundary.markerStatus === 'invalid') {
-        void vscode.window.showErrorMessage(
-            'Table Viewer could not verify the physical-edit protocol marker. Files remain available in view-only mode. Close and update every Table Viewer product, then repair or remove the unreadable or tampered coordination marker before arming the protocol again.',
-        );
+function get_max_stored_files(): number {
+    return vscode.workspace.getConfiguration('tableViewer')
+        .get<number>('maxStoredFiles', 10_000)!;
+}
+
+function dispose_best_effort(disposable: vscode.Disposable | undefined): void {
+    try {
+        disposable?.dispose();
+    } catch {
+        // Teardown continues so queues can drain and SQLite can always close.
     }
-    drain_active_viewers = () => viewer_registration.drain();
-    let viewers_stopped = false;
-    const stop_viewers = async () => {
-        if (!viewers_stopped) {
-            viewers_stopped = true;
-            dispose_csv_preview();
-        }
-        // Re-invocation retries panels whose renderer did not answer a previous
-        // bounded flush. Registrations are idempotent; failed panels stay open and
-        // view-only until a later attempt succeeds.
-        viewer_registration.dispose();
-        await viewer_registration.drain();
-    };
+}
 
-    const disposables = [
-        viewer_registration,
-        vscode.commands.registerCommand('tableViewer.setupPhysicalEditProtocol', async () => {
-            await run_physical_edit_protocol_setup(marker, boundary, stop_viewers);
-        }),
-        vscode.commands.registerCommand('tableViewer.showCsvPreviewToSide', (uri?: vscode.Uri) => {
-            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-            if (!target) return;
-            show_csv_preview(target, context.extensionUri, boundary.store, vscode.ViewColumn.Beside);
-        }),
-        vscode.commands.registerCommand('tableViewer.showCsvPreview', (uri?: vscode.Uri) => {
-            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-            if (!target) return;
-            show_csv_preview(target, context.extensionUri, boundary.store, vscode.ViewColumn.Active);
-        }),
-        vscode.commands.registerCommand('tableViewer.openCsvTable', (uri?: vscode.Uri) => {
-            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
-            if (!target) return;
-            void vscode.commands.executeCommand('vscode.openWith', target, TABLE_VIEW_TYPE);
-        }),
-        vscode.commands.registerCommand('tableViewer.openAsText', (uri?: vscode.Uri) => {
-            const target = uri ?? active_custom_tab_uri();
-            if (!target) return;
-            void vscode.commands.executeCommand('vscode.openWith', target, 'default');
-        }),
-        { dispose: dispose_csv_preview },
-    ];
-    active_disposables = disposables;
-    context.subscriptions.push(...disposables);
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    const state_directory = vscode.Uri.joinPath(context.globalStorageUri, 'state');
+    try {
+        await vscode.workspace.fs.createDirectory(state_directory);
+    } catch {
+        // The database opener below performs the authoritative open and selects its
+        // in-memory cosmetic fallback when the directory is unusable.
+    }
+    const database = await open_vscode_cosmetic_state_database({
+        storageDirectory: state_directory.fsPath,
+        appVersion: extension_version(context),
+        getMaxStoredFiles: get_max_stored_files,
+        warn: async (message) => {
+            await vscode.window.showWarningMessage(message);
+        },
+    });
+
+    let viewers: TableViewerRegistration | undefined;
+    const commands: vscode.Disposable[] = [];
+    try {
+        viewers = register_table_viewer(context, database.store);
+        commands.push(vscode.commands.registerCommand(
+            'tableViewer.showCsvPreviewToSide',
+            (uri?: vscode.Uri) => {
+                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+                if (!target) return;
+                show_csv_preview(
+                    target,
+                    context.extensionUri,
+                    database.store,
+                    vscode.ViewColumn.Beside,
+                );
+            },
+        ));
+        commands.push(vscode.commands.registerCommand(
+            'tableViewer.showCsvPreview',
+            (uri?: vscode.Uri) => {
+                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+                if (!target) return;
+                show_csv_preview(
+                    target,
+                    context.extensionUri,
+                    database.store,
+                    vscode.ViewColumn.Active,
+                );
+            },
+        ));
+        commands.push(vscode.commands.registerCommand(
+            'tableViewer.openCsvTable',
+            (uri?: vscode.Uri) => {
+                const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+                if (!target) return;
+                void vscode.commands.executeCommand(
+                    'vscode.openWith',
+                    target,
+                    TABLE_VIEW_TYPE,
+                );
+            },
+        ));
+        commands.push(vscode.commands.registerCommand(
+            'tableViewer.openAsText',
+            (uri?: vscode.Uri) => {
+                const target = uri ?? active_custom_tab_uri();
+                if (!target) return;
+                void vscode.commands.executeCommand('vscode.openWith', target, 'default');
+            },
+        ));
+        context.subscriptions.push(...commands);
+        active_runtime = { viewers, commands, database };
+    } catch (error) {
+        for (const command of commands.reverse()) dispose_best_effort(command);
+        if (viewers) {
+            try {
+                viewers.stop_admissions();
+            } catch {
+                // Continue rollback through disposal and drain.
+            }
+            dispose_best_effort(viewers);
+            await Promise.allSettled([viewers.drain()]);
+        }
+        try {
+            await database.close();
+        } catch {
+            // Preserve the activation failure that triggered rollback.
+        }
+        throw error;
+    }
 }
 
 export async function deactivate(): Promise<void> {
-    const disposables = active_disposables;
-    active_disposables = [];
-    for (const disposable of disposables) {
-        try {
-            disposable.dispose();
-        } catch {
-            // Continue teardown; a later drain still gets its bounded chance to settle.
-        }
+    const runtime = active_runtime;
+    active_runtime = undefined;
+    if (!runtime) return;
+
+    // First stop admissions and begin viewer/preview teardown so no new document
+    // or controller work can begin. Viewer provider registration stays alive only
+    // long enough for already-admitted native edit events to drain below.
+    try {
+        runtime.viewers.stop_admissions();
+    } catch {
+        // Continue ordered teardown; close must not be skipped by a host callback.
     }
-    const drain_viewers = drain_active_viewers;
-    drain_active_viewers = undefined;
-    const boundary = active_boundary;
-    active_boundary = undefined;
-    await Promise.allSettled([
-        drain_viewers?.() ?? Promise.resolve(),
-        boundary?.drain() ?? Promise.resolve(),
-    ]);
+    try {
+        dispose_csv_preview();
+    } catch {
+        // Continue through controller drain.
+    }
+    for (const command of runtime.commands) dispose_best_effort(command);
+    dispose_best_effort(runtime.viewers);
+
+    try {
+        // Then settle all document and controller queues, finalize the viewer
+        // provider bridge, and only then close the direct SQLite handle. close()
+        // is idempotent and is invoked exactly once here.
+        await Promise.allSettled([
+            runtime.viewers.drain(),
+            drain_csv_previews(),
+        ]);
+    } finally {
+        await runtime.database.close();
+    }
 }
