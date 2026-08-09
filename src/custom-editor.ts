@@ -374,22 +374,20 @@ export class CsvTableEditorProvider extends ViewerProviderBase
                             viewId: view_id,
                             viewMutationEpoch: attachment.viewMutationEpoch,
                             requestNativeCommand: async (command) => {
-                                if (command === 'save') {
-                                    const saved = await vscode.workspace.save(document.uri);
-                                    if (saved === undefined) {
-                                        throw new Error('VS Code could not save the CSV document.');
-                                    }
-                                    return;
-                                }
-                                // Undo/Redo are global active-editor commands. Recheck at
+                                // Save/Undo/Redo are active-editor commands. Recheck at
                                 // dispatch time because this document-scoped request may
-                                // have waited behind another view's history transaction.
+                                // have waited behind another view's operation. Saving by URI
+                                // would also save a text editor input for the same resource.
                                 if (!panel.active) {
                                     throw new Error(
                                         'The requesting Table Viewer panel is no longer active.',
                                     );
                                 }
-                                await vscode.commands.executeCommand(command);
+                                await vscode.commands.executeCommand(
+                                    command === 'save'
+                                        ? 'workbench.action.files.save'
+                                        : command,
+                                );
                             },
                         },
                     },

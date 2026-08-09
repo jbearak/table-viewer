@@ -294,6 +294,11 @@ const ROW_HEIGHT_LIMIT_WARNING =
 const CSV_NATIVE_HISTORY_WARNING =
     'Table Viewer could not complete the document history operation. '
     + 'The table was resynchronized.';
+const CSV_NATIVE_SAVE_WARNING =
+    'Table Viewer could not route Save because the requesting table is no longer active. '
+    + 'Return to the table and try again.';
+const CSV_DOCUMENT_INPUT_WARNING =
+    'Table Viewer could not apply that edit. The previous value was restored.';
 
 function content_digest(bytes: Uint8Array): string {
     return csv_content_digest(bytes);
@@ -4516,6 +4521,7 @@ export function attach_viewer(
                     });
                 } catch (error) {
                     log_sanitized_failure('Failed to apply CSV document input', error);
+                    show_owner_warning(CSV_DOCUMENT_INPUT_WARNING);
                     await post_document_sync({
                         closeViewGesture: true,
                         mutationEpoch: msg.mutationEpoch,
@@ -4586,7 +4592,9 @@ export function attach_viewer(
                         }
                     } catch (error) {
                         log_sanitized_failure('Failed to run native CSV document command', error);
-                        if (msg.command !== 'save') {
+                        if (msg.command === 'save') {
+                            show_owner_warning(CSV_NATIVE_SAVE_WARNING);
+                        } else {
                             show_owner_warning(CSV_NATIVE_HISTORY_WARNING);
                             await post_document_sync({ closeViewGesture: true });
                         }

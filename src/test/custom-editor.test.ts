@@ -1018,11 +1018,6 @@ describe('controller document bridge', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = registered_csv_provider();
         const document = await open_document(provider, uri);
-        const saved_uris: vscode_mock.UriLike[] = [];
-        vscode_mock.__setSaveImplementation(async (saved_uri) => {
-            saved_uris.push(saved_uri);
-            return saved_uri;
-        });
         const edit_events: vscode.CustomDocumentEditEvent<CsvProviderDocument>[] = [];
         provider.onDidChangeCustomDocument((event) => {
             if ('undo' in event && 'redo' in event) {
@@ -1083,6 +1078,28 @@ describe('controller document bridge', () => {
         }>(mock_panel, 'csvDocumentSync', before_resync);
         expect(resync.revision).toBe(document.revision);
 
+        vi.spyOn(document, 'apply_cell_input').mockRejectedValueOnce(
+            Object.assign(new Error('backup admission rejected'), { code: 'sizeLimit' }),
+        );
+        const before_rejected_input = mock_panel.__messages.length;
+        await mock_panel.__receive({
+            type: 'csvDocumentCellInput',
+            mutationEpoch: 1,
+            viewMutationEpoch: resync.viewMutationEpoch,
+            viewId,
+            key: '0:1',
+            value: 'rejected',
+            revision: resync.revision,
+        });
+        await wait_for_message(
+            mock_panel,
+            'csvDocumentSync',
+            before_rejected_input,
+        );
+        expect(vscode_mock.__getWarningMessages()).toEqual([
+            'Table Viewer could not apply that edit. The previous value was restored.',
+        ]);
+
         const undo_registration = vscode_mock.commands.registerCommand(
             'undo',
             () => edit_events[edit_events.length - 1]?.undo(),
@@ -1096,9 +1113,8 @@ describe('controller document bridge', () => {
         expect(document.cell_value('0:1')).toBe('2');
         await mock_panel.__receive({ type: 'csvDocumentNativeCommand', command: 'redo' });
         expect(document.cell_value('0:1')).toBe('3');
-        expect(saved_uris).toEqual([document.uri]);
-        expect(vscode_mock.__getExecutedCommands().slice(-2).map(({ command }) => command))
-            .toEqual(['undo', 'redo']);
+        expect(vscode_mock.__getExecutedCommands().slice(-3).map(({ command }) => command))
+            .toEqual(['workbench.action.files.save', 'undo', 'redo']);
         undo_registration.dispose();
         redo_registration.dispose();
 
@@ -1391,7 +1407,7 @@ describe('controller document bridge', () => {
         await document.dispose();
     });
 
-    it('refuses inactive-panel history commands while keeping Save directly routed', async () => {
+    it('refuses inactive-panel native commands instead of saving another editor', async () => {
         const uri = vscode_mock.Uri.file('/inactive.csv') as vscode.Uri;
         install_memory_file_system({ [uri.toString()]: 'a,b\n1,2\n' });
         const registration = register_table_viewer(context(), state_store());
@@ -1424,17 +1440,23 @@ describe('controller document bridge', () => {
         await mock_panel.__receive({
             type: 'csvDocumentNativeCommand', command: 'save',
         });
-        expect(save).toHaveBeenCalledWith(document.uri);
+        expect(save).not.toHaveBeenCalled();
         expect(vscode_mock.__getExecutedCommands().some(
             ({ command }) => command === 'workbench.action.files.save',
         )).toBe(false);
+        expect(vscode_mock.__getWarningMessages()).toEqual([
+            'Table Viewer could not complete the document history operation. '
+            + 'The table was resynchronized.',
+            'Table Viewer could not route Save because the requesting table is no longer active. '
+            + 'Return to the table and try again.',
+        ]);
 
         registration.dispose();
         await registration.drain();
         await document.dispose();
     });
 
-    it('targets the requesting document when another editor becomes active before Save dispatch', async () => {
+    it('refuses queued Save when another editor becomes active before dispatch', async () => {
         const first_uri = vscode_mock.Uri.file('/targeted-first.csv') as vscode.Uri;
         const second_uri = vscode_mock.Uri.file('/targeted-second.csv') as vscode.Uri;
         install_memory_file_system({
@@ -1477,11 +1499,14 @@ describe('controller document bridge', () => {
         second.__setActive(true);
         await save_request;
 
-        expect(saved_uris).toEqual([first_document.uri]);
-        expect(saved_uris).not.toContain(second_document.uri);
+        expect(saved_uris).toEqual([]);
         expect(vscode_mock.__getExecutedCommands().some(
             ({ command }) => command === 'workbench.action.files.save',
         )).toBe(false);
+        expect(vscode_mock.__getWarningMessages()).toEqual([
+            'Table Viewer could not route Save because the requesting table is no longer active. '
+            + 'Return to the table and try again.',
+        ]);
 
         registration.dispose();
         await registration.drain();
