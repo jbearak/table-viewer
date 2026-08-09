@@ -27,6 +27,7 @@ import {
     type DesktopSettings,
 } from './desktop-config';
 import {
+    close_desktop_windows,
     create_app_quit_coordinator,
     ViewerWindowManager,
     type AppQuitShutdownPort,
@@ -179,15 +180,20 @@ const quit_shutdown: AppQuitShutdownPort = {
 };
 
 // Electron's first app.quit() is synchronous, while viewer close is fenced by
-// renderer and state-backend acknowledgements. Resume quit after those windows
-// close and the SQLite connection has been released; the allow-quit guard admits
-// the second before-quit event on macOS too.
+// renderer and state-backend acknowledgements. Close every BrowserWindow before
+// resuming quit: on macOS, a cancelled window close clears Electron's own quitting
+// flag, which otherwise consumes the first Cmd-Q and leaves a windowless process.
+// After the windows and SQLite connection are released, the allow-quit guard
+// admits the resumed before-quit event.
 //
 // Constructed at module scope, before either the window manager or the state
 // backend exists, so every dependency is read through a closure over a mutable
 // module binding rather than captured now.
 const coordinate_app_quit = create_app_quit_coordinator(
-    () => viewer_windows?.close_all() ?? Promise.resolve(true),
+    () => close_desktop_windows(
+        () => viewer_windows?.close_all() ?? Promise.resolve(true),
+        () => BrowserWindow.getAllWindows(),
+    ),
     () => app.quit(),
     quit_shutdown,
 );

@@ -78,7 +78,7 @@ async function apply_sort(page: Page): Promise<void> {
 
 /**
  * Quit through the real before-quit → close fence → drain path, and wait until
- * this app's own connection is released.
+ * both the process exits and this app's own connection is released.
  *
  * `remaining` is how many tokens legitimately survive the quit: zero normally,
  * and one after a launch was killed, because that launch's token is deliberately
@@ -91,10 +91,15 @@ async function quit_cleanly(
     user_data_dir: string,
     remaining = 0,
 ): Promise<void> {
+    const process_handle = app.process();
     await app.evaluate(({ app: electron_app }) => electron_app.quit()).catch(() => {
         // The quit can tear the harness connection down before the call
-        // resolves; the reader-token poll below is the real signal.
+        // resolves; the observable polls below are the real signals.
     });
+    await expect
+        .poll(() => process_handle.exitCode !== null || process_handle.signalCode !== null,
+            { timeout: 30_000 })
+        .toBe(true);
     await expect
         .poll(() => reader_tokens(user_data_dir).length, { timeout: 30_000 })
         .toBe(remaining);
