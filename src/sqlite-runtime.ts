@@ -920,15 +920,10 @@ async function cleanup_final_reference(runtime: RuntimeState): Promise<void> {
         database.exec('BEGIN IMMEDIATE');
         try {
             assert_runtime_fences(runtime, database);
-            const ownedEdits = prepared(database, `SELECT count(*) AS count
-                FROM edit_sessions WHERE owner_writer_session_id = ?`).get(runtime.writerSessionId);
-            const editCount = sqlite_safe_integer(ownedEdits?.count, 'owned edit count');
-            if (editCount === 0) {
-                prepared(database, 'DELETE FROM entry_leases WHERE writer_session_id = ?')
-                    .run(runtime.writerSessionId);
-                prepared(database, 'DELETE FROM writer_sessions WHERE writer_session_id = ?')
-                    .run(runtime.writerSessionId);
-            }
+            prepared(database, 'DELETE FROM entry_leases WHERE writer_session_id = ?')
+                .run(runtime.writerSessionId);
+            prepared(database, 'DELETE FROM writer_sessions WHERE writer_session_id = ?')
+                .run(runtime.writerSessionId);
             database.exec('COMMIT');
         } catch (error) {
             try { database.exec('ROLLBACK'); } catch { /* Best-effort cleanup only. */ }

@@ -16,14 +16,7 @@ import {
     sqlite_file_state_schema_error,
 } from './sqlite-file-state-errors';
 import { decode_stored_per_file_state, type StoredPerFileState } from './types';
-import {
-    decode_prepared_install_lifecycle,
-    SQLITE_PREPARED_INSTALL_STATE_KEY,
-} from './sqlite-file-state-repository';
-import {
-    state_has_pending_edits,
-    type PersistedPreparedInstallLifecycleRecord,
-} from './state';
+import { state_has_pending_edits } from './state';
 
 type SqliteRow = Record<string, unknown>;
 
@@ -42,7 +35,6 @@ export interface ValidatedSqliteFileStateMetadata {
     readonly nextRevision: number;
     readonly absenceRevision: number;
     readonly nextRecencyOrder: bigint;
-    readonly nextOwnershipGeneration: number;
     readonly entryCount: number;
 }
 
@@ -53,7 +45,7 @@ const EXPECTED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
         'legacy_source_format', 'legacy_source_digest', 'legacy_import_claim_id',
         'min_reader_protocol', 'max_reader_protocol', 'min_writer_protocol',
         'max_writer_protocol', 'coordination_generation', 'next_revision',
-        'absence_revision', 'next_recency_order', 'next_ownership_generation',
+        'absence_revision', 'next_recency_order',
         'store_updated_at_ms',
     ],
     entries: [
@@ -75,20 +67,6 @@ const EXPECTED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     entry_leases: [
         'lease_id', 'writer_session_id', 'current_entry_path', 'acquired_at_ms',
         'acquired_generation',
-    ],
-    edit_sessions: [
-        'entry_path', 'physical_resource_lock_key', 'host_lock_id', 'edit_session_id',
-        'owner_writer_session_id', 'ownership_generation', 'acquired_at_ms',
-        'last_confirmed_at_ms',
-    ],
-    file_write_reservations: [
-        'reservation_id', 'save_operation_id', 'entry_path', 'physical_resource_lock_key',
-        'host_lock_id', 'edit_session_id', 'ownership_generation', 'reserved_generation',
-        'stage_id', 'prepared_install_id', 'expected_state_revision',
-        'expected_commit_sequence', 'expected_authority_revision',
-        'expected_physical_revision', 'expected_projection_revision',
-        'expected_physical_digest', 'intended_physical_digest', 'recovery_record_id',
-        'acquired_at_ms',
     ],
     legacy_imports: [
         'capsule_id', 'source_format', 'source_digest', 'source_entry_count',
@@ -112,7 +90,7 @@ const INTEGER_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     state_meta: [
         'singleton', 'min_reader_protocol', 'max_reader_protocol', 'min_writer_protocol',
         'max_writer_protocol', 'coordination_generation', 'next_revision',
-        'absence_revision', 'next_recency_order', 'next_ownership_generation',
+        'absence_revision', 'next_recency_order',
         'store_updated_at_ms',
     ],
     entries: [
@@ -128,12 +106,6 @@ const INTEGER_COLUMNS: Readonly<Record<string, readonly string[]>> = {
         'opened_generation', 'last_committed_sequence',
     ],
     entry_leases: ['acquired_at_ms', 'acquired_generation'],
-    edit_sessions: ['ownership_generation', 'acquired_at_ms', 'last_confirmed_at_ms'],
-    file_write_reservations: [
-        'ownership_generation', 'reserved_generation', 'expected_state_revision',
-        'expected_commit_sequence', 'expected_authority_revision',
-        'expected_physical_revision', 'expected_projection_revision', 'acquired_at_ms',
-    ],
     legacy_imports: [
         'source_entry_count', 'source_next_revision', 'source_absence_revision',
         'source_updated_at_ms', 'imported_at_ms',
@@ -260,25 +232,14 @@ function validate_integer_storage(database: DatabaseSync): void {
     }
 }
 
-function decode_state_json(value: unknown): {
-    readonly state: StoredPerFileState;
-    readonly lifecycle?: PersistedPreparedInstallLifecycleRecord;
-} {
+function decode_state_json(value: unknown): { readonly state: StoredPerFileState } {
     if (typeof value !== 'string') throw sqlite_file_state_malformed_error();
     try {
         const parsed = JSON.parse(value);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             throw sqlite_file_state_malformed_error();
         }
-        const logical = { ...(parsed as Record<string, unknown>) };
-        const lifecycle = decode_prepared_install_lifecycle(
-            logical[SQLITE_PREPARED_INSTALL_STATE_KEY],
-        );
-        delete logical[SQLITE_PREPARED_INSTALL_STATE_KEY];
-        return {
-            state: decode_stored_per_file_state(logical),
-            ...(lifecycle === undefined ? {} : { lifecycle }),
-        };
+        return { state: decode_stored_per_file_state(parsed) };
     } catch {
         throw sqlite_file_state_malformed_error();
     }
@@ -405,22 +366,12 @@ function validate_identity_and_counters(
     ) ?? 0n;
     const nextRecency = bigint_value(meta.next_recency_order) as bigint;
     if (nextRecency <= maxRecency) throw sqlite_file_state_counter_error();
-    const maxOwnership = safe_number(
-        row(database, 'SELECT max(ownership_generation) AS value FROM edit_sessions')?.value,
-        true,
-    ) ?? 0;
-    const nextOwnership = safe_number(meta.next_ownership_generation) as number;
-    if (nextOwnership >= SQLITE_FILE_STATE_EXHAUSTION_SENTINEL || nextOwnership <= maxOwnership) {
-        throw sqlite_file_state_counter_error();
-    }
     return { meta, entryCount };
 }
 
 function validate_coordination(
     database: DatabaseSync,
     meta: SqliteRow,
-    pending: Map<string, boolean>,
-    requiresPendingEditRecovery: boolean,
 ): void {
     const generation = safe_number(meta.coordination_generation) as number;
     const minReader = safe_number(meta.min_reader_protocol) as number;
@@ -439,107 +390,6 @@ function validate_coordination(
     for (const lease of rows(database, 'SELECT * FROM entry_leases')) {
         if ((safe_number(lease.acquired_generation) as number) > generation) {
             throw sqlite_file_state_protocol_error({ coordinationGeneration: generation });
-        }
-    }
-    const editRows = rows(database, 'SELECT * FROM edit_sessions');
-    const ownerships = new Set<number>();
-    for (const edit of editRows) {
-        const ownership = safe_number(edit.ownership_generation) as number;
-        if (text(edit.entry_path).length === 0
-            || text(edit.physical_resource_lock_key).length === 0
-            || text(edit.host_lock_id).length === 0
-            || text(edit.edit_session_id).length === 0
-            || text(edit.owner_writer_session_id).length === 0
-            || ownerships.has(ownership) || !pending.has(text(edit.entry_path))
-            || (safe_number(edit.last_confirmed_at_ms) as number)
-                < (safe_number(edit.acquired_at_ms) as number)) {
-            throw sqlite_file_state_malformed_error({ rowCount: editRows.length });
-        }
-        ownerships.add(ownership);
-    }
-
-    const reservations = rows(database, `SELECT
-        r.*, e.state_json, e.state_revision, e.authority_commit_sequence, e.authority_revision,
-        e.physical_revision, e.projection_revision, e.physical_digest AS current_physical_digest,
-        s.kind AS stage_kind, s.expected_state_revision AS stage_state_revision,
-        s.expected_commit_sequence AS stage_commit_sequence,
-        s.physical_digest AS stage_physical_digest,
-        s.next_state_json
-        FROM file_write_reservations r
-        JOIN entries e ON e.path = r.entry_path
-        JOIN authority_stages s ON s.entry_path = r.entry_path AND s.stage_id = r.stage_id`);
-    if (reservations.length !== count(database, 'SELECT count(*) AS count FROM file_write_reservations')) {
-        throw sqlite_file_state_foreign_key_error({ rowCount: reservations.length });
-    }
-    for (const reservation of reservations) {
-        const lifecycle = decode_state_json(reservation.state_json).lifecycle;
-        const exactNumbers = [
-            ['expected_state_revision', 'state_revision'],
-            ['expected_commit_sequence', 'authority_commit_sequence'],
-            ['expected_authority_revision', 'authority_revision'],
-            ['expected_physical_revision', 'physical_revision'],
-            ['expected_projection_revision', 'projection_revision'],
-            ['expected_state_revision', 'stage_state_revision'],
-            ['expected_commit_sequence', 'stage_commit_sequence'],
-        ] as const;
-        if (exactNumbers.some(([left, right]) => safe_number(reservation[left]) !== safe_number(reservation[right]))) {
-            throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-        }
-        if (!lifecycle || lifecycle.phase !== 'reserved'
-            || lifecycle.reservationId !== text(reservation.reservation_id)
-            || lifecycle.saveOperationId !== text(reservation.save_operation_id)
-            || lifecycle.stageId !== text(reservation.stage_id)
-            || lifecycle.preparedInstallId !== text(reservation.prepared_install_id)
-            || lifecycle.hostLockId !== text(reservation.host_lock_id)
-            || lifecycle.physicalResourceLockKey
-                !== text(reservation.physical_resource_lock_key)
-            || lifecycle.expectedPhysicalDigest !== text(reservation.expected_physical_digest)
-            || lifecycle.intendedPhysicalDigest !== text(reservation.intended_physical_digest)
-            || lifecycle.recoveryRecordId !== nullable_text(reservation.recovery_record_id)
-            || text(reservation.reservation_id).length === 0
-            || text(reservation.save_operation_id).length === 0
-            || text(reservation.entry_path).length === 0
-            || text(reservation.physical_resource_lock_key).length === 0
-            || text(reservation.host_lock_id).length === 0
-            || text(reservation.edit_session_id).length === 0
-            || text(reservation.stage_id).length === 0
-            || text(reservation.prepared_install_id).length === 0
-            || nullable_text(reservation.expected_physical_digest) === undefined
-            || nullable_text(reservation.expected_physical_digest)?.length === 0
-            || nullable_text(reservation.expected_physical_digest)
-                !== nullable_text(reservation.current_physical_digest)
-            || text(reservation.intended_physical_digest).length === 0
-            || text(reservation.stage_kind) !== 'physical'
-            || nullable_text(reservation.stage_physical_digest)
-                !== text(reservation.intended_physical_digest)
-            || (safe_number(reservation.reserved_generation) as number) !== generation) {
-            throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-        }
-        if (requiresPendingEditRecovery
-            && pending.get(text(reservation.entry_path))
-            && reservation.next_state_json !== null) {
-            const next = state_from_json(reservation.next_state_json);
-            if (!state_has_pending_edits(next) && reservation.recovery_record_id === null) {
-                throw sqlite_file_state_malformed_error({ rowCount: reservations.length });
-            }
-        }
-    }
-
-    const lifecycleIds = new Set<string>();
-    for (const entry of rows(database, 'SELECT path, state_json FROM entries')) {
-        const lifecycle = decode_state_json(entry.state_json).lifecycle;
-        if (!lifecycle) continue;
-        if (lifecycleIds.has(lifecycle.reservationId)) {
-            throw sqlite_file_state_malformed_error();
-        }
-        lifecycleIds.add(lifecycle.reservationId);
-        const reservation = reservations.find((candidate) => (
-            text(candidate.entry_path) === text(entry.path)
-        ));
-        if ((lifecycle.phase === 'reserved') !== (reservation !== undefined)
-            || (reservation !== undefined
-                && text(reservation.reservation_id) !== lifecycle.reservationId)) {
-            throw sqlite_file_state_malformed_error();
         }
     }
 }
@@ -686,7 +536,7 @@ export function validate_sqlite_file_state_database(
     const requiresPendingEditRecovery = options.requiresPendingEditRecovery ?? false;
     const pending = validate_entries(database, requiresPendingEditRecovery, nextRevision);
     validate_stages(database, nextRevision);
-    validate_coordination(database, meta, pending, requiresPendingEditRecovery);
+    validate_coordination(database, meta);
     validate_legacy(database, options.identity, meta, pending);
 
     return {
@@ -697,7 +547,6 @@ export function validate_sqlite_file_state_database(
         nextRevision: safe_number(meta.next_revision) as number,
         absenceRevision: safe_number(meta.absence_revision) as number,
         nextRecencyOrder: bigint_value(meta.next_recency_order) as bigint,
-        nextOwnershipGeneration: safe_number(meta.next_ownership_generation) as number,
         entryCount,
     };
 }

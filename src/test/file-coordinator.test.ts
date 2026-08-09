@@ -1095,10 +1095,7 @@ describe('file coordinator Task 10 invariants', () => {
             -1,
             { activeSheetIndex: 4 },
             validate_throw,
-            {
-                expectedAuthorityRevision: 99,
-                editOwner: { editSessionId: 'unsupported', ownershipGeneration: 1 },
-            },
+            { expectedAuthorityRevision: 99 },
         )).rejects.toBe(thrown);
         expect(validate_throw).toHaveBeenCalledOnce();
         expect(compare_and_set).toHaveBeenCalledTimes(3);

@@ -3,8 +3,6 @@
 // other shells (e.g. a future desktop app) can provide their own without the
 // shared code importing `vscode`.
 import type { FileRefreshWatcherFactory } from './file-refresh-watcher';
-import type { PreparedPhysicalInstallBundle } from './prepared-physical-install';
-import type { HostPhysicalResourceLock } from './physical-resource-lock';
 import type { ResourceUriLike } from './resource-identity';
 
 /** Minimal disposable, structurally compatible with vscode.Disposable. */
@@ -22,6 +20,7 @@ export interface FileStat {
 export interface FileSystemPort {
     stat(resource: ResourceUriLike): Promise<FileStat>;
     read_file(resource: ResourceUriLike): Promise<Uint8Array>;
+    /** Viewer saves use the host's ordinary filesystem write after conflict checks. */
     write_file(resource: ResourceUriLike, content: Uint8Array): Promise<void>;
 }
 
@@ -45,43 +44,6 @@ export interface ConfigPort {
     default_tab_orientation(): 'horizontal' | 'vertical';
     /** Fires whenever the configured font (family or size) may have changed. */
     on_font_change(listener: () => void): Disposable;
-}
-
-export type PhysicalEditViewOnlyReason =
-    | 'non-file'
-    | 'remote-host'
-    | 'shared-mount'
-    | 'wsl'
-    | 'unverifiable-filesystem'
-    | 'unsupported-platform'
-    | 'conditional-install-unsupported';
-
-export type PhysicalEditAvailability =
-    | { readonly type: 'available' }
-    | { readonly type: 'viewOnly'; readonly reason: PhysicalEditViewOnlyReason };
-
-/**
- * Host-owned physical coordination; unsupported resources stay view-only.
- *
- * No viewer host is wired to a port today — the shared controller saves through
- * `FileSystemPort` — and the extension has no platform-enforced conditional
- * install fence to implement one with. The desktop keeps its implementation and
- * its test because that is where a real fence can exist; the port stays here as
- * the shared shape it must satisfy.
- */
-export interface PhysicalCoordinationPort {
-    availability(resource: ResourceUriLike): PhysicalEditAvailability;
-    acquire(resource: ResourceUriLike): Promise<
-        | { readonly type: 'acquired'; readonly lock: HostPhysicalResourceLock }
-        | { readonly type: 'busy' }
-        | { readonly type: 'viewOnly'; readonly reason: PhysicalEditViewOnlyReason }
-    >;
-    prepare(
-        resource: ResourceUriLike,
-        expectedOriginal: Uint8Array,
-        intended: Uint8Array,
-        lock: HostPhysicalResourceLock,
-    ): Promise<PreparedPhysicalInstallBundle>;
 }
 
 /** Everything host-specific the shared controller needs, injected at attach. */

@@ -3,7 +3,6 @@ import type { ExtensionContext } from 'vscode';
 import { compare_authority } from '../authority-order';
 import {
     create_keyed_authority_store,
-    supports_coordinated_file_state,
     type KeyedFileStatePersistence,
     type KeyedStateReadTransaction,
     type KeyedStateWriteTransaction,
@@ -85,40 +84,6 @@ file_state_store_contract('Memento test-fixture medium', () => {
 });
 
 describe('FileStateStore versioned state', () => {
-    it('requires the complete coordinated file-state surface', () => {
-        const base = create_memento_file_state_store(context_with({}).context);
-        const coordinated = {
-            ...base,
-            acquire_edit_session: vi.fn(),
-            release_edit_session: vi.fn(),
-            reserve_physical_write: vi.fn(),
-            execute_reserved_physical_write: vi.fn(),
-            reconcile_reserved_physical_write: vi.fn(),
-        };
-        expect(supports_coordinated_file_state(coordinated)).toBe(true);
-
-        for (const method of [
-            'read',
-            'compare_and_set',
-            'touch',
-            'read_authority',
-            'stage_authority_transaction',
-            'finalize_authority_transaction',
-            'inspect_authority_transaction',
-            'discard_authority_transaction',
-            'cleanup_authority_transactions',
-            'acquire_edit_session',
-            'release_edit_session',
-            'reserve_physical_write',
-            'execute_reserved_physical_write',
-            'reconcile_reserved_physical_write',
-        ] as const) {
-            const incomplete = { ...coordinated } as Record<string, unknown>;
-            delete incomplete[method];
-            expect(supports_coordinated_file_state(incomplete as never)).toBe(false);
-        }
-    });
-
     it('commits an exact revision and rejects a stale compare-and-set', async () => {
         const backing = context_with({});
         const store = create_memento_file_state_store(backing.context);
