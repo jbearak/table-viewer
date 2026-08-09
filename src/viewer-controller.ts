@@ -64,6 +64,7 @@ import {
     transform_is_active,
     transform_schema_for_sheet,
     type ActiveCsvSaveLifecycle,
+    type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveRejection,
@@ -452,6 +453,10 @@ export function attach_viewer(
     // `release_edit_session`. Weak so a retired operation's entry goes with it —
     // `save_lifecycle.operation` is the only strong reference either way.
     const persisted_save_identities = new WeakSet<CsvSaveOperation>();
+    const pending_rehydration_rejections = new WeakMap<PanelAdoption, {
+        readonly operation: CsvSaveOperation;
+        readonly rejection: CsvSaveRejection;
+    }>();
     let save_lifecycle: CsvSaveLifecycle = Object.freeze({
         revision: 0,
         state: 'idle',
@@ -571,6 +576,21 @@ export function attach_viewer(
         onNeedsResyncSource: () => { void refresh_panel_source(true); },
         onCurrentAdoptionAcknowledged: (adoption) => {
             if (disposed || session.current_adoption() !== adoption) return;
+            const rehydration_rejection = pending_rehydration_rejections.get(adoption);
+            pending_rehydration_rejections.delete(adoption);
+            if (
+                rehydration_rejection
+                && edit_message_is_current(rehydration_rejection.operation.editSessionId)
+            ) {
+                const active = begin_save_lifecycle(rehydration_rejection.operation);
+                const lifecycle = finish_save_lifecycle(active.operation, 'failed');
+                void post_to_receiver({
+                    type: 'saveResult',
+                    success: false,
+                    lifecycle,
+                    rejection: rehydration_rejection.rejection,
+                }, session.current_receiver_epoch);
+            }
             const digest = adoption.source === 'commitReceipt'
                 ? adoption.receipt.resultingBasis.physicalDigest
                 : adoption.authority.physicalDigest;
@@ -1659,6 +1679,73 @@ export function attach_viewer(
         return { revision: snapshot.revision, state: rest };
     }
 
+    function validate_restored_pending_edits(
+        src: DataSource,
+        pending_edits: NonNullable<PerFileState['pendingEdits']>,
+    ): { dirtyEdits: CsvDirtyMap; rejection: CsvSaveRejection } | undefined {
+        const dirty_edits: CsvDirtyMap = Object.fromEntries(
+            Object.entries(pending_edits).filter((entry): entry is [string, {
+                value: string;
+                base: string;
+            }] => typeof entry[1] !== 'string'),
+        );
+        if (Object.keys(dirty_edits).length === 0) return undefined;
+
+        const source_row_count = src.meta().sheets[0].sourceRowCount;
+        const wanted_columns = new Map<number, number[]>();
+        for (const key of Object.keys(dirty_edits)) {
+            const [source_row, col] = key.split(':').map(Number);
+            if (
+                !Number.isInteger(source_row)
+                || !Number.isInteger(col)
+                || source_row < 0
+                || col < 0
+                || source_row >= source_row_count
+            ) continue;
+            const columns = wanted_columns.get(source_row);
+            if (columns) columns.push(col);
+            else wanted_columns.set(source_row, [col]);
+        }
+
+        const observed_bases = new Map<string, string>();
+        const wanted_rows = [...wanted_columns.keys()].sort((left, right) => left - right);
+        for (let index = 0; index < wanted_rows.length;) {
+            const start = wanted_rows[index];
+            let end = start;
+            while (wanted_rows[index + 1] === end + 1) {
+                end += 1;
+                index += 1;
+            }
+            const window = src.read_rows(0, start, end - start + 1);
+            for (const [offset, row] of window.rows.entries()) {
+                const source_row = window.startRow + offset;
+                for (const col of wanted_columns.get(source_row) ?? []) {
+                    const cell = row[col];
+                    if (cell !== undefined) {
+                        observed_bases.set(
+                            `${source_row}:${col}`,
+                            cell === null ? '' : String(cell.raw ?? ''),
+                        );
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        const validation = validate_dirty_bases(
+            dirty_edits,
+            source_row_count,
+            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
+        );
+        if (validation.type === 'valid') return undefined;
+        return {
+            dirtyEdits: dirty_edits,
+            rejection: validation.type === 'removedRows'
+                ? { reason: 'rowsRemoved', keys: validation.keys }
+                : { reason: 'baseMismatch', keys: validation.keys },
+        };
+    }
+
     function update_session_state_material(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
@@ -2473,6 +2560,7 @@ export function attach_viewer(
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
                     const material = installed.snapshot_material();
+                    const owned_before_projection = owns_edit_session();
                     const adoption_state = project_state_for_panel(
                         projected_state ?? committed.receipt.stateSnapshot,
                         true,
@@ -2504,6 +2592,41 @@ export function attach_viewer(
                             stateSnapshot: adoption_state,
                         }),
                     };
+                    const restored_pending_edits = (
+                        adoption_state.state as PerFileState
+                    ).pendingEdits;
+                    if (
+                        !owned_before_projection
+                        && owns_edit_session()
+                        && active_edit_session_id
+                        && restored_pending_edits
+                    ) {
+                        try {
+                            const validation = validate_restored_pending_edits(
+                                next,
+                                restored_pending_edits,
+                            );
+                            if (validation) {
+                                const operation = clone_save_operation({
+                                    editSessionId: active_edit_session_id,
+                                    saveRequestId: `rehydration:${seq}`,
+                                    edits: Object.fromEntries(Object.entries(
+                                        validation.dirtyEdits,
+                                    ).map(([key, entry]) => [key, entry.value])),
+                                    dirtyEdits: validation.dirtyEdits,
+                                });
+                                pending_rehydration_rejections.set(adoption, {
+                                    operation,
+                                    rejection: validation.rejection,
+                                });
+                            }
+                        } catch (error) {
+                            log_sanitized_failure(
+                                'Failed to validate restored CSV edit bases',
+                                error,
+                            );
+                        }
+                    }
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;

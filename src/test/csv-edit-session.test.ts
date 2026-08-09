@@ -107,6 +107,43 @@ class StubSource implements DataSource {
     close(): void {}
 }
 
+class RestoredEditSource extends StubSource {
+    readonly reads: Array<{ start: number; count: number }> = [];
+
+    constructor(
+        private readonly values: readonly string[],
+        private readonly fail_reads = false,
+    ) {
+        super();
+    }
+
+    override meta(): WorkbookMeta {
+        const meta = super.meta();
+        return {
+            ...meta,
+            sheets: [{
+                ...meta.sheets[0],
+                rowCount: this.values.length,
+                sourceRowCount: this.values.length,
+            }],
+        };
+    }
+
+    override read_rows(_sheet: number, start: number, count: number): RowWindow {
+        this.reads.push({ start, count });
+        if (this.fail_reads) throw new Error('restored edit read failed');
+        return {
+            startRow: start,
+            rows: this.values.slice(start, start + count).map((raw) => [{
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+            }]),
+        };
+    }
+}
+
 class FailingTransformSource extends StubSource {
     override meta(): WorkbookMeta {
         const meta = super.meta();
@@ -1655,6 +1692,147 @@ describe('CSV edit sessions', () => {
         pending_gate.resolve();
         await Promise.all([pending, save, write_started.promise]);
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('reports a restored base mismatch only after its initial snapshot is acknowledged', async () => {
+        const pendingEdits = { '0:0': { value: 'draft', base: 'old' } };
+        const state = state_store({ pendingEdits });
+        const source = new RestoredEditSource(['current']);
+        const panel = open_csv_table(uri('/tmp/rehydrated-mismatch.csv'), state.store, {
+            editing: true,
+            build_source: async () => source,
+        });
+        panel.__autoAckSnapshots = false;
+
+        await panel.__receive({ type: 'ready' });
+        const snapshot = initial_snapshot(panel);
+        expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
+            .toBe(false);
+
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: snapshot.identity,
+            disposition: 'applied',
+        });
+        await wait_for_observable(() => panel.__messages.some((message: any) => (
+            message?.type === 'saveResult'
+        )));
+        expect(panel.__messages).toContainEqual({
+            type: 'saveResult',
+            success: false,
+            lifecycle: expect.objectContaining({
+                state: 'failed',
+                operation: expect.objectContaining({
+                    edits: { '0:0': 'draft' },
+                    dirtyEdits: pendingEdits,
+                }),
+            }),
+            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+        });
+        expect(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits)
+            .toEqual(pendingEdits);
+    });
+
+    it('reports a restored edit whose source row was removed', async () => {
+        const pendingEdits = { '3:0': { value: 'draft', base: 'gone' } };
+        const state = state_store({ pendingEdits });
+        const panel = open_csv_table(uri('/tmp/rehydrated-removed.csv'), state.store, {
+            editing: true,
+            build_source: async () => new RestoredEditSource(['only row']),
+        });
+
+        await panel.__receive({ type: 'ready' });
+        await wait_for_observable(() => panel.__messages.some((message: any) => (
+            message?.type === 'saveResult'
+        )));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: false,
+            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+        }));
+    });
+
+    it('does not reject restored edits whose bases still match', async () => {
+        const pendingEdits = { '0:0': { value: 'draft', base: 'current' } };
+        const state = state_store({ pendingEdits });
+        const panel = open_csv_table(uri('/tmp/rehydrated-valid.csv'), state.store, {
+            editing: true,
+            build_source: async () => new RestoredEditSource(['current']),
+        });
+
+        await panel.__receive({ type: 'ready' });
+        await settle_panel(panel);
+        expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
+            .toBe(false);
+        expect(latest_snapshot(panel).state.pendingEdits).toEqual(pendingEdits);
+    });
+
+    it('checks restored edits in sparse source-row windows outside renderer residency', async () => {
+        const values = Array.from({ length: 501 }, (_, row) => `row ${row}`);
+        const pendingEdits = {
+            '0:0': { value: 'first draft', base: 'old first' },
+            '500:0': { value: 'last draft', base: 'old last' },
+        };
+        const source = new RestoredEditSource(values);
+        const panel = open_csv_table(
+            uri('/tmp/rehydrated-sparse.csv'),
+            state_store({ pendingEdits }).store,
+            { editing: true, build_source: async () => source },
+        );
+
+        await panel.__receive({ type: 'ready' });
+        await wait_for_observable(() => panel.__messages.some((message: any) => (
+            message?.type === 'saveResult'
+        )));
+        expect(source.reads).toEqual(expect.arrayContaining([
+            { start: 0, count: 1 },
+            { start: 500, count: 1 },
+        ]));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            rejection: { reason: 'baseMismatch', keys: ['0:0', '500:0'] },
+        }));
+    });
+
+    it('preserves restored edits when their targeted source read fails', async () => {
+        const pendingEdits = { '0:0': { value: 'draft', base: 'current' } };
+        const state = state_store({ pendingEdits });
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const panel = open_csv_table(uri('/tmp/rehydrated-read-failure.csv'), state.store, {
+            editing: true,
+            build_source: async () => new RestoredEditSource(['current'], true),
+        });
+
+        await panel.__receive({ type: 'ready' });
+        await settle_panel(panel);
+        expect(error).toHaveBeenCalledWith(
+            'Failed to validate restored CSV edit bases',
+            { code: 'UNKNOWN' },
+        );
+        expect(state.get_state('/tmp/rehydrated-read-failure.csv').pendingEdits)
+            .toEqual(pendingEdits);
+        expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
+            .toBe(false);
+    });
+
+    it('drops a queued restored-edit verdict when its panel is disposed before acknowledgement', async () => {
+        const pendingEdits = { '0:0': { value: 'draft', base: 'old' } };
+        const state = state_store({ pendingEdits });
+        const panel = open_csv_table(uri('/tmp/rehydrated-disposed.csv'), state.store, {
+            editing: true,
+            build_source: async () => new RestoredEditSource(['current']),
+        });
+        panel.__autoAckSnapshots = false;
+
+        await panel.__receive({ type: 'ready' });
+        expect(initial_snapshot(panel).state.pendingEdits).toEqual(pendingEdits);
+        panel.dispose();
+        await settle_panel(panel);
+
+        expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
+            .toBe(false);
+        expect(state.get_state('/tmp/rehydrated-disposed.csv').pendingEdits)
+            .toEqual(pendingEdits);
     });
 
     it('refuses a save whose base never matched the file, before writing any bytes', async () => {
