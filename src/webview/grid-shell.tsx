@@ -782,12 +782,6 @@ export function GridShell({
     // survive into the next edit session. Keying on the session id as well as the
     // payload keeps a freshly granted session from being stranded with a map the
     // host recorded under the previous one.
-    const [pending_edit_status, set_pending_edit_status] = useState(() => (
-        edit_session_id
-            ? pending_edit_durability.snapshot(edit_session_id)
-            : { highestProducedSequence: 0, highestAcknowledgedSequence: 0 }
-    ));
-
     const post_pending_edits = useCallback((
         edits: Record<string, DirtyEntry> | null,
         force = false,
@@ -799,23 +793,6 @@ export function GridShell({
         }
         return pending_edit_durability.publish(edit_session_id, edits, force);
     }, [edit_session_id]);
-
-    useEffect(() => {
-        if (!edit_session_id) {
-            set_pending_edit_status({
-                highestProducedSequence: 0,
-                highestAcknowledgedSequence: 0,
-            });
-            return;
-        }
-        return pending_edit_durability.subscribe(
-            edit_session_id,
-            set_pending_edit_status,
-        );
-    }, [edit_session_id]);
-
-    const highest_produced_sequence = pending_edit_status.highestProducedSequence;
-    const highest_acknowledged_sequence = pending_edit_status.highestAcknowledgedSequence;
 
     // Persist a complete dirty map under a renderer-monotonic sequence. The host
     // acknowledges only after the corresponding state-store write resolves.
@@ -2998,39 +2975,9 @@ export function GridShell({
         });
     }
 
-    const durability_status = edit_mode
-        && highest_produced_sequence > 0
-        && (dirty_cells.size > 0
-            || highest_acknowledged_sequence < highest_produced_sequence)
-        ? (highest_acknowledged_sequence >= highest_produced_sequence
-            ? 'Edits stored in this state session'
-            : 'Storing edits…')
-        : undefined;
-
     if (!has_visible_columns) {
         return (
             <div ref={grid_root_ref} className="grid-shell-root">
-                {durability_status && (
-                    <div
-                        className="pending-edit-durability"
-                        role="status"
-                        aria-live="polite"
-                        style={{
-                            position: 'absolute',
-                            right: 8,
-                            bottom: 8,
-                            zIndex: 20,
-                            padding: '4px 8px',
-                            borderRadius: 4,
-                            background: 'var(--vscode-editorWidget-background)',
-                            color: 'var(--vscode-editorWidget-foreground)',
-                            boxShadow: '0 1px 4px var(--vscode-widget-shadow)',
-                            fontSize: 12,
-                        }}
-                    >
-                        {durability_status}
-                    </div>
-                )}
                 <div className="all-columns-hidden" role="status">
                     {sheet_meta.columnCount === 0
                         ? 'This sheet contains no columns.'
@@ -3046,27 +2993,6 @@ export function GridShell({
             className="grid-shell-root"
             onPointerDownCapture={row_markers.on_pointer_down_capture}
         >
-            {durability_status && (
-                <div
-                        className="pending-edit-durability"
-                        role="status"
-                        aria-live="polite"
-                        style={{
-                            position: 'absolute',
-                            right: 8,
-                            bottom: 8,
-                            zIndex: 20,
-                            padding: '4px 8px',
-                            borderRadius: 4,
-                            background: 'var(--vscode-editorWidget-background)',
-                            color: 'var(--vscode-editorWidget-foreground)',
-                            boxShadow: '0 1px 4px var(--vscode-widget-shadow)',
-                            fontSize: 12,
-                        }}
-                    >
-                    {durability_status}
-                </div>
-            )}
             <DataEditor
                 ref={grid_ref}
                 className="glide-grid"
