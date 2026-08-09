@@ -4,7 +4,11 @@ import {
     TABLE_VIEW_TYPE,
     type TableViewerRegistration,
 } from './custom-editor';
-import { show_csv_preview, dispose_csv_preview } from './csv-preview';
+import {
+    show_csv_preview,
+    dispose_csv_preview,
+    drain_csv_previews,
+} from './csv-preview';
 import {
     open_vscode_state_database,
     type OpenedVscodeStateDatabase,
@@ -48,7 +52,7 @@ function dispose_best_effort(disposable: vscode.Disposable | undefined): void {
     try {
         disposable?.dispose();
     } catch {
-        // Teardown continues so queues can drain and SQLite can always close.
+        // Teardown continues so persistence queues can still be drained.
     }
 }
 
@@ -80,6 +84,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const disposables: vscode.Disposable[] = [];
     try {
         viewers = register_table_viewer(context, database.store);
+        disposables.push({ dispose: dispose_csv_preview });
         // Each registration is pushed as soon as it exists. A single
         // push(a, b, c) evaluates every argument before the array is touched, so
         // a failure registering the second command would leak the first past the
@@ -109,7 +114,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => vscode.window.activeTextEditor?.document.uri,
         ));
         register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
-        disposables.push({ dispose: dispose_csv_preview });
         context.subscriptions.push(...disposables);
         active_runtime = { viewers, disposables, database };
     } catch (error) {
@@ -117,10 +121,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // will not call deactivate for an activation that threw, and a retained
         // handle would block the coordination gate for the next attempt.
         for (const disposable of [...disposables].reverse()) dispose_best_effort(disposable);
-        if (viewers) {
-            dispose_best_effort(viewers);
-            await Promise.allSettled([viewers.drain()]);
-        }
+        if (viewers) dispose_best_effort(viewers);
+        const drains: Promise<void>[] = [];
+        if (viewers) drains.push(viewers.drain());
+        drains.push(drain_csv_previews());
+        await Promise.allSettled(drains);
         try {
             await database.close();
         } catch {
@@ -130,22 +135,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 }
 
+async function drain_runtime(runtime: ActiveExtensionRuntime): Promise<void> {
+    let viewer_failure: { error: unknown } | undefined;
+    try {
+        await runtime.viewers.drain();
+    } catch (error) {
+        viewer_failure = { error };
+    }
+    try {
+        await drain_csv_previews();
+    } catch (preview_failure) {
+        if (viewer_failure) {
+            throw new AggregateError(
+                [viewer_failure.error, preview_failure],
+                'Viewer and CSV preview drains failed during deactivation.',
+            );
+        }
+        throw preview_failure;
+    }
+    if (viewer_failure) throw viewer_failure.error;
+}
+
 export function deactivate(): Promise<void> {
+    if (active_teardown) return active_teardown;
     const runtime = active_runtime;
-    if (!runtime) return active_teardown ?? Promise.resolve();
-    active_runtime = undefined;
+    if (!runtime) return Promise.resolve();
     const teardown = (async () => {
         // Dispose first so no new panel or preview work can begin, then let the
         // already-admitted controller writes settle, and only then close SQLite.
         // dispose_viewers() fences edit admission before its first await, so the
-        // drain below observes a closed set.
+        // drains below observe closed sets. A failed viewer or preview drain retains
+        // the runtime and database so a later deactivation can retry the flush.
         for (const disposable of runtime.disposables) dispose_best_effort(disposable);
         dispose_best_effort(runtime.viewers);
-        try {
-            await Promise.allSettled([runtime.viewers.drain()]);
-        } finally {
-            await runtime.database.close();
-        }
+        await drain_runtime(runtime);
+        await runtime.database.close();
+        if (active_runtime === runtime) active_runtime = undefined;
     })();
     active_teardown = teardown;
     void teardown.finally(() => {

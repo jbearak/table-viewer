@@ -16,6 +16,7 @@ const seams = vi.hoisted(() => ({
     throwViewerDispose: false,
     throwViewerDrain: false,
     throwPreviewDispose: false,
+    throwPreviewDrain: false,
     throwDatabaseClose: false,
 }));
 
@@ -42,6 +43,10 @@ vi.mock('../csv-preview', () => ({
     dispose_csv_preview() {
         seams.events.push('dispose:preview');
         if (seams.throwPreviewDispose) throw new Error('preview dispose failed');
+    },
+    async drain_csv_previews() {
+        seams.events.push('drain:preview');
+        if (seams.throwPreviewDrain) throw new Error('preview drain failed');
     },
 }));
 
@@ -96,6 +101,7 @@ beforeEach(async () => {
     seams.throwViewerDispose = false;
     seams.throwViewerDrain = false;
     seams.throwPreviewDispose = false;
+    seams.throwPreviewDrain = false;
     seams.throwDatabaseClose = false;
 });
 
@@ -213,7 +219,12 @@ describe('VS Code activation', () => {
 
         await expect(activate(context())).rejects.toThrow('viewer registration failed');
 
-        expect(seams.events).toEqual(['open:sqlite', 'register:viewers', 'close:database']);
+        expect(seams.events).toEqual([
+            'open:sqlite',
+            'register:viewers',
+            'drain:preview',
+            'close:database',
+        ]);
         expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
     });
 
@@ -232,8 +243,10 @@ describe('VS Code activation', () => {
         expect(seams.events).toEqual([
             'open:sqlite',
             'register:viewers',
+            'dispose:preview',
             'dispose:viewers',
             'drain:viewers',
+            'drain:preview',
             'close:database',
         ]);
     });
@@ -253,23 +266,26 @@ describe('VS Code activation', () => {
         expect(seams.events.at(-1)).toBe('close:database');
     });
 
-    it('disposes registrations, drains viewers, then closes the database exactly once', async () => {
+    it('shares concurrent teardown and closes the database exactly once', async () => {
         await activate(context());
         seams.events.length = 0;
 
-        await deactivate();
+        const teardown = deactivate();
+        expect(deactivate()).toBe(teardown);
+        await teardown;
         await deactivate();
 
         expect(seams.events).toEqual([
             'dispose:preview',
             'dispose:viewers',
             'drain:viewers',
+            'drain:preview',
             'close:database',
         ]);
         expect(seams.events.filter((event) => event === 'close:database')).toHaveLength(1);
     });
 
-    it('still closes the database once when teardown disposables and drains throw', async () => {
+    it('keeps SQLite open after a failed viewer drain and retries deactivation later', async () => {
         const register_command = vscode_mock.commands.registerCommand.bind(vscode_mock.commands);
         vi.spyOn(vscode_mock.commands, 'registerCommand').mockImplementation((command, handler) => {
             const registered = register_command(command, handler);
@@ -286,14 +302,63 @@ describe('VS Code activation', () => {
         seams.throwViewerDrain = true;
         seams.throwPreviewDispose = true;
 
-        await deactivate();
-        await deactivate();
+        const failed_teardown = deactivate();
+        expect(deactivate()).toBe(failed_teardown);
+        await expect(failed_teardown).rejects.toThrow('viewer drain failed');
 
         expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
         expect(seams.events).toEqual([
             'dispose:preview',
             'dispose:viewers',
             'drain:viewers',
+            'drain:preview',
+        ]);
+
+        seams.throwViewerDrain = false;
+        await deactivate();
+        await deactivate();
+
+        expect(seams.events).toEqual([
+            'dispose:preview',
+            'dispose:viewers',
+            'drain:viewers',
+            'drain:preview',
+            'dispose:preview',
+            'dispose:viewers',
+            'drain:viewers',
+            'drain:preview',
+            'close:database',
+        ]);
+        expect(seams.events.filter((event) => event === 'close:database')).toHaveLength(1);
+    });
+
+    it('keeps SQLite open after a failed preview drain and retries deactivation later', async () => {
+        await activate(context());
+        seams.events.length = 0;
+        seams.throwPreviewDrain = true;
+
+        await expect(deactivate()).rejects.toThrow('preview drain failed');
+
+        expect(seams.events).toEqual([
+            'dispose:preview',
+            'dispose:viewers',
+            'drain:viewers',
+            'drain:preview',
+        ]);
+
+        seams.throwPreviewDrain = false;
+        await deactivate();
+        await deactivate();
+
+        expect(seams.events).toEqual([
+            'dispose:preview',
+            'dispose:viewers',
+            'drain:viewers',
+            'drain:preview',
+            'dispose:preview',
+            'dispose:viewers',
+            'drain:viewers',
+            'drain:preview',
             'close:database',
         ]);
         expect(seams.events.filter((event) => event === 'close:database')).toHaveLength(1);

@@ -126,10 +126,24 @@ export function register_table_viewer(
         supportsMultipleEditorsPerDocument: true,
         webviewOptions: { retainContextWhenHidden: true },
     };
-    const registrations = [
-        vscode.window.registerCustomEditorProvider(EXCEL_VIEW_TYPE, provider, excel_options),
-        vscode.window.registerCustomEditorProvider(TABLE_VIEW_TYPE, provider, table_options),
-    ];
+    const registrations: vscode.Disposable[] = [];
+    try {
+        registrations.push(
+            vscode.window.registerCustomEditorProvider(EXCEL_VIEW_TYPE, provider, excel_options),
+        );
+        registrations.push(
+            vscode.window.registerCustomEditorProvider(TABLE_VIEW_TYPE, provider, table_options),
+        );
+    } catch (error) {
+        for (const registration of [...registrations].reverse()) {
+            try {
+                registration.dispose();
+            } catch {
+                // Preserve the registration failure that triggered this rollback.
+            }
+        }
+        throw error;
+    }
     const registration: TableViewerRegistration = {
         dispose() {
             provider.dispose_viewers();

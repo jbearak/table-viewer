@@ -1,7 +1,12 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
-import { attach_viewer, build_csv_source, type ViewerProfile } from './viewer-controller';
+import {
+    attach_viewer,
+    build_csv_source,
+    type ViewerController,
+    type ViewerProfile,
+} from './viewer-controller';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
 import type { AuthorityFileStateStore } from './state';
 import type { WebviewMessage } from './types';
@@ -22,6 +27,13 @@ interface ActivePreview {
 }
 
 let active_preview: ActivePreview | null = null;
+const preview_drains = new Map<ViewerController, Promise<void> | undefined>();
+
+function start_preview_drain(controller: ViewerController): Promise<void> {
+    const drain = controller.drain();
+    void drain.catch(() => {});
+    return drain;
+}
 
 export function show_csv_preview(
     uri: vscode.Uri,
@@ -220,7 +232,7 @@ function setup_preview(
 
     // Attach the shared controller (owns the `ready` handshake, watcher, reload
     // guard, and core dispatch; forwards visibleRowChanged to profile.on_message).
-    disposables.push(attach_viewer(panel, uri, state_store, profile, vscode_viewer_host));
+    const controller = attach_viewer(panel, uri, state_store, profile, vscode_viewer_host);
 
     // When reusing an existing panel for a different file, rebuild the webview
     // HTML rather than messaging the live (stale) one. This clears the previous
@@ -234,10 +246,13 @@ function setup_preview(
     }
 
     return () => {
+        if (torn_down) return;
         torn_down = true;
         clear_lockout(editor_lockout);
         clear_lockout(preview_lockout);
         for (const d of disposables) d.dispose();
+        controller.dispose();
+        preview_drains.set(controller, start_preview_drain(controller));
     };
 }
 
@@ -246,5 +261,25 @@ export function dispose_csv_preview(): void {
     if (active_preview) {
         active_preview.panel.dispose();
         // onDidDispose handler will clean up
+    }
+}
+
+/** Wait for every disposed preview controller to finish its admitted work. */
+export async function drain_csv_previews(): Promise<void> {
+    while (preview_drains.size > 0) {
+        const drains = [...preview_drains].map(async ([controller, tracked]) => {
+            const drain = tracked ?? start_preview_drain(controller);
+            if (!tracked) preview_drains.set(controller, drain);
+            try {
+                await drain;
+                if (preview_drains.get(controller) === drain) preview_drains.delete(controller);
+            } catch (error) {
+                if (preview_drains.get(controller) === drain) {
+                    preview_drains.set(controller, undefined);
+                }
+                throw error;
+            }
+        });
+        await Promise.all(drains);
     }
 }

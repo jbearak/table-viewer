@@ -449,8 +449,9 @@ export const window = {
         provider: unknown,
         options?: unknown,
     ) {
-        custom_editor_registrations.push({ viewType, provider, options });
-        return disposable();
+        const registration = { viewType, provider, options };
+        custom_editor_registrations.push(registration);
+        return disposable(custom_editor_registrations, registration);
     },
     createWebviewPanel(_viewType: string, title: string): MockWebviewPanel {
         const panel = make_panel(title);
