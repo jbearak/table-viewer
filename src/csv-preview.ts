@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import { attach_viewer, build_csv_source, type ViewerProfile } from './viewer-controller';
 import { get_preview_reveal_target_line } from './preview-scroll-sync';
-import type { FileStateStore } from './state';
+import type { AuthorityFileStateStore } from './state';
 import type { WebviewMessage } from './types';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
@@ -22,12 +22,11 @@ interface ActivePreview {
 }
 
 let active_preview: ActivePreview | null = null;
-const preview_drains = new Set<Promise<void>>();
 
 export function show_csv_preview(
     uri: vscode.Uri,
     extension_uri: vscode.Uri,
-    state_store: FileStateStore,
+    state_store: AuthorityFileStateStore,
     view_column: vscode.ViewColumn
 ): void {
     if (active_preview) {
@@ -78,7 +77,7 @@ function setup_preview(
     panel: vscode.WebviewPanel,
     uri: vscode.Uri,
     extension_uri: vscode.Uri,
-    state_store: FileStateStore,
+    state_store: AuthorityFileStateStore,
     reusing: boolean
 ): () => void {
     const disposables: vscode.Disposable[] = [];
@@ -221,14 +220,7 @@ function setup_preview(
 
     // Attach the shared controller (owns the `ready` handshake, watcher, reload
     // guard, and core dispatch; forwards visibleRowChanged to profile.on_message).
-    const controller = attach_viewer(
-        panel,
-        uri,
-        state_store,
-        profile,
-        vscode_viewer_host,
-    );
-    disposables.push(controller);
+    disposables.push(attach_viewer(panel, uri, state_store, profile, vscode_viewer_host));
 
     // When reusing an existing panel for a different file, rebuild the webview
     // HTML rather than messaging the live (stale) one. This clears the previous
@@ -245,26 +237,8 @@ function setup_preview(
         torn_down = true;
         clear_lockout(editor_lockout);
         clear_lockout(preview_lockout);
-        let first_error: unknown;
-        for (const d of disposables) {
-            try {
-                d.dispose();
-            } catch (error) {
-                first_error ??= error;
-            }
-        }
-        // A throwing disposable must not skip drain registration during shutdown.
-        const drain = controller.drain();
-        preview_drains.add(drain);
-        void drain.finally(() => preview_drains.delete(drain)).catch(() => undefined);
-        if (first_error !== undefined) throw first_error;
+        for (const d of disposables) d.dispose();
     };
-}
-
-export async function drain_csv_previews(): Promise<void> {
-    while (preview_drains.size > 0) {
-        await Promise.allSettled([...preview_drains]);
-    }
 }
 
 /** Dispose the active preview (for extension deactivation). */

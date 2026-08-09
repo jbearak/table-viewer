@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ExtensionContext } from 'vscode';
 import { compare_authority } from '../authority-order';
-import { create_cosmetic_file_state_store } from '../cosmetic-file-state-store';
-import { with_in_memory_authority_transactions } from '../state-authority';
 import {
     create_file_state_store,
     create_keyed_authority_store,
@@ -101,7 +99,6 @@ describe('FileStateStore versioned state', () => {
             'read',
             'compare_and_set',
             'touch',
-            'copy_cosmetic_entry_if_absent',
             'read_authority',
             'stage_authority_transaction',
             'finalize_authority_transaction',
@@ -894,152 +891,6 @@ describe('FileStateStore versioned state', () => {
         await lease.release();
     });
 
-    it('atomically copies only cosmetic state without pending edits or authority', async () => {
-        const source = '/legacy-authority.csv';
-        const destination = '/provider-cosmetic.csv';
-        const backing = context_with({
-            format: 'tableViewer.fileState.v1',
-            nextRevision: 6,
-            absenceRevision: 0,
-            entries: {
-                [source]: {
-                    revision: 4,
-                    state: {
-                        activeSheetIndex: 3,
-                        pendingEdits: { '0:0': { value: 'forged', base: 'original' } },
-                    },
-                    authority: {
-                        commitSequence: 2,
-                        authorityRevision: 1,
-                        physicalRevision: 1,
-                        projectionRevision: 0,
-                        physicalDigest: 'physical-digest',
-                    },
-                    stages: {
-                        projection: {
-                            id: 'projection',
-                            kind: 'projection',
-                            ordinal: 1,
-                            expectedStateRevision: 4,
-                            expectedCommitSequence: 2,
-                            nextState: { activeSheetIndex: 9 },
-                            createdAt: Date.now(),
-                        },
-                    },
-                },
-            },
-        });
-        const backingStore = create_file_state_store(backing.context);
-        const store = create_cosmetic_file_state_store(backingStore);
-
-        await expect(store.compare_and_set(source, 3, { activeSheetIndex: 8 }))
-            .resolves.toMatchObject({
-                type: 'conflict',
-                snapshot: { state: { activeSheetIndex: 3 }, revision: 4 },
-                authority: {
-                    commitSequence: 0,
-                    authorityRevision: 0,
-                    physicalRevision: 0,
-                    projectionRevision: 0,
-                },
-            });
-        await expect(store.copy_entry_if_absent!(
-            source,
-            destination,
-            'cosmetic-copy',
-        )).resolves.toMatchObject({
-            type: 'copied',
-            source: { state: { activeSheetIndex: 3 }, revision: 4 },
-            destination: { state: { activeSheetIndex: 3 }, revision: 6 },
-        });
-
-        expect(backing.value().entries[destination]).toMatchObject({
-            revision: 6,
-            state: { activeSheetIndex: 3 },
-            copyProvenance: {
-                id: 'cosmetic-copy',
-                sourcePath: source,
-                sourceRevision: 4,
-            },
-        });
-        expect(backing.value().entries[destination]).not.toHaveProperty('authority');
-        expect(backing.value().entries[destination]).not.toHaveProperty('stages');
-        expect(backing.value().entries[destination].state).not.toHaveProperty('pendingEdits');
-        expect(await backingStore.read_authority(destination)).toEqual({
-            commitSequence: 0,
-            authorityRevision: 0,
-            physicalRevision: 0,
-            projectionRevision: 0,
-        });
-    });
-
-    it('preserves cosmetic copy semantics through the in-memory authority wrapper', async () => {
-        const source = '/cosmetic-source.csv';
-        const destination = 'provider:memfs:/cosmetic-destination.csv';
-        const backing = context_with({});
-        const cosmetic = create_cosmetic_file_state_store(
-            create_file_state_store(backing.context),
-        );
-        const store = with_in_memory_authority_transactions(cosmetic);
-        const initial = await store.compare_and_set(source, 0, { activeSheetIndex: 3 });
-        expect(initial.type).toBe('committed');
-        await store.stage_authority_transaction(source, {
-            id: 'installed-projection',
-            kind: 'projection',
-            ordinal: 1,
-            expectedStateRevision: initial.snapshot.revision,
-            expectedCommitSequence: 0,
-        });
-        const installed = await store.finalize_authority_transaction(
-            source,
-            'installed-projection',
-        );
-        expect(installed.type).toBe('finalized');
-        if (installed.type !== 'finalized') throw new Error('Expected installed projection.');
-        await store.stage_authority_transaction(source, {
-            id: 'pending-projection',
-            kind: 'projection',
-            ordinal: 2,
-            expectedStateRevision: initial.snapshot.revision,
-            expectedCommitSequence: installed.authority.commitSequence,
-            nextState: { activeSheetIndex: 7 },
-        });
-        expect(await store.read_authority(source)).toMatchObject({
-            commitSequence: 1,
-            authorityRevision: 1,
-            projectionRevision: 1,
-        });
-        expect((await store.inspect_authority_transaction(
-            source,
-            'pending-projection',
-        )).stagePresent).toBe(true);
-
-        await expect(store.copy_entry_if_absent!(
-            source,
-            destination,
-            'composed-cosmetic-copy',
-        )).resolves.toMatchObject({
-            type: 'copied',
-            source: { state: { activeSheetIndex: 3 } },
-            destination: { state: { activeSheetIndex: 3 } },
-        });
-
-        expect(await store.read_authority(destination)).toEqual({
-            commitSequence: 0,
-            authorityRevision: 0,
-            physicalRevision: 0,
-            projectionRevision: 0,
-        });
-        expect((await store.inspect_authority_transaction(
-            destination,
-            'pending-projection',
-        )).stagePresent).toBe(false);
-        expect((await store.inspect_authority_transaction(
-            source,
-            'pending-projection',
-        )).stagePresent).toBe(true);
-    });
-
     it('allocates a destination revision that fences pre-copy absence CAS', async () => {
         const source = '/legacy-revision-zero.xlsx';
         const destination = '/provider-revision-fence.xlsx';
@@ -1429,7 +1280,6 @@ describe('FileStateStore versioned state', () => {
             'canonicalize_path',
             'cleanup_authority_transactions',
             'compare_and_set',
-            'copy_cosmetic_entry_if_absent',
             'copy_entry_if_absent',
             'discard_authority_transaction',
             'finalize_authority_transaction',

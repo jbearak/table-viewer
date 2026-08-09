@@ -1,254 +1,216 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type * as vscode from 'vscode';
-import { versioned_state_store } from './helpers/versioned-state-store';
-import * as vscode_mock from './mocks/vscode';
-
-const seams = vi.hoisted(() => ({
-    events: [] as string[],
-    openedOptions: undefined as {
-        storageDirectory: string;
-        appVersion: string;
-        getMaxStoredFiles: () => number;
-        warn: (message: string) => void | Promise<void>;
-    } | undefined,
-    mode: 'sqlite' as 'sqlite' | 'memory',
-    store: undefined as unknown,
-    failViewerRegistration: false,
-    throwViewerStop: false,
-    throwViewerDispose: false,
-    throwViewerDrain: false,
-    throwPreviewDispose: false,
-    throwPreviewDrain: false,
-    throwDatabaseClose: false,
-}));
-
-vi.mock('../custom-editor', () => ({
-    TABLE_VIEW_TYPE: 'tableViewer.editor',
-    register_table_viewer: (_context: unknown, store: unknown) => {
-        seams.events.push(store === seams.store ? 'register:viewers' : 'register:wrong-store');
-        if (seams.failViewerRegistration) throw new Error('viewer registration failed');
-        return {
-            stop_admissions() {
-                seams.events.push('stop:viewers');
-                if (seams.throwViewerStop) throw new Error('viewer stop failed');
-            },
-            dispose() {
-                seams.events.push('dispose:viewers');
-                if (seams.throwViewerDispose) throw new Error('viewer dispose failed');
-            },
-            async drain() {
-                seams.events.push('drain:viewers');
-                if (seams.throwViewerDrain) throw new Error('viewer drain failed');
-            },
-        };
-    },
-}));
-
-vi.mock('../csv-preview', () => ({
-    show_csv_preview() {},
-    dispose_csv_preview() {
-        seams.events.push('dispose:preview');
-        if (seams.throwPreviewDispose) throw new Error('preview dispose failed');
-    },
-    async drain_csv_previews() {
-        seams.events.push('drain:preview');
-        if (seams.throwPreviewDrain) throw new Error('preview drain failed');
-    },
-}));
-
-vi.mock('../vscode-cosmetic-state-database', () => ({
-    open_vscode_cosmetic_state_database: async (options: typeof seams.openedOptions) => {
-        seams.openedOptions = options;
-        seams.events.push(`open:${seams.mode}`);
-        return {
-            mode: seams.mode,
-            databasePath: `${options!.storageDirectory}/file-state.sqlite3`,
-            store: seams.store,
-            async close() {
-                seams.events.push('close:database');
-                if (seams.throwDatabaseClose) throw new Error('database close failed');
-            },
-        };
-    },
-}));
-
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as vscode from 'vscode';
 import { activate, deactivate } from '../extension';
+import { MIGRATION_ARMING_STATE_KEY } from '../migration-companion';
+import * as physicalActivation from '../physical-edit-activation';
+import * as sqliteArming from '../sqlite-migration-arming';
 
-function context(): vscode.ExtensionContext {
+const ABSENT_ARMING_STATE = Symbol('absent arming state');
+const vscodeMock = vscode as unknown as {
+    __hasCommand(command: string): boolean;
+    __setCommand(command: string, handler: (...args: unknown[]) => unknown): void;
+};
+
+async function poll_for(predicate: () => boolean, description: string): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}.`);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+}
+
+function mark_after_abort(signal: AbortSignal | undefined, mark: () => void): void {
+    if (!signal) throw new Error('Expected lifecycle-owned work to receive an AbortSignal.');
+    const mark_after_current_teardown_turn = () => { queueMicrotask(mark); };
+    signal.addEventListener('abort', mark_after_current_teardown_turn, { once: true });
+    if (signal.aborted) mark_after_current_teardown_turn();
+}
+
+function observe_owned_task_drain(): () => boolean {
+    const allSettled = vi.spyOn(Promise, 'allSettled');
+    return () => allSettled.mock.calls.some(
+        ([tasks]) => Array.isArray(tasks) && tasks.length === 1,
+    );
+}
+
+function context(
+    armingState: unknown | typeof ABSENT_ARMING_STATE = { invalid: true },
+): vscode.ExtensionContext {
+    const values = new Map<string, unknown>([['tableViewer.fileState', {}]]);
+    if (armingState !== ABSENT_ARMING_STATE) values.set(MIGRATION_ARMING_STATE_KEY, armingState);
     return {
-        extensionUri: vscode_mock.Uri.file('/extension'),
-        globalStorageUri: vscode_mock.Uri.file('/global-storage'),
-        extension: { packageJSON: { version: '0.7.0' } },
+        extension: {
+            packageJSON: { version: '0.7.0' },
+            extensionKind: vscode.ExtensionKind.Workspace,
+        },
+        extensionUri: vscode.Uri.file('/extension'),
+        globalStorageUri: vscode.Uri.file('/profile/table-viewer'),
+        globalState: {
+            get(key: string, fallback?: unknown) {
+                return values.has(key) ? values.get(key) : fallback;
+            },
+            async update(key: string, value: unknown) {
+                values.set(key, value);
+            },
+        },
         subscriptions: [],
     } as unknown as vscode.ExtensionContext;
 }
 
 beforeEach(async () => {
     await deactivate();
+    (vscode as unknown as { __reset(): void }).__reset();
     vi.restoreAllMocks();
-    vscode_mock.__reset();
-    seams.events.length = 0;
-    seams.openedOptions = undefined;
-    seams.mode = 'sqlite';
-    seams.store = versioned_state_store().store;
-    seams.failViewerRegistration = false;
-    seams.throwViewerStop = false;
-    seams.throwViewerDispose = false;
-    seams.throwViewerDrain = false;
-    seams.throwPreviewDispose = false;
-    seams.throwPreviewDrain = false;
-    seams.throwDatabaseClose = false;
 });
 
-afterEach(async () => {
-    await deactivate();
-});
-
-describe('VS Code activation', () => {
-    it('opens the direct cosmetic SQLite path and registers only the live commands', async () => {
-        const created: string[] = [];
-        vscode_mock.__setCreateDirectoryImplementation(async (uri) => {
-            created.push(uri.fsPath);
-        });
-
-        await activate(context());
-
-        expect(created).toEqual(['/global-storage/state']);
-        expect(seams.openedOptions).toMatchObject({
-            storageDirectory: '/global-storage/state',
-            appVersion: '0.7.0',
-        });
-        expect(seams.openedOptions?.getMaxStoredFiles()).toBe(10_000);
-        expect(seams.events).toEqual(['open:sqlite', 'register:viewers']);
-        expect(vscode_mock.__getRegisteredCommands()).toEqual(expect.arrayContaining([
-            'tableViewer.showCsvPreviewToSide',
-            'tableViewer.showCsvPreview',
-            'tableViewer.openCsvTable',
-            'tableViewer.openAsText',
-        ]));
-        expect(vscode_mock.__getRegisteredCommands())
-            .not.toContain('tableViewer.setupPhysicalEditProtocol');
-    });
-
-    it('keeps providers and CSV commands registered with the cosmetic memory fallback', async () => {
-        seams.mode = 'memory';
-
-        await activate(context());
-
-        expect(seams.events).toEqual(['open:memory', 'register:viewers']);
-        expect(vscode_mock.__getCustomEditorRegistrations()).toEqual([]);
-        expect(vscode_mock.__getRegisteredCommands())
-            .toContain('tableViewer.openCsvTable');
-    });
-
-    it('closes SQLite when provider registration fails during activation', async () => {
-        seams.failViewerRegistration = true;
-
-        await expect(activate(context())).rejects.toThrow('viewer registration failed');
-
-        expect(seams.events).toEqual([
-            'open:sqlite',
-            'register:viewers',
-            'close:database',
-        ]);
-        expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
-    });
-
-    it('rolls back partial command registration, drains viewers, and closes SQLite', async () => {
-        const register_command = vscode_mock.commands.registerCommand.bind(vscode_mock.commands);
-        let registrations = 0;
-        vi.spyOn(vscode_mock.commands, 'registerCommand').mockImplementation((command, handler) => {
-            registrations += 1;
-            if (registrations === 2) throw new Error('command registration failed');
-            return register_command(command, handler);
-        });
-
-        await expect(activate(context())).rejects.toThrow('command registration failed');
-
-        expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
-        expect(seams.events).toEqual([
-            'open:sqlite',
-            'register:viewers',
-            'stop:viewers',
-            'dispose:viewers',
-            'drain:viewers',
-            'close:database',
-        ]);
-    });
-
-    it('preserves the activation error when rollback database close also fails', async () => {
-        const register_command = vscode_mock.commands.registerCommand.bind(vscode_mock.commands);
-        let registrations = 0;
-        vi.spyOn(vscode_mock.commands, 'registerCommand').mockImplementation((command, handler) => {
-            registrations += 1;
-            if (registrations === 2) throw new Error('command registration failed');
-            return register_command(command, handler);
-        });
-        seams.throwDatabaseClose = true;
-
-        await expect(activate(context())).rejects.toThrow('command registration failed');
-
-        expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
-        expect(seams.events).toEqual([
-            'open:sqlite',
-            'register:viewers',
-            'stop:viewers',
-            'dispose:viewers',
-            'drain:viewers',
-            'close:database',
-        ]);
-    });
-
-    it('stops admissions, disposes registrations, drains, then closes SQLite once', async () => {
-        await activate(context());
-        seams.events.length = 0;
+describe('extension activation during SQLite cold-boundary recovery', () => {
+    it('drains an initial boundary that resolves after deactivation without registering commands', async () => {
+        let resolveBoundary!: (value: physicalActivation.PhysicalEditActivationBoundary) => void;
+        const drain = vi.fn(async () => undefined);
+        vi.spyOn(physicalActivation, 'create_physical_edit_activation_boundary').mockImplementation(() => (
+            new Promise((resolve) => { resolveBoundary = resolve; })
+        ));
+        const activation = activate(context(ABSENT_ARMING_STATE));
 
         await deactivate();
-        await deactivate();
+        resolveBoundary({
+            store: {} as never,
+            viewOnly: false,
+            markerStatus: 'unarmed',
+            enter_view_only: vi.fn(async () => undefined),
+            drain,
+        });
+        await activation;
 
-        expect(seams.events).toEqual([
-            'stop:viewers',
-            'dispose:preview',
-            'dispose:viewers',
-            'drain:viewers',
-            'drain:preview',
-            'close:database',
-        ]);
-        expect(seams.events.at(-1)).toBe('close:database');
-        expect(seams.events.filter((event) => event === 'close:database')).toHaveLength(1);
+        expect(drain).toHaveBeenCalledTimes(1);
+        expect(vscodeMock.__hasCommand('tableViewer.openCsvTable')).toBe(false);
+        const openWith = vi.fn();
+        vscodeMock.__setCommand('vscode.openWith', openWith);
+        await vscode.commands.executeCommand('tableViewer.openCsvTable', vscode.Uri.file('/workspace/stale.csv'));
+        expect(openWith).not.toHaveBeenCalled();
     });
 
-    it('closes SQLite once when teardown disposables and drains throw', async () => {
-        const register_command = vscode_mock.commands.registerCommand.bind(vscode_mock.commands);
-        vi.spyOn(vscode_mock.commands, 'registerCommand').mockImplementation((command, handler) => {
-            const registered = register_command(command, handler);
-            return {
-                dispose() {
-                    registered.dispose();
-                    throw new Error('command dispose failed');
-                },
-            };
-        });
+    it('awaits owned cold-start work before deactivation completes', async () => {
+        let resolveCold!: (value: sqliteArming.ColdArmingResult) => void;
+        const cold = new Promise<sqliteArming.ColdArmingResult>((resolve) => { resolveCold = resolve; });
+        let teardownReachedCold = false;
+        vi.spyOn(sqliteArming, 'evaluate_sqlite_migration_cold_start').mockImplementation(
+            (_context, _isActive, signal) => {
+                mark_after_abort(signal, () => { teardownReachedCold = true; });
+                return cold;
+            },
+        );
+
+        await activate(context(ABSENT_ARMING_STATE));
+        const ownedTaskDrainReached = observe_owned_task_drain();
+        let settled = false;
+        const teardown = deactivate().then(() => { settled = true; });
+        await poll_for(
+            () => teardownReachedCold && ownedTaskDrainReached(),
+            'cold-start owned-work drain',
+        );
+        expect(settled).toBe(false);
+
+        resolveCold({ blocksStateWriters: false, phase: 'unarmed' });
+        await teardown;
+        expect(settled).toBe(true);
+    });
+
+    it('registers the viewer and commands without awaiting a cold-start modal', async () => {
+        vi.spyOn(vscode.window, 'showErrorMessage').mockImplementation(() => new Promise(() => undefined));
+        const openWith = vi.fn();
+        vscodeMock.__setCommand('vscode.openWith', openWith);
+
         await activate(context());
-        seams.events.length = 0;
-        seams.throwViewerStop = true;
-        seams.throwViewerDispose = true;
-        seams.throwViewerDrain = true;
-        seams.throwPreviewDispose = true;
-        seams.throwPreviewDrain = true;
+        expect(vscodeMock.__hasCommand('tableViewer.openCsvTable')).toBe(true);
+        const resource = vscode.Uri.file('/workspace/example.csv');
+        await vscode.commands.executeCommand('tableViewer.openCsvTable', resource);
 
+        expect(openWith).toHaveBeenCalledWith(resource, 'tableViewer.editor');
         await deactivate();
-        await deactivate();
+        expect(vscodeMock.__hasCommand('tableViewer.openCsvTable')).toBe(false);
+    });
 
-        expect(vscode_mock.__getRegisteredCommands()).toEqual([]);
-        expect(seams.events).toEqual([
-            'stop:viewers',
-            'dispose:preview',
-            'dispose:viewers',
-            'drain:viewers',
-            'drain:preview',
-            'close:database',
-        ]);
-        expect(seams.events.filter((event) => event === 'close:database')).toHaveLength(1);
+    it('awaits an owned arming operation before deactivation completes', async () => {
+        let resolveArming!: (value: boolean) => void;
+        const arming = new Promise<boolean>((resolve) => { resolveArming = resolve; });
+        let teardownReachedArming = false;
+        const prepare = vi.spyOn(sqliteArming, 'prepare_sqlite_migration_arming')
+            .mockImplementation((_context, _boundary, _stopViewers, _isActive, signal) => {
+                mark_after_abort(signal, () => { teardownReachedArming = true; });
+                return arming;
+            });
+        await activate(context(ABSENT_ARMING_STATE));
+
+        const command = vscode.commands.executeCommand('tableViewer.armSqliteMigration');
+        await poll_for(
+            () => prepare.mock.calls.length > 0,
+            'arming command dispatch',
+        );
+        const ownedTaskDrainReached = observe_owned_task_drain();
+        let settled = false;
+        const teardown = deactivate().then(() => { settled = true; });
+        await poll_for(
+            () => teardownReachedArming && ownedTaskDrainReached(),
+            'arming-operation owned-work drain',
+        );
+        expect(settled).toBe(false);
+
+        resolveArming(false);
+        await expect(Promise.all([command, teardown])).resolves.toEqual([undefined, undefined]);
+        expect(settled).toBe(true);
+    });
+
+    it('awaits an owned physical-edit setup operation before deactivation completes', async () => {
+        let resolveSetup!: (value: boolean) => void;
+        const setup = new Promise<boolean>((resolve) => { resolveSetup = resolve; });
+        let teardownReachedSetup = false;
+        const runSetup = vi.spyOn(physicalActivation, 'run_physical_edit_protocol_setup')
+            .mockImplementation((_marker, _boundary, _stopViewers, _isActive, signal) => {
+                mark_after_abort(signal, () => { teardownReachedSetup = true; });
+                return setup;
+            });
+        await activate(context(ABSENT_ARMING_STATE));
+
+        const command = vscode.commands.executeCommand('tableViewer.setupPhysicalEditProtocol');
+        await poll_for(
+            () => runSetup.mock.calls.length > 0,
+            'physical-edit setup command dispatch',
+        );
+        expect(runSetup.mock.calls[0]?.[4]).toBeInstanceOf(AbortSignal);
+        const ownedTaskDrainReached = observe_owned_task_drain();
+        let settled = false;
+        const teardown = deactivate().then(() => { settled = true; });
+        await poll_for(
+            () => teardownReachedSetup && ownedTaskDrainReached(),
+            'physical-edit setup owned-work drain',
+        );
+        expect(settled).toBe(false);
+
+        resolveSetup(false);
+        await expect(Promise.all([command, teardown])).resolves.toEqual([undefined, undefined]);
+        expect(settled).toBe(true);
+    });
+
+    it('shares one arming transaction between concurrent migration commands', async () => {
+        vi.spyOn(vscode.window, 'showErrorMessage').mockResolvedValue(undefined);
+        let resolveWarning!: (value: undefined) => void;
+        const warningResponse = new Promise<undefined>((resolve) => { resolveWarning = resolve; });
+        const warning = vi.spyOn(vscode.window, 'showWarningMessage').mockReturnValue(warningResponse as never);
+        const prepare = vi.spyOn(sqliteArming, 'prepare_sqlite_migration_arming');
+        await activate(context(ABSENT_ARMING_STATE));
+
+        const first = vscode.commands.executeCommand('tableViewer.armSqliteMigration');
+        const second = vscode.commands.executeCommand('tableViewer.upgradeToSqlitePersistence');
+        await poll_for(
+            () => warning.mock.calls.length > 0,
+            'shared arming warning dispatch',
+        );
+        expect(warning).toHaveBeenCalledTimes(1);
+        resolveWarning(undefined);
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(prepare).toHaveBeenCalledTimes(1);
+        await deactivate();
     });
 });

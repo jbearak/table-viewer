@@ -39,24 +39,9 @@ describe('editor_key_intent', () => {
         expect(editor_key_intent(ev('Enter', { altKey: true }))).toBe('newline');
     });
 
-    it('routes plain Cmd/Ctrl+S to Save and leaves Shift+S as native Save As', () => {
+    it('Cmd+S and Ctrl+S propagate to the window save handler', () => {
         expect(editor_key_intent(ev('s', { metaKey: true }))).toBe('save');
         expect(editor_key_intent(ev('s', { ctrlKey: true }))).toBe('save');
-        expect(editor_key_intent(ev('s', { metaKey: true, shiftKey: true })))
-            .toBe('save-as');
-        expect(editor_key_intent(ev('S', { ctrlKey: true, shiftKey: true })))
-            .toBe('save-as');
-    });
-
-    it('classifies native Undo and Redo shortcuts', () => {
-        expect(editor_key_intent(ev('z', { metaKey: true }))).toBe('undo');
-        expect(editor_key_intent(ev('Z', { ctrlKey: true }))).toBe('undo');
-        expect(editor_key_intent(ev('z', { metaKey: true, shiftKey: true }))).toBe('redo');
-        expect(editor_key_intent(ev('y', { ctrlKey: true }))).toBe('redo');
-        expect(editor_key_intent(ev('y', { ctrlKey: true, shiftKey: true })))
-            .toBe('default');
-        expect(editor_key_intent(ev('z', { ctrlKey: true, altKey: true })))
-            .toBe('default');
     });
 
     it('any other key is default (handled by the input)', () => {

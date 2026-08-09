@@ -14,9 +14,7 @@ import {
     SqliteFileStateError,
 } from './sqlite-file-state-errors';
 import {
-    is_direct_vscode_file_state_identity,
     SQLITE_FILE_STATE_PROTOCOL_VERSION,
-    sqlite_file_state_schema_identity,
     type SqliteFileStateIdentity,
 } from './sqlite-file-state-schema';
 import {
@@ -276,7 +274,6 @@ function normalize_options(options: SqliteRuntimeOptions): NormalizedOptions {
             databasePath,
             {
                 timeoutMs: options.timeoutMs,
-                expectedUserVersion: sqlite_file_state_schema_identity(options.identity).userVersion,
                 validate(database) {
                     validate_sqlite_file_state_database(database, {
                         identity: options.identity,
@@ -300,12 +297,6 @@ function identities_equal(left: SqliteFileStateIdentity, right: SqliteFileStateI
         || left.coordinationGeneration !== right.coordinationGeneration) return false;
     if (left.productKind === 'desktop' || right.productKind === 'desktop') {
         return left.productKind === right.productKind;
-    }
-    const leftIsDirect = is_direct_vscode_file_state_identity(left);
-    const rightIsDirect = is_direct_vscode_file_state_identity(right);
-    if (leftIsDirect || rightIsDirect) {
-        return leftIsDirect && rightIsDirect
-            && left.clientProfileId === right.clientProfileId;
     }
     if (left.clientProfileId !== right.clientProfileId
         || left.legacy.capsuleId !== right.legacy.capsuleId
@@ -342,13 +333,6 @@ function same_identity(actual: Record<string, SQLOutputValue>, identity: SqliteF
         || actual.storage_environment_id !== identity.storageEnvironmentId
         || actual.product_kind !== identity.productKind) return false;
     if (identity.productKind === 'desktop') return actual.client_profile_id === null;
-    if (is_direct_vscode_file_state_identity(identity)) {
-        return actual.client_profile_id === identity.clientProfileId
-            && actual.legacy_capsule_id === null
-            && actual.legacy_source_format === null
-            && actual.legacy_source_digest === null
-            && actual.legacy_import_claim_id === null;
-    }
     return actual.client_profile_id === identity.clientProfileId
         && actual.legacy_capsule_id === identity.legacy.capsuleId
         && actual.legacy_source_format === identity.legacy.sourceFormat
@@ -686,7 +670,6 @@ async function reconcile_ambiguous_commit<T>(
         if (!retired) throw sqlite_file_state_commit_error({ operation: 'commit-reconcile-connection' });
         fresh = await retired.replaceConnection({
             timeoutMs: runtime.options.timeoutMs,
-            expectedUserVersion: sqlite_file_state_schema_identity(runtime.options.identity).userVersion,
             validate(database) {
                 validate_sqlite_file_state_database(database, {
                     identity: runtime.options.identity,

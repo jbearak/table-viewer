@@ -7,7 +7,6 @@
   },
   "dependencies": {
     "@vscode/vsce": "3.7.1",
-    "ovsx": "0.10.9",
-    "semver": "7.8.5"
+    "ovsx": "0.10.9"
   }
 }

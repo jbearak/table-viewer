@@ -98,11 +98,7 @@ import {
     measurable_from_rendered,
     type MeasurableCell,
 } from './fit-column-model';
-import {
-    CsvCellEditor,
-    type CsvCellEditorHandle,
-    type CsvCellEditorProps,
-} from './csv-cell-editor';
+import { CsvCellEditor, type CsvCellEditorProps } from './csv-cell-editor';
 import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
     RowResizeOverlay,
@@ -112,7 +108,7 @@ import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
 import {
     changed_highlight_keys,
-    changed_edit_keys,
+    changed_tint_keys,
     visible_source_key_damage,
 } from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
@@ -198,11 +194,6 @@ export interface EditingHandle {
     stop_edit_admission(): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
     commit_live_edit(): void;
-    /**
-     * Reconcile a focused document overlay with accepted host authority without
-     * publishing the value back as a new edit.
-     */
-    apply_authoritative_cell_value(key: string, value: string): void;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
 }
@@ -298,12 +289,7 @@ export interface GridShellProps {
     // ever touch the plain-cell path.
     edit_mode?: boolean;
     csv_editable?: boolean;
-    editing_mode?: 'selfManaged' | 'vscodeDocument';
     edit_session_id?: string;
-    on_document_cell_input?: (key: string, value: string) => void;
-    on_document_gesture_complete?: () => void;
-    on_document_gesture_cancel?: () => void;
-    on_native_document_command?: (command: 'save' | 'undo' | 'redo') => void;
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
     save_lifecycle?: CsvSaveLifecycle;
@@ -392,12 +378,7 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     csv_editable = false,
-    editing_mode = 'selfManaged',
     edit_session_id,
-    on_document_cell_input = () => {},
-    on_document_gesture_complete = () => {},
-    on_document_gesture_cancel = () => {},
-    on_native_document_command = () => {},
     save_operation,
     save_lifecycle = { revision: 0, state: 'idle' },
     on_save_request = () => undefined,
@@ -839,16 +820,11 @@ export function GridShell({
     // Persist a complete dirty map under a renderer-monotonic sequence. The host
     // acknowledges only after the corresponding state-store write resolves.
     useEffect(() => {
-        if (
-            editing_mode !== 'selfManaged'
-            || !edit_mode
-            || !edit_session_id
-            || save_in_flight_ref.current
-        ) return;
+        if (!edit_mode || !edit_session_id || save_in_flight_ref.current) return;
         post_pending_edits(
             dirty_cells.size > 0 ? Object.fromEntries(dirty_cells) : null,
         );
-    }, [dirty_cells, edit_mode, edit_session_id, editing_mode, post_pending_edits, save_in_flight]);
+    }, [dirty_cells, edit_mode, edit_session_id, post_pending_edits, save_in_flight]);
 
     // Mirror read imperatively by the save handle (which must stay stable so the
     // ref App holds doesn't churn): the current selection. The dirty map needs no
@@ -1085,7 +1061,6 @@ export function GridShell({
         source_row: number;
         pin: symbol;
     } | null>(null);
-    const active_editor_ref = useRef<CsvCellEditorHandle | null>(null);
     // Stable handles so the tracking editor's memo identity never churns: Glide
     // remounts (and unfocuses) the overlay editor whenever the component identity
     // changes, which would defeat the very capture below.
@@ -1192,25 +1167,6 @@ export function GridShell({
         const live = read_live_edit_ref.current();
         set_live_uncommitted(!!live && live.value !== live.original);
     }, []);
-
-    const active_document_cell_key = useCallback((): string | undefined => {
-        const captured = open_overlay_row_ref.current;
-        const display_column = grid_selection_ref.current.current?.cell[0];
-        if (!captured || display_column === undefined) return undefined;
-        const source_column = source_column_for_display(display_column);
-        return source_column === undefined
-            ? undefined
-            : `${captured.source_row}:${source_column}`;
-    }, [source_column_for_display]);
-
-    const apply_authoritative_cell_value = useCallback((key: string, value: string) => {
-        if (
-            editing_mode !== 'vscodeDocument'
-            || active_document_cell_key() !== key
-        ) return;
-        active_editor_ref.current?.replace_text(value);
-        refresh_live_uncommitted();
-    }, [active_document_cell_key, editing_mode, refresh_live_uncommitted]);
 
     // Collect committed dirty edits + any in-progress editor and post saveCsv.
     // Returns false (no message sent) when there is nothing to save.
@@ -1381,27 +1337,17 @@ export function GridShell({
 
     // Cmd/Ctrl+S saves while editing. The custom editor lets this bubble; here we
     // catch it at the window so it works whether or not an overlay is focused.
-    // Shift+S stays unhandled so VS Code can invoke native Save As.
     useEffect(() => {
         if (!editable_cells) return;
         const handler = (e: KeyboardEvent) => {
-            if (e.defaultPrevented) return;
-            if (
-                (e.metaKey || e.ctrlKey)
-                && !e.shiftKey
-                && (e.key === 's' || e.key === 'S')
-            ) {
+            if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
                 e.preventDefault();
-                if (editing_mode === 'vscodeDocument') {
-                    on_native_document_command('save');
-                } else {
-                    request_save();
-                }
+                request_save();
             }
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [editable_cells, editing_mode, on_native_document_command, request_save]);
+    }, [editable_cells, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
         if (close_barrier_ref.current || save_in_flight_ref.current) return;
@@ -1433,7 +1379,6 @@ export function GridShell({
                 set_close_barrier_active(true);
             },
             commit_live_edit,
-            apply_authoritative_cell_value,
             has_uncommitted_changes,
         };
         return () => {
@@ -1446,7 +1391,6 @@ export function GridShell({
         guarded_discard_conflicted,
         guarded_discard_keys,
         commit_live_edit,
-        apply_authoritative_cell_value,
         has_uncommitted_changes,
     ]);
 
@@ -1877,16 +1821,7 @@ export function GridShell({
             if (source_row === undefined) return;
             const text =
                 new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
-            const key = `${source_row}:${source_column}`;
-            const from_open_overlay = open_overlay_row_ref.current?.display_row === row;
             commit_edit(source_row, source_column, text);
-            if (editing_mode === 'vscodeDocument' && !from_open_overlay) {
-                // Paste/delete commits do not mount the custom overlay, so there is
-                // no per-keystroke wrapper to publish them. Treat each direct commit
-                // as its own native undo unit.
-                on_document_cell_input(key, text);
-                on_document_gesture_complete();
-            }
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
             // user-sized one; repaints the whole row + overlay at the new height.
@@ -1919,9 +1854,6 @@ export function GridShell({
             auto_grow_row_for_text,
             commit_edit,
             display_column_count,
-            editing_mode,
-            on_document_cell_input,
-            on_document_gesture_complete,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
@@ -1958,13 +1890,9 @@ export function GridShell({
             const handle_change = (next: GridCell) => {
                 if (save_in_flight_ref.current || close_barrier_ref.current) return;
                 props.onChange(next);
-                if (editing_mode === 'vscodeDocument' && next.kind === GridCellKind.Text) {
-                    const key = active_document_cell_key();
-                    if (key) on_document_cell_input(key, next.data ?? '');
-                }
                 // Keep the live overlay in the renderer snapshot without turning
-                // every keystroke into a durable self-managed state write. Document
-                // mode has already sent the value above to its CustomDocument.
+                // every keystroke into a host state write. A close/reload flush reads
+                // this snapshot synchronously; ordinary edits publish on commit.
                 refresh_live_uncommitted();
             };
             const handle_finished: CsvCellEditorProps['onFinishedEditing'] = (
@@ -1972,12 +1900,6 @@ export function GridShell({
                 movement,
             ) => {
                 props.onFinishedEditing(next, movement);
-                if (editing_mode === 'vscodeDocument') {
-                    if (save_in_flight_ref.current || close_barrier_ref.current) return;
-                    if (next === undefined) on_document_gesture_cancel();
-                    else on_document_gesture_complete();
-                    return;
-                }
                 if (next !== undefined) return;
                 // Escape retracts the speculative overlay projection after Glide
                 // has closed it. Ordinary commits are published by the dirty-store
@@ -1991,24 +1913,14 @@ export function GridShell({
             return (
                 <CsvCellEditor
                     {...props}
-                    ref={active_editor_ref}
                     onChange={handle_change}
                     onFinishedEditing={handle_finished}
-                    onNativeCommand={editing_mode === 'vscodeDocument'
-                        ? on_native_document_command
-                        : undefined}
                 />
             );
         }
         return TrackingCsvCellEditor;
     }, [
-        active_document_cell_key,
         capture_open_overlay_row,
-        editing_mode,
-        on_document_cell_input,
-        on_document_gesture_cancel,
-        on_document_gesture_complete,
-        on_native_document_command,
         post_pending_edits,
         refresh_live_uncommitted,
         release_open_overlay_row,
@@ -2927,21 +2839,23 @@ export function GridShell({
         conflict_bg,
     ]);
 
-    // Targeted edit repaint: damage only cells whose displayed dirty value or
-    // dirty/conflict tint changed, not the whole viewport. Value comparison is
-    // required for authoritative document patches, which update the shared store
-    // without passing through on_cell_edited's inline damage.
-    const prev_dirty_cells_ref = useRef<ReadonlyMap<string, DirtyEntry>>(new Map());
+    // Targeted tint repaint: damage only the cells whose dirty/conflict tint
+    // actually changed, not the whole viewport. Single-cell edits/discards
+    // already damage their own cell inline; this covers the bulk transitions
+    // (save-clear of saved keys, "Discard Conflicted"/"Discard All", and reload
+    // drift flipping cells in/out of the conflicted set) without rebuilding
+    // every visible cell on each keystroke.
+    const prev_dirty_keys_ref = useRef<Set<string>>(new Set());
     const prev_conflicted_keys_ref = useRef<Set<string>>(new Set());
     useEffect(() => {
-        const changed = changed_edit_keys(
-            prev_dirty_cells_ref.current,
-            dirty_cells,
+        const next_dirty = new Set(dirty_cells.keys());
+        const changed = changed_tint_keys(
+            prev_dirty_keys_ref.current,
+            next_dirty,
             prev_conflicted_keys_ref.current,
             conflicted_keys,
         );
-        // Store snapshots are immutable and reference-stable between mutations.
-        prev_dirty_cells_ref.current = dirty_cells;
+        prev_dirty_keys_ref.current = next_dirty;
         // conflicted_keys is a fresh useMemo Set (new identity each change, never
         // mutated in place), so it can be stashed as the snapshot directly — no copy.
         prev_conflicted_keys_ref.current = conflicted_keys;

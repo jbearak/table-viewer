@@ -18,6 +18,9 @@
   "extensionKind": [
     "workspace"
   ],
+  "extensionPack": [
+    "jbearak.table-viewer-companion"
+  ],
   "categories": [
     "Other"
   ],
@@ -65,6 +68,18 @@
         "command": "tableViewer.openAsText",
         "title": "Table Viewer: Open in Text Editor",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "tableViewer.setupPhysicalEditProtocol",
+        "title": "Table Viewer: Arm Physical Edit Protocol"
+      },
+      {
+        "command": "tableViewer.armSqliteMigration",
+        "title": "Table Viewer: Prepare SQLite Migration"
+      },
+      {
+        "command": "tableViewer.upgradeToSqlitePersistence",
+        "title": "Table Viewer: Upgrade to SQLite Persistence"
       }
     ],
     "menus": {
@@ -154,7 +169,6 @@
           "type": "integer",
           "default": 10000,
           "minimum": 1,
-          "maximum": 100000,
           "scope": "application",
           "description": "Maximum number of files whose layout settings (column widths, row heights, scroll positions) are remembered. When the limit is reached, the least recently used entries are removed first."
         },
@@ -168,7 +182,6 @@
           "type": "number",
           "default": 256,
           "minimum": 1,
-          "maximum": 256,
           "description": "Maximum file size in MiB for all file types (xlsx, xls, csv, tsv)."
         }
       }
@@ -178,25 +191,27 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:sqlite:multiprocess": "vitest run src/test/sqlite-multiprocess.test.ts",
-    "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts src/test/vscode-cosmetic-state-database.test.ts",
+    "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts",
     "test:sqlite:windows-fail-closed": "node -e \"if (process.platform !== 'win32') { console.error('Windows SQLite test requires win32'); process.exit(1); }\" && vitest run src/test/sqlite-windows-fail-closed.test.ts",
     "test:sqlite:performance": "vitest run --no-file-parallelism src/test/sqlite-performance.test.ts",
     "compile:integration": "tsc -p tsconfig.integration.json",
     "typecheck": "tsc -p . --noEmit",
     "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit",
-    "typecheck:all": "npm run typecheck && npm run typecheck:desktop && npm run typecheck:integration",
-    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run compile:integration",
+    "typecheck:all": "npm run typecheck && npm run typecheck:companion && npm run typecheck:desktop && npm run typecheck:integration",
+    "typecheck:companion": "tsc -p companion --noEmit",
+    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run package:companion && npm run compile:integration",
     "test:integration": "vscode-test",
     "test:integration:minimum": "npm run pretest:integration && vscode-test --label minimum",
     "test:integration:current": "npm run pretest:integration && vscode-test --label current",
     "probe:sqlite:host": "node desktop/host-sqlite-runtime-probe.mjs",
     "probe:sqlite:electron": "npm run bundle:desktop && electron dist/runtime-probes/electron-sqlite-runtime-probe.js",
-    "probe:sqlite:bundles": "npm run bundle && npm run bundle:desktop && node desktop/check-sqlite-bundle-externals.mjs",
+    "probe:sqlite:bundles": "npm run bundle && npm run bundle:companion && npm run bundle:desktop && node desktop/check-sqlite-bundle-externals.mjs",
     "probe:sqlite:runtimes": "npm run probe:sqlite:host && npm run probe:sqlite:electron && npm run test:integration",
     "probe:windows:durability": "npm run bundle:desktop && electron dist/runtime-probes/windows-durability-probe.js",
     "gate:sqlite:recovery": "npm run bundle:desktop && electron dist/runtime-probes/packaged-recovery-gate.js",
     "vscode:prepublish": "npm run bundle && npm run bundle:webview",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
+    "bundle:companion": "esbuild companion/src/extension.ts --bundle --outfile=companion/dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
     "bundle:desktop": "node desktop/build.mjs",
     "typecheck:desktop": "tsc -p desktop",
@@ -210,7 +225,10 @@
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "package:companion": "npm --prefix companion run package",
+    "probe:vsix:packages": "node scripts/check-vsix-packages.mjs",
+    "package:release": "npm run package && npm run package:companion && npm run probe:vsix:packages"
   },
   "dependencies": {
     "@glideapps/glide-data-grid": "6.0.3",

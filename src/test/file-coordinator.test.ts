@@ -2406,12 +2406,7 @@ describe('file coordinator refresh stream', () => {
         await flush_refresh();
         expect(events).toEqual([]);
         await expect(subscription.request('postSave')).resolves.toMatchObject({
-            event: {
-                refreshRevision: 2,
-                episode: 1,
-                reason: 'postSave',
-                absorbedWatcherSignal: true,
-            },
+            event: { refreshRevision: 2, episode: 1, reason: 'postSave' },
         });
         absorbed.cancel(); // already consumed by request
         expect(events).toMatchObject([{
@@ -2419,8 +2414,6 @@ describe('file coordinator refresh stream', () => {
             episode: 1,
             reason: 'postSave',
             priority: 'high',
-            absorbedWatcherSignal: true,
-            requestedByThisSubscription: true,
         }]);
 
         const released = subscription.reserve_post_save();
@@ -2440,79 +2433,6 @@ describe('file coordinator refresh stream', () => {
         coordinator.dispose();
     });
 
-    it('binds cancellation to the exact post-save reservation handle', async () => {
-        const factory = new TestRefreshWatcherFactory();
-        const coordinator = acquire_file_coordinator(`/tmp/reservation-handle-${Math.random()}.csv`);
-        const events: FileRefreshEvent[] = [];
-        const subscription = coordinator.subscribe_refresh((event) => { events.push(event); }, factory);
-        const oldest = subscription.reserve_post_save();
-        const newer = subscription.reserve_post_save();
-
-        factory.watchers[0].emit('change');
-        await expect(subscription.request('postSave')).resolves.toMatchObject({
-            event: { absorbedWatcherSignal: true },
-        });
-        oldest.cancel();
-        factory.watchers[0].emit('delete');
-        await flush_refresh();
-        expect(events).toHaveLength(1);
-
-        oldest.cancel();
-        await flush_refresh();
-        expect(events).toHaveLength(1);
-        newer.cancel();
-        await flush_refresh();
-        expect(events[1]).toMatchObject({
-            refreshRevision: 3,
-            episode: 2,
-            reason: 'watcherDelete',
-        });
-
-        subscription.dispose();
-        coordinator.dispose();
-    });
-
-    it('marks only the exact requester across overlapping postSave requests', async () => {
-        const factory = new TestRefreshWatcherFactory();
-        const coordinator = acquire_file_coordinator(`/tmp/overlapping-post-save-${Math.random()}.csv`);
-        const first_events: FileRefreshEvent[] = [];
-        const second_events: FileRefreshEvent[] = [];
-        let release_first!: () => void;
-        let release_second!: () => void;
-        const first_gate = new Promise<void>((resolve) => { release_first = resolve; });
-        const second_gate = new Promise<void>((resolve) => { release_second = resolve; });
-        const first = coordinator.subscribe_refresh((event) => {
-            first_events.push(event);
-            if (event.requestedByThisSubscription) return first_gate;
-        }, factory);
-        const second = coordinator.subscribe_refresh((event) => {
-            second_events.push(event);
-            if (event.requestedByThisSubscription) return second_gate;
-        }, factory);
-
-        const first_request = first.request('postSave');
-        const second_request = second.request('postSave');
-
-        expect(first_events.map((event) => [
-            event.refreshRevision,
-            event.requestedByThisSubscription ?? false,
-            event.absorbedWatcherSignal ?? false,
-        ])).toEqual([[1, true, false], [2, false, false]]);
-        expect(second_events.map((event) => [
-            event.refreshRevision,
-            event.requestedByThisSubscription ?? false,
-            event.absorbedWatcherSignal ?? false,
-        ])).toEqual([[1, false, false], [2, true, false]]);
-
-        release_second();
-        await expect(second_request).resolves.toMatchObject({ type: 'completed' });
-        release_first();
-        await expect(first_request).resolves.toMatchObject({ type: 'completed' });
-        first.dispose();
-        second.dispose();
-        coordinator.dispose();
-    });
-
     it('lets postSave absorb pending watcher work but not later signals', async () => {
         const factory = new TestRefreshWatcherFactory();
         const coordinator = acquire_file_coordinator(`/tmp/post-save-${Math.random()}.csv`);
@@ -2525,28 +2445,13 @@ describe('file coordinator refresh stream', () => {
         watcher.emit('delete');
         await expect(requested).resolves.toMatchObject({
             type: 'completed',
-            event: {
-                refreshRevision: 2,
-                episode: 1,
-                reason: 'postSave',
-                priority: 'high',
-                absorbedWatcherSignal: true,
-            },
+            event: { refreshRevision: 2, episode: 1, reason: 'postSave', priority: 'high' },
         });
         await flush_refresh();
         expect(events).toMatchObject([
-            {
-                refreshRevision: 2,
-                episode: 1,
-                reason: 'postSave',
-                priority: 'high',
-                absorbedWatcherSignal: true,
-                requestedByThisSubscription: true,
-            },
+            { refreshRevision: 2, episode: 1, reason: 'postSave', priority: 'high' },
             { refreshRevision: 3, episode: 2, reason: 'watcherDelete', priority: 'normal' },
         ]);
-        expect(events[1]).not.toHaveProperty('absorbedWatcherSignal');
-        expect(events[1]).not.toHaveProperty('requestedByThisSubscription');
 
         subscription.dispose();
         coordinator.dispose();

@@ -133,7 +133,6 @@ describe('paginated protocol message shapes', () => {
                 capabilities: {
                     csvEditable: false,
                     csvEditingSupported: false,
-                    csvEditingMode: 'selfManaged',
                     csvSaveLifecycle: { revision: 0, state: 'idle' },
                 },
                 truncationMessage: null,
@@ -285,93 +284,6 @@ describe('paginated protocol message shapes', () => {
             type: 'pendingEditsFlushFailed',
             requestId: request.requestId,
         });
-    });
-
-    it('carries revisioned VS Code document edits, resync, replacement, and native commands', () => {
-        const input: WebviewMessage = {
-            type: 'csvDocumentCellInput',
-            mutationEpoch: 1,
-            viewMutationEpoch: 13,
-            viewId: 'view:1',
-            key: '4:2',
-            value: 'live',
-            revision: 7,
-        };
-        const complete: WebviewMessage = {
-            type: 'csvDocumentGestureComplete',
-            mutationEpoch: 1,
-            viewMutationEpoch: input.viewMutationEpoch,
-            viewId: input.viewId,
-            revision: 8,
-        };
-        const cancel: WebviewMessage = {
-            type: 'csvDocumentGestureCancel',
-            mutationEpoch: 1,
-            viewMutationEpoch: input.viewMutationEpoch,
-            viewId: input.viewId,
-            revision: 8,
-        };
-        const resync: WebviewMessage = {
-            type: 'csvDocumentResyncRequest',
-            mutationEpoch: 1,
-            viewMutationEpoch: input.viewMutationEpoch,
-            viewId: input.viewId,
-        };
-        const native: WebviewMessage = {
-            type: 'csvDocumentNativeCommand',
-            command: 'save',
-        };
-        const sync: HostMessage = {
-            type: 'csvDocumentSync',
-            mutationEpoch: 1,
-            viewMutationEpoch: input.viewMutationEpoch,
-            revision: 8,
-            sourceGeneration: 3,
-            dirtyEntries: { '4:2': { value: 'live', base: 'old' } },
-            conflict: { type: 'none' },
-        };
-        const patch: HostMessage = {
-            type: 'csvDocumentPatch',
-            mutationEpoch: 1,
-            revision: 8,
-            sourceGeneration: 3,
-            key: input.key,
-            value: input.value,
-            dirtyEntry: { value: 'live', base: 'old' },
-            origin: 'input',
-            selfOriginated: true,
-        };
-        const replaced: HostMessage = {
-            type: 'csvDocumentSourceReplaced',
-            mutationEpoch: 1,
-            revision: 9,
-            sourceGeneration: 4,
-            reason: 'save',
-        };
-
-        expect(input).not.toHaveProperty('sourceGeneration');
-        expect(complete).not.toHaveProperty('sourceGeneration');
-        expect(cancel).not.toHaveProperty('sourceGeneration');
-        expect(input.mutationEpoch).toBe(sync.mutationEpoch);
-        expect(sync.viewMutationEpoch).toBe(input.viewMutationEpoch);
-        expect(complete.viewMutationEpoch).toBe(input.viewMutationEpoch);
-        expect(cancel.viewMutationEpoch).toBe(input.viewMutationEpoch);
-        expect(resync.viewMutationEpoch).toBe(input.viewMutationEpoch);
-        expect(complete.mutationEpoch).toBe(input.mutationEpoch);
-        expect(cancel.mutationEpoch).toBe(input.mutationEpoch);
-        expect(resync.mutationEpoch).toBe(input.mutationEpoch);
-        expect(complete.revision).toBe(input.revision + 1);
-        expect(cancel.viewId).toBe(input.viewId);
-        expect(resync.viewId).toBe(input.viewId);
-        expect(native.command).toBe('save');
-        expect(sync.dirtyEntries).toEqual({
-            '4:2': { value: 'live', base: 'old' },
-        });
-        expect(patch.key).toBe(input.key);
-        expect(patch.selfOriginated).toBe(true);
-        expect(patch.mutationEpoch).toBe(sync.mutationEpoch);
-        expect(replaced.sourceGeneration).toBe(sync.sourceGeneration + 1);
-        expect(replaced.mutationEpoch).toBe(sync.mutationEpoch);
     });
 
     it('WebviewMessage carries a showWarning variant with a message', () => {

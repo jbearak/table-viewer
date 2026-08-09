@@ -1,22 +1,4 @@
 import type { CellData } from './types';
-import { is_dirty_map } from './csv-base-validation';
-
-/** A renderer-owned record or the custom document's sparse edit projection. */
-export type CsvEditValues = Readonly<Record<string, string>> | ReadonlyMap<string, string>;
-
-function is_edit_map(edits: CsvEditValues): edits is ReadonlyMap<string, string> {
-    return is_dirty_map(edits);
-}
-
-function edit_entries(edits: CsvEditValues): Iterable<[string, string]> {
-    return is_edit_map(edits) ? edits.entries() : Object.entries(edits);
-}
-
-function edit_value(edits: CsvEditValues, key: string): string | undefined {
-    return is_edit_map(edits)
-        ? edits.get(key)
-        : Object.prototype.hasOwnProperty.call(edits, key) ? edits[key] : undefined;
-}
 
 /**
  * Serialize rows to CSV/TSV text.
@@ -41,17 +23,10 @@ function edit_value(edits: CsvEditValues, key: string): string | undefined {
  * covers exactly this case — so dropping here is the safe residual behavior for a
  * caller that skipped validation, not the policy the user ever sees.
  */
-export function serialize_csv_fields(
-    fields: readonly string[],
-    delimiter: ',' | '\t',
-): string {
-    return fields.map((value) => quote_field(value, delimiter)).join(delimiter);
-}
-
 export function serialize_csv(
     rows: Iterable<(CellData | null)[]>,
     delimiter: ',' | '\t',
-    edits?: CsvEditValues,
+    edits?: Record<string, string>,
     original_column_counts?: number[],
     line_ending: '\r\n' | '\r' | '\n' = '\n',
     header_line?: string,
@@ -64,7 +39,7 @@ export function serialize_csv(
     let max_edit_col: Map<number, number> | undefined;
     if (edits) {
         max_edit_col = new Map();
-        for (const [key] of edit_entries(edits)) {
+        for (const key of Object.keys(edits)) {
             const [er, ec] = key.split(':').map(Number);
             const cur = max_edit_col.get(er);
             if (cur === undefined || ec > cur) max_edit_col.set(er, ec);
@@ -82,9 +57,8 @@ export function serialize_csv(
         for (let c = 0; c < col_count; c++) {
             const key = `${r}:${c}`;
             let value: string;
-            const edited = edits ? edit_value(edits, key) : undefined;
-            if (edited !== undefined) {
-                value = edited;
+            if (edits && key in edits) {
+                value = edits[key];
             } else {
                 const cell = row[c];
                 value = cell !== null && cell !== undefined ? String(cell.raw ?? '') : '';

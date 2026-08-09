@@ -5,15 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
     initialize_sqlite_file_state_schema,
-    SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
-    SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME,
-    SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION,
     SQLITE_FILE_STATE_APPLICATION_ID,
     SQLITE_FILE_STATE_USER_VERSION,
     SQLITE_FILE_STATE_V1_INDEX_SQL,
     SQLITE_FILE_STATE_V1_TABLE_SQL,
     type SqliteDesktopFileStateIdentity,
-    type SqliteDirectVscodeFileStateIdentity,
     type SqliteVscodeFileStateIdentity,
 } from '../sqlite-file-state-schema';
 
@@ -24,15 +20,6 @@ const desktopIdentity: SqliteDesktopFileStateIdentity = {
     productKind: 'desktop',
     databaseId: 'desktop-database',
     storageEnvironmentId: 'desktop-environment',
-    coordinationGeneration: 1,
-};
-
-const directVscodeIdentity: SqliteDirectVscodeFileStateIdentity = {
-    productKind: 'vscode',
-    schemaKind: 'direct-vscode',
-    databaseId: 'direct-vscode-database',
-    clientProfileId: 'direct-profile-id',
-    storageEnvironmentId: 'direct-environment',
     coordinationGeneration: 1,
 };
 
@@ -139,65 +126,6 @@ describe('canonical SQLite file-state schema', () => {
         });
         expect(database.prepare('SELECT count(*) AS count FROM legacy_imports').get()?.count).toBe(0);
         expect(database.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
-    });
-
-    it('creates a fresh migration-free direct VS Code identity without legacy metadata', () => {
-        const database = openDatabase('direct-vscode.sqlite3');
-
-        initialize_sqlite_file_state_schema(database, directVscodeIdentity, {
-            appliedAtMs: 200,
-            appVersion: '0.7.0',
-        });
-
-        expect(pragmaNumber(database, 'application_id')).toBe(SQLITE_FILE_STATE_APPLICATION_ID);
-        expect(pragmaNumber(database, 'user_version')).toBe(SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION);
-        expect(database.prepare('SELECT * FROM state_meta').get()).toMatchObject({
-            format: SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
-            database_id: 'direct-vscode-database',
-            client_profile_id: 'direct-profile-id',
-            storage_environment_id: 'direct-environment',
-            product_kind: 'vscode',
-            authority_mode: 'sqlite',
-            legacy_capsule_id: null,
-            legacy_source_format: null,
-            legacy_source_digest: null,
-            legacy_import_claim_id: null,
-            next_revision: 1,
-            absence_revision: 0,
-        });
-        expect(database.prepare('SELECT * FROM schema_migrations').get()).toMatchObject({
-            version: SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION,
-            name: SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME,
-        });
-        expect(database.prepare('SELECT count(*) AS count FROM legacy_imports').get()?.count).toBe(0);
-        expect(database.prepare('SELECT count(*) AS count FROM legacy_sources').get()?.count).toBe(0);
-        expect(database.prepare('SELECT count(*) AS count FROM legacy_entry_claims').get()?.count).toBe(0);
-    });
-
-    it('does not migrate or rebrand databases across desktop and direct VS Code identities', () => {
-        const desktop = openDatabase('desktop-cross-identity.sqlite3');
-        initialize_sqlite_file_state_schema(desktop, desktopIdentity, {
-            appliedAtMs: 100,
-            appVersion: '0.7.0',
-        });
-        expect(() => initialize_sqlite_file_state_schema(desktop, directVscodeIdentity, {
-            appliedAtMs: 200,
-            appVersion: '0.7.0',
-        })).toThrow('unsupported schema identity');
-        expect(pragmaNumber(desktop, 'user_version')).toBe(SQLITE_FILE_STATE_USER_VERSION);
-        expect(desktop.prepare('SELECT product_kind FROM state_meta').get()?.product_kind).toBe('desktop');
-
-        const direct = openDatabase('direct-cross-identity.sqlite3');
-        initialize_sqlite_file_state_schema(direct, directVscodeIdentity, {
-            appliedAtMs: 200,
-            appVersion: '0.7.0',
-        });
-        expect(() => initialize_sqlite_file_state_schema(direct, desktopIdentity, {
-            appliedAtMs: 300,
-            appVersion: '0.7.0',
-        })).toThrow('unsupported schema identity');
-        expect(pragmaNumber(direct, 'user_version')).toBe(SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION);
-        expect(direct.prepare('SELECT product_kind FROM state_meta').get()?.product_kind).toBe('vscode');
     });
 
     it('atomically creates the immutable synthetic VS Code import identity', () => {

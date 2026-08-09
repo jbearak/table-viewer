@@ -335,22 +335,6 @@ describe('GridShell CSV save', () => {
         }]);
     });
 
-    it('does not intercept Cmd/Ctrl+Shift+S from the native Save As lifecycle', async () => {
-        const { post_message } = await render_grid();
-        const save_as = new KeyboardEvent('keydown', {
-            key: 's',
-            ctrlKey: true,
-            shiftKey: true,
-            bubbles: true,
-            cancelable: true,
-        });
-
-        await act(async () => { window.dispatchEvent(save_as); });
-
-        expect(save_as.defaultPrevented).toBe(false);
-        expect(save_messages(post_message)).toEqual([]);
-    });
-
     it('leaves document-lifetime flush ownership outside GridShell', async () => {
         const { post_message } = await render_grid();
         await edit_cell('draft');

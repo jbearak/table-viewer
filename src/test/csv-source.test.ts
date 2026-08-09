@@ -279,11 +279,9 @@ describe('CsvDataSource', () => {
             expect(w.rows[1].map((c) => c?.raw)).toEqual(['Bob', '25', 'LA']);
         });
 
-        it('exposes the verbatim header line and exact parsed fields for the save path', () => {
-            const ds = new CsvDataSource(enc('Name,"Full, Name"\nAlice,A B,extra\n'), ',', 10000, opts);
+        it('exposes the verbatim header line for the save path', () => {
+            const ds = new CsvDataSource(enc('Name,"Full, Name"\nAlice,A B\n'), ',', 10000, opts);
             expect(ds.headerLine).toBe('Name,"Full, Name"');
-            expect(ds.headerFields).toEqual(['Name', 'Full, Name']);
-            expect(ds.meta().sheets[0].columnNames).toEqual(['Name', 'Full, Name', '']);
         });
 
         it('blank header cells leave an empty name (letter fallback is the renderer\'s job)', () => {

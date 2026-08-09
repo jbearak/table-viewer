@@ -31,22 +31,7 @@
  * `row-loader.ts`'s ingest validation and deliberately so.
  */
 
-import type { CsvDirtyEntry, CsvDirtyMap } from './types';
-
-/** A durable record in the desktop path or the document core's sparse map. */
-export type CsvDirtyEntries = CsvDirtyMap | ReadonlyMap<string, CsvDirtyEntry>;
-
-/**
- * Discriminate the record-or-map union. Sound because every cell key is `row:col`,
- * so a plain record can never carry a callable `get`. Exported as the single
- * source of truth: `serialize-csv.ts` and `csv-save-service.ts` select their
- * iteration strategy with the same test and must not diverge from it.
- */
-export function is_dirty_map<V>(
-    dirty: Readonly<Record<string, V>> | ReadonlyMap<string, V>,
-): dirty is ReadonlyMap<string, V> {
-    return typeof (dirty as ReadonlyMap<string, V>).get === 'function';
-}
+import type { CsvDirtyMap } from './types';
 
 export type BaseValidationOutcome =
     | { readonly type: 'valid' }
@@ -54,17 +39,14 @@ export type BaseValidationOutcome =
     | { readonly type: 'removedRows'; readonly keys: readonly string[] };
 
 export function validate_dirty_bases(
-    dirty_edits: CsvDirtyEntries,
+    dirty_edits: CsvDirtyMap,
     source_row_count: number,
     read_raw: (source_row: number, col: number) => string | undefined,
 ): BaseValidationOutcome {
     const removed_keys: string[] = [];
     const conflicted_keys: string[] = [];
-    const entries = is_dirty_map(dirty_edits)
-        ? dirty_edits.entries()
-        : Object.entries(dirty_edits);
 
-    for (const [key, entry] of entries) {
+    for (const [key, entry] of Object.entries(dirty_edits)) {
         const [source_row, col] = key.split(':').map(Number);
         // Fail closed on a key that is not a pair of non-negative integers. Without
         // this the arithmetic silently absorbs the garbage rather than rejecting it:

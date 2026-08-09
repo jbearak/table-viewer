@@ -1,10 +1,4 @@
-import React, {
-    forwardRef,
-    useEffect,
-    useImperativeHandle,
-    useRef,
-    useState,
-} from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { GridCellKind, type GridCell } from '@glideapps/glide-data-grid';
 import { editor_key_intent, insert_newline } from './csv-cell-editor-model';
 
@@ -19,12 +13,6 @@ export interface CsvCellEditorProps {
     value: GridCell;
     onChange: (newValue: GridCell) => void;
     onFinishedEditing: (newValue?: GridCell, movement?: Movement) => void;
-    onNativeCommand?: (command: 'save' | 'undo' | 'redo') => void;
-}
-
-export interface CsvCellEditorHandle {
-    /** Replace browser-local overlay text without publishing another document edit. */
-    replace_text(value: string): void;
 }
 
 function cell_text(cell: GridCell): string {
@@ -40,35 +28,20 @@ function with_text(cell: GridCell, text: string): GridCell {
  * `.gdg-clip-region`; it reproduces the old DOM editor's keyboard contract via
  * {@link editor_key_intent}: Enter commits down, Tab/Shift+Tab commit
  * right/left, Shift/Alt+Enter inserts a newline (growing to a textarea), Escape
- * discards, Cmd/Ctrl+S bubbles to the window save handler, and Shift+S remains
- * native Save As. The grid shell mirrors the committed value into the dirty map
- * via onCellEdited.
+ * discards, and Cmd/Ctrl+S bubbles to the window save handler. The grid shell
+ * mirrors the committed value into the dirty map via onCellEdited.
  */
-export const CsvCellEditor = forwardRef<CsvCellEditorHandle, CsvCellEditorProps>(
-function CsvCellEditor({
+export function CsvCellEditor({
     value,
     onChange,
     onFinishedEditing,
-    onNativeCommand,
-}, ref): React.JSX.Element {
+}: CsvCellEditorProps): React.JSX.Element {
     const initial = cell_text(value);
     const [text, set_text] = useState(initial);
     const [is_multiline, set_is_multiline] = useState(initial.includes('\n'));
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const mounted_ref = useRef(false);
     const cursor_pos_ref = useRef<number | null>(null);
-
-    useImperativeHandle(ref, () => ({
-        replace_text(next) {
-            // Keep the DOM authoritative immediately as well as scheduling React's
-            // controlled-state update, so a following key event cannot commit the
-            // stale browser value between patch delivery and the next render.
-            if (input_ref.current) input_ref.current.value = next;
-            cursor_pos_ref.current = null;
-            set_text(next);
-            set_is_multiline(next.includes('\n'));
-        },
-    }), []);
 
     useEffect(() => {
         const el = input_ref.current;
@@ -94,8 +67,7 @@ function CsvCellEditor({
     const handle_key_down = (
         e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
     ) => {
-        const intent = editor_key_intent(e);
-        switch (intent) {
+        switch (editor_key_intent(e)) {
             case 'cancel':
                 e.preventDefault();
                 e.stopPropagation();
@@ -129,43 +101,8 @@ function CsvCellEditor({
                 onChange(with_text(value, next));
                 return;
             }
-            case 'save-as':
-                // The native host owns Save As. Leave both propagation and the
-                // browser default untouched so the webview keybinding bridge sees it.
-                return;
             case 'save':
-                if (!onNativeCommand) {
-                    // Self-managed editing uses the window-level save handler.
-                    return;
-                }
-                // Native document lifecycle commands all close the optimistic overlay
-                // before VS Code moves the savepoint or history cursor.
-                e.preventDefault();
-                e.stopPropagation();
-                onFinishedEditing(with_text(
-                    value,
-                    input_ref.current?.value ?? text,
-                ));
-                onNativeCommand('save');
-                return;
-            case 'undo':
-            case 'redo':
-                if (onNativeCommand) {
-                    // The CustomDocument owns history in VS Code mode. Commit and
-                    // close Glide's optimistic overlay before asking VS Code to move
-                    // document history, otherwise the focused input would consume the
-                    // shortcut and retain stale browser-local text.
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onFinishedEditing(with_text(
-                        value,
-                        input_ref.current?.value ?? text,
-                    ));
-                    onNativeCommand(intent);
-                    return;
-                }
-                // Self-managed desktop editing keeps the browser input's local history.
-                e.stopPropagation();
+                // Let Cmd/Ctrl+S bubble to the window-level save handler.
                 return;
             default:
                 // Keep the grid's own keyboard handlers from firing while typing.
@@ -203,4 +140,4 @@ function CsvCellEditor({
             {...shared}
         />
     );
-});
+}
