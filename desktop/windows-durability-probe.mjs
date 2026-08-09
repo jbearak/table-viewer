@@ -596,8 +596,9 @@ function run_cut_point_child(cut_point, user_data_dir) {
             // An abort is *positively* identified, never inferred from "not one of
             // the codes above". `process.abort()` raises SIGABRT, which on POSIX
             // arrives as the signal and on Windows surfaces as the CRT's abort exit
-            // code (3) or as STATUS_FATAL_APP_EXIT (0xC0000409) when the runtime
-            // takes the fast-fail path instead.
+            // code (3), the conventional 128+SIGABRT code (134), or
+            // STATUS_FATAL_APP_EXIT (0xC0000409), depending on the runtime's abort
+            // path.
             //
             // Everything else is an unexplained death — an Electron launch failure,
             // an OOM kill, a crash before the cut point that never reached the
@@ -608,7 +609,9 @@ function run_cut_point_child(cut_point, user_data_dir) {
             // a claim that Windows durability was verified. Harmless only while
             // `pending` is non-empty; the moment REPRESENTATIVE_CUT_POINTS becomes
             // the full matrix it is not, and that extension is the stated next step.
-            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            const aborted = signal === 'SIGABRT'
+                || (process.platform === 'win32'
+                    && (code === 3 || code === 134 || code === 0xC0000409));
             resolve(aborted
                 ? { outcome: 'aborted-at-cut-point', signal: signal ?? 'none' }
                 : {

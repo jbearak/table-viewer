@@ -319,8 +319,9 @@ function run_crashing_child(role, cut_point, user_data_dir) {
             }
             // An abort is *positively* identified, never inferred from "not 0 and
             // not 2". `process.abort()` raises SIGABRT, which arrives as the signal
-            // on POSIX and as the CRT's abort code (3) or STATUS_FATAL_APP_EXIT
-            // (0xC0000409) on Windows.
+            // on POSIX and as the CRT's abort code (3), the conventional
+            // 128+SIGABRT code (134), or STATUS_FATAL_APP_EXIT (0xC0000409) on
+            // Windows, depending on the embedded runtime's abort path.
             //
             // Anything else — SIGSEGV, an OOM kill, a launch failure, a plain exit 1
             // from somewhere that never reached the classified exit(2) — is an
@@ -334,7 +335,9 @@ function run_crashing_child(role, cut_point, user_data_dir) {
             // Same reasoning, and now the same rule, as
             // `windows-durability-probe.mjs`'s classifier. That one inferred aborts
             // until it was fixed; this is the sibling defect.
-            const aborted = signal === 'SIGABRT' || code === 3 || code === 0xC0000409;
+            const aborted = signal === 'SIGABRT'
+                || (process.platform === 'win32'
+                    && (code === 3 || code === 134 || code === 0xC0000409));
             if (!aborted) {
                 // The code and the signal, and a *boolean* for the stderr — never the
                 // text. The exit-2 branch above can forward its stderr because the
