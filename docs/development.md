@@ -1,6 +1,6 @@
 # Development
 
-Clone the repo and run `npm install`. Node >= 24 is required (`engines.node` in `package.json`, and what CI runs).
+Clone the repo and run `npm install`. Node >= 26.5.1 is required by `engines.node` in `package.json`; CI and release workflows pin exactly Node 26.5.1.
 
 ## npm scripts
 
@@ -46,11 +46,12 @@ The database is created empty on first run. There is no import from the older
 VS Code Memento store, and no synchronization with the standalone desktop app,
 which keeps its own database under its user-data directory.
 
-SQLite is the only backend on every platform, Windows included. Where a host has
-no directory-flush primitive at all — NTFS — the flush is skipped rather than
-refused, matching SQLite's own Windows VFS; a filesystem that is asked to flush
-and rejects it is still a refusal, because that one the user can act on by moving
-their storage.
+SQLite is the only backend on every platform, Windows included. The default Node
+directory primitive is attempted on Windows, so future runtime support is used
+automatically; only a directory-open result proving that Node cannot obtain a
+handle is skipped, matching SQLite's own Windows posture. Once a directory handle
+is reachable, a filesystem that rejects fsync is still a refusal, because that one
+the user can act on by moving their storage.
 
 If the database genuinely cannot be opened, activation fails with an error naming
 the database path and the underlying cause, and suggesting the two things that
@@ -72,7 +73,7 @@ Passing both `--no-` flags is an error (nothing left to install), as is any unre
 
 What it does, in order:
 
-1. **Preflight** — requires `node` and `npm` on `PATH`, and Node >= 24 (matching `engines.node`). Anything missing is a hard error.
+1. **Preflight** — requires `node` and `npm` on `PATH`, and Node >= 26.5.1 (matching `engines.node`). Anything missing is a hard error.
 2. **`npm install`** — always runs, regardless of flags.
 3. **Extension** (skipped with `--no-extension`):
    - `npm run vscode:prepublish` to build the extension and webview bundles.
@@ -112,7 +113,7 @@ What it does, in order:
 
 Pushing the tag is the release trigger: `.github/workflows/release-build.yml` runs on `v*` tags, and `release-publish.yml` runs on that build's completion. Both also accept a manual `workflow_dispatch` with an explicit tag. A manual Release Build must be dispatched from that same tag ref (for example, `gh workflow run release-build.yml --ref v1.2.3 -f tag=v1.2.3`), so its run SHA and artifacts remain bound to the immutable release commit.
 
-`release-build.yml` has three jobs: `build` packages the `.vsix` on Linux, `desktop` packages the standalone macOS app (arm64 dmg + zip) on a macOS runner, and `desktop-windows` packages the unsigned Windows exes (setup + portable, x64 + arm64) on a Windows runner. `release-publish.yml` publishes the extension to both marketplaces, attaches every artifact to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
+`release-build.yml` first runs the Windows SQLite public-open and packaged/runtime recovery gates against the immutable tag commit. Only after they pass does `build` package and upload the `.vsix` on Linux. The `desktop` job packages the standalone macOS app (arm64 dmg + zip), while `desktop-windows` currently reports the Windows release fence and packages nothing pending complete NTFS crash-recovery evidence. `release-publish.yml` publishes the extension to both marketplaces, attaches the required VSIX plus any available desktop artifacts to the GitHub Release, and — once enabled — opens a cask bump PR against the Homebrew tap. See the [Homebrew tap guide](homebrew-tap.md) for that flow, its one-time setup, and how code signing switches itself on.
 
 ```sh
 git push && git push --tags

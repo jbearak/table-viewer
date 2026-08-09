@@ -132,9 +132,10 @@ Builds are not yet signed or notarized, so macOS blocks the first launch; the ca
 
 **Windows desktop builds are paused.** The desktop app keeps its per-file view
 state in a SQLite database. It now opens that database on Windows — every durable
-step of the storage protocol flushes the containing directory, and where no
-directory-flush primitive is reachable at all, as on NTFS, the flush is skipped
-exactly as SQLite's own Windows engine skips it. What is not yet established is
+step of the storage protocol attempts to flush the containing directory. On
+Windows the default Node primitive is tried, so future runtime support is used;
+only a directory-open result proving that no handle can be obtained is skipped,
+matching SQLite's own Windows posture. What is not yet established is
 what a crash at each of those steps actually leaves behind on NTFS; that evidence
 is being gathered in CI. Until it is complete, no Windows desktop artifact is
 published, so nobody's sorts, filters, and layouts depend on an unverified
@@ -159,7 +160,7 @@ Clone the repo and run `npm install`.
 
 - `npm run desktop:dev` — build the bundles and launch the app with Electron
 - `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
-- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows. Developer-only: the resulting app declines to open its state database (see the Windows note above), and the release workflow does not publish Windows artifacts.
+- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows. Developer-only: the resulting app uses the same SQLite state backend as every other platform, but the release workflow does not publish Windows artifacts until the packaged-runtime NTFS crash-recovery evidence is complete.
 - `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
 
 `./scripts/setup.sh` builds and installs both front ends locally in one go — the `.vsix` into every supported editor on `PATH`, and (on macOS) the desktop app into `/Applications`. See the [development guide](docs/development.md) for its flags and exact behavior.

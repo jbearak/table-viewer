@@ -33,6 +33,7 @@ const CANDIDATE_MARKER = '.init-candidate.';
 const RECOVERY_MARKER = '.recovery.';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EBADF']);
+const WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES = new Set(['EISDIR']);
 
 export const SQLITE_INITIALIZATION_DURABLE_CUT_POINTS = [
     'candidate-after-schema',
@@ -482,38 +483,52 @@ function flush_file(filePath: string): void {
     }
 }
 
-/**
- * Whether this host has no directory-flush primitive to call at all.
- *
- * NTFS exposes none: a directory handle is not something `fs.fsyncSync` can act
- * on, and no Node API stands in for it. SQLite's own Windows VFS reaches the same
- * conclusion and simply omits the directory sync, so a flush skipped here leaves
- * us exactly as durable as the engine we are storing through — which is the
- * standard the rest of this module's protocols are written against.
- *
- * A test that injects its own capability is asking for the flush path to run, so
- * the skip is conditioned on the default implementation still being in place.
- */
-function directory_flush_is_unavailable(
-    platform: NodeJS.Platform,
-    fsyncDirectory: (descriptor: number) => void,
-): boolean {
-    return platform === 'win32' && fsyncDirectory === fs.fsyncSync;
+interface DirectoryDurabilityFileSystem {
+    openDirectory(directoryPath: string): number;
+    closeDirectory(descriptor: number): void;
 }
 
+const DEFAULT_DIRECTORY_DURABILITY_FILE_SYSTEM: DirectoryDurabilityFileSystem = {
+    openDirectory(directoryPath) {
+        return fs.openSync(directoryPath, 'r');
+    },
+    closeDirectory(descriptor) {
+        fs.closeSync(descriptor);
+    },
+};
+
+/**
+ * Flush a directory when Node exposes a usable primitive for it.
+ *
+ * Windows is not skipped by platform. The default Node primitive is attempted so
+ * future runtime support is used automatically. Only an `EISDIR` from the default
+ * directory open is treated as proof that this Node build cannot obtain a
+ * directory handle at all; once a handle exists, an unsupported fsync result is a
+ * filesystem durability refusal just as it is on POSIX.
+ *
+ * The filesystem seam is deliberately narrower than `fs`: tests can distinguish
+ * open, fsync, and close phases without replacing process-wide Node functions.
+ * Injecting an fsync implementation always opts into attempting it.
+ */
 export function assert_sqlite_directory_durability_supported(
     directoryPath: string,
     fsyncDirectory: (descriptor: number) => void = fs.fsyncSync,
     platform: NodeJS.Platform = process.platform,
+    fileSystem: DirectoryDurabilityFileSystem = DEFAULT_DIRECTORY_DURABILITY_FILE_SYSTEM,
 ): void {
-    // Best-effort where no primitive exists, refusal where one exists and the
-    // filesystem rejects it. The distinction matters: an exotic mount that answers
-    // ENOTSUP is a location the user can move off, while an absent platform
-    // primitive is not something any location on that machine can fix.
-    if (directory_flush_is_unavailable(platform, fsyncDirectory)) return;
     let descriptor: number | undefined;
     try {
-        descriptor = fs.openSync(directoryPath, 'r');
+        try {
+            descriptor = fileSystem.openDirectory(directoryPath);
+        } catch (error) {
+            if (platform === 'win32'
+                && fsyncDirectory === fs.fsyncSync
+                && is_node_error(error)
+                && WINDOWS_UNAVAILABLE_DIRECTORY_OPEN_CODES.has(error.code ?? '')) {
+                return;
+            }
+            throw error;
+        }
         fsyncDirectory(descriptor);
     } catch (error) {
         if (is_node_error(error) && UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error.code ?? '')) {
@@ -521,7 +536,7 @@ export function assert_sqlite_directory_durability_supported(
         }
         throw error;
     } finally {
-        if (descriptor !== undefined) fs.closeSync(descriptor);
+        if (descriptor !== undefined) fileSystem.closeDirectory(descriptor);
     }
 }
 

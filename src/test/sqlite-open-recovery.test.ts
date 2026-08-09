@@ -1509,37 +1509,70 @@ describe('raw preflight and writable rollback-journal recovery', () => {
         expect(fs.existsSync(path.join(tempDirectory, '.file-state.sqlite3.recovery-gate'))).toBe(false);
     });
 
-    it('skips the flush where no directory primitive exists rather than refusing', () => {
-        // Windows has no directory-flush primitive to call at all, and SQLite's own
-        // VFS omits the sync there for the same reason. Skipping keeps this backend
-        // exactly as durable as the engine it stores through; refusing would take
-        // the whole platform out over a call that was never available to make.
+    it('skips only when the default Windows directory-open primitive is unavailable', () => {
+        const opened: string[] = [];
+        const closed: number[] = [];
+        const unavailable = Object.assign(new Error('directories cannot be opened'), {
+            code: 'EISDIR',
+        });
+
         expect(() => assert_sqlite_directory_durability_supported(
             tempDirectory,
             fs.fsyncSync,
             'win32',
+            {
+                openDirectory(directoryPath) {
+                    opened.push(directoryPath);
+                    throw unavailable;
+                },
+                closeDirectory(descriptor) {
+                    closed.push(descriptor);
+                },
+            },
         )).not.toThrow();
-
-        // A test that injects its own primitive is asking for the flush to happen,
-        // so the skip must not swallow it.
-        const flushed: number[] = [];
-        assert_sqlite_directory_durability_supported(
-            tempDirectory,
-            (descriptor) => { flushed.push(descriptor); },
-            'win32',
-        );
-        expect(flushed).toHaveLength(1);
+        expect(opened).toEqual([tempDirectory]);
+        expect(closed).toEqual([]);
     });
 
-    it('still refuses a filesystem that rejects a flush it was asked to perform', () => {
-        // The distinction the skip above must not erase: an exotic mount answering
-        // ENOTSUP is a location the user can move off, and that stays a refusal.
+    it('flushes and closes a reachable Windows directory handle', () => {
+        const events: string[] = [];
+        assert_sqlite_directory_durability_supported(
+            tempDirectory,
+            (descriptor) => { events.push(`fsync:${descriptor}`); },
+            'win32',
+            {
+                openDirectory(directoryPath) {
+                    events.push(`open:${directoryPath}`);
+                    return 37;
+                },
+                closeDirectory(descriptor) {
+                    events.push(`close:${descriptor}`);
+                },
+            },
+        );
+        expect(events).toEqual([
+            `open:${tempDirectory}`,
+            'fsync:37',
+            'close:37',
+        ]);
+    });
+
+    it('fails closed when a reachable Windows filesystem rejects fsync', () => {
         const rejected = Object.assign(new Error('not supported'), { code: 'ENOTSUP' });
+        const closed: number[] = [];
         try {
             assert_sqlite_directory_durability_supported(
                 tempDirectory,
                 () => { throw rejected; },
-                'darwin',
+                'win32',
+                {
+                    openDirectory() {
+                        return 41;
+                    },
+                    closeDirectory(descriptor) {
+                        closed.push(descriptor);
+                    },
+                },
             );
             throw new Error('directory durability unexpectedly succeeded');
         } catch (error) {
@@ -1547,6 +1580,17 @@ describe('raw preflight and writable rollback-journal recovery', () => {
             expect((error as SqliteFileStateError).category).toBe('unsupported');
             expect((error as SqliteFileStateError).metadata.operation).toBe('directory-durability');
         }
+        expect(closed).toEqual([41]);
+    });
+
+    it('always executes an injected Windows fsync primitive', () => {
+        const flushed: number[] = [];
+        assert_sqlite_directory_durability_supported(
+            tempDirectory,
+            (descriptor) => { flushed.push(descriptor); },
+            'win32',
+        );
+        expect(flushed).toHaveLength(1);
     });
 
     it('sanitizes spoofed SqliteFileStateError names instead of trusting attacker fields', async () => {
