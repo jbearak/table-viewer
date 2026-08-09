@@ -10,6 +10,7 @@ import type { PerFileState } from '../types';
 import { attach_viewer, csv_table_profile } from '../viewer-controller';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import { SQLITE_PREPARED_INSTALL_STATE_KEY } from '../sqlite-file-state-repository';
+import type { open_sqlite_file_state_store } from '../sqlite-file-state-persistence';
 import {
     initialize_sqlite_file_state_schema,
     SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION,
@@ -108,14 +109,23 @@ describe('VS Code cosmetic SQLite foundation', () => {
             requiresPendingEditRecovery?: boolean;
             initialization?: { directoryDurabilityPolicy?: string };
         }> = [];
-        const openStore = (async (_databasePath: string, sqliteOptions: typeof observed[number]) => {
+        // Typed against the production signature so a change to
+        // open_sqlite_file_state_store's parameters breaks this test instead of
+        // silently letting it stop proving the option shape is forwarded. Only the
+        // unpopulated store/persistence fields are cast.
+        const openStore: typeof open_sqlite_file_state_store = async (
+            _databasePath,
+            sqliteOptions,
+        ) => {
             observed.push(sqliteOptions);
             return {
-                store: {},
-                persistence: {},
+                store: {} as Awaited<ReturnType<typeof open_sqlite_file_state_store>>['store'],
+                persistence: {} as Awaited<
+                    ReturnType<typeof open_sqlite_file_state_store>
+                >['persistence'],
                 async close() {},
             };
-        }) as any;
+        };
 
         const defaulted = await open_vscode_cosmetic_state_database({
             ...openOptions(),

@@ -1,10 +1,11 @@
 import type { CellData } from './types';
+import { is_dirty_map } from './csv-base-validation';
 
 /** A renderer-owned record or the custom document's sparse edit projection. */
 export type CsvEditValues = Readonly<Record<string, string>> | ReadonlyMap<string, string>;
 
 function is_edit_map(edits: CsvEditValues): edits is ReadonlyMap<string, string> {
-    return typeof (edits as ReadonlyMap<string, string>).get === 'function';
+    return is_dirty_map(edits);
 }
 
 function edit_entries(edits: CsvEditValues): Iterable<[string, string]> {

@@ -235,16 +235,26 @@ describe('SQLite file-state structural validation', () => {
     });
 
     it('rejects direct VS Code physical/projection authority and stages', () => {
-        const authority = createDatabase(directVscodeIdentity);
-        const authorityPath = 'file:///authority.csv';
-        insertEntry(authority, { activeSheetIndex: 1 }, {
-            path: authorityPath,
-            recoveryEntryId: authorityPath,
-        });
-        authority.exec(`UPDATE entries SET authority_commit_sequence = 1,
-            authority_revision = 1, physical_revision = 1,
-            projection_revision = 1, physical_digest = 'forged-digest'`);
-        expectValidationCategory(authority, 'malformed-state', directVscodeIdentity);
+        // One forged column per database. Forging all five at once would keep the
+        // test green even if a rule for any single column stopped being validated,
+        // because the remaining four still trigger the same category.
+        const forgeries = [
+            'authority_commit_sequence = 1',
+            'authority_revision = 1',
+            'physical_revision = 1',
+            'projection_revision = 1',
+            "physical_digest = 'forged-digest'",
+        ];
+        for (const forgery of forgeries) {
+            const authority = createDatabase(directVscodeIdentity);
+            const authorityPath = 'file:///authority.csv';
+            insertEntry(authority, { activeSheetIndex: 1 }, {
+                path: authorityPath,
+                recoveryEntryId: authorityPath,
+            });
+            authority.exec(`UPDATE entries SET ${forgery}`);
+            expectValidationCategory(authority, 'malformed-state', directVscodeIdentity);
+        }
 
         const stage = createDatabase(directVscodeIdentity);
         const stagePath = 'file:///stage.csv';

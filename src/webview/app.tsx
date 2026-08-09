@@ -2573,13 +2573,14 @@ export function App(): React.JSX.Element {
 
     const post_native_document_command = useCallback((
         command: 'save' | 'undo' | 'redo',
-    ) => {
+    ): boolean => {
         if (
             csv_editing_mode_ref.current !== 'vscodeDocument'
             || !document_publication_admitted_ref.current
             || document_projection_epoch !== document_projection_epoch_ref.current
-        ) return;
+        ) return false;
         host_bridge.postMessage({ type: 'csvDocumentNativeCommand', command });
+        return true;
     }, [document_projection_epoch]);
 
     const handle_document_cell_input = useCallback((key: string, value: string) => {
@@ -2655,9 +2656,13 @@ export function App(): React.JSX.Element {
             // VS Code installs its webview keybinding bridge on the bubbling phase
             // before extension scripts run. Capture document commands first so that
             // bridge cannot preempt the document-targeted lifecycle/history request.
+            // Consume the keystroke only once the command is actually routed: an
+            // unadmitted projection or a stale epoch posts nothing, and swallowing
+            // the gesture there would lose Save/Undo/Redo silently. Propagation
+            // resumes after this handler returns, so posting first is equivalent.
+            if (!post_native_document_command(command)) return;
             event.preventDefault();
             event.stopImmediatePropagation();
-            post_native_document_command(command);
         };
         window.addEventListener('keydown', handler, { capture: true });
         return () => window.removeEventListener('keydown', handler, { capture: true });

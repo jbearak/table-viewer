@@ -9464,6 +9464,41 @@ describe('VS Code custom document protocol', () => {
         ]);
     });
 
+    it('leaves the keystroke for VS Code when the projection is not yet admitted', async () => {
+        const forwarded_by_vscode: KeyboardEvent[] = [];
+        const vscode_key_bridge = (event: KeyboardEvent) => {
+            if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+            forwarded_by_vscode.push(event);
+        };
+        window.addEventListener('keydown', vscode_key_bridge);
+        const { post_message } = await render_app();
+        // Native-document mode is announced, but the authoritative csvDocumentSync
+        // has not arrived, so no command can be routed to the host yet.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditingMode: 'vscodeDocument',
+                csvDocumentViewId: 'view:1',
+            },
+        }));
+        post_message.mockClear();
+
+        const save = new KeyboardEvent('keydown', {
+            key: 's', ctrlKey: true, bubbles: true, cancelable: true,
+        });
+        await act(async () => { window.dispatchEvent(save); });
+        window.removeEventListener('keydown', vscode_key_bridge);
+
+        // Nothing was posted, so the gesture must remain available to VS Code
+        // rather than being swallowed into a silent no-op.
+        expect(post_message.mock.calls.some(
+            (call) => call[0]?.type === 'csvDocumentNativeCommand',
+        )).toBe(false);
+        expect(save.defaultPrevented).toBe(false);
+        expect(forwarded_by_vscode).toEqual([save]);
+    });
+
     it('captures native Save, Undo, and Redo before the VS Code key bridge', async () => {
         const forwarded_by_vscode: KeyboardEvent[] = [];
         const vscode_key_bridge = (event: KeyboardEvent) => {

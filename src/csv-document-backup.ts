@@ -95,6 +95,12 @@ export interface DecodedCsvDocumentBackupEnvelope {
     readonly sourceBytes: Uint8Array;
     readonly dirtyCount: number;
     readonly recoveryLimits: CsvDocumentRecoveryLimits;
+    /**
+     * Decode the dirty section into a fresh map. Every call re-runs the preflight
+     * and the full UTF-8 and JSON decode, and results are deliberately not
+     * memoized because they depend on `validate`. Call once per recovery and
+     * retain the map.
+     */
     decodeDirtyEntries(
         validate?: CsvDocumentDirtyEntryValidator,
     ): ReadonlyMap<string, CsvDirtyEntry>;
@@ -698,7 +704,9 @@ export function decode_csv_document_backup_envelope(
         );
     }
     // Intrinsic dirty validity is independent of CSV parsing. Validate it before
-    // copying the source or asking the runtime to build a data source.
+    // copying the source or asking the runtime to build a data source. This repeats
+    // the entry-prefix scan above by design: the earlier pass must precede the
+    // digest hash, and the prefix walk is far cheaper than the hash it guards.
     decode_dirty_section(input, dirty_start, dirty_count, limits, undefined, false);
 
     const source_bytes = Uint8Array.from(source_view);

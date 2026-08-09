@@ -3,7 +3,6 @@ import type { DataSource, WorkbookMeta } from '../data-source/interface';
 import type { FileStat, FileSystemPort } from '../host-ports';
 import type { ResourceUriLike } from '../resource-identity';
 import {
-    CsvSaveServiceError,
     csv_content_digest,
     prepare_csv_save_content,
     read_csv_target_stably,
@@ -338,12 +337,14 @@ describe('CSV target reads and writes', () => {
     it('honors cancellation before taking the post-save reservation', async () => {
         const fs = new MemoryFileSystem('a\n');
         const reserve = vi.fn(() => ({ cancel: vi.fn() }));
-        let reads = 0;
-        const cancellation = {
-            get isCancellationRequested() {
-                reads += 1;
-                return reads >= 6;
-            },
+        // Cancel from an observable step rather than by counting cancellation
+        // reads, so adding or removing a throw_if_cancelled check cannot silently
+        // move where this fires. Assert the code too: a tooLarge or externalChange
+        // failure would otherwise satisfy a bare error-class assertion.
+        const cancellation = { isCancellationRequested: false };
+        fs.onStat = (_call, stat) => {
+            cancellation.isCancellationRequested = true;
+            return stat;
         };
         await expect(write_csv_target({
             fs, resource, content: prepared('b\n'), maxFileSizeBytes: 100,
@@ -352,7 +353,7 @@ describe('CSV target reads and writes', () => {
                 reserve_post_save: reserve,
                 request: vi.fn(async () => undefined),
             },
-        })).rejects.toBeInstanceOf(CsvSaveServiceError);
+        })).rejects.toMatchObject({ code: 'cancelled' });
         expect(fs.writeCalls).toBe(0);
         expect(reserve).not.toHaveBeenCalled();
     });

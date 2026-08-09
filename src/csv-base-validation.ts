@@ -36,10 +36,16 @@ import type { CsvDirtyEntry, CsvDirtyMap } from './types';
 /** A durable record in the desktop path or the document core's sparse map. */
 export type CsvDirtyEntries = CsvDirtyMap | ReadonlyMap<string, CsvDirtyEntry>;
 
-function is_dirty_map(
-    dirty: CsvDirtyEntries,
-): dirty is ReadonlyMap<string, CsvDirtyEntry> {
-    return typeof (dirty as ReadonlyMap<string, CsvDirtyEntry>).get === 'function';
+/**
+ * Discriminate the record-or-map union. Sound because every cell key is `row:col`,
+ * so a plain record can never carry a callable `get`. Exported as the single
+ * source of truth: `serialize-csv.ts` and `csv-save-service.ts` select their
+ * iteration strategy with the same test and must not diverge from it.
+ */
+export function is_dirty_map<V>(
+    dirty: Readonly<Record<string, V>> | ReadonlyMap<string, V>,
+): dirty is ReadonlyMap<string, V> {
+    return typeof (dirty as ReadonlyMap<string, V>).get === 'function';
 }
 
 export type BaseValidationOutcome =

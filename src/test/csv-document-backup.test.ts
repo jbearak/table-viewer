@@ -310,5 +310,30 @@ describe('CSV document backup codec', () => {
         expect(() => encode(encoder.encode('a\n'), new Map([
             ['bad', { value: 'x', base: 'a' }],
         ]))).toThrowError(expect.objectContaining({ code: 'malformed' }));
+
+        // A Map cannot express a duplicate key, so the decoder's repeated-key
+        // rejection is only reachable by patching the encoded byte stream.
+        const copy = Uint8Array.from(encode(encoder.encode('a,b\n'), new Map([
+            ['0:0', { value: 'x', base: 'a' }],
+            ['0:1', { value: 'y', base: 'b' }],
+        ])));
+        const view = new DataView(copy.buffer, copy.byteOffset, copy.byteLength);
+        const first_entry = 24 + view.getUint32(12, true) + view.getUint32(16, true);
+        const first_key_length = view.getUint32(first_entry, true);
+        const first_key_start = first_entry + 12;
+        const second_entry = first_key_start
+            + first_key_length
+            + view.getUint32(first_entry + 4, true)
+            + view.getUint32(first_entry + 8, true);
+        const second_key_start = second_entry + 12;
+        // Rewrite the second entry's key to repeat the first entry's key.
+        copy.set(copy.subarray(first_key_start, first_key_start + first_key_length),
+            second_key_start);
+
+        expect(() => decode_csv_document_backup(
+            copy,
+            create_resource_identity(uri('/one.csv')),
+            limits,
+        )).toThrowError(expect.objectContaining({ code: 'malformed' }));
     });
 });

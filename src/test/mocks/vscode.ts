@@ -634,6 +634,11 @@ export const workspace = {
 
 export const commands = {
     registerCommand(command: string, handler: (...args: unknown[]) => unknown) {
+        // The real API rejects a second registration of the same id. Without this a
+        // production double-registration bug would pass the activation tests.
+        if (registered_commands.has(command)) {
+            throw new Error(`command '${command}' already exists`);
+        }
         registered_commands.set(command, handler);
         return {
             dispose() {

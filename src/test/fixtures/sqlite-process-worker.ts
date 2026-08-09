@@ -163,10 +163,15 @@ function runtimeHooks(): SqliteRuntimeHooks | undefined {
             if (observedEvents.has(event)) {
                 send({ type: 'event', name: `runtime-${event}` });
             }
+            // Only the ambiguous-commit configuration owns the reconciliation
+            // rendezvous. Observing runtime events alone must not block the worker
+            // on a release path that configuration never provides.
+            const release = options.ambiguousCommit?.reconciliationReleasePath;
+            if (!release) return;
             if (event !== 'before-reconcile-open' || reconciliationReadySent) return;
             reconciliationReadySent = true;
             send({ type: 'event', name: 'reconciliation-ready' });
-            waitForObservableFile(options.ambiguousCommit?.reconciliationReleasePath as string);
+            waitForObservableFile(release);
         },
         commit(commit) {
             commit();
@@ -428,9 +433,17 @@ async function handle(command: string, payload: any): Promise<unknown> {
                 payload.basis,
             );
         case 'copy': {
-            const copy = requireFileStateStore().copy_entry_if_absent;
-            if (!copy) throw new Error('Copy API is unavailable.');
-            return copy(payload.sourcePath, payload.destinationPath, payload.copyId);
+            // Called on its receiver: the current store returns closures, but a
+            // future class-based store would break silently under a detached call.
+            const fileStateStore = requireFileStateStore();
+            if (!fileStateStore.copy_entry_if_absent) {
+                throw new Error('Copy API is unavailable.');
+            }
+            return fileStateStore.copy_entry_if_absent(
+                payload.sourcePath,
+                payload.destinationPath,
+                payload.copyId,
+            );
         }
         case 'touch':
             await requireFileStateStore().touch(payload.path);

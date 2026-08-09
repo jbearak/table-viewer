@@ -1193,6 +1193,14 @@ function pending_json(state: StoredPerFileState): string | undefined {
     return pending && Object.keys(pending).length > 0 ? JSON.stringify(pending) : undefined;
 }
 
+/**
+ * Project a already-validated stored state onto its cosmetic fields for a
+ * cosmetic copy. Deliberately not the same helper as `cosmetic_state` in
+ * `cosmetic-file-state-store.ts`: that one projects an *untrusted* value read
+ * back from a backing store, so it decodes first and rejects a malformed
+ * `pendingEdits` instead of stripping it, and it additionally removes the
+ * prepared-install key that never appears in a durable copy source here.
+ */
 function cosmetic_state(state: StoredPerFileState): StoredPerFileState {
     const cosmetic = structuredClone(state) as PerFileState;
     delete cosmetic.pendingEdits;

@@ -5,6 +5,7 @@ import type { FileStat, FileSystemPort } from './host-ports';
 import type { ResourceUriLike } from './resource-identity';
 import { serialize_csv, type CsvEditValues } from './serialize-csv';
 import {
+    is_dirty_map,
     validate_dirty_bases,
     type BaseValidationOutcome,
     type CsvDirtyEntries,
@@ -107,9 +108,7 @@ export interface WriteCsvTargetResult extends CsvTargetBasis {
 function dirty_entries(
     dirty: CsvDirtyEntries,
 ): Iterable<[string, CsvDirtyEntry]> {
-    return typeof (dirty as ReadonlyMap<string, CsvDirtyEntry>).get === 'function'
-        ? (dirty as ReadonlyMap<string, CsvDirtyEntry>).entries()
-        : Object.entries(dirty);
+    return is_dirty_map(dirty) ? dirty.entries() : Object.entries(dirty);
 }
 
 function same_stat(left: FileStat, right: FileStat): boolean {

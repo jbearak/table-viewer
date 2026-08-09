@@ -36,6 +36,13 @@ import {
 import { serialize_csv_fields } from './serialize-csv';
 import type { CsvDirtyEntry, CsvDirtyMap } from './types';
 
+/**
+ * How many times host history callbacks may re-arm the settlement tail before the
+ * drain stops waiting. A cooperative host re-arms at most once or twice; the bound
+ * only exists so a misbehaving one cannot park the document's operation queue.
+ */
+const MAX_SETTLEMENT_DRAIN_PASSES = 64;
+
 export interface CsvDocumentRefreshSubscription extends CsvPostSaveRefresh, Disposable {}
 
 export type CsvDocumentRefreshFactory = (
@@ -326,29 +333,20 @@ function normalize_max_file_size_bytes(max_file_size_bytes: number): number {
 
 class OpeningRefreshBridge {
     private document?: CsvCustomDocument;
-    private accepting = true;
-    private queued = false;
 
     readonly notify = async (): Promise<void> => {
         const document = this.document;
-        if (document) {
-            await document.notify_external_change();
-            return;
-        }
-        if (this.accepting) this.queued = true;
+        // A signal that arrives before bind needs no replay: both call sites
+        // reconcile unconditionally with `notify_external_change` right after
+        // binding, so the pre-bind window is already covered.
+        if (document) await document.notify_external_change();
     };
 
-    bind(document: CsvCustomDocument): boolean {
+    bind(document: CsvCustomDocument): void {
         this.document = document;
-        this.accepting = false;
-        const queued = this.queued;
-        this.queued = false;
-        return queued;
     }
 
     fail(): void {
-        this.accepting = false;
-        this.queued = false;
         this.document = undefined;
     }
 }
@@ -463,6 +461,11 @@ export class CsvCustomDocument {
         const max_file_size_bytes = normalize_max_file_size_bytes(
             options.maxFileSizeBytes,
         );
+        // Reject the argument error before any expensive work, matching where
+        // `open` and `restore` perform the same check.
+        if (options.refresh && options.refreshFactory) {
+            throw new TypeError('Provide either refresh or refreshFactory, not both.');
+        }
         if (initial_data.byteLength > max_file_size_bytes) {
             throw new CsvSaveServiceError(
                 'tooLarge',
@@ -475,10 +478,6 @@ export class CsvCustomDocument {
             delimiter,
             max_rows,
         );
-        if (options.refresh && options.refreshFactory) {
-            close_source_best_effort(source);
-            throw new TypeError('Provide either refresh or refreshFactory, not both.');
-        }
         let refresh: CsvDocumentRefreshSubscription | undefined;
         try {
             // Untitled/host-supplied initial data has no backing target to watch.
@@ -622,7 +621,9 @@ export class CsvCustomDocument {
             // source-base checks run before each insertion, so malformed backups
             // cannot amplify into a complete decoded overlay before rejection. Keep
             // only one source row cached to bound validation memory independently of
-            // the dirty-entry count while retaining row-major recovery efficiency.
+            // the dirty-entry count. Entries arrive in edit order, not row order, so
+            // the cache helps only consecutive entries from the same row; bounding
+            // memory is the point, and a full row index would defeat it.
             let cached_row_index = -1;
             let cached_row: ReturnType<CsvDataSource['read_rows']>['rows'][number]
                 | undefined;
@@ -1364,13 +1365,15 @@ export class CsvCustomDocument {
                     'The CSV was truncated while loading and cannot be edited safely.',
                 );
             }
-            this.raw_source_value(input.key);
+            // Resolved up front for its range check, which rejects a key outside the
+            // source shape before any gesture bookkeeping. Reused below so an
+            // unedited cell does not pay for a second byte-slice and row parse.
+            const source_value = this.raw_source_value(input.key);
 
             const active = this.active_gesture;
             const continues_active_gesture = active?.viewId === input.viewId
                 && active.key === input.key;
-            const before = this.dirty.get(input.key)?.value
-                ?? this.raw_source_value(input.key);
+            const before = this.dirty.get(input.key)?.value ?? source_value;
             if (!continues_active_gesture && before === input.value) {
                 this.set_absolute_value(
                     input.key,
@@ -1747,10 +1750,18 @@ export class CsvCustomDocument {
                     // boundary and drain before ordinary work already queued on the gate.
                     release_history();
                     void (async () => {
-                        while (true) {
+                        // The host drives these callbacks, so the tail settles in
+                        // practice. Bound the drain anyway: without it a host that
+                        // kept re-arming the tail would park the operation queue
+                        // behind `following_gate` for the life of the document, and
+                        // leave `save_as_for_host` unable to attach a view ever again.
+                        for (let drained = 0; ; drained += 1) {
                             const history_tail = settlement.historyTail;
                             await history_tail;
-                            if (history_tail !== settlement.historyTail) continue;
+                            if (
+                                history_tail !== settlement.historyTail
+                                && drained < MAX_SETTLEMENT_DRAIN_PASSES
+                            ) continue;
                             settlement.acceptingHistory = false;
                             const index = this.host_settlement_gates.indexOf(settlement);
                             if (index >= 0) this.host_settlement_gates.splice(index, 1);

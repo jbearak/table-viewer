@@ -79,6 +79,17 @@ describe('extension runtime manifest', () => {
         });
     });
 
+    it('bounds the retention setting so a large value cannot disable eviction', () => {
+        expect(manifest.contributes?.configuration?.properties?.[
+            'tableViewer.maxStoredFiles'
+        ]).toMatchObject({
+            type: 'integer',
+            default: 10_000,
+            minimum: 1,
+            maximum: 100_000,
+        });
+    });
+
     it('packages one extension without retired coordination artifacts', () => {
         expect(manifest.extensionPack).toBeUndefined();
         expect(manifest.contributes?.commands?.map(({ command }) => command)).toEqual([

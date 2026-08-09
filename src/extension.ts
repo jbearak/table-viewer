@@ -13,6 +13,7 @@ import {
     open_vscode_cosmetic_state_database,
     type OpenedVscodeCosmeticStateDatabase,
 } from './vscode-cosmetic-state-database';
+import { DEFAULT_MAX_STORED_FILES } from './state';
 
 interface ActiveExtensionRuntime {
     readonly viewers: TableViewerRegistration;
@@ -32,9 +33,18 @@ function extension_version(context: vscode.ExtensionContext): string {
     return typeof version === 'string' && version.length > 0 ? version : '0.0.0';
 }
 
+const MAX_STORED_FILES_CEILING = 100_000;
+
 function get_max_stored_files(): number {
-    return vscode.workspace.getConfiguration('tableViewer')
-        .get<number>('maxStoredFiles', 10_000)!;
+    // The setting is user-editable, so a hand-written settings file can supply a
+    // non-integer, a negative, or a value large enough to disable retention
+    // entirely. Clamp at the boundary rather than trusting the manifest schema.
+    const configured = vscode.workspace.getConfiguration('tableViewer')
+        .get<number>('maxStoredFiles', DEFAULT_MAX_STORED_FILES);
+    if (typeof configured !== 'number' || !Number.isFinite(configured)) {
+        return DEFAULT_MAX_STORED_FILES;
+    }
+    return Math.min(MAX_STORED_FILES_CEILING, Math.max(1, Math.floor(configured)));
 }
 
 function dispose_best_effort(disposable: vscode.Disposable | undefined): void {

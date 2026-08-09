@@ -303,6 +303,10 @@ export function with_in_memory_authority_transactions(
     const candidate = store as FileStateStore & {
         copy_cosmetic_entry_if_absent?: AuthorityFileStateStore['copy_cosmetic_entry_if_absent'];
     };
+    // Unlike copy_complete_entry this deliberately omits the single retry and the
+    // in-memory copyProvenance memo: copy_in_transaction in state.ts writes
+    // copyProvenance for cosmetic copies and performs the idempotent replay
+    // durably, so a second attempt would replay from the transaction, not here.
     const copy_cosmetic_entry = async (
         source: string,
         destination: string,

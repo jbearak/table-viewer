@@ -21,6 +21,12 @@ export interface OpenedCosmeticFileStateStore {
     close(): Promise<void>;
 }
 
+/**
+ * Project an untrusted stored value onto its cosmetic fields. Decodes before
+ * stripping, so a structurally invalid `pendingEdits` is rejected rather than
+ * silently discarded. See the `cosmetic_state` in `state.ts` for the durable
+ * copy variant that operates on already-validated state.
+ */
 function cosmetic_state(value: unknown): StoredPerFileState {
     const decoded = decode_stored_per_file_state(value);
     delete (decoded as { pendingEdits?: unknown }).pendingEdits;
@@ -80,6 +86,13 @@ function cosmetic_copy_result(result: FileStateCopyResult): FileStateCopyResult 
  * migration uses the semantic core's atomic cosmetic-only copy operation.
  */
 export function create_cosmetic_file_state_store(backing: AuthorityFileStateStore): FileStateStore {
+    const copyCosmeticEntryIfAbsent = async (
+        sourcePath: string,
+        destinationPath: string,
+        copyId: string,
+    ): Promise<FileStateCopyResult> => cosmetic_copy_result(
+        await backing.copy_cosmetic_entry_if_absent(sourcePath, destinationPath, copyId),
+    );
     const store: FileStateStore = {
         async read(filePath) {
             return cosmetic_snapshot(await backing.read(filePath));
@@ -100,13 +113,10 @@ export function create_cosmetic_file_state_store(backing: AuthorityFileStateStor
             return backing.touch(filePath);
         },
     };
-    const copyCosmeticEntryIfAbsent = async (
-        sourcePath: string,
-        destinationPath: string,
-        copyId: string,
-    ): Promise<FileStateCopyResult> => cosmetic_copy_result(
-        await backing.copy_cosmetic_entry_if_absent(sourcePath, destinationPath, copyId),
-    );
+    // Non-enumerable by design: `copy_cosmetic_entry_if_absent` is an internal
+    // capability reachable by direct property access (state-authority.ts reads it
+    // off the original reference), while `Object.keys(store)` must continue to
+    // report exactly the cosmetic FileStateStore surface this module promises.
     Object.defineProperty(store, 'copy_cosmetic_entry_if_absent', {
         value: copyCosmeticEntryIfAbsent,
     });

@@ -4,7 +4,14 @@ export const SQLITE_FILE_STATE_APPLICATION_ID = 1_414_940_243;
 /** Shipped desktop and legacy-import VS Code schema. This identity stays immutable. */
 export const SQLITE_FILE_STATE_USER_VERSION = 1;
 export const SQLITE_FILE_STATE_FORMAT = 'tableViewer.fileState.sqlite.v1';
-/** Fresh, migration-free schema identity used only by direct VS Code cosmetic state. */
+/**
+ * Fresh, migration-free schema identity used only by direct VS Code cosmetic state.
+ *
+ * This shares the single `PRAGMA user_version` number space with
+ * `SQLITE_FILE_STATE_USER_VERSION`, so 2 is reserved: a future canonical desktop
+ * v2 must not claim it, or the two schemas would be distinguishable only by the
+ * `format` string in `state_meta`.
+ */
 export const SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION = 2;
 export const SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT =
     'tableViewer.fileState.sqlite.vscodeDirect.v1';
@@ -61,6 +68,11 @@ export interface SqliteLegacyImportIdentity {
 export interface SqliteVscodeFileStateIdentity extends SqliteFileStateIdentityBase {
     readonly productKind: 'vscode';
     readonly clientProfileId: string;
+    // Makes the two productKind: 'vscode' arms a discriminated union. Without it a
+    // legacy-import identity carrying a stray schemaKind would still be assignable
+    // here, and is_direct_vscode_file_state_identity would then report direct while
+    // insert_schema_identity discarded the legacy metadata.
+    readonly schemaKind?: undefined;
     readonly legacy: SqliteLegacyImportIdentity;
 }
 

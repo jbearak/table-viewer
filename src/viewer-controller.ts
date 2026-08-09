@@ -5383,7 +5383,12 @@ export function attach_viewer(
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
         }
-            })())
+            })().catch((error: unknown) => {
+                // track_controller_operation swallows rejections, so an unexpected
+                // throw in any case above would otherwise vanish without a record.
+                log_sanitized_failure('Failed to handle a viewer webview message', error);
+                throw error;
+            }))
         )));
     } catch (error) {
         return abort_setup(error);
