@@ -1,8 +1,21 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 export const SQLITE_FILE_STATE_APPLICATION_ID = 1_414_940_243;
+/** Shipped desktop and legacy-import VS Code schema. This identity stays immutable. */
 export const SQLITE_FILE_STATE_USER_VERSION = 1;
 export const SQLITE_FILE_STATE_FORMAT = 'tableViewer.fileState.sqlite.v1';
+/**
+ * Fresh, migration-free schema identity used by the VS Code extension's own
+ * database, which has no Memento import lineage of any kind.
+ *
+ * This shares the single `PRAGMA user_version` number space with
+ * `SQLITE_FILE_STATE_USER_VERSION`, so 2 is reserved: a future canonical desktop
+ * v2 must not claim it, or the two schemas would be distinguishable only by the
+ * `format` string in `state_meta`.
+ */
+export const SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION = 2;
+export const SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT =
+    'tableViewer.fileState.sqlite.vscodeDirect.v1';
 export const SQLITE_FILE_STATE_PROTOCOL_VERSION = 1;
 export const SQLITE_FILE_STATE_EXHAUSTION_SENTINEL = 9_007_199_254_740_991;
 export const SQLITE_FILE_STATE_MAX_COUNTER = SQLITE_FILE_STATE_EXHAUSTION_SENTINEL - 1;
@@ -10,6 +23,8 @@ export const SQLITE_FILE_STATE_MAX_COUNTER = SQLITE_FILE_STATE_EXHAUSTION_SENTIN
 // as a representable exhausted state. next_ownership_generation must remain below
 // it because that field always denotes the next ownership generation to allocate.
 export const SQLITE_FILE_STATE_V1_MIGRATION_NAME = 'canonical-file-state-v1';
+export const SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME =
+    'direct-vscode-file-state-v1';
 
 export type SqliteFileStateProductKind = 'desktop' | 'vscode';
 export type SqliteFileStateAuthorityMode = 'sqlite_importing_memento' | 'sqlite';
@@ -54,12 +69,37 @@ export interface SqliteLegacyImportIdentity {
 export interface SqliteVscodeFileStateIdentity extends SqliteFileStateIdentityBase {
     readonly productKind: 'vscode';
     readonly clientProfileId: string;
+    // Makes the two productKind: 'vscode' arms a discriminated union. Without it a
+    // legacy-import identity carrying a stray schemaKind would still be assignable
+    // here, and is_direct_vscode_file_state_identity would then report direct while
+    // insert_schema_identity discarded the legacy metadata.
+    readonly schemaKind?: undefined;
     readonly legacy: SqliteLegacyImportIdentity;
+}
+
+/**
+ * VS Code-owned state with no Memento import lineage. The schemaKind discriminant
+ * selects a fresh schema identity; it is not persisted as fake legacy metadata and
+ * never projects to the desktop identity.
+ */
+export interface SqliteDirectVscodeFileStateIdentity extends SqliteFileStateIdentityBase {
+    readonly productKind: 'vscode';
+    readonly clientProfileId: string;
+    readonly schemaKind: 'direct-vscode';
 }
 
 export type SqliteFileStateIdentity =
     | SqliteDesktopFileStateIdentity
-    | SqliteVscodeFileStateIdentity;
+    | SqliteVscodeFileStateIdentity
+    | SqliteDirectVscodeFileStateIdentity;
+
+export function is_direct_vscode_file_state_identity(
+    identity: SqliteFileStateIdentity,
+): identity is SqliteDirectVscodeFileStateIdentity {
+    return identity.productKind === 'vscode'
+        && 'schemaKind' in identity
+        && identity.schemaKind === 'direct-vscode';
+}
 
 export interface SqliteFileStateMigrationOptions {
     readonly appliedAtMs: number;
@@ -473,6 +513,66 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
 ) STRICT, WITHOUT ROWID`,
 } as const;
 
+/**
+ * The VS Code extension's own database reuses the shared backend tables verbatim.
+ * Only state_meta has a fresh format/identity constraint, so desktop v1 DDL remains
+ * byte-for-byte unchanged and no parallel data model is introduced.
+ */
+export const SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL = {
+    ...SQLITE_FILE_STATE_V1_TABLE_SQL,
+    state_meta: `CREATE TABLE state_meta (
+    singleton                  INTEGER NOT NULL PRIMARY KEY
+                               CHECK (singleton = 1),
+    format                     TEXT NOT NULL
+                               CHECK (format = 'tableViewer.fileState.sqlite.vscodeDirect.v1'),
+    database_id                TEXT NOT NULL COLLATE BINARY,
+    client_profile_id          TEXT NOT NULL COLLATE BINARY,
+    storage_environment_id     TEXT NOT NULL COLLATE BINARY,
+    product_kind               TEXT NOT NULL CHECK (product_kind = 'vscode'),
+    journal_policy             TEXT NOT NULL CHECK (journal_policy = 'delete'),
+    authority_mode             TEXT NOT NULL CHECK (authority_mode = 'sqlite'),
+    legacy_capsule_id          TEXT COLLATE BINARY,
+    legacy_source_format       TEXT,
+    legacy_source_digest       TEXT COLLATE BINARY,
+    legacy_import_claim_id     TEXT COLLATE BINARY,
+
+    min_reader_protocol        INTEGER NOT NULL CHECK (min_reader_protocol >= 1),
+    max_reader_protocol        INTEGER NOT NULL CHECK (max_reader_protocol >= 1),
+    min_writer_protocol        INTEGER NOT NULL CHECK (min_writer_protocol >= 1),
+    max_writer_protocol        INTEGER NOT NULL CHECK (max_writer_protocol >= 1),
+    coordination_generation    INTEGER NOT NULL CHECK (coordination_generation >= 1),
+
+    next_revision              INTEGER NOT NULL
+                               CHECK (next_revision BETWEEN 1 AND 9007199254740991),
+    absence_revision           INTEGER NOT NULL
+                               CHECK (absence_revision BETWEEN 0 AND 9007199254740990),
+    next_recency_order         INTEGER NOT NULL CHECK (next_recency_order >= 1),
+    next_ownership_generation  INTEGER NOT NULL
+                               CHECK (next_ownership_generation BETWEEN 1 AND 9007199254740991),
+    store_updated_at_ms        INTEGER
+                               CHECK (store_updated_at_ms IS NULL OR store_updated_at_ms >= 0),
+
+    CHECK (min_reader_protocol <= max_reader_protocol),
+    CHECK (min_writer_protocol <= max_writer_protocol),
+    CHECK (absence_revision < next_revision),
+    CHECK (
+        legacy_capsule_id IS NULL
+        AND legacy_source_format IS NULL
+        AND legacy_source_digest IS NULL
+        AND legacy_import_claim_id IS NULL
+    ),
+    FOREIGN KEY (
+        legacy_capsule_id,
+        legacy_source_format,
+        legacy_source_digest
+    ) REFERENCES legacy_imports(
+        capsule_id,
+        source_format,
+        source_digest
+    ) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID`,
+} as const;
+
 export const SQLITE_FILE_STATE_V1_INDEX_SQL = {
     entries_by_recency: 'CREATE UNIQUE INDEX entries_by_recency ON entries(recency_order)',
     entries_by_state_revision: 'CREATE INDEX entries_by_state_revision ON entries(state_revision)',
@@ -499,6 +599,39 @@ export const SQLITE_FILE_STATE_V1_SCHEMA_SQL = [
     ...Object.values(SQLITE_FILE_STATE_V1_TABLE_SQL),
     ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
 ] as const;
+
+export const SQLITE_DIRECT_VSCODE_FILE_STATE_SCHEMA_SQL = [
+    ...Object.values(SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL),
+    ...Object.values(SQLITE_FILE_STATE_V1_INDEX_SQL),
+] as const;
+
+export interface SqliteFileStateSchemaIdentity {
+    readonly userVersion: number;
+    readonly format: string;
+    readonly migrationName: string;
+    readonly tableSql: Readonly<Record<string, string>>;
+    readonly indexSql: Readonly<Record<string, string>>;
+}
+
+export function sqlite_file_state_schema_identity(
+    identity: SqliteFileStateIdentity,
+): SqliteFileStateSchemaIdentity {
+    return is_direct_vscode_file_state_identity(identity)
+        ? {
+            userVersion: SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION,
+            format: SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
+            migrationName: SQLITE_DIRECT_VSCODE_FILE_STATE_MIGRATION_NAME,
+            tableSql: SQLITE_DIRECT_VSCODE_FILE_STATE_TABLE_SQL,
+            indexSql: SQLITE_FILE_STATE_V1_INDEX_SQL,
+        }
+        : {
+            userVersion: SQLITE_FILE_STATE_USER_VERSION,
+            format: SQLITE_FILE_STATE_FORMAT,
+            migrationName: SQLITE_FILE_STATE_V1_MIGRATION_NAME,
+            tableSql: SQLITE_FILE_STATE_V1_TABLE_SQL,
+            indexSql: SQLITE_FILE_STATE_V1_INDEX_SQL,
+        };
+}
 
 function assert_nonempty(value: string, name: string): void {
     if (value.length === 0) throw new TypeError(`${name} must not be empty.`);
@@ -530,6 +663,7 @@ function validate_identity(identity: SqliteFileStateIdentity): void {
     }
     if (identity.productKind === 'desktop') return;
     assert_nonempty(identity.clientProfileId, 'clientProfileId');
+    if (is_direct_vscode_file_state_identity(identity)) return;
     const legacy = identity.legacy;
     for (const [name, value] of [
         ['capsuleId', legacy.capsuleId],
@@ -581,12 +715,37 @@ function scalar_number(database: DatabaseSync, sql: string, column: string): num
     return Number(value);
 }
 
-function insert_v1_identity(database: DatabaseSync, identity: SqliteFileStateIdentity): void {
+function insert_schema_identity(database: DatabaseSync, identity: SqliteFileStateIdentity): void {
     const minReader = protocol_value(identity.minReaderProtocol);
     const maxReader = protocol_value(identity.maxReaderProtocol);
     const minWriter = protocol_value(identity.minWriterProtocol);
     const maxWriter = protocol_value(identity.maxWriterProtocol);
     const generation = identity.coordinationGeneration ?? 1;
+
+    if (is_direct_vscode_file_state_identity(identity)) {
+        database.prepare(`INSERT INTO state_meta (
+            singleton, format, database_id, client_profile_id,
+            storage_environment_id, product_kind, journal_policy, authority_mode,
+            legacy_capsule_id, legacy_source_format, legacy_source_digest,
+            legacy_import_claim_id, min_reader_protocol, max_reader_protocol,
+            min_writer_protocol, max_writer_protocol, coordination_generation,
+            next_revision, absence_revision, next_recency_order,
+            next_ownership_generation, store_updated_at_ms
+        ) VALUES (1, ?, ?, ?, ?, 'vscode', 'delete', 'sqlite',
+            NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1, 0, 1, 1, NULL)`)
+            .run(
+                SQLITE_DIRECT_VSCODE_FILE_STATE_FORMAT,
+                identity.databaseId,
+                identity.clientProfileId,
+                identity.storageEnvironmentId,
+                minReader,
+                maxReader,
+                minWriter,
+                maxWriter,
+                generation,
+            );
+        return;
+    }
 
     if (identity.productKind === 'vscode') {
         const legacy = identity.legacy;
@@ -676,17 +835,24 @@ function insert_v1_identity(database: DatabaseSync, identity: SqliteFileStateIde
         );
 }
 
-function apply_v1_migration(
+function apply_schema_installation(
     database: DatabaseSync,
     identity: SqliteFileStateIdentity,
+    schema: SqliteFileStateSchemaIdentity,
     options: SqliteFileStateMigrationOptions,
 ): void {
-    for (const sql of SQLITE_FILE_STATE_V1_SCHEMA_SQL) database.exec(sql);
+    for (const sql of Object.values(schema.tableSql)) database.exec(sql);
+    for (const sql of Object.values(schema.indexSql)) database.exec(sql);
     database.prepare(`INSERT INTO schema_migrations (
         version, name, applied_at_ms, app_version
     ) VALUES (?, ?, ?, ?)`)
-        .run(1, SQLITE_FILE_STATE_V1_MIGRATION_NAME, options.appliedAtMs, options.appVersion);
-    insert_v1_identity(database, identity);
+        .run(
+            schema.userVersion,
+            schema.migrationName,
+            options.appliedAtMs,
+            options.appVersion,
+        );
+    insert_schema_identity(database, identity);
 }
 
 /**
@@ -704,10 +870,8 @@ export function migrate_sqlite_file_state_schema(
 
     const applicationId = scalar_number(database, 'PRAGMA application_id', 'application_id');
     const userVersion = scalar_number(database, 'PRAGMA user_version', 'user_version');
-    if (userVersion > SQLITE_FILE_STATE_USER_VERSION) {
-        throw new Error('SQLite file-state schema is newer than this application supports.');
-    }
-    if (userVersion === SQLITE_FILE_STATE_USER_VERSION) {
+    const schema = sqlite_file_state_schema_identity(identity);
+    if (userVersion === schema.userVersion) {
         if (applicationId !== SQLITE_FILE_STATE_APPLICATION_ID) {
             throw new Error('SQLite file-state application identity does not match.');
         }
@@ -742,9 +906,9 @@ export function migrate_sqlite_file_state_schema(
     database.exec('BEGIN IMMEDIATE');
     try {
         database.exec(`PRAGMA application_id = ${SQLITE_FILE_STATE_APPLICATION_ID}`);
-        apply_v1_migration(database, identity, options);
+        apply_schema_installation(database, identity, schema, options);
         options.beforeSetUserVersion?.();
-        database.exec(`PRAGMA user_version = ${SQLITE_FILE_STATE_USER_VERSION}`);
+        database.exec(`PRAGMA user_version = ${schema.userVersion}`);
         database.exec('COMMIT');
     } catch (error) {
         try {

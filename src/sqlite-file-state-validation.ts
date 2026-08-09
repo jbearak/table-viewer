@@ -1,13 +1,10 @@
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import {
+    is_direct_vscode_file_state_identity,
     SQLITE_FILE_STATE_APPLICATION_ID,
     SQLITE_FILE_STATE_EXHAUSTION_SENTINEL,
-    SQLITE_FILE_STATE_FORMAT,
     SQLITE_FILE_STATE_PROTOCOL_VERSION,
-    SQLITE_FILE_STATE_USER_VERSION,
-    SQLITE_FILE_STATE_V1_INDEX_SQL,
-    SQLITE_FILE_STATE_V1_MIGRATION_NAME,
-    SQLITE_FILE_STATE_V1_TABLE_SQL,
+    sqlite_file_state_schema_identity,
     type SqliteFileStateIdentity,
     type SqliteLegacySourceIdentity,
 } from './sqlite-file-state-schema';
@@ -198,12 +195,16 @@ function normalize_sql(sql: string): string {
         .trim();
 }
 
-function validate_schema_objects(database: DatabaseSync): void {
+function validate_schema_objects(
+    database: DatabaseSync,
+    identity: SqliteFileStateIdentity,
+): void {
+    const schema = sqlite_file_state_schema_identity(identity);
     const expected = new Map<string, { type: string; sql: string }>();
-    for (const [name, sql] of Object.entries(SQLITE_FILE_STATE_V1_TABLE_SQL)) {
+    for (const [name, sql] of Object.entries(schema.tableSql)) {
         expected.set(name, { type: 'table', sql });
     }
-    for (const [name, sql] of Object.entries(SQLITE_FILE_STATE_V1_INDEX_SQL)) {
+    for (const [name, sql] of Object.entries(schema.indexSql)) {
         expected.set(name, { type: 'index', sql });
     }
     const actual = rows(database, `SELECT type, name, sql FROM sqlite_schema
@@ -230,12 +231,13 @@ function validate_schema_objects(database: DatabaseSync): void {
     }
 }
 
-function validate_pragmas(database: DatabaseSync): void {
+function validate_pragmas(database: DatabaseSync, identity: SqliteFileStateIdentity): void {
+    const expectedUserVersion = sqlite_file_state_schema_identity(identity).userVersion;
     if (safe_number(row(database, 'PRAGMA application_id')?.application_id)
         !== SQLITE_FILE_STATE_APPLICATION_ID
         || safe_number(row(database, 'PRAGMA user_version')?.user_version)
-        !== SQLITE_FILE_STATE_USER_VERSION) {
-        throw sqlite_file_state_schema_error({ schemaVersion: SQLITE_FILE_STATE_USER_VERSION });
+        !== expectedUserVersion) {
+        throw sqlite_file_state_schema_error({ schemaVersion: expectedUserVersion });
     }
     if (text(row(database, 'PRAGMA journal_mode')?.journal_mode) !== 'delete') {
         throw sqlite_file_state_schema_error();
@@ -352,7 +354,7 @@ function validate_identity_and_counters(
     const meta = metaRows[0];
     const identity = options.identity;
     if (safe_number(meta.singleton) !== 1
-        || text(meta.format) !== SQLITE_FILE_STATE_FORMAT
+        || text(meta.format) !== sqlite_file_state_schema_identity(identity).format
         || text(meta.database_id) !== identity.databaseId
         || text(meta.storage_environment_id) !== identity.storageEnvironmentId
         || text(meta.product_kind) !== identity.productKind
@@ -571,6 +573,20 @@ function validate_legacy(
         }
         return;
     }
+    if (is_direct_vscode_file_state_identity(identity)) {
+        // A direct VS Code database never imports a memento, so it must carry a
+        // client profile but no legacy import metadata at all.
+        if (text(meta.client_profile_id) !== identity.clientProfileId
+            || text(meta.authority_mode) !== 'sqlite'
+            || meta.legacy_capsule_id !== null
+            || meta.legacy_source_format !== null
+            || meta.legacy_source_digest !== null
+            || meta.legacy_import_claim_id !== null
+            || importRows.length !== 0 || sourceRows.length !== 0 || claimRows.length !== 0) {
+            throw sqlite_file_state_schema_error();
+        }
+        return;
+    }
     const legacy = identity.legacy;
     if (text(meta.client_profile_id) !== identity.clientProfileId
         || text(meta.legacy_capsule_id) !== legacy.capsuleId
@@ -642,11 +658,15 @@ function validate_legacy(
     }
 }
 
-function validate_migration_history(database: DatabaseSync): void {
+function validate_migration_history(
+    database: DatabaseSync,
+    identity: SqliteFileStateIdentity,
+): void {
+    const schema = sqlite_file_state_schema_identity(identity);
     const migrations = rows(database, 'SELECT * FROM schema_migrations ORDER BY version');
     if (migrations.length !== 1
-        || safe_number(migrations[0].version) !== 1
-        || text(migrations[0].name) !== SQLITE_FILE_STATE_V1_MIGRATION_NAME) {
+        || safe_number(migrations[0].version) !== schema.userVersion
+        || text(migrations[0].name) !== schema.migrationName) {
         throw sqlite_file_state_schema_error({ rowCount: migrations.length });
     }
 }
@@ -656,11 +676,11 @@ export function validate_sqlite_file_state_database(
     database: DatabaseSync,
     options: SqliteFileStateValidationOptions,
 ): ValidatedSqliteFileStateMetadata {
-    validate_pragmas(database);
-    validate_schema_objects(database);
+    validate_pragmas(database, options.identity);
+    validate_schema_objects(database, options.identity);
     validate_integer_storage(database);
     validate_foreign_keys(database);
-    validate_migration_history(database);
+    validate_migration_history(database, options.identity);
     const { meta, entryCount } = validate_identity_and_counters(database, options);
     const nextRevision = safe_number(meta.next_revision) as number;
     const requiresPendingEditRecovery = options.requiresPendingEditRecovery ?? false;

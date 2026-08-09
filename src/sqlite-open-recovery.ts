@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import {
     initialize_sqlite_file_state_schema,
+    is_direct_vscode_file_state_identity,
     SQLITE_FILE_STATE_APPLICATION_ID,
     SQLITE_FILE_STATE_PROTOCOL_VERSION,
     type SqliteFileStateIdentity,
@@ -1801,6 +1802,15 @@ function scalar_bigint(database: DatabaseSync, sql: string, column: string): big
     return typeof value === 'bigint' ? value : undefined;
 }
 
+/**
+ * Losing candidates are retained only for the memento-importing VS Code database,
+ * where the abandoned candidate can hold import-claim evidence worth inventorying.
+ * Desktop and the direct (import-free) VS Code database have nothing to preserve.
+ */
+function retains_losing_candidate(identity: SqliteFileStateIdentity): boolean {
+    return identity.productKind === 'vscode' && !is_direct_vscode_file_state_identity(identity);
+}
+
 function validate_exact_v1_database(
     database: DatabaseSync,
     identity: SqliteFileStateIdentity,
@@ -2240,7 +2250,7 @@ export async function initialize_sqlite_database_no_clobber(
             },
         }, suppliedGate === undefined);
         await emit(options, 'winner-validated');
-        if (wonInstallation || identity.productKind === 'desktop') {
+        if (wonInstallation || !retains_losing_candidate(identity)) {
             try {
                 remove_exact_candidate(candidatePath, candidateStat, options);
             } catch {
@@ -2364,7 +2374,7 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         const canonicalStat = fs.statSync(resolved, { bigint: true });
         const exactInstalledIncarnation = canonicalStat.dev === candidateStat.dev
             && canonicalStat.ino === candidateStat.ino;
-        if (exactInstalledIncarnation || identity.productKind === 'desktop') {
+        if (exactInstalledIncarnation || !retains_losing_candidate(identity)) {
             try {
                 remove_exact_candidate(resolvedCandidate, candidateStat, options);
             } catch {
@@ -2381,7 +2391,7 @@ export async function install_recognized_sqlite_candidate_no_clobber(
         return {
             installed: wonInstallation,
             wonInstallation,
-            candidatePath: exactInstalledIncarnation || identity.productKind === 'desktop'
+            candidatePath: exactInstalledIncarnation || !retains_losing_candidate(identity)
                 ? undefined
                 : resolvedCandidate,
             database,
