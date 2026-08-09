@@ -137,7 +137,7 @@ export interface ViewerProfile {
         state: PerFileState,
     ): Promise<DataSource>;
     /** Enables csvEditingSupported + saveCsv/pendingEdits/showSaveDialog handling. */
-    editing: boolean;
+    readonly editing: boolean;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */

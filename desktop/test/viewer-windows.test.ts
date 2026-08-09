@@ -221,13 +221,8 @@ vi.mock('../../src/viewer-controller', () => ({
 import {
     close_desktop_windows,
     create_app_quit_coordinator,
-    decide_desktop_editing,
-    desktop_conditional_install_fence_available,
-    desktop_editing_gate_ports,
     ViewerWindowManager,
     type AppQuitShutdownPort,
-    type DesktopEditingDecision,
-    type DesktopEditingGatePorts,
 } from '../main/viewer-windows';
 import {
     create_desktop_lifecycle,
@@ -282,7 +277,6 @@ function controlled_deadlines() {
 
 function manager(
     deadline_scheduler?: (callback: () => void, delayMs: number) => () => void,
-    editing_decision?: (file_path: string) => DesktopEditingDecision,
 ) {
     const config = {
         settings: () => ({
@@ -296,20 +290,12 @@ function manager(
         config_port: () => ({}),
         update: vi.fn(),
     };
-    return editing_decision
-        ? new ViewerWindowManager(
-            {} as any,
-            config as any,
-            '/viewer-preload.js',
-            deadline_scheduler,
-            editing_decision,
-        )
-        : new ViewerWindowManager(
-            {} as any,
-            config as any,
-            '/viewer-preload.js',
-            deadline_scheduler,
-        );
+    return new ViewerWindowManager(
+        {} as any,
+        config as any,
+        '/viewer-preload.js',
+        deadline_scheduler,
+    );
 }
 
 function latest_window() {
@@ -375,153 +361,24 @@ beforeEach(() => {
     controller_mock.profile_for.mockClear();
 });
 
-/**
- * Ports with every arm already answering yes, so each test below turns exactly
- * one of them off and the failing arm is the only thing under test. Nothing here
- * is a claim about the product: the real
- * `desktop_conditional_install_fence_available` is asserted separately, and it is
- * what the shipping build consults.
- */
-function permissive_gate_ports(
-    overrides: Partial<DesktopEditingGatePorts> = {},
-): DesktopEditingGatePorts {
-    return {
-        activation_marker_armed: () => true,
-        eligibility: () => ({ eligible: true, lockRoot: '/lock-root' }),
-        conditional_install_fence_available: () => true,
-        ...overrides,
-    };
-}
-
-describe('desktop editing gate', () => {
-    // The gate that keeps this release view-only, stated per platform so it
-    // fails the day someone adds a conditional installer for one of them without
-    // extending the gate. Everything else is arranged to say yes, so a pass here
-    // is specifically about the install fence and nothing else — if this starts
-    // returning `editing: true` for a platform, an installer landed without a
-    // decision about whether the whole coordinated-save protocol is proven on it.
-    it.each(['darwin', 'win32', 'linux'] as const)(
-        'ships %s view-only for want of a conditional-install fence',
-        (platform) => {
-            expect(desktop_conditional_install_fence_available(platform)).toBe(false);
-            // Every other arm says yes and the *real* fence probe is wired in, so
-            // the refusal can only be the fence.
-            expect(decide_desktop_editing(
-                '/tmp/gate.csv',
-                permissive_gate_ports({
-                    conditional_install_fence_available: desktop_conditional_install_fence_available,
-                }),
-                platform,
-            )).toEqual({ editing: false, reason: 'conditional-install-unsupported' });
-        },
-    );
-
-    // The production ports, not the permissive stand-ins: the value the window
-    // manager actually reaches for must reach the same answer, so a future
-    // rewiring of `desktop_editing_gate_ports` cannot make the matrix above a
-    // test of a function nothing calls.
-    it.each(['darwin', 'win32', 'linux'] as const)(
-        'answers view-only on %s through the production ports',
-        (platform) => {
-            expect(
-                decide_desktop_editing('/tmp/gate.csv', desktop_editing_gate_ports, platform).editing,
-            ).toBe(false);
-        },
-    );
-
-    it('refuses editing before the physical-edit protocol marker is armed', () => {
-        expect(decide_desktop_editing(
-            '/tmp/unarmed.csv',
-            permissive_gate_ports({ activation_marker_armed: () => false }),
-            'darwin',
-        )).toEqual({ editing: false, reason: 'protocol-unarmed' });
-    });
-
-    // The marker is checked first so an unarmed host says so rather than
-    // reporting whichever later arm also happens to fail — a user who has not
-    // armed the protocol must not be told their disk is unsupported.
-    it('reports the unarmed marker ahead of every later refusal', () => {
-        expect(decide_desktop_editing(
-            '/mnt/share/data.csv',
-            permissive_gate_ports({
-                activation_marker_armed: () => false,
-                eligibility: () => ({ eligible: false, reason: 'shared-mount' }),
-                conditional_install_fence_available: () => false,
-            }),
-            'linux',
-        )).toEqual({ editing: false, reason: 'protocol-unarmed' });
-    });
-
+describe('viewer profile wiring', () => {
     it.each([
-        'non-file',
-        'remote-host',
-        'shared-mount',
-        'wsl',
-        'unsupported-platform',
-        'unverifiable-filesystem',
-    ] as const)('carries the %s ineligibility through as the view-only reason', (reason) => {
-        expect(decide_desktop_editing(
-            '/tmp/ineligible.csv',
-            permissive_gate_ports({ eligibility: () => ({ eligible: false, reason }) }),
-            'darwin',
-        )).toEqual({ editing: false, reason });
-    });
+        ['/tmp/editable.csv', true],
+        ['/tmp/editable.tsv', true],
+        ['/tmp/read-only.xlsx', false],
+    ] as const)('passes the shared profile through unchanged for %s', (file_path, editing) => {
+        const profile = { editing, marker: Symbol(file_path) };
+        controller_mock.profile_for.mockReturnValueOnce(profile);
+        const viewer_manager = manager();
 
-    // Eligibility is filesystem I/O (statfs, realpath, lstat), so it can fail for
-    // reasons that have nothing to do with safety. A gate that could not be
-    // evaluated is a closed gate; the one thing it must never do is fall through.
-    it.each([
-        ['the marker check', { activation_marker_armed: () => { throw new Error('marker'); } }],
-        ['the eligibility probe', { eligibility: () => { throw new Error('statfs'); } }],
-        ['the fence probe', {
-            conditional_install_fence_available: () => { throw new Error('fence'); },
-        }],
-    ])('fails closed when %s throws', (_name, override) => {
-        expect(decide_desktop_editing(
-            '/tmp/throws.csv',
-            permissive_gate_ports(override as Partial<DesktopEditingGatePorts>),
-            'darwin',
-        )).toEqual({ editing: false, reason: 'unverifiable-filesystem' });
-    });
+        viewer_manager.open_file(file_path);
 
-    // The one arrangement that returns editing, asserted so the gate is known to
-    // be a decision rather than a function that can only say no. Reaching it in
-    // production requires a real conditional-install fence, which is the thing
-    // that does not exist.
-    it('permits editing only when every arm passes', () => {
-        expect(decide_desktop_editing('/tmp/all-pass.csv', permissive_gate_ports(), 'darwin'))
-            .toEqual({ editing: true });
+        expect(controller_mock.profile_for).toHaveBeenCalledWith(file_path, expect.anything());
+        expect(controller_mock.profile).toBe(profile);
     });
 });
 
 describe('viewer window close protocol', () => {
-    it('keeps the desktop viewer profile view-only', () => {
-        const viewer_manager = manager();
-        viewer_manager.open_file('/tmp/view-only.csv');
-
-        expect(controller_mock.profile).toMatchObject({ editing: false });
-    });
-
-    // The window manager consults the gate rather than hardcoding the answer:
-    // the decision is per file, and the profile carries whatever it returned.
-    it('takes the viewer profile edit flag from the gate decision', () => {
-        const decided: string[] = [];
-        const viewer_manager = manager(undefined, (file_path) => {
-            decided.push(file_path);
-            // `editing: false`, deliberately *differing* from the `profile_for` mock
-            // default of `{ editing: true }`. Returning `true` here made the profile
-            // assertion below unfalsifiable: it matched the mock's own default, so
-            // deleting `profile.editing = this.editing_decision(file_path).editing`
-            // from viewer-windows.ts left this test green. The `decided` assertion
-            // proved the gate was *consulted*; nothing proved its answer was used.
-            return { editing: false, reason: 'conditional-install-unsupported' };
-        });
-        viewer_manager.open_file('/tmp/gate-consulted.csv');
-
-        expect(decided).toEqual(['/tmp/gate-consulted.csv']);
-        expect(controller_mock.profile).toMatchObject({ editing: false });
-    });
-
     it('finds a viewer entry by exact basename rather than substring', () => {
         const viewer_manager = manager();
         viewer_manager.open_file('/tmp/prefix-target.csv');

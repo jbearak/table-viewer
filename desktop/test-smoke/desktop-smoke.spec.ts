@@ -1,8 +1,7 @@
 // Smoke test for the standalone desktop app: launches the built Electron
 // bundle (dist/desktop/main.js) with a csv and an xlsx fixture, asserts each
-// file opened in its own window and rendered the data grid, and exercises a
-// couple of interactions (sort, and the Edit menu's grid-routed Copy /
-// Select All).
+// file opened in its own window and rendered the data grid, and exercises
+// editing and saving, sorting, and the Edit menu's grid-routed Copy / Select All.
 //
 // One window per file, so Playwright surfaces one page per opened file; the
 // welcome window only appears when the app is launched with no file.
@@ -36,7 +35,9 @@ const VIEWER_URL_PREFIX = 'tv-app://viewer';
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
 
 let app: ElectronApplication;
+let smoke_root: string;
 let user_data_dir: string;
+let editable_csv: string;
 
 function viewer_pages(): Page[] {
     return app.windows().filter((page) => page.url().startsWith(VIEWER_URL_PREFIX));
@@ -139,9 +140,13 @@ async function click_grid_cell(
 
 test.beforeAll(async () => {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
-    user_data_dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-smoke-')));
+    smoke_root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tv-smoke-')));
+    user_data_dir = path.join(smoke_root, 'user-data');
+    fs.mkdirSync(user_data_dir);
+    editable_csv = path.join(smoke_root, 'basic.csv');
+    fs.copyFileSync(csv_fixture, editable_csv);
     app = await electron.launch({
-        args: [main_js, csv_fixture, xlsx_fixture],
+        args: [main_js, editable_csv, xlsx_fixture],
         cwd: repo_dir,
         env: {
             ...process.env,
@@ -161,7 +166,7 @@ test.beforeAll(async () => {
 
 test.afterAll(async () => {
     await app?.close();
-    if (user_data_dir) fs.rmSync(user_data_dir, { recursive: true, force: true });
+    if (smoke_root) fs.rmSync(smoke_root, { recursive: true, force: true });
 });
 
 test('opens each file in its own window and renders both grids', async () => {
@@ -223,7 +228,7 @@ test('reopening an open file focuses its window instead of duplicating it', asyn
     const reopened = await app.evaluate((electron, file) => {
         electron.app.emit('open-file', { preventDefault() {} }, file);
         return electron.BrowserWindow.getAllWindows().length;
-    }, csv_fixture);
+    }, editable_csv);
     expect(reopened).toBe(2);
 
     // Still two windows a moment later (a duplicate would appear async), and the
@@ -683,10 +688,11 @@ test('the About window shows the app version and its notice links', async () => 
     }
 });
 
-// Unsaved CSV edits are durable, so the window only has to *show* that it holds a
-// draft: macOS puts a dot in an edited document's close button, other platforms
-// mark the title. Kept last — it deliberately leaves a draft behind.
-test('a window holding unsaved edits is marked as edited', async () => {
+// Desktop editing uses the complete shared path: the renderer obtains an edit
+// session, SQLite accepts the draft, and Cmd/Ctrl+S reaches the controller's
+// conflict checks and the desktop filesystem port. The fixture is a temporary
+// copy, so this proves the physical save without modifying the repository.
+test('CSV edits are marked dirty and save to the opened file', async () => {
     const page = await focus_viewer('basic.csv');
     const window_state = () => app.evaluate(({ BrowserWindow }) => {
         const window = BrowserWindow.getAllWindows()
@@ -701,13 +707,17 @@ test('a window holding unsaved edits is marked as edited', async () => {
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
 
-    // Type into the first body cell and commit it. The first keystroke opens the
-    // overwrite editor and is consumed, so the cell ends up holding "licia".
+    // Open the first body cell's editor explicitly, replace its value, and commit.
+    // Separating activation from entry makes the expected saved bytes unambiguous.
     await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
-    await page.keyboard.type('Alicia');
     await page.keyboard.press('Enter');
-    // The toolbar marks its own unsaved state; wait for the page to agree a draft
-    // exists before asking the window about it.
+    const cell_editor = page.locator('.cell-editor-input');
+    await expect(cell_editor).toBeVisible();
+    await expect(cell_editor).toBeFocused();
+    await expect(cell_editor).toHaveValue('Alice');
+    await cell_editor.fill('Alicia');
+    await cell_editor.press('Enter');
+    await expect(cell_editor).toBeHidden();
     await expect(edit_toggle).toHaveClass(/has-unsaved/);
 
     await expect.poll(window_state, { timeout: 15_000 }).toEqual(
@@ -715,4 +725,22 @@ test('a window holding unsaved edits is marked as edited', async () => {
             ? { title: 'basic.csv', edited: true }
             : { title: '• basic.csv', edited: false },
     );
+
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+S' : 'Control+S');
+    await expect.poll(
+        () => fs.readFileSync(editable_csv, 'utf8'),
+        { timeout: 15_000 },
+    ).toBe([
+        'Name,Age,City',
+        'Alicia,30,New York',
+        'Bob,25,London',
+        'Charlie,35,Paris',
+        '',
+    ].join('\n'));
+    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
+    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(window_state, { timeout: 15_000 }).toEqual({
+        title: 'basic.csv',
+        edited: false,
+    });
 });

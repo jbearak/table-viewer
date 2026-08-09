@@ -64,11 +64,9 @@ async function click_grid_cell(
 /**
  * Produce one piece of durable view state: a sort on the first data column.
  *
- * A sort rather than an edit, deliberately. This release is view-only on every
- * platform (see `decide_desktop_editing` in desktop/main/viewer-windows.ts), so
- * a pending-edit map is not something a user can create here — and the gate is
- * about the state backend surviving a restart, which a sort exercises through
- * exactly the same CAS, revision, and commit path.
+ * A sort rather than an edit, deliberately. This CI gate isolates generic view
+ * state and SQLite restart recovery from edit-session behavior, and a sort
+ * exercises the same CAS, revision, and commit path without changing the fixture.
  */
 async function apply_sort(page: Page): Promise<void> {
     await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
