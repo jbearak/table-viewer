@@ -111,6 +111,46 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="A1" s="4"><v>9</v></c>');
     });
 
+    it('refuses a shared-formula cell rather than breaking the group', () => {
+        // The master defines the formula its followers reference by `si`. Dropping
+        // it leaves them pointing at a definition that no longer exists.
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><f t="shared" ref="A1:A3" si="0">B1*2</f><v>2</v></c></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/A1.*shared formula/);
+    });
+
+    it('refuses a shared-formula follower too', () => {
+        expect(() => apply_cell_edits(
+            doc('<row r="2"><c r="A2"><f t="shared" si="0"/><v>4</v></c></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/A2.*shared formula/);
+    });
+
+    it('refuses an array-formula cell', () => {
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><f t="array" ref="A1:B1">SUM(C1:D1)</f><v>3</v></c></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/A1.*array formula/);
+    });
+
+    it('drops control characters XML 1.0 cannot represent', () => {
+        // Pasted from a terminal or a PDF, invisible in the grid, and fatal in the
+        // part: there is no escape for these, so a numeric reference would be just
+        // as invalid as the byte.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="s"><v>0</v></c></row>'),
+            [{ row: 0, col: 0, value: 'a\u000bb\u0000c' }],
+            OPTS,
+        );
+        expect(out).toContain('abc');
+        expect(out).not.toContain('\u000b');
+        expect(out).not.toContain('\u0000');
+    });
+
     it('drops a formula when a literal overwrites it', () => {
         const out = apply_cell_edits(
             doc('<row r="1"><c r="A1"><f>SUM(B1:C1)</f><v>3</v></c></row>'),
@@ -251,17 +291,25 @@ describe('apply_cell_edits', () => {
 
 describe('widen_dimension', () => {
     it('widens to cover newly written cells', () => {
-        const out = widen_dimension('<x><dimension ref="A1:B2"/></x>', 5, 4);
+        const out = widen_dimension('<x><dimension ref="A1:B2"/></x>', 5, 4, 5, 4);
         expect(out).toContain('ref="A1:E6"');
     });
 
     it('never shrinks an existing extent', () => {
         const xml = '<x><dimension ref="A1:Z100"/></x>';
-        expect(widen_dimension(xml, 1, 1)).toBe(xml);
+        expect(widen_dimension(xml, 1, 1, 1, 1)).toBe(xml);
+    });
+
+    it('grows the top-left corner too', () => {
+        // A used range that does not start at A1 is ordinary — a table with a
+        // margin above and to the left. Writing into that margin has to move the
+        // start, or the recorded range excludes the cell just written.
+        const out = widen_dimension('<x><dimension ref="C3:D4"/></x>', 0, 0, 0, 0);
+        expect(out).toContain('ref="A1:D4"');
     });
 
     it('tolerates a single-cell ref', () => {
-        expect(widen_dimension('<x><dimension ref="A1"/></x>', 2, 2)).toContain('ref="A1:C3"');
+        expect(widen_dimension('<x><dimension ref="A1"/></x>', 2, 2, 2, 2)).toContain('ref="A1:C3"');
     });
 });
 

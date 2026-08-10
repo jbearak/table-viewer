@@ -145,12 +145,14 @@ export function write_xlsx_cell_edits(
 
     let updated = apply_cell_edits(sheet_xml, edits, { datemode, is_date_style });
 
-    let max_row = 0, max_col = 0;
+    let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
     for (const e of edits) {
+        if (e.row < min_row) min_row = e.row;
+        if (e.col < min_col) min_col = e.col;
         if (e.row > max_row) max_row = e.row;
         if (e.col > max_col) max_col = e.col;
     }
-    updated = widen_dimension(updated, max_row, max_col);
+    updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
 
     if (!write_part_text(cfb_file, `/${part}`, updated)) {
         throw new Error('Could not update the worksheet to save');

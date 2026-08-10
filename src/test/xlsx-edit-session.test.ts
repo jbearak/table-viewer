@@ -205,6 +205,56 @@ describe('xlsx edit sessions', () => {
         expect(bytes).toBe(untouched);
     });
 
+    it('fails the save, keeping the file, when a cell is in a formula group', async () => {
+        // The writer refuses a shared or array formula rather than breaking the
+        // group. That refusal happens at write time, after the user confirmed, so
+        // what matters here is that it lands as a clean failed save with the file
+        // untouched — not a half-written workbook.
+        const raw = read_fixture('basic.xlsx');
+        const file = CFB.read(raw, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet2.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                .replace(
+                    /<c r="A2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/,
+                    '<c r="A2"><f t="shared" ref="A2:A3" si="0">B2*2</f><v>1</v></c>',
+                ),
+            'utf8',
+        );
+        sheet.content = patched;
+        sheet.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+        const untouched = bytes;
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base = String(
+            (await parse_xlsx(bytes)).data.sheets[1].rows[1][0]?.raw ?? '',
+        );
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base } },
+            },
+        });
+        await flush_promises();
+
+        // Not a base mismatch — the base was read from the patched file — so the
+        // refusal is the writer's, which is what this test is about.
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(save_results(panel).at(-1)).not.toHaveProperty('rejection');
+        expect(bytes).toBe(untouched);
+    });
+
     it('refuses a save whose base no longer matches the cell', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

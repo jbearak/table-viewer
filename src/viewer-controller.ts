@@ -409,21 +409,30 @@ function excel_hidden_rows_for_source(
  * so it never reaches these keys; it does have to be undone to read a base back
  * out, which is what `projected_row_for_source` is for.
  */
-function plan_xlsx_save(input: SavePlanInput): SavePlan {
-    const { source: src, sheet_index, edits, wanted_bases } = input;
-
-    // Only the wanted rows are read, not the whole sheet: unlike CSV there is no
-    // serialization walk to ride along with, and an edit touches a handful of
-    // rows out of a million.
+/**
+ * Read the current value of each wanted `row:col`, keyed by *source* row.
+ *
+ * The projection step is the whole of it. Edits are source-keyed, but a
+ * `DataSource` reads in projected space, and with a promoted header those spaces
+ * differ by one — so reading a source index directly returns the neighbouring
+ * physical row, and every base looks changed. Shared by the save path and the
+ * restore path because the two must agree: a base one accepts and the other
+ * rejects is a save that refuses work the user was just shown as clean.
+ *
+ * A row the projection hides is left unobserved, so validation sees `undefined`
+ * and rejects rather than writing against a base nobody checked.
+ */
+function harvest_source_bases(
+    src: DataSource,
+    sheet_index: number,
+    wanted_bases: Iterable<string>,
+): Map<string, string> {
     const observed_bases = new Map<string, string>();
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
         if (!Number.isInteger(source_row) || !Number.isInteger(col)) continue;
         const projected = projected_row_for_source(src, sheet_index, source_row);
-        // Out of range, or hidden by the header projection: left unobserved, so
-        // base validation sees `undefined` and rejects the save rather than
-        // writing against a base nobody checked.
         if (projected === undefined) continue;
         const entry = by_projected_row.get(projected);
         if (entry) entry.cols.push(col);
@@ -446,7 +455,16 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             }
         });
     }
+    return observed_bases;
+}
 
+function plan_xlsx_save(input: SavePlanInput): SavePlan {
+    const { source: src, sheet_index, edits, wanted_bases } = input;
+
+    // Only the wanted rows are read, not the whole sheet: unlike CSV there is no
+    // serialization walk to ride along with, and an edit touches a handful of
+    // rows out of a million.
+    const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
     const cell_edits: XlsxCellEdit[] = [];
     for (const [key, value] of Object.entries(edits)) {
         const [row, col] = key.split(':').map(Number);
@@ -1992,48 +2010,16 @@ export function attach_viewer(
         if (Object.keys(dirty_edits).length === 0) return undefined;
 
         const source_row_count = src.meta().sheets[sheet_index]?.sourceRowCount ?? 0;
-        const wanted_columns = new Map<number, number[]>();
-        for (const key of Object.keys(dirty_edits)) {
-            const [source_row, col] = key.split(':').map(Number);
-            if (
-                !Number.isInteger(source_row)
-                || !Number.isInteger(col)
-                || source_row < 0
-                || col < 0
-                || source_row >= source_row_count
-            ) continue;
-            const columns = wanted_columns.get(source_row);
-            if (columns) columns.push(col);
-            else wanted_columns.set(source_row, [col]);
-        }
-
-        const observed_bases = new Map<string, string>();
-        const wanted_rows = [...wanted_columns.keys()].sort((left, right) => left - right);
-        for (let index = 0; index < wanted_rows.length;) {
-            const run_start = wanted_rows[index];
-            let end = run_start;
-            while (wanted_rows[index + 1] === end + 1) {
-                end += 1;
-                index += 1;
-            }
-            for (let start = run_start; start <= end; start += SAVE_WINDOW) {
-                const count = Math.min(SAVE_WINDOW, end - start + 1);
-                const window = src.read_rows(sheet_index, start, count);
-                for (const [offset, row] of window.rows.entries()) {
-                    const source_row = window.startRow + offset;
-                    for (const col of wanted_columns.get(source_row) ?? []) {
-                        const cell = row[col];
-                        if (cell !== undefined) {
-                            observed_bases.set(
-                                `${source_row}:${col}`,
-                                cell === null ? '' : String(cell.raw ?? ''),
-                            );
-                        }
-                    }
-                }
-            }
-            index += 1;
-        }
+        // The same harvest the save path uses, so the two cannot disagree about a
+        // base. It projects source rows before reading, which is identity for a CSV
+        // and off by the promoted header row for an Excel sheet — reading source
+        // indices directly here made every restored edit under a promoted header
+        // look conflicted.
+        const observed_bases = harvest_source_bases(
+            src,
+            sheet_index,
+            Object.keys(dirty_edits),
+        );
 
         const validation = validate_dirty_bases(
             dirty_edits,

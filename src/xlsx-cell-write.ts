@@ -47,7 +47,14 @@ function encode_xml(s: string): string {
     return s
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/>/g, '&gt;')
+        // Control characters XML 1.0 forbids outright: they have no escape, so a
+        // numeric reference would be just as invalid as the raw byte. Excel drops
+        // them on paste too. A user pasting from a terminal or a PDF can carry
+        // one in without ever seeing it, and the result would be a worksheet part
+        // no reader accepts — a corrupt workbook from one invisible character.
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -245,6 +252,26 @@ function letter_to_index(letters: string): number {
     return index - 1;
 }
 
+/**
+ * `'shared'` / `'array'` when the cell's `<f>` belongs to a multi-cell group.
+ *
+ * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
+ * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
+ */
+function grouped_formula_kind(cell_inner: string): 'shared' | 'array' | null {
+    const open = /<f\b[^>]*>/.exec(cell_inner);
+    if (!open) return null;
+    const type = /\bt="([^"]*)"/.exec(open[0]);
+    if (type?.[1] === 'shared') return 'shared';
+    if (type?.[1] === 'array') return 'array';
+    return null;
+}
+
+/** `A1`-style reference for a message a user will read. */
+function cell_reference(row: number, col: number): string {
+    return `${col_index_to_letter(col)}${row + 1}`;
+}
+
 function existing_style(open_tag: string): number | null {
     const m = /\bs="(\d+)"/.exec(open_tag);
     return m ? Number(m[1]) : null;
@@ -329,8 +356,28 @@ export function apply_cell_edits(
             const cell_span = cells.get(e.col);
             if (cell_span) {
                 // Existing cell: keep its style index, replace the element. Any
-                // `<f>` it carried is dropped with it — the agreed putexcel
+                // plain `<f>` it carried is dropped with it — the agreed putexcel
                 // behavior, where writing a value replaces the formula.
+                //
+                // A *shared* or *array* formula is different, and refused. Its `<f>`
+                // is not local to the cell: a shared master defines the formula its
+                // followers reference by `si`, and an array formula's `ref` spans a
+                // range of cells. Dropping either leaves the rest of the group
+                // pointing at a definition that no longer exists — cells that
+                // silently stop calculating, or a workbook Excel offers to repair.
+                // Handling those groups properly means rewriting cells the user did
+                // not edit, which is the opposite of a surgical save, so this
+                // refuses and says why instead of quietly corrupting the sheet.
+                const grouped = grouped_formula_kind(
+                    xml.slice(cell_span.inner_start, cell_span.end),
+                );
+                if (grouped) {
+                    throw new Error(
+                        `Cannot edit ${cell_reference(e.row, e.col)}: it is part of `
+                        + `${grouped === 'array' ? 'an array' : 'a shared'} formula. `
+                        + 'Clear the formula in Excel first.',
+                    );
+                }
                 const xf = existing_style(cell_span.open_tag);
                 splices.push({
                     start: cell_span.start,
@@ -455,7 +502,13 @@ function find_sheet_data_open(xml: string): {
  * including our own `parse_dimension`. Only widening is safe: shrinking would
  * require knowing that no other cell still occupies the old extent.
  */
-export function widen_dimension(xml: string, max_row: number, max_col: number): string {
+export function widen_dimension(
+    xml: string,
+    min_row: number,
+    min_col: number,
+    max_row: number,
+    max_col: number,
+): string {
     const start = xml.indexOf('<dimension');
     if (start === -1 || !is_tag_boundary(xml[start + 10])) return xml;
     const tag_end = find_tag_end(xml, start);
@@ -463,10 +516,23 @@ export function widen_dimension(xml: string, max_row: number, max_col: number): 
     const open_tag = xml.slice(start, tag_end + 1);
     const m = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(open_tag);
     if (!m) return xml;
-    const cur_end_col = m[3] !== undefined ? letter_to_index(m[3]) : letter_to_index(m[1]);
-    const cur_end_row = m[4] !== undefined ? Number(m[4]) - 1 : Number(m[2]) - 1;
-    if (max_row <= cur_end_row && max_col <= cur_end_col) return xml;
-    const ref = `${m[1]}${m[2]}:${col_index_to_letter(Math.max(cur_end_col, max_col))}${Math.max(cur_end_row, max_row) + 1}`;
+    const cur_start_col = letter_to_index(m[1]);
+    const cur_start_row = Number(m[2]) - 1;
+    const cur_end_col = m[3] !== undefined ? letter_to_index(m[3]) : cur_start_col;
+    const cur_end_row = m[4] !== undefined ? Number(m[4]) - 1 : cur_start_row;
+    // Both corners, not just the bottom-right one: a sheet whose used range starts
+    // at C3 and gets a value written into A1 still has to grow up and to the left,
+    // or the recorded range excludes the cell we just wrote and readers that trust
+    // `<dimension>` never see it.
+    const start_col = Math.min(cur_start_col, min_col);
+    const start_row = Math.min(cur_start_row, min_row);
+    const end_col = Math.max(cur_end_col, max_col);
+    const end_row = Math.max(cur_end_row, max_row);
+    if (
+        start_col === cur_start_col && start_row === cur_start_row
+        && end_col === cur_end_col && end_row === cur_end_row
+    ) return xml;
+    const ref = `${col_index_to_letter(start_col)}${start_row + 1}:${col_index_to_letter(end_col)}${end_row + 1}`;
     const replaced = open_tag.replace(/\bref="[^"]*"/, `ref="${ref}"`);
     return xml.slice(0, start) + replaced + xml.slice(tag_end + 1);
 }
