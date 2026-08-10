@@ -417,6 +417,33 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="B2"><v>9</v></c>');
     });
 
+    it('replaces a cell whose end tag carries whitespace', () => {
+        // XML permits whitespace between the name and the `>` of an end tag, so
+        // `</c >` is ordinary — a pretty-printer may well write it. Matching only
+        // the exact spelling `</c>` made the cell look unterminated, the edit took
+        // the synthesize-a-new-one path, and the row came out with two `<c r="A1">`.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c ></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out.match(/r="A1"/g)).toHaveLength(1);
+        expect(out).toContain('<v>9</v>');
+        expect(out).not.toContain('<v>1</v>');
+    });
+
+    it('replaces a cell in a row whose end tag carries whitespace', () => {
+        // The same spelling one level up, and the same duplicate outcome: the row
+        // looked unterminated, so an edit to a cell inside it appended a second row.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row\n>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out.match(/<row\b/g)).toHaveLength(1);
+        expect(out).toContain('<v>9</v>');
+    });
+
     it('does not count formula-shaped text in comments or CDATA', () => {
         // The count only exists to answer "did an edit drop a formula". Counting
         // quoted text made an edit *near* a comment look like a formula appearing
@@ -911,6 +938,18 @@ describe('write_xlsx_cell_edits', () => {
             .toContain('<v>43844</v>');
     });
 
+    it('reads a formatCode written with single quotes', () => {
+        // Both quote styles are legal XML, and calling one of them malformed was
+        // this module's own invention: `formatCode='yyyy-mm-dd'` went unread, so the
+        // style did not look like a date and a typed date was written as text.
+        const bytes = patched_parts([
+            ['/xl/styles.xml', /formatCode="([^"]*)"/, "formatCode='yyyy-mm-dd'"],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>45306</v>');
+    });
+
     it('matches a relationship id spelled with a character reference', () => {
         // `Id="R1&#54;f42588a6664ec0"` and `r:id="R16f42588a6664ec0"` are one
         // relationship to a parser and two strings to a raw compare. The lookup
@@ -1024,7 +1063,7 @@ describe('write_xlsx_cell_edits', () => {
          */
         function with_calc_chain(
             raw: Uint8Array,
-            paired: false | 'tight' | 'pretty' = false,
+            paired: false | 'tight' | 'pretty' | 'commented' = false,
             /**
              * An extra attribute placed ahead of the ones that matter, on both
              * references. `note="1 > 0"` is legal XML — a raw `>` inside a quoted
@@ -1045,7 +1084,12 @@ describe('write_xlsx_cell_edits', () => {
             const empty = (tag: string, attrs: string) => {
                 const all = `${extra}${attrs}`;
                 if (!paired) return `<${tag} ${all}/>`;
-                const gap = paired === 'pretty' ? '\n    ' : '';
+                // 'commented' puts the element's own end-tag spelling inside a
+                // comment — text, not markup, and the raw `indexOf` that used to
+                // locate the real one stopped there instead.
+                const gap = paired === 'pretty'
+                    ? '\n    '
+                    : paired === 'commented' ? `<!-- </${tag}> -->` : '';
                 return `<${tag} ${all}>${gap}</${tag}>`;
             };
             for (const [path, insert] of [
@@ -1130,6 +1174,34 @@ describe('write_xlsx_cell_edits', () => {
                 written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
             );
             expect(text_part(raw, '/xl/worksheets/sheet3.xml')).toContain('<f>1+1</f>');
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
+        it('is detached completely when its references contain a comment', () => {
+            // `<Override ...><!-- </Override> --></Override>` is one element: the
+            // text inside a comment is not markup. Locating the end tag with a raw
+            // `indexOf` stopped at the commented one, so the element looked like it
+            // had content, the removal declined to touch it, and the part was
+            // deleted with both references still naming it.
+            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
+            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
+            const patched = Buffer.from(
+                Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
+                'utf8',
+            );
+            sheet.content = patched;
+            sheet.size = patched.length;
+            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
+            const raw = with_calc_chain(
+                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                'commented',
+            );
 
             const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
 

@@ -351,6 +351,42 @@ export function* live_tags_in(xml: string, name: string): Generator<[number, str
 }
 
 /**
+ * The `[start, end)` of the `</name>` closing the element whose opening tag runs
+ * to `inner_start`, plus its inner text with comments and processing instructions
+ * blanked out. Null if the element is unterminated.
+ *
+ * Exported for the package layer's element removal, which located its closing tag
+ * with a raw `indexOf`. `</Override>` written inside a comment is text, so a
+ * comment mentioning one ended the element early: the removal then saw
+ * non-whitespace "content", declined to touch it, and the package kept a content
+ * type and a relationship naming a part it no longer contains. Whitespace before
+ * the `>` is handled for the same reason `scan_cells` handles it.
+ *
+ * Comments and PIs are blanked because a caller asking "is this element empty?"
+ * means empty of *content*, and neither is content — an element holding only a
+ * comment is an empty element with a note attached, and removing it takes the note
+ * with it. CDATA is left in place: that genuinely is character data.
+ */
+export function element_close(
+    xml: string,
+    name: string,
+    inner_start: number,
+): { inner: string; end: number } | null {
+    const ranges = ignorable_ranges(xml, 0, xml.length);
+    const end_tag = end_tag_after(xml, name, inner_start, ranges);
+    if (end_tag === null) return null;
+    let inner = xml.slice(inner_start, end_tag[0]);
+    for (const [start, end] of ranges) {
+        if (end <= inner_start || start >= end_tag[0]) continue;
+        if (xml.startsWith('<![CDATA[', start)) continue;
+        const from = Math.max(start, inner_start) - inner_start;
+        const to = Math.min(end, end_tag[0]) - inner_start;
+        inner = inner.slice(0, from) + ' '.repeat(to - from) + inner.slice(to);
+    }
+    return { inner, end: end_tag[1] };
+}
+
+/**
  * The inner text of the first live `<name>…</name>` element, or null.
  *
  * The same hazard one level up: `<numFmts[^>]*>([\s\S]*?)</numFmts>` cut the
@@ -363,8 +399,8 @@ export function element_content(xml: string, name: string): string | null {
     for (const [at, tag] of live_tags(xml, name, 0, xml.length, ranges)) {
         if (tag.endsWith('/>')) return null;
         const inner_start = at + tag.length;
-        const close = indexOf_live(xml, `</${name}`, inner_start, ranges);
-        return close === -1 ? null : xml.slice(inner_start, close);
+        const end_tag = end_tag_after(xml, name, inner_start, ranges);
+        return end_tag === null ? null : xml.slice(inner_start, end_tag[0]);
     }
     return null;
 }
@@ -413,6 +449,38 @@ function indexOf_live(
     }
 }
 
+/**
+ * The span of the first live `</name>` end tag at or after `from`, as
+ * `[start, end)`, or null if there is none.
+ *
+ * Not an `indexOf('</c>')`: XML permits whitespace between the name and the `>`,
+ * so `</c\n>` is an ordinary end tag that a pretty-printer may well write.
+ * Missing it made the element look unterminated, the cell took the
+ * synthesize-a-new-one path, and the row came out with *two* `<c r="A1">` — a
+ * file whose displayed value depends on which one the reader keeps.
+ *
+ * The name boundary is checked rather than assumed, because `</c` is also a
+ * prefix of `</calcChain`; a prefix match resumes the search instead of ending
+ * the element in the wrong place.
+ */
+function end_tag_after(
+    xml: string,
+    name: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): [number, number] | null {
+    let pos = from;
+    while (true) {
+        const at = indexOf_live(xml, `</${name}`, pos, ranges);
+        if (at === -1) return null;
+        const after = at + name.length + 2;
+        if (xml[after] === '>') return [at, after + 1];
+        const gt = xml.indexOf('>', after);
+        if (gt !== -1 && after < gt && !/\S/.test(xml.slice(after, gt))) return [at, gt + 1];
+        pos = at + 1;
+    }
+}
+
 function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
     const out = new Map<number, Span>();
     const ignorable = ignorable_ranges(xml, from, to);
@@ -433,8 +501,9 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
             pos = tag_end + 1;
             continue;
         }
-        const close = indexOf_live(xml, '</row>', tag_end, ignorable);
-        if (close === -1) break;
+        const end_tag = end_tag_after(xml, 'row', tag_end, ignorable);
+        if (end_tag === null) break;
+        const [close, after_close] = end_tag;
         // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
         // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
         // disagree, and an edit to a cell the user can plainly see took the
@@ -445,9 +514,9 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
             ? Number(r[1]) - 1
             : row_index_from_first_cell(xml, tag_end + 1, close, ignorable);
         if (row_index !== undefined) {
-            out.set(row_index, { start, end: close + 6, inner_start: tag_end + 1, open_tag });
+            out.set(row_index, { start, end: after_close, inner_start: tag_end + 1, open_tag });
         }
-        pos = close + 6;
+        pos = after_close;
     }
     return out;
 }
@@ -473,10 +542,11 @@ function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
             pos = tag_end + 1;
             continue;
         }
-        const close = indexOf_live(xml, '</c>', tag_end, ignorable);
-        if (close === -1) break;
-        if (col !== null) out.set(col, { start, end: close + 4, inner_start: tag_end + 1, open_tag });
-        pos = close + 4;
+        const end_tag = end_tag_after(xml, 'c', tag_end, ignorable);
+        if (end_tag === null) break;
+        const [, after_close] = end_tag;
+        if (col !== null) out.set(col, { start, end: after_close, inner_start: tag_end + 1, open_tag });
+        pos = after_close;
     }
     return out;
 }
@@ -975,14 +1045,15 @@ function find_sheet_data_open(xml: string): {
                 element_end: tag_end + 1,
             };
         }
-        const close = indexOf_live(xml, '</sheetData>', tag_end, ignorable);
-        if (close === -1) return null;
+        const end_tag = end_tag_after(xml, 'sheetData', tag_end, ignorable);
+        if (end_tag === null) return null;
+        const [close, after_close] = end_tag;
         return {
             inner_start: tag_end + 1,
             inner_end: close,
             self_closing: false,
             element_start: start,
-            element_end: close + '</sheetData>'.length,
+            element_end: after_close,
         };
     }
 }
