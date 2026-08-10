@@ -37,7 +37,7 @@ function get_attr(tag: string, attr: string): string | null {
 }
 
 /** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
-function find_tag_end(xml: string, start: number): number {
+export function find_tag_end(xml: string, start: number): number {
     let in_quote: string | null = null;
     for (let i = start; i < xml.length; i++) {
         const ch = xml[i];
@@ -53,12 +53,12 @@ function find_tag_end(xml: string, start: number): number {
 }
 
 /** Check whether the character after a tag-name match is a valid tag delimiter. */
-function is_tag_boundary(ch: string | undefined): boolean {
+export function is_tag_boundary(ch: string | undefined): boolean {
     return ch === '>' || ch === ' ' || ch === '/' || ch === '\t' || ch === '\n' || ch === '\r';
 }
 
 /** Check whether the region between start and tag_end represents a self-closing tag (handles `<tag/>` and `<tag />`). */
-function is_self_closing(xml: string, start: number, tag_end: number): boolean {
+export function is_self_closing(xml: string, start: number, tag_end: number): boolean {
     for (let i = tag_end - 1; i > start; i--) {
         const ch = xml[i];
         if (ch === '/') return true;
