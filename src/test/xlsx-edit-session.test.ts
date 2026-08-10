@@ -1218,6 +1218,30 @@ describe('xlsx edit sessions', () => {
         expect(durable, 'durable draft').toContain('Draft');
     });
 
+    it('rehydrates a live draft sitting behind a parked one', async () => {
+        // Declining the parked slot is right; stopping there was not. Only one
+        // worksheet holds a session at a time, so this asks *which* — and a slot with
+        // no worksheet is not an answer to that question, it is a slot to skip. The
+        // first-occupied rule hid every later draft behind it, leaving a perfectly
+        // live `Inventory` draft durable but invisible, recoverable only by renaming
+        // a sheet the user may know nothing about.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Ghost', cells: { '1:0': { value: 'Parked', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Real', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        const snapshot = latest_snapshot(panel);
+        expect(snapshot.capabilities.csvEditSheetIndex).toBe(1);
+        const projected = JSON.stringify(snapshot.state?.pendingEdits ?? null);
+        expect(projected).toContain('Real');
+        // And the parked draft is still not projected anywhere — it has no worksheet.
+        expect(projected).not.toContain('Parked');
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .toContain('Parked');
+    });
+
     it('does not adopt a parked draft into the worksheet at its stale index', async () => {
         // A draft whose name the workbook no longer has is parked at its old index
         // rather than deleted, because a rename and a deletion look the same from

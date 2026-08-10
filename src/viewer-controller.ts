@@ -1366,18 +1366,34 @@ export function attach_viewer(
      * one worksheet's draft into another, which is the corruption the parking was
      * careful not to cause. The draft stays durable and recoverable; what it does
      * not get is a session on a sheet that is not its own.
+     *
+     * Such a slot is *skipped*, not returned as the answer. Only one worksheet can
+     * hold a session at a time, so this asks which one — and a parked slot is a
+     * draft with no worksheet, which is not an answer to that question. Stopping at
+     * the first one hid every later slot behind it: a `Ghost` draft at index 0 left
+     * a perfectly live `Inventory` draft at index 1 unrehydrated and invisible,
+     * recoverable only by renaming a sheet the user may know nothing about.
      */
     function rehydration_sheet_index(
         slots: PerFileState['pendingEdits'],
         names?: readonly string[],
     ): number | undefined {
         if (!slots) return 0;
+        let parked = false;
         for (let index = 0; index < slots.length; index += 1) {
             const slot = slots[index];
             if (!slot) continue;
             if (!slot.sheetName) return index;
-            return sheet_index_named(slot.sheetName, names);
+            const named = sheet_index_named(slot.sheetName, names);
+            if (named !== undefined) return named;
+            // Parked: skipped, and remembered, so the fall-through below can tell
+            // "every slot is parked" from "there are no slots".
+            parked = true;
         }
+        // Slots exist but none names a live worksheet. Sheet 0 would be the answer
+        // for an empty leaf, and it is exactly the wrong one here — that is the
+        // adoption-by-position this function refuses.
+        if (parked) return undefined;
         // An all-holes array names no sheet at all; sheet 0 is the answer the
         // caller had before any of this was worksheet-scoped.
         return 0;
