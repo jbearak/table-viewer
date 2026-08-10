@@ -231,11 +231,10 @@ export function state_recovery_wording(kind: StateRecoveryKind): StateRecoveryWo
             // not borrow the `corrupt` story either.
             return {
                 message: 'This copy of Table Viewer cannot use the saved view settings it found.',
-                detail: 'They belong to a different Table Viewer product or to a newer version'
-                    + ' of the app, so this version has no safe way to read or write them. They'
-                    + ' are not damaged. Installing the newer version, or pointing this one at'
-                    + ' its own location, is the fix; setting these aside would leave the other'
-                    + ' product without them.',
+                detail: 'The saved settings use a format this version of Table Viewer does not'
+                    + ' recognize, so it has no safe way to read or write them. They are not'
+                    + ' damaged. Updating Table Viewer may restore access; setting these aside'
+                    + ' could keep the version that created them from finding them.',
             };
         case 'unsupported-platform':
             // Neither corruption nor ownership: the durability primitive this
@@ -558,9 +557,9 @@ const PLATFORM_DURABILITY_OPERATION = 'platform-durability-unsupported';
  * - `schema` is thrown both for a database whose *contents* are not this build's
  *   — the honest ownership story — and, via `raw-header`, for a file whose first
  *   bytes are not a SQLite header at all. The latter is not a database, so the
- *   `compatibility` prose is false in every clause: it says the settings belong to
- *   another product or a newer version, that "they are not damaged", and that
- *   setting them aside would leave the other product without them — which
+ *   `compatibility` prose is false in every clause: it says the settings use an
+ *   unrecognized format, that "they are not damaged", and that another version
+ *   may need to find them — which
  *   actively discourages the only action that recovers. It got `corrupt` because
  *   for a file with no header `corrupt` is the honest word. (The story used to
  *   flip on file length: shredding a real database left the header intact past

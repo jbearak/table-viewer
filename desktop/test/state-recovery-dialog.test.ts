@@ -251,11 +251,11 @@ describe('state recovery classification', () => {
     it('tells a headerless file as damage, not as another product’s property', () => {
         // `read_sqlite_raw_header` throws `schema` for bad magic or a file too
         // short to hold a header, and `schema` defaults to `compatibility` —
-        // whose prose says the settings belong to a different product or a newer
-        // version, that "they are not damaged", and that setting them aside would
-        // leave the other product without them. For a garbage file every clause is
-        // false and the last discourages the only action that recovers. This is
-        // the mirror of the `io`-must-not-say-corruption rule.
+        // whose prose says the settings use an unrecognized format, that "they are
+        // not damaged", and that another version may need to find them. For a
+        // garbage file every clause is false and the last discourages the only
+        // action that recovers. This is the mirror of the
+        // `io`-must-not-say-corruption rule.
         const headerless = classify_state_recovery_failure({
             category: 'schema',
             operation: 'raw-header',
@@ -434,6 +434,14 @@ describe('state recovery wording', () => {
         // module simply never uses — and the denial-stripping above does not
         // silently defuse them.
         expect(damage_claims('corrupt')).toMatch(/damaged/i);
+    });
+
+    it('describes compatibility without speculating about another product', () => {
+        const prose = Object.values(state_recovery_wording('compatibility')).join(' ');
+
+        expect(prose).not.toMatch(/\bproducts?\b/i);
+        expect(prose).toMatch(/format this version of Table Viewer does not recognize/i);
+        expect(prose).toMatch(/Updating Table Viewer may restore access/i);
     });
 
     it('makes no ownership or damage claim for either unsupported kind', () => {

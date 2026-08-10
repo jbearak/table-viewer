@@ -1068,10 +1068,10 @@ describe('desktop state database', () => {
     it('calls a headerless main file damaged rather than another product’s', async () => {
         // `read_sqlite_raw_header` throws `schema` for bad magic, and `schema`
         // defaults to the `compatibility` story — whose every clause is false
-        // here: it says the settings belong to another product or a newer version,
-        // that they are "not damaged", and that setting them aside would leave the
-        // other product without them, which discourages the only action that
-        // recovers. The story even flipped on file length, since a longer
+        // here: it says the settings use an unrecognized format, that they are
+        // "not damaged", and that another version may need to find them, which
+        // discourages the only action that recovers. The story even flipped on
+        // file length, since a longer
         // truncation of a real database keeps its header and reaches SQLite, which
         // reports `corrupt` correctly.
         seed_database_file('file-state.sqlite3', Buffer.alloc(50, 0x41));
