@@ -34,17 +34,28 @@ async function flush_promises(): Promise<void> {
     for (let index = 0; index < 100; index += 1) await Promise.resolve();
 }
 
-function open_xlsx(file_path: string) {
+function open_xlsx(
+    file_path: string,
+    state = versioned_state_store({}),
+) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         uri(file_path),
-        with_in_memory_authority_transactions(versioned_state_store({}).store),
+        with_in_memory_authority_transactions(state.store),
         profile_for(file_path),
         fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;
+}
+
+async function wait_for_observable(predicate: () => boolean): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (predicate()) return;
+        await new Promise((done) => { setImmediate(done); });
+    }
+    throw new Error('Observable result did not arrive.');
 }
 
 function latest_snapshot(panel: { __messages: unknown[] }) {
@@ -53,13 +64,19 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
         && candidate !== null
         && (candidate as { type?: unknown }).type === 'workbookSnapshot'
     )) as { snapshot: { identity: unknown } };
-    return message.snapshot;
+    return message.snapshot as unknown as {
+        identity: unknown;
+        capabilities: { csvEditSessionId?: string; csvEditSheetIndex?: number };
+    };
 }
 
 /** Open, and acknowledge the first snapshot: a save refuses until the webview
  *  has confirmed it is looking at the bytes the save will be validated against. */
-async function open_ready_xlsx(file_path: string) {
-    const panel = open_xlsx(file_path);
+async function open_ready_xlsx(
+    file_path: string,
+    state?: ReturnType<typeof versioned_state_store>,
+) {
+    const panel = open_xlsx(file_path, state);
     await panel.__receive({ type: 'ready' });
     // The source build is async, so the first snapshot lands a few turns after
     // `ready` resolves.
@@ -74,7 +91,12 @@ async function open_ready_xlsx(file_path: string) {
 
 function latest_edit_session(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
-        (message): message is { type: string; granted: boolean; editSessionId?: string } => (
+        (message): message is {
+            type: string;
+            granted: boolean;
+            editSessionId?: string;
+            sheetIndex?: number;
+        } => (
             typeof message === 'object'
             && message !== null
             && (message as { type?: unknown }).type === 'editSessionResult'
@@ -175,6 +197,55 @@ describe('xlsx edit sessions', () => {
             rejection: { reason: 'baseMismatch' },
         });
         expect(bytes).toBe(untouched);
+    });
+
+    it('keeps another worksheet\u2019s unsaved draft through a save', async () => {
+        // A draft on sheet 0 that outlived its session \u2014 the shape a closed panel
+        // or a previous window leaves behind. Saving sheet 1 must not touch it: the
+        // single-sheet code dropped the whole leaf, which is exactly this bug.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'People', cells: { '1:0': { value: 'Draft', base: 'Ada' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+
+        // Opening the file rehydrates the draft's session on sheet 0, so sheet 1 is
+        // refused until it is released \u2014 a session cannot move worksheets.
+        await panel.__receive({ type: 'requestEditSession', requestId: 'a', sheetIndex: 1 });
+        expect(latest_edit_session(panel)).toMatchObject({
+            granted: false,
+            sheetIndex: 0,
+        });
+        // The rehydrated session's id reaches the webview through the snapshot,
+        // which is also how the real webview learns it holds one it never asked for.
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await flush_promises();
+
+        await panel.__receive({ type: 'requestEditSession', requestId: 'b', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!;
+        expect(session.granted).toBe(true);
+        expect(session.sheetIndex).toBe(1);
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session.editSessionId!,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        await flush_promises();
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(state.get_state(file_path).pendingEdits?.[1]).toBeUndefined();
+        expect(state.get_state(file_path).pendingEdits?.[0]?.cells)
+            .toEqual({ '1:0': { value: 'Draft', base: 'Ada' } });
     });
 
     it('preserves the styles part byte-for-byte across a save', async () => {

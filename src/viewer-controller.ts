@@ -213,8 +213,12 @@ type CsvEditFilePhase =
     | { type: 'claiming'; claim: symbol; token: symbol }
     | { type: 'owned'; token: symbol }
     | { type: 'releasing'; release: symbol; token: symbol }
-    | { type: 'cleanupPending'; operation: symbol }
-    | { type: 'uncertain'; operation: symbol };
+    // `sheetIndex` is the worksheet whose edits the clear is removing. Editing is
+    // worksheet-scoped, so a clear is too: the other sheets' slots are unrelated
+    // drafts, and a recovery that runs long after the session ended has no other
+    // way left to learn which sheet it was for.
+    | { type: 'cleanupPending'; operation: symbol; sheetIndex: number }
+    | { type: 'uncertain'; operation: symbol; sheetIndex: number };
 
 type CsvEditStateSubscriber = (snapshot?: Readonly<FileStateSnapshot>) => void;
 
@@ -1714,10 +1718,12 @@ export function attach_viewer(
         ) return undefined;
         if (save_operation === undefined && active_save_operation) return undefined;
         const operation = Symbol(file_key);
+        // Read before the reset below: the clear is scoped to this sheet.
+        const sheet_index = save_operation?.identity.sheetIndex ?? active_edit_sheet_index ?? 0;
         active_save_operation = undefined;
         active_edit_session_id = undefined;
         active_edit_sheet_index = undefined;
-        file_edit_state.phase = { type: 'cleanupPending', operation };
+        file_edit_state.phase = { type: 'cleanupPending', operation, sheetIndex: sheet_index };
         recapture_edit_capabilities();
         return operation;
     }
@@ -1735,7 +1741,7 @@ export function attach_viewer(
         ) return;
         file_edit_state.phase = success
             ? { type: 'free' }
-            : { type: 'uncertain', operation };
+            : { type: 'uncertain', operation, sheetIndex: phase.sheetIndex };
         if (success && cleared_snapshot !== undefined) {
             observe_durable_state(cleared_snapshot);
             file_edit_state.clearedStateRevision = Math.max(
@@ -3176,9 +3182,17 @@ export function attach_viewer(
     // CSV pending-edit persistence deliberately remains on FileStateStore's CAS
     // queue in this phase. Edit-session ownership is separate from file authority;
     // physical/projection/layout writes use the coordinator serialization above.
-    async function clear_pending_edits(): Promise<FileStateSnapshot> {
+    async function clear_pending_edits(sheet_index: number): Promise<FileStateSnapshot> {
         const committed = await update_file_state((current) => {
             if (!current.pendingEdits) return current;
+            // One sheet's slot, not the leaf: a save or discard on this worksheet
+            // must leave another worksheet's unsaved draft exactly where it is.
+            const next = with_pending_edits_for_sheet(
+                current.pendingEdits,
+                sheet_index,
+                undefined,
+            );
+            if (next) return { ...current, pendingEdits: next };
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
         }, undefined, undefined, null);
@@ -3195,7 +3209,7 @@ export function attach_viewer(
             const operation = phase.operation;
             const recovery = (async () => {
                 try {
-                    const snapshot = await clear_pending_edits();
+                    const snapshot = await clear_pending_edits(phase.sheetIndex);
                     // Recovery only restores file availability. A live request waiter
                     // must subsequently win the ordinary free -> owned transition.
                     finish_edit_cleanup(operation, true, snapshot);
@@ -4010,10 +4024,12 @@ export function attach_viewer(
             cleanup_operation = Symbol(file_key);
             active_save_operation = undefined;
             active_edit_session_id = undefined;
+            active_edit_sheet_index = undefined;
             if (file_edit_state) {
                 file_edit_state.phase = {
                     type: 'cleanupPending',
                     operation: cleanup_operation,
+                    sheetIndex: identity.sheetIndex,
                 };
             }
             console.error('CSV save lost edit ownership after writeFile');
@@ -4043,7 +4059,7 @@ export function attach_viewer(
             );
         });
 
-        void clear_pending_edits().then((snapshot) => {
+        void clear_pending_edits(identity.sheetIndex).then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
@@ -4835,7 +4851,20 @@ export function attach_viewer(
                 const owner_still_available = already_owned
                     ? phase.type === 'owned' && phase.token === edit_session_token
                     : phase.type === 'claiming' && phase.claim === claim;
+                // A session belongs to one worksheet and cannot be moved to another:
+                // its pending edits, its save operation and its conflict bases are
+                // all in that sheet's key space. So a request naming a different
+                // sheet is refused rather than answered with the sheet it is not
+                // about. This is reachable without a UI bug — a panel rehydrates a
+                // durable draft's session without asking, and the user then tries to
+                // edit a different worksheet.
+                const denied_by_sheet = already_owned
+                    && active_edit_sheet_index !== undefined
+                    && active_edit_sheet_index !== requested_sheet_index;
+                const granted_sheet_index = active_edit_sheet_index
+                    ?? requested_sheet_index;
                 const granted = can_edit
+                    && !denied_by_sheet
                     && owner_still_available
                     && try_claim_edit_session(true, claim, requested_sheet_index);
                 if (!granted) cancel_edit_claim(claim);
@@ -4859,7 +4888,7 @@ export function attach_viewer(
                     ? pending_edits_for_current_session(
                         pending_edits_for_sheet(
                             (edit_state?.state as PerFileState | undefined)?.pendingEdits,
-                            requested_sheet_index,
+                            granted_sheet_index,
                         ),
                     )
                     : undefined;
@@ -4869,7 +4898,10 @@ export function attach_viewer(
                     type: 'editSessionResult',
                     requestId: request.requestId,
                     granted,
-                    sheetIndex: requested_sheet_index,
+                    // The sheet the *session* is on, not the one asked about: a
+                    // refusal names the worksheet whose session is in the way, which
+                    // is what the webview needs to keep its own scoping honest.
+                    sheetIndex: granted_sheet_index,
                     ...(granted && active_edit_session_id
                         ? { editSessionId: active_edit_session_id }
                         : {}),
@@ -5316,11 +5348,12 @@ export function attach_viewer(
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
                     active_save_dialog_request = undefined;
+                    const discarded_sheet_index = active_edit_sheet_index ?? 0;
                     const operation = begin_edit_cleanup(msg.editSessionId);
                     if (!operation) return;
                     notify_edit_state();
                     try {
-                        const snapshot = await clear_pending_edits();
+                        const snapshot = await clear_pending_edits(discarded_sheet_index);
                         finish_edit_cleanup(operation, true, snapshot);
                         if (!disposed) update_session_state_material(snapshot, false);
                     } catch (error) {

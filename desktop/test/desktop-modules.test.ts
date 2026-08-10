@@ -13,6 +13,7 @@ import {
 } from '../main/desktop-config';
 import { clamp_zoom_level } from '../main/zoom';
 import { dirty_from_host_message, dirty_from_webview_message } from '../main/dirty-state';
+import { sheet_edits } from '../../src/test/pending-edits-helper';
 import {
     CASCADE_STEP,
     DEFAULT_WINDOW_HEIGHT,
@@ -317,9 +318,14 @@ describe('zoom', () => {
 });
 
 describe('unsaved-edit indicator', () => {
-    const snapshot = (pendingEdits?: Record<string, string>) => ({
+    const snapshot = (
+        cells?: Record<string, string>,
+        sheet_index = 0,
+    ) => ({
         type: 'workbookSnapshot' as const,
-        snapshot: { state: pendingEdits ? { pendingEdits } : {} },
+        snapshot: {
+            state: cells ? { pendingEdits: sheet_edits(cells, sheet_index) } : {},
+        },
     } as unknown as HostMessage);
 
     it('reads a live draft, and its clearing, from the webview', () => {
@@ -362,6 +368,10 @@ describe('unsaved-edit indicator', () => {
         })).toBe(false);
         expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }))).toBe(true);
         expect(dirty_from_host_message(snapshot())).toBe(false);
+        // Any worksheet's draft marks the window. The leaf keeps cleared sheets as
+        // holes, so reading only sheet 0 — or the array's length — would miss this.
+        expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }, 2))).toBe(true);
+        expect(dirty_from_host_message(snapshot({}, 2))).toBe(false);
     });
 
     // undefined means "no information": the indicator must not flip on messages
