@@ -419,7 +419,7 @@ describe('CSV reload races', () => {
         let deleted = false;
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => {
-            if (deleted) throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+            if (deleted) throw Object.assign(new Error('not found'), { code: 'FileNotFound' });
             return { size: bytes.byteLength, mtime: 1 };
         });
         vscode_mock.__setReadFileImplementation(async () => bytes);
@@ -435,6 +435,9 @@ describe('CSV reload races', () => {
 
         expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(error_spy).toHaveBeenCalledTimes(1);
+        expect(error_spy).toHaveBeenCalledWith(
+            'The file was deleted or moved, so Table Viewer could not reload it.',
+        );
 
         deleted = false;
         bytes = enc.encode('h\na\nb\n');
