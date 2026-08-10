@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import type { ExtensionContext } from 'vscode';
-import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
+import { attach_viewer, csv_table_profile, plan_csv_save, type ViewerProfile } from '../viewer-controller';
 import {
     create_authority_store,
     type DurableFileAuthority,
@@ -1704,6 +1704,7 @@ describe('CSV edit sessions', () => {
         const source = new RestoredEditSource(['current']);
         const panel = open_csv_table(uri('/tmp/rehydrated-mismatch.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => source,
         });
         panel.__autoAckSnapshots = false;
@@ -1743,6 +1744,7 @@ describe('CSV edit sessions', () => {
         const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-removed.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => new RestoredEditSource(['only row']),
         });
 
@@ -1762,6 +1764,7 @@ describe('CSV edit sessions', () => {
         const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-valid.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => new RestoredEditSource(['current']),
         });
 
@@ -1782,7 +1785,7 @@ describe('CSV edit sessions', () => {
         const panel = open_csv_table(
             uri('/tmp/rehydrated-sparse.csv'),
             state_store({ pendingEdits: sheet_edits(pendingEdits) }).store,
-            { editing: true, build_source: async () => source },
+            { editing: true, plan_save: plan_csv_save, build_source: async () => source },
         );
 
         await panel.__receive({ type: 'ready' });
@@ -1812,7 +1815,7 @@ describe('CSV edit sessions', () => {
         const panel = open_csv_table(
             uri('/tmp/rehydrated-contiguous.csv'),
             state_store({ pendingEdits: sheet_edits(pendingEdits) }).store,
-            { editing: true, build_source: async () => source },
+            { editing: true, plan_save: plan_csv_save, build_source: async () => source },
         );
 
         await panel.__receive({ type: 'ready' });
@@ -1829,6 +1832,7 @@ describe('CSV edit sessions', () => {
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
         const panel = open_csv_table(uri('/tmp/rehydrated-read-failure.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => new RestoredEditSource(['current'], true),
         });
 
@@ -1849,6 +1853,7 @@ describe('CSV edit sessions', () => {
         const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-disposed.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => new RestoredEditSource(['current']),
         });
         panel.__autoAckSnapshots = false;
@@ -3032,6 +3037,7 @@ describe('CSV edit sessions', () => {
         };
         const profile: ViewerProfile = {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw, path) {
                 builds += 1;
                 if (builds > 1) return new Promise<DataSource>(() => {});
@@ -8357,6 +8363,7 @@ describe('CSV edit sessions', () => {
         const state = state_store();
         const panel = open_csv_table(uri('/tmp/truncated.csv'), state.store, {
             editing: true,
+            plan_save: plan_csv_save,
             build_source: async () => new StubSource('Showing 1 of 2 rows'),
         });
 

@@ -9,6 +9,10 @@ import type {
     WorkbookMeta,
 } from './data-source/interface';
 import {
+    projected_row_for_source,
+    read_source_rows_indexed,
+} from './data-source/interface';
+import {
     InvalidPersistedTransformError,
     TransformAdmissionLapsedError,
     ViewerPanelCore,
@@ -28,6 +32,8 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
+import { write_xlsx_cell_edits } from './xlsx-package';
+import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
 import type {
     AuthorityFileStateStore,
@@ -69,6 +75,7 @@ import {
     type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type CsvSaveOperationRequest,
     type CsvSaveRejection,
     type HostMessage,
     type PerFileState,
@@ -107,6 +114,38 @@ import {
 
 const SAVE_WINDOW = 10_000;
 
+/**
+ * What a profile needs to turn one worksheet's edits into bytes.
+ *
+ * `wanted_bases` names the cells whose pre-edit raw text the save must observe,
+ * as `row:col` source keys. CSV harvests them from the serialization walk it
+ * already makes, so the two jobs are one interface rather than two traversals
+ * of a million-row file.
+ */
+export interface SavePlanInput {
+    readonly source: DataSource;
+    readonly sheet_index: number;
+    readonly file_path: string;
+    /** Source-keyed `row:col` → new text, exactly the cells the user changed. */
+    readonly edits: Readonly<Record<string, string>>;
+    readonly wanted_bases: ReadonlySet<string>;
+}
+
+export interface SavePlan {
+    /** Observed pre-edit raw text, `row:col` → text, for the wanted keys that
+     *  exist. A missing key reads as "" downstream, matching a blank cell. */
+    readonly observed_bases: ReadonlyMap<string, string>;
+    /**
+     * The bytes to write, given the file's current bytes.
+     *
+     * `raw` is what the caller just read and verified against the acknowledged
+     * digest. CSV ignores it — it re-serializes the whole file from the source.
+     * xlsx splices into it, which is what makes the save `putexcel`-shaped:
+     * every part it does not touch is copied through byte-for-byte.
+     */
+    produce(raw: Uint8Array): Uint8Array;
+}
+
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
  *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
  *  satisfy it; html is set by the host before attaching. */
@@ -135,15 +174,13 @@ export interface ViewerController extends Disposable {
     drain(): Promise<void>;
 }
 
-export interface ViewerProfile {
+interface ViewerProfileBase {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
         raw: Uint8Array,
         file_path: string,
         state: PerFileState,
     ): Promise<DataSource>;
-    /** Enables csvEditingSupported + saveCsv/pendingEdits/showSaveDialog handling. */
-    readonly editing: boolean;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -152,6 +189,24 @@ export interface ViewerProfile {
      *  Return true if handled. */
     on_message?(msg: WebviewMessage): boolean | Promise<boolean>;
 }
+
+/**
+ * A viewer profile, discriminated on whether it can edit.
+ *
+ * `editing` gates csvEditingSupported and the saveCsv/pendingEdits/showSaveDialog
+ * handling; `plan_save` is what a save actually calls. They live on the same arm
+ * of the union so a profile cannot claim the first without supplying the second —
+ * the alternative is a runtime "this file type cannot be saved" error thrown from
+ * inside a save the user has already confirmed.
+ */
+export type ViewerProfile = ViewerProfileBase & (
+    | { readonly editing: false; readonly plan_save?: undefined }
+    | {
+        readonly editing: true;
+        /** Harvest conflict bases now; produce the bytes to write at write time. */
+        plan_save(input: SavePlanInput): SavePlan;
+    }
+);
 
 type CsvEditFilePhase =
     | { type: 'free' }
@@ -340,9 +395,68 @@ function excel_hidden_rows_for_source(
     });
 }
 
-function excel_profile(): ViewerProfile {
+/**
+ * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
+ * the package alone.
+ *
+ * Edit keys are canonical *source* rows of the worksheet, which for xlsx are its
+ * physical rows — the same space `xl/worksheets/sheetN.xml` numbers, offset by
+ * one. A promoted header row shifts only the *projected* space the grid shows,
+ * so it never reaches these keys; it does have to be undone to read a base back
+ * out, which is what `projected_row_for_source` is for.
+ */
+function plan_xlsx_save(input: SavePlanInput): SavePlan {
+    const { source: src, sheet_index, edits, wanted_bases } = input;
+
+    // Only the wanted rows are read, not the whole sheet: unlike CSV there is no
+    // serialization walk to ride along with, and an edit touches a handful of
+    // rows out of a million.
+    const observed_bases = new Map<string, string>();
+    const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    for (const key of wanted_bases) {
+        const [source_row, col] = key.split(':').map(Number);
+        if (!Number.isInteger(source_row) || !Number.isInteger(col)) continue;
+        const projected = projected_row_for_source(src, sheet_index, source_row);
+        // Out of range, or hidden by the header projection: left unobserved, so
+        // base validation sees `undefined` and rejects the save rather than
+        // writing against a base nobody checked.
+        if (projected === undefined) continue;
+        const entry = by_projected_row.get(projected);
+        if (entry) entry.cols.push(col);
+        else by_projected_row.set(projected, { source_row, cols: [col] });
+    }
+    const projected_rows = [...by_projected_row.keys()].sort((a, b) => a - b);
+    for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
+        const batch = projected_rows.slice(start, start + SAVE_WINDOW);
+        const { rows } = read_source_rows_indexed(src, sheet_index, batch);
+        batch.forEach((projected, offset) => {
+            const entry = by_projected_row.get(projected)!;
+            const row = rows[offset] ?? [];
+            for (const col of entry.cols) {
+                const cell = row[col];
+                if (cell === undefined) continue;
+                observed_bases.set(
+                    `${entry.source_row}:${col}`,
+                    cell === null ? '' : String(cell.raw ?? ''),
+                );
+            }
+        });
+    }
+
+    const cell_edits: XlsxCellEdit[] = [];
+    for (const [key, value] of Object.entries(edits)) {
+        const [row, col] = key.split(':').map(Number);
+        if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
+        cell_edits.push({ row, col, value });
+    }
     return {
-        editing: false,
+        observed_bases,
+        produce: (raw) => write_xlsx_cell_edits(raw, sheet_index, cell_edits),
+    };
+}
+
+function excel_profile(file_path: string): ViewerProfile {
+    const base: ViewerProfileBase = {
         async build_source(raw, file_path, state) {
             const physical = file_path.toLowerCase().endsWith('.xlsx')
                 ? await XlsxDataSource.create(raw)
@@ -355,6 +469,11 @@ function excel_profile(): ViewerProfile {
             );
         },
     };
+    // .xls is out of scope for editing: the writer above is an OOXML package
+    // splice, and the binary BIFF container shares nothing with it.
+    return file_path.toLowerCase().endsWith('.xlsx')
+        ? { ...base, editing: true, plan_save: plan_xlsx_save }
+        : { ...base, editing: false };
 }
 
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
@@ -377,9 +496,75 @@ export function build_csv_source(
     });
 }
 
+/**
+ * Harvest conflict bases and re-serialize the whole file, in one traversal.
+ *
+ * The walk visits every row (a million is a real case), so the base harvest
+ * rides along with the serialization rather than making a second pass.
+ */
+export function plan_csv_save(input: SavePlanInput): SavePlan {
+    const { source: src, edits, wanted_bases } = input;
+    const observed_bases = new Map<string, string>();
+    const wanted_columns = new Map<number, number[]>();
+    for (const key of wanted_bases) {
+        const [source_row, col] = key.split(':').map(Number);
+        const columns = wanted_columns.get(source_row);
+        if (columns) columns.push(col);
+        else wanted_columns.set(source_row, [col]);
+    }
+    const wants_bases = wanted_columns.size > 0;
+
+    const row_count = src.meta().sheets[0].rowCount;
+    function* row_windows(): Generator<(RenderedCell | null)[]> {
+        let absolute_row = 0;
+        for (let start = 0; start < row_count; start += SAVE_WINDOW) {
+            const { rows } = src.read_rows(0, start, SAVE_WINDOW);
+            for (const row of rows) {
+                // `wants_bases` short-circuits the per-row Map probe. The walk
+                // visits every row of the file but the map is empty whenever
+                // there is nothing to harvest, so without this a save with no
+                // dirty edits pays a million lookups for no possible hit.
+                const columns = wants_bases
+                    ? wanted_columns.get(absolute_row)
+                    : undefined;
+                if (columns) {
+                    for (const col of columns) {
+                        // A column past this row's field count is left
+                        // unrecorded, so the reader reports `undefined` and
+                        // validate_dirty_bases coalesces it to '' — matching the
+                        // webview's get_cell_raw, where a loaded blank cell is ''.
+                        const cell = row[col];
+                        if (cell === undefined) continue;
+                        observed_bases.set(
+                            `${absolute_row}:${col}`,
+                            cell === null ? '' : String(cell.raw ?? ''),
+                        );
+                    }
+                }
+                absolute_row++;
+                yield row;
+            }
+        }
+    }
+    // Serialized eagerly, not inside `produce`: the harvest is a side effect of
+    // this walk, and the caller reads `observed_bases` to decide whether the
+    // save may proceed at all.
+    const content = serialize_csv(
+        row_windows(),
+        get_delimiter(input.file_path),
+        edits,
+        src.originalColumnCounts,
+        src.lineEnding,
+        src.headerLine,
+    );
+    const bytes = new TextEncoder().encode(content);
+    return { observed_bases, produce: () => bytes };
+}
+
 export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
+        plan_save: plan_csv_save,
         build_source: (raw, file_path) =>
             build_csv_source(raw, file_path, config?.csv_max_rows()),
     };
@@ -390,7 +575,7 @@ export function profile_for(file_path: string, config?: ConfigPort): ViewerProfi
     const ext = file_path.toLowerCase();
     return ext.endsWith('.csv') || ext.endsWith('.tsv')
         ? csv_table_profile(config)
-        : excel_profile();
+        : excel_profile(file_path);
 }
 
 /**
@@ -1790,6 +1975,7 @@ export function attach_viewer(
     function validate_restored_pending_edits(
         src: DataSource,
         pending_edits: SheetPendingEditCells,
+        sheet_index: number,
     ): { dirtyEdits: CsvDirtyMap; rejection: CsvSaveRejection } | undefined {
         const dirty_edits: CsvDirtyMap = Object.fromEntries(
             Object.entries(pending_edits).filter((entry): entry is [string, {
@@ -1799,7 +1985,7 @@ export function attach_viewer(
         );
         if (Object.keys(dirty_edits).length === 0) return undefined;
 
-        const source_row_count = src.meta().sheets[0].sourceRowCount;
+        const source_row_count = src.meta().sheets[sheet_index]?.sourceRowCount ?? 0;
         const wanted_columns = new Map<number, number[]>();
         for (const key of Object.keys(dirty_edits)) {
             const [source_row, col] = key.split(':').map(Number);
@@ -1826,7 +2012,7 @@ export function attach_viewer(
             }
             for (let start = run_start; start <= end; start += SAVE_WINDOW) {
                 const count = Math.min(SAVE_WINDOW, end - start + 1);
-                const window = src.read_rows(0, start, count);
+                const window = src.read_rows(sheet_index, start, count);
                 for (const [offset, row] of window.rows.entries()) {
                     const source_row = window.startRow + offset;
                     for (const col of wanted_columns.get(source_row) ?? []) {
@@ -2726,6 +2912,7 @@ export function attach_viewer(
                             const validation = validate_restored_pending_edits(
                                 next,
                                 restored_pending_edits,
+                                restored_sheet_index,
                             );
                             if (validation) {
                                 const operation = clone_save_operation({
@@ -3463,7 +3650,7 @@ export function attach_viewer(
         });
     }
 
-    function clone_save_operation(input: CsvSaveOperation): CsvSaveOperation {
+    function clone_save_operation(input: CsvSaveOperationRequest): CsvSaveOperation {
         const dirty_edits = Object.fromEntries(
             Object.entries(input.dirtyEdits).map(([key, entry]) => [
                 key,
@@ -3472,7 +3659,10 @@ export function attach_viewer(
         );
         return Object.freeze({
             editSessionId: input.editSessionId,
-            sheetIndex: input.sheetIndex,
+            // Normalized here, at the boundary where a wire message becomes an
+            // identity: everything downstream compares whole operations, so the
+            // field must be settled before any of them sees one.
+            sheetIndex: input.sheetIndex ?? 0,
             saveRequestId: input.saveRequestId,
             edits: Object.freeze({ ...input.edits }),
             dirtyEdits: Object.freeze(dirty_edits),
@@ -3511,7 +3701,7 @@ export function attach_viewer(
         notify_edit_state(committed);
     }
 
-    async function handle_save(input: CsvSaveOperation): Promise<void> {
+    async function handle_save(input: CsvSaveOperationRequest): Promise<void> {
         const receiver_epoch = session.current_receiver_epoch;
         const identity = clone_save_operation(input);
         if (active_save_operation) return;
@@ -3564,64 +3754,18 @@ export function attach_viewer(
             return;
         }
 
-        // Raw text of exactly the cells the dirty map names, harvested from the
-        // serialization walk below so the source is traversed once. Keys are
-        // source-keyed, like the dirty map itself.
-        const observed_bases = new Map<string, string>();
-        const wanted_columns = new Map<number, number[]>();
-        for (const key of Object.keys(identity.dirtyEdits)) {
-            const [source_row, col] = key.split(':').map(Number);
-            const columns = wanted_columns.get(source_row);
-            if (columns) columns.push(col);
-            else wanted_columns.set(source_row, [col]);
-        }
-
-        const wants_bases = wanted_columns.size > 0;
-
-        let content: string;
+        let plan: SavePlan;
         try {
-            const row_count = src.meta().sheets[0].rowCount;
-            function* row_windows(): Generator<(RenderedCell | null)[]> {
-                let absolute_row = 0;
-                for (let start = 0; start < row_count; start += SAVE_WINDOW) {
-                    const { rows } = src!.read_rows(0, start, SAVE_WINDOW);
-                    for (const row of rows) {
-                        // `wants_bases` short-circuits the per-row Map probe. The
-                        // walk visits every row of the file (1M+ is a real case) but
-                        // the map is empty whenever there is nothing to harvest, so
-                        // without this a save with no dirty edits pays a million
-                        // lookups on an empty Map for no possible hit.
-                        const columns = wants_bases
-                            ? wanted_columns.get(absolute_row)
-                            : undefined;
-                        if (columns) {
-                            for (const col of columns) {
-                                // A column past this row's field count is left
-                                // unrecorded, so the reader below reports
-                                // `undefined` and validate_dirty_bases coalesces it
-                                // to '' — matching the webview's get_cell_raw,
-                                // where a loaded blank cell is ''.
-                                const cell = row[col];
-                                if (cell === undefined) continue;
-                                observed_bases.set(
-                                    `${absolute_row}:${col}`,
-                                    cell === null ? '' : String(cell.raw ?? ''),
-                                );
-                            }
-                        }
-                        absolute_row++;
-                        yield row;
-                    }
-                }
+            if (!profile.plan_save) {
+                throw new Error('This file type cannot be saved.');
             }
-            content = serialize_csv(
-                row_windows(),
-                get_delimiter(file_path),
-                identity.edits,
-                src.originalColumnCounts,
-                src.lineEnding,
-                src.headerLine,
-            );
+            plan = profile.plan_save({
+                source: src,
+                sheet_index: identity.sheetIndex,
+                file_path,
+                edits: identity.edits,
+                wanted_bases: new Set(Object.keys(identity.dirtyEdits)),
+            });
         } catch (error) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
@@ -3647,8 +3791,8 @@ export function attach_viewer(
         // evicted, or shrunk-away row is never flagged there.
         const validation = validate_dirty_bases(
             identity.dirtyEdits,
-            src.meta().sheets[0].sourceRowCount,
-            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
+            src.meta().sheets[identity.sheetIndex].sourceRowCount,
+            (source_row, col) => plan.observed_bases.get(`${source_row}:${col}`),
         );
         if (validation.type !== 'valid') {
             // Same shape as the sibling early-returns above: a begin/finish pair so
@@ -3687,8 +3831,11 @@ export function attach_viewer(
             lifecycle: active_lifecycle,
         }, receiver_epoch);
 
-        const saved_bytes = new TextEncoder().encode(content);
-        const saved_digest = content_digest(saved_bytes);
+        // Produced below, once the bytes on disk have been verified against the
+        // acknowledged digest: an xlsx save splices into exactly those bytes, so
+        // it cannot be built before we know which bytes they are.
+        let saved_bytes: Uint8Array;
+        let saved_digest: string;
         let post_save_reservation: { cancel(): void } | undefined;
         try {
             await pending_edit_writes.catch(() => {});
@@ -3731,6 +3878,12 @@ export function attach_viewer(
                 await refuse_as_external_change();
                 return;
             }
+
+            // `current_raw` is now known to be the bytes this session parsed, so
+            // it is the correct base for a splice as well as for the comparison
+            // above. A CSV plan ignores it and re-serializes from the source.
+            saved_bytes = plan.produce(current_raw);
+            saved_digest = content_digest(saved_bytes);
 
             // Narrow (but do not close) the pre-check/pre-write TOCTOU.
             //

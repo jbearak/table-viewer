@@ -932,11 +932,20 @@ export interface CsvSaveRejection {
  */
 export interface CsvSaveOperation {
     readonly editSessionId: string;
+    /** Worksheet this save writes. Part of the operation's identity: a tombstone
+     *  or cleanup for one sheet must never touch another's slot. */
     readonly sheetIndex: number;
     readonly saveRequestId: string;
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
 }
+
+/** A save as the webview posts it. `sheetIndex` is optional on the wire for the
+ *  same reason it is on the edit-session messages: a single-sheet source has
+ *  only sheet 0 to name. The host normalizes it before the operation becomes an
+ *  identity anything is compared against. */
+export type CsvSaveOperationRequest =
+    Omit<CsvSaveOperation, 'sheetIndex'> & { readonly sheetIndex?: number };
 
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }
@@ -1058,7 +1067,7 @@ export type WebviewMessage =
     | { type: 'requestEditSession'; requestId: string; sheetIndex?: number }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
-    | { type: 'saveCsv'; operation: CsvSaveOperation }
+    | { type: 'saveCsv'; operation: CsvSaveOperationRequest }
     | { type: 'showSaveDialog'; editSessionId: string; requestId: string }
     | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number }
     /** Renderer close/reload barrier response; zero means no map was produced. */
