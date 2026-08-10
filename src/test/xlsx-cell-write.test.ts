@@ -444,6 +444,82 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<v>9</v>');
     });
 
+    it('inserts a new cell into a row whose end tag carries whitespace', () => {
+        // The insertion point was `end - '</row>'.length`, which is inside a
+        // `</row\n>` rather than before it: the new cell was spliced into the middle
+        // of the end tag, producing XML no reader accepts.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row\n>'),
+            [{ row: 0, col: 1, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row\n>');
+        expect(out).not.toContain('<<');
+    });
+
+    it('drops a spans hint an insertion would make stale', () => {
+        // `spans` caches the row's occupied column range. Excel recomputes it, but
+        // readers that trust it never see a cell outside the cached range — so a row
+        // left saying `1:1` while holding C1 hides the user's own edit.
+        const out = apply_cell_edits(
+            doc('<row r="1" spans="1:1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 2, value: '3' }],
+            OPTS,
+        );
+        expect(out).not.toContain('spans=');
+        expect(out).toContain('<c r="C1"><v>3</v></c>');
+    });
+
+    it('drops a stale spans hint on an empty row too', () => {
+        // The self-closing row takes the replacement path, which rebuilds the
+        // opening tag from its own attributes and would otherwise carry the stale
+        // hint straight through.
+        const out = apply_cell_edits(
+            doc('<row r="1" spans="1:1" ht="20"/>'),
+            [{ row: 0, col: 2, value: '3' }],
+            OPTS,
+        );
+        expect(out).not.toContain('spans=');
+        expect(out).toContain('ht="20"');
+        expect(out).toContain('<c r="C1"><v>3</v></c>');
+    });
+
+    it('keeps spans when no cell is inserted', () => {
+        // Replacing a cell in place cannot move the row's range, so the hint is
+        // still true and rewriting the tag would be churn in a file we promise to
+        // leave alone.
+        const out = apply_cell_edits(
+            doc('<row r="1" spans="1:1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('spans="1:1"');
+    });
+
+    it('does not refuse a prefixed namespace declaration', () => {
+        // Only a *default* declaration rebinds the unprefixed `<c>` this writer
+        // splices. `xmlns:vendor="…"` introduces a prefix for elements that opt into
+        // it and changes nothing about the cell — refusing on it rejected an
+        // ordinary worksheet outright.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c xmlns:vendor="urn:vendor" r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<v>2</v>');
+    });
+
+    it('still refuses a default namespace override', () => {
+        // The other half of the same guard: this one really does rebind the row and
+        // every unprefixed child, so a spliced `<c>` would land in a foreign
+        // namespace and the save would report success having written nothing.
+        expect(() => apply_cell_edits(
+            doc('<row r="1" xmlns="urn:other"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        )).toThrow(/different XML namespace/);
+    });
+
     it('does not count formula-shaped text in comments or CDATA', () => {
         // The count only exists to answer "did an edit drop a formula". Counting
         // quoted text made an edit *near* a comment look like a formula appearing
@@ -936,6 +1012,33 @@ describe('write_xlsx_cell_edits', () => {
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
             .toContain('<v>43844</v>');
+    });
+
+    it('resolves a relationship target containing a dot segment', () => {
+        // `./worksheets/sheet1.xml` names the same part as `worksheets/sheet1.xml`.
+        // Concatenated without resolving, it became `xl/./worksheets/sheet1.xml`,
+        // matched no entry, and the save failed outright on a file Excel opens fine.
+        const bytes = patched_parts([[
+            '/xl/_rels/workbook.xml.rels',
+            'Target="worksheets/sheet1.xml"',
+            'Target="./worksheets/sheet1.xml"',
+        ]]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '9' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('>9<');
+    });
+
+    it('reads a number-format condition whose bound is written +N', () => {
+        // `[>+50000]` is the same condition as `[>50000]`. Read as unconditional, the
+        // date section was picked for a value the cell displays with the fallback, so
+        // a typed date went in as a serial the user then sees as 45306.
+        const bytes = patched_parts([
+            ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="[>+50000]yyyy-mm-dd;0"'],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        // 45306 is below the bound, so the fallback `0` section applies — not a date
+        // format, so the date stays text rather than becoming a bare serial.
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('2024-01-15');
     });
 
     it('reads a formatCode written with single quotes', () => {

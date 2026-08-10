@@ -52,10 +52,7 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
         // raw compare. The lookup then missed, the entry was skipped as
         // unresolvable, and every later worksheet shifted down one — an edit
         // written to the wrong sheet.
-        worksheet_targets.set(
-            id,
-            target.startsWith('/') ? target.slice(1) : `xl/${target}`,
-        );
+        worksheet_targets.set(id, resolve_part_path(target));
     }
 
     const rel_ids: string[] = [];
@@ -70,6 +67,30 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
     }
     const rel_id = rel_ids[sheet_index];
     return rel_id ? worksheet_targets.get(rel_id) ?? null : null;
+}
+
+/**
+ * A relationship `Target` resolved to a package path, without a leading slash.
+ *
+ * `.` and `..` segments are legal in a relative URI reference and mean what they
+ * do anywhere else, so `./worksheets/sheet1.xml` names the same part as
+ * `worksheets/sheet1.xml`. Concatenating without resolving them produced
+ * `xl/./worksheets/sheet1.xml`, which matched no entry in the package: the save
+ * failed outright with "Could not read the worksheet to save" on a file that opens
+ * perfectly well in Excel.
+ */
+function resolve_part_path(target: string): string {
+    const absolute = target.startsWith('/');
+    const segments = (absolute ? target.slice(1) : `xl/${target}`).split('/');
+    const out: string[] = [];
+    for (const segment of segments) {
+        if (segment === '.' || segment === '') continue;
+        // A `..` that would climb above the package root has nowhere to go; dropping
+        // it keeps the path inside the package rather than inventing a parent.
+        if (segment === '..') { out.pop(); continue; }
+        out.push(segment);
+    }
+    return out.join('/');
 }
 
 function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
@@ -124,8 +145,14 @@ function format_sections(code: string): string[] {
  * bracket ahead of its condition (`[Red][>50000]yyyy-mm-dd`), and requiring the
  * condition to come first made those read as unconditional — which then took the
  * positive/negative/zero path and picked the wrong section entirely.
+ *
+ * The bound's sign may be written explicitly: `[>+50000]` is the same condition as
+ * `[>50000]`. Accepting only a leading `-` made the format read as unconditional
+ * for the same reason and with the same consequence — the date section was picked
+ * for a value the cell will not display as a date, so a typed date went in as a
+ * serial the user then sees as `45306`.
  */
-const CONDITION_RE = /^\s*(?:\[(?![<>=])[^\]]*\]\s*)*\[\s*(<=|>=|<>|<|>|=)\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
+const CONDITION_RE = /^\s*(?:\[(?![<>=])[^\]]*\]\s*)*\[\s*(<=|>=|<>|<|>|=)\s*([+-]?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
 
 function condition_holds(section: string, value: number): boolean | null {
     const m = CONDITION_RE.exec(section);
@@ -457,7 +484,7 @@ function remove_workbook_relationship(
     const stripped = remove_elements(xml, 'Relationship', (tag) => {
         const path = attr(tag, 'Target');
         if (path === null) return false;
-        const resolved = path.startsWith('/') ? path.slice(1) : `xl/${path}`;
+        const resolved = resolve_part_path(path);
         return resolved === wanted;
     });
     if (stripped !== xml) write_part_text(cfb_file, '/xl/_rels/workbook.xml.rels', stripped);

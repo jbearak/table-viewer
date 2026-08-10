@@ -230,6 +230,15 @@ interface Span {
     /** Offset just past the opening tag's `>`; equals `end` for self-closing elements. */
     readonly inner_start: number;
     readonly open_tag: string;
+    /**
+     * Where the element's content ends, i.e. the start of its end tag. Equals
+     * `end` for a self-closing element.
+     *
+     * Carried rather than derived: an end tag may legally be written `</row\n>`, so
+     * `end - '</row>'.length` is not where it starts. Computing it that way put an
+     * insertion *inside* the end tag and emitted malformed XML.
+     */
+    readonly inner_end: number;
 }
 
 /**
@@ -497,7 +506,7 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         const r = /\br="(\d+)"/.exec(open_tag);
         if (is_self_closing(xml, start, tag_end)) {
             // Nothing inside to infer a row number from, and nothing to edit either.
-            if (r) out.set(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, open_tag });
+            if (r) out.set(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;
             continue;
         }
@@ -514,7 +523,7 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
             ? Number(r[1]) - 1
             : row_index_from_first_cell(xml, tag_end + 1, close, ignorable);
         if (row_index !== undefined) {
-            out.set(row_index, { start, end: after_close, inner_start: tag_end + 1, open_tag });
+            out.set(row_index, { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag });
         }
         pos = after_close;
     }
@@ -538,14 +547,14 @@ function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
         const r = /\br="([A-Z]+)(\d+)"/.exec(open_tag);
         const col = r ? letter_to_index(r[1]) : null;
         if (is_self_closing(xml, start, tag_end)) {
-            if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, open_tag });
+            if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;
             continue;
         }
         const end_tag = end_tag_after(xml, 'c', tag_end, ignorable);
         if (end_tag === null) break;
-        const [, after_close] = end_tag;
-        if (col !== null) out.set(col, { start, end: after_close, inner_start: tag_end + 1, open_tag });
+        const [close, after_close] = end_tag;
+        if (col !== null) out.set(col, { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag });
         pos = after_close;
     }
     return out;
@@ -820,7 +829,13 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         // default-namespace override (`<row xmlns="urn:other">`) rebinds the row and
         // every unprefixed child. A `<c>` spliced in there inherits the foreign
         // namespace, so the save reports success and no worksheet cell is written.
-        if (/\sxmlns(?::[\w.-]+)?=/.test(attrs)) {
+        //
+        // Only the *default* declaration, because only it rebinds anything.
+        // `xmlns:vendor="…"` introduces a prefix for elements that opt into it and
+        // leaves the unprefixed `<c>` exactly where it was — refusing on that
+        // rejected an ordinary worksheet, and the prefixed elements themselves are
+        // already caught above.
+        if (/\sxmlns=/.test(attrs)) {
             unsupported('worksheet elements in a different XML namespace');
         }
     }
@@ -948,6 +963,14 @@ export function apply_cell_edits(
         // offset and `apply_splices` then keeps them in the order they arrived —
         // which is the caller's edit order, not the column order the schema wants.
         inserts.sort((a, b) => a.col - b.col);
+        // `spans` caches the row's occupied column range. It is an optimization hint
+        // that Excel recomputes, but a *stale* one is a lie about the row: an insert
+        // outside the cached range left `spans="1:1"` on a row now reaching C, and
+        // readers that trust it (ours does not; others do) never see the new cell.
+        // Dropped rather than recomputed — the correct value depends on cells this
+        // splice does not enumerate, and absent is a legal spelling that means
+        // "work it out", while wrong is not.
+        const drop_spans = inserts.length > 0 && / spans="[^"]*"/.test(row_span.open_tag);
         if (inserts.length > 0 && row_span.inner_start === row_span.end) {
             // `<row r="5" ht="20"/>` — a valid empty row, which is what a row given
             // a height or a format but no cells looks like. There is no `</row>` to
@@ -961,12 +984,26 @@ export function apply_cell_edits(
             splices.push({
                 start: row_span.start,
                 end: row_span.end,
-                text: `<row${attributes}>${inserts.map((i) => i.text).join('')}</row>`,
+                text: `<row${drop_spans ? attributes.replace(/ spans="[^"]*"/, '') : attributes}>`
+                    + `${inserts.map((i) => i.text).join('')}</row>`,
             });
             continue;
         }
+        // Rewritten as its own splice for a paired row, whose opening tag this loop
+        // otherwise leaves untouched.
+        if (drop_spans) {
+            splices.push({
+                start: row_span.start,
+                end: row_span.inner_start,
+                text: row_span.open_tag.replace(/ spans="[^"]*"/, ''),
+            });
+        }
         for (const ins of inserts) {
-            let at = row_span.end - '</row>'.length;
+            // The span's own content end, not `end - '</row>'.length`: an end tag may
+            // legally be written `</row\n>`, and the subtraction then landed *inside*
+            // it, splicing the new cell into the middle of the tag and emitting
+            // malformed XML.
+            let at = row_span.inner_end;
             let best: number | undefined;
             for (const [col, span] of cells) {
                 if (col > ins.col && (best === undefined || span.start < best)) best = span.start;
