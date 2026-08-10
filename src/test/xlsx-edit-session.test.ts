@@ -1184,6 +1184,33 @@ describe('xlsx edit sessions', () => {
         expect(durable, 'durable draft').toContain('Draft');
     });
 
+    it('does not adopt a parked draft into the worksheet at its stale index', async () => {
+        // A draft whose name the workbook no longer has is parked at its old index
+        // rather than deleted, because a rename and a deletion look the same from
+        // the tag alone. The index is therefore where the draft was *last* seen and
+        // says nothing about what sits there now — but rehydration took it anyway,
+        // opening a session on the unrelated worksheet at that position with the
+        // parked cells projected into it. With matching bases the save then wrote
+        // one worksheet's draft into another.
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                { sheetName: 'Ghost', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        // Sheet 1 is `Inventory`, and `Ghost` is nobody — so no session, and none
+        // of `Ghost`'s cells reach `Inventory`.
+        expect(sheet_names(panel)).toEqual(['People', 'Inventory']);
+        const snapshot = latest_snapshot(panel);
+        expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
+        expect(JSON.stringify(snapshot.state?.pendingEdits ?? null)).not.toContain('Draft');
+        // Declined, not discarded: the draft survives for the rename that brings
+        // its worksheet back.
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .toContain('Draft');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

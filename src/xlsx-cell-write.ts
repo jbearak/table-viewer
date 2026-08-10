@@ -790,6 +790,23 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('namespace-prefixed cell elements');
         }
     }
+    // Markup-compatibility branches. `<mc:AlternateContent>` holds several
+    // alternative spellings of the same content, of which a consumer picks *one*
+    // by whether it understands the `Requires` namespaces — so the same `<row
+    // r="1">` legitimately appears more than once with different values, and
+    // which one is real depends on the reader.
+    //
+    // The row and cell scans are flat maps keyed by coordinate, so the last
+    // branch simply overwrote the earlier ones: an edit landed in `mc:Fallback`
+    // alone and every application that understands the `mc:Choice` went on
+    // showing the old value, after a save that reported success. There is no
+    // position this writer can splice that is correct for all readers, so it
+    // declines instead. Any prefix, since `mc` is a convention and not a rule.
+    for (const m of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?AlternateContent\b/g)) {
+        if (m.index >= from && m.index < to && live(m.index)) {
+            unsupported('markup-compatibility alternate content');
+        }
+    }
     const tags: Array<[number, string]> = [];
     for (const name of ['row', 'c', 'f'] as const) {
         // Whole tags, quote-aware. Matching `[^>]*` cut every tag at the first `>`,

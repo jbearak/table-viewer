@@ -648,6 +648,37 @@ describe('apply_cell_edits', () => {
         }
     });
 
+    it('refuses markup-compatibility alternate content', () => {
+        // Both branches spell row 1 / A1, and which one a reader believes depends
+        // on whether it understands `Requires`. The scans are flat coordinate maps,
+        // so the last branch won: the edit landed in `mc:Fallback` alone, every
+        // application honouring the `mc:Choice` kept showing the old value, and the
+        // save reported success.
+        const inner = '<mc:AlternateContent'
+            + ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<mc:Choice Requires="x14">'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>choice</t></is></c></row></mc:Choice>'
+            + '<mc:Fallback>'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>fallback</t></is></c></row></mc:Fallback>'
+            + '</mc:AlternateContent>';
+        expect(() => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'edited' }], OPTS))
+            .toThrow(/cannot\s+edit\s+safely/i);
+        // The prefix is a convention, not a rule; an unprefixed default-namespace
+        // spelling is the same element and the same hazard.
+        const bare = '<AlternateContent><Choice Requires="x14">'
+            + '<row r="1"><c r="A1"><v>1</v></c></row></Choice>'
+            + '<Fallback><row r="1"><c r="A1"><v>2</v></c></row></Fallback></AlternateContent>';
+        expect(() => apply_cell_edits(doc(bare), [{ row: 0, col: 0, value: '3' }], OPTS))
+            .toThrow(/cannot\s+edit\s+safely/i);
+    });
+
+    it('does not refuse alternate content quoted inside a comment', () => {
+        const inner = '<row r="1"><c r="A1"><v>1</v></c></row>'
+            + '<!-- <mc:AlternateContent/> -->';
+        expect(apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: '2' }], OPTS))
+            .toContain('<c r="A1"><v>2</v></c>');
+    });
+
     it('does not refuse ordinary attributes it never reads', () => {
         // The guard is a subtraction — anything left after canonical `name="value"`
         // pairs are removed is unreadable — so it has to leave attributes the writer

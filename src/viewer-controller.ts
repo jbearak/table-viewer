@@ -1352,22 +1352,31 @@ export function attach_viewer(
      * `Inventory`'s cells, and saving it wrote them into `People` — the exact
      * cross-worksheet corruption the name tags exist to prevent.
      *
-     * A slot whose name still resolves is followed to where the name now is. One
-     * that resolves nowhere, and every untagged slot, keeps the positional answer:
-     * untagged slots are single-sheet CSV by construction, and a name the workbook
-     * does not have cannot be checked against anything.
+     * A slot whose name still resolves is followed to where the name now is. An
+     * untagged slot keeps the positional answer: those are single-sheet CSV by
+     * construction, and there is no name to check.
+     *
+     * A tagged slot whose name resolves *nowhere* adopts no worksheet at all —
+     * `undefined`, and the caller claims nothing. Reconciliation parks such a slot
+     * at its own index rather than deleting it (a rename and a deletion are
+     * indistinguishable from the tag alone), so the index is where the draft was
+     * *last* seen and says nothing about what sits there now. Taking it anyway
+     * granted a session on the unrelated worksheet at that position and projected
+     * the parked draft into it — and with matching cell bases the save then wrote
+     * one worksheet's draft into another, which is the corruption the parking was
+     * careful not to cause. The draft stays durable and recoverable; what it does
+     * not get is a session on a sheet that is not its own.
      */
     function rehydration_sheet_index(
         slots: PerFileState['pendingEdits'],
         names?: readonly string[],
-    ): number {
+    ): number | undefined {
         if (!slots) return 0;
         for (let index = 0; index < slots.length; index += 1) {
             const slot = slots[index];
             if (!slot) continue;
             if (!slot.sheetName) return index;
-            const named = sheet_index_named(slot.sheetName, names);
-            return named ?? index;
+            return sheet_index_named(slot.sheetName, names);
         }
         // An all-holes array names no sheet at all; sheet 0 is the answer the
         // caller had before any of this was worksheet-scoped.
@@ -2328,6 +2337,11 @@ export function attach_viewer(
         // `may_rehydrate_session()` is asked here by name, not left implicit inside
         // the claim, because this is the site where its answer decides whether
         // durable user work reaches the panel at all.
+        // Rehydration adopts whichever sheet the durable slot belongs to, rather
+        // than assuming sheet 0 — and adopts none at all, `undefined`, when the
+        // slot names a worksheet this workbook does not have. See
+        // `rehydration_sheet_index`.
+        const adoption_sheet_index = rehydration_sheet_index(state.pendingEdits, names);
         const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
             && profile.editing
@@ -2336,13 +2350,8 @@ export function attach_viewer(
                 || (
                     allow_claim
                     && may_rehydrate_session()
-                    && try_claim_edit_session(
-                        false,
-                        undefined,
-                        // Rehydration adopts whichever sheet the durable slot
-                        // belongs to, rather than assuming sheet 0.
-                        rehydration_sheet_index(state.pendingEdits, names),
-                    )
+                    && adoption_sheet_index !== undefined
+                    && try_claim_edit_session(false, undefined, adoption_sheet_index)
                 )
             );
         if (represents_session) {
@@ -2373,6 +2382,11 @@ export function attach_viewer(
             && profile.editing
             && !!file_edit_state
             && !predates_completed_clear
+            // A slot naming no live worksheet declines the claim deliberately, so
+            // there is nothing here that `may_rehydrate_session()` promised. The
+            // draft is not dropped either — it stays durable, and reappears the
+            // moment the workbook has that name again.
+            && adoption_sheet_index !== undefined
             && edit_phase().type === 'free'
         ) {
             console.error('Dropped durable CSV pending edits with no panel holding the session');
