@@ -261,8 +261,17 @@ function letter_to_index(letters: string): number {
     return index - 1;
 }
 
+/** A grouped formula's `ref` range, half-inclusive of nothing — both corners count. */
+interface GroupedRange {
+    readonly kind: 'shared' | 'array';
+    readonly start_row: number;
+    readonly start_col: number;
+    readonly end_row: number;
+    readonly end_col: number;
+}
+
 /**
- * Every cell covered by a grouped formula's `ref`, keyed `row:col`.
+ * The `ref` range of every shared/array formula on the sheet.
  *
  * An array formula writes one `<f t="array" ref="A1:B2">` on its top-left cell;
  * the other cells in that range hold a value and no `<f>` at all. So the
@@ -270,25 +279,45 @@ function letter_to_index(letters: string): number {
  * of the group without ever meeting a formula. A shared master's `ref` spans its
  * followers the same way — those *do* carry an `<f>`, but scanning the range
  * catches them uniformly and costs one pass either way.
+ *
+ * Kept as bounds rather than expanded into a set of coordinates: a `ref` is
+ * whatever the writing application put there, and a whole-column or
+ * whole-sheet range (`A1:XFD1048576`) is legal and not rare. Materializing that
+ * is billions of entries for a workbook we may not even be editing near.
  */
-function grouped_formula_cells(xml: string): Set<string> {
-    const covered = new Set<string>();
+function grouped_formula_ranges(xml: string): GroupedRange[] {
+    const ranges: GroupedRange[] = [];
     for (const m of xml.matchAll(/<f\b[^>]*>/g)) {
         const type = /\bt="([^"]*)"/.exec(m[0]);
-        if (type?.[1] !== 'shared' && type?.[1] !== 'array') continue;
+        const kind = type?.[1];
+        if (kind !== 'shared' && kind !== 'array') continue;
         const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(m[0]);
         if (!ref) continue;
         const start_col = letter_to_index(ref[1]);
         const start_row = Number(ref[2]) - 1;
-        const end_col = ref[3] !== undefined ? letter_to_index(ref[3]) : start_col;
-        const end_row = ref[4] !== undefined ? Number(ref[4]) - 1 : start_row;
-        for (let row = start_row; row <= end_row; row += 1) {
-            for (let col = start_col; col <= end_col; col += 1) {
-                covered.add(`${row}:${col}`);
-            }
+        ranges.push({
+            kind,
+            start_row,
+            start_col,
+            end_col: ref[3] !== undefined ? letter_to_index(ref[3]) : start_col,
+            end_row: ref[4] !== undefined ? Number(ref[4]) - 1 : start_row,
+        });
+    }
+    return ranges;
+}
+
+/** `'shared'` / `'array'` when `row`/`col` falls inside some group's `ref`. */
+function grouped_range_kind(
+    ranges: readonly GroupedRange[],
+    row: number,
+    col: number,
+): 'shared' | 'array' | null {
+    for (const r of ranges) {
+        if (row >= r.start_row && row <= r.end_row && col >= r.start_col && col <= r.end_col) {
+            return r.kind;
         }
     }
-    return covered;
+    return null;
 }
 
 /**
@@ -376,8 +405,8 @@ export function apply_cell_edits(
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
     // Scanned once for the whole sheet, because an array formula's members are
-    // only identifiable from the master's `ref` — see `grouped_formula_cells`.
-    const grouped_cells = grouped_formula_cells(xml);
+    // only identifiable from the master's `ref` — see `grouped_formula_ranges`.
+    const grouped_ranges = grouped_formula_ranges(xml);
 
     for (const [row, row_edits] of by_row) {
         const row_span = rows.get(row);
@@ -412,7 +441,7 @@ export function apply_cell_edits(
                 // refuses and says why instead of quietly corrupting the sheet.
                 const grouped = grouped_formula_kind(
                     xml.slice(cell_span.inner_start, cell_span.end),
-                ) ?? (grouped_cells.has(`${e.row}:${e.col}`) ? 'array' : null);
+                ) ?? grouped_range_kind(grouped_ranges, e.row, e.col);
                 if (grouped) {
                     throw new Error(
                         `Cannot edit ${cell_reference(e.row, e.col)}: it is part of `

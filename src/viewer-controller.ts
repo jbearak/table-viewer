@@ -740,6 +740,17 @@ export function attach_viewer(
      * revoke?") has to name a sheet. Undefined exactly when no session is held.
      */
     let active_edit_sheet_index: number | undefined;
+    /**
+     * The *name* of that worksheet, as the workbook spelled it when the session
+     * was claimed. The index alone does not survive a reload: a workbook edited
+     * externally can reorder its sheets, and slot 2 afterwards is a different
+     * worksheet than slot 2 before. Names are unique within a workbook, so the
+     * name identifies the sheet the user is actually editing across an adoption —
+     * see `rebase_edit_session_sheet`. Undefined when no session is held, or when
+     * no source was adopted to name the sheet at claim time (the legacy CSV shape,
+     * which is single-sheet and cannot reorder).
+     */
+    let active_edit_sheet_name: string | undefined;
     const excel_header_subscriber_token = Symbol(file_key);
     const cell_highlight_subscriber_token = Symbol(file_key);
     const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
@@ -1235,6 +1246,42 @@ export function attach_viewer(
         return source?.meta().sheets[sheet_index]?.name;
     }
 
+    /**
+     * Follow the edit session to its worksheet in a newly adopted workbook.
+     *
+     * A reload can bring back a workbook whose sheets were reordered, renamed or
+     * deleted while it was open. `active_edit_sheet_index` is a position, and a
+     * position means a different worksheet after a reorder — so leaving it alone
+     * would point the session's pending edits, its save and its revocation at
+     * somebody else's sheet, keyed to rows that mean something else there.
+     *
+     * Names are unique within a workbook, so a reorder is unambiguous and the
+     * session simply moves. A name that is gone entirely is not a relocation, so
+     * there is no honest index to give the session: it is cleared, which stops the
+     * rehydration below from adopting a stranger's slot and makes `handle_save`
+     * refuse. The caller then releases the session — see `adopt_committed_candidate`.
+     *
+     * Untagged sessions (no source at claim time, i.e. the legacy CSV shape) are
+     * single-sheet by construction and stay where they are.
+     */
+    function rebase_edit_session_sheet(
+        next: DataSource,
+    ): 'kept' | 'moved' | 'lost' {
+        if (active_edit_sheet_name === undefined || active_edit_sheet_index === undefined) {
+            return 'kept';
+        }
+        const names = next.meta().sheets.map((sheet) => sheet.name);
+        const moved_to = names.indexOf(active_edit_sheet_name);
+        if (moved_to === -1) {
+            active_edit_sheet_index = undefined;
+            active_edit_sheet_name = undefined;
+            return 'lost';
+        }
+        if (moved_to === active_edit_sheet_index) return 'kept';
+        active_edit_sheet_index = moved_to;
+        return 'moved';
+    }
+
     function durable_pending_edit_keys(sheet_index: number): readonly string[] {
         // Only the sheet the session is editing can have keys to report; asking
         // about any other sheet must not return this one's, since the caller
@@ -1615,6 +1662,7 @@ export function attach_viewer(
             if (active_edit_session_id === undefined) {
                 active_edit_session_id = allocate_edit_session_id(file_key);
                 active_edit_sheet_index = sheet_index;
+                active_edit_sheet_name = sheet_name_at(sheet_index);
             }
             return true;
         }
@@ -1627,6 +1675,7 @@ export function attach_viewer(
             if (active_edit_claim === claim) active_edit_claim = undefined;
             active_edit_session_id = allocate_edit_session_id(file_key);
             active_edit_sheet_index = sheet_index;
+            active_edit_sheet_name = sheet_name_at(sheet_index);
             file_edit_state.phase = { type: 'owned', token: edit_session_token };
             if (notify) notify_edit_state();
             return true;
@@ -1635,6 +1684,7 @@ export function attach_viewer(
         retire_save_lifecycle(undefined);
         active_edit_session_id = allocate_edit_session_id(file_key);
         active_edit_sheet_index = sheet_index;
+        active_edit_sheet_name = sheet_name_at(sheet_index);
         file_edit_state.phase = { type: 'owned', token: edit_session_token };
         if (notify) notify_edit_state();
         return true;
@@ -1708,6 +1758,7 @@ export function attach_viewer(
                 ) {
                     active_edit_session_id = undefined;
                     active_edit_sheet_index = undefined;
+                    active_edit_sheet_name = undefined;
                     file_edit_state.phase = { type: 'free' };
                     notify_edit_state();
                     void ensure_failed_save_cleanup();
@@ -1741,6 +1792,7 @@ export function attach_viewer(
         active_save_operation = undefined;
         active_edit_session_id = undefined;
         active_edit_sheet_index = undefined;
+        active_edit_sheet_name = undefined;
         file_edit_state.phase = { type: 'cleanupPending', operation, sheetIndex: sheet_index };
         recapture_edit_capabilities();
         return operation;
@@ -2846,6 +2898,10 @@ export function attach_viewer(
             );
         }
         let adopted: DataSource | undefined;
+        // Set when the session's worksheet is not in the reloaded workbook. The
+        // release runs after the transfer, not inside the installer, so it cannot
+        // reorder itself against the adoption it is reacting to.
+        let lost_edit_sheet = false;
         const transferred = candidate.transfer_to((next, confirm_transfer) => {
             if (!load_is_current(seq, refresh_event)) return;
             const result = adopt_source_into_core(
@@ -2863,6 +2919,9 @@ export function attach_viewer(
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
                     const material = installed.snapshot_material();
                     const owned_before_projection = owns_edit_session();
+                    // Before anything reads `active_edit_sheet_index` against the new
+                    // workbook: the sheets may have moved under the session.
+                    if (rebase_edit_session_sheet(next) === 'lost') lost_edit_sheet = true;
                     const adoption_state = project_state_for_panel(
                         projected_state ?? committed.receipt.stateSnapshot,
                         true,
@@ -2887,10 +2946,12 @@ export function attach_viewer(
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
-                                ...(owns_edit_session() && active_edit_session_id
+                                ...(owns_edit_session()
+                                    && active_edit_session_id
+                                    && active_edit_sheet_index !== undefined
                                     ? {
                                         csvEditSessionId: active_edit_session_id,
-                                        csvEditSheetIndex: active_edit_sheet_index ?? 0,
+                                        csvEditSheetIndex: active_edit_sheet_index,
                                     }
                                     : {}),
                             },
@@ -2957,6 +3018,11 @@ export function attach_viewer(
             if (result.type === 'refused') return;
         });
         if (!transferred || !adopted || disposed) return undefined;
+        if (lost_edit_sheet) {
+            void release_edit_session().catch((error) => {
+                log_sanitized_failure('Failed to release an edit session whose sheet is gone', error);
+            });
+        }
         profile.on_source_adopted?.(adopted);
         return adopted;
     }
@@ -3085,10 +3151,12 @@ export function attach_viewer(
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
-                                        ...(owns_edit_session() && active_edit_session_id
+                                        ...(owns_edit_session()
+                                            && active_edit_session_id
+                                            && active_edit_sheet_index !== undefined
                                             ? {
                                                 csvEditSessionId: active_edit_session_id,
-                                                csvEditSheetIndex: active_edit_sheet_index ?? 0,
+                                                csvEditSheetIndex: active_edit_sheet_index,
                                             }
                                             : {}),
                                     },
@@ -4039,6 +4107,7 @@ export function attach_viewer(
             active_save_operation = undefined;
             active_edit_session_id = undefined;
             active_edit_sheet_index = undefined;
+            active_edit_sheet_name = undefined;
             if (file_edit_state) {
                 file_edit_state.phase = {
                     type: 'cleanupPending',

@@ -159,6 +159,26 @@ describe('apply_cell_edits', () => {
         )).toThrow(/B1.*array formula/);
     });
 
+    it('handles a whole-sheet array ref without expanding it', () => {
+        // A `ref` is whatever wrote the file, and `A1:XFD1048576` is legal. Cells
+        // inside it are still refused; the point is that an unrelated edit
+        // elsewhere returns promptly rather than materializing 17e9 coordinates.
+        const xml = doc(
+            '<row r="1"><c r="A1"><f t="array" ref="A1:XFD1048576">SUM(C1:D1)</f><v>3</v></c>'
+            + '</row><row r="2"><c r="A2"><v>4</v></c></row>',
+        );
+        expect(() => apply_cell_edits(xml, [{ row: 1, col: 0, value: '9' }], OPTS))
+            .toThrow(/A2.*array formula/);
+
+        // Same shape, ref bounded away from the edited cell: it goes through.
+        const bounded = doc(
+            '<row r="1"><c r="A1"><f t="array" ref="A1:B1">SUM(C1:D1)</f><v>3</v></c></row>'
+            + '<row r="2"><c r="A2"><v>4</v></c></row>',
+        );
+        expect(apply_cell_edits(bounded, [{ row: 1, col: 0, value: '9' }], OPTS))
+            .toContain('<c r="A2"><v>9</v></c>');
+    });
+
     it('drops control characters XML 1.0 cannot represent', () => {
         // Pasted from a terminal or a PDF, invisible in the grid, and fatal in the
         // part: there is no escape for these, so a numeric reference would be just

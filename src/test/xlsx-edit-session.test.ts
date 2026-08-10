@@ -329,6 +329,73 @@ describe('xlsx edit sessions', () => {
             .toEqual({ '1:0': { value: 'Draft', base: 'Ada' } });
     });
 
+    it('follows its worksheet when the workbook is reordered underneath it', async () => {
+        // The session names a sheet by *position*, and an external reorder makes
+        // that position somebody else's worksheet. Saving through the stale index
+        // would splice this sheet's edits into the other one and produce a
+        // perfectly valid, wrong workbook.
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
+        );
+
+        // "Inventory" is slot 0 now, and the session went with it: the save the
+        // webview posts against the reloaded snapshot lands on Inventory's rows.
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 0,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        await flush_promises();
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        const inventory = after.data.sheets.find((sheet) => sheet.name === 'Inventory')!;
+        const people = after.data.sheets.find((sheet) => sheet.name === 'People')!;
+        expect(inventory.rows[1][0]?.raw).toBe('Gadget');
+        expect(people.rows[1][0]?.raw).toBe('Alice');
+    });
+
+    it('gives up the session when its worksheet is gone from the workbook', async () => {
+        // Not a relocation: there is no honest index to move the session to, so it
+        // must not silently land on whatever sheet now holds that position.
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = drop_second_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
+
+        // The old session id no longer buys a save on the surviving worksheet.
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 0,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Alice' } },
+            },
+        });
+        await flush_promises();
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw).toBe('Alice');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
@@ -351,6 +418,43 @@ describe('xlsx edit sessions', () => {
         expect(read_part(bytes, 'xl/styles.xml')).toEqual(styles_before);
     });
 });
+
+/**
+ * Swap the two `<sheet>` entries in the workbook part.
+ *
+ * The parts themselves are untouched, which is what an external reorder looks
+ * like: the same worksheet XML, listed the other way round, so index 0 and index
+ * 1 now name each other's sheet.
+ */
+function swap_sheet_order(zip: Uint8Array): Uint8Array {
+    const file = CFB.read(zip, { type: 'buffer' });
+    const entry = CFB.find(file, '/xl/workbook.xml')!;
+    const xml = Buffer.from(entry.content as Uint8Array).toString('utf8');
+    const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
+    expect(sheets).toHaveLength(2);
+    const swapped = Buffer.from(
+        xml.replace(sheets[0] + sheets[1], sheets[1] + sheets[0]),
+        'utf8',
+    );
+    entry.content = swapped;
+    entry.size = swapped.length;
+    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
+
+/** Drop the second `<sheet>` entry, as deleting that worksheet elsewhere would. */
+function drop_second_sheet(zip: Uint8Array): Uint8Array {
+    const file = CFB.read(zip, { type: 'buffer' });
+    const entry = CFB.find(file, '/xl/workbook.xml')!;
+    const xml = Buffer.from(entry.content as Uint8Array).toString('utf8');
+    const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
+    expect(sheets).toHaveLength(2);
+    const trimmed = Buffer.from(xml.replace(sheets[1], ''), 'utf8');
+    entry.content = trimmed;
+    entry.size = trimmed.length;
+    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
 
 function read_part(zip: Uint8Array, part: string): Buffer | null {
     const entry = CFB.find(CFB.read(zip, { type: 'buffer' }), `/${part}`);
