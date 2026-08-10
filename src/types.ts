@@ -894,12 +894,19 @@ export function with_pending_edits_for_sheet(
     const next = pending ? [...pending] : [];
     while (next.length <= sheet_index) next.push(undefined);
     const incumbent = next[sheet_index];
-    const displaced = sheet_name !== undefined
+    const foreign = sheet_name !== undefined
         && incumbent !== undefined
         && incumbent.sheetName !== undefined
-        && incumbent.sheetName !== sheet_name
-        ? incumbent
-        : undefined;
+        && incumbent.sheetName !== sheet_name;
+    // Nothing of this worksheet's is here to clear. A slot tagged for another
+    // worksheet at this index is a displaced draft, and an empty replacement is
+    // this worksheet saying it has no draft — so emptying the slot would delete
+    // someone else's unsaved work in the name of removing our own, which was never
+    // there. The write path below relocates such an incumbent; a clear must simply
+    // leave it alone, or discarding a session that never published a durable map
+    // silently dropped the other worksheet's draft.
+    if (foreign && !(cells && Object.keys(cells).length > 0)) return pending;
+    const displaced = foreign ? incumbent : undefined;
     next[sheet_index] = cells && Object.keys(cells).length > 0
         ? (sheet_name === undefined ? { cells } : { sheetName: sheet_name, cells })
         : undefined;

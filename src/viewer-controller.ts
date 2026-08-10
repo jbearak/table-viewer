@@ -3633,6 +3633,14 @@ export function attach_viewer(
                 current.pendingEdits,
                 target,
                 undefined,
+                // Named, so the clear can tell its own slot from a displaced one.
+                // Without it the resolved position was emptied whatever was sitting
+                // there, and when this worksheet had no durable slot of its own —
+                // a session discarded before it ever published a map — `target` fell
+                // back to the captured index, which another worksheet's draft may
+                // legitimately occupy. That draft was deleted with no message asking
+                // to discard it.
+                sheet_name,
             );
             if (next) return { ...current, pendingEdits: next };
             const { pendingEdits: _drop, ...rest } = current;

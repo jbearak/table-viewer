@@ -1122,6 +1122,35 @@ describe('xlsx edit sessions', () => {
         expect(durable()).toContain('Draft');
     });
 
+    it('keeps a displaced draft when a session with no durable map is discarded', async () => {
+        // The discarded worksheet never published a durable map, so it has no slot
+        // of its own and `slot_index_tagged` falls back to the captured index — which
+        // a displaced same-named draft legitimately occupies, since reconciliation
+        // seats only one of two same-named slots at their sheet's own index. The
+        // clear emptied that position by number, deleting an unsaved draft that no
+        // message asked to discard.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({ type: 'discardEditSession', editSessionId: session });
+        await controller_of(panel).drain();
+
+        const durable = JSON.stringify(state.get_state(file_path).pendingEdits ?? []);
+        expect(durable, 'Mallory').toContain('Mallory');
+        expect(durable, 'Draft').toContain('Draft');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
