@@ -3632,6 +3632,51 @@ describe('edit mode save exit', () => {
         );
     });
 
+    it('holds the worksheet tabs while a save dialog is open', async () => {
+        // The dialog asks about one worksheet, and the answer is applied against the
+        // *active* sheet's store. Switching tabs while it was open pointed the answer
+        // at the wrong worksheet: the new sheet's store has no session, so it reports
+        // nothing to save, and a "Save" choice took the exit path — releasing the
+        // session without ever posting the save. The user asked to save and the edits
+        // were dropped.
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(true);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'inventory-session',
+            sheetIndex: 1,
+            pendingEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+        });
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'showSaveDialog' })
+        );
+
+        // The tab click is refused while the question is on screen.
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+
+        // So "Save" still reaches the worksheet the dialog was about.
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
+        );
+    });
+
     it('folds an open editor into the store before switching worksheets', async () => {
         // Worksheet editing made this reachable: the grid is keyed by the active
         // sheet, so clicking another tab unmounts the one holding the open overlay.

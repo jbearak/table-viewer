@@ -400,6 +400,15 @@ export function App(): React.JSX.Element {
     // synchronously; this is what the toolbar and grid re-render against, so the
     // Edit button and the editable grid follow the session from sheet to sheet.
     const [edit_session_sheet_index, set_edit_session_sheet_index] = useState(0);
+    /**
+     * The active sheet, readable from the long-lived host-message handler.
+     *
+     * That handler does not re-close over `active_sheet_index`, and a dialog answer
+     * has to know whether the store it is about to act on is still the session's —
+     * see the `saveDialogResult` branch.
+     */
+    const active_sheet_index_ref = useRef(0);
+    active_sheet_index_ref.current = active_sheet_index;
     const renderer_publication_fenced_session_ref = useRef<string>();
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
@@ -2343,6 +2352,20 @@ export function App(): React.JSX.Element {
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
+            // A Save/Discard/Cancel dialog is a question about *one* worksheet, and
+            // the answer is applied against `editing_ref.current` — which follows
+            // the active sheet. Switching tabs while it is open therefore pointed
+            // the answer at the wrong worksheet: the store for the new sheet has no
+            // session, so `request_save()` and `has_uncommitted_changes()` both
+            // returned false and a "Save" choice took the exit path instead,
+            // releasing the session without ever posting the save. The user asked
+            // to save and the edits were dropped.
+            //
+            // Held rather than redirected: the dialog is already on screen naming
+            // this worksheet's file, so answering it is a two-second interaction and
+            // silently retargeting it would be its own surprise. Cancel returns
+            // control immediately.
+            if (pending_save_dialog_ref.current) return;
             // The grid is keyed by the active sheet, so this unmounts the one
             // holding any open overlay editor — and Glide portals that editor
             // outside the tree, so its cleanup releases the captured row without
@@ -2891,9 +2914,24 @@ export function App(): React.JSX.Element {
                 ) return;
                 pending_save_dialog_ref.current = null;
                 if (msg.choice === 'save') {
-                    const editing = editing_ref.current;
+                    // `editing_ref` is the *active* sheet's store, and the answer is
+                    // about the session's sheet. Those are normally the same — the
+                    // tab strip refuses to switch while a dialog is open — but a
+                    // reorder or a restore can move the active sheet without one, and
+                    // acting on the wrong store here silently drops the save: a
+                    // sessionless store reports nothing to save, so the exit path
+                    // runs and releases the session instead. Answering "save" must
+                    // never end in "exited without saving".
+                    const on_session_sheet =
+                        active_sheet_index_ref.current === edit_session_sheet_index_ref.current;
+                    const editing = on_session_sheet ? editing_ref.current : null;
                     // request_save() has side effects, so it must be evaluated first.
-                    if (editing?.request_save() || editing?.has_uncommitted_changes()) {
+                    if (!on_session_sheet) {
+                        // Stay in edit mode with the edits intact rather than
+                        // exiting: the draft is preserved and the user can press
+                        // Edit again on the owning worksheet.
+                        pending_save_dialog_ref.current = null;
+                    } else if (editing?.request_save() || editing?.has_uncommitted_changes()) {
                         pending_exit_ref.current = true;
                     } else {
                         leave_edit_mode();

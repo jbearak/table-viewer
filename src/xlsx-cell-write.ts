@@ -83,7 +83,8 @@ export function col_index_to_letter(index: number): string {
  * user cannot see. Ambiguous input stays a string, which is visible and
  * correctable; a wrong date is neither.
  */
-const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?Z?)?$/;
+const ISO_DATE_RE
+    = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 
 /**
  * Convert an ISO date string to an Excel serial, or null if not an ISO date.
@@ -97,6 +98,14 @@ const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?
  * 1900-02-28, we just never write it.
  */
 export function iso_to_serial(text: string, datemode: 0 | 1): number | null {
+    // A timezone offset is accepted and then ignored for the arithmetic. An Excel
+    // serial is a naive wall-clock number with no zone in it at all, so there is
+    // nothing to carry the offset into: shifting the instant to UTC would move the
+    // displayed date, which is the one thing the user can see. Accepting the
+    // spelling is what matters — `2024-01-15T12:00:00+02:00` is a perfectly ordinary
+    // `t="d"` value, and rejecting it meant retyping exactly what the grid showed
+    // rewrote the cell as an inline string, silently dropping its date type for
+    // every formula and filter downstream.
     const m = ISO_DATE_RE.exec(text.trim());
     if (!m) return null;
     const [, y, mo, d, hh, mm, ss, ms] = m;
@@ -829,12 +838,36 @@ function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
  * coordinates are covered.
  */
 function merged_follower_ranges(xml: string): GroupedRange[] {
-    const section = /<mergeCells\b[^>]*>([\s\S]*?)<\/mergeCells\s*>/.exec(xml);
-    if (!section) return [];
+    // Located exactly as `get_text` does it: the first raw `<mergeCells`, closed at
+    // the first *literal* `</mergeCells>`. Not `[^>]*` for the opening tag — a legal
+    // `<mergeCell note="x > y" ref="A1:C1"/>` cut the match short, so a merge the
+    // reader honours went unseen and an edit to a hidden follower was allowed
+    // through. And not `</mergeCells\s*>` for the close — the reader does not accept
+    // that spelling, so it saw no merges at all while the writer refused a cell the
+    // grid was displaying normally.
+    const open = /<mergeCells[\s>]/.exec(xml);
+    if (!open) return [];
+    const tag_end = find_tag_end(xml, open.index);
+    if (tag_end === -1) return [];
+    const close = xml.indexOf('</mergeCells>', tag_end);
+    if (close === -1) return [];
+    const inner = xml.slice(tag_end + 1, close);
     const ranges: GroupedRange[] = [];
-    const re = /<mergeCell\b[^>]*\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(section[1])) !== null) {
+    // Walked tag by tag with the same quote-aware `find_tag_end` the reader uses,
+    // rather than matched with one regex: `[^>]*` ends the tag at a `>` inside an
+    // attribute value, and the reader does not. Comments are deliberately *not*
+    // skipped here — `iter_elements` does not skip them either, so a commented-out
+    // `<mergeCell>` hides cells for the reader and must for the writer too.
+    let pos = 0;
+    while (pos < inner.length) {
+        const at = inner.indexOf('<mergeCell', pos);
+        if (at === -1) break;
+        if (!is_tag_boundary(inner[at + '<mergeCell'.length])) { pos = at + 1; continue; }
+        const cell_end = find_tag_end(inner, at);
+        if (cell_end === -1) break;
+        const m = /\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/.exec(inner.slice(at, cell_end + 1));
+        pos = cell_end + 1;
+        if (!m) continue;
         const start_row = Number(m[2]) - 1;
         const end_row = Number(m[4]) - 1;
         const start_col = letter_to_index(m[1]);

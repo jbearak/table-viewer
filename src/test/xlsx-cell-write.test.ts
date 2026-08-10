@@ -1062,6 +1062,45 @@ describe('apply_cell_edits', () => {
         )).toContain('<c r="A1"><v>0</v></c>');
     });
 
+    it('reads mergeCells exactly where the reader does', () => {
+        const merged = (cells: string, close = '</mergeCells>') =>
+            '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c>'
+            + '<c r="B1"><v>2</v></c></row></sheetData>'
+            + `<mergeCells count="1">${cells}${close}</worksheet>`;
+        // A `>` inside an attribute value does not end the tag, and the reader's
+        // `find_tag_end` knows that. A `[^>]*` match cut the element short, missed
+        // the `ref` after it, and let an edit through to a follower the grid hides.
+        expect(() => apply_cell_edits(
+            merged('<mergeCell note="x > y" ref="A1:C1"/>'),
+            [{ row: 0, col: 1, value: '9' }],
+            OPTS,
+        )).toThrow(/covered by a merged cell/);
+        // And the close must be the literal spelling the reader requires. Accepting
+        // `</mergeCells >` refused a cell the reader — which saw no merges at all —
+        // was displaying normally.
+        expect(apply_cell_edits(
+            merged('<mergeCell ref="A1:C1"/>', '</mergeCells >'),
+            [{ row: 0, col: 1, value: '9' }],
+            OPTS,
+        )).toContain('<v>9</v>');
+    });
+
+    it('keeps the date type when a t="d" value carries a timezone offset', () => {
+        // An offset is the ordinary spelling of an ISO instant, and the reader shows
+        // such a cell as a date. Rejecting it here meant retyping exactly what the
+        // grid displayed rewrote the cell as an inline string, silently dropping its
+        // date type for every formula and filter downstream.
+        for (const value of ['2024-01-15T12:00:00+02:00', '2024-01-15T12:00:00-0500']) {
+            const out = apply_cell_edits(
+                doc('<row r="1"><c r="A1" t="d"><v>2024-01-01</v></c></row>'),
+                [{ row: 0, col: 0, value }],
+                OPTS,
+            );
+            expect(out, value).toContain('t="d"');
+            expect(out, value).toContain(`<v>${value}</v>`);
+        }
+    });
+
     it('refuses a sheetData that does not end where the reader stops', () => {
         // The reader closes the element at the first literal `</sheetData>` from
         // `indexOf` — comment-blind, and that exact spelling only. A comment holding
