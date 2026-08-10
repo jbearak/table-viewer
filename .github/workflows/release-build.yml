@@ -401,94 +401,80 @@ jobs:
             dist/desktop-packages/table-viewer-*.zip
             dist/desktop-packages/*.sha256
 
-  # The Windows desktop release fence.
-  #
-  # This job used to package an NSIS installer and a portable exe for x64 and
-  # arm64. It packages nothing today, on purpose — but it no longer fails, and
-  # that distinction is the whole of this block.
-  #
-  # The desktop's state authority is SQLite, and it does now open on Windows: every
-  # durable step of the storage protocol — candidate install, marker creation,
-  # member move — attempts to flush the containing directory. The default Node
-  # primitive is tried so future runtime support is used; only a directory-open
-  # result proving no handle can be obtained is skipped, in line with SQLite's own
-  # Windows posture. `desktop_state_platform_support` no longer declines Windows.
-  #
-  # What is still missing is *crash* evidence, and that is what fences this job.
-  # `fs.openSync` on a directory fails and `FlushFileBuffers` on a file handle says
-  # nothing about rename and unlink ordering, so what a kill at each durable cut
-  # point leaves behind on NTFS has not been established from the packaged runtime.
-  # Shipping an installer before it is would put real users' view state on an
-  # unverified recovery path, which is the one thing the failure policy will not
-  # trade away.
-  #
-  # An earlier revision of this job failed hard, which stopped the *entire*
-  # release run — `release-publish.yml` triggers only on a successful Release Build,
-  # so a fenced Windows packaging job also withheld the macOS build. That coupling
-  # is withdrawn. Windows being unproven is not a reason to stop shipping the
-  # platform that is proven. A pushed-tag publish warns and proceeds when the
-  # expected fenced `windows-<tag>` artifact is absent; a hand-dispatched publish
-  # requires `allow_missing_windows=true` to acknowledge that omission explicitly.
-  # This job therefore skips loudly and lets the run proceed.
-  #
-  # Windows is not withdrawn as a target. The open question is empirical — which
-  # write-through and flush primitives the packaged runtime can actually reach on
-  # NTFS, and what they guarantee across a kill — and it is answered by the
-  # `windows-durability` job in ci.yml, not by argument here. The decision tree is
-  # fixed in advance so neither outcome can be quietly reinterpreted:
-  #
-  #   * the durability gate verifies  -> Windows ships on the same evidence
-  #     standard as macOS: a documented durability contract plus kill-crash
-  #     verification, which is exactly the trust basis fsync gives us on POSIX.
-  #     Replace this job with the real packaging steps.
-  #   * the gate cannot verify        -> this fence stays, and the reason stays
-  #     stated: the backend runs on Windows, but its crash recovery there is not
-  #     verified, so the desktop app is not published for it.
-  #
-  # Neither branch permits a silent weakening: shipping requires the evidence, and
-  # not shipping requires saying so. `npm run desktop:package:win` remains
-  # available for developers either way — a local build, never a published one.
-
+  # Build the standalone Windows app only after its SQLite/runtime release gates
+  # pass. Four unsigned executables are published: setup and portable variants
+  # for x64 and arm64. A failure here fails Release Build, so the publisher cannot
+  # silently create a release without its Windows downloads.
   desktop-windows:
+    needs: windows-validation
     runs-on: windows-latest
 
     steps:
-      # No checkout, no toolchain, no dependencies. Nothing this job could
-      # install would change the answer today, and a job that built anything at
-      # all would leave something for a future step to pick up and upload.
-      #
-      # Exits 0. The release run continues and the macOS artifact publishes.
-      # release-publish.yml warns and proceeds for a successful pushed-tag build;
-      # only a hand-dispatched publish requires `allow_missing_windows=true`.
-      - name: Report that Windows desktop packaging is pending durability verification
+      - name: Checkout tag commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '26.5.1'
+          cache: npm
+
+      - name: Validate tag + version
         shell: bash
+        env:
+          THE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          cat >&2 <<'MESSAGE'
-          NOTE: no Windows desktop artifact is produced by this release.
+          if [[ ! "$THE_TAG" =~ ^v[0-9] ]]; then
+            echo "ERROR: tag must start with 'v' and a digit (e.g., v0.1.1). Got: $THE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: checkout does not match the immutable release commit" >&2
+            exit 1
+          fi
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "$THE_TAG" != "v${PKG_VERSION}" ]]; then
+            echo "ERROR: tag/version mismatch. tag=$THE_TAG package.json=$PKG_VERSION" >&2
+            exit 1
+          fi
 
-          The desktop app stores its view settings in SQLite, and it does open that
-          database on Windows. Every durable step attempts the default Node directory
-          flush so future runtime support is used; only a directory-open result proving
-          that no handle can be obtained is skipped, in line with SQLite's own Windows
-          posture.
+      - name: Install dependencies
+        run: npm ci
 
-          What has NOT been established is what a crash at each of those durable
-          steps leaves behind on NTFS, measured from the packaged runtime. Publishing
-          an installer today would put real users' view state on a recovery path
-          nobody has verified, so the fence stays until the evidence exists.
+      - name: Package desktop app (unsigned)
+        run: npm run desktop:package:win
 
-          Windows is NOT withdrawn as a target. Which primitives are actually
-          reachable, and what they guarantee across a kill, is being established
-          empirically by the `windows-durability` job in ci.yml. When that gate
-          verifies, Windows ships on the same evidence standard as macOS — a
-          documented durability contract plus kill-crash verification — and this job
-          is replaced with the real packaging steps. If it cannot verify, this fence
-          and this message stay exactly as they are.
+      # Four exes are expected: {x64,arm64} x {setup,portable}. Assert the count
+      # so a silently dropped target fails here rather than disappearing from the
+      # GitHub Release.
+      - name: Calculate checksums
+        shell: bash
+        working-directory: dist/desktop-packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          exes=(table-viewer-*.exe)
+          if [[ "${#exes[@]}" -ne 4 ]]; then
+            echo "ERROR: expected 4 .exe files (x64/arm64 x setup/portable), found ${#exes[@]}." >&2
+            ls -la >&2
+            exit 1
+          fi
+          for exe in "${exes[@]}"; do
+            sha256sum "$exe" | tee "$exe.sha256"
+          done
 
-          This job no longer fails the release run: Windows being unproven is not a
-          reason to withhold the platform that is proven. A pushed-tag publish reports
-          the omitted Windows assets; a manual publish requires an explicit override.
-
-          Developers can still build locally with: npm run desktop:package:win
-          MESSAGE
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: windows-${{ inputs.tag || github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/desktop-packages/table-viewer-*.exe
+            dist/desktop-packages/table-viewer-*.exe.sha256
