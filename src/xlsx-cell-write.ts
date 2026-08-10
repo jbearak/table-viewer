@@ -199,10 +199,17 @@ export function classify_value(
     // Such a token is stored as a string instead, which is also what Excel does
     // with an identifier too long to hold as a number, and what editing the same
     // text in a CSV already does here.
+    //
+    // `n !== 0` covers the other end of the same loss: `1e-400` underflows to zero
+    // in every double-based reader there is, so storing it as a number replaces a
+    // nonzero value the user typed with `0` — silently and permanently. A typed
+    // `0` is of course still a number; only a token that *means* nonzero and
+    // *reads back* as zero falls through to text.
     const trimmed = value.trim();
     if (NUMBER_RE.test(trimmed)) {
         const n = Number(trimmed);
-        if (Number.isFinite(n) && significant_digits(trimmed) <= MAX_EXACT_DIGITS) {
+        const underflowed = n === 0 && /[1-9]/.test(trimmed.replace(/[eE][+-]?\d+$/, ''));
+        if (Number.isFinite(n) && !underflowed && significant_digits(trimmed) <= MAX_EXACT_DIGITS) {
             return { kind: 'number', text: trimmed };
         }
     }
@@ -265,7 +272,15 @@ function build_cell_xml(
     // repair. The shape test alone was the wrong gate; a value that cannot be a
     // date falls through and is stored as the text the user typed.
     if (was_iso_date && iso_to_serial(value, options.datemode) !== null) {
-        return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(value.trim())}</v></c>`;
+        // The space-separated spelling `2024-01-15 12:00` is what a user retypes
+        // from a grid, and `ISO_DATE_RE` accepts it — but a `t="d"` cell's text is
+        // an `xsd:dateTime`, where the `T` is required. Written through verbatim it
+        // made a date cell whose value no conforming date parser accepts: strict
+        // consumers reject it and prefix-parsing ones keep the date and drop the
+        // 12:00. Normalized rather than refused, since the value *is* the date the
+        // user meant, and this is the same repair the invalid-date gate above is
+        // there to prevent.
+        return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(value.trim().replace(' ', 'T'))}</v></c>`;
     }
     // A boolean cell edited back to a boolean stays one. The reader renders `t="b"`
     // as the text TRUE/FALSE, so that is what the user sees in the grid and types
@@ -793,6 +808,65 @@ function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
     return null;
 }
 
+/**
+ * The merge ranges the *reader* believes in, read the way it reads them.
+ *
+ * `parse_xlsx` takes the first `<mergeCells>` section by raw `indexOf`, walks its
+ * `<mergeCell ref>` children, and accepts only a two-corner `A1:B2` spelling.
+ * Then it hides every cell in a range except the top-left one: `cell_at` returns
+ * null for the followers, so the grid shows the anchor's value spanning them and
+ * nothing the user can type reaches a follower coordinate.
+ *
+ * That makes a follower unwritable rather than merely awkward. An edit to one
+ * inserted a perfectly valid `<c r="B1">` that no reader on either side would
+ * ever show: the save reported success, the reload showed the anchor unchanged,
+ * and Excel treats a value under a merged follower as discardable. So a follower
+ * is refused, like the grouped-formula ranges above — deliberately mirroring the
+ * reader's own parsing, comment-blindness and all, so both sides agree on which
+ * coordinates are covered.
+ */
+function merged_follower_ranges(xml: string): GroupedRange[] {
+    const section = /<mergeCells\b[^>]*>([\s\S]*?)<\/mergeCells\s*>/.exec(xml);
+    if (!section) return [];
+    const ranges: GroupedRange[] = [];
+    const re = /<mergeCell\b[^>]*\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(section[1])) !== null) {
+        const start_row = Number(m[2]) - 1;
+        const end_row = Number(m[4]) - 1;
+        const start_col = letter_to_index(m[1]);
+        const end_col = letter_to_index(m[3]);
+        // An inverted range hides nothing, because the reader drops it outright
+        // rather than normalizing the corners. Refusing on one would refuse an edit
+        // the grid was perfectly willing to accept.
+        if (start_row > end_row || start_col > end_col) continue;
+        ranges.push({
+            kind: 'array',
+            start_col,
+            start_row,
+            end_col,
+            end_row,
+        });
+    }
+    return ranges;
+}
+
+/** True when `row`/`col` sits in a merge range but is not its anchor. */
+function is_merged_follower(
+    ranges: readonly GroupedRange[],
+    row: number,
+    col: number,
+): boolean {
+    for (const r of ranges) {
+        if (row < r.start_row || row > r.end_row || col < r.start_col || col > r.end_col) continue;
+        // The anchor is the range's top-left, which is where the reader keeps the
+        // visible value — that cell stays editable.
+        if (row === r.start_row && col === r.start_col) continue;
+        return true;
+    }
+    return false;
+}
+
 /** `A1`-style reference for a message a user will read. */
 function cell_reference(row: number, col: number): string {
     return `${col_index_to_letter(col)}${row + 1}`;
@@ -1119,9 +1193,19 @@ export function apply_cell_edits(
     // `<row>` either. Left inside the existing-cell branch, those edits reached
     // the insertion paths instead and wrote a literal into the middle of an array
     // formula's result range, which is the corruption the refusal exists to stop.
+    const merged = merged_follower_ranges(xml);
     for (const e of edits) {
         const grouped = grouped_range_kind(grouped_ranges, e.row, e.col);
         if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+        // Same sweep, same reason: a merged follower usually has no `<c>` of its
+        // own, so nothing downstream would ever meet it.
+        if (is_merged_follower(merged, e.row, e.col)) {
+            throw new Error(
+                `Cannot edit ${cell_reference(e.row, e.col)}: it is covered by a merged `
+                + 'cell, which shows the value of its top-left cell. Edit that cell '
+                + 'instead, or unmerge the range in Excel.',
+            );
+        }
     }
 
     for (const [row, row_edits] of by_row) {

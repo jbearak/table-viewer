@@ -1016,6 +1016,52 @@ describe('apply_cell_edits', () => {
             .toThrow(/sheetData/);
     });
 
+    it('refuses a cell covered by a merged range', () => {
+        // The reader hides every cell of a merge except its top-left anchor, so a
+        // follower coordinate is one the grid never shows and the user cannot see.
+        // The edit wrote a perfectly valid `<c r="B1">` that nothing would ever
+        // render: the save reported success, the reload showed A1 unchanged, and
+        // Excel treats a value under a merged follower as discardable.
+        const xml = '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>'
+            + '<mergeCells count="1"><mergeCell ref="A1:C1"/></mergeCells></worksheet>';
+        expect(() => apply_cell_edits(xml, [{ row: 0, col: 1, value: '9' }], OPTS))
+            .toThrow(/Cannot edit B1: it is covered by a merged cell/);
+        // The anchor is the cell the grid does show, so it stays editable.
+        expect(apply_cell_edits(xml, [{ row: 0, col: 0, value: '9' }], OPTS)).toContain('<v>9</v>');
+    });
+
+    it('normalizes a space-separated date-time in a t="d" cell', () => {
+        // `2024-01-15 12:00` is what a user retypes from the grid and `ISO_DATE_RE`
+        // accepts it, but a `t="d"` value is an xsd:dateTime, where the `T` is
+        // required. Written verbatim it made a date cell no conforming date parser
+        // accepts — strict consumers reject it, prefix-parsing ones drop the 12:00.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="d"><v>2024-01-01</v></c></row>'),
+            [{ row: 0, col: 0, value: '2024-01-15 12:00' }],
+            OPTS,
+        );
+        expect(out).toContain('<v>2024-01-15T12:00</v>');
+    });
+
+    it('stores a number that underflows to zero as text', () => {
+        // The other end of the precision loss the digit limit guards: `1e-400` is
+        // finite as typed and zero once read back, so storing it as a number
+        // replaced a nonzero value with `0`, silently and permanently.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '1e-400' }],
+            OPTS,
+        );
+        expect(out).toContain('>1e-400<');
+        expect(out).toContain('t="inlineStr"');
+        // A typed zero is still a number.
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '0' }],
+            OPTS,
+        )).toContain('<c r="A1"><v>0</v></c>');
+    });
+
     it('refuses a worksheet whose first sheetData is commented out', () => {
         // The writer skips comments; the reader does not. `parse_xlsx` scans raw
         // text, so it finds the *commented* `<sheetData>` first and shows the values
