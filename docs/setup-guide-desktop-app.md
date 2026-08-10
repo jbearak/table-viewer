@@ -32,7 +32,7 @@ Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/r
 
 - Choose `table-viewer-…-x64-setup.exe` for most PCs.
 - Choose `table-viewer-…-arm64-setup.exe` for an Arm-based PC such as a Snapdragon laptop or Surface Pro X/11.
-- If you cannot install software, choose the matching `…-portable.exe` instead. It runs directly and does not add Start Menu or **Open with** entries.
+- If you cannot install software, choose the matching `…-portable.exe` instead. It runs directly with no Start Menu entry and adds per-user **Open with** entries on first launch.
 
 Run the downloaded file. The installer defaults to installing only for your account, which does not require administrator access. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time. Click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. If you would rather check the download first, each `.exe` on the release page has a matching `.sha256` file; run `Get-FileHash <file>` in PowerShell and compare.
 
@@ -40,7 +40,7 @@ Run the downloaded file. The installer defaults to installing only for your acco
 
 Download the [sample workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-sample.xlsx). Launch Table Viewer and click **Open File…**, or choose **File → Open…**, then select the downloaded workbook.
 
-You can also right-click a supported file in Finder or File Explorer and choose **Open With → Table Viewer** after installing the app. The installer adds Table Viewer as an available handler without replacing your current default spreadsheet program. The portable Windows version does not add this entry.
+You can also right-click a supported file in Finder or File Explorer and choose **Open With → Table Viewer** after installing or launching the app. Table Viewer becomes an available handler without replacing your current default spreadsheet program.
 
 The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, citrus, herb, and tea sheets. Click **Coffee Shelf** to get oriented.
 
@@ -106,7 +106,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 **The revised data appears in a separate window or view.** Check that it replaced the working file at exactly the same folder and filename. Saved views are tied to the file path.
 
-**You want to remove Table Viewer.** On macOS, move the application to the Trash, or, if you installed it with Homebrew, run `brew uninstall --cask table-viewer`. On Windows, uninstall it from **Installed apps**. If you chose the portable Windows version, close it and delete the downloaded `.exe`.
+**You want to remove Table Viewer.** On macOS, move the application to the Trash, or, if you installed it with Homebrew, run `brew uninstall --cask table-viewer`. On Windows, uninstall it from **Installed apps**. If you chose the portable Windows version, close it and delete the downloaded `.exe`; its per-user **Open with** entries may remain because there is no uninstaller.
 
 ## What feedback would be most helpful?
 
