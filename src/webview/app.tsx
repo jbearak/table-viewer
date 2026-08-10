@@ -587,6 +587,8 @@ export function App(): React.JSX.Element {
     // in handle_editing_change, so a request always reads the latest report and
     // there is no closure to go stale.
     const save_in_flight_ref = useRef(false);
+    /** `editing_another_sheet` for callbacks that must not re-subscribe on it. */
+    const editing_another_sheet_ref = useRef(false);
     const pending_excel_header_unhide_ref = useRef(false);
     const pending_excel_header_promote_ref = useRef(false);
     const pending_edit_request_ref = useRef<string | null>(null);
@@ -2984,11 +2986,25 @@ export function App(): React.JSX.Element {
     // GridShell reports editing status up so the toolbar dirty dot, pending-edit
     // persistence, and conflict banner — App-level concerns — can react. The
     // dirty map itself lives in edit_session_ref.
+    // Assigned during render, not in an effect: a grid mounted by this same render
+    // reports its editing status before effects run, and the stale value would be
+    // exactly the one that has to be right.
+    editing_another_sheet_ref.current = editing_another_sheet;
+
     const handle_editing_change = useCallback((status: EditingStatus) => {
         latest_live_edits_ref.current = Object.keys(status.edits).length > 0
             ? status.edits
             : undefined;
-        save_in_flight_ref.current = status.save_in_flight;
+        // `save_in_flight_ref` is document-scoped, but only the grid that owns the
+        // session is told about the save — a grid on any other worksheet is
+        // deliberately handed no lifecycle, so it reports `false` while a save is
+        // very much in flight. Letting it write that through cleared the flag, and
+        // the close/reload flush then published a pending-edit sequence the host
+        // ignores while a save is active: advertised, never acknowledged, and
+        // quitting waited on it until the barrier timed out.
+        if (!editing_another_sheet_ref.current) {
+            save_in_flight_ref.current = status.save_in_flight;
+        }
         set_editing_status(status);
     }, []);
 

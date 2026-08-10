@@ -832,9 +832,22 @@ export type SheetPendingEditCells = Record<string, string | CsvDirtyEntry>;
 export function pending_edits_for_sheet(
     pending: PerFileState['pendingEdits'],
     sheet_index: number,
+    // The worksheet actually at `sheet_index`, when the caller knows it.
+    sheet_name?: string,
 ): Record<string, string | CsvDirtyEntry> | undefined {
     const slot = pending?.[sheet_index];
-    return slot && Object.keys(slot.cells).length > 0 ? slot.cells : undefined;
+    if (!slot) return undefined;
+    // Position alone is not proof of ownership. Reconciliation cannot place two
+    // same-named slots at one index, so a slot tagged for a *different* worksheet
+    // can be sitting here — and handing its draft to a session on this sheet
+    // leaked one worksheet's edits into another, keyed to rows that mean something
+    // else. An untagged slot predates tagging and is single-sheet CSV by
+    // construction, so it keeps the positional answer.
+    if (sheet_name !== undefined && slot.sheetName !== undefined
+        && slot.sheetName !== sheet_name) {
+        return undefined;
+    }
+    return Object.keys(slot.cells).length > 0 ? slot.cells : undefined;
 }
 
 /**

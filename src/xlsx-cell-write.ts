@@ -307,6 +307,50 @@ function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): num
 }
 
 /**
+ * Every real `<name …>` opening tag in `[from, to)`, as [offset, whole tag].
+ *
+ * The one way to scan tags here. `matchAll(/<f\b[^>]*>/g)` gets both halves of
+ * this wrong: `[^>]*` stops at the first `>`, and a `>` inside a quoted attribute
+ * value is legal XML — `x:note="1 &gt; 0"` need not be escaped — so the "tag" it
+ * yields is a fragment, which made the safety guard refuse a perfectly editable
+ * worksheet and made a sheet named `Welcome > Intro` shift the workbook's
+ * worksheet numbering, writing an edit into the wrong sheet. And a bare regex has
+ * no idea what a comment is, so a commented-out element read as live.
+ * `find_tag_end` is the reader's own quote-aware scan; `ignorable_ranges` is what
+ * makes "live" mean live.
+ */
+/**
+ * Every real `<name …>` opening tag in a whole document, quote- and comment-aware.
+ *
+ * The package layer's `matchAll(/<sheet\b[^>]*>/g)` had the same defect as the
+ * writer's scans: a legal raw `>` inside a sheet name truncated the tag, the
+ * `name="` test then failed, and that worksheet dropped out of the numbering —
+ * so an edit aimed at sheet 0 was written into sheet 1. Silent, and valid on disk.
+ */
+export function* live_tags_in(xml: string, name: string): Generator<[number, string]> {
+    yield* live_tags(xml, name, 0, xml.length, ignorable_ranges(xml, 0, xml.length));
+}
+
+function* live_tags(
+    xml: string,
+    name: string,
+    from: number,
+    to: number,
+    ranges: ReadonlyArray<[number, number]>,
+): Generator<[number, string]> {
+    let pos = from;
+    while (pos < to) {
+        const at = indexOf_live(xml, `<${name}`, pos, ranges);
+        if (at === -1 || at >= to) return;
+        if (!is_tag_boundary(xml[at + name.length + 1])) { pos = at + 1; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1) return;
+        yield [at, xml.slice(at, tag_end + 1)];
+        pos = tag_end + 1;
+    }
+}
+
+/**
  * The first `needle` at or after `from` that is real markup rather than quoted text.
  *
  * Every raw `indexOf` in these scanners needs this, not just the ones that find
@@ -448,12 +492,11 @@ function grouped_formula_ranges(xml: string): GroupedRange[] {
     // Same reason `scan_rows` skips these: a commented-out array formula is text,
     // and treating it as a live range refuses an edit to a cell that is not in one.
     const ignorable = ignorable_ranges(xml, 0, xml.length);
-    for (const m of xml.matchAll(/<f\b[^>]*>/g)) {
-        if (ignorable_end(ignorable, m.index) !== undefined) continue;
-        const type = /\bt="([^"]*)"/.exec(m[0]);
+    for (const [, tag] of live_tags(xml, 'f', 0, xml.length, ignorable)) {
+        const type = /\bt="([^"]*)"/.exec(tag);
         const kind = type?.[1];
         if (!is_grouped_formula_kind(kind)) continue;
-        const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(m[0]);
+        const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(tag);
         if (!ref) continue;
         const start_col = letter_to_index(ref[1]);
         const start_row = Number(ref[2]) - 1;
@@ -510,10 +553,14 @@ function grouped_range_kind(
  * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
  */
 function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
-    const open = /<f\b[^>]*>/.exec(cell_inner);
-    if (!open) return null;
-    const type = /\bt="([^"]*)"/.exec(open[0]);
-    return is_grouped_formula_kind(type?.[1]) ? type![1] as GroupedFormulaKind : null;
+    // Only the cell's *live* `<f>`: an array formula quoted in a comment inside an
+    // ordinary cell refused a literal edit that was never part of a group.
+    const ignorable = ignorable_ranges(cell_inner, 0, cell_inner.length);
+    for (const [, tag] of live_tags(cell_inner, 'f', 0, cell_inner.length, ignorable)) {
+        const type = /\bt="([^"]*)"/.exec(tag);
+        return is_grouped_formula_kind(type?.[1]) ? type![1] as GroupedFormulaKind : null;
+    }
+    return null;
 }
 
 /** `A1`-style reference for a message a user will read. */
@@ -626,30 +673,39 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('namespace-prefixed cell elements');
         }
     }
-    for (const m of xml.matchAll(/<(?:row|c|f)\b([^>]*)>/g)) {
-        if (m.index < from || m.index >= to || !live(m.index)) continue;
+    const tags: Array<[number, string]> = [];
+    for (const name of ['row', 'c', 'f'] as const) {
+        // Whole tags, quote-aware. Matching `[^>]*` cut every tag at the first `>`,
+        // and a `>` inside a quoted attribute value is legal and needs no escaping —
+        // so the fragment left over had an unbalanced quote in it, failed the
+        // subtraction below, and refused a worksheet that edits perfectly well.
+        for (const found of live_tags(xml, name, from, to, ignorable)) tags.push(found);
+    }
+    for (const [at, tag] of tags) {
+        if (!live(at)) continue;
+        const attrs = tag.slice(tag.indexOf(' ') === -1 ? tag.length - 1 : tag.indexOf(' '), -1);
         // Whatever remains once every canonical `name="value"` pair is removed has
         // to be nothing but the tag's own whitespace and its self-closing slash.
         // Written as a subtraction so an attribute spelled some way not thought of
         // here still fails closed rather than passing unexamined.
-        const rest = m[1].replace(/\s[A-Za-z_:][\w.:-]*="[^"]*"/g, '');
+        const rest = attrs.replace(/\s[A-Za-z_:][\w.:-]*="[^"]*"/g, '');
         if (/\S/.test(rest.replace(/\/$/, ''))) {
             unsupported('attributes this writer cannot read the way a parser would');
         }
         // Entities are only a hazard in the values this writer reads back: `r="A&#49;"`
         // is `A1` to a parser and unmatchable here, so the cell is missed and the edit
         // appends a duplicate. Elsewhere in the tag an `&amp;` is ordinary and legal.
-        if (/\s(?:r|s|t|ref)="[^"]*&/.test(m[1])) {
+        if (/\s(?:r|s|t|ref)="[^"]*&/.test(attrs)) {
             unsupported('cell references written with XML entities');
         }
-        if (m[0].startsWith('<c') && !/\br="/.test(m[0])) {
+        if (tag.startsWith('<c') && !/\br="/.test(tag)) {
             unsupported('cells whose position is implied rather than written');
         }
         // A prefix is not the only way to move an element out of SpreadsheetML: a
         // default-namespace override (`<row xmlns="urn:other">`) rebinds the row and
         // every unprefixed child. A `<c>` spliced in there inherits the foreign
         // namespace, so the save reports success and no worksheet cell is written.
-        if (/\sxmlns(?::[\w.-]+)?=/.test(m[1])) {
+        if (/\sxmlns(?::[\w.-]+)?=/.test(attrs)) {
             unsupported('worksheet elements in a different XML namespace');
         }
     }
@@ -855,9 +911,12 @@ function find_sheet_data_open(xml: string): {
     element_start: number;
     element_end: number;
 } | null {
+    // A commented-out `<sheetData>` ahead of the live one took every edit into the
+    // comment: the worksheet on disk never changed and the save reported success.
+    const ignorable = ignorable_ranges(xml, 0, xml.length);
     let pos = 0;
     while (true) {
-        const start = xml.indexOf('<sheetData', pos);
+        const start = indexOf_live(xml, '<sheetData', pos, ignorable);
         if (start === -1) return null;
         if (!is_tag_boundary(xml[start + 10])) { pos = start + 1; continue; }
         const tag_end = find_tag_end(xml, start);
@@ -871,7 +930,7 @@ function find_sheet_data_open(xml: string): {
                 element_end: tag_end + 1,
             };
         }
-        const close = xml.indexOf('</sheetData>', tag_end);
+        const close = indexOf_live(xml, '</sheetData>', tag_end, ignorable);
         if (close === -1) return null;
         return {
             inner_start: tag_end + 1,
@@ -898,11 +957,18 @@ export function widen_dimension(
     max_row: number,
     max_col: number,
 ): string {
-    const start = xml.indexOf('<dimension');
-    if (start === -1 || !is_tag_boundary(xml[start + 10])) return xml;
-    const tag_end = find_tag_end(xml, start);
-    if (tag_end === -1) return xml;
-    const open_tag = xml.slice(start, tag_end + 1);
+    // The live one: widening a commented-out `<dimension>` left the real extent
+    // stale, which is what `<dimension>` is maintained here to prevent.
+    const found = live_tags(
+        xml,
+        'dimension',
+        0,
+        xml.length,
+        ignorable_ranges(xml, 0, xml.length),
+    ).next();
+    if (found.done) return xml;
+    const [start, open_tag] = found.value;
+    const tag_end = start + open_tag.length - 1;
     const m = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(open_tag);
     if (!m) return xml;
     const cur_start_col = letter_to_index(m[1]);

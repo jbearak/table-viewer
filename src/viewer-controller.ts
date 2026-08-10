@@ -2023,12 +2023,46 @@ export function attach_viewer(
         if (owns) {
             const owning = tagged.filter((index) => owns(slots?.[index]?.cells));
             if (owning.length === 1) return owning[0];
-            // Ambiguous either way: no slot holds the operation's entries (already
-            // cleaned, or never persisted), or several do. Fall through to position.
+            // Several slots hold entries matching the operation's, and nothing here
+            // can tell which is really its own — the user may have retyped the same
+            // value on the other one. Callers that must not guess ask
+            // `slot_indices_holding` and act on all of them.
             if (owning.length > 1 && owning.includes(captured_index)) return captured_index;
             if (owning.length > 1) return owning[0];
         }
         return tagged.includes(captured_index) ? captured_index : tagged[0];
+    }
+
+    /**
+     * Every slot tagged for this operation's worksheet that holds its entries.
+     *
+     * Where `slot_index_tagged` has to answer with one index, a cleanup does not:
+     * the entries it removes are matched by key *and* value, so removing them
+     * wherever they appear under this worksheet's name is exactly as targeted as
+     * removing them from one slot — and picking a single slot when several match
+     * deleted an unrelated draft while leaving the operation's own entries behind
+     * as a phantom. Empty when nothing matches, and the single-slot answer
+     * otherwise, so the ordinary case is unchanged.
+     */
+    function slot_indices_holding(
+        operation: CsvSaveOperation,
+        slots: PerFileState['pendingEdits'],
+        names?: readonly string[],
+    ): number[] {
+        const name = save_operation_sheet_names.get(operation);
+        if (name === undefined) return [operation.sheetIndex];
+        if (source) {
+            const index = sheet_index_named(name, names);
+            return index === undefined ? [] : [index];
+        }
+        const holding: number[] = [];
+        slots?.forEach((slot, index) => {
+            if (slot?.sheetName !== name) return;
+            if (holds_operation_entries(slot.cells, operation)) holding.push(index);
+        });
+        if (holding.length > 0) return holding;
+        const single = slot_index_tagged(slots, name, operation.sheetIndex);
+        return [single];
     }
 
     /**
@@ -2199,24 +2233,32 @@ export function attach_viewer(
                     // slot is unrelated work this cleanup must not touch. Resolved
                     // by name, because `update_file_state` has already reconciled
                     // `current`'s slots against the adopted workbook.
-                    const sheet_index = operation_sheet_index(
+                    // Every slot holding this operation's entries, not one guessed
+                    // between indistinguishable candidates: the strip matches key
+                    // *and* value, so it removes only what this save wrote.
+                    const targets = slot_indices_holding(
                         operation,
+                        current.pendingEdits,
                         names,
-                        current.pendingEdits,
                     );
-                    if (sheet_index === undefined) return current;
-                    const slot = current.pendingEdits?.[sheet_index];
-                    const pending_edits = strip_operation_owned_pending_edits(
-                        slot?.cells,
-                        operation,
-                    );
-                    if (pending_edits === slot?.cells) return current;
-                    const next = with_pending_edits_for_sheet(
-                        current.pendingEdits,
-                        sheet_index,
-                        pending_edits,
-                        slot?.sheetName,
-                    );
+                    let next = current.pendingEdits;
+                    let changed = false;
+                    for (const sheet_index of targets) {
+                        const slot = next?.[sheet_index];
+                        const pending_edits = strip_operation_owned_pending_edits(
+                            slot?.cells,
+                            operation,
+                        );
+                        if (pending_edits === slot?.cells) continue;
+                        changed = true;
+                        next = with_pending_edits_for_sheet(
+                            next,
+                            sheet_index,
+                            pending_edits,
+                            slot?.sheetName,
+                        );
+                    }
+                    if (!changed) return current;
                     if (next) return { ...current, pendingEdits: next };
                     const { pendingEdits: _drop, ...rest } = current;
                     return rest;
@@ -5313,6 +5355,7 @@ export function attach_viewer(
                         pending_edits_for_sheet(
                             (edit_state?.state as PerFileState | undefined)?.pendingEdits,
                             granted_sheet_index,
+                            sheet_name_at(granted_sheet_index),
                         ),
                     )
                     : undefined;

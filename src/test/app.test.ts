@@ -3707,6 +3707,78 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.latest_props?.save_lifecycle).toBeUndefined();
     });
 
+    it('keeps the save fence while a non-owning worksheet is on screen', async () => {
+        // `save_in_flight_ref` is document-scoped, but a grid on a sheet that does
+        // not own the session is deliberately handed no lifecycle and so reports
+        // `save_in_flight: false`. Letting it write that through cleared the fence,
+        // and the close/reload flush then published a pending-edit sequence the
+        // host ignores while a save is active — advertised, never acknowledged,
+        // and quitting waited on it until the barrier timed out.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'csvSaveLifecycle',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+        // The owning grid saw the save and reported it; the mock reports whatever
+        // this flag says, as the real GridShell reports its own derived state.
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        // Switching sheets mounts a grid that was handed no lifecycle, so it
+        // reports `save_in_flight: false` — truthfully, about a save it cannot see.
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-1',
+        });
+        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
+
+        // Fenced: the flush reports the sequence already produced rather than
+        // publishing a new one that could never be acknowledged.
+        const flush = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'pendingEditsFlush');
+        expect(flush?.highestProducedSequence).toBe(0);
+        expect(
+            post_message.mock.calls.some(
+                ([message]) => message?.type === 'pendingEditsChanged',
+            ),
+        ).toBe(false);
+    });
+
     it('adopts the worksheet the host names for a session it did not request', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(

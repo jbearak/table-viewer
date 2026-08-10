@@ -403,6 +403,57 @@ describe('apply_cell_edits', () => {
         expect(formula_count('<f>SUM(A1:A2)</f><!-- <f>doc</f> -->')).toBe(1);
     });
 
+    it('edits the live sheetData, not a commented-out one before it', () => {
+        // The element the whole splice is scoped to. Found by raw indexOf, a
+        // commented-out `<sheetData>` ahead of the live one took every edit into
+        // the comment: the worksheet never changed and the save reported success.
+        const out = apply_cell_edits(
+            '<?xml version="1.0"?><worksheet>'
+            + '<!-- <sheetData><row r="1"><c r="A1"><v>stale</v></c></row></sheetData> -->'
+            + '<sheetData><row r="1"><c r="A1"><v>live</v></c></row></sheetData></worksheet>',
+            [{ row: 0, col: 0, value: 'new' }],
+            OPTS,
+        );
+        expect(out).toContain('<!-- <sheetData><row r="1"><c r="A1"><v>stale</v></c></row></sheetData> -->');
+        expect(out).toContain('<t xml:space="preserve">new</t>');
+        expect(out).not.toContain('<v>live</v>');
+    });
+
+    it('widens the live dimension, not a commented-out one before it', () => {
+        const out = widen_dimension(
+            '<?xml version="1.0"?><worksheet>'
+            + '<!-- <dimension ref="A1"/> --><dimension ref="A1"/>'
+            + '<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>',
+            0, 0, 4, 4,
+        );
+        expect(out).toContain('<!-- <dimension ref="A1"/> -->');
+        expect(out).toContain('<dimension ref="A1:E5"/>');
+    });
+
+    it('does not refuse an edit over an array formula quoted inside the cell', () => {
+        // The per-cell grouped-formula check, unlike the sheet-wide one, still read
+        // comments — so an ordinary literal cell that merely documents an array
+        // formula refused an edit that was never part of a group.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><!-- <f t="array" ref="A1:B2"/> --><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'x' }],
+            OPTS,
+        );
+        expect(out).toContain('<t xml:space="preserve">x</t>');
+    });
+
+    it('accepts a legal raw > inside a quoted attribute value', () => {
+        // `>` needs no escaping inside an attribute value, so `[^>]*` cut the tag
+        // mid-attribute; the fragment left an unbalanced quote, failed the guard's
+        // subtraction, and refused a worksheet that edits perfectly well.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" x:note="1 > 0"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'x' }],
+            OPTS,
+        );
+        expect(out).toContain('<t xml:space="preserve">x</t>');
+    });
+
     it('does not refuse a cell whose only array formula is commented out', () => {
         const out = apply_cell_edits(
             doc(
@@ -747,6 +798,32 @@ describe('write_xlsx_cell_edits', () => {
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
             .toContain('<v>45306</v>');
+    });
+
+    it('numbers worksheets correctly when a sheet name contains a raw >', () => {
+        // `Welcome > Intro` is a legal sheet name and needs no escaping in the
+        // attribute. Under `[^>]*` the `<sheet>` tag was cut before its `name=`,
+        // the entry was skipped as unnamed, every later worksheet shifted down one
+        // — and an edit aimed at sheet 0 was written into sheet 1. Valid on disk,
+        // and wrong.
+        const raw = readFileSync(FORMATTED);
+        const file = CFB.read(raw, { type: 'buffer' });
+        const wb = CFB.find(file, '/xl/workbook.xml')!;
+        const text = Buffer.from(wb.content as Uint8Array).toString('utf8');
+        const first = /<sheet\b[^>]*name="([^"]*)"/.exec(text)![1];
+        const patched = Buffer.from(
+            text.replace(`name="${first}"`, 'name="Welcome > Intro"'),
+            'utf8',
+        );
+        wb.content = patched;
+        wb.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: 'MARK' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('MARK');
     });
 
     it('leaves every part it did not edit byte-identical', () => {

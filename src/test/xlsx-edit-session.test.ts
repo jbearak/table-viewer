@@ -927,6 +927,103 @@ describe('xlsx edit sessions', () => {
         ]);
     });
 
+    it('does not hand a displaced slot’s draft to the sheet sitting at its index', async () => {
+        // Reconciliation cannot place two same-named slots at one index, so an
+        // Inventory-tagged draft can sit at index 0 while sheet 0 is People. The
+        // grant path read the slot purely by position, so asking to edit People
+        // came back holding Inventory's cells — keyed to rows that mean something
+        // else there, and one save away from writing them into the wrong sheet.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        // Rehydration adopts Inventory at its own index; release it so People can
+        // be requested.
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+
+        const granted = latest_edit_session(panel)!;
+        expect(granted.granted).toBe(true);
+        expect(granted.sheetIndex).toBe(0);
+        expect((granted as { pendingEdits?: unknown }).pendingEdits).toBeUndefined();
+    });
+
+    it('clears its entries from every same-named slot holding them', async () => {
+        // Two slots tagged alike can both hold entries matching the operation's —
+        // the user legitimately retyped the same value on the other worksheet's
+        // draft — and nothing distinguishes them. Picking one deleted an unrelated
+        // draft and left the failed save's own entries behind as a phantom. The
+        // strip matches key *and* value, so removing them wherever they appear
+        // under this name is exactly as targeted.
+        const failed = {
+            '1:0': { value: 'Gadget', base: 'Widget' },
+            '2:0': { value: 'Shared', base: 'Gadget' },
+        };
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget', '2:0': 'Shared' },
+                dirtyEdits: failed,
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        // Slot 0 keeps the operation's partially-cleaned remainder; slot 1 holds an
+        // unrelated draft that happens to share one exact entry.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let injected = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!injected) {
+                injected = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        {
+                            sheetName: 'Inventory',
+                            cells: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                        },
+                        {
+                            sheetName: 'Inventory',
+                            cells: {
+                                '2:0': { value: 'Shared', base: 'Gadget' },
+                                '0:1': { value: 'Mine', base: 'Price' },
+                            },
+                        },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        controller_of(panel).dispose();
+        await wait_for_observable(() => injected);
+        await controller_of(panel).drain();
+
+        // Both of the operation's entries are gone; the unrelated one survives.
+        expect(state.get_state(file_path).pendingEdits).toEqual([
+            undefined,
+            { sheetName: 'Inventory', cells: { '0:1': { value: 'Mine', base: 'Price' } } },
+        ]);
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

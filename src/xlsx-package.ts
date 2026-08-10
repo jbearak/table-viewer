@@ -1,5 +1,5 @@
 import CFB from 'cfb';
-import { apply_cell_edits, formula_count, widen_dimension, type XlsxCellEdit } from './xlsx-cell-write';
+import { apply_cell_edits, formula_count, live_tags_in, widen_dimension, type XlsxCellEdit } from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
 import { decode_xml } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
@@ -32,11 +32,11 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
     // through worksheet relationships, which is what drops chartsheets and
     // dialogsheets from the numbering on both sides.
     const worksheet_targets = new Map<string, string>();
-    for (const m of rels.matchAll(/<Relationship\b[^>]*>/g)) {
-        const type = /\bType="([^"]*)"/.exec(m[0]);
+    for (const [, tag] of live_tags_in(rels, 'Relationship')) {
+        const type = /\bType="([^"]*)"/.exec(tag);
         if (!type?.[1].endsWith('/worksheet')) continue;
-        const id = /\bId="([^"]*)"/.exec(m[0]);
-        const target = /\bTarget="([^"]*)"/.exec(m[0]);
+        const id = /\bId="([^"]*)"/.exec(tag);
+        const target = /\bTarget="([^"]*)"/.exec(tag);
         if (!id || !target) continue;
         worksheet_targets.set(
             id[1],
@@ -45,9 +45,12 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
     }
 
     const rel_ids: string[] = [];
-    for (const m of wb.matchAll(/<sheet\b[^>]*>/g)) {
-        if (!/\bname="/.test(m[0])) continue;
-        const id = /\br:[iI]d="([^"]*)"/.exec(m[0]);
+    // Quote-aware: a sheet legally named `Welcome > Intro` truncated the tag under
+    // `[^>]*`, so its `name="` went missing, the entry was skipped as unnamed, and
+    // every later worksheet shifted down one — an edit written to the wrong sheet.
+    for (const [, tag] of live_tags_in(wb, 'sheet')) {
+        if (!/\bname="/.test(tag)) continue;
+        const id = /\br:[iI]d="([^"]*)"/.exec(tag);
         const rel_id = id ? id[1] : '';
         if (!worksheet_targets.has(rel_id)) continue;
         rel_ids.push(rel_id);
