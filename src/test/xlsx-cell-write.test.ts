@@ -25,6 +25,20 @@ function part(bytes: Uint8Array, path: string): Buffer | null {
 
 const OPTS = { datemode: 0 as const, is_date_style: () => false };
 
+/** `formatted.xlsx` with one substitution made in its styles part. */
+function patched_styles(from: string, to: string): Uint8Array {
+    const file = CFB.read(readFileSync(FORMATTED), { type: 'buffer' });
+    const entry = CFB.find(file, '/xl/styles.xml')!;
+    const patched = Buffer.from(
+        Buffer.from(entry.content as Uint8Array).toString('utf8').replace(from, to),
+        'utf8',
+    );
+    entry.content = patched;
+    entry.size = patched.length;
+    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
+
 describe('iso_to_serial', () => {
     it('converts plain ISO dates in the 1900 system', () => {
         expect(iso_to_serial('2024-01-15', 0)).toBe(45306);
@@ -466,6 +480,23 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
     });
 
+    it('edits the live cell, not element-shaped data inside a processing instruction', () => {
+        // Everything between `<?` and `?>` is opaque to a parser and its content is
+        // unconstrained, so a PI carrying element-shaped text is text. Scanning it
+        // as markup put the edit *inside the PI* and left the live A1 untouched:
+        // the save reports success and the cell on screen never changes.
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c></row>'
+                + '<?note <row r="1"><c r="A1"><v>quoted</v></c></row> ?>',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
+        expect(out).toContain('<?note <row r="1"><c r="A1"><v>quoted</v></c></row> ?>');
+    });
+
     it('refuses a worksheet whose markup it cannot read the way a parser would', () => {
         // Each of these scans as something other than what it is, and the failure
         // is silent: the prefixed formula is overwritten unseen (and calcChain is
@@ -488,6 +519,13 @@ describe('apply_cell_edits', () => {
             // child, so a `<c>` spliced in is not a SpreadsheetML cell at all — the
             // save would report success having written nothing Excel can see.
             '<row xmlns="urn:not-spreadsheet" r="1"><c r="B1"><v>1</v></c></row>',
+            // Any whitespace separates a tag name from its attributes, and a
+            // pretty-printer that writes one attribute per line uses a newline.
+            // Looking for a space alone found no attributes at all, so the
+            // subtraction examined an empty string and this unreadable `s` passed
+            // unexamined — the edit then dropped the cell's formatting.
+            '<row r="1"><c\nr="A1"\ns=\'7\'><v>1</v></c></row>',
+            '<row r="1"><c\tr="A1"\ts=\'7\'><v>1</v></c></row>',
         ];
         for (const inner of cases) {
             expect(() => apply_cell_edits(
@@ -826,6 +864,44 @@ describe('write_xlsx_cell_edits', () => {
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('MARK');
     });
 
+    it('reads a number format containing a legal raw >', () => {
+        // The same defect one part over: `<numFmts>` and its `<numFmt>` entries were
+        // matched with `[^>]*`, so a format code as ordinary as `yyyy>mm` cut its
+        // own tag short. The format went unread, the cell's date style was
+        // invisible, and a typed date was stored as an inline string under a format
+        // that renders dates.
+        const bytes = patched_styles('formatCode="$#,##0.00"', 'formatCode="yyyy>mm"');
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>45306</v>');
+    });
+
+    it('reads date1904 past a legal raw > in an earlier workbookPr attribute', () => {
+        // The two epochs are 1462 days apart, so misreading the mode writes a date
+        // four years off. `[^>]*` cut `<workbookPr>` before `date1904`, and a 1904
+        // workbook read as 1900.
+        const file = CFB.read(
+            patched_styles('formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'),
+            { type: 'buffer' },
+        );
+        const wb = CFB.find(file, '/xl/workbook.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(wb.content as Uint8Array).toString('utf8')
+                .replace('<workbookPr ', '<workbookPr note="1 > 0" date1904="1" '),
+            'utf8',
+        );
+        wb.content = patched;
+        wb.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>43844</v>');
+    });
+
     it('leaves every part it did not edit byte-identical', () => {
         const raw = readFileSync(SAMPLE);
         const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
@@ -893,6 +969,13 @@ describe('write_xlsx_cell_edits', () => {
         function with_calc_chain(
             raw: Uint8Array,
             paired: false | 'tight' | 'pretty' = false,
+            /**
+             * An extra attribute placed ahead of the ones that matter, on both
+             * references. `note="1 > 0"` is legal XML — a raw `>` inside a quoted
+             * value needs no escaping — and it is exactly what a `[^>]*` match cuts
+             * the tag short on.
+             */
+            extra = '',
         ): Uint8Array {
             const file = CFB.read(raw, { type: 'buffer' });
             CFB.utils.cfb_add(
@@ -904,9 +987,10 @@ describe('write_xlsx_cell_edits', () => {
             // wild use both. `paired` produces the `<X ...></X>` spelling —
             // 'pretty' with the newline a pretty-printer puts between the halves.
             const empty = (tag: string, attrs: string) => {
-                if (!paired) return `<${tag} ${attrs}/>`;
+                const all = `${extra}${attrs}`;
+                if (!paired) return `<${tag} ${all}/>`;
                 const gap = paired === 'pretty' ? '\n    ' : '';
-                return `<${tag} ${attrs}>${gap}</${tag}>`;
+                return `<${tag} ${all}>${gap}</${tag}>`;
             };
             for (const [path, insert] of [
                 ['/[Content_Types].xml', empty(
@@ -990,6 +1074,36 @@ describe('write_xlsx_cell_edits', () => {
                 written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
             );
             expect(text_part(raw, '/xl/worksheets/sheet3.xml')).toContain('<f>1+1</f>');
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
+        it('is detached completely when its references carry a legal raw >', () => {
+            // `<Override note="1 > 0" PartName=.../>` is ordinary XML: a raw `>`
+            // inside a quoted attribute value needs no escaping. Matching it with
+            // `[^>]*` cut the tag at that `>`, so neither reference matched, and the
+            // part was deleted while the content type and the relationship both went
+            // on naming it — a dangling reference, which is the repair prompt this
+            // removal exists to avoid.
+            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
+            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
+            const patched = Buffer.from(
+                Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
+                'utf8',
+            );
+            sheet.content = patched;
+            sheet.size = patched.length;
+            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
+            const raw = with_calc_chain(
+                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                false,
+                'note="1 > 0" ',
+            );
 
             const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
 

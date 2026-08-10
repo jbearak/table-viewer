@@ -1,5 +1,12 @@
 import CFB from 'cfb';
-import { apply_cell_edits, formula_count, live_tags_in, widen_dimension, type XlsxCellEdit } from './xlsx-cell-write';
+import {
+    apply_cell_edits,
+    element_content,
+    formula_count,
+    live_tags_in,
+    widen_dimension,
+    type XlsxCellEdit,
+} from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
 import { decode_xml } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
@@ -168,12 +175,17 @@ function read_style_date_predicate(
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
     if (!xml) return () => false;
 
+    // Quote-aware throughout, like the sheet enumeration above: a `>` inside a
+    // quoted attribute value is legal XML, so `[^>]*` cut both the `<numFmts>`
+    // opening tag and the `<numFmt>` entries short. A format code as ordinary as
+    // `yyyy>mm` then went unread, its date style was invisible here, and a typed
+    // date was stored as an inline string under a format that renders dates.
     const format_map = new Map<number, string>();
-    const num_fmts = /<numFmts\b[^>]*>([\s\S]*?)<\/numFmts>/.exec(xml);
-    if (num_fmts) {
-        for (const m of num_fmts[1].matchAll(/<numFmt\b[^>]*>/g)) {
-            const id = /\bnumFmtId="(\d+)"/.exec(m[0]);
-            const code = /\bformatCode="([^"]*)"/.exec(m[0]);
+    const num_fmts = element_content(xml, 'numFmts');
+    if (num_fmts !== null) {
+        for (const [, tag] of live_tags_in(num_fmts, 'numFmt')) {
+            const id = /\bnumFmtId="(\d+)"/.exec(tag);
+            const code = /\bformatCode="([^"]*)"/.exec(tag);
             // Decoded before anything reads it: `formatCode` is an XML attribute, so
             // a perfectly ordinary format like `0 "&"` is stored as
             // `0 &quot;&amp;&quot;` — and `SSF.is_date` says *true* of that escaped
@@ -184,11 +196,11 @@ function read_style_date_predicate(
     }
 
     const xfs: XfEntry[] = [];
-    const cell_xfs = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(xml);
-    if (cell_xfs) {
-        for (const m of cell_xfs[1].matchAll(/<xf\b[^>]*>/g)) {
-            const num_fmt_id = /\bnumFmtId="(\d+)"/.exec(m[0]);
-            const font_id = /\bfontId="(\d+)"/.exec(m[0]);
+    const cell_xfs = element_content(xml, 'cellXfs');
+    if (cell_xfs !== null) {
+        for (const [, tag] of live_tags_in(cell_xfs, 'xf')) {
+            const num_fmt_id = /\bnumFmtId="(\d+)"/.exec(tag);
+            const font_id = /\bfontId="(\d+)"/.exec(tag);
             xfs.push({
                 font_index: font_id ? Number(font_id[1]) : 0,
                 format_index: num_fmt_id ? Number(num_fmt_id[1]) : 0,
@@ -214,9 +226,13 @@ function read_style_date_predicate(
 function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
     const wb = read_part_text(cfb_file, '/xl/workbook.xml');
     if (!wb) return 0;
-    const m = /<workbookPr\b[^>]*>/.exec(wb);
-    if (!m) return 0;
-    const d = /\bdate1904="([^"]*)"/.exec(m[0]);
+    // Quote-aware for the same reason: `[^>]*` cuts `<workbookPr>` at a legal `>`
+    // in an earlier attribute value, and the fragment no longer carries
+    // `date1904`. The two epochs are 1462 days apart, so misreading the mode is
+    // not a rounding error — it writes a date four years off.
+    const [, m] = live_tags_in(wb, 'workbookPr').next().value ?? [];
+    if (m === undefined) return 0;
+    const d = /\bdate1904="([^"]*)"/.exec(m);
     return d && (d[1] === '1' || d[1] === 'true') ? 1 : 0;
 }
 
@@ -312,27 +328,52 @@ function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): 
     }
 }
 
-function escape_regexp(text: string): string {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/**
+ * Delete every live empty `<name …>` element that `wanted` selects.
+ *
+ * Both spellings: XML lets an empty element be written `<X .../>` or
+ * `<X ...></X>` — pretty-printed, with whitespace between the halves — and
+ * writers in the wild use both. Spans are removed back to front so the earlier
+ * offsets stay valid. An element that actually has content is left alone rather
+ * than half-deleted; both parts this serves are attribute-only by schema.
+ */
+function remove_elements(xml: string, name: string, wanted: (tag: string) => boolean): string {
+    const spans: Array<[number, number]> = [];
+    for (const [at, tag] of live_tags_in(xml, name)) {
+        if (!wanted(tag)) continue;
+        const inner_start = at + tag.length;
+        if (tag.endsWith('/>')) {
+            spans.push([at, inner_start]);
+            continue;
+        }
+        const close = xml.indexOf(`</${name}`, inner_start);
+        if (close === -1 || /\S/.test(xml.slice(inner_start, close))) continue;
+        const end = xml.indexOf('>', close);
+        if (end === -1) continue;
+        spans.push([at, end + 1]);
+    }
+    let out = xml;
+    for (const [start, end] of spans.reverse()) out = out.slice(0, start) + out.slice(end);
+    return out;
 }
 
 /**
  * Drop a part's `<Override>` from `[Content_Types].xml` after deleting the part.
  *
- * Both spellings of an empty element: XML lets `<Override .../>` be written
- * `<Override ...></Override>` — or, pretty-printed, with whitespace between the
- * halves. Matching only the self-closing form would leave a content-type override
- * naming a part that is no longer in the package — exactly the inconsistency Excel
- * offers to repair.
+ * Located quote-aware, then removed by span. A `[^>]*` match cut the tag at a
+ * legal `>` inside an earlier attribute value, so an `<Override>` carrying one
+ * never matched at all and the package kept a content type naming a part it no
+ * longer contains — exactly the inconsistency Excel offers to repair, and the one
+ * this removal exists to prevent.
  */
 function remove_content_type_override(cfb_file: ReturnType<typeof CFB.read>, part_name: string): void {
     const xml = read_part_text(cfb_file, '/[Content_Types].xml');
     if (!xml) return;
-    const re = new RegExp(
-        `<Override\\b[^>]*PartName="${escape_regexp(part_name)}"[^>]*(?:/>|>\\s*</Override>)`,
-        'g',
+    const stripped = remove_elements(
+        xml,
+        'Override',
+        (tag) => /\bPartName="([^"]*)"/.exec(tag)?.[1] === part_name,
     );
-    const stripped = xml.replace(re, '');
     if (stripped !== xml) write_part_text(cfb_file, '/[Content_Types].xml', stripped);
 }
 
@@ -349,19 +390,14 @@ function remove_workbook_relationship(
     const xml = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
     if (!xml) return;
     const wanted = part_path.replace(/^\//, '');
-    let stripped = xml;
-    // Self-closing or paired: see `remove_content_type_override`. A relationship
-    // left pointing at a deleted part is the other half of the same broken package.
-    // The `\s*` covers a pretty-printed package, where the two halves of an empty
-    // element sit on separate lines.
-    for (const m of xml.matchAll(/<Relationship\b[^>]*(?:\/>|>\s*<\/Relationship>)/g)) {
-        const target = /\bTarget="([^"]*)"/.exec(m[0]);
-        if (!target) continue;
-        const resolved = target[1].startsWith('/')
-            ? target[1].slice(1)
-            : `xl/${target[1]}`;
-        if (resolved !== wanted) continue;
-        stripped = stripped.replace(m[0], '');
-    }
+    // See `remove_content_type_override`: same quote-aware location, and a
+    // relationship left pointing at a deleted part is the other half of the same
+    // broken package.
+    const stripped = remove_elements(xml, 'Relationship', (tag) => {
+        const target = /\bTarget="([^"]*)"/.exec(tag);
+        if (!target) return false;
+        const resolved = target[1].startsWith('/') ? target[1].slice(1) : `xl/${target[1]}`;
+        return resolved === wanted;
+    });
     if (stripped !== xml) write_part_text(cfb_file, '/xl/_rels/workbook.xml.rels', stripped);
 }

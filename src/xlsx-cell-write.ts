@@ -263,8 +263,8 @@ function row_index_from_first_cell(
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
 /**
- * Ranges inside `[from, to)` whose contents are text, not markup: XML comments
- * and CDATA sections.
+ * Ranges inside `[from, to)` whose contents are text, not markup: XML comments,
+ * CDATA sections, and processing instructions.
  *
  * The scanners below match on raw `<row`/`<c` substrings, which is exact for real
  * markup and wrong for anything quoting it. A commented-out row — the shape a
@@ -273,12 +273,18 @@ function row_index_from_first_cell(
  * *into the comment*: the file stays valid, the save reports success, and the
  * cell on screen never changes. Skipping these ranges makes the writer agree with
  * an XML parser about what a row is, without needing one.
+ *
+ * A processing instruction is the third spelling of the same hazard. Everything
+ * between `<?` and `?>` is opaque data to a parser and its content is
+ * unconstrained, so element-shaped text in there is text — but reading it as
+ * markup let an edit rewrite a cell *inside the PI* while the live cell of that
+ * name kept its old value.
  */
 function ignorable_ranges(xml: string, from: number, to: number): Array<[number, number]> {
     const out: Array<[number, number]> = [];
     let pos = from;
     while (pos < to) {
-        const at = xml.indexOf('<!', pos);
+        const at = earliest_of(xml, ['<!', '<?'], pos);
         if (at === -1 || at >= to) break;
         let end: number;
         if (xml.startsWith('<!--', at)) {
@@ -287,6 +293,9 @@ function ignorable_ranges(xml: string, from: number, to: number): Array<[number,
         } else if (xml.startsWith('<![CDATA[', at)) {
             const close = xml.indexOf(']]>', at + 9);
             end = close === -1 ? to : close + 3;
+        } else if (xml.startsWith('<?', at)) {
+            const close = xml.indexOf('?>', at + 2);
+            end = close === -1 ? to : close + 2;
         } else {
             pos = at + 2;
             continue;
@@ -295,6 +304,16 @@ function ignorable_ranges(xml: string, from: number, to: number): Array<[number,
         pos = end;
     }
     return out;
+}
+
+/** The earliest occurrence at or after `from` of any of `needles`, or -1. */
+function earliest_of(xml: string, needles: readonly string[], from: number): number {
+    let best = -1;
+    for (const needle of needles) {
+        const at = xml.indexOf(needle, from);
+        if (at !== -1 && (best === -1 || at < best)) best = at;
+    }
+    return best;
 }
 
 /** Where to resume from if `at` falls inside an ignorable range, else undefined. */
@@ -329,6 +348,25 @@ function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): num
  */
 export function* live_tags_in(xml: string, name: string): Generator<[number, string]> {
     yield* live_tags(xml, name, 0, xml.length, ignorable_ranges(xml, 0, xml.length));
+}
+
+/**
+ * The inner text of the first live `<name>…</name>` element, or null.
+ *
+ * The same hazard one level up: `<numFmts[^>]*>([\s\S]*?)</numFmts>` cut the
+ * opening tag at the first `>`, so an attribute value legally containing one
+ * swallowed the element's content and every entry inside went unread. An empty
+ * element has no content and answers null.
+ */
+export function element_content(xml: string, name: string): string | null {
+    const ranges = ignorable_ranges(xml, 0, xml.length);
+    for (const [at, tag] of live_tags(xml, name, 0, xml.length, ranges)) {
+        if (tag.endsWith('/>')) return null;
+        const inner_start = at + tag.length;
+        const close = indexOf_live(xml, `</${name}`, inner_start, ranges);
+        return close === -1 ? null : xml.slice(inner_start, close);
+    }
+    return null;
 }
 
 function* live_tags(
@@ -683,7 +721,14 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
     }
     for (const [at, tag] of tags) {
         if (!live(at)) continue;
-        const attrs = tag.slice(tag.indexOf(' ') === -1 ? tag.length - 1 : tag.indexOf(' '), -1);
+        // Any whitespace separates a tag name from its attributes, not a space
+        // alone: `<c\nr="A1"\ns='7'>` is how a pretty-printer that writes one
+        // attribute per line spells an ordinary cell. Looking only for a space
+        // found none, so the subtraction below examined an empty string, the
+        // unreadable single-quoted style passed the guard unexamined, and the edit
+        // silently dropped the cell's formatting.
+        const first_space = /\s/.exec(tag)?.index;
+        const attrs = tag.slice(first_space ?? tag.length - 1, -1);
         // Whatever remains once every canonical `name="value"` pair is removed has
         // to be nothing but the tag's own whitespace and its self-closing slash.
         // Written as a subtraction so an attribute spelled some way not thought of
