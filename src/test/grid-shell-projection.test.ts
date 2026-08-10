@@ -251,7 +251,11 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
 // coordinates and our hook's editing_cell stays null). A separate React root
 // stands in for the portal; the component still closes over this GridShell's
 // refs, which is all the capture needs.
-async function open_tracking_overlay(cell: [number, number], text: string) {
+async function open_tracking_overlay(
+    cell: [number, number],
+    text: string,
+    on_finished_editing: (...args: unknown[]) => void = () => {},
+) {
     const on_selection_change = grid_mock.props!.onGridSelectionChange as
         (selection: unknown) => void;
     await act(async () => on_selection_change({
@@ -276,7 +280,7 @@ async function open_tracking_overlay(cell: [number, number], text: string) {
         overlay_root.render(React.createElement(provided.editor, {
             value,
             onChange: () => {},
-            onFinishedEditing: () => {},
+            onFinishedEditing: on_finished_editing,
         }));
     });
     return async function close_overlay() {
@@ -376,6 +380,135 @@ describe('GridShell column projection', () => {
         );
     });
 
+    it('wraps Tab and Shift+Tab through displayed columns', async () => {
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]),
+            rows: compact([]),
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        const tab = {
+            key: 'Tab',
+            altKey: false,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            rawEvent: { code: 'Tab', target: document.createElement('canvas') },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        };
+        await act(async () => on_key_down(tab));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([0, 1]);
+        expect(grid_mock.scroll_to).toHaveBeenLastCalledWith(0, 1);
+        expect(tab.cancel).toHaveBeenCalled();
+        expect(tab.preventDefault).toHaveBeenCalled();
+
+        await act(async () => on_key_down({ ...tab, shiftKey: true }));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+    });
+
+    it('keeps Tab focus inside the grid at the outer boundaries', async () => {
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 2, sourceRowCount: 2 },
+            row_count: 2,
+        }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        const select = async (cell: [number, number]) => act(async () => {
+            on_selection_change({
+                columns: compact([]),
+                rows: compact([]),
+                current: {
+                    cell,
+                    range: { x: cell[0], y: cell[1], width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+        const key = (shiftKey: boolean) => ({
+            key: 'Tab',
+            altKey: false,
+            shiftKey,
+            ctrlKey: false,
+            metaKey: false,
+            rawEvent: { code: 'Tab', target: document.createElement('canvas') },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        });
+
+        await select([0, 0]);
+        const backward = key(true);
+        await act(async () => on_key_down(backward));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([0, 0]);
+        expect(backward.cancel).toHaveBeenCalled();
+
+        await select([1, 1]);
+        const forward = key(false);
+        await act(async () => on_key_down(forward));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 1]);
+        expect(forward.cancel).toHaveBeenCalled();
+    });
+
+    it('restores grid focus after an edited Tab wraps to the next row', async () => {
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+        }));
+        const finished = vi.fn();
+        const close_overlay = await open_tracking_overlay([1, 0], 'typed', finished);
+        const input = document.querySelector<HTMLInputElement>('.cell-editor-input')!;
+        expect(document.activeElement).toBe(input);
+
+        await act(async () => {
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Tab',
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+        expect(finished).toHaveBeenCalledWith(
+            expect.objectContaining({ data: 'typed' }),
+            [0, 0],
+        );
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+
+        await close_overlay();
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([0, 1]);
+        expect(document.activeElement).toBe(
+            container!.querySelector('.data-editor-stub'),
+        );
+
+        const on_key_down = grid_mock.props!.onKeyDown as
+            (args: Record<string, unknown>) => void;
+        await act(async () => on_key_down({
+            key: 'Tab',
+            altKey: false,
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            rawEvent: { code: 'Tab', target: document.activeElement },
+            cancel: vi.fn(),
+            preventDefault: vi.fn(),
+        }));
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 1]);
+    });
+
     it('clears display selection when projection changes without remounting editing state', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         const GridShell = await render_grid(props({
@@ -416,6 +549,31 @@ describe('GridShell column projection', () => {
         const selection = grid_mock.props!.gridSelection as { current?: unknown };
         expect(selection.current).toBeUndefined();
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('retains display selection when a projection is recreated unchanged', async () => {
+        const GridShell = await render_grid(props());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: {},
+            rows: {},
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            column_projection: {
+                visible_to_source: [0, 2],
+                source_to_visible: [0, undefined, 1],
+                hidden_count: 1,
+            },
+        }))));
+
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
     });
 
     it('retargets shortcuts when the previously focused source column is hidden', async () => {

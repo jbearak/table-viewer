@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { GridCellKind, type GridCell } from '@glideapps/glide-data-grid';
-import { editor_key_intent, insert_newline } from './csv-cell-editor-model';
+import {
+    editor_key_intent,
+    insert_newline,
+    type EditorCommitNavigation,
+} from './csv-cell-editor-model';
 
 /** Glide movement delta: `[deltaCol, deltaRow]`, each clamped to -1/0/+1. */
 type Movement = readonly [-1 | 0 | 1, -1 | 0 | 1];
@@ -13,6 +17,7 @@ export interface CsvCellEditorProps {
     value: GridCell;
     onChange: (newValue: GridCell) => void;
     onFinishedEditing: (newValue?: GridCell, movement?: Movement) => void;
+    onCommitNavigation?: (navigation: EditorCommitNavigation) => void;
 }
 
 function cell_text(cell: GridCell): string {
@@ -26,15 +31,17 @@ function with_text(cell: GridCell, text: string): GridCell {
 /**
  * Custom CSV editor overlay (Phase E). Glide portals this into
  * `.gdg-clip-region`; it reproduces the old DOM editor's keyboard contract via
- * {@link editor_key_intent}: Enter commits down, Tab/Shift+Tab commit
- * right/left, Shift/Alt+Enter inserts a newline (growing to a textarea), Escape
- * discards, and Cmd/Ctrl+S bubbles to the window save handler. The grid shell
+ * {@link editor_key_intent}: Enter commits down, Tab/Shift+Tab commit for
+ * forward/backward traversal, Shift/Alt+Enter inserts a newline (growing to a
+ * textarea), Escape discards, and Cmd/Ctrl+S bubbles to the window save handler.
+ * The grid shell
  * mirrors the committed value into the dirty map via onCellEdited.
  */
 export function CsvCellEditor({
     value,
     onChange,
     onFinishedEditing,
+    onCommitNavigation,
 }: CsvCellEditorProps): React.JSX.Element {
     const initial = cell_text(value);
     const [text, set_text] = useState(initial);
@@ -59,9 +66,12 @@ export function CsvCellEditor({
         }
     }, [is_multiline]);
 
-    const commit = (movement: Movement) => {
+    const commit = (navigation: EditorCommitNavigation) => {
         const live = input_ref.current?.value ?? text;
-        onFinishedEditing(with_text(value, live), movement);
+        onCommitNavigation?.(navigation);
+        // GridShell owns post-commit selection, including row wrapping. Glide only
+        // commits the value and closes its overlay.
+        onFinishedEditing(with_text(value, live), [0, 0]);
     };
 
     const handle_key_down = (
@@ -73,20 +83,20 @@ export function CsvCellEditor({
                 e.stopPropagation();
                 onFinishedEditing(undefined);
                 return;
-            case 'commit-right':
+            case 'commit-tab-forward':
                 e.preventDefault();
                 e.stopPropagation();
-                commit([1, 0]);
+                commit('next');
                 return;
-            case 'commit-left':
+            case 'commit-tab-backward':
                 e.preventDefault();
                 e.stopPropagation();
-                commit([-1, 0]);
+                commit('previous');
                 return;
             case 'commit-down':
                 e.preventDefault();
                 e.stopPropagation();
-                commit([0, 1]);
+                commit('below');
                 return;
             case 'newline': {
                 e.preventDefault();

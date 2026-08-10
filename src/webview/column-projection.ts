@@ -9,6 +9,22 @@ export interface ColumnProjection {
     hidden_count: number;
 }
 
+/** Structural equality for projections recreated from an equivalent snapshot. */
+export function column_projections_equal(
+    left: ColumnProjection,
+    right: ColumnProjection,
+): boolean {
+    return left.hidden_count === right.hidden_count
+        && left.visible_to_source.length === right.visible_to_source.length
+        && left.visible_to_source.every(
+            (source, display) => source === right.visible_to_source[display],
+        )
+        && left.source_to_visible.length === right.source_to_visible.length
+        && left.source_to_visible.every(
+            (display, source) => display === right.source_to_visible[source],
+        );
+}
+
 export function sanitize_column_visibility_state(
     value: unknown,
     column_count = Number.MAX_SAFE_INTEGER,

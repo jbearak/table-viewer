@@ -19,12 +19,12 @@ describe('editor_key_intent', () => {
         expect(editor_key_intent(ev('Escape'))).toBe('cancel');
     });
 
-    it('Tab commits and moves right', () => {
-        expect(editor_key_intent(ev('Tab'))).toBe('commit-right');
+    it('Tab commits for forward traversal', () => {
+        expect(editor_key_intent(ev('Tab'))).toBe('commit-tab-forward');
     });
 
-    it('Shift+Tab commits and moves left', () => {
-        expect(editor_key_intent(ev('Tab', { shiftKey: true }))).toBe('commit-left');
+    it('Shift+Tab commits for backward traversal', () => {
+        expect(editor_key_intent(ev('Tab', { shiftKey: true }))).toBe('commit-tab-backward');
     });
 
     it('Enter commits and moves down', () => {
