@@ -5,6 +5,7 @@ import {
     has_any_pending_edits,
     type PerFileState,
     type StoredPerFileState,
+    stringify_stored_per_file_state,
 } from './types';
 
 const STATE_FORMAT = 'tableViewer.fileState.v1';
@@ -531,7 +532,7 @@ function complete_from_entry(
     return {
         entry: {
             ...metadata_from_entry(path, entry, recencyOrder),
-            stateJson: JSON.stringify(entry.state),
+            stateJson: stringify_stored_per_file_state(entry.state),
         },
         stages: Object.values(entry.stages ?? {}).map((stage) => structuredClone(stage)),
     };
@@ -782,7 +783,7 @@ function write_complete(
     tx.write_entry({
         entry: {
             ...value.entry,
-            stateJson: JSON.stringify(state),
+            stateJson: stringify_stored_per_file_state(state),
             hasPendingEdits: state_has_pending_edits(state),
             authorityStageCount: value.stages.length,
             ...(value.stages.length === 0 ? {} : {
@@ -1030,7 +1031,7 @@ function copy_in_transaction(
             ...source.entry,
             path: destinationPath,
             stateRevision: revision,
-            stateJson: JSON.stringify(state),
+            stateJson: stringify_stored_per_file_state(state),
             hasPendingEdits: state_has_pending_edits(state),
             recencyOrder: tx.allocate_recency_order(),
             updatedAtMs: capturedAt,
@@ -1085,7 +1086,7 @@ export function create_keyed_authority_store(
         compare_and_set(filePath, expectedRevision, state, validate, basis) {
             // Proposal capture and structural validation happen before queue admission.
             const proposed = decode_stored_per_file_state(state);
-            const proposedJson = JSON.stringify(proposed);
+            const proposedJson = stringify_stored_per_file_state(proposed);
             const capturedAt = Date.now();
             return writeTransaction('compareAndSet', (tx) => {
                 const currentEntry = tx.read_entry(filePath);
@@ -1247,7 +1248,7 @@ export function create_keyed_authority_store(
                 (complete as { entry: PersistedKeyedStateEntry }).entry = {
                     ...complete.entry,
                     stateRevision: revision,
-                    stateJson: JSON.stringify(nextState),
+                    stateJson: stringify_stored_per_file_state(nextState),
                     hasPendingEdits: state_has_pending_edits(nextState),
                     authority: nextAuthority,
                     recencyOrder: tx.allocate_recency_order(),

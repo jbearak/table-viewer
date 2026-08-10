@@ -4,6 +4,7 @@ import {
     has_any_pending_edits,
     pending_edits_for_sheet,
     reconcile_pending_edit_sheets,
+    stringify_stored_per_file_state,
     with_pending_edits_for_sheet,
 } from '../types';
 import type { PerFileState } from '../types';
@@ -67,6 +68,34 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         })).toThrow();
         expect(() => decode_stored_per_file_state({
             pendingEdits: [{ cells: { '0:0': { value: 'x' } } }],
+        })).toThrow();
+    });
+
+    it('round-trips through the persisted wrapper', () => {
+        // What actually goes to disk. The list is wrapped so `json_type` stays
+        // 'object' and the CHECK v0.8.0 installed on existing databases still
+        // passes — see `stringify_stored_per_file_state`.
+        const state = {
+            activeSheetIndex: 2,
+            pendingEdits: [{ sheetName: 'S', cells: { '1:2': entry('v', 'b') } }],
+        };
+        const json = stringify_stored_per_file_state(state as never);
+        expect(JSON.parse(json).pendingEdits).toEqual({ sheets: state.pendingEdits });
+        expect(decode_stored_per_file_state(JSON.parse(json))).toEqual(state);
+    });
+
+    it('leaves a state with no pending edits unwrapped', () => {
+        expect(stringify_stored_per_file_state({ activeSheetIndex: 1 } as never))
+            .toBe('{"activeSheetIndex":1}');
+    });
+
+    it('rejects a wrapper carrying anything but the sheet list', () => {
+        // The wrapper is told from a legacy flat map by its `sheets` key, so it has
+        // to be exactly that and nothing else — otherwise a malformed leaf could be
+        // read as a wrapper and silently lose the rest of its contents.
+        expect(() => decode_stored_per_file_state({ pendingEdits: { sheets: {} } })).toThrow();
+        expect(() => decode_stored_per_file_state({
+            pendingEdits: { sheets: [{ cells: { '0:0': entry('x') } }], '0:0': entry('y') },
         })).toThrow();
     });
 

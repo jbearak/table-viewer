@@ -209,16 +209,22 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
                                    OR copy_source_revision BETWEEN 0 AND 9007199254740990
                                ),
 
-    -- 'array' is the worksheet-scoped leaf (one slot per sheet); 'object' is the
-    -- pre-worksheet flat map, still on disk in rows written by older versions and
-    -- migrated on read. A CHECK only runs on write, so accepting both keeps those
-    -- rows readable without a rewrite pass.
+    -- Still 'object', and deliberately so. The worksheet-scoped leaf is a
+    -- positional list, but it persists wrapped as a "sheets" object rather than as
+    -- a bare array precisely to keep this line untouched: this DDL shipped in
+    -- v0.8.0, user_version is unchanged, migrate_sqlite_file_state_schema returns
+    -- early when the version already matches, and validation compares the stored
+    -- text exactly. Widening this to accept 'array' would therefore make every
+    -- existing user database fail to open -- their saved view state and every
+    -- unsaved draft in it -- and no migration could reach them, because the
+    -- migration path only ever initializes a fresh candidate. The wrapper is
+    -- described at pendingEdits in types.ts.
     CHECK (
         (has_pending_edits = 0
             AND json_type(state_json, '$.pendingEdits') IS NULL)
         OR
         (has_pending_edits = 1
-            AND json_type(state_json, '$.pendingEdits') IN ('array', 'object'))
+            AND json_type(state_json, '$.pendingEdits') = 'object')
     ),
     CHECK (
         (copy_id IS NULL

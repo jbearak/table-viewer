@@ -733,15 +733,30 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
 }
 
 /**
- * Decode `pendingEdits` in either shape, migrating the legacy flat map.
+ * Decode `pendingEdits` in any of its persisted shapes.
  *
- * A plain object is a pre-worksheet map of one CSV's edits and becomes slot 0
- * with no `sheetName` — see the `pendingEdits` doc comment for why that is the
- * correct reading rather than a lossy guess. An array is already worksheet-scoped.
- * Returns `undefined` when nothing survives, so the caller can drop the leaf.
+ * Three are accepted, and all three are objects on disk:
+ *
+ *  - `{sheets: [...]}` — what this version writes. See {@link encode_pending_edits}
+ *    for why the list is wrapped rather than stored bare.
+ *  - a bare array — never persisted, but this is also the in-memory shape, and the
+ *    same decoder runs over states that never went to disk.
+ *  - a flat cell map — the pre-worksheet shape, one CSV's edits, which becomes slot
+ *    0 with no `sheetName`. See the `pendingEdits` doc comment for why that is the
+ *    correct reading rather than a lossy guess.
+ *
+ * The wrapper is told from the flat map by its `sheets` key, which cannot collide:
+ * flat-map keys are all `"<row>:<col>"` and `validate_edit_cells` rejects anything
+ * else. Returns `undefined` when nothing survives, so the caller can drop the leaf.
  */
 function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefined)[] | undefined {
     if (is_plain_record(value)) {
+        if (Object.hasOwn(value, 'sheets')) {
+            if (Object.keys(value).length !== 1 || !Array.isArray(value.sheets)) {
+                invalid_leaf('pendingEdits');
+            }
+            return decode_pending_edits(value.sheets);
+        }
         const cells = validate_edit_cells(value);
         return Object.keys(cells).length === 0 ? undefined : [{ cells }];
     }
@@ -764,6 +779,28 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
     // from growing once and never shrinking as sheets are saved.
     while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();
     return slots.length === 0 ? undefined : slots;
+}
+
+/**
+ * Serialize a state for persistence, wrapping the `pendingEdits` list.
+ *
+ * The leaf is a positional array in memory but goes to disk as
+ * `{"sheets": [...]}`, because the SQLite `entries` table CHECKs
+ * `json_type(state_json, '$.pendingEdits') = 'object'` and that DDL shipped in
+ * v0.8.0. `user_version` did not change for this feature,
+ * `migrate_sqlite_file_state_schema` returns early when the version already
+ * matches, and validation compares the stored schema text exactly — so widening
+ * the CHECK to accept an array would have left every existing user database
+ * failing to open, with no migration able to reach it. One wrapper key is the
+ * whole cost of not breaking them.
+ *
+ * Use this rather than `JSON.stringify` anywhere the result is durable. In-memory
+ * comparisons may use either, as long as both sides use the same one.
+ */
+export function stringify_stored_per_file_state(state: StoredPerFileState): string {
+    const pending = (state as PerFileState).pendingEdits;
+    if (pending === undefined) return JSON.stringify(state);
+    return JSON.stringify({ ...state, pendingEdits: { sheets: pending } });
 }
 
 /** Validate known leaves while preserving unknown top-level leaves verbatim. */
