@@ -2229,8 +2229,15 @@ export function attach_viewer(
         if (!pending_edits) return undefined;
         const sheet_index = active_edit_sheet_index;
         if (sheet_index === undefined) return undefined;
+        // Named as well as indexed, so a slot tagged for another worksheet cannot
+        // be handed to this session by position alone. `pending_edits_for_sheet`
+        // has always refused that; it just needs to be told which sheet this is.
+        // Belt to the ordering fix in `reconcile_pending_edit_sheets`, which is
+        // what actually stops a parked slot from taking the index a live one has a
+        // right to — this is the cheaper of the two checks and the one that holds
+        // if a future placement rule gets it wrong again.
         const projected = pending_edits_for_current_session(
-            pending_edits_for_sheet(pending_edits, sheet_index),
+            pending_edits_for_sheet(pending_edits, sheet_index, active_edit_sheet_name),
         );
         const slot = pending_edits[sheet_index];
         // Preserve identity when nothing changed, so callers can keep using

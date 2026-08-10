@@ -1242,6 +1242,38 @@ describe('xlsx edit sessions', () => {
             .toContain('Parked');
     });
 
+    it('does not project a parked foreign draft when the session moves onto its slot', async () => {
+        // A parked slot has no worksheet, so it has no claim on an index either —
+        // it is only sitting somewhere. Reconciliation placed it in the same pass as
+        // slots whose names resolve, and array order decided: `Ghost` at 0 was
+        // reached first, took index 0, and the `Inventory` slot that had a *right*
+        // to that index found it occupied and fell aside. The session followed
+        // `Inventory` to index 0 as it should and found `Ghost`'s cells there —
+        // another worksheet's draft projected as the user's own, keyed to rows that
+        // mean something else, with the real draft displaced and invisible.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Ghost', cells: { '1:0': { value: 'Parked', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Real', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(JSON.stringify(latest_snapshot(panel).state?.pendingEdits ?? null))
+            .toContain('Real');
+
+        // Externally reorder, so `Inventory` lands exactly where `Ghost` is parked.
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => (
+            sheet_names(panel)[0] === 'Inventory'
+            && latest_snapshot(panel).capabilities.csvEditSheetIndex === 0
+        ));
+
+        const projected = JSON.stringify(latest_snapshot(panel).state?.pendingEdits ?? null);
+        expect(projected).toContain('Real');
+        expect(projected).not.toContain('Parked');
+    });
+
     it('does not adopt a parked draft into the worksheet at its stale index', async () => {
         // A draft whose name the workbook no longer has is parked at its old index
         // rather than deleted, because a rename and a deletion look the same from

@@ -1013,29 +1013,17 @@ export function reconcile_pending_edit_sheets(
             claimant.set(moved_to, index);
         }
     });
+    // Two passes, and the order between them is the whole point. A slot whose name
+    // resolves has a *right* to that index; a parked one is only sitting somewhere.
+    // Placing them together let position beat entitlement: park `Ghost` at 0, move
+    // `Inventory` from 1 to 0 externally, and `Ghost` — earlier in the array — took
+    // index 0 first, so `Inventory` found it occupied and fell to the loser branch.
+    // The session followed `Inventory` to index 0 and found a parked foreign draft
+    // there, its own real one displaced and invisible.
     pending.forEach((slot, index) => {
         if (!slot?.sheetName) return;
         const moved_to = index_of_name.get(slot.sheetName);
-        if (moved_to === undefined) {
-            // The name is not in this workbook — and nothing here can tell why. A
-            // worksheet deleted and a worksheet *renamed* look identical from this
-            // side: both are a tag that no longer resolves. Dropping the slot was
-            // therefore not "forgetting a deleted sheet's draft", it was deleting
-            // unsaved work every time someone renamed a sheet in Excel while the
-            // file was open — and durably, so renaming it back recovered nothing.
-            //
-            // So the slot is parked at its own index instead. Its draft stays
-            // attached to a worksheet that may not be its own, exactly like the
-            // duplicate-tag loser below: visible and dismissable, which is the
-            // recoverable direction to be wrong in. A genuinely deleted sheet leaves
-            // a draft the user can discard; a renamed one leaves the work intact.
-            while (next.length <= index) next.push(undefined);
-            let parked = next[index] === undefined ? index : next.indexOf(undefined);
-            if (parked === -1) parked = next.length;
-            next[parked] = slot;
-            if (parked !== index) changed = true;
-            return;
-        }
+        if (moved_to === undefined) return;
         while (next.length <= moved_to) next.push(undefined);
         if (claimant.get(moved_to) !== index || next[moved_to] !== undefined) {
             // A loser keeps its own index when that is free, so a reconciliation
@@ -1051,6 +1039,29 @@ export function reconcile_pending_edit_sheets(
         }
         if (moved_to !== index) changed = true;
         next[moved_to] = slot;
+    });
+    // Parked slots last, into whatever the resolving ones left free.
+    pending.forEach((slot, index) => {
+        if (!slot?.sheetName) return;
+        if (index_of_name.get(slot.sheetName) !== undefined) return;
+        // The name is not in this workbook — and nothing here can tell why. A
+        // worksheet deleted and a worksheet *renamed* look identical from this
+        // side: both are a tag that no longer resolves. Dropping the slot was
+        // therefore not "forgetting a deleted sheet's draft", it was deleting
+        // unsaved work every time someone renamed a sheet in Excel while the file
+        // was open — and durably, so renaming it back recovered nothing.
+        //
+        // So the slot is parked instead: at its own index when that is still free,
+        // else the first free one. Its draft stays attached to a worksheet that may
+        // not be its own, exactly like the duplicate-tag loser above: visible and
+        // dismissable, which is the recoverable direction to be wrong in. A
+        // genuinely deleted sheet leaves a draft the user can discard; a renamed one
+        // leaves the work intact.
+        while (next.length <= index) next.push(undefined);
+        let parked = next[index] === undefined ? index : next.indexOf(undefined);
+        if (parked === -1) parked = next.length;
+        next[parked] = slot;
+        if (parked !== index) changed = true;
     });
     if (!changed) return pending;
     while (next.length > 0 && next[next.length - 1] === undefined) next.pop();
