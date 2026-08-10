@@ -75,7 +75,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     } = props;
     const toolbar_ref = useRef<HTMLDivElement>(null);
     const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
-    const lead_ref = useRef<HTMLSpanElement>(null);
+    const lead_ref = useRef<HTMLDivElement>(null);
     const chips_ref = useRef<HTMLDivElement>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
     useImperativeHandle(focus_ref, () => ({
@@ -126,9 +126,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             {props.highlight && (
                 // Highlight is a control, not a chip: keep it out of the wrapping
                 // chip region so adding a sort or filter never shifts it to row two.
-                <span ref={lead_ref} className="toolbar-lead">
+                <div ref={lead_ref} className="toolbar-lead">
                     <HighlightControl {...props.highlight} />
-                </span>
+                </div>
             )}
             <div ref={chips_ref} className="toolbar-chips">
                 <SortStrip
