@@ -147,6 +147,9 @@ const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
  */
 const MAX_EXACT_DIGITS = 15;
 
+/** The namespace a worksheet's own elements are already in. */
+const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
 /**
  * How many significant digits a numeric literal spells out.
  *
@@ -1109,7 +1112,20 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         // leaves the unprefixed `<c>` exactly where it was — refusing on that
         // rejected an ordinary worksheet, and the prefixed elements themselves are
         // already caught above.
-        if (/\sxmlns=/.test(attrs)) {
+        //
+        // And only a declaration that actually *changes* the binding. Redeclaring
+        // the SpreadsheetML namespace the worksheet is already in is redundant but
+        // legal, and a generator may well emit it; refusing on it rejected a cell
+        // the reader displays perfectly well, with a message that was simply untrue
+        // — the namespace had not changed. A `<c>` spliced under such a row lands in
+        // exactly the namespace it would have had anyway.
+        const declared = /\sxmlns="([^"]*)"/.exec(attrs);
+        if (declared && declared[1] !== SPREADSHEETML_NS) {
+            unsupported('worksheet elements in a different XML namespace');
+        }
+        // A single-quoted or entity-bearing spelling is not read here, so it fails
+        // closed rather than being assumed harmless.
+        if (!declared && /\sxmlns=/.test(attrs)) {
             unsupported('worksheet elements in a different XML namespace');
         }
     }
@@ -1152,6 +1168,29 @@ export function apply_cell_edits(
             'Cannot edit this worksheet: it has a commented-out <sheetData> before the '
             + 'live one, which Table Viewer cannot edit safely. Re-saving the file in '
             + 'Excel will normally fix it.',
+        );
+    }
+
+    // And the same for the *end* of the element. The reader closes `<sheetData>` at
+    // the first literal `</sheetData>` from `indexOf` — comment-blind, and matching
+    // that exact spelling only. This scan skips quoted text and tolerates the legal
+    // `</sheetData >`, so the two disagree twice over:
+    //
+    //   - a comment containing `</sheetData>` ends the element early for the reader,
+    //     which then sees none of the rows after it, while the writer edits them
+    //     happily;
+    //   - a real close written `</sheetData >` is no close at all to the reader, so
+    //     `get_text` returns null and the sheet reads as empty.
+    //
+    // Either way the save reports success and changes nothing the user can see —
+    // the same divergence the guard above refuses, at the other end of the element.
+    // `self_closing` is exempt: the reader returns an empty string for it and the
+    // expansion below gives both sides the same element.
+    if (!self_closing && xml.indexOf('</sheetData>', inner_start) !== inner_end) {
+        throw new Error(
+            'Cannot edit this worksheet: its <sheetData> does not end where a parser '
+            + 'reading it would stop, so Table Viewer cannot edit it safely. '
+            + 'Re-saving the file in Excel will normally fix it.',
         );
     }
 

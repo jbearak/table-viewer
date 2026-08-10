@@ -89,6 +89,17 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
             .toBe('{"activeSheetIndex":1}');
     });
 
+    it('drops an empty pending-edits leaf rather than wrapping it', () => {
+        // The durable row's `has_pending_edits` column comes from
+        // `has_any_pending_edits`, which is false for all of these — while the leaf
+        // itself was still written, and the CHECK constraint pairing the two
+        // rejected the row outright.
+        for (const pendingEdits of [[], [undefined], [{ sheetName: 'S', cells: {} }]]) {
+            const json = stringify_stored_per_file_state({ activeSheetIndex: 1, pendingEdits } as never);
+            expect(JSON.parse(json), JSON.stringify(pendingEdits)).toEqual({ activeSheetIndex: 1 });
+        }
+    });
+
     it('rejects a wrapper carrying anything but the sheet list', () => {
         // The wrapper is told from a legacy flat map by its `sheets` key, so it has
         // to be exactly that and nothing else — otherwise a malformed leaf could be

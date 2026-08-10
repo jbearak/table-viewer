@@ -1062,6 +1062,45 @@ describe('apply_cell_edits', () => {
         )).toContain('<c r="A1"><v>0</v></c>');
     });
 
+    it('refuses a sheetData that does not end where the reader stops', () => {
+        // The reader closes the element at the first literal `</sheetData>` from
+        // `indexOf` — comment-blind, and that exact spelling only. A comment holding
+        // one ends the element early for the reader, which then never sees the rows
+        // after it; a real close written `</sheetData >` is no close at all, so the
+        // sheet reads as empty. Either way the writer edited rows happily and the
+        // save changed nothing the user could see.
+        for (const body of [
+            '<sheetData><!-- </sheetData> --><row r="1"><c r="A1"><v>1</v></c></row></sheetData>',
+            '<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData >',
+        ]) {
+            expect(() => apply_cell_edits(
+                `<worksheet>${body}</worksheet>`,
+                [{ row: 0, col: 0, value: '9' }],
+                OPTS,
+            ), body).toThrow(/does not end where a parser/);
+        }
+    });
+
+    it('allows a redundant declaration of the SpreadsheetML namespace', () => {
+        // Only a declaration that *changes* the binding moves an element out of the
+        // worksheet's namespace. Redeclaring the namespace it is already in is
+        // redundant but legal, and refusing on it rejected a cell the reader
+        // displays perfectly well — with a message that was untrue.
+        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const out = apply_cell_edits(
+            doc(`<row xmlns="${ns}" r="1"><c r="A1"><v>1</v></c></row>`),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out).toContain('<v>9</v>');
+        // A genuinely different one still refuses.
+        expect(() => apply_cell_edits(
+            doc('<row xmlns="urn:other" r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/different XML namespace/);
+    });
+
     it('refuses a worksheet whose first sheetData is commented out', () => {
         // The writer skips comments; the reader does not. `parse_xlsx` scans raw
         // text, so it finds the *commented* `<sheetData>` first and shows the values

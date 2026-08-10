@@ -799,7 +799,18 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
  */
 export function stringify_stored_per_file_state(state: StoredPerFileState): string {
     const pending = (state as PerFileState).pendingEdits;
-    if (pending === undefined) return JSON.stringify(state);
+    // An empty leaf is dropped, not wrapped. The durable row's `has_pending_edits`
+    // column comes from `has_any_pending_edits`, which is false for `[]`,
+    // `[undefined]`, and a slot whose `cells` is empty — while the leaf itself was
+    // still written, and the CHECK constraint pairing the two rejected the row.
+    // `decode_stored_per_file_state` already normalizes those away, so this only
+    // matters for a state that reaches durability without passing through it; it is
+    // the serializer's own invariant either way, and cheaper to hold here than to
+    // rely on every caller.
+    if (pending === undefined || !has_any_pending_edits(pending)) {
+        const { pendingEdits: _dropped, ...rest } = state as PerFileState;
+        return JSON.stringify(rest);
+    }
     return JSON.stringify({ ...state, pendingEdits: { sheets: pending } });
 }
 
