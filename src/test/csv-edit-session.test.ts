@@ -1706,6 +1706,7 @@ describe('CSV edit sessions', () => {
 
         await panel.__receive({ type: 'ready' });
         const snapshot = initial_snapshot(panel);
+        await settle_panel(panel);
         expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
             .toBe(false);
 
@@ -1788,10 +1789,34 @@ describe('CSV edit sessions', () => {
             { start: 0, count: 1 },
             { start: 500, count: 1 },
         ]));
+        expect(source.reads.every(({ start, count }) => (
+            count === 1 && (start === 0 || start === 500)
+        ))).toBe(true);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             rejection: { reason: 'baseMismatch', keys: ['0:0', '500:0'] },
         }));
+    });
+
+    it('bounds contiguous restored-edit source reads', async () => {
+        const values = Array.from({ length: 10_001 }, (_, row) => `row ${row}`);
+        const pendingEdits = Object.fromEntries(values.map((base, row) => [
+            `${row}:0`,
+            { value: `draft ${row}`, base },
+        ]));
+        const source = new RestoredEditSource(values);
+        const panel = open_csv_table(
+            uri('/tmp/rehydrated-contiguous.csv'),
+            state_store({ pendingEdits }).store,
+            { editing: true, build_source: async () => source },
+        );
+
+        await panel.__receive({ type: 'ready' });
+        await settle_panel(panel);
+        expect(source.reads).toEqual([
+            { start: 0, count: 10_000 },
+            { start: 10_000, count: 1 },
+        ]);
     });
 
     it('preserves restored edits when their targeted source read fails', async () => {

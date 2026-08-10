@@ -102,6 +102,8 @@ import {
     type WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
 
+const SAVE_WINDOW = 10_000;
+
 /** The host surface the controller needs: the core's `PanelLike` (postMessage)
  *  plus inbound messages. Both vscode.WebviewPanel and the unit-test mock panel
  *  satisfy it; html is set by the host before attaching. */
@@ -1718,22 +1720,25 @@ export function attach_viewer(
         const observed_bases = new Map<string, string>();
         const wanted_rows = [...wanted_columns.keys()].sort((left, right) => left - right);
         for (let index = 0; index < wanted_rows.length;) {
-            const start = wanted_rows[index];
-            let end = start;
+            const run_start = wanted_rows[index];
+            let end = run_start;
             while (wanted_rows[index + 1] === end + 1) {
                 end += 1;
                 index += 1;
             }
-            const window = src.read_rows(0, start, end - start + 1);
-            for (const [offset, row] of window.rows.entries()) {
-                const source_row = window.startRow + offset;
-                for (const col of wanted_columns.get(source_row) ?? []) {
-                    const cell = row[col];
-                    if (cell !== undefined) {
-                        observed_bases.set(
-                            `${source_row}:${col}`,
-                            cell === null ? '' : String(cell.raw ?? ''),
-                        );
+            for (let start = run_start; start <= end; start += SAVE_WINDOW) {
+                const count = Math.min(SAVE_WINDOW, end - start + 1);
+                const window = src.read_rows(0, start, count);
+                for (const [offset, row] of window.rows.entries()) {
+                    const source_row = window.startRow + offset;
+                    for (const col of wanted_columns.get(source_row) ?? []) {
+                        const cell = row[col];
+                        if (cell !== undefined) {
+                            observed_bases.set(
+                                `${source_row}:${col}`,
+                                cell === null ? '' : String(cell.raw ?? ''),
+                            );
+                        }
                     }
                 }
             }
@@ -2610,6 +2615,9 @@ export function attach_viewer(
                         && restored_pending_edits
                     ) {
                         try {
+                            // DataSource reads are synchronous by contract. Validate against
+                            // this exact source during installation, with SAVE_WINDOW bounding
+                            // each read; delivery of any verdict still waits for acknowledgement.
                             const validation = validate_restored_pending_edits(
                                 next,
                                 restored_pending_edits,
@@ -3456,7 +3464,6 @@ export function attach_viewer(
 
         let content: string;
         try {
-            const SAVE_WINDOW = 10_000;
             const row_count = src.meta().sheets[0].rowCount;
             function* row_windows(): Generator<(RenderedCell | null)[]> {
                 let absolute_row = 0;
