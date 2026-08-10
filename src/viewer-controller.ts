@@ -2883,7 +2883,10 @@ export function attach_viewer(
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
                                 ...(owns_edit_session() && active_edit_session_id
-                                    ? { csvEditSessionId: active_edit_session_id }
+                                    ? {
+                                        csvEditSessionId: active_edit_session_id,
+                                        csvEditSheetIndex: active_edit_sheet_index ?? 0,
+                                    }
                                     : {}),
                             },
                             stateSnapshot: adoption_state,
@@ -3078,7 +3081,10 @@ export function attach_viewer(
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
-                                            ? { csvEditSessionId: active_edit_session_id }
+                                            ? {
+                                                csvEditSessionId: active_edit_session_id,
+                                                csvEditSheetIndex: active_edit_sheet_index ?? 0,
+                                            }
                                             : {}),
                                     },
                                     stateSnapshot: project_state_for_panel(

@@ -513,6 +513,13 @@ function get_button(label: string): HTMLButtonElement {
     return button as HTMLButtonElement;
 }
 
+async function click_sheet_tab(name: string) {
+    const tab = Array.from(document.querySelectorAll<HTMLButtonElement>('.sheet-tab'))
+        .find((button) => button.textContent === name);
+    expect(tab).toBeDefined();
+    await act(async () => tab!.click());
+}
+
 async function click_button(label: string) {
     await act(async () => {
         get_button(label).click();
@@ -968,7 +975,9 @@ describe('workbook snapshot hydration', () => {
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
-                pendingEdits: sheet_edits({ '0:0': { value: 'new', base: 'old' } }),
+                // On the active sheet: editing is worksheet-scoped, so the grid only
+                // shows a restored map while the tab holding it is the one on screen.
+                pendingEdits: sheet_edits({ '0:0': { value: 'new', base: 'old' } }, 1),
                 transforms: [],
                 columnVisibility: [],
             },
@@ -3571,6 +3580,78 @@ describe('edit mode save exit', () => {
         // a subscriber of the *surviving* mount, which is the whole point of lifting
         // edit state above the grid generation.
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
+    });
+
+    it('shows edit mode only on the worksheet whose session the host granted', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        // Edit the second worksheet, then walk back to the first one.
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        const pendingEdits = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'inventory-session',
+            sheetIndex: 1,
+            pendingEdits,
+        });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await click_sheet_tab('People');
+        // Sheet 0 is not the sheet being edited, so it neither renders as editable
+        // nor offers an Edit button that would retarget the held session.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
+
+        // Returning to the edited sheet finds the session exactly as it was.
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
+            JSON.stringify(pendingEdits)
+        );
+    });
+
+    it('adopts the worksheet the host names for a session it did not request', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'adopted-session',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
     it('restores a clean owned edit session after receiver recreation', async () => {

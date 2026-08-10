@@ -838,6 +838,25 @@ export function pending_edits_for_sheet(
 }
 
 /**
+ * The worksheet a restored edit map belongs to, when nothing else names it.
+ *
+ * A snapshot that carries edits but no live session — a reload, a restored
+ * window — still says which sheet they are for, because the slot's index *is* the
+ * sheet. Only one sheet can hold edits at a time (a session is worksheet-scoped
+ * and there is one at a time), so the first occupied slot is the whole answer;
+ * `undefined` means there is nothing to attribute.
+ */
+export function sheet_index_with_pending_edits(
+    pending: PerFileState['pendingEdits'],
+): number | undefined {
+    if (!pending) return undefined;
+    for (let i = 0; i < pending.length; i++) {
+        if (pending_edits_for_sheet(pending, i)) return i;
+    }
+    return undefined;
+}
+
+/**
  * Replace one sheet's slot, preserving the others.
  *
  * Passing `undefined` cells clears that sheet — which is what a save or discard

@@ -11,6 +11,7 @@ import {
     MAX_PERSISTED_ROW_HEIGHTS,
     is_range_filter_operator,
     pending_edits_for_sheet,
+    sheet_index_with_pending_edits,
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
@@ -395,6 +396,10 @@ export function App(): React.JSX.Element {
      * silently retarget an in-flight save.
      */
     const edit_session_sheet_index_ref = useRef<number>(0);
+    // The same value as a rendered one. The ref is what callbacks read
+    // synchronously; this is what the toolbar and grid re-render against, so the
+    // Edit button and the editable grid follow the session from sheet to sheet.
+    const [edit_session_sheet_index, set_edit_session_sheet_index] = useState(0);
     const renderer_publication_fenced_session_ref = useRef<string>();
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
@@ -411,6 +416,17 @@ export function App(): React.JSX.Element {
         edit_mode_ref.current = next;
         set_edit_mode_state(next);
     }, []);
+    /**
+     * Edit mode as *this tab* sees it. A session belongs to one worksheet, so
+     * switching tabs mid-session must not show the grid another sheet's dirty map
+     * in a key space it does not share, nor light the Edit button as if this sheet
+     * were the one being edited.
+     */
+    const edit_mode_on_active_sheet =
+        edit_mode && active_sheet_index === edit_session_sheet_index;
+    /** A session is open, on some other worksheet. */
+    const editing_another_sheet =
+        edit_mode && active_sheet_index !== edit_session_sheet_index;
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
     const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
@@ -1242,6 +1258,22 @@ export function App(): React.JSX.Element {
                     }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
+                    // The sheet the *host's* session holds, which is the key space
+                    // its restored edits are in. A snapshot can arrive before any
+                    // grant this panel asked for (adoption, reload, a restored
+                    // window), so the ref's own value is not authoritative here.
+                    const snapshot_edit_sheet_index =
+                        snapshot.capabilities.csvEditSheetIndex
+                        // No session to name it: the durable slot does. A reload or a
+                        // restored window arrives this way, with edits and no owner.
+                        ?? sheet_index_with_pending_edits(
+                            snapshot.presentation === 'refresh'
+                                ? refresh_authoritative_state?.pendingEdits
+                                : initial_normalized_state?.pendingEdits,
+                        )
+                        ?? edit_session_sheet_index_ref.current;
+                    edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
+                    set_edit_session_sheet_index(snapshot_edit_sheet_index);
                     const refresh_editing_current_session =
                         snapshot.presentation === 'refresh'
                         && edit_mode_ref.current
@@ -1252,7 +1284,7 @@ export function App(): React.JSX.Element {
                             snapshot_edit_session_id,
                             pending_edits_for_sheet(
                                 refresh_authoritative_state?.pendingEdits,
-                                edit_session_sheet_index_ref.current,
+                                snapshot_edit_sheet_index,
                             ),
                         )
                         : undefined;
@@ -1407,7 +1439,7 @@ export function App(): React.JSX.Element {
                             snapshot_edit_session_id,
                             pending_edits_for_sheet(
                                 normalized.pendingEdits,
-                                edit_session_sheet_index_ref.current,
+                                snapshot_edit_sheet_index,
                             ),
                         );
                         const exact_session_succeeded =
@@ -2435,6 +2467,11 @@ export function App(): React.JSX.Element {
     }, [request_excel_header]);
 
     const handle_toggle_edit_mode = useCallback(() => {
+        // The button is disabled in this case; the guard is here so a keyboard or
+        // programmatic press cannot hand another worksheet's session to this tab.
+        if (edit_mode && active_sheet_index !== edit_session_sheet_index_ref.current) {
+            return;
+        }
         if (!edit_mode) {
             if (edit_session_pending) return;
             // Only work in flight, and only because the host refuses it: warning
@@ -2804,6 +2841,7 @@ export function App(): React.JSX.Element {
                     // A grant that names no sheet is a single-sheet source's, whose
                     // only sheet is 0.
                     edit_session_sheet_index_ref.current = msg.sheetIndex ?? 0;
+                    set_edit_session_sheet_index(msg.sheetIndex ?? 0);
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
@@ -3535,7 +3573,7 @@ export function App(): React.JSX.Element {
         installed_rules,
         dirty_keys,
     );
-    const stale_view_current_signature = edit_mode
+    const stale_view_current_signature = edit_mode_on_active_sheet
         ? stale_view_signature(
             installed_rules,
             dirty_keys,
@@ -3576,7 +3614,8 @@ export function App(): React.JSX.Element {
     // it ("Keep All") sticks until a *different* set of cells drifts.
     const conflicted_keys = editing_status?.conflicted ?? [];
     const conflict_signature = [...conflicted_keys].sort().join(',');
-    const show_host_rejection = edit_mode && live_rejected_keys.length > 0;
+    const show_host_rejection = edit_mode_on_active_sheet
+        && live_rejected_keys.length > 0;
     // A host rejection is an *independent* reason to render, because the keys it
     // names are exactly the ones the webview's residency-gated detection cannot
     // flag: requiring conflicted_keys.length > 0 would leave the banner (and every
@@ -3589,7 +3628,7 @@ export function App(): React.JSX.Element {
     // is safe because it cannot outlive the verdict: every save result clears both
     // (see clear_save_verdict).
     const show_conflict_banner =
-        edit_mode
+        edit_mode_on_active_sheet
         && (show_host_rejection || conflicted_keys.length > 0)
         && conflict_signature !== dismissed_conflict_signature;
     // Conflicts the *webview* derived and the host did not name. `conflicted_keys` is
@@ -3679,7 +3718,7 @@ export function App(): React.JSX.Element {
             on_row_resize={handle_row_resize}
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
-            edit_mode={edit_mode}
+            edit_mode={edit_mode_on_active_sheet}
             csv_editable={csv_editable}
             edit_session_id={csv_edit_session_id}
             save_operation={save_operation}
@@ -3789,7 +3828,7 @@ export function App(): React.JSX.Element {
                             : 'Show at least one column before using auto-fit.'
                         : 'Wait for sorting and filtering to finish.'
                 }
-                edit_mode={edit_mode}
+                edit_mode={edit_mode_on_active_sheet}
                 is_dirty={editing_status?.is_dirty ?? false}
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
@@ -3801,6 +3840,11 @@ export function App(): React.JSX.Element {
                 // disables, matching the host's own transient refusal.
                 edit_disabled={
                     editing_status?.save_in_flight === true
+                    // A session belongs to one worksheet, and the host holds one at
+                    // a time. So while another sheet's session is open this sheet's
+                    // Edit button has nothing to do: pressing it could only either
+                    // retarget that session or ask for a second one.
+                    || editing_another_sheet
                     || (!edit_mode && (
                         edit_session_pending
                         || transform_pending
@@ -3809,6 +3853,8 @@ export function App(): React.JSX.Element {
                 edit_disabled_reason={
                     editing_status?.save_in_flight
                         ? 'Saving changes.'
+                        : editing_another_sheet
+                        ? 'Finish editing the other worksheet first.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'
                         // Transform work in flight is the only disabler left.
