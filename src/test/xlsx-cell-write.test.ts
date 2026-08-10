@@ -200,6 +200,44 @@ describe('apply_cell_edits', () => {
             .toContain('<c r="A2"><v>9</v></c>');
     });
 
+    it('replaces a cell in a row that carries no r= attribute', () => {
+        // `r` is optional in SpreadsheetML and the reader never needed it. Skipping
+        // such a row made the writer synthesize a second one, so the sheet ended up
+        // with two A1s and a reader free to pick either.
+        const out = apply_cell_edits(
+            doc('<row><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out).toContain('<v>9</v>');
+        expect(out).not.toContain('<v>1</v>');
+        expect(out.match(/<row\b/g)).toHaveLength(1);
+        expect(out.match(/r="A1"/g)).toHaveLength(1);
+    });
+
+    it('refuses a cell inside a what-if data table', () => {
+        // `t="dataTable"` is the third grouped kind: one `<f>` with a `ref`, and
+        // result cells carrying only a cached value.
+        const table = '<row r="1"><c r="A1"><f t="dataTable" ref="A1:B2" r1="$D$1"/><v>1</v></c>'
+            + '<c r="B1"><v>2</v></c></row>';
+        expect(() => apply_cell_edits(doc(table), [{ row: 0, col: 0, value: '9' }], OPTS))
+            .toThrow(/A1.*data table/);
+        // A follower, which carries no formula of its own.
+        expect(() => apply_cell_edits(doc(table), [{ row: 1, col: 1, value: '9' }], OPTS))
+            .toThrow(/B2.*data table/);
+    });
+
+    it('rejects a time whose components are out of range', () => {
+        // `Date.UTC` rolls 12:60 to 13:00 and leaves the date alone, so the
+        // existing calendar round-trip check cannot see it.
+        expect(iso_to_serial('2024-01-15T12:60', 0)).toBeNull();
+        expect(iso_to_serial('2024-01-15T25:00', 0)).toBeNull();
+        expect(iso_to_serial('2024-01-15T12:30:60', 0)).toBeNull();
+        // Still accepted, unchanged.
+        expect(iso_to_serial('2024-01-15T12:30', 0)).toBeCloseTo(45306.5208333, 6);
+        expect(iso_to_serial('2024-01-15T23:59:59', 0)).not.toBeNull();
+    });
+
     it('drops control characters XML 1.0 cannot represent', () => {
         // Pasted from a terminal or a PDF, invisible in the grid, and fatal in the
         // part: there is no escape for these, so a numeric reference would be just
@@ -212,6 +250,17 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('abc');
         expect(out).not.toContain('\u000b');
         expect(out).not.toContain('\u0000');
+
+        // U+FFFE and U+FFFF are forbidden by XML 1.0 too, and survive UTF-8
+        // encoding intact — a worksheet part no reader accepts.
+        const noncharacters = apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="s"><v>0</v></c></row>'),
+            [{ row: 0, col: 0, value: 'x\uFFFEy\uFFFFz' }],
+            OPTS,
+        );
+        expect(noncharacters).toContain('xyz');
+        expect(noncharacters).not.toContain('\uFFFE');
+        expect(noncharacters).not.toContain('\uFFFF');
     });
 
     it('drops a formula when a literal overwrites it', () => {
@@ -479,18 +528,27 @@ describe('write_xlsx_cell_edits', () => {
          * fixture: none of the sample files has one, and the point of the test is
          * the three references (part, content type, relationship) moving together.
          */
-        function with_calc_chain(raw: Uint8Array): Uint8Array {
+        function with_calc_chain(raw: Uint8Array, paired = false): Uint8Array {
             const file = CFB.read(raw, { type: 'buffer' });
             CFB.utils.cfb_add(
                 file,
                 '/xl/calcChain.xml',
                 Buffer.from('<?xml version="1.0"?><calcChain><c r="B2" i="1"/></calcChain>'),
             );
+            // XML lets an empty element be written either way, and writers in the
+            // wild use both. `paired` produces the `<X ...></X>` spelling.
+            const empty = (tag: string, attrs: string) => (paired
+                ? `<${tag} ${attrs}></${tag}>`
+                : `<${tag} ${attrs}/>`);
             for (const [path, insert] of [
-                ['/[Content_Types].xml',
-                    '<Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/>'],
-                ['/xl/_rels/workbook.xml.rels',
-                    '<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml" Id="RcalcChain"/>'],
+                ['/[Content_Types].xml', empty(
+                    'Override',
+                    'PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"',
+                )],
+                ['/xl/_rels/workbook.xml.rels', empty(
+                    'Relationship',
+                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml" Id="RcalcChain"',
+                )],
             ] as const) {
                 const entry = CFB.find(file, path)!;
                 const text = Buffer.from(entry.content as Uint8Array).toString('utf8');
@@ -513,6 +571,32 @@ describe('write_xlsx_cell_edits', () => {
             expect(part(out, '/xl/calcChain.xml')).toEqual(part(raw, '/xl/calcChain.xml'));
             expect(text_part(out, '/[Content_Types].xml'))
                 .toContain('/xl/calcChain.xml');
+        });
+
+        it('is detached completely when its references use paired empty elements', () => {
+            // Same as below, with `<Override ...></Override>` and
+            // `<Relationship ...></Relationship>`. Matching only the self-closing
+            // spelling left the package naming a part it no longer contains.
+            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
+            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
+            const patched = Buffer.from(
+                Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
+                'utf8',
+            );
+            sheet.content = patched;
+            sheet.size = patched.length;
+            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
+            const raw = with_calc_chain(
+                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                true,
+            );
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
         });
 
         it('is detached completely when an edit drops a formula', () => {

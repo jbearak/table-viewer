@@ -200,11 +200,21 @@ function escape_regexp(text: string): string {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Drop a part's `<Override>` from `[Content_Types].xml` after deleting the part. */
+/**
+ * Drop a part's `<Override>` from `[Content_Types].xml` after deleting the part.
+ *
+ * Both spellings of an empty element: XML lets `<Override .../>` be written
+ * `<Override ...></Override>`, and matching only the self-closing form would
+ * leave a content-type override naming a part that is no longer in the package —
+ * exactly the inconsistency Excel offers to repair.
+ */
 function remove_content_type_override(cfb_file: ReturnType<typeof CFB.read>, part_name: string): void {
     const xml = read_part_text(cfb_file, '/[Content_Types].xml');
     if (!xml) return;
-    const re = new RegExp(`<Override\\b[^>]*PartName="${escape_regexp(part_name)}"[^>]*/>`, 'g');
+    const re = new RegExp(
+        `<Override\\b[^>]*PartName="${escape_regexp(part_name)}"[^>]*(?:/>|></Override>)`,
+        'g',
+    );
     const stripped = xml.replace(re, '');
     if (stripped !== xml) write_part_text(cfb_file, '/[Content_Types].xml', stripped);
 }
@@ -223,7 +233,9 @@ function remove_workbook_relationship(
     if (!xml) return;
     const wanted = part_path.replace(/^\//, '');
     let stripped = xml;
-    for (const m of xml.matchAll(/<Relationship\b[^>]*\/>/g)) {
+    // Self-closing or paired: see `remove_content_type_override`. A relationship
+    // left pointing at a deleted part is the other half of the same broken package.
+    for (const m of xml.matchAll(/<Relationship\b[^>]*(?:\/>|><\/Relationship>)/g)) {
         const target = /\bTarget="([^"]*)"/.exec(m[0]);
         if (!target) continue;
         const resolved = target[1].startsWith('/')

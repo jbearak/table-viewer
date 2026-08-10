@@ -54,7 +54,7 @@ function encode_xml(s: string): string {
         // one in without ever seeing it, and the result would be a worksheet part
         // no reader accepts — a corrupt workbook from one invisible character.
         // eslint-disable-next-line no-control-regex
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '');
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -95,11 +95,15 @@ export function iso_to_serial(text: string, datemode: 0 | 1): number | null {
     const [, y, mo, d, hh, mm, ss, ms] = m;
     const year = Number(y), month = Number(mo), day = Number(d);
     if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    // Bounded before `Date.UTC`, which rolls `12:60` forward to `13:00` and leaves
+    // the calendar date intact — so the round-trip check below cannot see it, and
+    // we would store a time the user did not type.
+    const hour = hh ? Number(hh) : 0;
+    const minute = mm ? Number(mm) : 0;
+    const second = ss ? Number(ss) : 0;
+    if (hour > 23 || minute > 59 || second > 59) return null;
     const utc = Date.UTC(
-        year, month - 1, day,
-        hh ? Number(hh) : 0,
-        mm ? Number(mm) : 0,
-        ss ? Number(ss) : 0,
+        year, month - 1, day, hour, minute, second,
         ms ? Number(ms.padEnd(3, '0')) : 0,
     );
     if (!Number.isFinite(utc)) return null;
@@ -204,6 +208,17 @@ interface Span {
     readonly open_tag: string;
 }
 
+/**
+ * The row number an unnumbered `<row>` implies, taken from its first `<c r="…">`.
+ *
+ * Undefined for a row with no referenced cell — there is nothing to edit in it,
+ * so leaving it unmapped costs nothing.
+ */
+function row_index_from_first_cell(xml: string, from: number, to: number): number | undefined {
+    const ref = /<c\b[^>]*\br="[A-Z]+(\d+)"/.exec(xml.slice(from, to));
+    return ref ? Number(ref[1]) - 1 : undefined;
+}
+
 /** Locate every `<row>` element in `sheetData`, in document order. */
 function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
     const out = new Map<number, Span>();
@@ -217,13 +232,25 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         const open_tag = xml.slice(start, tag_end + 1);
         const r = /\br="(\d+)"/.exec(open_tag);
         if (is_self_closing(xml, start, tag_end)) {
+            // Nothing inside to infer a row number from, and nothing to edit either.
             if (r) out.set(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, open_tag });
             pos = tag_end + 1;
             continue;
         }
         const close = xml.indexOf('</row>', tag_end);
         if (close === -1) break;
-        if (r) out.set(Number(r[1]) - 1, { start, end: close + 6, inner_start: tag_end + 1, open_tag });
+        // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
+        // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
+        // disagree, and an edit to a cell the user can plainly see took the
+        // synthesize-the-row path — appending a *second* row with a second copy of
+        // that cell. Duplicate coordinates, and a reader may pick either value.
+        // Recover the number from the first cell reference inside instead.
+        const row_index = r
+            ? Number(r[1]) - 1
+            : row_index_from_first_cell(xml, tag_end + 1, close);
+        if (row_index !== undefined) {
+            out.set(row_index, { start, end: close + 6, inner_start: tag_end + 1, open_tag });
+        }
         pos = close + 6;
     }
     return out;
@@ -261,9 +288,23 @@ function letter_to_index(letters: string): number {
     return index - 1;
 }
 
+/**
+ * Formula kinds whose `<f>` governs cells other than its own.
+ *
+ * `shared` names a definition its followers reference by `si`; `array` and
+ * `dataTable` each carry a `ref` spanning a range whose other cells hold only a
+ * cached value. Writing a literal into any of them leaves the group pointing at
+ * a definition that is gone, so all three are refused the same way.
+ */
+type GroupedFormulaKind = 'shared' | 'array' | 'dataTable';
+
+function is_grouped_formula_kind(value: string | undefined): value is GroupedFormulaKind {
+    return value === 'shared' || value === 'array' || value === 'dataTable';
+}
+
 /** A grouped formula's `ref` range, half-inclusive of nothing — both corners count. */
 interface GroupedRange {
-    readonly kind: 'shared' | 'array';
+    readonly kind: GroupedFormulaKind;
     readonly start_row: number;
     readonly start_col: number;
     readonly end_row: number;
@@ -290,7 +331,7 @@ function grouped_formula_ranges(xml: string): GroupedRange[] {
     for (const m of xml.matchAll(/<f\b[^>]*>/g)) {
         const type = /\bt="([^"]*)"/.exec(m[0]);
         const kind = type?.[1];
-        if (kind !== 'shared' && kind !== 'array') continue;
+        if (!is_grouped_formula_kind(kind)) continue;
         const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(m[0]);
         if (!ref) continue;
         const start_col = letter_to_index(ref[1]);
@@ -317,20 +358,22 @@ function grouped_formula_ranges(xml: string): GroupedRange[] {
  * user did not edit, which is the opposite of a surgical save, so this refuses
  * and says why instead of quietly corrupting the sheet.
  */
-function grouped_formula_error(row: number, col: number, kind: 'shared' | 'array'): Error {
+function grouped_formula_error(row: number, col: number, kind: GroupedFormulaKind): Error {
+    const described = kind === 'array'
+        ? 'an array formula'
+        : kind === 'dataTable' ? 'a data table' : 'a shared formula';
     return new Error(
-        `Cannot edit ${cell_reference(row, col)}: it is part of `
-        + `${kind === 'array' ? 'an array' : 'a shared'} formula. `
+        `Cannot edit ${cell_reference(row, col)}: it is part of ${described}. `
         + 'Clear the formula in Excel first.',
     );
 }
 
-/** `'shared'` / `'array'` when `row`/`col` falls inside some group's `ref`. */
+/** The group kind when `row`/`col` falls inside some group's `ref`. */
 function grouped_range_kind(
     ranges: readonly GroupedRange[],
     row: number,
     col: number,
-): 'shared' | 'array' | null {
+): GroupedFormulaKind | null {
     for (const r of ranges) {
         if (row >= r.start_row && row <= r.end_row && col >= r.start_col && col <= r.end_col) {
             return r.kind;
@@ -340,18 +383,16 @@ function grouped_range_kind(
 }
 
 /**
- * `'shared'` / `'array'` when the cell's `<f>` belongs to a multi-cell group.
+ * The group kind when the cell's own `<f>` belongs to a multi-cell group.
  *
  * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
  * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
  */
-function grouped_formula_kind(cell_inner: string): 'shared' | 'array' | null {
+function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
     const open = /<f\b[^>]*>/.exec(cell_inner);
     if (!open) return null;
     const type = /\bt="([^"]*)"/.exec(open[0]);
-    if (type?.[1] === 'shared') return 'shared';
-    if (type?.[1] === 'array') return 'array';
-    return null;
+    return is_grouped_formula_kind(type?.[1]) ? type![1] as GroupedFormulaKind : null;
 }
 
 /** `A1`-style reference for a message a user will read. */

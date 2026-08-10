@@ -6,6 +6,7 @@ import { attach_viewer, profile_for } from '../viewer-controller';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import CFB from 'cfb';
+import type { PerFileState } from '../types';
 import { parse_xlsx } from '../parse-xlsx';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
@@ -28,10 +29,6 @@ function read_fixture(name: string): Uint8Array {
 
 function uri(file_path: string): vscode.Uri {
     return vscode_mock.Uri.file(file_path) as unknown as vscode.Uri;
-}
-
-async function flush_promises(): Promise<void> {
-    for (let index = 0; index < 100; index += 1) await Promise.resolve();
 }
 
 function open_xlsx(
@@ -58,6 +55,14 @@ async function wait_for_observable(predicate: () => boolean): Promise<void> {
     throw new Error('Observable result did not arrive.');
 }
 
+function has_snapshot(panel: { __messages: unknown[] }): boolean {
+    return panel.__messages.some((candidate) => (
+        typeof candidate === 'object'
+        && candidate !== null
+        && (candidate as { type?: unknown }).type === 'workbookSnapshot'
+    ));
+}
+
 function latest_snapshot(panel: { __messages: unknown[] }) {
     const message = [...panel.__messages].reverse().find((candidate) => (
         typeof candidate === 'object'
@@ -67,6 +72,7 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
     return message.snapshot as unknown as {
         identity: unknown;
         capabilities: { csvEditSessionId?: string; csvEditSheetIndex?: number };
+        state?: PerFileState;
     };
 }
 
@@ -78,9 +84,10 @@ async function open_ready_xlsx(
 ) {
     const panel = open_xlsx(file_path, state);
     await panel.__receive({ type: 'ready' });
-    // The source build is async, so the first snapshot lands a few turns after
-    // `ready` resolves.
-    await flush_promises();
+    // The source build is async, so the first snapshot arrives some turns after
+    // `ready` resolves. Polled, never counted: a fixed number of turns that passes
+    // here is a CI flake already written.
+    await wait_for_observable(() => has_snapshot(panel));
     await panel.__receive({
         type: 'snapshotApplied',
         identity: latest_snapshot(panel).identity,
@@ -164,7 +171,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
         const after = await parse_xlsx(bytes);
@@ -199,7 +206,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect(bytes).toBe(untouched);
@@ -246,7 +253,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
 
         // Not a base mismatch — the base was read from the patched file — so the
         // refusal is the writer's, which is what this test is about.
@@ -271,7 +278,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Something else' } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
 
         expect(save_results(panel).at(-1)).toMatchObject({
             success: false,
@@ -304,7 +311,9 @@ describe('xlsx edit sessions', () => {
             type: 'releaseEditSession',
             editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
         });
-        await flush_promises();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
 
         await panel.__receive({ type: 'requestEditSession', requestId: 'b', sheetIndex: 1 });
         const session = latest_edit_session(panel)!;
@@ -320,11 +329,13 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
-        await wait_for_observable(() => save_results(panel).length > 0);
-        await flush_promises();
+        // The saved sheet's durable slot is cleared after the write reports, so
+        // that clear — not the save result — is the observable this waits on.
+        await wait_for_observable(
+            () => state.get_state(file_path).pendingEdits?.[1] === undefined,
+        );
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
-        expect(state.get_state(file_path).pendingEdits?.[1]).toBeUndefined();
         expect(state.get_state(file_path).pendingEdits?.[0]?.cells)
             .toEqual({ '1:0': { value: 'Draft', base: 'Ada' } });
     });
@@ -357,7 +368,6 @@ describe('xlsx edit sessions', () => {
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
-        await flush_promises();
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
         const after = await parse_xlsx(bytes);
@@ -399,7 +409,6 @@ describe('xlsx edit sessions', () => {
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
-        await flush_promises();
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
         const after = await parse_xlsx(bytes);
@@ -407,6 +416,32 @@ describe('xlsx edit sessions', () => {
         const people = after.data.sheets.find((sheet) => sheet.name === 'People')!;
         expect(inventory.rows[1][0]?.raw).toBe('Gadget');
         expect(people.rows[1][0]?.raw).toBe('Alice');
+    });
+
+    it('keeps a restored draft visible when the workbook is reordered', async () => {
+        // Session and durable slots are *both* positional, and a reorder invalidates
+        // each separately. Moving only the session leaves the projection reading the
+        // wrong slot: it finds nothing and drops the leaf, so the draft disappears
+        // from the grid while still sitting on disk — the user's unsaved work,
+        // silently gone from view with no way to notice.
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
+        );
+
+        // Inventory is slot 0 now, and the draft moved with it.
+        const projected = latest_snapshot(panel).state?.pendingEdits;
+        expect(projected?.[0]?.cells).toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
     });
 
     it('gives up the session when its worksheet is gone from the workbook', async () => {
@@ -433,7 +468,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Alice' } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw).toBe('Alice');
     });
@@ -454,7 +489,7 @@ describe('xlsx edit sessions', () => {
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
-        await flush_promises();
+        await wait_for_observable(() => save_results(panel).length > 0);
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
         expect(read_part(bytes, 'xl/styles.xml')).toEqual(styles_before);

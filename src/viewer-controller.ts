@@ -65,6 +65,7 @@ import {
     MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
     pending_edits_for_sheet,
+    reconcile_pending_edit_sheets,
     sanitize_excel_header_overrides,
     sheet_name_from_transform_schema,
     transform_has_entries,
@@ -1247,6 +1248,35 @@ export function attach_viewer(
     }
 
     /**
+     * The same snapshot with its pending-edit slots placed against `next`'s sheets.
+     *
+     * The durable leaf is positional, and the workbook being adopted may have
+     * reordered since it was written. Every other reader of durable state gets
+     * this for free by going through `normalize_host_state` on the way to a
+     * write; the adoption projection reads a snapshot directly, so it has to ask.
+     *
+     * Identity is preserved when nothing moved, so an adoption that changes
+     * nothing still hands `project_state_for_panel` the object it was given.
+     */
+    function reconciled_against(
+        snapshot: Readonly<FileStateSnapshot>,
+        next: DataSource,
+    ): Readonly<FileStateSnapshot> {
+        const state = snapshot.state as PerFileState;
+        if (!state.pendingEdits) return snapshot;
+        const reconciled = reconcile_pending_edit_sheets(
+            state.pendingEdits,
+            next.meta().sheets.map((sheet) => sheet.name),
+        );
+        if (reconciled === state.pendingEdits) return snapshot;
+        if (reconciled) {
+            return { revision: snapshot.revision, state: { ...state, pendingEdits: reconciled } };
+        }
+        const { pendingEdits: _drop, ...rest } = state;
+        return { revision: snapshot.revision, state: rest };
+    }
+
+    /**
      * Follow the edit session to its worksheet in a newly adopted workbook.
      *
      * A reload can bring back a workbook whose sheets were reordered, renamed or
@@ -1280,6 +1310,12 @@ export function attach_viewer(
         if (moved_to === active_edit_sheet_index) return 'kept';
         active_edit_sheet_index = moved_to;
         return 'moved';
+    }
+
+    /** Where `name` sits in the adopted workbook, or undefined if it is gone. */
+    function sheet_index_named(name: string): number | undefined {
+        const index = source?.meta().sheets.findIndex((sheet) => sheet.name === name);
+        return index === undefined || index === -1 ? undefined : index;
     }
 
     function durable_pending_edit_keys(sheet_index: number): readonly string[] {
@@ -1539,7 +1575,19 @@ export function attach_viewer(
 
     function save_operation_is_current(operation: CsvSaveHostOperation): boolean {
         return active_save_operation === operation
-            && edit_message_is_current(operation.identity.editSessionId);
+            && edit_message_is_current(operation.identity.editSessionId)
+            // The operation's worksheet is a position captured when the save began,
+            // and an external reorder mid-save moves the session off it. Without
+            // this term the operation stays "current" against a stale index:
+            // `persist_accepted_save` writes the accepted edits into whatever sheet
+            // now sits there and tags them with *that* sheet's name, which is worse
+            // than losing them — a later session on the innocent worksheet is
+            // offered another sheet's values as its own restored draft.
+            //
+            // `handle_save` already required this equality to start, so it can only
+            // fail here if the workbook moved underneath, and the save is refused as
+            // it would be for any other mid-flight external change.
+            && operation.identity.sheetIndex === active_edit_sheet_index;
     }
 
     function recapture_edit_capabilities(deliver = false): void {
@@ -2919,11 +2967,24 @@ export function attach_viewer(
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
                     const material = installed.snapshot_material();
                     const owned_before_projection = owns_edit_session();
-                    // Before anything reads `active_edit_sheet_index` against the new
-                    // workbook: the sheets may have moved under the session.
+                    // Both halves of the reorder, in one step, before any consumer
+                    // reads either. The session's index is a position and so are the
+                    // durable slots', and an external reorder invalidates both — but
+                    // it invalidates them *separately*. Rebasing the session alone
+                    // leaves the projection below indexing a reconciled session
+                    // against unreconciled slots: it reads the wrong sheet's slot,
+                    // finds nothing, and drops the leaf, so the user's restored draft
+                    // silently vanishes from the grid while still sitting on disk.
+                    //
+                    // Slots move by name (`reconcile_pending_edit_sheets`), the
+                    // session moves by name (`rebase_edit_session_sheet`), and both
+                    // read the same workbook, so afterwards they agree.
                     if (rebase_edit_session_sheet(next) === 'lost') lost_edit_sheet = true;
                     const adoption_state = project_state_for_panel(
-                        projected_state ?? committed.receipt.stateSnapshot,
+                        reconciled_against(
+                            projected_state ?? committed.receipt.stateSnapshot,
+                            next,
+                        ),
                         true,
                     );
                     // A session the projection above just rehydrated was claimed
@@ -5513,17 +5574,34 @@ export function attach_viewer(
                 pending_edit_admissions.add(admission);
                 // The posting session's sheet. Writes land in that slot only, so a
                 // post about one worksheet cannot clear another's unsaved edits.
+                //
+                // Named as well as numbered, because the write below is queued behind
+                // `pending_edit_writes` and can execute after a reload has reordered
+                // the workbook. The index alone would then address a different
+                // worksheet, and the write would store this sheet's edits in that
+                // one's slot *tagged with its name* — which `reconcile_pending_edit_sheets`
+                // reads as authoritative, so the mistake survives every later reload.
+                // The authority fence does not catch this: the write captures its
+                // expected revision when it executes, which is already after the reload.
                 const posted_sheet_index = active_edit_sheet_index ?? 0;
+                const posted_sheet_name = active_edit_sheet_name;
                 const write = pending_edit_writes.catch(() => {}).then(async () => {
                     const apply = (
                         current: PerFileState,
                         cells: SheetPendingEditCells | undefined,
                     ): PerFileState => {
+                        // Resolved now, not at admission: if the workbook reordered
+                        // while this write was queued, the sheet it was posted about
+                        // is the one still carrying that name. An untagged post (the
+                        // single-sheet CSV shape) has nothing to follow and stays put.
+                        const target_index = posted_sheet_name === undefined
+                            ? posted_sheet_index
+                            : sheet_index_named(posted_sheet_name) ?? posted_sheet_index;
                         const next = with_pending_edits_for_sheet(
                             current.pendingEdits,
-                            posted_sheet_index,
+                            target_index,
                             cells,
-                            sheet_name_at(posted_sheet_index),
+                            sheet_name_at(target_index),
                         );
                         if (next) return { ...current, pendingEdits: next };
                         if (!current.pendingEdits) return current;

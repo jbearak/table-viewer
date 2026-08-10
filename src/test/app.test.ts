@@ -3610,6 +3610,13 @@ describe('edit mode save exit', () => {
         // nor offers an Edit button that would retarget the held session.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        // And it must not be handed the other sheet's dirty map. Read-only is not
+        // enough on its own: the grid paints a dirty value and its tint whenever an
+        // edit exists for the key, edit mode or not, so sheet 1's '0:0' would show
+        // up as sheet 0's own edited cell — a value the user never typed here, in a
+        // worksheet they cannot even edit.
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
         expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
         post_message.mockClear();
         await click_button('Edit');

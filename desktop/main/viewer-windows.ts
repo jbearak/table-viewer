@@ -538,7 +538,7 @@ export class ViewerWindowManager {
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
         // Format capabilities come from the same shared profile factory as the
-        // VS Code extension: CSV/TSV are editable, while Excel remains read-only.
+        // VS Code extension: CSV/TSV and .xlsx worksheets are editable, .xls is not.
         const controller = attach_viewer(
             panel,
             file_path,

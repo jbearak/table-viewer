@@ -493,8 +493,9 @@ export function App(): React.JSX.Element {
     const [highlight_request_pending, set_highlight_request_pending] = useState(false);
     const [highlight_status, set_highlight_status] = useState('');
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
-    // unsaved work survives a webview reload. CSV is single-sheet, so this flat map
-    // belongs to the one editable sheet. Keys are source-keyed — see the
+    // unsaved work survives a webview reload. Flat, not worksheet-indexed like the
+    // durable leaf: a session owns exactly one worksheet, so this map is always
+    // that sheet's. Keys are source-keyed — see the
     // `pendingEdits` declaration in types.ts for why existing maps are
     // reinterpreted as source-keyed rather than migrated.
     const [initial_edits, set_initial_edits] = useState<
@@ -3724,8 +3725,20 @@ export function App(): React.JSX.Element {
             save_operation={save_operation}
             save_lifecycle={save_lifecycle}
             on_save_request={begin_save_operation}
-            initial_edits={initial_edits}
-            edit_session={edit_session_ref.current}
+            initial_edits={editing_another_sheet ? undefined : initial_edits}
+            // Withheld while a session is open on a *different* worksheet. Making
+            // this sheet read-only is not enough on its own: the grid paints a dirty
+            // value and its tint whenever the store holds that key, edit mode or
+            // not, and the key space is per-worksheet — so the other sheet's `0:0`
+            // would render here as this sheet's own edited cell, in a worksheet the
+            // user cannot even edit.
+            //
+            // Keyed on `editing_another_sheet` rather than on edit mode being on:
+            // a store whose session just ended still legitimately paints its dirty
+            // map on the sheet it belongs to, which is how a finished save leaves
+            // the grid. The store itself stays above the grid generation either way,
+            // so returning to the owning sheet finds the session intact.
+            edit_session={editing_another_sheet ? undefined : edit_session_ref.current}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

@@ -335,19 +335,23 @@ describe('unsaved-edit indicator', () => {
             editSessionId: 's',
             sequence: 1,
         })).toBe(true);
-        // Saving posts null; an empty map means the same thing.
+        // Saving posts null, and an empty map means the same thing — but only
+        // about the worksheet that posted it. Editing is worksheet-scoped, so a
+        // sibling sheet may still hold a draft this message says nothing about;
+        // answering `false` here would take the dot off a window with unsaved work
+        // in it. Only the workbook-wide snapshot below can clear the indicator.
         expect(dirty_from_webview_message({
             type: 'pendingEditsChanged',
             edits: null,
             editSessionId: 's',
             sequence: 2,
-        })).toBe(false);
+        })).toBeUndefined();
         expect(dirty_from_webview_message({
             type: 'pendingEditsChanged',
             edits: {},
             editSessionId: 's',
             sequence: 3,
-        })).toBe(false);
+        })).toBeUndefined();
     });
 
     // A draft restored from a previous session arrives host → webview; the webview
@@ -360,18 +364,39 @@ describe('unsaved-edit indicator', () => {
             editSessionId: 's',
             pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
         })).toBe(true);
+        // Same worksheet scoping as the webview post: a clean grant on one sheet
+        // is no evidence about the others, so it withholds rather than clears.
         expect(dirty_from_host_message({
             type: 'editSessionResult',
             requestId: 'r',
             granted: true,
             editSessionId: 's',
-        })).toBe(false);
+        })).toBeUndefined();
         expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }))).toBe(true);
         expect(dirty_from_host_message(snapshot())).toBe(false);
         // Any worksheet's draft marks the window. The leaf keeps cleared sheets as
         // holes, so reading only sheet 0 — or the array's length — would miss this.
         expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }, 2))).toBe(true);
         expect(dirty_from_host_message(snapshot({}, 2))).toBe(false);
+    });
+
+    it('keeps the window marked when another worksheet still holds a draft', () => {
+        // Sheet 0 has a draft; sheet 1 is granted a clean session and then saved.
+        // Neither worksheet-local message may clear the workbook-wide indicator.
+        expect(dirty_from_host_message(snapshot({ '0:0': 'draft' }))).toBe(true);
+        expect(dirty_from_host_message({
+            type: 'editSessionResult',
+            requestId: 'r',
+            granted: true,
+            editSessionId: 's',
+            sheetIndex: 1,
+        })).toBeUndefined();
+        expect(dirty_from_webview_message({
+            type: 'pendingEditsChanged',
+            edits: null,
+            editSessionId: 's',
+            sequence: 1,
+        })).toBeUndefined();
     });
 
     // undefined means "no information": the indicator must not flip on messages
