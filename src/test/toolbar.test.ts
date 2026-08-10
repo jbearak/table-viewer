@@ -670,6 +670,84 @@ describe('Toolbar', () => {
         }
     });
 
+    it('keeps Highlight on the first toolbar row when sort and filter chips wrap', () => {
+        const scroll_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'scrollWidth',
+        );
+        const client_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'clientWidth',
+        );
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                if (this.classList.contains('sort-strip')) return 210;
+                if (this.classList.contains('filter-strip')) return 240;
+                if (this.classList.contains('toolbar-item')) return 90;
+                return 0;
+            },
+        });
+        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                return this.classList.contains('toolbar') ? 420 : 0;
+            },
+        });
+        const style = document.createElement('style');
+        style.textContent = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+        document.head.appendChild(style);
+        try {
+            const { container } = render_toolbar({
+                transform: {
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [{
+                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
+                        caseSensitive: false, enabled: true,
+                    }],
+                },
+                highlight: {
+                    active_color: 'yellow',
+                    on_color_change: vi.fn(),
+                    on_apply: vi.fn(),
+                    on_clear: vi.fn(),
+                    on_clear_all: vi.fn(),
+                    selection_available: true,
+                    pending: false,
+                    status: '',
+                },
+            });
+            const toolbar = container.querySelector('.toolbar') as HTMLElement;
+            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
+            const highlight = container.querySelector('.highlight-trigger') as HTMLElement;
+
+            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
+            // Only .toolbar-chips is pushed onto the second row, so Highlight must
+            // live outside it to stay put when a sort or filter appears.
+            expect(getComputedStyle(chips).flexBasis).toBe('100%');
+            expect(chips.contains(highlight)).toBe(false);
+            expect(highlight.closest('.toolbar-lead')).not.toBeNull();
+            expect(getComputedStyle(
+                highlight.closest('.toolbar-lead') as HTMLElement,
+            ).flexBasis).not.toBe('100%');
+        } finally {
+            style.remove();
+            if (scroll_width) {
+                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+            }
+            if (client_width) {
+                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+            }
+        }
+    });
+
     it('repositions a visible tooltip when a captured ancestor scroll moves its button', () => {
         let button_left = 40;
         vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')

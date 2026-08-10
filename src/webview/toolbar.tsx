@@ -123,8 +123,14 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             <span className="sr-only" role="status" aria-live="polite">
                 {props.excel_header_status ?? ''}
             </span>
+            {props.highlight && (
+                // Highlight is a control, not a chip: keep it out of the wrapping
+                // chip region so adding a sort or filter never shifts it to row two.
+                <span ref={lead_ref} className="toolbar-lead">
+                    <HighlightControl {...props.highlight} />
+                </span>
+            )}
             <div ref={chips_ref} className="toolbar-chips">
-                {props.highlight && <HighlightControl {...props.highlight} />}
                 <SortStrip
                     state={transform}
                     column_names={column_names}
