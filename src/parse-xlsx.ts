@@ -153,6 +153,34 @@ function get_entry_text(cfb_file: ReturnType<typeof CFB.read>, path: string): st
 
 // --- Workbook Parsing ---
 
+/**
+ * A relationship `Target` resolved to a package path, without a leading slash.
+ *
+ * `.` and `..` segments are legal in a relative URI reference and mean what they do
+ * anywhere else, so `./worksheets/sheet1.xml` names the same part as
+ * `worksheets/sheet1.xml`. Concatenating without resolving them produced
+ * `xl/./worksheets/sheet1.xml`, which matches no entry in the package — the reader
+ * then displayed that worksheet as empty, and the save failed outright on a file
+ * Excel opens perfectly well.
+ *
+ * Shared with the writer rather than duplicated there, which is how the two came to
+ * disagree: the writer resolved the dot segment and the reader did not, so a save
+ * would have spliced into a worksheet the user was shown as blank.
+ */
+export function resolve_part_path(target: string): string {
+    const absolute = target.startsWith('/');
+    const segments = (absolute ? target.slice(1) : `xl/${target}`).split('/');
+    const out: string[] = [];
+    for (const segment of segments) {
+        if (segment === '.' || segment === '') continue;
+        // A `..` that would climb above the package root has nowhere to go; dropping
+        // it keeps the path inside the package rather than inventing a parent.
+        if (segment === '..') { out.pop(); continue; }
+        out.push(segment);
+    }
+    return out.join('/');
+}
+
 function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, string> {
     const map = new Map<string, string>();
     const xml = get_entry_text(cfb_file, '/xl/_rels/workbook.xml.rels');
@@ -164,13 +192,38 @@ function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, st
         const id = get_attr(open_tag, 'Id');
         const target = get_attr(open_tag, 'Target');
         if (id && target) {
-            // Targets are relative to xl/
-            const resolved = target.startsWith('/') ? target.slice(1) : `xl/${target}`;
-            map.set(id, resolved);
+            map.set(id, resolve_part_path(target));
         }
     });
 
     return map;
+}
+
+/**
+ * Worksheet part paths in the order this reader numbers the sheets — `xl/…`, no
+ * leading slash — for the writer to resolve a sheet index against.
+ *
+ * Exported so the two sides cannot disagree. The writer had its own enumeration,
+ * written to the same intent but not the same code, and every difference between
+ * them was an edit written into a worksheet other than the one the user was
+ * looking at. Two found that way: the writer read both quote styles where
+ * `get_attr` reads only `"…"`, so a legally single-quoted `name` gave the two a
+ * different sheet count; and the writer skipped `<sheet>` tags inside comments
+ * where `iter_elements` counts them. Neither disagreement is a bug in the writer's
+ * half — it is the more nearly correct one — but "correct" is not the requirement
+ * here. Indexing identically is, and sharing one enumeration is the only way to
+ * have it hold for the next difference nobody thought of.
+ */
+export function worksheet_part_paths(buffer: Uint8Array): string[] {
+    const cfb_file = CFB.read(buffer, { type: 'buffer' });
+    const rels = parse_sheet_rels(cfb_file);
+    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
+    if (!workbook_xml) return [];
+    // `parse_xlsx` drops a sheet whose relationship does not resolve *before*
+    // numbering the rest, so the filter belongs here too — see its own loop.
+    return parse_workbook_xml(workbook_xml).sheets
+        .map((sheet) => rels.get(sheet.rId))
+        .filter((path): path is string => path !== undefined);
 }
 
 function parse_shared_strings(xml: string): string[] {

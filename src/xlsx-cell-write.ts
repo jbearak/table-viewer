@@ -48,6 +48,13 @@ function encode_xml(s: string): string {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
+        // A raw CR does not survive: XML 1.0 requires every parser to normalize
+        // `\r` and `\r\n` in content to a single `\n` before the application ever
+        // sees it, so a literal one is not "preserved as typed" — it is silently a
+        // line feed on the way back in, and `\r\n` loses a character outright. The
+        // numeric reference is exempt from that normalization, which is what makes
+        // it the only spelling that round-trips. Excel writes CRs this way too.
+        .replace(/\r/g, '&#13;')
         // Control characters XML 1.0 forbids outright: they have no escape, so a
         // numeric reference would be just as invalid as the raw byte. Excel drops
         // them on paste too. A user pasting from a terminal or a PDF can carry
@@ -805,6 +812,25 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
     for (const m of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?AlternateContent\b/g)) {
         if (m.index >= from && m.index < to && live(m.index)) {
             unsupported('markup-compatibility alternate content');
+        }
+    }
+    // A commented-out cell that carries an `r`. Being right about XML is not
+    // enough here: `parse_xlsx` scans raw text with `indexOf`, so a `<c r="A1">`
+    // written inside a comment is a cell *to the reader*, and a later one wins over
+    // the live cell before it. The writer correctly edits the live cell, the reader
+    // correctly-for-itself keeps the commented value, and the save reports success
+    // having changed nothing the user can see.
+    //
+    // Refused rather than followed: splicing the comment would mean writing into
+    // text every conforming parser discards, and teaching the reader to skip
+    // comments is a reader change this branch does not make. A comment with no `r`
+    // in it is invisible to both sides and stays allowed — that is the ordinary
+    // annotated worksheet, and refusing it would be a false positive.
+    for (const [start, end] of ignorable) {
+        if (start < from || start >= to) continue;
+        if (!xml.startsWith('<!--', start)) continue;
+        if (/<c\s[^>]*\br=/.test(xml.slice(start, end))) {
+            unsupported('cells commented out but still carrying a reference');
         }
     }
     const tags: Array<[number, string]> = [];

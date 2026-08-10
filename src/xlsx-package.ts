@@ -9,7 +9,7 @@ import {
     type XlsxCellEdit,
 } from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
-import { decode_xml } from './parse-xlsx';
+import { decode_xml, resolve_part_path, worksheet_part_paths } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 
 /**
@@ -27,71 +27,6 @@ import type { XfEntry, DateMode } from './spreadsheet-format';
  * construction — the strongest preservation guarantee available, and the one the
  * `putexcel` requirement actually asks for.
  */
-
-/** Resolve `sheet_index` (workbook order) to its worksheet part path, e.g. `xl/worksheets/sheet3.xml`. */
-function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index: number): string | null {
-    const wb = read_part_text(cfb_file, '/xl/workbook.xml');
-    const rels = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
-    if (!wb || !rels) return null;
-
-    // Indexed exactly as the reader indexes them, or `sheet_index` names a
-    // different worksheet here than the one the user was looking at — a valid
-    // file, silently wrong. So: skip unnamed `<sheet>` entries, and resolve only
-    // through worksheet relationships, which is what drops chartsheets and
-    // dialogsheets from the numbering on both sides.
-    const worksheet_targets = new Map<string, string>();
-    for (const [, tag] of live_tags_in(rels, 'Relationship')) {
-        const type = attr(tag, 'Type');
-        if (!type?.endsWith('/worksheet')) continue;
-        const id = attr(tag, 'Id');
-        const target = attr(tag, 'Target');
-        if (id === null || target === null) continue;
-        // `attr` decodes, here and on the workbook side below, because the two
-        // parts need not spell the same id the same way: `Id="R1&#54;f42588"` and
-        // `r:id="R16f42588"` are one relationship to a parser and two strings to a
-        // raw compare. The lookup then missed, the entry was skipped as
-        // unresolvable, and every later worksheet shifted down one — an edit
-        // written to the wrong sheet.
-        worksheet_targets.set(id, resolve_part_path(target));
-    }
-
-    const rel_ids: string[] = [];
-    // Quote-aware: a sheet legally named `Welcome > Intro` truncated the tag under
-    // `[^>]*`, so its `name="` went missing, the entry was skipped as unnamed, and
-    // every later worksheet shifted down one — an edit written to the wrong sheet.
-    for (const [, tag] of live_tags_in(wb, 'sheet')) {
-        if (attr(tag, 'name') === null) continue;
-        const rel_id = attr(tag, 'r:[iI]d') ?? '';
-        if (!worksheet_targets.has(rel_id)) continue;
-        rel_ids.push(rel_id);
-    }
-    const rel_id = rel_ids[sheet_index];
-    return rel_id ? worksheet_targets.get(rel_id) ?? null : null;
-}
-
-/**
- * A relationship `Target` resolved to a package path, without a leading slash.
- *
- * `.` and `..` segments are legal in a relative URI reference and mean what they
- * do anywhere else, so `./worksheets/sheet1.xml` names the same part as
- * `worksheets/sheet1.xml`. Concatenating without resolving them produced
- * `xl/./worksheets/sheet1.xml`, which matched no entry in the package: the save
- * failed outright with "Could not read the worksheet to save" on a file that opens
- * perfectly well in Excel.
- */
-function resolve_part_path(target: string): string {
-    const absolute = target.startsWith('/');
-    const segments = (absolute ? target.slice(1) : `xl/${target}`).split('/');
-    const out: string[] = [];
-    for (const segment of segments) {
-        if (segment === '.' || segment === '') continue;
-        // A `..` that would climb above the package root has nowhere to go; dropping
-        // it keeps the path inside the package rather than inventing a parent.
-        if (segment === '..') { out.pop(); continue; }
-        out.push(segment);
-    }
-    return out.join('/');
-}
 
 function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
     const entry = CFB.find(cfb_file, path);
@@ -341,7 +276,11 @@ export function write_xlsx_cell_edits(
         throw new Error('Not a valid .xlsx file');
     }
 
-    const part = worksheet_part_path(cfb_file, sheet_index);
+    // The reader's own enumeration, not a second one written to match it: see
+    // `worksheet_part_paths`. `sheet_index` is the index of the worksheet the user
+    // was looking at, so anything that numbers differently here saves into a
+    // different sheet — valid file, wrong data, no error.
+    const part = worksheet_part_paths(raw)[sheet_index];
     if (!part) throw new Error('Could not locate the worksheet to save');
 
     const sheet_xml = read_part_text(cfb_file, `/${part}`);

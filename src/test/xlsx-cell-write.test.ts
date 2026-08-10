@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
 import { write_xlsx_cell_edits } from '../xlsx-package';
-import { parse_xlsx } from '../parse-xlsx';
+import { parse_xlsx, worksheet_part_paths } from '../parse-xlsx';
 import {
     apply_cell_edits,
     classify_value,
@@ -27,7 +27,14 @@ const OPTS = { datemode: 0 as const, is_date_style: () => false };
 
 /** `formatted.xlsx` with one substitution made in each of the named parts. */
 function patched_parts(edits: Array<[part: string, from: string | RegExp, to: string]>): Uint8Array {
-    const file = CFB.read(readFileSync(FORMATTED), { type: 'buffer' });
+    return patched_in(readFileSync(FORMATTED), edits);
+}
+
+function patched_in(
+    raw: Buffer,
+    edits: Array<[part: string, from: string | RegExp, to: string]>,
+): Uint8Array {
+    const file = CFB.read(raw, { type: 'buffer' });
     for (const [path, from, to] of edits) {
         const entry = CFB.find(file, path)!;
         const before = Buffer.from(entry.content as Uint8Array).toString('utf8');
@@ -41,6 +48,11 @@ function patched_parts(edits: Array<[part: string, from: string | RegExp, to: st
     }
     const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
     return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
+
+/** `basic.xlsx` — two worksheets — with one substitution made in each named part. */
+function patched_basic(edits: Array<[part: string, from: string | RegExp, to: string]>): Uint8Array {
+    return patched_in(readFileSync('src/test/fixtures/basic.xlsx'), edits);
 }
 
 /** `formatted.xlsx` with one substitution made in its styles part. */
@@ -360,19 +372,38 @@ describe('apply_cell_edits', () => {
         expect(absent).toContain('<c r="A1"><v>3</v></c>');
     });
 
-    it('edits the real row, not a commented-out one that names the same cell', () => {
-        // A commented-out row is text, but the scanners match raw `<row`/`<c`
-        // substrings. Treating one as live spliced the new value inside the comment:
-        // the file stays valid, the save reports success, and nothing changes.
-        const out = apply_cell_edits(
+    it('refuses a commented-out cell that names a live one', () => {
+        // A commented-out cell is text to a parser, and this writer is right about
+        // that — but `parse_xlsx` scans raw substrings, so to *the reader* a
+        // `<c r="A1">` inside a comment is a cell, and a later one wins over the
+        // live cell before it. Splicing the live cell therefore produced a save that
+        // reported success while the grid went on showing `stale`. Neither side can
+        // act on the other's reading, so the shape is refused.
+        expect(() => apply_cell_edits(
             doc(
                 '<row r="1"><c r="A1"><v>1</v></c></row>'
                 + '<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->',
             ),
             [{ row: 0, col: 0, value: '2' }],
             OPTS,
+        )).toThrow(/cannot\s+edit\s+safely/i);
+    });
+
+    it('edits the real row, not a commented-out one the reader also ignores', () => {
+        // The scanners match raw `<row`/`<c` substrings, so a commented-out row was
+        // treated as live and the new value spliced inside the comment: valid file,
+        // successful save, nothing changed. Carrying no `r`, this comment is
+        // invisible to the reader too, so there is nothing to refuse — the writer
+        // simply has to skip it.
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c></row>'
+                + '<!-- <row r="1"><c><v>stale</v></c></row> -->',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
         );
-        expect(out).toContain('<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->');
+        expect(out).toContain('<!-- <row r="1"><c><v>stale</v></c></row> -->');
         expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
     });
 
@@ -408,8 +439,11 @@ describe('apply_cell_edits', () => {
         // the row was filed under the wrong number — and an edit to a cell plainly
         // present took the synthesize-the-row path, appending a second row with a
         // duplicate coordinate while the original kept its old value.
+        // A commented reference is refused outright now (the reader reads it as a
+        // cell), so the inference is exercised with a comment that carries none. The
+        // hazard is the same: the scan must not take its row number from comment text.
         const out = apply_cell_edits(
-            doc('<row><!-- <c r="A1"/> --><c r="B2"><v>1</v></c></row>'),
+            doc('<row><!-- <c/> --><c r="B2"><v>1</v></c></row>'),
             [{ row: 1, col: 1, value: '9' }],
             OPTS,
         );
@@ -581,9 +615,12 @@ describe('apply_cell_edits', () => {
     });
 
     it('does not refuse a cell whose only array formula is commented out', () => {
+        // No `r` in the comment, so the reader ignores it too and there is nothing to
+        // refuse; what must not happen is the *formula* being read out of comment text
+        // and the live cell declined as part of an array range.
         const out = apply_cell_edits(
             doc(
-                '<!-- <row r="1"><c r="A1"><f t="array" ref="A1:B2">X</f></c></row> -->'
+                '<!-- <row r="1"><c><f t="array" ref="A1:B2">X</f></c></row> -->'
                 + '<row r="1"><c r="A1"><v>1</v></c></row>',
             ),
             [{ row: 0, col: 0, value: '2' }],
@@ -700,6 +737,21 @@ describe('apply_cell_edits', () => {
             expect(apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: '2' }], OPTS))
                 .toContain('<c r="A1"><v>2</v></c>');
         }
+    });
+
+    it('writes a carriage return as a numeric reference', () => {
+        // XML 1.0 requires every parser to normalize a raw `\r` in content to `\n`
+        // before the application sees it, so a literal one is not preserved — it comes
+        // back a line feed, and `\r\n` loses a character outright. The numeric
+        // reference is exempt from that normalization and is the only spelling that
+        // round-trips.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'left\r\nright' }],
+            OPTS,
+        );
+        expect(out).toContain('left&#13;\nright');
+        expect(out).not.toMatch(/left\r/);
     });
 
     it('keeps a boolean cell boolean', () => {
@@ -1049,6 +1101,9 @@ describe('write_xlsx_cell_edits', () => {
         // `./worksheets/sheet1.xml` names the same part as `worksheets/sheet1.xml`.
         // Concatenated without resolving, it became `xl/./worksheets/sheet1.xml`,
         // matched no entry, and the save failed outright on a file Excel opens fine.
+        // `resolve_part_path` now lives in the reader and is shared, because the two
+        // resolving it differently was worse than either being wrong alone: the reader
+        // displayed the worksheet empty while the writer happily spliced into it.
         const bytes = patched_parts([[
             '/xl/_rels/workbook.xml.rels',
             'Target="worksheets/sheet1.xml"',
@@ -1056,6 +1111,39 @@ describe('write_xlsx_cell_edits', () => {
         ]]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '9' }]);
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('>9<');
+    });
+
+    it('numbers worksheets exactly as the reader does', () => {
+        // `sheet_index` is the index of the worksheet the *user* was looking at, so
+        // any enumeration difference saves into a different sheet: a valid file with
+        // the edit in the wrong place and no error. The writer had its own copy of the
+        // enumeration and drifted twice — it read both quote styles where the reader's
+        // `get_attr` reads only `"…"`, and it skipped `<sheet>` tags in comments where
+        // the reader counts them. Both are the writer being *more* nearly correct, and
+        // both wrote to the wrong worksheet, so the two now share one enumeration.
+        // Two sheets, so a numbering shift has somewhere wrong to land.
+        for (const patch of [
+            // A legally single-quoted name: unreadable to the reader, so it drops the
+            // sheet, and its index 0 is the *second* worksheet.
+            ['name="People"', "name='People'"],
+            // A commented-out entry: text to a parser, a sheet to the reader. Pointed
+            // at the *second* worksheet's relationship, so the reader's sheet 0 is
+            // `Inventory` while a comment-skipping writer's is `People` — a wrong-sheet
+            // write with both parts present to tell them apart.
+            ['<sheets>', '<sheets><!-- <sheet name="Gone" sheetId="9" r:id="rId5"/> -->'],
+        ] as const) {
+            const bytes = patched_basic([['/xl/workbook.xml', patch[0], patch[1]]]);
+            const reader_paths = worksheet_part_paths(bytes);
+            const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: 'MARK' }]);
+            // Whatever the reader calls sheet 0 is the part that changed, and no other.
+            // Deduplicated: a workbook may legally list one part twice, and these
+            // patches do, so "every other entry" would otherwise include sheet 0.
+            expect(part(out, `/${reader_paths[0]}`)!.toString('utf8')).toContain('MARK');
+            for (const other of new Set(reader_paths.slice(1))) {
+                if (other === reader_paths[0]) continue;
+                expect(part(out, `/${other}`)!.toString('utf8')).not.toContain('MARK');
+            }
+        }
     });
 
     it('reads a number-format condition whose bound is written +N', () => {
