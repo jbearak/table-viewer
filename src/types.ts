@@ -503,8 +503,29 @@ export interface PerFileState {
      * have nothing to change, and would need a row permutation it cannot
      * reconstruct — permutations are deliberately never persisted (see
      * `transforms` below).
+     *
+     * ---
+     *
+     * **Worksheet scoping.** The map above describes one sheet's edits. Since
+     * .xlsx worksheets became editable the leaf is a *positional array* of those
+     * maps, indexed by sheet, because the unit of editing is the worksheet: each
+     * sheet has its own Edit button, its own dirty state and its own save.
+     *
+     * Each slot also carries the `sheetName` it was written against.  A bare
+     * positional array is not sufficient on its own: nothing stops the workbook
+     * being reordered in Excel between sessions, and a slot reattached by
+     * position alone would then hand one sheet's unsaved edits to a different
+     * sheet — silently, and keyed to rows that mean something else. On load a
+     * slot whose name does not match the workbook is dropped rather than
+     * reattached, which loses a draft only in the case where honouring it would
+     * corrupt the wrong worksheet.
+     *
+     * Legacy flat maps migrate to slot 0 with no name recorded (see
+     * `decode_stored_per_file_state`). That is exactly right for the data that
+     * exists: only CSV was ever editable, CSV is single-sheet, so slot 0 *is* the
+     * sheet, and an absent name is treated as "matches whatever is there".
      */
-    pendingEdits?: Record<string, string | CsvDirtyEntry>;
+    pendingEdits?: (WorksheetPendingEdits | undefined)[];
     /** Explicit Excel first-row choices keyed by worksheet name. Missing = auto. */
     excelFirstRowHeaders?: Record<string, ExcelHeaderOverride>;
     /** Last effective projection by worksheet name, used to detect closed-view changes. */
@@ -698,6 +719,53 @@ function validate_cell_highlights(value: unknown): void {
     }
 }
 
+/** Validate one sheet's cell map, rejecting the whole leaf on any malformed entry. */
+function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEntry> {
+    if (!is_plain_record(value)) invalid_leaf('pendingEdits');
+    for (const [key, entry] of Object.entries(value)) {
+        if (!is_canonical_cell_key(key)) invalid_leaf('pendingEdits');
+        if (typeof entry === 'string') continue;
+        if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
+            invalid_leaf('pendingEdits');
+        }
+    }
+    return value as Record<string, string | CsvDirtyEntry>;
+}
+
+/**
+ * Decode `pendingEdits` in either shape, migrating the legacy flat map.
+ *
+ * A plain object is a pre-worksheet map of one CSV's edits and becomes slot 0
+ * with no `sheetName` — see the `pendingEdits` doc comment for why that is the
+ * correct reading rather than a lossy guess. An array is already worksheet-scoped.
+ * Returns `undefined` when nothing survives, so the caller can drop the leaf.
+ */
+function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefined)[] | undefined {
+    if (is_plain_record(value)) {
+        const cells = validate_edit_cells(value);
+        return Object.keys(cells).length === 0 ? undefined : [{ cells }];
+    }
+    if (!Array.isArray(value)) invalid_leaf('pendingEdits');
+
+    const slots: (WorksheetPendingEdits | undefined)[] = value.map((slot) => {
+        if (slot === undefined || slot === null) return undefined;
+        if (!is_plain_record(slot)) invalid_leaf('pendingEdits');
+        if (slot.sheetName !== undefined && typeof slot.sheetName !== 'string') {
+            invalid_leaf('pendingEdits');
+        }
+        const cells = validate_edit_cells(slot.cells);
+        if (Object.keys(cells).length === 0) return undefined;
+        return slot.sheetName === undefined
+            ? { cells }
+            : { sheetName: slot.sheetName, cells };
+    });
+
+    // Trailing empties carry no information; trimming keeps the persisted array
+    // from growing once and never shrinking as sheets are saved.
+    while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();
+    return slots.length === 0 ? undefined : slots;
+}
+
 /** Validate known leaves while preserving unknown top-level leaves verbatim. */
 export function decode_stored_per_file_state(value: unknown): StoredPerFileState {
     if (!is_plain_record(value)) throw new TypeError('Persisted file state must be an object.');
@@ -733,17 +801,89 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
         }
     }
     if (state.pendingEdits !== undefined) {
-        if (!is_plain_record(state.pendingEdits)) invalid_leaf('pendingEdits');
-        for (const [key, entry] of Object.entries(state.pendingEdits)) {
-            if (!is_canonical_cell_key(key)) invalid_leaf('pendingEdits');
-            if (typeof entry === 'string') continue;
-            if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
-                invalid_leaf('pendingEdits');
-            }
-        }
-        if (Object.keys(state.pendingEdits).length === 0) delete state.pendingEdits;
+        state.pendingEdits = decode_pending_edits(state.pendingEdits);
+        if (state.pendingEdits === undefined) delete state.pendingEdits;
     }
     return state as unknown as StoredPerFileState;
+}
+
+/**
+ * One worksheet's durable pending edits, plus the sheet name they were written
+ * against so a workbook reordered externally cannot reattach them to the wrong
+ * sheet. See the `pendingEdits` doc comment for why the name is load-bearing.
+ *
+ * `sheetName` is absent only for edits migrated from the pre-worksheet flat map,
+ * where the file was necessarily single-sheet CSV.
+ */
+export interface WorksheetPendingEdits {
+    readonly sheetName?: string;
+    readonly cells: Record<string, string | CsvDirtyEntry>;
+}
+
+/** One sheet's cell map out of the worksheet-scoped leaf, or undefined. */
+export function pending_edits_for_sheet(
+    pending: PerFileState['pendingEdits'],
+    sheet_index: number,
+): Record<string, string | CsvDirtyEntry> | undefined {
+    const slot = pending?.[sheet_index];
+    return slot && Object.keys(slot.cells).length > 0 ? slot.cells : undefined;
+}
+
+/**
+ * Replace one sheet's slot, preserving the others.
+ *
+ * Passing `undefined` cells clears that sheet — which is what a save or discard
+ * does, and why it must not disturb the neighbouring sheets' unsaved work.
+ * Returns `undefined` when no slot has any edits left, so callers can drop the
+ * leaf entirely rather than persist an array of holes.
+ */
+export function with_pending_edits_for_sheet(
+    pending: PerFileState['pendingEdits'],
+    sheet_index: number,
+    cells: Record<string, string | CsvDirtyEntry> | undefined,
+    sheet_name?: string,
+): PerFileState['pendingEdits'] {
+    const next = pending ? [...pending] : [];
+    while (next.length <= sheet_index) next.push(undefined);
+    next[sheet_index] = cells && Object.keys(cells).length > 0
+        ? (sheet_name === undefined ? { cells } : { sheetName: sheet_name, cells })
+        : undefined;
+    while (next.length > 0 && next[next.length - 1] === undefined) next.pop();
+    return next.length === 0 ? undefined : next;
+}
+
+/** True when any sheet holds pending edits. */
+export function has_any_pending_edits(pending: PerFileState['pendingEdits']): boolean {
+    return !!pending?.some((slot) => slot && Object.keys(slot.cells).length > 0);
+}
+
+/**
+ * Drop slots whose recorded `sheetName` does not match the workbook as loaded.
+ *
+ * Guards the one case a positional array cannot: the workbook was reordered
+ * externally, so slot *i* no longer describes sheet *i*. Reattaching by position
+ * would apply a draft to the wrong worksheet, keyed to rows that mean something
+ * else there — silent corruption. Dropping loses the draft, which is strictly
+ * better and only happens when the alternative is wrong.
+ *
+ * Slots with no recorded name are legacy CSV migrations (single-sheet by
+ * construction) and are always kept.
+ */
+export function reconcile_pending_edit_sheets(
+    pending: PerFileState['pendingEdits'],
+    sheet_names: readonly string[],
+): PerFileState['pendingEdits'] {
+    if (!pending) return undefined;
+    let changed = false;
+    const next = pending.map((slot, index) => {
+        if (!slot?.sheetName) return slot;
+        if (sheet_names[index] === slot.sheetName) return slot;
+        changed = true;
+        return undefined;
+    });
+    if (!changed) return pending;
+    while (next.length > 0 && next[next.length - 1] === undefined) next.pop();
+    return next.length === 0 ? undefined : next;
 }
 
 /** Exact conflict-preserving entry durably owned by the CSV edit session. */
