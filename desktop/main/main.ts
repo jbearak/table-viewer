@@ -286,7 +286,12 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
         if (!viewer_windows) return;
         let opened_any = false;
         for (const file of action.files) {
-            if (viewer_windows.open_file(file)) opened_any = true;
+            if (viewer_windows.open_file(file)) {
+                if (process.platform === 'darwin' || process.platform === 'win32') {
+                    app.addRecentDocument(file);
+                }
+                opened_any = true;
+            }
         }
         const from_launcher = source !== undefined && welcome_windows.has(source);
         if (launcher_steps_aside(opened_any, from_launcher) && !source!.isDestroyed()) {
@@ -491,6 +496,15 @@ function build_menu(): void {
                     click: (_item, window) =>
                         void show_open_dialog(window as BrowserWindow | undefined),
                 },
+                ...(is_mac
+                    ? [{
+                        label: 'Open Recent',
+                        role: 'recentDocuments' as const,
+                        submenu: [
+                            { label: 'Clear Menu', role: 'clearRecentDocuments' as const },
+                        ],
+                    }]
+                    : []),
                 { type: 'separator' },
                 { role: 'close' },
                 ...(is_mac
